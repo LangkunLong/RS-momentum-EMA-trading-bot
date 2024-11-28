@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 
 def calculate_indicators(df):
@@ -8,9 +9,8 @@ def calculate_indicators(df):
     df['8_EMA'] = EMAIndicator(df['Close'], window=8).ema_indicator()
     df['21_EMA'] = EMAIndicator(df['Close'], window=21).ema_indicator()
     
-    # Calculate RS Rating (mock calculation: price % change over 14 days)
-    # Or can use relative strength index
-    df['RS_Rating'] = df['Close'].pct_change(14).apply(lambda x: (x + 1) * 10 if x > 0 else 0)
+    # Calculate RSI (14-period default)
+    df['RSI'] = RSIIndicator(df['Close'], window=14).rsi()
     return df
 
 def is_uptrend(row):
@@ -27,11 +27,11 @@ def find_trade_signals(symbol, start_date, end_date):
     # Identify trade signals
     df['Uptrend'] = df.apply(is_uptrend, axis=1)
     df['Pullback'] = df.apply(is_pullback, axis=1)
-    df['Signal'] = (df['Uptrend'] & df['Pullback'] & (df['RS_Rating'] > 7))
+    df['Signal'] = (df['Uptrend'] & df['Pullback'] & (df['RSI'] > 70))
 
     # Return rows with signals
     return df[df['Signal']]
 
 # Example usage
 signals = find_trade_signals('AAPL', '2023-01-01', '2023-12-31')
-print(signals[['Close', '8_EMA', '21_EMA', 'RS_Rating', 'Signal']])
+print(signals[['Close', '8_EMA', '21_EMA', 'RSI', 'Signal']])
