@@ -7,10 +7,13 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 import os
+from functools import lru_cache
+
 
 load_dotenv()
 api_key = os.getenv("FINNHUB_API_KEY")
 
+@lru_cache(maxsize=100)
 def get_large_cap_stocks_from_api(min_market_cap=50e9):
     """
     Fetch large-cap stocks with a market capitalization above the specified threshold using the Finnhub API.
