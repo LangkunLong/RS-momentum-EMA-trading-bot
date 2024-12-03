@@ -4,20 +4,47 @@
 from concurrent.futures import ThreadPoolExecutor
 from trading_algo import find_trade_signals
 import pandas as pd
-from yahooquery import Screener
+import requests
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+api_key = os.getenv("FINNHUB_API_KEY")
 
 def get_large_cap_stocks_from_api(min_market_cap=50e9):
-    # Use Yahoo Finance's predefined large-cap stocks screener
-    screener = Screener()
-    screeners = screener.get_screeners('most_actives', count=100)  # can use other screeners like Finnhub or alphavintage
+    """
+    Fetch large-cap stocks with a market capitalization above the specified threshold using the Finnhub API.
+    
+    Args:
+        min_market_cap (float): Minimum market capitalization (default is $50B).
+
+    Returns:
+        List[str]: A list of tickers for large-cap stocks.
+    """
+    base_url = "https://finnhub.io/api/v1/stock/symbol"
+    market_cap_url = "https://finnhub.io/api/v1/stock/metric"
+    exchange = "US"  # US exchange; modify for other exchanges if needed
     large_cap_stocks = []
 
     try:
-        results = screeners.get('quotes', [])
-        for stock in results:
-            ticker = stock.get('symbol')
-            market_cap = stock.get('marketCap')
+        # Fetch all US stocks
+        response = requests.get(f"{base_url}?exchange={exchange}&token={api_key}")
+        response.raise_for_status()  # Raise exception for HTTP errors
+        stocks = response.json()
 
+        # Check market cap for each stock
+        for stock in stocks:
+            ticker = stock.get("symbol")
+            if not ticker:
+                continue
+
+            # Fetch stock metrics to get market cap
+            metric_response = requests.get(f"{market_cap_url}?symbol={ticker}&metric=all&token={api_key}")
+            metric_response.raise_for_status()
+            metrics = metric_response.json()
+            
+            # Extract market capitalization
+            market_cap = metrics.get("metric", {}).get("marketCapitalization")
             if market_cap and market_cap >= min_market_cap:
                 large_cap_stocks.append(ticker)
 
@@ -52,11 +79,12 @@ def summarize_signals(all_signals):
             summary.append({'Stock': stock, 'Date': row.name, 'Close': row['Close'], 'RSI': row['RSI']})
     return pd.DataFrame(summary)
 
-# Example usage
-stocks = get_large_cap_stocks_from_api()
-print(f"stocks: {stocks}")
+if __name__ == "__main__":
+    
+    stocks = get_large_cap_stocks_from_api()
+    print(f"stocks: {stocks}")
 
-all_signals = find_trade_signals_for_all(stocks, '2023-01-01', '2023-12-31')
+    all_signals = find_trade_signals_for_all(stocks, '2023-01-01', '2023-12-31')
 
-for stock, signals in all_signals:
-    print(f"Signals for {stock}:\n{signals[['Close', 'RSI', 'Signal']]}\n")
+    for stock, signals in all_signals:
+        print(f"Signals for {stock}:\n{signals[['Close', 'RSI', 'Signal']]}\n")
