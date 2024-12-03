@@ -32,6 +32,3 @@ def find_trade_signals(symbol, start_date, end_date):
     # Return rows with signals
     return df[df['Signal']]
 
-# Example usage
-signals = find_trade_signals('AAPL', '2023-01-01', '2023-12-31')
-print(signals[['Close', '8_EMA', '21_EMA', 'RSI', 'Signal']])
