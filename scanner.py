@@ -8,53 +8,59 @@ import requests
 from dotenv import load_dotenv
 import os
 from functools import lru_cache
-
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 api_key = os.getenv("FINNHUB_API_KEY")
 
-@lru_cache(maxsize=100)
-def get_large_cap_stocks_from_api(min_market_cap=50e9):
-    """
-    Fetch large-cap stocks with a market capitalization above the specified threshold using the Finnhub API.
-    
-    Args:
-        min_market_cap (float): Minimum market capitalization (default is $50B).
+def requests_with_retries():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        backoff_factor=1
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
-    Returns:
-        List[str]: A list of tickers for large-cap stocks.
-    """
+# Cache the results to avoid redundant API calls and improve performance
+@lru_cache(maxsize=100)
+def fetch_large_cap_stocks(min_market_cap=50e9):
     base_url = "https://finnhub.io/api/v1/stock/symbol"
     market_cap_url = "https://finnhub.io/api/v1/stock/metric"
-    exchange = "US"  # US exchange; modify for other exchanges if needed
-    large_cap_stocks = []
+    exchange = "US"
 
     try:
-        # Fetch all US stocks
-        response = requests.get(f"{base_url}?exchange={exchange}&token={api_key}")
-        response.raise_for_status()  # Raise exception for HTTP errors
+        session = requests_with_retries()
+        response = session.get(f"{base_url}?exchange={exchange}&token={api_key}")
+        response.raise_for_status()
         stocks = response.json()
 
-        # Check market cap for each stock
-        for stock in stocks:
+        def fetch_market_cap(stock):
             ticker = stock.get("symbol")
             if not ticker:
-                continue
-
-            # Fetch stock metrics to get market cap
-            metric_response = requests.get(f"{market_cap_url}?symbol={ticker}&metric=all&token={api_key}")
-            metric_response.raise_for_status()
-            metrics = metric_response.json()
-            
-            # Extract market capitalization
-            market_cap = metrics.get("metric", {}).get("marketCapitalization")
-            if market_cap and market_cap >= min_market_cap:
-                large_cap_stocks.append(ticker)
-
+                return None
+            try:
+                metric_response = session.get(f"{market_cap_url}?symbol={ticker}&metric=all&token={api_key}")
+                metric_response.raise_for_status()
+                metrics = metric_response.json()
+                market_cap = metrics.get("metric", {}).get("marketCapitalization")
+                return ticker if market_cap and market_cap >= min_market_cap else None
+            except Exception as e:
+                print(f"Error fetching {ticker}: {e}")
+                return None
+        
+        # use parallel processing to fetch market cap 
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(executor.map(fetch_market_cap, stocks))
+        return [r for r in results if r]
+    
     except Exception as e:
-        print(f"Error fetching data: {e}")
-
-    return large_cap_stocks
+        print(f"Error fetching stocks: {e}")
+        return []
 
 def find_trade_signals_for_all(stocks, start_date, end_date):
     all_signals = []
@@ -83,8 +89,10 @@ def summarize_signals(all_signals):
     return pd.DataFrame(summary)
 
 if __name__ == "__main__":
+    # confirm api key:
+    print(f"API key: {api_key}")
     
-    stocks = get_large_cap_stocks_from_api()
+    stocks = fetch_large_cap_stocks()
     print(f"stocks: {stocks}")
 
     all_signals = find_trade_signals_for_all(stocks, '2023-01-01', '2023-12-31')
