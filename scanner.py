@@ -92,10 +92,15 @@ if __name__ == "__main__":
     # confirm api key:
     print(f"API key: {api_key}")
     
-    stocks = fetch_large_cap_stocks()
-    print(f"stocks: {stocks}")
+    # check rate limit:
+    rate_limit_url = "https://finnhub.io/api/v1/quote?symbol=AAPL&token={api_key}"
+    response = requests.get(rate_limit_url)
+    print(response.headers)
+    
+    # stocks = fetch_large_cap_stocks()
+    # print(f"stocks: {stocks}")
 
-    all_signals = find_trade_signals_for_all(stocks, '2023-01-01', '2023-12-31')
+    # all_signals = find_trade_signals_for_all(stocks, '2023-01-01', '2023-12-31')
 
-    for stock, signals in all_signals:
-        print(f"Signals for {stock}:\n{signals[['Close', 'RSI', 'Signal']]}\n")
+    # for stock, signals in all_signals:
+    #     print(f"Signals for {stock}:\n{signals[['Close', 'RSI', 'Signal']]}\n")
