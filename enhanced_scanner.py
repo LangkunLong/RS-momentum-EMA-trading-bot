@@ -89,56 +89,38 @@ def fetch_large_cap_stocks(min_market_cap=10e9):
         print(f"Error fetching stocks: {e}")
         return []
 
-def get_quality_stock_list():
-    """
-    Get a curated list of high-quality large cap stocks
-    This avoids API rate limits while focusing on quality names
-    """
-    quality_stocks = [
-        # Mega Cap Tech
-        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'NFLX',
-        # Large Cap Tech
-        'ADBE', 'CRM', 'ORCL', 'AVGO', 'INTC', 'AMD', 'QCOM', 'TXN',
-        # Financial Services
-        'JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'AXP', 'V', 'MA', 'PYPL',
-        # Healthcare
-        'JNJ', 'UNH', 'PFE', 'ABBV', 'MRK', 'TMO', 'ABT', 'DHR', 'BMY', 'AMGN',
-        # Consumer Discretionary
-        'AMZN', 'TSLA', 'HD', 'MCD', 'NKE', 'SBUX', 'TJX', 'LOW', 'TGT',
-        # Consumer Staples
-        'PG', 'KO', 'PEP', 'WMT', 'COST', 'CL', 'KMB', 'GIS', 'K',
-        # Industrial
-        'BA', 'CAT', 'GE', 'MMM', 'HON', 'UPS', 'RTX', 'LMT', 'DE',
-        # Energy
-        'XOM', 'CVX', 'COP', 'EOG', 'SLB', 'PSX', 'VLO', 'MPC',
-        # Communication
-        'GOOGL', 'META', 'NFLX', 'DIS', 'CMCSA', 'T', 'VZ', 'TMUS',
-        # Utilities
-        'NEE', 'DUK', 'SO', 'D', 'AEP', 'EXC', 'XEL', 'PEG',
-        # Real Estate
-        'AMT', 'PLD', 'CCI', 'EQIX', 'WELL', 'DLR', 'PSA', 'EXR',
-        # Materials
-        'LIN', 'APD', 'SHW', 'FCX', 'NUE', 'DOW', 'DD', 'PPG'
-    ]
-    
-    # Remove duplicates and return
-    return list(set(quality_stocks))
+from quality_stocks import get_quality_stock_list, get_sector_stocks, get_custom_watchlist
 
-def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_score=10, max_workers=3):
+def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_score=10, max_workers=3, sectors=None, custom_list=None):
     """
     Main scanning function for high momentum pullback opportunities
+    
+    Args:
+        use_api (bool): Use Finnhub API vs curated stock lists
+        min_market_cap (float): Minimum market cap for API filtering
+        min_rs_score (float): Minimum relative strength score
+        max_workers (int): Number of concurrent analysis threads
+        sectors (list): Specific sectors to scan (e.g., ['mega_cap_tech', 'healthcare'])
+        custom_list (list): Custom list of stock symbols to scan
     """
     print("=" * 60)
     print("HIGH MOMENTUM PULLBACK SCANNER")
     print("=" * 60)
     
     # Get stock list
-    if use_api:
+    if custom_list:
+        print("Using custom stock list...")
+        symbols = custom_list
+    elif use_api:
         stock_data = fetch_large_cap_stocks(min_market_cap)
         symbols = [stock['symbol'] for stock in stock_data]
     else:
-        print("Using curated quality stock list...")
-        symbols = get_quality_stock_list()
+        if sectors:
+            print(f"Using curated stock list for sectors: {sectors}")
+            symbols = get_quality_stock_list(sectors=sectors)
+        else:
+            print("Using default curated quality stock list...")
+            symbols = get_quality_stock_list()
     
     print(f"Scanning {len(symbols)} stocks for momentum opportunities...")
     print(f"Minimum RS Score: {min_rs_score}")
@@ -229,18 +211,50 @@ def export_results_to_csv(opportunities, filename=None):
     print(f"Results exported to {filename}")
 
 if __name__ == "__main__":
-    # Configuration
-    USE_API = False  # Set to True to use Finnhub API, False to use curated list
-    MIN_MARKET_CAP = 10e9  # 10 billion
+    # Configuration Options
+    USE_API = False  # Set to True to use Finnhub API, False to use curated lists
+    MIN_MARKET_CAP = 10e9  # 10 billion (only used if USE_API = True)
     MIN_RS_SCORE = 5  # Minimum relative strength score
     MAX_WORKERS = 2  # Concurrent analysis threads
+    
+    # Stock Selection Options (choose one):
+    
+    # Option 1: Use all quality stocks (default)
+    SECTORS = None
+    CUSTOM_LIST = None
+    
+    # Option 2: Focus on specific sectors
+    # SECTORS = ['mega_cap_tech', 'healthcare']
+    # CUSTOM_LIST = None
+    
+    # Option 3: Use your custom watchlist
+    # SECTORS = None
+    # CUSTOM_LIST = get_custom_watchlist()
+    
+    # Option 4: Tech stocks only
+    # SECTORS = ['mega_cap_tech', 'large_cap_tech']
+    # CUSTOM_LIST = None
+    
+    # Option 5: Conservative dividend stocks
+    # SECTORS = ['dividend_defensive']
+    # CUSTOM_LIST = None
+    
+    print("Stock Scanner Configuration:")
+    print(f"- Use API: {USE_API}")
+    print(f"- Min Market Cap: ${MIN_MARKET_CAP/1e9:.0f}B")
+    print(f"- Min RS Score: {MIN_RS_SCORE}")
+    print(f"- Max Workers: {MAX_WORKERS}")
+    print(f"- Sectors: {SECTORS}")
+    print(f"- Custom List: {'Yes' if CUSTOM_LIST else 'No'}")
     
     # Run the scan
     opportunities = scan_for_momentum_opportunities(
         use_api=USE_API,
         min_market_cap=MIN_MARKET_CAP,
         min_rs_score=MIN_RS_SCORE,
-        max_workers=MAX_WORKERS
+        max_workers=MAX_WORKERS,
+        sectors=SECTORS,
+        custom_list=CUSTOM_LIST
     )
     
     # Display results
