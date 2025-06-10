@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
+START_DATE = '2025-01-01'
+
 def calculate_rs_momentum(symbol, benchmark_symbol='SPY', period_days=63):
     """
     Calculate Relative Strength momentum score comparing stock to benchmark
@@ -209,7 +211,7 @@ def find_high_momentum_entries(symbol, start_date, end_date, min_rs_score=10):
         print(f"Error analyzing {symbol}: {e}")
         return None
 
-def screen_stocks_advanced(symbols, start_date='2024-01-01', end_date=None, min_rs_score=10):
+def screen_stocks_advanced(symbols, start_date=START_DATE, end_date=None, min_rs_score=10):
     """
     Screen multiple stocks for high momentum pullback opportunities
     """
