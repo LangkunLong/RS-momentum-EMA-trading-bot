@@ -254,7 +254,6 @@ CRYPTO_FINTECH = [
 # Emerging Growth & High Beta
 GROWTH_HIGH_BETA = [
     'ROKU',   # Roku Inc
-    'PELOTON',# Peloton Interactive Inc
     'ZM',     # Zoom Video Communications (also in tech)
     'DOCU',   # DocuSign Inc
     'CRWD',   # CrowdStrike Holdings Inc

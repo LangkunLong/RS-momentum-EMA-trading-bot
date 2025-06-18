@@ -8,6 +8,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime
 import time
+import yfinance as yf
 from enhanced_trading_algo import find_high_momentum_entries, print_analysis_results
 
 load_dotenv()
@@ -29,8 +30,8 @@ def requests_with_retries():
 # preprocess ticker symbol, see if avaiable on yahoo finance
 def is_valid_ticker(symbol):
     try:
-        info = yf.Ticker(symbol).fast_info
-        return info is not None and info.get("last_price") is not None
+        df = yf.download(symbol, period="5d", progress=False)
+        return not df.empty and df['Close'].notna().any()
     except Exception:
         return False
 
@@ -168,7 +169,7 @@ def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_s
     
     # Process stocks with controlled concurrency
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_symbol = {executor.submit(analyze_stock, symbol): symbol for symbol in symbols}
+        future_to_symbol = {executor.submit(analyze_stock, symbol): symbol for symbol in valid_symbols}
         
         completed = 0
         for future in as_completed(future_to_symbol):
@@ -247,7 +248,7 @@ if __name__ == "__main__":
     # CUSTOM_LIST = None
     
     # Option 2: Focus on specific sectors
-    SECTORS = ['mega_cap_tech', 'healthcare']
+    SECTORS = ['growth_high_beta', 'crypto_fintech']
     CUSTOM_LIST = None
     
     # Option 3: Use your custom watchlist
