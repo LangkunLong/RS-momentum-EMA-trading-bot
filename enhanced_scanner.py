@@ -13,12 +13,13 @@ from enhanced_trading_algo import find_high_momentum_entries, print_analysis_res
 load_dotenv()
 api_key = os.getenv("FINNHUB_API_KEY")
 
-def requests_with_retries():
+def create_robust_session():
+    """Create a requests session with retry strategy"""
     session = requests.Session()
     retry_strategy = Retry(
-        total=5,
+        total=3,
         status_forcelist=[429, 500, 502, 503, 504],
-        backoff_factor=2,
+        backoff_factor=1,
         respect_retry_after_header=True
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -220,12 +221,12 @@ if __name__ == "__main__":
     # Stock Selection Options (choose one):
     
     # Option 1: Use all quality stocks (default)
-    SECTORS = None
-    CUSTOM_LIST = None
+    # SECTORS = None
+    # CUSTOM_LIST = None
     
     # Option 2: Focus on specific sectors
-    # SECTORS = ['mega_cap_tech', 'healthcare']
-    # CUSTOM_LIST = None
+    SECTORS = ['mega_cap_tech', 'healthcare']
+    CUSTOM_LIST = None
     
     # Option 3: Use your custom watchlist
     # SECTORS = None
