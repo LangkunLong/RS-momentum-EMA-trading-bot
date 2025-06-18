@@ -13,19 +13,26 @@ from enhanced_trading_algo import find_high_momentum_entries, print_analysis_res
 load_dotenv()
 api_key = os.getenv("FINNHUB_API_KEY")
 
-def create_robust_session():
-    """Create a requests session with retry strategy"""
+def requests_with_retries():
     session = requests.Session()
     retry_strategy = Retry(
-        total=3,
+        total=5,
         status_forcelist=[429, 500, 502, 503, 504],
-        backoff_factor=1,
+        backoff_factor=2,
         respect_retry_after_header=True
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
+# preprocess ticker symbol, see if avaiable on yahoo finance
+def is_valid_ticker(symbol):
+    try:
+        info = yf.Ticker(symbol).fast_info
+        return info is not None and info.get("last_price") is not None
+    except Exception:
+        return False
 
 @lru_cache(maxsize=1)
 def fetch_large_cap_stocks(min_market_cap=10e9):
@@ -92,18 +99,21 @@ def fetch_large_cap_stocks(min_market_cap=10e9):
 
 from quality_stocks import get_quality_stock_list, get_sector_stocks, get_custom_watchlist
 
+
+
+"""
+Main scanning function for high momentum pullback opportunities
+
+Args:
+    use_api (bool): Use Finnhub API vs curated stock lists
+    min_market_cap (float): Minimum market cap for API filtering
+    min_rs_score (float): Minimum relative strength score
+    max_workers (int): Number of concurrent analysis threads
+    sectors (list): Specific sectors to scan (e.g., ['mega_cap_tech', 'healthcare'])
+    custom_list (list): Custom list of stock symbols to scan
+"""
 def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_score=10, max_workers=3, sectors=None, custom_list=None):
-    """
-    Main scanning function for high momentum pullback opportunities
-    
-    Args:
-        use_api (bool): Use Finnhub API vs curated stock lists
-        min_market_cap (float): Minimum market cap for API filtering
-        min_rs_score (float): Minimum relative strength score
-        max_workers (int): Number of concurrent analysis threads
-        sectors (list): Specific sectors to scan (e.g., ['mega_cap_tech', 'healthcare'])
-        custom_list (list): Custom list of stock symbols to scan
-    """
+
     print("=" * 60)
     print("HIGH MOMENTUM PULLBACK SCANNER")
     print("=" * 60)
@@ -126,6 +136,18 @@ def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_s
     print(f"Scanning {len(symbols)} stocks for momentum opportunities...")
     print(f"Minimum RS Score: {min_rs_score}")
     
+    # filter stocks:
+    # Filter out invalid/delisted tickers before scanning
+    print("Validating tickers with Yahoo Finance...")
+    valid_symbols = []
+    for symbol in symbols:
+        if is_valid_ticker(symbol):
+            valid_symbols.append(symbol)
+        else:
+            print(f"Skipping invalid/delisted ticker: {symbol}")
+
+    print(f"{len(valid_symbols)} valid tickers will be scanned.")
+
     # Scan stocks for opportunities
     opportunities = []
     failed_symbols = []
