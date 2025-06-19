@@ -119,27 +119,6 @@ Automatically exports results to timestamped CSV files containing:
 - **21EMA_Retest**: Deeper pullback to 21-day moving average
 - **8EMA_Reclaim**: Recovery pattern after temporary weakness
 
-## Example Output
-
-```
-================================================================================
-HIGH MOMENTUM PULLBACK OPPORTUNITIES (5 stocks found)
-================================================================================
-
-1. NVDA
-   RS Score: 45.2
-   Trend Score: 82.1
-   Current Price: $875.28
-   Current RSI: 58.3
-   8EMA Adherence: 75.8%
-   21EMA Adherence: 88.4%
-   Higher Highs: True
-   Higher Lows: True
-   Entry Signals (3):
-     2024-12-01: 8EMA_Retest
-       Price: $872.45, RSI: 56.7
-```
-
 ## Customization
 
 ### Adding Custom Stock Lists
