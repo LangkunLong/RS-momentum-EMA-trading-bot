@@ -163,10 +163,26 @@ def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_s
         try:
             result = find_high_momentum_entries(
                 symbol, 
-                start_date='2024-01-01', 
+                start_date='2025-01-01', 
                 end_date=None, 
                 min_rs_score=min_rs_score
             )
+            
+            # Add this block to guarantee all values in result are Python primitives
+            if result:
+                # Convert any pandas/numpy values to Python primitives
+                result['rs_score'] = float(result['rs_score'])
+                result['trend_score'] = float(result['trend_score'])
+                result['current_price'] = float(result['current_price'])
+                result['current_rsi'] = float(result['current_rsi'])
+                
+                # Convert trend details
+                result['trend_details']['ema_8_adherence'] = float(result['trend_details']['ema_8_adherence'])
+                result['trend_details']['ema_21_adherence'] = float(result['trend_details']['ema_21_adherence'])
+                result['trend_details']['higher_highs'] = bool(result['trend_details']['higher_highs'])
+                result['trend_details']['higher_lows'] = bool(result['trend_details']['higher_lows'])
+                result['trend_details']['strong_ema_adherence'] = bool(result['trend_details']['strong_ema_adherence'])
+                
             return result
         except Exception as e:
             failed_symbols.append(symbol)
