@@ -72,28 +72,20 @@ def analyze_trend_strength(df, min_days=60):
 
     recent_data = df.tail(min_days).copy()
 
-    # Check EMA adherence
-    ema_8_adherence = (recent_data['Above_8EMA'].sum() / len(recent_data)) * 100
-    ema_21_adherence = (recent_data['Above_21EMA'].sum() / len(recent_data)) * 100
+    # Check EMA adherence - ensure these are Python floats
+    ema_8_adherence = float((recent_data['Above_8EMA'].sum() / len(recent_data)) * 100)
+    ema_21_adherence = float((recent_data['Above_21EMA'].sum() / len(recent_data)) * 100)
 
     # Strong trend requires holding either 8EMA (>70%) or 21EMA (>80%)
-    strong_ema_adherence = ema_8_adherence > 70 or ema_21_adherence > 80
+    strong_ema_adherence = bool(ema_8_adherence > 70 or ema_21_adherence > 80)
 
     # Check for higher highs and higher lows pattern
     segment_size = min_days // 4
     segments = []
 
-    # Define to_float OUTSIDE the loop
-    def to_float(val, name):
-        try:
-            # If it's a Series or array, flatten and take first element
-            if isinstance(val, pd.Series):
-                return float(val.iloc[0])
-            elif isinstance(val, np.ndarray):
-                return float(val.item(0))
-            return float(val)
-        except Exception as e:
-            return float('nan')
+    # Create a completely flat structure with just Python floats
+    segment_highs = []
+    segment_lows = []
 
     for i in range(4):
         start_idx = i * segment_size
@@ -101,29 +93,47 @@ def analyze_trend_strength(df, min_days=60):
         segment = recent_data.iloc[start_idx:end_idx]
 
         if segment.empty:
-            high = low = close_avg = float('nan')
+            high = float('nan')
+            low = float('nan')
+            close_avg = float('nan')
         else:
-            high = segment['High'].max()
-            low = segment['Low'].min()
-            close_avg = segment['Close'].mean()
-
-            # Force scalar conversion
-            high = to_float(high, 'high')
-            low = to_float(low, 'low')
-            close_avg = to_float(close_avg, 'close_avg')
-
+            # Convert directly to Python float
+            try:
+                high_val = segment['High'].max()
+                high = float(high_val) if not pd.isna(high_val) else float('nan')
+                
+                low_val = segment['Low'].min()
+                low = float(low_val) if not pd.isna(low_val) else float('nan')
+                
+                close_val = segment['Close'].mean()
+                close_avg = float(close_val) if not pd.isna(close_val) else float('nan')
+            except:
+                high = float('nan')
+                low = float('nan')
+                close_avg = float('nan')
+        
+        segment_highs.append(high)
+        segment_lows.append(low)
+        
         segments.append({
             'high': high,
             'low': low,
             'close_avg': close_avg
         })
-
-    # Ensure we're comparing Python floats
+    
+    # Directly compare Python floats
+    higher_highs = False
+    higher_lows = False
+    
     try:
-        higher_highs = all(segments[i]['high'] <= segments[i+1]['high'] for i in range(2))
-        higher_lows = all(segments[i]['low'] <= segments[i+1]['low'] for i in range(2))
-    except Exception:
-        # Fallback if we get comparison errors
+        # Completely avoid any Series comparison by using the flat lists
+        if not (pd.isna(segment_highs[0]) or pd.isna(segment_highs[1]) or pd.isna(segment_highs[2])):
+            higher_highs = bool(segment_highs[0] <= segment_highs[1] <= segment_highs[2])
+        
+        if not (pd.isna(segment_lows[0]) or pd.isna(segment_lows[1]) or pd.isna(segment_lows[2])):
+            higher_lows = bool(segment_lows[0] <= segment_lows[1] <= segment_lows[2])
+    except Exception as e:
+        print(f"Failed to compare segments: {e}")
         higher_highs = higher_lows = False
 
     trend_strength = {
@@ -134,7 +144,7 @@ def analyze_trend_strength(df, min_days=60):
         'strong_ema_adherence': strong_ema_adherence
     }
 
-    is_strong_trend = strong_ema_adherence and (higher_highs or higher_lows)
+    is_strong_trend = bool(strong_ema_adherence and (higher_highs or higher_lows))
     trend_score = (ema_8_adherence + ema_21_adherence) / 2
 
     return is_strong_trend, trend_score, trend_strength
@@ -212,7 +222,7 @@ def find_high_momentum_entries(symbol, start_date, end_date, min_rs_score=10):
         rs_score = calculate_rs_momentum(symbol)
         
         # Skip if RS score is below threshold
-        if rs_score < min_rs_score:
+        if float(rs_score) < float(min_rs_score):
             return None
         
         # Fetch historical data with extra buffer for indicators
@@ -228,24 +238,31 @@ def find_high_momentum_entries(symbol, start_date, end_date, min_rs_score=10):
         # Analyze trend strength
         is_strong_trend, trend_score, trend_details = analyze_trend_strength(df)
         
-        if not is_strong_trend:
+        if not bool(is_strong_trend):
             return None
         
         # Identify pullback entries in the specified date range
-        analysis_df = df[df.index >= start_date]
+        start_date_dt = pd.to_datetime(start_date)  # Convert string to datetime
+        analysis_df = df[df.index >= start_date_dt]  # Use datetime comparison
         entry_signals = identify_pullback_entries(analysis_df)
         
-        # FIX: This line was causing the error - check length of list instead
-        if len(entry_signals) == 0:  # Changed from if not entry_signals:
+        # Check length of list instead of truthiness
+        if len(entry_signals) == 0:
             return None
         
         return {
             'symbol': symbol,
-            'rs_score': rs_score,
-            'trend_score': trend_score,
-            'trend_details': trend_details,
+            'rs_score': float(rs_score),
+            'trend_score': float(trend_score),
+            'trend_details': {
+                'ema_8_adherence': float(trend_details['ema_8_adherence']),
+                'ema_21_adherence': float(trend_details['ema_21_adherence']),
+                'higher_highs': bool(trend_details['higher_highs']),
+                'higher_lows': bool(trend_details['higher_lows']),
+                'strong_ema_adherence': bool(trend_details['strong_ema_adherence'])
+            },
             'entry_signals': entry_signals,
-            'current_price': float(df['Close'].iloc[-1]),  # Also ensure these are float values
+            'current_price': float(df['Close'].iloc[-1]),
             'current_rsi': float(df['RSI'].iloc[-1])
         }
         
