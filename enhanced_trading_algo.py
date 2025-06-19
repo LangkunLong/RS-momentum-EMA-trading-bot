@@ -23,24 +23,40 @@ def calculate_rs_momentum(symbol, benchmark_symbol='SPY', period_days=63):
         benchmark_data = yf.download(benchmark_symbol, start=start_date, end=end_date, progress=False)
         
         if len(stock_data) < period_days or len(benchmark_data) < period_days:
-            return 0
+            return 0.0
         
-        # Calculate performance over period
+        # Calculate performance over period - ENSURE SCALAR VALUES
         stock_start = stock_data['Close'].iloc[-period_days]
+        if isinstance(stock_start, pd.Series):
+            stock_start = stock_start.iloc[0]
+        stock_start = float(stock_start)
+        
         stock_current = stock_data['Close'].iloc[-1]
+        if isinstance(stock_current, pd.Series):
+            stock_current = stock_current.iloc[0]
+        stock_current = float(stock_current)
+        
         stock_performance = (stock_current / stock_start - 1) * 100
         
         benchmark_start = benchmark_data['Close'].iloc[-period_days]
+        if isinstance(benchmark_start, pd.Series):
+            benchmark_start = benchmark_start.iloc[0]
+        benchmark_start = float(benchmark_start)
+        
         benchmark_current = benchmark_data['Close'].iloc[-1]
+        if isinstance(benchmark_current, pd.Series):
+            benchmark_current = benchmark_current.iloc[0]
+        benchmark_current = float(benchmark_current)
+        
         benchmark_performance = (benchmark_current / benchmark_start - 1) * 100
         
-        # RS Score (relative strength)
-        rs_score = stock_performance - benchmark_performance
+        # RS Score (relative strength) - ensure Python float
+        rs_score = float(stock_performance - benchmark_performance)
         return rs_score
         
     except Exception as e:
         print(f"Error calculating RS for {symbol}: {e}")
-        return 0
+        return 0.0
 
 def calculate_indicators(df):
     """Calculate technical indicators"""
@@ -202,8 +218,13 @@ def identify_pullback_entries(df, lookback_days=10):
             entry_signals.append('8EMA_Reclaim')
 
         if entry_signals:
+            # Convert the date to string format to avoid serialization issues
+            date_val = current_row.name
+            if isinstance(date_val, pd.Timestamp):
+                date_val = date_val.strftime('%Y-%m-%d')
+            
             signals.append({
-                'date': current_row.name,
+                'date': date_val,  # Store as string instead of Timestamp object
                 'close': float(current_row['Close']),
                 'signals': entry_signals,
                 'rsi': float(current_row['RSI']),
@@ -235,36 +256,53 @@ def find_high_momentum_entries(symbol, start_date, end_date, min_rs_score=10):
         # Calculate indicators
         df = calculate_indicators(df)
         
-        # Analyze trend strength
+        # Analyze trend strength - no debug prints!
         is_strong_trend, trend_score, trend_details = analyze_trend_strength(df)
+        
+        # Immediately convert all trend_details values to Python primitives
+        safe_trend_details = {
+            'ema_8_adherence': float(trend_details.get('ema_8_adherence', 0)),
+            'ema_21_adherence': float(trend_details.get('ema_21_adherence', 0)),
+            'higher_highs': bool(trend_details.get('higher_highs', False)),
+            'higher_lows': bool(trend_details.get('higher_lows', False)),
+            'strong_ema_adherence': bool(trend_details.get('strong_ema_adherence', False))
+        }
         
         if not bool(is_strong_trend):
             return None
         
         # Identify pullback entries in the specified date range
-        start_date_dt = pd.to_datetime(start_date)  # Convert string to datetime
-        analysis_df = df[df.index >= start_date_dt]  # Use datetime comparison
+        start_date_dt = pd.to_datetime(start_date)
+        analysis_df = df[df.index >= start_date_dt]
         entry_signals = identify_pullback_entries(analysis_df)
         
-        # Check length of list instead of truthiness
         if len(entry_signals) == 0:
             return None
         
-        return {
-            'symbol': symbol,
-            'rs_score': float(rs_score),
-            'trend_score': float(trend_score),
-            'trend_details': {
-                'ema_8_adherence': float(trend_details['ema_8_adherence']),
-                'ema_21_adherence': float(trend_details['ema_21_adherence']),
-                'higher_highs': bool(trend_details['higher_highs']),
-                'higher_lows': bool(trend_details['higher_lows']),
-                'strong_ema_adherence': bool(trend_details['strong_ema_adherence'])
-            },
-            'entry_signals': entry_signals,
-            'current_price': float(df['Close'].iloc[-1]),
-            'current_rsi': float(df['RSI'].iloc[-1])
-        }
+        # Handle DataFrame access safely
+        try:
+            current_price = df['Close'].iloc[-1]
+            if isinstance(current_price, pd.Series):
+                current_price = current_price.iloc[0]
+            current_price = float(current_price)
+            
+            current_rsi = df['RSI'].iloc[-1]
+            if isinstance(current_rsi, pd.Series):
+                current_rsi = current_rsi.iloc[0]
+            current_rsi = float(current_rsi)
+            
+            return {
+                'symbol': symbol,
+                'rs_score': float(rs_score),
+                'trend_score': float(trend_score),
+                'trend_details': safe_trend_details,  # Use the safe version!
+                'entry_signals': entry_signals,
+                'current_price': current_price,
+                'current_rsi': current_rsi
+            }
+        except Exception as e:
+            print(f"ERROR converting values for {symbol}: {e}")
+            return None
         
     except Exception as e:
         print(f"Error analyzing {symbol}: {e}")
@@ -315,7 +353,9 @@ def print_analysis_results(results):
         
         print(f"   Entry Signals ({len(result['entry_signals'])}):")
         for signal in result['entry_signals'][-3:]:  # Show last 3 signals
-            print(f"     {signal['date'].strftime('%Y-%m-%d')}: {', '.join(signal['signals'])}")
+            # Handle date whether it's a string or Timestamp
+            date_str = signal['date'] if isinstance(signal['date'], str) else signal['date'].strftime('%Y-%m-%d')
+            print(f"     {date_str}: {', '.join(signal['signals'])}")
             print(f"       Price: ${signal['close']:.2f}, RSI: {signal['rsi']:.1f}")
 
 # Example usage
