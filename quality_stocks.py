@@ -358,7 +358,7 @@ def get_custom_watchlist():
 
     custom_list = [
         'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA',
-        'TSLA', 'META', 'NFLX', 'CRM',
+        'TSLA', 'META',
     ]
     return custom_list
 
