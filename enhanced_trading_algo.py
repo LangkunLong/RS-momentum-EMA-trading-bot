@@ -95,8 +95,9 @@ def analyze_trend_strength(df, min_days=60):
         })
     
     # Check for progression in highs and lows
-    higher_highs = all(segments[i]['high'] <= segments[i+1]['high'] for i in range(2))
-    higher_lows = all(segments[i]['low'] <= segments[i+1]['low'] for i in range(2))
+    # Check for progression in highs and lows
+    higher_highs = all(float(segments[i]['high']) <= float(segments[i+1]['high']) for i in range(2))
+    higher_lows = all(float(segments[i]['low']) <= float(segments[i+1]['low']) for i in range(2))
     
     trend_strength = {
         'ema_8_adherence': ema_8_adherence,
@@ -143,9 +144,9 @@ def identify_pullback_entries(df, lookback_days=10):
             entry_signals.append('21EMA_Retest')
         
         # Signal 3: Broke 8EMA but held 21EMA and reclaimed 8EMA
-        broke_8ema_recently = any(not above for above in previous_rows['Above_8EMA'].tail(5))
-        held_21ema = current_row['Above_21EMA'] and previous_rows['Above_21EMA'].tail(5).all()
-        reclaimed_8ema = current_row['Above_8EMA']
+        broke_8ema_recently = any(not bool(above) for above in previous_rows['Above_8EMA'].tail(5))
+        held_21ema = bool(current_row['Above_21EMA']) and bool(previous_rows['Above_21EMA'].tail(5).all())
+        reclaimed_8ema = bool(current_row['Above_8EMA'])
         
         if broke_8ema_recently and held_21ema and reclaimed_8ema:
             entry_signals.append('8EMA_Reclaim')
