@@ -28,12 +28,18 @@ def requests_with_retries():
     return session
 
 # preprocess ticker symbol, see if avaiable on yahoo finance
-def is_valid_ticker(symbol):
-    try:
-        df = yf.download(symbol, period="5d", progress=False)
-        return not df.empty and df['Close'].notna().any()
-    except Exception:
-        return False
+def is_valid_ticker(symbol, retries=3):
+    for attempt in range(retries):
+        try:
+            df = yf.download(symbol, period="5d", progress=False, auto_adjust=True)
+            if not df.empty and 'Close' in df.columns:
+                close_series = df['Close'].dropna()
+                if len(close_series) > 0:
+                    return True
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"Failed to get ticker '{symbol}' after {retries} attempts: {e}")
+    return False
 
 @lru_cache(maxsize=1)
 def fetch_large_cap_stocks(min_market_cap=10e9):
