@@ -70,9 +70,11 @@ def calculate_indicators(df):
     # Calculate RSI
     df['RSI'] = RSIIndicator(df['Close'], window=14).rsi()
     
-    # Calculate price vs EMA relationships
-    df['Above_8EMA'] = df['Close'] > df['8_EMA']
-    df['Above_21EMA'] = df['Close'] > df['21_EMA']
+    # Calculate price vs EMA relationships - ENSURE BOOLEAN CONVERSION
+    df['Above_8EMA'] = (df['Close'] > df['8_EMA']).astype(bool)
+    df['Above_21EMA'] = (df['Close'] > df['21_EMA']).astype(bool)
+    
+    # Calculate distances as float
     df['Distance_8EMA'] = ((df['Close'] - df['8_EMA']) / df['8_EMA']) * 100
     df['Distance_21EMA'] = ((df['Close'] - df['21_EMA']) / df['21_EMA']) * 100
     
@@ -208,10 +210,19 @@ def identify_pullback_entries(df, lookback_days=10):
 
         # Signal 3: Broke 8EMA but held 21EMA and reclaimed 8EMA
         above_8ema_tail = previous_rows['Above_8EMA'].tail(5)
-        broke_8ema_recently = any([not bool(x) for x in above_8ema_tail.tolist()]) if not above_8ema_tail.empty else False
+        # Ensure 1D data: convert to list of bool values
+        broke_8ema_recently = False
+        if not above_8ema_tail.empty:
+            bool_values = [bool(x) for x in above_8ema_tail.values.flatten()]
+            broke_8ema_recently = any(not x for x in bool_values)
 
         above_21ema_tail = previous_rows['Above_21EMA'].tail(5)
-        held_21ema = above_21ema and (not above_21ema_tail.empty and all(bool(x) for x in above_21ema_tail.tolist()))
+        # Ensure 1D data
+        held_21ema = bool(above_21ema) and not above_21ema_tail.empty
+        if held_21ema:
+            bool_values = [bool(x) for x in above_21ema_tail.values.flatten()]
+            held_21ema = held_21ema and all(bool_values)
+
         reclaimed_8ema = above_8ema
 
         if broke_8ema_recently and held_21ema and reclaimed_8ema:
