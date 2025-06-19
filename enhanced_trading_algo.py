@@ -88,16 +88,47 @@ def analyze_trend_strength(df, min_days=60):
         start_idx = i * segment_size
         end_idx = (i + 1) * segment_size if i < 3 else len(recent_data)
         segment = recent_data.iloc[start_idx:end_idx]
-        segments.append({
-            'high': segment['High'].max(),
-            'low': segment['Low'].min(),
-            'close_avg': segment['Close'].mean()
-        })
-    
+
+        if segment.empty:
+            high = low = close_avg = float('nan')
+        else:
+            high = segment['High'].max()
+            low = segment['Low'].min()
+            close_avg = segment['Close'].mean()
+
+            # Force scalar extraction and print debug info
+            for name, val in [('high', high), ('low', low), ('close_avg', close_avg)]:
+                if isinstance(val, pd.Series):
+                    print(f"DEBUG: {name} is Series: {val}")
+                    val = val.iloc[0]
+                if isinstance(val, np.ndarray):
+                    print(f"DEBUG: {name} is ndarray: {val}")
+                    val = val.item() if val.size == 1 else float('nan')
+                try:
+                    val = float(val)
+                except Exception as e:
+                    print(f"DEBUG: Could not convert {name} to float: {val} ({e})")
+                    val = float('nan')
+                if name == 'high':
+                    high = val
+                elif name == 'low':
+                    low = val
+                else:
+                    close_avg = val
+
+    segments.append({
+        'high': high,
+        'low': low,
+        'close_avg': close_avg
+    })
+
     # Check for progression in highs and lows
-    # Check for progression in highs and lows
-    higher_highs = all(float(segments[i]['high']) <= float(segments[i+1]['high']) for i in range(2))
-    higher_lows = all(float(segments[i]['low']) <= float(segments[i+1]['low']) for i in range(2))
+    # Print debug to ensure all are floats
+    for idx, seg in enumerate(segments):
+        print(f"DEBUG: Segment {idx} high={seg['high']} ({type(seg['high'])}), low={seg['low']} ({type(seg['low'])})")
+
+    higher_highs = all(segments[i]['high'] <= segments[i+1]['high'] for i in range(2))
+    higher_lows = all(segments[i]['low'] <= segments[i+1]['low'] for i in range(2))
     
     trend_strength = {
         'ema_8_adherence': ema_8_adherence,
@@ -112,57 +143,58 @@ def analyze_trend_strength(df, min_days=60):
     
     return is_strong_trend, trend_score, trend_strength
 
+
+"""
+Identify entry signals based on pullback patterns:
+1. Pullback to retest 8EMA or 21EMA
+2. Broke 8EMA but held 21EMA and reclaimed 8EMA
+"""
 def identify_pullback_entries(df, lookback_days=10):
-    """
-    Identify entry signals based on pullback patterns:
-    1. Pullback to retest 8EMA or 21EMA
-    2. Broke 8EMA but held 21EMA and reclaimed 8EMA
-    """
     if len(df) < lookback_days + 5:
         return []
-    
+
     signals = []
     recent_data = df.tail(lookback_days + 5)
-    
+
     for i in range(lookback_days, len(recent_data)):
         current_row = recent_data.iloc[i]
         previous_rows = recent_data.iloc[i-lookback_days:i]
-    
+
         entry_signals = []
-    
+
         # Signal 1: Pullback to 8EMA retest
         dist_8ema = float(current_row['Distance_8EMA'])
         above_8ema = bool(current_row['Above_8EMA'])
-        prev_above_8ema_mean = float(previous_rows['Above_8EMA'].mean())
+        prev_above_8ema_mean = float(previous_rows['Above_8EMA'].mean()) if not previous_rows['Above_8EMA'].empty else 0.0
         if (
             abs(dist_8ema) < 2.0 and
             above_8ema and
             prev_above_8ema_mean > 0.7
         ):
             entry_signals.append('8EMA_Retest')
-    
+
         # Signal 2: Pullback to 21EMA retest
         dist_21ema = float(current_row['Distance_21EMA'])
         above_21ema = bool(current_row['Above_21EMA'])
-        prev_above_21ema_mean = float(previous_rows['Above_21EMA'].mean())
+        prev_above_21ema_mean = float(previous_rows['Above_21EMA'].mean()) if not previous_rows['Above_21EMA'].empty else 0.0
         if (
             abs(dist_21ema) < 3.0 and
             above_21ema and
             prev_above_21ema_mean > 0.8
         ):
             entry_signals.append('21EMA_Retest')
-    
+
         # Signal 3: Broke 8EMA but held 21EMA and reclaimed 8EMA
         above_8ema_tail = previous_rows['Above_8EMA'].tail(5)
         broke_8ema_recently = any([not bool(x) for x in above_8ema_tail.tolist()]) if not above_8ema_tail.empty else False
-    
+
         above_21ema_tail = previous_rows['Above_21EMA'].tail(5)
         held_21ema = above_21ema and (not above_21ema_tail.empty and all(bool(x) for x in above_21ema_tail.tolist()))
         reclaimed_8ema = above_8ema
-    
+
         if broke_8ema_recently and held_21ema and reclaimed_8ema:
             entry_signals.append('8EMA_Reclaim')
-    
+
         if entry_signals:
             signals.append({
                 'date': current_row.name,
@@ -172,7 +204,7 @@ def identify_pullback_entries(df, lookback_days=10):
                 'distance_8ema': dist_8ema,
                 'distance_21ema': dist_21ema
             })
-    
+
     return signals
 
 def find_high_momentum_entries(symbol, start_date, end_date, min_rs_score=10):
