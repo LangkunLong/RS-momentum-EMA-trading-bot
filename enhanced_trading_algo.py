@@ -127,38 +127,50 @@ def identify_pullback_entries(df, lookback_days=10):
     for i in range(lookback_days, len(recent_data)):
         current_row = recent_data.iloc[i]
         previous_rows = recent_data.iloc[i-lookback_days:i]
-        
-        # Entry conditions
+    
         entry_signals = []
-        
+    
         # Signal 1: Pullback to 8EMA retest
-        if (abs(current_row['Distance_8EMA']) < 2.0 and  # Within 2% of 8EMA
-            current_row['Above_8EMA'] and
-            previous_rows['Above_8EMA'].mean() > 0.7):  # Was mostly above 8EMA recently
+        dist_8ema = float(current_row['Distance_8EMA'])
+        above_8ema = bool(current_row['Above_8EMA'])
+        prev_above_8ema_mean = float(previous_rows['Above_8EMA'].mean())
+        if (
+            abs(dist_8ema) < 2.0 and
+            above_8ema and
+            prev_above_8ema_mean > 0.7
+        ):
             entry_signals.append('8EMA_Retest')
-        
+    
         # Signal 2: Pullback to 21EMA retest
-        if (abs(current_row['Distance_21EMA']) < 3.0 and  # Within 3% of 21EMA
-            current_row['Above_21EMA'] and
-            previous_rows['Above_21EMA'].mean() > 0.8):  # Was mostly above 21EMA recently
+        dist_21ema = float(current_row['Distance_21EMA'])
+        above_21ema = bool(current_row['Above_21EMA'])
+        prev_above_21ema_mean = float(previous_rows['Above_21EMA'].mean())
+        if (
+            abs(dist_21ema) < 3.0 and
+            above_21ema and
+            prev_above_21ema_mean > 0.8
+        ):
             entry_signals.append('21EMA_Retest')
-        
+    
         # Signal 3: Broke 8EMA but held 21EMA and reclaimed 8EMA
-        broke_8ema_recently = any(not bool(above) for above in previous_rows['Above_8EMA'].tail(5))
-        held_21ema = bool(current_row['Above_21EMA']) and bool(previous_rows['Above_21EMA'].tail(5).all())
-        reclaimed_8ema = bool(current_row['Above_8EMA'])
-        
+        above_8ema_tail = previous_rows['Above_8EMA'].tail(5)
+        broke_8ema_recently = any([not bool(x) for x in above_8ema_tail.tolist()]) if not above_8ema_tail.empty else False
+    
+        above_21ema_tail = previous_rows['Above_21EMA'].tail(5)
+        held_21ema = above_21ema and (not above_21ema_tail.empty and all(bool(x) for x in above_21ema_tail.tolist()))
+        reclaimed_8ema = above_8ema
+    
         if broke_8ema_recently and held_21ema and reclaimed_8ema:
             entry_signals.append('8EMA_Reclaim')
-        
+    
         if entry_signals:
             signals.append({
                 'date': current_row.name,
-                'close': current_row['Close'],
+                'close': float(current_row['Close']),
                 'signals': entry_signals,
-                'rsi': current_row['RSI'],
-                'distance_8ema': current_row['Distance_8EMA'],
-                'distance_21ema': current_row['Distance_21EMA']
+                'rsi': float(current_row['RSI']),
+                'distance_8ema': dist_8ema,
+                'distance_21ema': dist_21ema
             })
     
     return signals
