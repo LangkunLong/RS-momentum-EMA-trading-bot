@@ -355,18 +355,10 @@ def get_available_sectors():
     return list(STOCK_LISTS.keys())
 
 def get_custom_watchlist():
-    """
-    Define your custom watchlist here.
-    Edit this function to create your own curated list.
-    
-    Returns:
-        list: Custom list of stock symbols
-    """
+
     custom_list = [
-        # Add your favorite stocks here
         'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA',
-        'TSLA', 'META', 'NFLX', 'ADBE', 'CRM',
-        # Add more as needed...
+        'TSLA', 'META', 'NFLX', 'CRM',
     ]
     return custom_list
 
