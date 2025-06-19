@@ -69,21 +69,32 @@ def analyze_trend_strength(df, min_days=60):
     """
     if len(df) < min_days:
         return False, 0, {}
-    
+
     recent_data = df.tail(min_days).copy()
-    
+
     # Check EMA adherence
     ema_8_adherence = (recent_data['Above_8EMA'].sum() / len(recent_data)) * 100
     ema_21_adherence = (recent_data['Above_21EMA'].sum() / len(recent_data)) * 100
-    
+
     # Strong trend requires holding either 8EMA (>70%) or 21EMA (>80%)
     strong_ema_adherence = ema_8_adherence > 70 or ema_21_adherence > 80
-    
+
     # Check for higher highs and higher lows pattern
-    # Divide period into segments and check progression
     segment_size = min_days // 4
     segments = []
-    
+
+    # Define to_float OUTSIDE the loop
+    def to_float(val, name):
+        try:
+            # If it's a Series or array, flatten and take first element
+            if isinstance(val, pd.Series):
+                return float(val.iloc[0])
+            elif isinstance(val, np.ndarray):
+                return float(val.item(0))
+            return float(val)
+        except Exception as e:
+            return float('nan')
+
     for i in range(4):
         start_idx = i * segment_size
         end_idx = (i + 1) * segment_size if i < 3 else len(recent_data)
@@ -96,40 +107,25 @@ def analyze_trend_strength(df, min_days=60):
             low = segment['Low'].min()
             close_avg = segment['Close'].mean()
 
-            # Force scalar extraction and print debug info
-            for name, val in [('high', high), ('low', low), ('close_avg', close_avg)]:
-                if isinstance(val, pd.Series):
-                    print(f"DEBUG: {name} is Series: {val}")
-                    val = val.iloc[0]
-                if isinstance(val, np.ndarray):
-                    print(f"DEBUG: {name} is ndarray: {val}")
-                    val = val.item() if val.size == 1 else float('nan')
-                try:
-                    val = float(val)
-                except Exception as e:
-                    print(f"DEBUG: Could not convert {name} to float: {val} ({e})")
-                    val = float('nan')
-                if name == 'high':
-                    high = val
-                elif name == 'low':
-                    low = val
-                else:
-                    close_avg = val
+            # Force scalar conversion
+            high = to_float(high, 'high')
+            low = to_float(low, 'low')
+            close_avg = to_float(close_avg, 'close_avg')
 
-    segments.append({
-        'high': high,
-        'low': low,
-        'close_avg': close_avg
-    })
+        segments.append({
+            'high': high,
+            'low': low,
+            'close_avg': close_avg
+        })
 
-    # Check for progression in highs and lows
-    # Print debug to ensure all are floats
-    for idx, seg in enumerate(segments):
-        print(f"DEBUG: Segment {idx} high={seg['high']} ({type(seg['high'])}), low={seg['low']} ({type(seg['low'])})")
+    # Ensure we're comparing Python floats
+    try:
+        higher_highs = all(segments[i]['high'] <= segments[i+1]['high'] for i in range(2))
+        higher_lows = all(segments[i]['low'] <= segments[i+1]['low'] for i in range(2))
+    except Exception:
+        # Fallback if we get comparison errors
+        higher_highs = higher_lows = False
 
-    higher_highs = all(segments[i]['high'] <= segments[i+1]['high'] for i in range(2))
-    higher_lows = all(segments[i]['low'] <= segments[i+1]['low'] for i in range(2))
-    
     trend_strength = {
         'ema_8_adherence': ema_8_adherence,
         'ema_21_adherence': ema_21_adherence,
@@ -137,10 +133,10 @@ def analyze_trend_strength(df, min_days=60):
         'higher_lows': higher_lows,
         'strong_ema_adherence': strong_ema_adherence
     }
-    
+
     is_strong_trend = strong_ema_adherence and (higher_highs or higher_lows)
     trend_score = (ema_8_adherence + ema_21_adherence) / 2
-    
+
     return is_strong_trend, trend_score, trend_strength
 
 
@@ -239,7 +235,8 @@ def find_high_momentum_entries(symbol, start_date, end_date, min_rs_score=10):
         analysis_df = df[df.index >= start_date]
         entry_signals = identify_pullback_entries(analysis_df)
         
-        if not entry_signals:
+        # FIX: This line was causing the error - check length of list instead
+        if len(entry_signals) == 0:  # Changed from if not entry_signals:
             return None
         
         return {
@@ -248,8 +245,8 @@ def find_high_momentum_entries(symbol, start_date, end_date, min_rs_score=10):
             'trend_score': trend_score,
             'trend_details': trend_details,
             'entry_signals': entry_signals,
-            'current_price': df['Close'].iloc[-1],
-            'current_rsi': df['RSI'].iloc[-1]
+            'current_price': float(df['Close'].iloc[-1]),  # Also ensure these are float values
+            'current_rsi': float(df['RSI'].iloc[-1])
         }
         
     except Exception as e:
