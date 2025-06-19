@@ -243,7 +243,6 @@ MATERIALS = [
 CRYPTO_FINTECH = [
     'COIN',   # Coinbase Global Inc
     'MSTR',   # MicroStrategy Incorporated
-    'SQ',     # Block Inc (formerly Square)
     'HOOD',   # Robinhood Markets Inc
     'AFRM',   # Affirm Holdings Inc
     'SOFI',   # SoFi Technologies Inc
