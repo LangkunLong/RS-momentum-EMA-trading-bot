@@ -270,12 +270,12 @@ if __name__ == "__main__":
     # CUSTOM_LIST = None
     
     # Option 2: Focus on specific sectors
-    # SECTORS = ['growth_high_beta', 'crypto_fintech']
-    # CUSTOM_LIST = None
+    SECTORS = ['growth_high_beta', 'crypto_fintech']
+    CUSTOM_LIST = None
     
     # Option 3: Use your custom watchlist
-    SECTORS = None
-    CUSTOM_LIST = get_custom_watchlist()
+    # SECTORS = None
+    # CUSTOM_LIST = get_custom_watchlist()
     
     # Option 4: Tech stocks only
     # SECTORS = ['mega_cap_tech', 'large_cap_tech']
