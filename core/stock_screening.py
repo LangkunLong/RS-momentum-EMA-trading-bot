@@ -1,25 +1,3 @@
-from datetime import datetime
-
-def screen_stocks_advanced(symbols, start_date, end_date=None, min_rs_score=10):
-    """
-    Screen multiple stocks for high momentum pullback opportunities
-    """
-    if end_date is None:
-        end_date = datetime.now().strftime('%Y-%m-%d')
-    
-    results = []
-    
-    for symbol in symbols:
-        print(f"Analyzing {symbol}...")
-        result = find_high_momentum_entries(symbol, start_date, end_date, min_rs_score)
-        if result:
-            results.append(result)
-    
-    # Sort by RS score descending
-    results.sort(key=lambda x: x['rs_score'], reverse=True)
-    
-    return results
-
 def print_analysis_results(results):
     """Print formatted analysis results"""
     if not results:
