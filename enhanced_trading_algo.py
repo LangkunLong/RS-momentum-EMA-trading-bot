@@ -9,6 +9,7 @@ from core.indicators import calculate_indicators
 from core.pullback_entries import identify_pullback_entries
 from core.stock_screening import screen_stocks_advanced, print_analysis_results
 from core.momentum_analysis import calculate_rs_momentum
+from config.settings import START_DATE, MIN_RS_SCORE, CUSTOM_LIST
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -109,9 +110,7 @@ def find_high_momentum_entries(symbol, start_date, end_date, min_rs_score=10):
         return None
 
 if __name__ == "__main__":
-    # Test with some large cap stocks
-    test_symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'NFLX']
-    
     print("Screening for high momentum pullback opportunities...")
-    results = screen_stocks_advanced(test_symbols, min_rs_score=5)
+    print(f"Using custom stock list: {CUSTOM_LIST}")
+    results = screen_stocks_advanced(CUSTOM_LIST, min_rs_score=MIN_RS_SCORE, start_date=START_DATE)
     print_analysis_results(results)
