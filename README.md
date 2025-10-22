@@ -23,13 +23,7 @@ A Python-based stock screening tool that identifies high-quality stocks with str
 - Filters for stocks with market cap >$10B (configurable)
 - Curated list of 100+ high-quality large-cap stocks
 - Optional Finnhub API integration for broader market scanning
-
-### ⚡ **High-Performance Scanning**
-- Concurrent processing with thread pool execution
-- Built-in rate limiting and retry mechanisms
-- Progress tracking and comprehensive error handling
-- CSV export functionality for further analysis
-
+  
 ## Installation
 
 ### Prerequisites
