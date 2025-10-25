@@ -131,3 +131,111 @@ def evaluate_market_direction(benchmark_symbol: str = "SPY") -> MarketTrend:
         },
     )
 
+# Compute a CAN SLIM style score for ``symbol``. The function returns ``None`` if we fail to obtain enough data.
+def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) -> Optional[Dict[str, object]]:
+
+    ticker = yf.Ticker(symbol)
+
+    try:
+        quarterly = ticker.quarterly_earnings
+        annual = ticker.earnings
+        info = ticker.fast_info if hasattr(ticker, "fast_info") else {}
+    except Exception:
+        quarterly = annual = None
+        info = {}
+
+    market_trend = market_trend or evaluate_market_direction()
+
+    price_history = pd.DataFrame()
+    try:
+        price_history = ticker.history(period="1y", interval="1d")
+    except Exception:
+        price_history = pd.DataFrame()
+
+    if price_history.empty or len(price_history) < 30:
+        return None
+
+    closes = price_history["Close"].astype(float)
+    latest_close = float(closes.iloc[-1])
+    high_52 = float(closes.max())
+    proximity_to_high = latest_close / high_52 if high_52 else 0.0
+
+    avg_volume_50 = float(price_history["Volume"].tail(50).mean()) if not price_history["Volume"].tail(50).empty else 0.0
+    shares_outstanding = None
+
+    try:
+        shares_outstanding = float(getattr(ticker, "shares_outstanding", None) or info.get("sharesOutstanding"))
+    except Exception:
+        shares_outstanding = None
+
+    turnover_ratio = None
+    if shares_outstanding and shares_outstanding > 0 and avg_volume_50:
+        turnover_ratio = (avg_volume_50 * 252) / shares_outstanding
+
+    # Current and annual earnings growth
+    current_growth = None
+    revenue_growth = None
+
+    if isinstance(quarterly, pd.DataFrame) and not quarterly.empty and "Earnings" in quarterly:
+        quarterly = quarterly.sort_index()
+        if len(quarterly) >= 2:
+            current_growth = _safe_growth(quarterly["Earnings"].iloc[-1], quarterly["Earnings"].iloc[-2])
+        if len(quarterly) >= 4 and "Revenue" in quarterly:
+            revenue_growth = _safe_growth(quarterly["Revenue"].iloc[-1], quarterly["Revenue"].iloc[-4])
+
+    annual_growth = None
+    if isinstance(annual, pd.DataFrame) and not annual.empty and "Earnings" in annual:
+        annual = annual.sort_index()
+        if len(annual) >= 2:
+            annual_growth = _safe_growth(annual["Earnings"].iloc[-1], annual["Earnings"].iloc[-2])
+
+    rs_score = calculate_rs_momentum(symbol)
+
+    # Institutional sponsorship proxy
+    institutional_score = 0.0
+    institutional_percent = None
+
+    try:
+        holders_info = ticker.get_info() if hasattr(ticker, "get_info") else {}
+        institutional_percent = holders_info.get("heldPercentInstitutions")
+    except Exception:
+        institutional_percent = None
+
+    if institutional_percent is not None:
+        institutional_score = _score_from_ratio(float(institutional_percent), 1.0)
+    elif turnover_ratio is not None:
+        institutional_score = _score_from_ratio(turnover_ratio, 1.5)
+
+    scores = {
+        "C": _score_from_growth(current_growth, 0.25),
+        "A": _score_from_growth(annual_growth, 0.25),
+        "N": float(
+            0.7 * _score_from_growth(revenue_growth, 0.2)
+            + 0.3 * _score_from_ratio(proximity_to_high, 1.05)
+        ),
+        "S": _score_from_ratio(turnover_ratio, 1.5),
+        "L": float(np.clip((rs_score + 20) / 40, 0, 1)),
+        "I": institutional_score,
+        "M": market_trend.score,
+    }
+
+    total_score = float(sum(scores.values()) / len(scores) * 100)
+
+    metrics = {
+        "current_growth": current_growth,
+        "annual_growth": annual_growth,
+        "revenue_growth": revenue_growth,
+        "turnover_ratio": turnover_ratio,
+        "proximity_to_high": proximity_to_high,
+        "avg_volume_50": avg_volume_50,
+        "shares_outstanding": shares_outstanding,
+    }
+
+    return {
+        "symbol": symbol,
+        "scores": scores,
+        "metrics": metrics,
+        "total_score": total_score,
+        "rs_score": rs_score,
+        "market_trend": market_trend,
+    }
