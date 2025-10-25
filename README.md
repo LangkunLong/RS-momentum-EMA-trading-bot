@@ -67,9 +67,3 @@ pip install yfinance ta pandas numpy python-dotenv requests urllib3
 - **8EMA_Retest**: Conservative pullback to 8-day moving average
 - **21EMA_Retest**: Deeper pullback to 21-day moving average
 - **8EMA_Reclaim**: Recovery pattern after temporary weakness
-
-This project is open source and available under the MIT License.
-
----
-
-**Happy Trading! 📈**
