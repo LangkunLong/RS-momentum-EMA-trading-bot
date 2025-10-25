@@ -1,5 +1,5 @@
-import pandas as pd
 from __future__ import annotations
+import pandas as pd
 
 def identify_pullback_entries(df, lookback_days=10):
     if len(df) < lookback_days + 5:

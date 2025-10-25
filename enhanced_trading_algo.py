@@ -17,7 +17,7 @@ def main() -> None:
 
     print_analysis_results(results, market_trend)
 
-if __name__ == main:
+if __name__ == "__main__":
     print("Screening for CAN SLIM momentum opportunities...")
     print(f"Universe: {', '.join(CUSTOM_LIST)}")
     main()
