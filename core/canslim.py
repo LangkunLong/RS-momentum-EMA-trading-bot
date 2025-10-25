@@ -202,8 +202,8 @@ def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) ->
                 if not revenue.empty:
                     quarterly["Revenue"] = revenue
 
+    
     market_trend = market_trend or evaluate_market_direction()
-
     price_history = pd.DataFrame()
     try:
         price_history = ticker.history(period="1y", interval="1d")
