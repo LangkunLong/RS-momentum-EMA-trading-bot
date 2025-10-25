@@ -137,15 +137,73 @@ def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) ->
     ticker = yf.Ticker(symbol)
 
     try:
-        quarterly = ticker.quarterly_earnings
-        annual = ticker.earnings
+        quarterly_income_stmt = (
+            ticker.quarterly_income_stmt if hasattr(ticker, "quarterly_income_stmt") else None
+        )
+        income_stmt = ticker.income_stmt if hasattr(ticker, "income_stmt") else None
         info = ticker.fast_info if hasattr(ticker, "fast_info") else {}
     except Exception:
-        quarterly = annual = None
+        quarterly_income_stmt = income_stmt = None
         info = {}
+    
+    # derive annual and quarterly income
+    annual = None
+    if isinstance(income_stmt, pd.DataFrame) and not income_stmt.empty:
+        net_income_label = next(
+            (
+                idx
+                for idx in income_stmt.index
+                if isinstance(idx, str) and idx.strip().lower() == "net income"
+            ),
+            None,
+        )
 
+        if net_income_label is not None:
+            net_income = income_stmt.loc[net_income_label].dropna()
+            if not net_income.empty:
+                net_income = net_income.sort_index()
+                annual = pd.DataFrame({"Earnings": net_income})
+
+    quarterly = None
+    if isinstance(quarterly_income_stmt, pd.DataFrame) and not quarterly_income_stmt.empty:
+        net_income_label = next(
+            (
+                idx
+                for idx in quarterly_income_stmt.index
+                if isinstance(idx, str) and idx.strip().lower() == "net income"
+            ),
+            None,
+        )
+        revenue_label = next(
+            (
+                idx
+                for idx in quarterly_income_stmt.index
+                if isinstance(idx, str) and idx.strip().lower() in {"total revenue", "totalrevenue"}
+            ),
+            None,
+        )
+
+        net_income = (
+            quarterly_income_stmt.loc[net_income_label].dropna()
+            if net_income_label is not None
+            else None
+        )
+        revenue = (
+            quarterly_income_stmt.loc[revenue_label].dropna()
+            if revenue_label is not None
+            else None
+        )
+
+        if net_income is not None and not net_income.empty:
+            net_income = net_income.sort_index()
+            quarterly = pd.DataFrame({"Earnings": net_income})
+            if revenue is not None and not revenue.empty:
+                revenue = revenue.reindex(net_income.index, method=None).dropna()
+                if not revenue.empty:
+                    quarterly["Revenue"] = revenue
+
+    
     market_trend = market_trend or evaluate_market_direction()
-
     price_history = pd.DataFrame()
     try:
         price_history = ticker.history(period="1y", interval="1d")
