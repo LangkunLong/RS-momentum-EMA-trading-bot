@@ -9,7 +9,8 @@ from urllib3.util.retry import Retry
 from datetime import datetime
 import time
 import yfinance as yf
-from enhanced_trading_algo import find_high_momentum_entries, print_analysis_results
+
+from core.stock_screening import find_high_momentum_entries, print_analysis_results
 
 load_dotenv()
 api_key = os.getenv("FINNHUB_API_KEY")
