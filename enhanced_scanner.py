@@ -191,7 +191,9 @@ def scan_for_momentum_opportunities(
                 symbol, 
                 start_date='2025-01-01', 
                 end_date=None, 
-                min_rs_score=min_rs_score
+                min_rs_score=min_rs_score,
+                min_canslim_score=min_canslim_score,
+                market_trend=market_trend
             )
             
             # Add this block to guarantee all values in result are Python primitives
@@ -239,7 +241,7 @@ def scan_for_momentum_opportunities(
     if failed_symbols:
         print(f"Failed symbols: {', '.join(failed_symbols[:10])}{'...' if len(failed_symbols) > 10 else ''}")
     
-    return opportunities
+    return opportunities, market_trend
 
 def export_results_to_csv(opportunities, filename=None):
     """Export results to CSV file"""
@@ -320,7 +322,7 @@ if __name__ == "__main__":
     print(f"- Custom List: {'Yes' if CUSTOM_LIST else 'No'}")
     
     # Run the scan
-    opportunities = scan_for_momentum_opportunities(
+    opportunities, market_trend = scan_for_momentum_opportunities(
         use_api=USE_API,
         min_market_cap=MIN_MARKET_CAP,
         min_rs_score=MIN_RS_SCORE,
@@ -329,10 +331,8 @@ if __name__ == "__main__":
         custom_list=CUSTOM_LIST
     )
     
-    # Display results
-    print_analysis_results(opportunities)
+    print_analysis_results(opportunities, market_trend)
     
-    # Export to CSV
     if opportunities:
         export_results_to_csv(opportunities)
     
