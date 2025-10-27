@@ -261,6 +261,10 @@ GROWTH_HIGH_BETA = [
     'NET',    # Cloudflare Inc
     'FSLY',   # Fastly Inc
     'TWLO',   # Twilio Inc
+    'IREN',   # Iris energy
+    'CRWV',   # Coreweave
+    'NBIS',   # Nebius
+    'OKLO'    # Oklo energy
 ]
 
 # Defensive Dividend Stocks
