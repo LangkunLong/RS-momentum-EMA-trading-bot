@@ -11,6 +11,7 @@ from urllib3.util.retry import Retry
 import time
 import yfinance as yf
 
+from core.yahoo_finance_helper import normalize_price_dataframe
 from core.stock_screening import find_high_momentum_entries, print_analysis_results
 from core.canslim import evaluate_market_direction
 from config.settings import MIN_CANSLIM_SCORE, START_DATE
@@ -36,6 +37,7 @@ def is_valid_ticker(symbol, retries=3):
     for attempt in range(retries):
         try:
             df = yf.download(symbol, period="5d", progress=False, auto_adjust=True)
+            df = normalize_price_dataframe(df)
             if not df.empty and 'Close' in df.columns:
                 close_series = df['Close'].dropna()
                 if len(close_series) > 0:
