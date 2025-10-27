@@ -95,7 +95,8 @@ def fetch_large_cap_stocks(min_market_cap=10e9):
         # Use parallel processing with rate limiting
         large_cap_stocks = []
         with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_stock = {executor.submit(fetch_market_cap, stock): stock for stock in stocks[:500]}  # Limit to first 500 for testing
+            future_to_stock = {
+                executor.submit(fetch_market_cap, stock): stock for stock in stocks[:500]} 
             
             for future in as_completed(future_to_stock):
                 result = future.result()
@@ -192,7 +193,7 @@ def scan_for_momentum_opportunities(
         try:
             result = find_high_momentum_entries(
                 symbol, 
-                start_date='2025-01-01', 
+                start_date= start_date, 
                 end_date=None, 
                 min_rs_score=min_rs_score,
                 min_canslim_score=min_canslim_score,
@@ -274,8 +275,13 @@ def export_results_to_csv(opportunities, filename=None):
         # Add latest entry signal details
         if opp['entry_signals']:
             latest_signal = opp['entry_signals'][-1]
+            latest_date = latest_signal['date']
+            if isinstance(latest_date, (datetime, pd.Timestamp)):
+                latest_date_str = latest_date.strftime('%Y-%m-%d')
+            else:
+                latest_date_str = str(latest_date)
             base_row.update({
-                'Latest_Signal_Date': latest_signal['date'].strftime('%Y-%m-%d'),
+                'Latest_Signal_Date': latest_date_str,
                 'Latest_Signal_Types': ', '.join(latest_signal['signals']),
                 'Latest_Signal_Price': latest_signal['close'],
                 'Latest_Signal_RSI': latest_signal['rsi']
