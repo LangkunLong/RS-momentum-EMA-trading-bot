@@ -9,6 +9,7 @@ import pandas as pd
 import yfinance as yf
 
 from core.canslim import MarketTrend, evaluate_canslim, evaluate_market_direction
+from core.yahoo_finance_helper import extract_float_series, normalize_price_dataframe
 from core.indicators import calculate_indicators
 from core.pullback_entries import identify_pullback_entries
 from core.trend_analysis import analyze_trend_strength
@@ -17,12 +18,14 @@ from core.trend_analysis import analyze_trend_strength
 def _fetch_price_history(symbol: str, start_date: datetime, end_date: Optional[str]) -> pd.DataFrame:
 
     extended_start = start_date - timedelta(days=120)
-    return yf.download(
+    data = yf.download(
         symbol,
         start=extended_start,
         end=end_date,
         progress=False,
+        auto_adjust=False,
     )
+    return normalize_price_dataframe(data)
 
 # helper function to identify actionable pullback entries for each tiker
 # returns None if a stock fails any of the CAN SLIM criteria, does not maintain a strong trend, or lacks recent pullback signals.
@@ -65,8 +68,14 @@ def find_high_momentum_entries(
     if not entry_signals:
         return None
 
-    current_price = float(price_history["Close"].iloc[-1])
-    current_rsi = float(price_history["RSI"].iloc[-1]) if "RSI" in price_history else float("nan")
+    close_series = extract_float_series(price_history, "Close")
+    current_price = float(close_series.iloc[-1])
+
+    current_rsi = (
+        float(extract_float_series(price_history, "RSI").iloc[-1])
+        if "RSI" in price_history
+        else float("nan")
+    )
 
     safe_trend_details = {
         "ema_8_adherence": float(trend_details.get("ema_8_adherence", 0.0)),
