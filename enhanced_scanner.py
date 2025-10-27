@@ -127,6 +127,7 @@ def scan_for_momentum_opportunities(
     use_api=False, 
     min_market_cap=10e9, 
     min_rs_score=10, 
+    min_canslim_score: Optional[float] = None,
     max_workers=3, 
     sectors=None, 
     custom_list=None,
