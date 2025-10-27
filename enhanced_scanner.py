@@ -342,7 +342,7 @@ if __name__ == "__main__":
     
     print_analysis_results(opportunities, market_trend)
     
-    if opportunities:
-        export_results_to_csv(opportunities)
+    # if opportunities:
+    #     export_results_to_csv(opportunities)
     
     print("\nScan completed!")
