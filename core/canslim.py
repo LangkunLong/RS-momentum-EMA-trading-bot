@@ -268,11 +268,13 @@ def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) ->
     institutional_score = 0.0
     institutional_percent = None
 
-    try:
-        holders_info = ticker.get_info() if hasattr(ticker, "get_info") else {}
-        institutional_percent = holders_info.get("heldPercentInstitutions")
-    except Exception:
-        institutional_percent = None
+    fast_info = info if isinstance(info, dict) else getattr(info, "__dict__", {})
+    if hasattr(fast_info, "get"):
+        for key in ("heldPercentInstitutions", "institutionPercent", "institutionPercentShares"):
+            value = fast_info.get(key)
+            if value is not None:
+                institutional_percent = value
+                break
 
     if institutional_percent is not None:
         institutional_score = _score_from_ratio(float(institutional_percent), 1.0)
