@@ -42,9 +42,8 @@ def normalize_price_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
+# convert to 1D series
 def ensure_series(data: pd.Series | pd.DataFrame) -> pd.Series:
-    """Coerce a Series/DataFrame column into a one-dimensional Series."""
 
     if isinstance(data, pd.DataFrame):
         if data.shape[1] == 0:
@@ -56,9 +55,8 @@ def ensure_series(data: pd.Series | pd.DataFrame) -> pd.Series:
 
     return data
 
-
+# convert numpy to float
 def coerce_scalar(value: Any) -> float:
-    """Convert pandas/NumPy scalar-like objects into a Python float."""
 
     if isinstance(value, pd.DataFrame):
         if value.shape[1] == 0:
@@ -78,8 +76,8 @@ def coerce_scalar(value: Any) -> float:
     return float(value)
 
 
+# extract as float
 def extract_float_series(df: pd.DataFrame, column: str) -> pd.Series:
-    """Return the specified column as a float Series with flattened shape."""
 
     if column not in df:
         raise KeyError(f"Column '{column}' not found in dataframe")
