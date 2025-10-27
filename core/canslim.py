@@ -276,18 +276,6 @@ def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) ->
                 institutional_percent = value
                 break
 
-    if institutional_percent is None and hasattr(ticker, "get_institutional_holders"):
-        try:
-            holders = ticker.get_institutional_holders()
-            if holders is not None and not holders.empty:
-                pct = holders.get("pctHeld")
-                if pct is not None:
-                    pct = pd.to_numeric(pct, errors="coerce").dropna()
-                    if not pct.empty:
-                        institutional_percent = float(pct.iloc[0]) / 100.0
-        except Exception:
-            pass
-
     if institutional_percent is not None:
         institutional_score = _score_from_ratio(float(institutional_percent), 1.0)
     elif turnover_ratio is not None:
