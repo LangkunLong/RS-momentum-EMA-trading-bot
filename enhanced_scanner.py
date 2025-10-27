@@ -1,16 +1,19 @@
 import pandas as pd
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from dotenv import load_dotenv
 import os
 from functools import lru_cache
+from typing import Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime
 import time
 import yfinance as yf
 
 from core.stock_screening import find_high_momentum_entries, print_analysis_results
+from core.canslim import evaluate_market_direction
+from config.settings import MIN_CANSLIM_SCORE, START_DATE
 
 load_dotenv()
 api_key = os.getenv("FINNHUB_API_KEY")
@@ -120,7 +123,16 @@ Args:
     sectors (list): Specific sectors to scan (e.g., ['mega_cap_tech', 'healthcare'])
     custom_list (list): Custom list of stock symbols to scan
 """
-def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_score=10, max_workers=3, sectors=None, custom_list=None):
+def scan_for_momentum_opportunities(
+    use_api=False, 
+    min_market_cap=10e9, 
+    min_rs_score=10, 
+    min_canslim_score: Optional[float] = None,
+    max_workers=3, 
+    sectors=None, 
+    custom_list=None,
+    start_date: Optional[str] =  None,
+):
 
     print("=" * 60)
     print("HIGH MOMENTUM PULLBACK SCANNER")
@@ -141,8 +153,22 @@ def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_s
             print("Using default curated quality stock list...")
             symbols = get_quality_stock_list()
     
+    if min_canslim_score is None:
+        min_canslim_score = MIN_CANSLIM_SCORE
+
+    if start_date is None:
+        start_date = START_DATE
+        
     print(f"Scanning {len(symbols)} stocks for momentum opportunities...")
     print(f"Minimum RS Score: {min_rs_score}")
+    print(f"Minimum CAN SLIM Score: {min_canslim_score}")
+
+    market_trend = evaluate_market_direction()
+    direction = "Bullish" if market_trend.is_bullish else "Cautious"
+    print(
+        f"Market Trend ({market_trend.symbol}): {direction} | "
+        f"Score: {market_trend.score * 100:.0f}%"
+    )
     
     # filter stocks:
     # Filter out invalid/delisted tickers before scanning
@@ -166,7 +192,9 @@ def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_s
                 symbol, 
                 start_date='2025-01-01', 
                 end_date=None, 
-                min_rs_score=min_rs_score
+                min_rs_score=min_rs_score,
+                min_canslim_score=min_canslim_score,
+                market_trend=market_trend
             )
             
             # Add this block to guarantee all values in result are Python primitives
@@ -214,7 +242,7 @@ def scan_for_momentum_opportunities(use_api=False, min_market_cap=10e9, min_rs_s
     if failed_symbols:
         print(f"Failed symbols: {', '.join(failed_symbols[:10])}{'...' if len(failed_symbols) > 10 else ''}")
     
-    return opportunities
+    return opportunities, market_trend
 
 def export_results_to_csv(opportunities, filename=None):
     """Export results to CSV file"""
@@ -295,7 +323,7 @@ if __name__ == "__main__":
     print(f"- Custom List: {'Yes' if CUSTOM_LIST else 'No'}")
     
     # Run the scan
-    opportunities = scan_for_momentum_opportunities(
+    opportunities, market_trend = scan_for_momentum_opportunities(
         use_api=USE_API,
         min_market_cap=MIN_MARKET_CAP,
         min_rs_score=MIN_RS_SCORE,
@@ -304,10 +332,8 @@ if __name__ == "__main__":
         custom_list=CUSTOM_LIST
     )
     
-    # Display results
-    print_analysis_results(opportunities)
+    print_analysis_results(opportunities, market_trend)
     
-    # Export to CSV
     if opportunities:
         export_results_to_csv(opportunities)
     
