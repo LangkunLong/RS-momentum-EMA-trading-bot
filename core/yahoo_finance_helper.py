@@ -48,7 +48,10 @@ def ensure_series(data: pd.Series | pd.DataFrame) -> pd.Series:
     if isinstance(data, pd.DataFrame):
         if data.shape[1] == 0:
             raise ValueError("Cannot coerce an empty DataFrame into a Series")
-        data = data.squeeze("columns")
+        
+        # operate on the first column
+        squeezed = data.squeeze("columns")
+        data = squeezed if isinstance(squeezed, pd.Series) else data.iloc[:, 0]
 
     if not isinstance(data, pd.Series):
         raise TypeError(f"Expected pandas Series, received {type(data)!r}")
