@@ -25,6 +25,11 @@ import pandas as pd
 import yfinance as yf
 
 from core.momentum_analysis import calculate_rs_momentum
+from core.yahoo_finance_helper import (
+    coerce_scalar,
+    extract_float_series,
+    normalize_price_dataframe,
+)
 
 #Light-weight representation of the general market trend
 @dataclass
@@ -93,15 +98,17 @@ def evaluate_market_direction(benchmark_symbol: str = "SPY") -> MarketTrend:
             indicators={},
         )
 
-    closes = data["Close"].astype(float)
+    data = normalize_price_dataframe(data)
+    closes = extract_float_series(data, "Close")
+    
     ema_21 = closes.ewm(span=21).mean()
     ema_50 = closes.ewm(span=50).mean()
     ema_200 = closes.ewm(span=200).mean()
-
-    latest_close = float(closes.iloc[-1])
-    latest_ema_21 = float(ema_21.iloc[-1])
-    latest_ema_50 = float(ema_50.iloc[-1])
-    latest_ema_200 = float(ema_200.iloc[-1])
+    
+    latest_close = coerce_scalar(closes.iloc[-1])
+    latest_ema_21 = coerce_scalar(ema_21.iloc[-1])
+    latest_ema_50 = coerce_scalar(ema_50.iloc[-1])
+    latest_ema_200 = coerce_scalar(ema_200.iloc[-1])
 
     trend_score = 0.0
 
@@ -111,8 +118,10 @@ def evaluate_market_direction(benchmark_symbol: str = "SPY") -> MarketTrend:
     if latest_ema_21 > latest_ema_50 > latest_ema_200:
         trend_score += 0.3
 
-    if latest_ema_50 > float(ema_50.iloc[-20]):
-        trend_score += 0.2
+    if len(ema_50) > 20:
+        ema_50_lookback = coerce_scalar(ema_50.iloc[-20])
+        if latest_ema_50 > ema_50_lookback:
+            trend_score += 0.2
 
     if latest_close > latest_ema_21:
         trend_score += 0.1
@@ -206,19 +215,25 @@ def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) ->
     market_trend = market_trend or evaluate_market_direction()
     price_history = pd.DataFrame()
     try:
-        price_history = ticker.history(period="1y", interval="1d")
+        price_history = ticker.history(period="1y", interval="1d", auto_adjust=False)
     except Exception:
         price_history = pd.DataFrame()
 
     if price_history.empty or len(price_history) < 30:
         return None
-
-    closes = price_history["Close"].astype(float)
-    latest_close = float(closes.iloc[-1])
-    high_52 = float(closes.max())
+    
+    price_history = normalize_price_dataframe(price_history)
+    closes = extract_float_series(price_history, "Close")
+    latest_close = coerce_scalar(closes.iloc[-1])
+    high_52 = coerce_scalar(closes.max())
     proximity_to_high = latest_close / high_52 if high_52 else 0.0
 
-    avg_volume_50 = float(price_history["Volume"].tail(50).mean()) if not price_history["Volume"].tail(50).empty else 0.0
+    try:
+        volume_series = extract_float_series(price_history, "Volume")
+    except (KeyError, TypeError):
+        volume_series = pd.Series(dtype=float)
+
+    avg_volume_50 = float(volume_series.tail(50).mean()) if not volume_series.tail(50).empty else 0.0
     shares_outstanding = None
 
     try:
