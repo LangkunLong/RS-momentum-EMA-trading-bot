@@ -94,8 +94,11 @@ def calculate_rs_momentum(symbol: str, benchmark_symbol: str = "SPY", period_day
         stock_performance = (stock_current / stock_start - 1.0) * 100.0
         benchmark_performance = (benchmark_current / benchmark_start - 1.0) * 100.0
         rs_score = float(stock_performance - benchmark_performance)
+        
         if not np.isfinite(rs_score):
             return 0.0
+        
+        return rs_score
         
     except Exception as exc: 
         print(f"Error calculating RS for {symbol}: {exc}")
