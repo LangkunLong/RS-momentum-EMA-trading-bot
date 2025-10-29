@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 
 from core.yahoo_finance_helper import (
@@ -8,6 +10,18 @@ from core.yahoo_finance_helper import (
     extract_float_series,
     normalize_price_dataframe,
 )
+
+# Download and align closing prices for specific stock and the benchmark.
+# Yahoo Finance occasionally returns slightly different calendars for individual tickers (for example around holidays or when a stock has a
+# trading halt).  The previous implementation sampled the *n*th value from the end of each series independently which meant we could end up comparing
+# different trading days.  That skewed the relative strength calculation led to surprisingly negative scores for genuinely strong stocks.
+def _prepare_aligned_closes(
+    symbol: str,
+    benchmark_symbol: str,
+    start_date: datetime,
+    end_date: datetime,
+) -> tuple[pd.Series, pd.Series]:
+    pass
 
 # calculate relative strength momentum score comparing stock to benchmark
 # RS = (Stock performance / Benchmark performance) over period
