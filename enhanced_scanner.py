@@ -327,7 +327,7 @@ if __name__ == "__main__":
     # SECTORS = ['dividend_defensive']
     # CUSTOM_LIST = None
     
-    DEBUG = False
+    DEBUG = True
     
     print("Stock Scanner Configuration:")
     print(f"- Use API: {USE_API}")
