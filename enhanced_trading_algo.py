@@ -1,5 +1,7 @@
 from __future__ import annotations
 import warnings
+
+from quality_stocks import GROWTH_HIGH_BETA, CRYPTO_FINTECH
 warnings.filterwarnings("ignore")
 
 from config.settings import CUSTOM_LIST, MIN_CANSLIM_SCORE, MIN_RS_SCORE, START_DATE
@@ -9,7 +11,7 @@ from core.stock_screening import print_analysis_results, screen_stocks_canslim
 def main() -> None:
 
     results, market_trend = screen_stocks_canslim(
-        symbols=CUSTOM_LIST,
+        symbols=CRYPTO_FINTECH,
         start_date=START_DATE,
         min_rs_score=MIN_RS_SCORE,
         min_canslim_score=MIN_CANSLIM_SCORE,
@@ -19,5 +21,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     print("Screening for CAN SLIM momentum opportunities...")
-    print(f"Universe: {', '.join(CUSTOM_LIST)}")
     main()
