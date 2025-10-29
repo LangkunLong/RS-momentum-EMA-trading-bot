@@ -135,6 +135,7 @@ def scan_for_momentum_opportunities(
     sectors=None, 
     custom_list=None,
     start_date: Optional[str] =  None,
+    debug: bool = False
 ):
 
     print("=" * 60)
@@ -197,7 +198,8 @@ def scan_for_momentum_opportunities(
                 end_date=None, 
                 min_rs_score=min_rs_score,
                 min_canslim_score=min_canslim_score,
-                market_trend=market_trend
+                market_trend=market_trend,
+                debug=debug
             )
             
             # Add this block to guarantee all values in result are Python primitives
@@ -233,7 +235,10 @@ def scan_for_momentum_opportunities(
             
             if result:
                 opportunities.append(result)
-                print(f"✓ {symbol} - RS: {result['rs_score']:.1f} ({completed}/{len(symbols)})")
+                status_msg = f"✗ {symbol} - No signals ({completed}/{len(symbols)})"
+                if debug:
+                    status_msg = f"{status_msg} | See debug details above."
+                print(status_msg)
             else:
                 print(f"✗ {symbol} - No signals ({completed}/{len(symbols)})")
     
@@ -322,6 +327,8 @@ if __name__ == "__main__":
     # SECTORS = ['dividend_defensive']
     # CUSTOM_LIST = None
     
+    DEBUG = False
+    
     print("Stock Scanner Configuration:")
     print(f"- Use API: {USE_API}")
     print(f"- Min Market Cap: ${MIN_MARKET_CAP/1e9:.0f}B")
@@ -337,7 +344,8 @@ if __name__ == "__main__":
         min_rs_score=MIN_RS_SCORE,
         max_workers=MAX_WORKERS,
         sectors=SECTORS,
-        custom_list=CUSTOM_LIST
+        custom_list=CUSTOM_LIST,
+        debug = DEBUG
     )
     
     print_analysis_results(opportunities, market_trend)
