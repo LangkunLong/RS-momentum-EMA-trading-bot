@@ -36,18 +36,39 @@ def find_high_momentum_entries(
     min_rs_score: float,
     min_canslim_score: float,
     market_trend: MarketTrend,
+    debug: bool = False
 ) -> Optional[Dict[str, object]]:
+    
+    if debug:
+        print("\n" + "-" * 60)
+        print(f"[DEBUG] Evaluating {symbol}")
 
     canslim_view = evaluate_canslim(symbol, market_trend=market_trend)
     if not canslim_view:
+        if debug:
+            print("[DEBUG] CAN SLIM evaluation unavailable.")
         return None
 
     rs_score = float(canslim_view["rs_score"])
+    if debug:
+        print(
+            f"[DEBUG] CAN SLIM RS Score: {rs_score:.1f} | "
+            f"Minimum Required: {min_rs_score:.1f}"
+        )
     if rs_score < min_rs_score:
+        if debug:
+            print("[DEBUG] Fails RS score threshold.")
         return None
 
     total_score = float(canslim_view["total_score"])
+    if debug:
+        print(
+            f"[DEBUG] CAN SLIM Total Score: {total_score:.1f} | "
+            f"Minimum Required: {min_canslim_score:.1f}"
+        )
     if total_score < min_canslim_score:
+        if debug:
+            print("[DEBUG] Fails CAN SLIM composite threshold.")
         return None
 
     start_dt = pd.to_datetime(start_date)
@@ -58,12 +79,37 @@ def find_high_momentum_entries(
 
     price_history = calculate_indicators(price_history)
     is_strong_trend, trend_score, trend_details = analyze_trend_strength(price_history)
+    if debug:
+        print(
+            f"[DEBUG] Trend Score: {trend_score:.1f} | "
+            f"Strong Trend: {is_strong_trend}"
+        )
+        if trend_details:
+            print(
+                "[DEBUG] Trend Details -> "
+                f"8EMA: {trend_details.get('ema_8_adherence', 0):.1f}% | "
+                f"21EMA: {trend_details.get('ema_21_adherence', 0):.1f}% | "
+                f"Higher Highs: {trend_details.get('higher_highs', False)} | "
+                f"Higher Lows: {trend_details.get('higher_lows', False)}"
+            )
 
     if not is_strong_trend:
+        if debug:
+            print("[DEBUG] Trend strength requirements not met.")
         return None
 
     analysis_df = price_history[price_history.index >= start_dt]
     entry_signals = identify_pullback_entries(analysis_df)
+    
+    if debug:
+        if entry_signals:
+            latest_signal = entry_signals[-1]
+            print(
+                "[DEBUG] Pullback signals found: "
+                f"{', '.join(latest_signal['signals'])} on {latest_signal['date']}"
+            )
+        else:
+            print("[DEBUG] No qualifying pullback signals in lookback window.")
 
     if not entry_signals:
         return None
@@ -103,6 +149,7 @@ def screen_stocks_canslim(
     end_date: Optional[str] = None,
     min_rs_score: float = 10.0,
     min_canslim_score: float = 70.0,
+    debug: bool = False,
 ) -> Tuple[List[Dict[str, object]], MarketTrend]:
 
     if end_date is None:
@@ -120,6 +167,7 @@ def screen_stocks_canslim(
                 min_rs_score=min_rs_score,
                 min_canslim_score=min_canslim_score,
                 market_trend=market_trend,
+                debug=debug
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             print(f"Error analysing {symbol}: {exc}")
