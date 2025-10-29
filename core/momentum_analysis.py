@@ -1,9 +1,8 @@
+from __future__ import annotations
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from __future__ import annotations
-
-from datetime import datetime, timedelta
 
 from core.yahoo_finance_helper import (
     coerce_scalar,
