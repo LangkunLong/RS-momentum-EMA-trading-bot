@@ -1,2 +1,6 @@
 .env
 __pycache__/*
+__pycache__/enhanced_trading_algo.cpython-311.pyc
+__pycache__/quality_stocks.cpython-311.pyc
+config/__pycache__
+core/__pycache__
