@@ -141,7 +141,7 @@ def evaluate_market_direction(benchmark_symbol: str = "SPY") -> MarketTrend:
     )
 
 # Compute a CAN SLIM style score for ``symbol``. The function returns ``None`` if we fail to obtain enough data.
-def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) -> Optional[Dict[str, object]]:
+def evaluate_canslim(symbol: str, rs_scores_df: pd.DataFrame, market_trend: Optional[MarketTrend] = None) -> Optional[Dict[str, object]]:
 
     ticker = yf.Ticker(symbol)
 
@@ -262,7 +262,7 @@ def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) ->
         if len(annual) >= 2:
             annual_growth = _safe_growth(annual["Earnings"].iloc[-1], annual["Earnings"].iloc[-2])
 
-    rs_score = calculate_rs_momentum(symbol)
+    rs_score = calculate_rs_momentum(symbol, rs_scores_df)
 
     # Institutional sponsorship proxy
     institutional_score = 0.0
@@ -289,7 +289,7 @@ def evaluate_canslim(symbol: str, market_trend: Optional[MarketTrend] = None) ->
             + 0.3 * _score_from_ratio(proximity_to_high, 1.05)
         ),
         "S": _score_from_ratio(turnover_ratio, 1.5),
-        "L": float(np.clip((rs_score + 20) / 40, 0, 1)),
+        "L": rs_score / 100.0,
         "I": institutional_score,
         "M": market_trend.score,
     }
