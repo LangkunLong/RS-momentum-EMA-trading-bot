@@ -1,15 +1,32 @@
 import pandas as pd
+import requests
 import yfinance as yf
 
 # Scrapes the Wikipedia page for the list of S&P 500 tickers.
 def get_sp500_tickers():
     print("Fetching S&P 500 ticker list...")
-    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-    # pd.read_html returns a list of DataFrames. The first one [0] is the table we want.
-    table = pd.read_html(url)[0]
     
-    # The 'Symbol' column contains the tickers.
-    # We need to replace '.' with '-' for yfinance (e.g., 'BRK.B' -> 'BRK-B')
+    # Set a User-Agent header to mimic a web browser to avoid 403 error accessing wikipedia
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+        
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()  # This will raise an error for bad responses (4xx or 5xx)
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching Wikipedia page: {e}")
+        return []
+
+    try:
+        table = pd.read_html(response.text, flavor='lxml')[0]
+    except ImportError:
+        # Fallback if lxml is not installed, though it's recommended
+        table = pd.read_html(response.text)[0]
+    except Exception as e:
+        print(f"Error parsing HTML table: {e}")
+        return []
+    
     tickers = table['Symbol'].str.replace('.', '-', regex=False).tolist()
     print(f"Found {len(tickers)} S&P 500 tickers.")
     return tickers
