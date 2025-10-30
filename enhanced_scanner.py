@@ -12,8 +12,7 @@ import time
 import yfinance as yf
 
 from core.yahoo_finance_helper import normalize_price_dataframe
-from core.stock_screening import find_high_momentum_entries, print_analysis_results
-from core.canslim import evaluate_market_direction
+from core.stock_screening import screen_stocks_canslim, print_analysis_results
 from config.settings import MIN_CANSLIM_SCORE, START_DATE
 
 load_dotenv()
@@ -167,13 +166,6 @@ def scan_for_momentum_opportunities(
     print(f"Minimum RS Score: {min_rs_score}")
     print(f"Minimum CAN SLIM Score: {min_canslim_score}")
 
-    market_trend = evaluate_market_direction()
-    direction = "Bullish" if market_trend.is_bullish else "Cautious"
-    print(
-        f"Market Trend ({market_trend.symbol}): {direction} | "
-        f"Score: {market_trend.score * 100:.0f}%"
-    )
-    
     # filter stocks:
     # Filter out invalid/delisted tickers before scanning
     print("Validating tickers with Yahoo Finance...")
@@ -186,69 +178,17 @@ def scan_for_momentum_opportunities(
 
     print(f"{len(valid_symbols)} valid tickers will be scanned.")
 
-    # Scan stocks for opportunities
-    opportunities = []
-    failed_symbols = []
-    
-    def analyze_stock(symbol):
-        try:
-            result = find_high_momentum_entries(
-                symbol, 
-                start_date= start_date, 
-                end_date=None, 
-                min_rs_score=min_rs_score,
-                min_canslim_score=min_canslim_score,
-                market_trend=market_trend,
-                debug=debug
-            )
-            
-            # Add this block to guarantee all values in result are Python primitives
-            if result:
-                # Convert any pandas/numpy values to Python primitives
-                result['rs_score'] = float(result['rs_score'])
-                result['trend_score'] = float(result['trend_score'])
-                result['current_price'] = float(result['current_price'])
-                result['current_rsi'] = float(result['current_rsi'])
-                
-                # Convert trend details
-                result['trend_details']['ema_8_adherence'] = float(result['trend_details']['ema_8_adherence'])
-                result['trend_details']['ema_21_adherence'] = float(result['trend_details']['ema_21_adherence'])
-                result['trend_details']['higher_highs'] = bool(result['trend_details']['higher_highs'])
-                result['trend_details']['higher_lows'] = bool(result['trend_details']['higher_lows'])
-                result['trend_details']['strong_ema_adherence'] = bool(result['trend_details']['strong_ema_adherence'])
-                
-            return result
-        except Exception as e:
-            failed_symbols.append(symbol)
-            print(f"Failed to analyze {symbol}: {e}")
-            return None
-    
-    # Process stocks with controlled concurrency
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_symbol = {executor.submit(analyze_stock, symbol): symbol for symbol in valid_symbols}
-        
-        completed = 0
-        for future in as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            result = future.result()
-            completed += 1
-            
-            if result:
-                opportunities.append(result)
-                status_msg = f"✗ {symbol} - No signals ({completed}/{len(symbols)})"
-                if debug:
-                    status_msg = f"{status_msg} | See debug details above."
-                print(status_msg)
-            else:
-                print(f"✗ {symbol} - No signals ({completed}/{len(symbols)})")
+    opportunities, market_trend = screen_stocks_canslim(
+        symbols=valid_symbols,
+        start_date=start_date,
+        min_rs_score=min_rs_score,
+        min_canslim_score=min_canslim_score,
+        debug=debug
+    )
     
     print(f"\nScan complete!")
     print(f"Analyzed: {len(symbols)} stocks")
-    print(f"Failed: {len(failed_symbols)} stocks")
     print(f"Opportunities found: {len(opportunities)} stocks")
-    
-    if failed_symbols:
-        print(f"Failed symbols: {', '.join(failed_symbols[:10])}{'...' if len(failed_symbols) > 10 else ''}")
     
     return opportunities, market_trend
 
