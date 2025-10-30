@@ -1,5 +1,3 @@
-# stock screening with CANSLIM Integration
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -13,6 +11,8 @@ from core.yahoo_finance_helper import extract_float_series, normalize_price_data
 from core.indicators import calculate_indicators
 from core.pullback_entries import identify_pullback_entries
 from core.trend_analysis import analyze_trend_strength
+from core.momentum_analysis import calculate_rs_scores_for_tickers
+from config.settings import MIN_RS_SCORE, MIN_CANSLIM_SCORE
 
 # Download historical pricing data with a safety buffer for indicators.
 def _fetch_price_history(symbol: str, start_date: datetime, end_date: Optional[str]) -> pd.DataFrame:
@@ -36,6 +36,7 @@ def find_high_momentum_entries(
     min_rs_score: float,
     min_canslim_score: float,
     market_trend: MarketTrend,
+    rs_scores_df: pd.DataFrame,
     debug: bool = False
 ) -> Optional[Dict[str, object]]:
     
@@ -43,7 +44,7 @@ def find_high_momentum_entries(
         print("\n" + "-" * 60)
         print(f"[DEBUG] Evaluating {symbol}")
 
-    canslim_view = evaluate_canslim(symbol, market_trend=market_trend)
+    canslim_view = evaluate_canslim(symbol, rs_scores_df=rs_scores_df, market_trend=market_trend)
     if not canslim_view:
         if debug:
             print("[DEBUG] CAN SLIM evaluation unavailable.")
@@ -147,16 +148,17 @@ def screen_stocks_canslim(
     symbols: Iterable[str],
     start_date: str,
     end_date: Optional[str] = None,
-    min_rs_score: float = 10.0,
-    min_canslim_score: float = 70.0,
+    min_rs_score: float = MIN_RS_SCORE,
+    min_canslim_score: float = MIN_CANSLIM_SCORE,
     debug: bool = False,
 ) -> Tuple[List[Dict[str, object]], MarketTrend]:
 
     if end_date is None:
         end_date = datetime.now().strftime("%Y-%m-%d")
-
     market_trend = evaluate_market_direction()
     results: List[Dict[str, object]] = []
+
+    rs_scores_df = calculate_rs_scores_for_tickers(list(symbols))
 
     for symbol in symbols:
         try:
@@ -167,6 +169,7 @@ def screen_stocks_canslim(
                 min_rs_score=min_rs_score,
                 min_canslim_score=min_canslim_score,
                 market_trend=market_trend,
+                rs_scores_df=rs_scores_df,
                 debug=debug
             )
         except Exception as exc:  # pragma: no cover - defensive logging
