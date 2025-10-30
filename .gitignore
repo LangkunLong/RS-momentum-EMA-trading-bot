@@ -2,6 +2,7 @@
 .env
 .venv
 venv/
+.vscode
 
 # Byte-compiled / optimized files
 __pycache__/
