@@ -13,12 +13,7 @@ import numpy as np
 import pandas as pd
 
 
-"""Return a frame with flattened columns for single-ticker downloads.
-
-yfinance sometimes returns a MultiIndex when historical data is fetched
-even for a single symbol. Indicator libraries expect one-dimensional
-Series, so we strip any redundant ticker level here.
-"""
+# flattened columns for single ticker downloads
 def normalize_price_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     if df.empty:
@@ -37,8 +32,10 @@ def normalize_price_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 df.columns = level1
         else:
-            df.columns = ["_".join(str(part) for part in col if part)
-                          for col in df.columns]
+            df.columns = [
+                "_".join(str(part) for part in col if part)
+                for col in df.columns
+            ]
 
     return df
 
