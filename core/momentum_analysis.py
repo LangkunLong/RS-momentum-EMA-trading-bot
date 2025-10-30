@@ -3,103 +3,94 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
 
-from core.yahoo_finance_helper import (
-    coerce_scalar,
-    extract_float_series,
-    normalize_price_dataframe,
-)
+# from core.yahoo_finance_helper import (
+#     coerce_scalar,
+#     extract_float_series,
+#     normalize_price_dataframe,
+# )
 
-# allign historical closes for the stock and benchmark
-def _prepare_aligned_closes(
-    symbol: str,
-    benchmark_symbol: str,
-    start_date: datetime,
-    end_date: datetime,
-) -> tuple[pd.Series, pd.Series]:
-    stock_data = yf.download(
-        symbol,
-        start=start_date,
-        end=end_date,
-        progress=False,
-        auto_adjust=True,
-    )
-    benchmark_data = yf.download(
-        benchmark_symbol,
-        start=start_date,
-        end=end_date,
-        progress=False,
-        auto_adjust=True,
-    )
-
-    stock_data = normalize_price_dataframe(stock_data)
-    benchmark_data = normalize_price_dataframe(benchmark_data)
-
-    if "Close" not in stock_data or "Close" not in benchmark_data:
-        raise KeyError("Close column missing from downloaded price data")
-
-    stock_closes = extract_float_series(stock_data, "Close")
-    benchmark_closes = extract_float_series(benchmark_data, "Close")
-
-    aligned = (
-        pd.DataFrame({
-            "stock": stock_closes,
-            "benchmark": benchmark_closes,
-        })
-        .dropna()
-        .sort_index()
-    )
-
-    if aligned.empty:
-        raise ValueError("No overlapping price history between symbol and benchmark")
-
-    return aligned["stock"], aligned["benchmark"]
-
-# CANSLIM RS score vs benchmakr
-def calculate_rs_momentum(symbol: str, benchmark_symbol: str = "SPY", period_days: int = 63) -> float:
+# Scrapes the Wikipedia page for the list of S&P 500 tickers.
+def get_sp500_tickers() -> list[str]:
+    print("Fetching S&P 500 ticker list...")
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+        
     try:
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=period_days + 30)  # budffer for holidays + closures
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching Wikipedia page: {e}")
+        return []
+
+    try:
+        table = pd.read_html(response.text, flavor='lxml')[0]
+    except ImportError:
+        table = pd.read_html(response.text)[0]
+    except Exception as e:
+        print(f"Error parsing HTML table: {e}")
+        return []
+    
+    tickers = table['Symbol'].str.replace('.', '-', regex=False).tolist()
+    print(f"Found {len(tickers)} S&P 500 tickers.")
+    return tickers
+
+# Calculates the 12-month weighted performance for a single stock's data.
+def calculate_weighted_performance(data_series: pd.Series) -> float | None:
+    try:
+        days_per_q = 65 
         
-        stock_closes, benchmark_closes = _prepare_aligned_closes(
-            symbol,
-            benchmark_symbol,
-            start_date,
-            end_date,
+        if len(data_series) < 4 * days_per_q:
+            return None
+
+        perf_q1 = (data_series.iloc[-1] / data_series.iloc[-days_per_q]) - 1
+        perf_q2 = (data_series.iloc[-days_per_q] / data_series.iloc[-2 * days_per_q]) - 1
+        perf_q3 = (data_series.iloc[-2 * days_per_q] / data_series.iloc[-3 * days_per_q]) - 1
+        perf_q4 = (data_series.iloc[-3 * days_per_q] / data_series.iloc[-4 * days_per_q]) - 1
+
+        weighted_performance = (
+            (0.40 * perf_q1) +
+            (0.20 * perf_q2) +
+            (0.20 * perf_q3) +
+            (0.20 * perf_q4)
         )
+        return weighted_performance
+    except (IndexError, TypeError, ZeroDivisionError):
+        return None
 
-        if len(stock_closes) <= period_days or len(benchmark_closes) <= period_days:
-            return 0.0
+# Calculates the RS Score for a list of tickers
+def calculate_rs_scores_for_tickers(tickers: list[str]) -> pd.DataFrame:
+    sp500_tickers = get_sp500_tickers()
+    all_tickers_to_check = list(set(tickers + sp500_tickers))
 
-        window = (
-            pd.DataFrame(
-                {
-                    "stock": stock_closes,
-                    "benchmark": benchmark_closes,
-                }
-            )
-            .tail(period_days + 1)
-            .dropna()
-        )
+    print(f"Downloading 14 months of data for {len(all_tickers_to_check)} total tickers...")
+    try:
+        all_data = yf.download(all_tickers_to_check, period='14mo')['Close']
+        print("Download complete.")
+    except Exception as e:
+        print(f"Error downloading data: {e}")
+        return pd.DataFrame()
 
-        if window.shape[0] <= period_days:
-            return 0.0
-        
-        returns = window.pct_change().dropna()
-        if returns.empty or returns.shape[0] < period_days // 2:
-            return 0.0
-        
-        stock_growth = float((1.0 + returns["stock"]).prod())
-        benchmark_growth = float((1.0 + returns["benchmark"]).prod())
+    print("Calculating weighted performance for all stocks...")
+    rs_scores = all_data.apply(calculate_weighted_performance)
 
-        if any(np.isclose(val, 0.0) for val in (stock_growth, benchmark_growth)):
-            return 0.0
-        
-        rs_ratio = stock_growth / benchmark_growth
-        rs_score = float((rs_ratio - 1.0) * 100.0)
+    rs_df = rs_scores.reset_index()
+    rs_df.columns = ['Ticker', 'Weighted_Perf']
+    rs_df = rs_df.dropna()
 
-        return rs_score if np.isfinite(rs_score) else 0.0
-        
-    except Exception as exc: 
-        print(f"Error calculating RS for {symbol}: {exc}")
+    rs_df['RS_Score'] = rs_df['Weighted_Perf'].rank(pct=True) * 98 + 1
+    rs_df = rs_df.sort_values(by='RS_Score', ascending=False).reset_index(drop=True)
+    
+    return rs_df
+
+# This function is kept for compatibility but will now use the new ranking method.
+def calculate_rs_momentum(symbol: str, rs_scores_df: pd.DataFrame) -> float:
+    try:
+        score = rs_scores_df[rs_scores_df['Ticker'] == symbol]['RS_Score'].iloc[0]
+        return float(score)
+    except (IndexError, KeyError):
         return 0.0
