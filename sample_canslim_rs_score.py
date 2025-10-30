@@ -5,6 +5,7 @@ import yfinance as yf
 # Scrapes the Wikipedia page for the list of S&P 500 tickers.
 def get_sp500_tickers():
     print("Fetching S&P 500 ticker list...")
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     
     # Set a User-Agent header to mimic a web browser to avoid 403 error accessing wikipedia
     headers = {
