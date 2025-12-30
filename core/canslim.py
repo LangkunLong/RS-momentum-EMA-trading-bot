@@ -140,170 +140,137 @@ def evaluate_market_direction(benchmark_symbol: str = "SPY") -> MarketTrend:
         },
     )
 
-# Compute a CAN SLIM style score for ``symbol``. The function returns ``None`` if we fail to obtain enough data.
+
+# separate into technical and fundamental (for stocks without a year's worth of data yet)
 def evaluate_canslim(symbol: str, rs_scores_df: pd.DataFrame, market_trend: Optional[MarketTrend] = None) -> Optional[Dict[str, object]]:
-
     ticker = yf.Ticker(symbol)
-
+    
+    # 1. Fetch Data with Error Handling
     try:
-        quarterly_income_stmt = (
-            ticker.quarterly_income_stmt if hasattr(ticker, "quarterly_income_stmt") else None
-        )
-        income_stmt = ticker.income_stmt if hasattr(ticker, "income_stmt") else None
-        info = ticker.fast_info if hasattr(ticker, "fast_info") else {}
-    except Exception:
-        quarterly_income_stmt = income_stmt = None
-        info = {}
-    
-    # derive annual and quarterly income
-    annual = None
-    if isinstance(income_stmt, pd.DataFrame) and not income_stmt.empty:
-        net_income_label = next(
-            (
-                idx
-                for idx in income_stmt.index
-                if isinstance(idx, str) and idx.strip().lower() == "net income"
-            ),
-            None,
-        )
+        # Use fast_info for market cap/shares if available
+        info = ticker.fast_info
+        # Attempt to get financials, handle empty frames
+        try:
+            quarterly_income = ticker.quarterly_income_stmt
+            annual_income = ticker.income_stmt
+        except Exception:
+            quarterly_income = pd.DataFrame()
+            annual_income = pd.DataFrame()
+    except Exception as e:
+        print(f"Data fetch error for {symbol}: {e}")
+        return None
 
-        if net_income_label is not None:
-            net_income = income_stmt.loc[net_income_label].dropna()
-            if not net_income.empty:
-                net_income = net_income.sort_index()
-                annual = pd.DataFrame({"Earnings": net_income})
-
-    quarterly = None
-    if isinstance(quarterly_income_stmt, pd.DataFrame) and not quarterly_income_stmt.empty:
-        net_income_label = next(
-            (
-                idx
-                for idx in quarterly_income_stmt.index
-                if isinstance(idx, str) and idx.strip().lower() == "net income"
-            ),
-            None,
-        )
-        revenue_label = next(
-            (
-                idx
-                for idx in quarterly_income_stmt.index
-                if isinstance(idx, str) and idx.strip().lower() in {"total revenue", "totalrevenue"}
-            ),
-            None,
-        )
-
-        net_income = (
-            quarterly_income_stmt.loc[net_income_label].dropna()
-            if net_income_label is not None
-            else None
-        )
-        revenue = (
-            quarterly_income_stmt.loc[revenue_label].dropna()
-            if revenue_label is not None
-            else None
-        )
-
-        if net_income is not None and not net_income.empty:
-            net_income = net_income.sort_index()
-            quarterly = pd.DataFrame({"Earnings": net_income})
-            if revenue is not None and not revenue.empty:
-                revenue = revenue.reindex(net_income.index, method=None).dropna()
-                if not revenue.empty:
-                    quarterly["Revenue"] = revenue
-
-    
+    # 2. Market Trend & Price History
     market_trend = market_trend or evaluate_market_direction()
-    price_history = pd.DataFrame()
     try:
-        price_history = ticker.history(period="1y", interval="1d", auto_adjust=False)
+        price_history = ticker.history(period="1y", interval="1d", auto_adjust=True)
     except Exception:
-        price_history = pd.DataFrame()
+        return None
 
     if price_history.empty or len(price_history) < 30:
         return None
-    
+
+    # ... (Keep existing normalization and volume logic) ...
     price_history = normalize_price_dataframe(price_history)
     closes = extract_float_series(price_history, "Close")
     latest_close = coerce_scalar(closes.iloc[-1])
     high_52 = coerce_scalar(closes.max())
     proximity_to_high = latest_close / high_52 if high_52 else 0.0
-
-    try:
-        volume_series = extract_float_series(price_history, "Volume")
-    except (KeyError, TypeError):
-        volume_series = pd.Series(dtype=float)
-
-    avg_volume_50 = float(volume_series.tail(50).mean()) if not volume_series.tail(50).empty else 0.0
+    
+    # Volume & Turnover
+    volume_series = extract_float_series(price_history, "Volume")
+    avg_volume_50 = float(volume_series.tail(50).mean()) if not volume_series.empty else 0.0
+    
+    # Robust Shares Outstanding Fetch
     shares_outstanding = None
+    if hasattr(info, 'shares_outstanding'):
+        shares_outstanding = info.shares_outstanding
+    elif hasattr(ticker, 'info') and 'sharesOutstanding' in ticker.info:
+        shares_outstanding = ticker.info['sharesOutstanding']
+    
+    turnover_ratio = (avg_volume_50 * 252) / shares_outstanding if (shares_outstanding and avg_volume_50) else None
 
-    try:
-        shares_outstanding = float(getattr(ticker, "shares_outstanding", None) or info.get("sharesOutstanding"))
-    except Exception:
-        shares_outstanding = None
-
-    turnover_ratio = None
-    if shares_outstanding and shares_outstanding > 0 and avg_volume_50:
-        turnover_ratio = (avg_volume_50 * 252) / shares_outstanding
-
-    # Current and annual earnings growth
+    # 3. Robust Earnings/Revenue Growth Calculation
     current_growth = None
     revenue_growth = None
-
-    if isinstance(quarterly, pd.DataFrame) and not quarterly.empty and "Earnings" in quarterly:
-        quarterly = quarterly.sort_index()
-        if len(quarterly) >= 2:
-            current_growth = _safe_growth(quarterly["Earnings"].iloc[-1], quarterly["Earnings"].iloc[-2])
-        if len(quarterly) >= 4 and "Revenue" in quarterly:
-            revenue_growth = _safe_growth(quarterly["Revenue"].iloc[-1], quarterly["Revenue"].iloc[-4])
-
     annual_growth = None
-    if isinstance(annual, pd.DataFrame) and not annual.empty and "Earnings" in annual:
-        annual = annual.sort_index()
-        if len(annual) >= 2:
-            annual_growth = _safe_growth(annual["Earnings"].iloc[-1], annual["Earnings"].iloc[-2])
+    
+    # Check if we actually have fundamental data
+    has_fundamentals = False
+    
+    if not quarterly_income.empty:
+        try:
+            # Flexible label search (Net Income, Net Income Common Stock, etc.)
+            net_income_row = quarterly_income.index[quarterly_income.index.str.contains('Net Income', case=False, regex=True)]
+            revenue_row = quarterly_income.index[quarterly_income.index.str.contains('Revenue|Total Revenue', case=False, regex=True)]
+            
+            if not net_income_row.empty:
+                earnings = quarterly_income.loc[net_income_row[0]].sort_index()
+                if len(earnings) >= 2:
+                    current_growth = _safe_growth(earnings.iloc[-1], earnings.iloc[-2])
+                    has_fundamentals = True
+            
+            if not revenue_row.empty:
+                revs = quarterly_income.loc[revenue_row[0]].sort_index()
+                if len(revs) >= 4: # YoY Quarterly
+                    revenue_growth = _safe_growth(revs.iloc[-1], revs.iloc[-4])
+        except Exception:
+            pass
 
+    if not annual_income.empty:
+        try:
+            net_income_row = annual_income.index[annual_income.index.str.contains('Net Income', case=False, regex=True)]
+            if not net_income_row.empty:
+                earnings = annual_income.loc[net_income_row[0]].sort_index()
+                if len(earnings) >= 2:
+                    annual_growth = _safe_growth(earnings.iloc[-1], earnings.iloc[-2])
+                    has_fundamentals = True
+        except Exception:
+            pass
+
+    # 4. Scoring
     rs_score = calculate_rs_momentum(symbol, rs_scores_df)
-
-    # Institutional sponsorship proxy
-    institutional_score = 0.0
-    institutional_percent = None
-
-    fast_info = info if isinstance(info, dict) else getattr(info, "__dict__", {})
-    if hasattr(fast_info, "get"):
-        for key in ("heldPercentInstitutions", "institutionPercent", "institutionPercentShares"):
-            value = fast_info.get(key)
-            if value is not None:
-                institutional_percent = value
-                break
-
-    if institutional_percent is not None:
-        institutional_score = _score_from_ratio(float(institutional_percent), 1.0)
-    elif turnover_ratio is not None:
-        institutional_score = _score_from_ratio(turnover_ratio, 1.5)
+    
+    # Component Scores
+    score_c = _score_from_growth(current_growth, 0.25)
+    score_a = _score_from_growth(annual_growth, 0.25)
+    score_n = float(0.7 * _score_from_growth(revenue_growth, 0.2) + 0.3 * _score_from_ratio(proximity_to_high, 1.05))
+    score_s = _score_from_ratio(turnover_ratio, 1.5)
+    score_l = rs_score / 100.0
+    score_m = market_trend.score
+    
+    # Institutional (I) - Default to 0.5 if missing, or use Turnover as proxy
+    score_i = 0.0
+    if hasattr(info, 'held_percent_institutions'):
+         score_i = _score_from_ratio(info.held_percent_institutions, 1.0)
+    elif turnover_ratio:
+         score_i = _score_from_ratio(turnover_ratio, 1.5)
 
     scores = {
-        "C": _score_from_growth(current_growth, 0.25),
-        "A": _score_from_growth(annual_growth, 0.25),
-        "N": float(
-            0.7 * _score_from_growth(revenue_growth, 0.2)
-            + 0.3 * _score_from_ratio(proximity_to_high, 1.05)
-        ),
-        "S": _score_from_ratio(turnover_ratio, 1.5),
-        "L": rs_score / 100.0,
-        "I": institutional_score,
-        "M": market_trend.score,
+        "C": score_c, "A": score_a, "N": score_n, 
+        "S": score_s, "L": score_l, "I": score_i, "M": score_m
     }
-
-    total_score = float(sum(scores.values()) / len(scores) * 100)
+    
+    # DYNAMIC SCORING: Calculate weighted average based on available data
+    # We always have L, M, and usually S and N (price based). 
+    # If C and A are 0.0 due to missing data (not bad data), we re-weight.
+    
+    valid_components = ["L", "M", "N", "S", "I"]
+    if has_fundamentals:
+        valid_components.extend(["C", "A"])
+        total_score = float(sum(scores.values()) / 7 * 100)
+    else:
+        # Speculative/Technical Score: Normalize based on 5 components
+        # We assume C and A are missing.
+        partial_sum = scores["L"] + scores["M"] + scores["N"] + scores["S"] + scores["I"]
+        total_score = float(partial_sum / 5 * 100)
 
     metrics = {
         "current_growth": current_growth,
         "annual_growth": annual_growth,
         "revenue_growth": revenue_growth,
         "turnover_ratio": turnover_ratio,
-        "proximity_to_high": proximity_to_high,
-        "avg_volume_50": avg_volume_50,
-        "shares_outstanding": shares_outstanding,
+        "has_fundamentals": has_fundamentals 
     }
 
     return {
