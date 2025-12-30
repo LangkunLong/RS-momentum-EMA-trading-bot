@@ -13,6 +13,7 @@ import yfinance as yf
 
 from core.yahoo_finance_helper import normalize_price_dataframe
 from core.stock_screening import screen_stocks_canslim, print_analysis_results
+from core.trending import get_yahoo_trending_tickers
 from config.settings import MIN_CANSLIM_SCORE, START_DATE
 
 load_dotenv()
@@ -32,7 +33,7 @@ def requests_with_retries():
     return session
 
 # preprocess ticker symbol, see if avaiable on yahoo finance
-def is_valid_ticker(symbol, retries=3):
+def is_valid_ticker(symbol, retries=1):
     for attempt in range(retries):
         try:
             df = yf.download(symbol, period="5d", progress=False, auto_adjust=True)
@@ -146,8 +147,9 @@ def scan_for_momentum_opportunities(
         print("Using custom stock list...")
         symbols = custom_list
     elif use_api:
-        stock_data = fetch_large_cap_stocks(min_market_cap)
-        symbols = [stock['symbol'] for stock in stock_data]
+        print("Fetching trending tickers from Yahoo Finance...")
+        trending = get_yahoo_trending_tickers(count=30)
+        symbols = trending
     else:
         if sectors:
             print(f"Using curated stock list for sectors: {sectors}")
@@ -240,8 +242,8 @@ def export_results_to_csv(opportunities, filename=None):
 
 if __name__ == "__main__":
     # Configuration Options
-    USE_API = False  # Set to True to use Finnhub API, False to use curated lists
-    MIN_MARKET_CAP = 10e9  # 10 billion (only used if USE_API = True)
+    USE_API = True  # Set to True to use Finnhub API, False to use curated lists
+    MIN_MARKET_CAP = 0  # 10 billion (only used if USE_API = True)
     MIN_RS_SCORE = 5  # Minimum relative strength score
     MAX_WORKERS = 2  # Concurrent analysis threads
     
