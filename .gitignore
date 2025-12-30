@@ -17,3 +17,4 @@ dist/
 
 # mypy cache
 .mypy_cache/
+rs_score_cache/
