@@ -34,11 +34,9 @@ from .l_leader_laggard import evaluate_l
 from .i_institutional import evaluate_i
 
 __all__ = [
-    # Main functions
     "evaluate_canslim",
     "evaluate_market_direction",
     "MarketTrend",
-    # Individual components
     "evaluate_c",
     "evaluate_a",
     "evaluate_n",
