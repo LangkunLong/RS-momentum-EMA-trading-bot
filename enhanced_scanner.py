@@ -1,3 +1,17 @@
+"""
+CANSLIM Stock Scanner
+
+Main scanning function for CANSLIM stock opportunities.
+This simplified scanner focuses purely on CANSLIM criteria without pullback entries.
+
+Args:
+    min_rs_score (float): Minimum relative strength score
+    min_canslim_score (float): Minimum CANSLIM composite score
+    sectors (list): Specific sectors to scan (e.g., ['mega_cap_tech', 'healthcare'])
+    custom_list (list): Custom list of stock symbols to scan
+    start_date (str): Start date for analysis
+    debug (bool): Enable verbose output
+"""
 import pandas as pd
 from datetime import datetime
 from typing import Optional
@@ -8,8 +22,9 @@ from core.stock_screening import screen_stocks_canslim, print_analysis_results
 from quality_stocks import get_quality_stock_list
 from config import settings
 
-# preprocess ticker symbol, see if available on yahoo finance
+
 def is_valid_ticker(symbol, retries=1):
+    """Preprocess ticker symbol, check if available on yahoo finance."""
     for attempt in range(retries):
         try:
             df = yf.download(symbol, period="5d", progress=False, auto_adjust=True)
@@ -24,19 +39,7 @@ def is_valid_ticker(symbol, retries=1):
     return False
 
 
-
-"""
-Main scanning function for high momentum pullback opportunities
-
-Args:
-    min_rs_score (float): Minimum relative strength score
-    min_canslim_score (float): Minimum CANSLIM composite score
-    sectors (list): Specific sectors to scan (e.g., ['mega_cap_tech', 'healthcare'])
-    custom_list (list): Custom list of stock symbols to scan
-    start_date (str): Start date for analysis
-    debug (bool): Enable verbose output
-"""
-def scan_for_momentum_opportunities(
+def scan_for_canslim_stocks(
     min_rs_score=None,
     min_canslim_score=None,
     sectors=None,
@@ -44,6 +47,20 @@ def scan_for_momentum_opportunities(
     start_date=None,
     debug=None
 ):
+    """
+    Main scanning function for CANSLIM stock opportunities.
+
+    Args:
+        min_rs_score: Minimum relative strength score
+        min_canslim_score: Minimum CANSLIM composite score
+        sectors: Specific sectors to scan
+        custom_list: Custom list of stock symbols to scan
+        start_date: Start date for analysis
+        debug: Enable verbose output
+
+    Returns:
+        Tuple of (opportunities, market_trend)
+    """
     # Load defaults from configuration
     min_rs_score = min_rs_score if min_rs_score is not None else settings.MIN_RS_SCORE
     min_canslim_score = min_canslim_score if min_canslim_score is not None else settings.MIN_CANSLIM_SCORE
@@ -53,7 +70,7 @@ def scan_for_momentum_opportunities(
     debug = debug if debug is not None else settings.DEBUG
 
     print("=" * 60)
-    print("HIGH MOMENTUM PULLBACK SCANNER")
+    print("CANSLIM STOCK SCANNER")
     print("=" * 60)
 
     # Get stock list
@@ -66,12 +83,11 @@ def scan_for_momentum_opportunities(
     else:
         print("Using default curated quality stock list...")
         symbols = get_quality_stock_list()
-        
-    print(f"Scanning {len(symbols)} stocks for momentum opportunities...")
-    print(f"Minimum RS Score: {min_rs_score}")
-    print(f"Minimum CAN SLIM Score: {min_canslim_score}")
 
-    # filter stocks:
+    print(f"Scanning {len(symbols)} stocks for CANSLIM opportunities...")
+    print(f"Minimum RS Score: {min_rs_score}")
+    print(f"Minimum CANSLIM Score: {min_canslim_score}")
+
     # Filter out invalid/delisted tickers before scanning
     print("Validating tickers with Yahoo Finance...")
     valid_symbols = []
@@ -90,58 +106,49 @@ def scan_for_momentum_opportunities(
         min_canslim_score=min_canslim_score,
         debug=debug
     )
-    
+
     print(f"\nScan complete!")
     print(f"Analyzed: {len(symbols)} stocks")
     print(f"Opportunities found: {len(opportunities)} stocks")
-    
+
     return opportunities, market_trend
 
+
 def export_results_to_csv(opportunities, filename=None):
-    """Export results to CSV file"""
+    """Export CANSLIM results to CSV file."""
     if not opportunities:
         print("No opportunities to export.")
         return
-    
+
     if filename is None:
-        filename = f"momentum_opportunities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
+        filename = f"canslim_opportunities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
     # Flatten the data for CSV export
     csv_data = []
     for opp in opportunities:
-        base_row = {
+        row = {
             'Symbol': opp['symbol'],
             'RS_Score': opp['rs_score'],
-            'Trend_Score': opp['trend_score'],
-            'Current_Price': opp['current_price'],
-            'Current_RSI': opp['current_rsi'],
-            'EMA_8_Adherence': opp['trend_details']['ema_8_adherence'],
-            'EMA_21_Adherence': opp['trend_details']['ema_21_adherence'],
-            'Higher_Highs': opp['trend_details']['higher_highs'],
-            'Higher_Lows': opp['trend_details']['higher_lows'],
-            'Entry_Signals_Count': len(opp['entry_signals'])
+            'CANSLIM_Score': opp['total_score'],
+            'C_Score': opp['scores']['C'] * 100,
+            'A_Score': opp['scores']['A'] * 100,
+            'N_Score': opp['scores']['N'] * 100,
+            'S_Score': opp['scores']['S'] * 100,
+            'L_Score': opp['scores']['L'] * 100,
+            'I_Score': opp['scores']['I'] * 100,
+            'M_Score': opp['scores']['M'] * 100,
+            'Current_Growth': opp['metrics']['current_growth'],
+            'Annual_Growth': opp['metrics']['annual_growth'],
+            'Revenue_Growth': opp['metrics']['revenue_growth'],
+            'Turnover_Ratio': opp['metrics']['turnover_ratio'],
+            'Proximity_to_High': opp['metrics']['proximity_to_high'],
         }
-        
-        # Add latest entry signal details
-        if opp['entry_signals']:
-            latest_signal = opp['entry_signals'][-1]
-            latest_date = latest_signal['date']
-            if isinstance(latest_date, (datetime, pd.Timestamp)):
-                latest_date_str = latest_date.strftime('%Y-%m-%d')
-            else:
-                latest_date_str = str(latest_date)
-            base_row.update({
-                'Latest_Signal_Date': latest_date_str,
-                'Latest_Signal_Types': ', '.join(latest_signal['signals']),
-                'Latest_Signal_Price': latest_signal['close'],
-                'Latest_Signal_RSI': latest_signal['rsi']
-            })
-        
-        csv_data.append(base_row)
-    
+        csv_data.append(row)
+
     df = pd.DataFrame(csv_data)
     df.to_csv(filename, index=False)
     print(f"Results exported to {filename}")
+
 
 if __name__ == "__main__":
     # You can override default settings here or edit config/settings.py
@@ -160,7 +167,7 @@ if __name__ == "__main__":
     CUSTOM_LIST = None
     DEBUG = True  # Override default
 
-    print("Stock Scanner Configuration:")
+    print("CANSLIM Stock Scanner Configuration:")
     print(f"- Min RS Score: {MIN_RS_SCORE or settings.MIN_RS_SCORE}")
     print(f"- Min CANSLIM Score: {MIN_CANSLIM_SCORE or settings.MIN_CANSLIM_SCORE}")
     print(f"- Sectors: {SECTORS or settings.SECTORS or 'All'}")
@@ -168,7 +175,7 @@ if __name__ == "__main__":
     print(f"- Debug Mode: {DEBUG or settings.DEBUG}")
 
     # Run the scan
-    opportunities, market_trend = scan_for_momentum_opportunities(
+    opportunities, market_trend = scan_for_canslim_stocks(
         min_rs_score=MIN_RS_SCORE,
         min_canslim_score=MIN_CANSLIM_SCORE,
         sectors=SECTORS,
