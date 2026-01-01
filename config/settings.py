@@ -17,9 +17,12 @@ MIN_CANSLIM_SCORE = 70              # Minimum composite CANSLIM score (0-100)
 MAX_WORKERS = 3                     # Maximum threads for parallel processing
 CHUNK_SIZE = 50                     # Batch size for downloading stock data
 
-# Stock selection
-USE_API = False                     # Use API vs curated lists
-SECTORS = None                      # List of sectors to filter (None = all)
+# Stock selection - Now fetches from major indices (S&P 500, Nasdaq 100, Russell 2000)
+USE_API = False                     # Use API vs index-based lists
+SECTORS = None                      # List of indices to scan (None = all indices)
+                                    # Options: 'sp500', 'nasdaq100', 'russell2000',
+                                    # 'large_cap' (S&P 500 + Nasdaq 100),
+                                    # 'small_cap' (Russell 2000), 'all'
 CUSTOM_LIST = None                  # Custom stock symbols (overrides sectors if set)
 
 # Debugging
@@ -39,6 +42,8 @@ PRICE_HISTORY_BUFFER_DAYS = 120    # Extra days to download for indicators
 # Caching
 RS_CACHE_DIR = 'rs_score_cache'     # Directory for RS score cache
 RS_CACHE_FILE = 'rs_scores_cache.csv'  # Cache filename
+TICKER_CACHE_DIR = 'ticker_cache'   # Directory for index ticker cache
+TICKER_CACHE_EXPIRY_HOURS = 24      # How often to refresh ticker lists
 
 
 # ==============================================================================
