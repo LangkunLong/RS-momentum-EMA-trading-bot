@@ -1,8 +1,18 @@
 import pandas as pd
 import numpy as np
+from config import settings
 
 # identify if uptrend: higher highs with higher lows
-def analyze_trend_strength(df: pd.DataFrame, min_days: int = 60):
+def analyze_trend_strength(
+    df: pd.DataFrame,
+    min_days=None,
+    strong_8ema_threshold=None,
+    strong_21ema_threshold=None
+):
+    # Load defaults from configuration
+    min_days = min_days or settings.MIN_TREND_DAYS
+    strong_8ema_threshold = strong_8ema_threshold or settings.STRONG_TREND_8EMA_THRESHOLD
+    strong_21ema_threshold = strong_21ema_threshold or settings.STRONG_TREND_21EMA_THRESHOLD
 
     if len(df) < min_days:
         return False, 0.0, {}
@@ -12,7 +22,7 @@ def analyze_trend_strength(df: pd.DataFrame, min_days: int = 60):
     ema_8_adherence = float((recent_data['Above_8EMA'].sum() / len(recent_data)) * 100)
     ema_21_adherence = float((recent_data['Above_21EMA'].sum() / len(recent_data)) * 100)
 
-    strong_ema_adherence = bool(ema_8_adherence > 70 or ema_21_adherence > 80)
+    strong_ema_adherence = bool(ema_8_adherence > strong_8ema_threshold or ema_21_adherence > strong_21ema_threshold)
 
     segment_size = max(min_days // 4, 1)
     segment_highs = []
