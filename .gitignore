@@ -17,4 +17,7 @@ dist/
 
 # mypy cache
 .mypy_cache/
+
+# Cache directories
 rs_score_cache/
+ticker_cache/

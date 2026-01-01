@@ -163,14 +163,16 @@ if __name__ == "__main__":
     # Or just use defaults from config/settings.py
     MIN_RS_SCORE = None  # Uses settings.MIN_RS_SCORE
     MIN_CANSLIM_SCORE = None  # Uses settings.MIN_CANSLIM_SCORE
-    SECTORS = ['growth_high_beta', 'crypto_fintech']  # Override default
+    # Available indices: 'sp500', 'nasdaq100', 'russell2000', 'large_cap', 'small_cap', 'all'
+    # Set to None to scan all major indices (S&P 500 + Nasdaq 100 + Russell 2000)
+    SECTORS = None  # Uses all indices from major markets
     CUSTOM_LIST = None
     DEBUG = True  # Override default
 
     print("CANSLIM Stock Scanner Configuration:")
     print(f"- Min RS Score: {MIN_RS_SCORE or settings.MIN_RS_SCORE}")
     print(f"- Min CANSLIM Score: {MIN_CANSLIM_SCORE or settings.MIN_CANSLIM_SCORE}")
-    print(f"- Sectors: {SECTORS or settings.SECTORS or 'All'}")
+    print(f"- Indices: {SECTORS or settings.SECTORS or 'All (S&P 500 + Nasdaq 100 + Russell 2000)'}")
     print(f"- Custom List: {'Yes' if CUSTOM_LIST else 'No'}")
     print(f"- Debug Mode: {DEBUG or settings.DEBUG}")
 
