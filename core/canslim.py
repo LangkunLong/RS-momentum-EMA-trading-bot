@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from config import settings
 from core.momentum_analysis import calculate_rs_momentum
 from core.yahoo_finance_helper import (
     coerce_scalar,
@@ -77,12 +78,29 @@ def _score_from_ratio(value: Optional[float], cap: float) -> float:
     return float(np.clip(value / cap, 0, 1))
 
 # current market direction using SPY benchmark, CANSLIM range of 0-100
-def evaluate_market_direction(benchmark_symbol: str = "SPY") -> MarketTrend:
+def evaluate_market_direction(
+    benchmark_symbol: str = "SPY",
+    period=None,
+    price_above_200_weight=None,
+    ema_alignment_weight=None,
+    rising_50ema_weight=None,
+    price_above_21_weight=None,
+    bullish_threshold=None,
+    rising_lookback=None
+) -> MarketTrend:
+    # Load defaults from configuration
+    period = period or settings.MARKET_TREND_PERIOD
+    price_above_200_weight = price_above_200_weight or settings.M_PRICE_ABOVE_200EMA_WEIGHT
+    ema_alignment_weight = ema_alignment_weight or settings.M_EMA_ALIGNMENT_WEIGHT
+    rising_50ema_weight = rising_50ema_weight or settings.M_50EMA_RISING_WEIGHT
+    price_above_21_weight = price_above_21_weight or settings.M_PRICE_ABOVE_21EMA_WEIGHT
+    bullish_threshold = bullish_threshold or settings.M_BULLISH_THRESHOLD
+    rising_lookback = rising_lookback or settings.M_50EMA_RISING_LOOKBACK
 
     try:
         data = yf.download(
             benchmark_symbol,
-            period="1y",
+            period=period,
             interval="1d",
             progress=False,
         )
@@ -113,25 +131,25 @@ def evaluate_market_direction(benchmark_symbol: str = "SPY") -> MarketTrend:
     trend_score = 0.0
 
     if latest_close > latest_ema_200:
-        trend_score += 0.4
+        trend_score += price_above_200_weight
 
     if latest_ema_21 > latest_ema_50 > latest_ema_200:
-        trend_score += 0.3
+        trend_score += ema_alignment_weight
 
-    if len(ema_50) > 20:
-        ema_50_lookback = coerce_scalar(ema_50.iloc[-20])
+    if len(ema_50) > rising_lookback:
+        ema_50_lookback = coerce_scalar(ema_50.iloc[-rising_lookback])
         if latest_ema_50 > ema_50_lookback:
-            trend_score += 0.2
+            trend_score += rising_50ema_weight
 
     if latest_close > latest_ema_21:
-        trend_score += 0.1
+        trend_score += price_above_21_weight
 
     trend_score = float(np.clip(trend_score, 0, 1))
 
     return MarketTrend(
         symbol=benchmark_symbol,
         score=trend_score,
-        is_bullish=trend_score >= 0.6,
+        is_bullish=trend_score >= bullish_threshold,
         latest_close=latest_close,
         indicators={
             "ema_21": latest_ema_21,
@@ -142,7 +160,27 @@ def evaluate_market_direction(benchmark_symbol: str = "SPY") -> MarketTrend:
 
 
 # separate into technical and fundamental (for stocks without a year's worth of data yet)
-def evaluate_canslim(symbol: str, rs_scores_df: pd.DataFrame, market_trend: Optional[MarketTrend] = None) -> Optional[Dict[str, object]]:
+def evaluate_canslim(
+    symbol: str,
+    rs_scores_df: pd.DataFrame,
+    market_trend: Optional[MarketTrend] = None,
+    period=None,
+    c_growth_target=None,
+    a_growth_target=None,
+    n_revenue_weight=None,
+    n_proximity_weight=None,
+    s_turnover_cap=None,
+    i_institutional_cap=None
+) -> Optional[Dict[str, object]]:
+    # Load defaults from configuration
+    period = period or settings.CANSLIM_DATA_PERIOD
+    c_growth_target = c_growth_target or settings.C_GROWTH_TARGET
+    a_growth_target = a_growth_target or settings.A_GROWTH_TARGET
+    n_revenue_weight = n_revenue_weight or settings.N_REVENUE_GROWTH_WEIGHT
+    n_proximity_weight = n_proximity_weight or settings.N_PROXIMITY_TO_HIGH_WEIGHT
+    s_turnover_cap = s_turnover_cap or settings.S_TURNOVER_CAP
+    i_institutional_cap = i_institutional_cap or settings.I_INSTITUTIONAL_CAP
+
     ticker = yf.Ticker(symbol)
     
     # 1. Fetch Data with Error Handling
@@ -163,7 +201,7 @@ def evaluate_canslim(symbol: str, rs_scores_df: pd.DataFrame, market_trend: Opti
     # 2. Market Trend & Price History
     market_trend = market_trend or evaluate_market_direction()
     try:
-        price_history = ticker.history(period="1y", interval="1d", auto_adjust=True)
+        price_history = ticker.history(period=period, interval="1d", auto_adjust=True)
     except Exception:
         return None
 
@@ -230,21 +268,21 @@ def evaluate_canslim(symbol: str, rs_scores_df: pd.DataFrame, market_trend: Opti
 
     # 4. Scoring
     rs_score = calculate_rs_momentum(symbol, rs_scores_df)
-    
+
     # Component Scores
-    score_c = _score_from_growth(current_growth, 0.25)
-    score_a = _score_from_growth(annual_growth, 0.25)
-    score_n = float(0.7 * _score_from_growth(revenue_growth, 0.2) + 0.3 * _score_from_ratio(proximity_to_high, 1.05))
-    score_s = _score_from_ratio(turnover_ratio, 1.5)
+    score_c = _score_from_growth(current_growth, c_growth_target)
+    score_a = _score_from_growth(annual_growth, a_growth_target)
+    score_n = float(n_revenue_weight * _score_from_growth(revenue_growth, 0.2) + n_proximity_weight * _score_from_ratio(proximity_to_high, 1.05))
+    score_s = _score_from_ratio(turnover_ratio, s_turnover_cap)
     score_l = rs_score / 100.0
     score_m = market_trend.score
-    
+
     # Institutional (I) - Default to 0.5 if missing, or use Turnover as proxy
     score_i = 0.0
     if hasattr(info, 'held_percent_institutions'):
-         score_i = _score_from_ratio(info.held_percent_institutions, 1.0)
+         score_i = _score_from_ratio(info.held_percent_institutions, i_institutional_cap)
     elif turnover_ratio:
-         score_i = _score_from_ratio(turnover_ratio, 1.5)
+         score_i = _score_from_ratio(turnover_ratio, s_turnover_cap)
 
     scores = {
         "C": score_c, "A": score_a, "N": score_n, 
