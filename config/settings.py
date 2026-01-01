@@ -55,31 +55,6 @@ EMA_MARKET_200 = 200                # Market 200-day EMA
 RSI_PERIOD = 14                     # RSI calculation period
 
 
-# ==============================================================================
-# PULLBACK ENTRY DETECTION PARAMETERS
-# ==============================================================================
-
-# Pullback tolerance thresholds (percentage)
-PULLBACK_8EMA_TOLERANCE = 2.0       # Max % distance from 8-EMA for entry
-PULLBACK_21EMA_TOLERANCE = 3.0      # Max % distance from 21-EMA for entry
-
-# Trend adherence requirements (percentage above EMA)
-MIN_ADHERENCE_8EMA = 0.7            # 70% of days must be above 8-EMA
-MIN_ADHERENCE_21EMA = 0.8           # 80% of days must be above 21-EMA
-
-# Lookback windows
-PULLBACK_LOOKBACK_DAYS = 10         # Days to check for pullback patterns
-RECLAIM_LOOKBACK_DAYS = 5           # Days to check for 8-EMA reclaim pattern
-
-
-# ==============================================================================
-# TREND ANALYSIS PARAMETERS
-# ==============================================================================
-
-# Trend strength requirements
-MIN_TREND_DAYS = 60                 # Minimum days of data for trend analysis
-STRONG_TREND_8EMA_THRESHOLD = 70    # Strong trend if 8-EMA adherence > 70%
-STRONG_TREND_21EMA_THRESHOLD = 80   # Strong trend if 21-EMA adherence > 80%
 
 
 # ==============================================================================
