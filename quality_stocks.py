@@ -180,3 +180,4 @@ if __name__ == "__main__":
     print("\nAvailable categories:")
     for name, desc in get_available_categories().items():
         print(f"  {name}: {desc}")
+# TBI
