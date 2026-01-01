@@ -1,45 +1,42 @@
+"""
+Stock screening module focused on CANSLIM evaluation.
+
+This module provides functionality to screen stocks based on CANSLIM criteria,
+filtering for stocks with strong fundamentals, technical strength, and market leadership.
+"""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-import yfinance as yf
 
-from core.canslim import MarketTrend, evaluate_canslim, evaluate_market_direction
-from core.yahoo_finance_helper import extract_float_series, normalize_price_dataframe
-from core.indicators import calculate_indicators
-from core.pullback_entries import identify_pullback_entries
-from core.trend_analysis import analyze_trend_strength
+from core.canslim import evaluate_canslim, evaluate_market_direction, MarketTrend
 from core.momentum_analysis import calculate_rs_scores_for_tickers
 from config.settings import MIN_RS_SCORE, MIN_CANSLIM_SCORE
 
-# Download historical pricing data with a safety buffer for indicators.
-def _fetch_price_history(symbol: str, start_date: datetime, end_date: Optional[str]) -> pd.DataFrame:
 
-    extended_start = start_date - timedelta(days=120)
-    data = yf.download(
-        symbol,
-        start=extended_start,
-        end=end_date,
-        progress=False,
-        auto_adjust=False,
-    )
-    return normalize_price_dataframe(data)
-
-# helper function to identify actionable pullback entries for each tiker
-# returns None if a stock fails any of the CAN SLIM criteria, does not maintain a strong trend, or lacks recent pullback signals.
-def find_high_momentum_entries(
+def evaluate_stock_canslim(
     symbol: str,
-    start_date: str,
-    end_date: Optional[str],
     min_rs_score: float,
     min_canslim_score: float,
     market_trend: MarketTrend,
     rs_scores_df: pd.DataFrame,
     debug: bool = False
 ) -> Optional[Dict[str, object]]:
-    
+    """
+    Evaluate a single stock against CANSLIM criteria.
+
+    Args:
+        symbol: Stock ticker symbol
+        min_rs_score: Minimum RS score threshold
+        min_canslim_score: Minimum CANSLIM composite score threshold
+        market_trend: Pre-calculated market trend
+        rs_scores_df: DataFrame with pre-calculated RS scores
+        debug: Enable verbose output
+
+    Returns:
+        Dict with CANSLIM evaluation results, or None if stock doesn't meet criteria
+    """
     if debug:
         print("\n" + "-" * 60)
         print(f"[DEBUG] Evaluating {symbol}")
@@ -47,13 +44,13 @@ def find_high_momentum_entries(
     canslim_view = evaluate_canslim(symbol, rs_scores_df=rs_scores_df, market_trend=market_trend)
     if not canslim_view:
         if debug:
-            print("[DEBUG] CAN SLIM evaluation unavailable.")
+            print("[DEBUG] CANSLIM evaluation unavailable.")
         return None
 
     rs_score = float(canslim_view["rs_score"])
     if debug:
         print(
-            f"[DEBUG] CAN SLIM RS Score: {rs_score:.1f} | "
+            f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | "
             f"Minimum Required: {min_rs_score:.1f}"
         )
     if rs_score < min_rs_score:
@@ -64,86 +61,20 @@ def find_high_momentum_entries(
     total_score = float(canslim_view["total_score"])
     if debug:
         print(
-            f"[DEBUG] CAN SLIM Total Score: {total_score:.1f} | "
+            f"[DEBUG] CANSLIM Total Score: {total_score:.1f} | "
             f"Minimum Required: {min_canslim_score:.1f}"
         )
     if total_score < min_canslim_score:
         if debug:
-            print("[DEBUG] Fails CAN SLIM composite threshold.")
+            print("[DEBUG] Fails CANSLIM composite threshold.")
         return None
 
-    start_dt = pd.to_datetime(start_date)
-    price_history = _fetch_price_history(symbol, start_dt, end_date)
-
-    if price_history.empty or len(price_history) < 120:
-        return None
-
-    price_history = calculate_indicators(price_history)
-    is_strong_trend, trend_score, trend_details = analyze_trend_strength(price_history)
     if debug:
-        print(
-            f"[DEBUG] Trend Score: {trend_score:.1f} | "
-            f"Strong Trend: {is_strong_trend}"
-        )
-        if trend_details:
-            print(
-                "[DEBUG] Trend Details -> "
-                f"8EMA: {trend_details.get('ema_8_adherence', 0):.1f}% | "
-                f"21EMA: {trend_details.get('ema_21_adherence', 0):.1f}% | "
-                f"Higher Highs: {trend_details.get('higher_highs', False)} | "
-                f"Higher Lows: {trend_details.get('higher_lows', False)}"
-            )
+        print(f"[DEBUG] ✓ {symbol} meets all CANSLIM criteria!")
 
-    if not is_strong_trend:
-        if debug:
-            print("[DEBUG] Trend strength requirements not met.")
-        return None
+    return canslim_view
 
-    analysis_df = price_history[price_history.index >= start_dt]
-    entry_signals = identify_pullback_entries(analysis_df)
-    
-    if debug:
-        if entry_signals:
-            latest_signal = entry_signals[-1]
-            print(
-                "[DEBUG] Pullback signals found: "
-                f"{', '.join(latest_signal['signals'])} on {latest_signal['date']}"
-            )
-        else:
-            print("[DEBUG] No qualifying pullback signals in lookback window.")
 
-    if not entry_signals:
-        return None
-
-    close_series = extract_float_series(price_history, "Close")
-    current_price = float(close_series.iloc[-1])
-
-    current_rsi = (
-        float(extract_float_series(price_history, "RSI").iloc[-1])
-        if "RSI" in price_history
-        else float("nan")
-    )
-
-    safe_trend_details = {
-        "ema_8_adherence": float(trend_details.get("ema_8_adherence", 0.0)),
-        "ema_21_adherence": float(trend_details.get("ema_21_adherence", 0.0)),
-        "higher_highs": bool(trend_details.get("higher_highs", False)),
-        "higher_lows": bool(trend_details.get("higher_lows", False)),
-        "strong_ema_adherence": bool(trend_details.get("strong_ema_adherence", False)),
-    }
-
-    return {
-        "symbol": symbol,
-        "rs_score": rs_score,
-        "trend_score": float(trend_score),
-        "trend_details": safe_trend_details,
-        "entry_signals": entry_signals,
-        "current_price": current_price,
-        "current_rsi": current_rsi,
-        "canslim": canslim_view,
-    }
-
-# screen stocks for CAN SLIM characteristics and pullback setups
 def screen_stocks_canslim(
     symbols: Iterable[str],
     start_date: str,
@@ -152,43 +83,63 @@ def screen_stocks_canslim(
     min_canslim_score: float = MIN_CANSLIM_SCORE,
     debug: bool = False,
 ) -> Tuple[List[Dict[str, object]], MarketTrend]:
+    """
+    Screen multiple stocks for CANSLIM characteristics.
 
-    if end_date is None:
-        end_date = datetime.now().strftime("%Y-%m-%d")
+    Args:
+        symbols: List of stock ticker symbols to screen
+        start_date: Start date for analysis (unused but kept for compatibility)
+        end_date: End date for analysis (unused but kept for compatibility)
+        min_rs_score: Minimum relative strength score threshold
+        min_canslim_score: Minimum composite CANSLIM score threshold
+        debug: Enable verbose output
+
+    Returns:
+        Tuple of (results_list, market_trend) where results_list contains
+        CANSLIM evaluations for stocks meeting criteria
+    """
     market_trend = evaluate_market_direction()
     results: List[Dict[str, object]] = []
 
+    # Calculate RS scores for all symbols at once
     rs_scores_df = calculate_rs_scores_for_tickers(list(symbols))
 
     for symbol in symbols:
         try:
-            entry = find_high_momentum_entries(
+            evaluation = evaluate_stock_canslim(
                 symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
                 min_rs_score=min_rs_score,
                 min_canslim_score=min_canslim_score,
                 market_trend=market_trend,
                 rs_scores_df=rs_scores_df,
                 debug=debug
             )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            print(f"Error analysing {symbol}: {exc}")
-            entry = None
+        except Exception as exc:
+            print(f"Error analyzing {symbol}: {exc}")
+            evaluation = None
 
-        if entry:
-            results.append(entry)
+        if evaluation:
+            results.append(evaluation)
 
-    results.sort(key=lambda x: x["canslim"]["total_score"], reverse=True)
+    # Sort by CANSLIM total score (highest first)
+    results.sort(key=lambda x: x["total_score"], reverse=True)
     return results, market_trend
 
-# outputs CANSLIM Scores
+
 def print_analysis_results(results: List[Dict[str, object]], market_trend: Optional[MarketTrend] = None) -> None:
+    """
+    Print CANSLIM analysis results in a formatted table.
+
+    Args:
+        results: List of CANSLIM evaluation results
+        market_trend: Market trend information
+    """
     if not results:
         print("No stocks found matching criteria.")
         return
+
     print("\n" + "=" * 80)
-    print(f"HIGH MOMENTUM CAN SLIM OPPORTUNITIES ({len(results)} stocks found)")
+    print(f"CANSLIM STOCK SCREENING RESULTS ({len(results)} stocks found)")
     print("=" * 80)
 
     if market_trend is not None:
@@ -213,34 +164,23 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
         "I": "Institutional sponsorship",
         "M": "Market direction",
     }
-    
+
     def _fmt(value: Optional[float], precision: int = 2) -> str:
         if value is None or (isinstance(value, float) and pd.isna(value)):
             return "n/a"
         return f"{value:.{precision}f}"
-    
+
     for idx, result in enumerate(results, start=1):
         print(f"\n{idx}. {result['symbol']}")
-        print(f"   Price: ${result['current_price']:.2f} | RSI: {result['current_rsi']:.1f}")
-        print(f"   RS Score: {result['rs_score']:.1f} | Trend Score: {result['trend_score']:.1f}")
+        print(f"   RS Score: {result['rs_score']:.1f} | CANSLIM Score: {result['total_score']:.1f}")
 
-        trend = result["trend_details"]
-        print(
-            "   Trend Details: "
-            f"8EMA {trend['ema_8_adherence']:.1f}% | "
-            f"21EMA {trend['ema_21_adherence']:.1f}% | "
-            f"Higher Highs {trend['higher_highs']} | Higher Lows {trend['higher_lows']}"
-        )
-
-        canslim = result["canslim"]
-        print(f"   CAN SLIM Composite Score: {canslim['total_score']:.1f}")
-
+        print(f"   Component Breakdown:")
         for key in "C A N S L I M".split():
-            score_pct = canslim["scores"].get(key, 0.0) * 100
+            score_pct = result["scores"].get(key, 0.0) * 100
             label = component_labels[key]
             print(f"     {key} - {label}: {score_pct:.0f}%")
 
-        metrics = canslim["metrics"]
+        metrics = result["metrics"]
         print(
             "   Fundamentals: "
             f"Quarterly EPS Growth {_fmt(metrics['current_growth'])} | "
@@ -248,18 +188,8 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
             f"Revenue Growth {_fmt(metrics['revenue_growth'])}"
         )
         print(
-            "   Liquidity: "
+            "   Technicals: "
             f"Avg Volume (50d) {_fmt(metrics['avg_volume_50'], 0)} | "
             f"Turnover Ratio {_fmt(metrics['turnover_ratio'])} | "
             f"52w High Proximity {_fmt(metrics['proximity_to_high'])}"
         )
-
-        print("   Recent Entry Signals:")
-        for signal in result["entry_signals"][-3:]:
-            date_val = signal["date"]
-            if not isinstance(date_val, str):
-                date_val = date_val.strftime("%Y-%m-%d")
-            print(
-                f"     {date_val}: {', '.join(signal['signals'])} | "
-                f"Close ${signal['close']:.2f} | RSI {signal['rsi']:.1f}"
-            )
