@@ -69,8 +69,10 @@ A_GROWTH_TARGET = 0.25              # Annual earnings growth target
 N_REVENUE_GROWTH_WEIGHT = 0.7       # Weight for revenue growth
 N_PROXIMITY_TO_HIGH_WEIGHT = 0.3    # Weight for proximity to 52-week high
 
-# S (Supply/Demand) threshold
-S_TURNOVER_CAP = 1.5                # Maximum turnover ratio for scoring
+# S (Supply/Demand) - Volume Surge & Breakout Detection
+S_VOLUME_SURGE_THRESHOLD = 1.5      # Volume multiplier for surge detection (1.5 = 50% above avg)
+S_BREAKOUT_PROXIMITY = 0.98         # Proximity to 52-week high for breakout (0.98 = within 2%)
+S_POWER_GAP_LOOKBACK = 10           # Days to look back for Power Earnings Gaps
 
 # I (Institutional) threshold
 I_INSTITUTIONAL_CAP = 1.0           # Maximum institutional ownership for scoring

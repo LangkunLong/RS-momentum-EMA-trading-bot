@@ -132,7 +132,12 @@ def evaluate_canslim(
     )
 
     # S - Supply and Demand
-    score_s, turnover_ratio = evaluate_s(avg_volume_50, shares_outstanding, s_turnover_cap)
+    score_s, s_metrics = evaluate_s(
+        price_history,
+        avg_volume_50,
+        latest_close,
+        high_52
+    )
 
     # L - Leader or Laggard
     score_l, rs_score = evaluate_l(symbol, rs_scores_df)
@@ -141,7 +146,7 @@ def evaluate_canslim(
     held_percent_institutions = None
     if hasattr(info, 'held_percent_institutions'):
         held_percent_institutions = info.held_percent_institutions
-    score_i = evaluate_i(held_percent_institutions, turnover_ratio, i_institutional_cap)
+    score_i = evaluate_i(held_percent_institutions, None, i_institutional_cap)
 
     # M - Market Direction
     score_m = market_trend.score
@@ -176,7 +181,7 @@ def evaluate_canslim(
         "current_growth": current_growth,
         "annual_growth": annual_growth,
         "revenue_growth": revenue_growth,
-        "turnover_ratio": turnover_ratio,
+        "s_metrics": s_metrics,  # New: volume surge, breakout, power gap details
         "proximity_to_high": proximity_to_high,
         "avg_volume_50": avg_volume_50,
         "has_fundamentals": has_fundamentals
