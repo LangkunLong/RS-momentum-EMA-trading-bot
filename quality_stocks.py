@@ -48,29 +48,6 @@ def get_quality_stock_list(
     if sectors is None:
         return get_all_index_tickers(force_refresh=force_refresh)
 
-    # Resolve sector aliases to actual index names
-    indices_to_fetch = set()
-    for sector in sectors:
-        sector_lower = sector.lower().strip()
-        if sector_lower in INDEX_ALIASES:
-            indices_to_fetch.update(INDEX_ALIASES[sector_lower])
-        else:
-            # Try to use as-is if it's a valid index name
-            valid_indices = {"sp500", "nasdaq100", "russell2000"}
-            if sector_lower in valid_indices:
-                indices_to_fetch.add(sector_lower)
-            else:
-                print(f"Warning: Unknown sector/index '{sector}', skipping...")
-
-    if not indices_to_fetch:
-        print("No valid indices found, returning all tickers...")
-        return get_all_index_tickers(force_refresh=force_refresh)
-
-    return get_all_index_tickers(
-        indices=list(indices_to_fetch),
-        force_refresh=force_refresh
-    )
-
 
 def get_index_tickers(index_name: str, force_refresh: bool = False) -> List[str]:
     index_lower = index_name.lower().strip()

@@ -19,7 +19,7 @@ import yfinance as yf
 
 from core.yahoo_finance_helper import normalize_price_dataframe
 from core.stock_screening import screen_stocks_canslim, print_analysis_results
-from quality_stocks import get_quality_stock_list
+from quality_stocks import get_quality_stock_list, get_index_tickers
 from config import settings
 
 
@@ -47,20 +47,7 @@ def scan_for_canslim_stocks(
     start_date=None,
     debug=None
 ):
-    """
-    Main scanning function for CANSLIM stock opportunities.
 
-    Args:
-        min_rs_score: Minimum relative strength score
-        min_canslim_score: Minimum CANSLIM composite score
-        sectors: Specific sectors to scan
-        custom_list: Custom list of stock symbols to scan
-        start_date: Start date for analysis
-        debug: Enable verbose output
-
-    Returns:
-        Tuple of (opportunities, market_trend)
-    """
     # Load defaults from configuration
     min_rs_score = min_rs_score if min_rs_score is not None else settings.MIN_RS_SCORE
     min_canslim_score = min_canslim_score if min_canslim_score is not None else settings.MIN_CANSLIM_SCORE
@@ -79,7 +66,7 @@ def scan_for_canslim_stocks(
         symbols = custom_list
     elif sectors:
         print(f"Using curated stock list for sectors: {sectors}")
-        symbols = get_quality_stock_list(sectors=sectors)
+        symbols = get_index_tickers(index_name = sectors)
     else:
         print("Using default curated quality stock list...")
         symbols = get_quality_stock_list()
@@ -165,7 +152,7 @@ if __name__ == "__main__":
     MIN_CANSLIM_SCORE = None  # Uses settings.MIN_CANSLIM_SCORE
     # Available indices: 'sp500', 'nasdaq100', 'russell2000', 'large_cap', 'small_cap', 'all'
     # Set to None to scan all major indices (S&P 500 + Nasdaq 100 + Russell 2000)
-    SECTORS = None  # Uses all indices from major markets
+    SECTORS = 'nasdaq100'  # Uses all indices from major markets
     CUSTOM_LIST = None
     DEBUG = True  # Override default
 
