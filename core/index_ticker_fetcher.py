@@ -24,24 +24,21 @@ class IndexTickerFetcher:
     """Fetches and caches stock tickers from major market indices."""
 
     # Wikipedia URLs for index constituents
-    WIKIPEDIA_URLS = {
-        "sp500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-        "nasdaq100": "https://en.wikipedia.org/wiki/Nasdaq-100",
-        "russell2000": "https://en.wikipedia.org/wiki/Russell_2000_Index",
+    ISHARES_URL = {
+        "sp500": "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund",
+        "nasdaq100": "https://www.ishares.com/us/products/239696/ishares-nasdaq-100-etf/1467271812596.ajax?fileType=csv&fileName=QQQ_holdings&dataType=fund",
+        "russell2000": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
     }
 
     def __init__(self, cache_dir: Optional[Path] = None):
-        """Initialize the fetcher with optional custom cache directory."""
         self.cache_dir = cache_dir or CACHE_DIR
         self.cache_file = self.cache_dir / "index_tickers_cache.json"
         self._ensure_cache_dir()
 
     def _ensure_cache_dir(self) -> None:
-        """Create cache directory if it doesn't exist."""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _is_cache_valid(self) -> bool:
-        """Check if cache exists and is not expired."""
         if not self.cache_file.exists():
             return False
 
@@ -56,7 +53,6 @@ class IndexTickerFetcher:
             return False
 
     def _load_cache(self) -> Optional[Dict]:
-        """Load cached ticker data."""
         if not self._is_cache_valid():
             return None
 
@@ -67,87 +63,96 @@ class IndexTickerFetcher:
             return None
 
     def _save_cache(self, data: Dict) -> None:
-        """Save ticker data to cache."""
         data["timestamp"] = datetime.now().isoformat()
         with open(self.cache_file, "w") as f:
             json.dump(data, f, indent=2)
 
     def fetch_sp500_tickers(self) -> List[str]:
-        """
-        Fetch S&P 500 constituent tickers from Wikipedia.
-
-        Returns:
-            List of ticker symbols
-        """
         try:
-            tables = pd.read_html(self.WIKIPEDIA_URLS["sp500"])
-            # First table contains the S&P 500 constituents
-            df = tables[0]
-            # Symbol column may be named 'Symbol' or 'Ticker'
-            symbol_col = "Symbol" if "Symbol" in df.columns else "Ticker"
-            tickers = df[symbol_col].tolist()
-            # Clean up tickers (remove any BRK.B -> BRK-B format issues)
-            tickers = [t.replace(".", "-") for t in tickers]
-            print(f"Fetched {len(tickers)} S&P 500 tickers")
-            return tickers
+            url = self.ISHARES_URL["sp500"]
+
+            response = requests.get(url, timeout=30, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+
+            if response.status_code == 200:
+                # Parse CSV content
+                from io import StringIO
+                # Skip metadata rows at the top
+                lines = response.text.split("\n")
+                # Find the header row
+                header_idx = 0
+                for i, line in enumerate(lines):
+                    if "Ticker" in line or "ticker" in line.lower():
+                        header_idx = i
+                        break
+
+                csv_content = "\n".join(lines[header_idx:])
+                df = pd.read_csv(StringIO(csv_content))
+
+                # Find ticker column
+                ticker_col = None
+                for col in df.columns:
+                    if "ticker" in col.lower():
+                        ticker_col = col
+                        break
+
+                if ticker_col:
+                    tickers = df[ticker_col].dropna().tolist()
+                    tickers = [str(t).replace(".", "-") for t in tickers if isinstance(t, str) and t.strip()]
+                    # Filter out non-ticker values
+                    tickers = [t for t in tickers if t.isalpha() or "-" in t]
+                    print(f"Fetched {len(tickers)} sp 500 tickers from iShares")
+                    return tickers
+
         except Exception as e:
-            print(f"Error fetching S&P 500 tickers: {e}")
-            return []
+            print(f"Error fetching sp 500 from iShares: {e}")
 
     def fetch_nasdaq100_tickers(self) -> List[str]:
-        """
-        Fetch Nasdaq 100 constituent tickers from Wikipedia.
-
-        Returns:
-            List of ticker symbols
-        """
         try:
-            tables = pd.read_html(self.WIKIPEDIA_URLS["nasdaq100"])
-            # Find the table with ticker symbols (usually has 'Ticker' or 'Symbol' column)
-            for table in tables:
-                if "Ticker" in table.columns:
-                    tickers = table["Ticker"].tolist()
-                    tickers = [t.replace(".", "-") for t in tickers]
-                    print(f"Fetched {len(tickers)} Nasdaq 100 tickers")
-                    return tickers
-                elif "Symbol" in table.columns:
-                    tickers = table["Symbol"].tolist()
-                    tickers = [t.replace(".", "-") for t in tickers]
-                    print(f"Fetched {len(tickers)} Nasdaq 100 tickers")
-                    return tickers
+            url = self.ISHARES_URL["nasdaq100"]
 
-            # Fallback: try the 5th table which often has the components
-            if len(tables) >= 5:
-                df = tables[4]
+            response = requests.get(url, timeout=30, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+
+            if response.status_code == 200:
+                # Parse CSV content
+                from io import StringIO
+                # Skip metadata rows at the top
+                lines = response.text.split("\n")
+                # Find the header row
+                header_idx = 0
+                for i, line in enumerate(lines):
+                    if "Ticker" in line or "ticker" in line.lower():
+                        header_idx = i
+                        break
+
+                csv_content = "\n".join(lines[header_idx:])
+                df = pd.read_csv(StringIO(csv_content))
+
+                # Find ticker column
+                ticker_col = None
                 for col in df.columns:
-                    if df[col].dtype == object and df[col].str.match(r"^[A-Z]+$").any():
-                        tickers = df[col].dropna().tolist()
-                        tickers = [t for t in tickers if isinstance(t, str) and t.isupper()]
-                        if len(tickers) > 50:  # Likely the ticker column
-                            print(f"Fetched {len(tickers)} Nasdaq 100 tickers")
-                            return tickers
+                    if "ticker" in col.lower():
+                        ticker_col = col
+                        break
 
-            print("Could not find Nasdaq 100 tickers table")
-            return []
+                if ticker_col:
+                    tickers = df[ticker_col].dropna().tolist()
+                    tickers = [str(t).replace(".", "-") for t in tickers if isinstance(t, str) and t.strip()]
+                    # Filter out non-ticker values
+                    tickers = [t for t in tickers if t.isalpha() or "-" in t]
+                    print(f"Fetched {len(tickers)} Nasdaq 100 tickers from iShares")
+                    return tickers
+
         except Exception as e:
-            print(f"Error fetching Nasdaq 100 tickers: {e}")
-            return []
+            print(f"Error fetching Nasdaq 100 from iShares: {e}")
+            
 
     def fetch_russell2000_tickers(self) -> List[str]:
-        """
-        Fetch Russell 2000 constituent tickers.
-
-        Note: Russell 2000 constituents are not freely available on Wikipedia.
-        We use the iShares Russell 2000 ETF (IWM) holdings as a proxy,
-        or fall back to fetching from other sources.
-
-        Returns:
-            List of ticker symbols
-        """
         try:
-            # Try to get from iShares IWM holdings page
-            # This is a common proxy for Russell 2000
-            url = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+            url = self.ISHARES_URL["russell2000"]
 
             response = requests.get(url, timeout=30, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -186,41 +191,7 @@ class IndexTickerFetcher:
         except Exception as e:
             print(f"Error fetching Russell 2000 from iShares: {e}")
 
-        # Fallback: Use a curated list of representative small-cap stocks
-        # This is a subset but covers key small-cap names
-        print("Using fallback Russell 2000 representative list")
-        return self._get_russell2000_fallback()
-
-    def _get_russell2000_fallback(self) -> List[str]:
-        """
-        Return a fallback list of representative Russell 2000 stocks.
-        This is used when live fetching fails.
-        """
-        # Representative small-cap stocks (top holdings of IWM)
-        return [
-            "SMCI", "ONTO", "FN", "TGTX", "ANF", "CELH", "DOCS", "BOOT", "LNTH",
-            "PIPR", "CSWI", "POWL", "MC", "ACIW", "CRVL", "ESNT", "SPSC", "CALM",
-            "BGC", "CVLT", "EXPO", "SFM", "SBCF", "PRGS", "IIPR", "ITRI", "ABG",
-            "ALKS", "VCYT", "AMRX", "GKOS", "CTRE", "KBH", "VCTR", "COOP", "CNMD",
-            "AGIO", "STEP", "MMSI", "RDNT", "HWKN", "CERT", "GPI", "JANX", "PINC",
-            "LPG", "NVEE", "OII", "PTEN", "VBTX", "CADE", "SSTK", "WDFC", "SIG",
-            "PAYO", "TDS", "MSGS", "RELY", "CORT", "CVBF", "ARLO", "HLIT", "ATGE",
-            "NBTB", "BCPC", "WSBC", "SHOO", "KLIC", "INDB", "LBRT", "ASO", "INVA",
-            "TRMK", "PTGX", "STNG", "LBPH", "AROC", "LAUR", "CATY", "AMPH", "CPK",
-            "AWR", "BLFS", "CNXN", "INSM", "PECO", "ROIC", "TOWN", "VECO", "WHD",
-        ]
-
     def fetch_all_index_tickers(self, indices: Optional[List[str]] = None) -> Dict[str, List[str]]:
-        """
-        Fetch tickers from specified indices or all major indices.
-
-        Args:
-            indices: List of index names to fetch. Options: 'sp500', 'nasdaq100', 'russell2000'
-                    If None, fetches all indices.
-
-        Returns:
-            Dict mapping index name to list of tickers
-        """
         if indices is None:
             indices = ["sp500", "nasdaq100", "russell2000"]
 
@@ -245,18 +216,6 @@ class IndexTickerFetcher:
         deduplicate: bool = True,
         force_refresh: bool = False
     ) -> List[str]:
-        """
-        Get all tickers from specified indices, with caching.
-
-        Args:
-            indices: List of index names to fetch. Options: 'sp500', 'nasdaq100', 'russell2000'
-                    If None, fetches all indices.
-            deduplicate: If True, removes duplicate tickers across indices
-            force_refresh: If True, bypasses cache and fetches fresh data
-
-        Returns:
-            List of unique ticker symbols
-        """
         # Check cache first (unless force refresh)
         if not force_refresh:
             cache_data = self._load_cache()
@@ -296,20 +255,9 @@ class IndexTickerFetcher:
         return all_tickers
 
     def get_tickers_by_index(self, index_name: str, force_refresh: bool = False) -> List[str]:
-        """
-        Get tickers for a specific index.
-
-        Args:
-            index_name: Index name ('sp500', 'nasdaq100', 'russell2000')
-            force_refresh: If True, bypasses cache
-
-        Returns:
-            List of ticker symbols for the specified index
-        """
         return self.get_all_tickers(indices=[index_name], deduplicate=False, force_refresh=force_refresh)
 
     def clear_cache(self) -> None:
-        """Clear the ticker cache."""
         if self.cache_file.exists():
             self.cache_file.unlink()
             print("Ticker cache cleared")
@@ -320,7 +268,6 @@ _fetcher_instance: Optional[IndexTickerFetcher] = None
 
 
 def get_fetcher() -> IndexTickerFetcher:
-    """Get or create the singleton fetcher instance."""
     global _fetcher_instance
     if _fetcher_instance is None:
         _fetcher_instance = IndexTickerFetcher()
@@ -331,31 +278,18 @@ def get_all_index_tickers(
     indices: Optional[List[str]] = None,
     force_refresh: bool = False
 ) -> List[str]:
-    """
-    Get all tickers from major indices with daily caching.
-
-    Args:
-        indices: Optional list of indices to fetch ('sp500', 'nasdaq100', 'russell2000')
-        force_refresh: If True, fetch fresh data ignoring cache
-
-    Returns:
-        List of unique ticker symbols from all specified indices
-    """
     return get_fetcher().get_all_tickers(indices=indices, force_refresh=force_refresh)
 
 
 def get_sp500_tickers(force_refresh: bool = False) -> List[str]:
-    """Get S&P 500 constituent tickers."""
     return get_fetcher().get_tickers_by_index("sp500", force_refresh=force_refresh)
 
 
 def get_nasdaq100_tickers(force_refresh: bool = False) -> List[str]:
-    """Get Nasdaq 100 constituent tickers."""
     return get_fetcher().get_tickers_by_index("nasdaq100", force_refresh=force_refresh)
 
 
 def get_russell2000_tickers(force_refresh: bool = False) -> List[str]:
-    """Get Russell 2000 constituent tickers."""
     return get_fetcher().get_tickers_by_index("russell2000", force_refresh=force_refresh)
 
 
