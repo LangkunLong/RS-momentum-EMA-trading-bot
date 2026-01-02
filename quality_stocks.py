@@ -1,11 +1,3 @@
-"""
-Quality Stocks Module
-
-Provides stock lists from major indices for CANSLIM screening.
-Fetches tickers from S&P 500, Nasdaq 100, and Russell 2000 indices
-with daily caching to minimize API calls.
-"""
-
 from typing import List, Optional
 
 from core.index_ticker_fetcher import (
@@ -52,35 +44,6 @@ def get_quality_stock_list(
     sectors: Optional[List[str]] = None,
     force_refresh: bool = False
 ) -> List[str]:
-    """
-    Get a list of quality stocks from major indices.
-
-    This function fetches tickers from S&P 500, Nasdaq 100, and Russell 2000
-    indices. Results are cached daily to avoid repeated fetches.
-
-    Args:
-        sectors: Optional list of indices/categories to include.
-                 Options: 'sp500', 'nasdaq100', 'russell2000', 'large_cap',
-                          'small_cap', 'all', or legacy sector names.
-                 If None, returns all tickers from all major indices.
-        force_refresh: If True, bypasses cache and fetches fresh data.
-
-    Returns:
-        List of unique stock ticker symbols.
-
-    Examples:
-        >>> # Get all tickers from all indices
-        >>> tickers = get_quality_stock_list()
-
-        >>> # Get only S&P 500 tickers
-        >>> sp500 = get_quality_stock_list(sectors=['sp500'])
-
-        >>> # Get large-cap stocks (S&P 500 + Nasdaq 100)
-        >>> large_caps = get_quality_stock_list(sectors=['large_cap'])
-
-        >>> # Get small-cap stocks (Russell 2000)
-        >>> small_caps = get_quality_stock_list(sectors=['small_cap'])
-    """
     # If no sectors specified, return all indices
     if sectors is None:
         return get_all_index_tickers(force_refresh=force_refresh)
@@ -110,16 +73,6 @@ def get_quality_stock_list(
 
 
 def get_index_tickers(index_name: str, force_refresh: bool = False) -> List[str]:
-    """
-    Get tickers for a specific index.
-
-    Args:
-        index_name: One of 'sp500', 'nasdaq100', 'russell2000'
-        force_refresh: If True, bypasses cache
-
-    Returns:
-        List of ticker symbols for the specified index
-    """
     index_lower = index_name.lower().strip()
 
     if index_lower in ["sp500", "s&p500", "s&p 500"]:
@@ -144,7 +97,6 @@ def get_available_indices() -> List[str]:
 
 
 def get_available_categories() -> dict:
-    """Get available categories and their descriptions."""
     return {
         "sp500": "S&P 500 - Large-cap US stocks",
         "nasdaq100": "Nasdaq 100 - Large-cap tech-focused stocks",
