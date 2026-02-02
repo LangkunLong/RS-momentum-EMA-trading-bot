@@ -176,6 +176,13 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
         print(
             f"Market Direction ({market_trend.symbol}): {direction} | Score: {market_trend.score * 100:.0f}%"
         )
+        if hasattr(market_trend, 'distribution_days'):
+            dist_status = "WARNING" if market_trend.distribution_days >= 5 else "OK"
+            ftd_status = "Yes" if market_trend.follow_through else "No"
+            print(
+                f"Distribution Days (25d): {market_trend.distribution_days} [{dist_status}] | "
+                f"Follow-Through Day: {ftd_status}"
+            )
         if market_trend.latest_close is not None:
             print(
                 f"Latest Close: ${market_trend.latest_close:.2f} | "
@@ -185,9 +192,9 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
             )
 
     component_labels = {
-        "C": "Current earnings",
-        "A": "Annual earnings",
-        "N": "New product/price leadership",
+        "C": "Current earnings (YoY)",
+        "A": "Annual earnings (multi-yr)",
+        "N": "New highs / revenue",
         "S": "Supply & demand",
         "L": "Leader vs laggard",
         "I": "Institutional sponsorship",
@@ -198,6 +205,11 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
         if value is None or (isinstance(value, float) and pd.isna(value)):
             return "n/a"
         return f"{value:.{precision}f}"
+
+    def _fmt_pct(value: Optional[float]) -> str:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "n/a"
+        return f"{value * 100:.1f}%"
 
     for idx, result in enumerate(results, start=1):
         print(f"\n{idx}. {result['symbol']}")
@@ -212,13 +224,24 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
         metrics = result["metrics"]
         print(
             "   Fundamentals: "
-            f"Quarterly EPS Growth {_fmt(metrics['current_growth'])} | "
-            f"Annual EPS Growth {_fmt(metrics['annual_growth'])} | "
-            f"Revenue Growth {_fmt(metrics['revenue_growth'])}"
+            f"Quarterly EPS Growth {_fmt_pct(metrics['current_growth'])} | "
+            f"Annual EPS Growth {_fmt_pct(metrics['annual_growth'])} | "
+            f"Revenue Growth {_fmt_pct(metrics['revenue_growth'])} | "
+            f"ROE {_fmt_pct(metrics.get('roe'))}"
         )
+
+        s_metrics = metrics.get('s_metrics', {})
+        market = result.get('market_trend')
+        dist_info = ""
+        if market and hasattr(market, 'distribution_days'):
+            dist_info = f" | Dist Days: {market.distribution_days}"
+            if market.follow_through:
+                dist_info += " | FTD: Yes"
+
         print(
             "   Technicals: "
             f"Avg Volume (50d) {_fmt(metrics['avg_volume_50'], 0)} | "
-            f"Turnover Ratio {_fmt(metrics['turnover_ratio'])} | "
-            f"52w High Proximity {_fmt(metrics['proximity_to_high'])}"
+            f"52w Proximity {_fmt(metrics['proximity_to_high'])} | "
+            f"Up/Down Vol {_fmt(s_metrics.get('up_down_volume_ratio'))}"
+            f"{dist_info}"
         )
