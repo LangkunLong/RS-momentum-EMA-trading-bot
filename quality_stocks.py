@@ -50,16 +50,18 @@ def get_quality_stock_list(
 
 
 def get_index_tickers(index_name: str, force_refresh: bool = False) -> List[str]:
+    """Resolve an index name (or alias like 'large_cap') to a list of tickers."""
     index_lower = index_name.lower().strip()
 
-    if index_lower in ["sp500", "s&p500", "s&p 500"]:
-        return get_sp500_tickers(force_refresh=force_refresh)
-    elif index_lower in ["nasdaq100", "nasdaq 100", "nasdaq"]:
-        return get_nasdaq100_tickers(force_refresh=force_refresh)
-    elif index_lower in ["russell2000", "russell 2000", "russell"]:
-        return get_russell2000_tickers(force_refresh=force_refresh)
-    else:
-        raise ValueError(f"Unknown index: {index_name}. Use 'sp500', 'nasdaq100', or 'russell2000'.")
+    # Look up in the alias map first — handles combined categories like large_cap
+    indices = INDEX_ALIASES.get(index_lower)
+    if indices is None:
+        raise ValueError(
+            f"Unknown index: {index_name}. "
+            f"Available: {', '.join(sorted(INDEX_ALIASES.keys()))}"
+        )
+
+    return get_all_index_tickers(indices=indices, force_refresh=force_refresh)
 
 
 def refresh_ticker_cache() -> None:

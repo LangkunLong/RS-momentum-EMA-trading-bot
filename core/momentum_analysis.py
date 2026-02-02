@@ -6,21 +6,12 @@ import os
 import time
 
 from config import settings
+from core.index_ticker_fetcher import get_sp500_tickers as _fetch_sp500
 
-# use github csv instead 
+
 def get_sp500_tickers() -> list[str]:
-    print("Fetching S&P 500 ticker list from GitHub (reliable source)...")
-    url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-    try:
-        # Read directly into pandas
-        df = pd.read_csv(url)
-        tickers = df['Symbol'].tolist()
-        print(f"Found {len(tickers)} S&P 500 tickers.")
-        return tickers
-    except Exception as e:
-        print(f"Error fetching S&P 500 list: {e}")
-        # Fallback to a small list if everything fails, so code doesn't crash
-        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA']
+    """Fetch S&P 500 tickers via the shared IndexTickerFetcher (iShares CSV)."""
+    return _fetch_sp500()
 
 # Calculates the 12-month weighted performance for a single stock's data.
 def calculate_weighted_performance(

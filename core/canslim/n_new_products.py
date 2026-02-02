@@ -32,12 +32,15 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
 
 
 def _score_from_growth(growth: Optional[float], target: float) -> float:
-    """Convert revenue growth into a 0-1 score."""
+    """Convert revenue growth into a 0-1 score.
+
+    Meeting the target earns full credit (1.0). Negative growth = 0.
+    """
     if growth is None:
         return 0.0
 
     import numpy as np
-    return float(np.clip(growth / target, 0, 2) / 2)
+    return float(np.clip(growth / target, 0.0, 1.0))
 
 
 def _score_from_ratio(value: Optional[float], cap: float) -> float:

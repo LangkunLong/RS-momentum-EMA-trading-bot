@@ -40,7 +40,6 @@ def evaluate_canslim(
     a_growth_target: Optional[float] = None,
     n_revenue_weight: Optional[float] = None,
     n_proximity_weight: Optional[float] = None,
-    s_turnover_cap: Optional[float] = None,
     i_institutional_cap: Optional[float] = None
 ) -> Optional[Dict[str, object]]:
     """
@@ -55,7 +54,6 @@ def evaluate_canslim(
         a_growth_target: Target for annual earnings growth
         n_revenue_weight: Weight for revenue growth in N score
         n_proximity_weight: Weight for price proximity in N score
-        s_turnover_cap: Maximum turnover ratio for S score
         i_institutional_cap: Maximum institutional holding for I score
 
     Returns:
@@ -67,7 +65,6 @@ def evaluate_canslim(
     a_growth_target = a_growth_target or settings.A_GROWTH_TARGET
     n_revenue_weight = n_revenue_weight or settings.N_REVENUE_GROWTH_WEIGHT
     n_proximity_weight = n_proximity_weight or settings.N_PROXIMITY_TO_HIGH_WEIGHT
-    s_turnover_cap = s_turnover_cap or settings.S_TURNOVER_CAP
     i_institutional_cap = i_institutional_cap or settings.I_INSTITUTIONAL_CAP
 
     ticker = yf.Ticker(symbol)
@@ -162,29 +159,42 @@ def evaluate_canslim(
         "M": score_m
     }
 
-    # 6. DYNAMIC SCORING: Calculate weighted average based on available data
-    # We always have L, M, and usually S and N (price based).
-    # If C and A are 0.0 due to missing data (not bad data), we re-weight.
+    # 6. O'Neil-faithful scoring
+    #
+    # Market direction (M) is a GATEKEEPER: O'Neil insists you only buy in
+    # confirmed uptrends.  When the market is not bullish the composite score
+    # is capped at 50 (never "passing") so the stock is filtered out downstream.
+    #
+    # Fundamentals (C + A) are REQUIRED: O'Neil's system is earnings-first.
+    # If we cannot obtain *any* earnings data for a stock, we mark it with
+    # has_fundamentals=False and cap the score at 40 so it won't pass the
+    # default MIN_CANSLIM_SCORE of 70.
 
     has_fundamentals = (current_growth is not None or annual_growth is not None)
 
-    if has_fundamentals:
-        # Full CANSLIM score with all 7 components
-        total_score = float(sum(scores.values()) / 7 * 100)
-    else:
-        # Speculative/Technical Score: Normalize based on 5 components (exclude C and A)
-        partial_sum = scores["L"] + scores["M"] + scores["N"] + scores["S"] + scores["I"]
-        total_score = float(partial_sum / 5 * 100)
+    # Full CANSLIM: equal weight across all 7 components (each 0-1 → total 0-100)
+    total_score = float(sum(scores.values()) / 7 * 100)
+
+    # Gate 1: No fundamentals → hard cap
+    if not has_fundamentals:
+        total_score = min(total_score, 40.0)
+
+    # Gate 2: Bearish market → hard cap
+    if not market_trend.is_bullish:
+        total_score = min(total_score, 50.0)
 
     # 7. Compile metrics for reporting
+    turnover_ratio = (avg_volume_50 / shares_outstanding) if shares_outstanding else None
     metrics = {
         "current_growth": current_growth,
         "annual_growth": annual_growth,
         "revenue_growth": revenue_growth,
-        "s_metrics": s_metrics,  # New: volume surge, breakout, power gap details
+        "s_metrics": s_metrics,
         "proximity_to_high": proximity_to_high,
         "avg_volume_50": avg_volume_50,
-        "has_fundamentals": has_fundamentals
+        "turnover_ratio": turnover_ratio,
+        "has_fundamentals": has_fundamentals,
+        "market_bullish": market_trend.is_bullish
     }
 
     return {
