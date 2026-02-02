@@ -274,18 +274,46 @@ def evaluate_s(
     surge_breakout_score = 0.5 * volume_score + 0.5 * breakout_score
 
     # --- Component 4: Power Earnings Gap ---
+    # O'Neil considers PEGs among the strongest buy signals. A stock that gaps up
+    # on massive volume (often post-earnings) shows overwhelming institutional demand.
+    # The stronger the volume surge on the gap day, the more significant the signal.
     has_power_gap, gap_details = _detect_power_earnings_gap(
         price_history, lookback_days=s_power_gap_lookback
     )
-    power_gap_score = 1.0 if has_power_gap else 0.0
+
+    power_gap_score = 0.0
+    if has_power_gap and gap_details:
+        # Scale PEG score by the intensity of the volume surge on the gap day
+        # A 1.5x volume gap is decent; a 3x+ volume gap is exceptional
+        gap_vol_ratio = gap_details.get('volume_ratio', 1.5)
+        gap_size = gap_details.get('gap_size', 0.02)
+
+        # Volume intensity: 1.5x = base, 3x+ = max
+        vol_intensity = float(np.clip((gap_vol_ratio - 1.0) / 2.0, 0.5, 1.0))
+        # Gap size intensity: 2% = base, 5%+ = max
+        gap_intensity = float(np.clip(gap_size / 0.05, 0.4, 1.0))
+
+        power_gap_score = vol_intensity * gap_intensity
 
     # --- Weighted combination ---
-    score = (
-        settings.S_FLOAT_WEIGHT * float_score
-        + settings.S_UP_DOWN_VOL_WEIGHT * ud_score
-        + settings.S_SURGE_BREAKOUT_WEIGHT * surge_breakout_score
-        + settings.S_POWER_GAP_WEIGHT * power_gap_score
-    )
+    # When a Power Earnings Gap is detected, it dominates the S score
+    # because it's the strongest supply/demand signal per O'Neil
+    if has_power_gap:
+        # PEG detected: give it outsized weight (50%), reduce others proportionally
+        score = (
+            settings.S_FLOAT_WEIGHT * 0.5 * float_score
+            + settings.S_UP_DOWN_VOL_WEIGHT * 0.5 * ud_score
+            + settings.S_SURGE_BREAKOUT_WEIGHT * 0.5 * surge_breakout_score
+            + 0.50 * power_gap_score
+        )
+    else:
+        # No PEG: standard weights, power_gap contributes nothing
+        score = (
+            settings.S_FLOAT_WEIGHT * float_score
+            + settings.S_UP_DOWN_VOL_WEIGHT * ud_score
+            + settings.S_SURGE_BREAKOUT_WEIGHT * surge_breakout_score
+            + settings.S_POWER_GAP_WEIGHT * power_gap_score
+        )
     score = float(np.clip(score, 0, 1))
 
     # Compile metrics for reporting

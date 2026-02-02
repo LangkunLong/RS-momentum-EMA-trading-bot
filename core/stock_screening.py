@@ -238,10 +238,22 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
             if market.follow_through:
                 dist_info += " | FTD: Yes"
 
+        # Power Earnings Gap info
+        peg_info = ""
+        if s_metrics.get('has_power_gap') and s_metrics.get('power_gap_details'):
+            gap = s_metrics['power_gap_details']
+            peg_info = (
+                f"\n   ** POWER EARNINGS GAP: "
+                f"Gap {gap.get('gap_size', 0) * 100:.1f}% | "
+                f"Volume {gap.get('volume_ratio', 0):.1f}x avg | "
+                f"{gap.get('days_ago', 0)}d ago **"
+            )
+
         print(
             "   Technicals: "
             f"Avg Volume (50d) {_fmt(metrics['avg_volume_50'], 0)} | "
             f"52w Proximity {_fmt(metrics['proximity_to_high'])} | "
             f"Up/Down Vol {_fmt(s_metrics.get('up_down_volume_ratio'))}"
             f"{dist_info}"
+            f"{peg_info}"
         )

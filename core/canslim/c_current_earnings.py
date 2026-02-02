@@ -7,6 +7,11 @@ Per William O'Neil's CANSLIM methodology:
 - Look for accelerating quarterly earnings growth (each quarter better than the last)
 - The more quarters of strong growth, the better
 
+For IPO / recently public stocks with < 5 quarters of data:
+- Use whatever quarters are available
+- If only sequential comparison is possible, use it with a data-quality discount
+- O'Neil says IPOs can be great buys if initial earnings are strong and accelerating
+
 Priority: EPS (Basic or Diluted) first, then fallback to Net Income.
 """
 from __future__ import annotations
@@ -82,6 +87,23 @@ def _get_quarterly_yoy_growths(earnings: pd.Series) -> List[Optional[float]]:
     return growths
 
 
+def _get_sequential_growths(earnings: pd.Series) -> List[Optional[float]]:
+    """Calculate sequential quarter-over-quarter growth (for IPOs with < 5 quarters).
+
+    Args:
+        earnings: Time-sorted earnings series (oldest to newest).
+
+    Returns:
+        List of sequential growth rates (most recent first).
+    """
+    growths = []
+    n = len(earnings)
+    for i in range(n - 1, 0, -1):
+        growth = _safe_growth(earnings.iloc[i], earnings.iloc[i - 1])
+        growths.append(growth)
+    return growths
+
+
 def _check_acceleration(growths: List[Optional[float]]) -> float:
     """Check if earnings growth is accelerating (each quarter better than prior).
 
@@ -122,7 +144,13 @@ def evaluate_c(
     2. Prefer accelerating growth across recent quarters
     3. Multiple quarters of 25%+ growth is ideal
 
-    Scoring breakdown:
+    For IPO stocks with < 5 quarters:
+    - Use sequential growth as best-available proxy
+    - Apply a data-quality discount (IPO_DATA_DISCOUNT) since sequential
+      comparisons don't account for seasonality
+    - O'Neil notes IPOs can be strong buys on initial earnings momentum
+
+    Scoring breakdown (full data):
     - 60% weight: Most recent quarter YoY growth vs target
     - 20% weight: Consistency (how many of last 3 quarters show 25%+ growth)
     - 20% weight: Acceleration (are growth rates increasing?)
@@ -150,18 +178,35 @@ def evaluate_c(
         # Sort columns by date oldest→newest so iloc[-1] is most recent
         earnings = quarterly_income.loc[row_label].sort_index()
 
-        if len(earnings) < 5:
-            # Need at least 5 quarters for YoY (current + 4 back)
-            # Fallback: if we have at least 2, use what we have
-            if len(earnings) >= 2:
-                current_growth = _safe_growth(earnings.iloc[-1], earnings.iloc[-2])
-                if current_growth is None:
-                    return 0.0, None
-                growth_score = float(np.clip(current_growth / c_growth_target, 0, 2) / 2)
-                return growth_score, current_growth
+        if len(earnings) < 2:
             return 0.0, None
 
-        # --- O'Neil's methodology: Year-over-Year comparison ---
+        if len(earnings) < 5:
+            # --- IPO / Limited Data Path ---
+            # Not enough quarters for proper YoY. Use sequential growth
+            # with a discount factor since it doesn't control for seasonality.
+            seq_growths = _get_sequential_growths(earnings)
+            if not seq_growths or seq_growths[0] is None:
+                return 0.0, None
+
+            current_growth = seq_growths[0]
+
+            # Growth score (same formula, but sequential)
+            growth_score = float(np.clip(current_growth / c_growth_target, 0, 2) / 2)
+
+            # Acceleration check (if we have 3+ quarters of sequential data)
+            accel_score = _check_acceleration(seq_growths) if len(seq_growths) >= 2 else 0.5
+
+            # Weighted: emphasize growth more for IPOs since we lack consistency data
+            score = 0.70 * growth_score + 0.30 * accel_score
+
+            # Apply IPO data-quality discount — sequential isn't as reliable as YoY
+            score *= settings.C_IPO_DATA_DISCOUNT
+
+            score = float(np.clip(score, 0, 1))
+            return score, current_growth
+
+        # --- Standard Path: Year-over-Year comparison ---
         # Compare most recent quarter to same quarter last year (4 quarters back)
         yoy_growths = _get_quarterly_yoy_growths(earnings)
 

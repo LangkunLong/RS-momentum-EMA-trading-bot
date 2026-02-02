@@ -221,6 +221,20 @@ def evaluate_canslim(
             + (settings.CANSLIM_WEIGHT_M / tech_weight_sum) * score_m
         ) * 100
 
+    # 6b. POWER EARNINGS GAP BONUS
+    # O'Neil considers PEGs among the strongest buy signals in his entire
+    # methodology. A stock that gaps up on massive volume after earnings
+    # shows overwhelming institutional demand that overrides other factors.
+    # Apply a composite-level bonus when a PEG is detected.
+    has_power_gap = s_metrics.get('has_power_gap', False)
+    if has_power_gap:
+        gap_details = s_metrics.get('power_gap_details', {})
+        gap_vol_ratio = gap_details.get('volume_ratio', 1.5) if gap_details else 1.5
+        # Scale bonus by gap volume intensity: 1.5x = +5pts, 3x+ = +10pts
+        import numpy as np
+        peg_bonus = float(np.clip((gap_vol_ratio - 1.0) / 2.0, 0.25, 1.0)) * settings.PEG_COMPOSITE_BONUS
+        total_score = min(total_score + peg_bonus, 100.0)
+
     total_score = float(total_score)
 
     # 7. Compile metrics for reporting

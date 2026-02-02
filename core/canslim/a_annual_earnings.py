@@ -140,7 +140,12 @@ def evaluate_a(
     2. Consistency across multiple years is critical
     3. ROE should be 17% or higher
 
-    Scoring breakdown:
+    For IPO stocks with limited annual data (< 3 years):
+    - Score based on available years with a data-quality discount
+    - Shift weight from consistency (can't measure) to growth + ROE
+    - O'Neil still wants to see strong earnings even for new companies
+
+    Scoring breakdown (full data):
     - 50% weight: Most recent year's EPS growth vs target
     - 30% weight: Consistency (how many of last 3 years show 25%+ growth)
     - 20% weight: ROE score (17%+ = full score)
@@ -183,19 +188,10 @@ def evaluate_a(
 
         annual_growth = yoy_growths[0]  # Most recent year
 
-        # Component 1 (50%): Most recent year growth vs target
+        # Component 1: Most recent year growth vs target
         growth_score = float(np.clip(annual_growth / a_growth_target, 0, 2) / 2)
 
-        # Component 2 (30%): Consistency — how many of last 3 years show 25%+ growth
-        # O'Neil wants 3-5 years of consistent growth
-        valid_growths = [g for g in yoy_growths[:settings.A_MIN_YEARS_GROWTH] if g is not None]
-        if valid_growths:
-            years_above_target = sum(1 for g in valid_growths if g >= a_growth_target)
-            consistency_score = years_above_target / len(valid_growths)
-        else:
-            consistency_score = 0.0
-
-        # Component 3 (20%): ROE check — O'Neil requires 17%+ ROE
+        # Component 3: ROE check — O'Neil requires 17%+ ROE
         roe_score = 0.0
         if balance_sheet is not None and not balance_sheet.empty:
             roe = _calculate_roe(annual_income, balance_sheet)
@@ -203,14 +199,49 @@ def evaluate_a(
                 roe_target = settings.A_ROE_TARGET
                 roe_score = float(np.clip(roe / roe_target, 0, 2) / 2)
 
-        # Weighted combination
-        score = (
-            settings.A_GROWTH_WEIGHT * growth_score
-            + settings.A_CONSISTENCY_WEIGHT * consistency_score
-            + settings.A_ROE_WEIGHT * roe_score
-        )
-        score = float(np.clip(score, 0, 1))
+        # Determine if this is an IPO / limited data scenario
+        years_available = len(yoy_growths)
+        is_ipo = years_available < settings.A_MIN_YEARS_GROWTH
 
+        if is_ipo:
+            # --- IPO / Limited Data Path ---
+            # Can't properly assess multi-year consistency with < 3 years.
+            # Shift consistency weight to growth + ROE, apply discount.
+            valid_growths = [g for g in yoy_growths if g is not None]
+            if valid_growths:
+                years_above_target = sum(1 for g in valid_growths if g >= a_growth_target)
+                consistency_score = years_above_target / len(valid_growths)
+            else:
+                consistency_score = 0.0
+
+            # For IPOs: 60% growth, 15% consistency (limited), 25% ROE
+            score = (
+                0.60 * growth_score
+                + 0.15 * consistency_score
+                + 0.25 * roe_score
+            )
+
+            # Apply IPO data-quality discount
+            score *= settings.A_IPO_DATA_DISCOUNT
+
+        else:
+            # --- Standard Path: 3+ years of data ---
+            # Component 2: Consistency — how many of last 3 years show 25%+ growth
+            valid_growths = [g for g in yoy_growths[:settings.A_MIN_YEARS_GROWTH] if g is not None]
+            if valid_growths:
+                years_above_target = sum(1 for g in valid_growths if g >= a_growth_target)
+                consistency_score = years_above_target / len(valid_growths)
+            else:
+                consistency_score = 0.0
+
+            # Weighted combination
+            score = (
+                settings.A_GROWTH_WEIGHT * growth_score
+                + settings.A_CONSISTENCY_WEIGHT * consistency_score
+                + settings.A_ROE_WEIGHT * roe_score
+            )
+
+        score = float(np.clip(score, 0, 1))
         return score, annual_growth, roe
 
     except Exception:

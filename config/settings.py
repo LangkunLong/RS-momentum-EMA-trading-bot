@@ -77,6 +77,12 @@ CANSLIM_WEIGHT_L = 0.20             # Leader or laggard — critical
 CANSLIM_WEIGHT_I = 0.10             # Institutional sponsorship
 CANSLIM_WEIGHT_M = 0.15             # Market direction — critical (3/4 stocks follow market)
 
+# Power Earnings Gap composite bonus (added on top of weighted score)
+# O'Neil treats PEGs as one of the strongest buy signals in his methodology.
+# A stock gapping up on massive volume after earnings shows overwhelming
+# institutional demand. This bonus is scaled by the gap's volume intensity.
+PEG_COMPOSITE_BONUS = 10.0          # Max +10 points on composite score for a PEG
+
 
 # ==============================================================================
 # C (CURRENT QUARTERLY EARNINGS) PARAMETERS
@@ -88,6 +94,10 @@ C_GROWTH_TARGET = 0.25              # 25% YoY quarterly EPS growth target
 C_GROWTH_WEIGHT = 0.60              # Weight for current quarter growth vs target
 C_CONSISTENCY_WEIGHT = 0.20         # Weight for multiple quarters of 25%+ growth
 C_ACCELERATION_WEIGHT = 0.20        # Weight for accelerating growth rates
+
+# IPO / limited data handling
+C_IPO_DATA_DISCOUNT = 0.85          # Discount factor for IPO stocks with < 5 quarters
+                                    # Sequential comparison less reliable than YoY
 
 
 # ==============================================================================
@@ -102,6 +112,10 @@ A_MIN_YEARS_GROWTH = 3              # Check last 3 years for consistency
 A_GROWTH_WEIGHT = 0.50              # Weight for most recent year's growth
 A_CONSISTENCY_WEIGHT = 0.30         # Weight for multi-year consistency
 A_ROE_WEIGHT = 0.20                 # Weight for ROE check
+
+# IPO / limited data handling
+A_IPO_DATA_DISCOUNT = 0.80          # Discount factor for IPOs with < 3 years of data
+                                    # Can't assess multi-year consistency, so discount more
 
 
 # ==============================================================================
