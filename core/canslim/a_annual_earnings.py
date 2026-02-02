@@ -1,13 +1,17 @@
 """
 A - Annual Earnings Growth
 
-Evaluates the year-over-year growth in annual earnings.
-Consistent annual earnings growth (25%+) demonstrates sustainable business performance.
+Evaluates the year-over-year growth in annual earnings per share.
+Per William O'Neil's CANSLIM methodology:
+- Annual EPS should show 25%+ growth for each of the last 3-5 years
+- Consistency of growth across multiple years matters
+- Return on Equity (ROE) should be 17% or higher
+- Companies with erratic earnings (one good year, one bad) score lower
 
 Priority: EPS (Basic or Diluted) first, then fallback to Net Income.
 """
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, List
 import pandas as pd
 from config import settings
 
@@ -31,15 +35,6 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
         return (current - previous) / abs(previous)
     except ZeroDivisionError:
         return None
-
-
-def _score_from_growth(growth: Optional[float], target: float) -> float:
-    """Convert earnings growth into a 0-1 score."""
-    if growth is None:
-        return 0.0
-
-    import numpy as np
-    return float(np.clip(growth / target, 0, 2) / 2)
 
 
 def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
@@ -68,33 +63,155 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def evaluate_a(annual_income: pd.DataFrame, a_growth_target: Optional[float] = None) -> tuple[float, Optional[float]]:
+def _get_annual_growths(earnings: pd.Series) -> List[Optional[float]]:
+    """Calculate year-over-year growth for each available year.
+
+    Args:
+        earnings: Time-sorted annual earnings series (oldest to newest).
+
+    Returns:
+        List of YoY growth rates (most recent first).
+    """
+    growths = []
+    n = len(earnings)
+    for i in range(n - 1, 0, -1):
+        growth = _safe_growth(earnings.iloc[i], earnings.iloc[i - 1])
+        growths.append(growth)
+    return growths
+
+
+def _calculate_roe(annual_income: pd.DataFrame, balance_sheet: pd.DataFrame) -> Optional[float]:
+    """Calculate Return on Equity from financial statements.
+
+    ROE = Net Income / Shareholders' Equity
+
+    Args:
+        annual_income: Annual income statement DataFrame.
+        balance_sheet: Annual balance sheet DataFrame.
+
+    Returns:
+        ROE as a decimal (e.g., 0.20 = 20%), or None if unavailable.
+    """
+    try:
+        # Find net income
+        ni_mask = annual_income.index.str.contains(r'Net Income', case=False, regex=True)
+        if not ni_mask.any():
+            return None
+
+        ni_row = annual_income.index[ni_mask][0]
+        net_income_series = annual_income.loc[ni_row].sort_index()
+        net_income = float(net_income_series.iloc[-1])
+
+        # Find shareholders' equity
+        equity_patterns = [
+            r'Stockholders.? Equity',
+            r'Shareholders.? Equity',
+            r'Total Equity',
+            r'Common Stock Equity',
+        ]
+        equity_val = None
+        for pattern in equity_patterns:
+            eq_mask = balance_sheet.index.str.contains(pattern, case=False, regex=True)
+            if eq_mask.any():
+                eq_row = balance_sheet.index[eq_mask][0]
+                eq_series = balance_sheet.loc[eq_row].sort_index()
+                equity_val = float(eq_series.iloc[-1])
+                break
+
+        if equity_val is None or equity_val <= 0:
+            return None
+
+        return net_income / equity_val
+
+    except Exception:
+        return None
+
+
+def evaluate_a(
+    annual_income: pd.DataFrame,
+    a_growth_target: Optional[float] = None,
+    balance_sheet: Optional[pd.DataFrame] = None
+) -> tuple[float, Optional[float], Optional[float]]:
     """
     Evaluate A (Annual Earnings Growth) score.
+
+    Per O'Neil's methodology:
+    1. Annual EPS should be up 25%+ for each of the last 3-5 years
+    2. Consistency across multiple years is critical
+    3. ROE should be 17% or higher
+
+    Scoring breakdown:
+    - 50% weight: Most recent year's EPS growth vs target
+    - 30% weight: Consistency (how many of last 3 years show 25%+ growth)
+    - 20% weight: ROE score (17%+ = full score)
 
     Args:
         annual_income: Annual income statement DataFrame
         a_growth_target: Target growth rate (defaults to settings.A_GROWTH_TARGET)
+        balance_sheet: Annual balance sheet DataFrame for ROE calculation
 
     Returns:
-        tuple: (score, annual_growth) where score is 0-1 and annual_growth is decimal
+        tuple: (score, annual_growth, roe) where score is 0-1,
+               annual_growth is most recent year decimal,
+               roe is return on equity decimal
     """
+    import numpy as np
+
     a_growth_target = a_growth_target or settings.A_GROWTH_TARGET
     annual_growth = None
+    roe = None
 
     if annual_income.empty:
-        return 0.0, None
+        return 0.0, None, None
 
     try:
         row_label = _find_earnings_row(annual_income)
+        if row_label is None:
+            return 0.0, None, None
 
-        if row_label is not None:
-            # Sort columns by date oldest→newest so iloc[-1] is most recent
-            earnings = annual_income.loc[row_label].sort_index()
-            if len(earnings) >= 2:
-                annual_growth = _safe_growth(earnings.iloc[-1], earnings.iloc[-2])
+        # Sort columns by date oldest→newest so iloc[-1] is most recent
+        earnings = annual_income.loc[row_label].sort_index()
+
+        if len(earnings) < 2:
+            return 0.0, None, None
+
+        # Get year-over-year growth rates (most recent first)
+        yoy_growths = _get_annual_growths(earnings)
+
+        if not yoy_growths or yoy_growths[0] is None:
+            return 0.0, None, None
+
+        annual_growth = yoy_growths[0]  # Most recent year
+
+        # Component 1 (50%): Most recent year growth vs target
+        growth_score = float(np.clip(annual_growth / a_growth_target, 0, 2) / 2)
+
+        # Component 2 (30%): Consistency — how many of last 3 years show 25%+ growth
+        # O'Neil wants 3-5 years of consistent growth
+        valid_growths = [g for g in yoy_growths[:settings.A_MIN_YEARS_GROWTH] if g is not None]
+        if valid_growths:
+            years_above_target = sum(1 for g in valid_growths if g >= a_growth_target)
+            consistency_score = years_above_target / len(valid_growths)
+        else:
+            consistency_score = 0.0
+
+        # Component 3 (20%): ROE check — O'Neil requires 17%+ ROE
+        roe_score = 0.0
+        if balance_sheet is not None and not balance_sheet.empty:
+            roe = _calculate_roe(annual_income, balance_sheet)
+            if roe is not None:
+                roe_target = settings.A_ROE_TARGET
+                roe_score = float(np.clip(roe / roe_target, 0, 2) / 2)
+
+        # Weighted combination
+        score = (
+            settings.A_GROWTH_WEIGHT * growth_score
+            + settings.A_CONSISTENCY_WEIGHT * consistency_score
+            + settings.A_ROE_WEIGHT * roe_score
+        )
+        score = float(np.clip(score, 0, 1))
+
+        return score, annual_growth, roe
+
     except Exception:
-        pass
-
-    score = _score_from_growth(annual_growth, a_growth_target)
-    return score, annual_growth
+        return 0.0, annual_growth, roe

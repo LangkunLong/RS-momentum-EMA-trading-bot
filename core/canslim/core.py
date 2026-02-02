@@ -2,13 +2,15 @@
 Core CANSLIM evaluation that combines all seven components.
 
 This module orchestrates the evaluation of all CANSLIM criteria:
-C - Current quarterly earnings growth
-A - Annual earnings growth
-N - New products/price leadership
-S - Supply and demand dynamics
+C - Current quarterly earnings growth (YoY, with acceleration)
+A - Annual earnings growth (multi-year consistency, ROE)
+N - New products/price leadership (new highs emphasis)
+S - Supply and demand dynamics (float, up/down volume, breakouts)
 L - Leader or laggard (relative strength)
-I - Institutional sponsorship
-M - Market direction
+I - Institutional sponsorship (sweet-spot ownership, trend)
+M - Market direction (distribution days, follow-through, EMA trend)
+
+Composite scoring uses O'Neil-weighted averages, not equal weights.
 """
 from __future__ import annotations
 from typing import Dict, Optional
@@ -46,6 +48,11 @@ def evaluate_canslim(
     """
     Evaluate all CANSLIM components for a given stock.
 
+    Uses O'Neil's weighted scoring:
+    - C (20%), A (15%), L (20%) are weighted highest (earnings + leadership)
+    - M (15%) is also critical (3/4 stocks follow the market)
+    - N (10%), S (10%), I (10%) provide supporting evidence
+
     Args:
         symbol: Stock ticker symbol
         rs_scores_df: DataFrame containing pre-calculated RS scores
@@ -55,8 +62,8 @@ def evaluate_canslim(
         a_growth_target: Target for annual earnings growth
         n_revenue_weight: Weight for revenue growth in N score
         n_proximity_weight: Weight for price proximity in N score
-        s_turnover_cap: Maximum turnover ratio for S score
-        i_institutional_cap: Maximum institutional holding for I score
+        s_turnover_cap: Legacy parameter (unused)
+        i_institutional_cap: Legacy parameter (unused)
 
     Returns:
         Dict containing CANSLIM scores and metrics, or None if evaluation fails
@@ -67,8 +74,6 @@ def evaluate_canslim(
     a_growth_target = a_growth_target or settings.A_GROWTH_TARGET
     n_revenue_weight = n_revenue_weight or settings.N_REVENUE_GROWTH_WEIGHT
     n_proximity_weight = n_proximity_weight or settings.N_PROXIMITY_TO_HIGH_WEIGHT
-    s_turnover_cap = s_turnover_cap or settings.S_TURNOVER_CAP
-    i_institutional_cap = i_institutional_cap or settings.I_INSTITUTIONAL_CAP
 
     ticker = yf.Ticker(symbol)
 
@@ -83,6 +88,12 @@ def evaluate_canslim(
         except Exception:
             quarterly_income = pd.DataFrame()
             annual_income = pd.DataFrame()
+
+        # Fetch balance sheet for ROE calculation (A criterion)
+        try:
+            balance_sheet = ticker.balance_sheet
+        except Exception:
+            balance_sheet = pd.DataFrame()
     except Exception as e:
         print(f"Data fetch error for {symbol}: {e}")
         return None
@@ -104,7 +115,7 @@ def evaluate_canslim(
     high_52 = coerce_scalar(closes.max())
     proximity_to_high = latest_close / high_52 if high_52 else 0.0
 
-    # Volume & Turnover
+    # Volume
     volume_series = extract_float_series(price_history, "Volume")
     avg_volume_50 = float(volume_series.tail(50).mean()) if not volume_series.empty else 0.0
 
@@ -117,13 +128,13 @@ def evaluate_canslim(
 
     # 4. Evaluate Each CANSLIM Component
 
-    # C - Current Quarterly Earnings
+    # C - Current Quarterly Earnings (YoY with acceleration)
     score_c, current_growth = evaluate_c(quarterly_income, c_growth_target)
 
-    # A - Annual Earnings
-    score_a, annual_growth = evaluate_a(annual_income, a_growth_target)
+    # A - Annual Earnings (multi-year consistency + ROE)
+    score_a, annual_growth, roe = evaluate_a(annual_income, a_growth_target, balance_sheet)
 
-    # N - New Products/Price Leadership
+    # N - New Products/Price Leadership (emphasis on new highs)
     score_n, revenue_growth = evaluate_n(
         quarterly_income,
         proximity_to_high,
@@ -131,22 +142,37 @@ def evaluate_canslim(
         n_proximity_weight
     )
 
-    # S - Supply and Demand
+    # S - Supply and Demand (float, up/down volume, breakout, power gap)
     score_s, s_metrics = evaluate_s(
         price_history,
         avg_volume_50,
         latest_close,
-        high_52
+        high_52,
+        shares_outstanding
     )
 
     # L - Leader or Laggard
     score_l, rs_score = evaluate_l(symbol, rs_scores_df)
 
-    # I - Institutional Sponsorship
+    # I - Institutional Sponsorship (sweet-spot + trend)
     held_percent_institutions = None
+    num_institutional_holders = None
     if hasattr(info, 'held_percent_institutions'):
         held_percent_institutions = info.held_percent_institutions
-    score_i = evaluate_i(held_percent_institutions, None, i_institutional_cap)
+    # Try to get number of institutional holders for trend analysis
+    try:
+        full_info = ticker.info
+        if 'heldPercentInstitutions' in full_info and held_percent_institutions is None:
+            held_percent_institutions = full_info['heldPercentInstitutions']
+        if 'institutionCount' in full_info:
+            num_institutional_holders = full_info['institutionCount']
+    except Exception:
+        pass
+
+    score_i = evaluate_i(
+        held_percent_institutions,
+        num_institutional_holders=num_institutional_holders
+    )
 
     # M - Market Direction
     score_m = market_trend.score
@@ -162,29 +188,52 @@ def evaluate_canslim(
         "M": score_m
     }
 
-    # 6. DYNAMIC SCORING: Calculate weighted average based on available data
-    # We always have L, M, and usually S and N (price based).
-    # If C and A are 0.0 due to missing data (not bad data), we re-weight.
-
+    # 6. WEIGHTED SCORING per O'Neil's methodology
+    # C, A, and L are the most critical factors
     has_fundamentals = (current_growth is not None or annual_growth is not None)
 
     if has_fundamentals:
-        # Full CANSLIM score with all 7 components
-        total_score = float(sum(scores.values()) / 7 * 100)
+        # Full CANSLIM score with O'Neil-weighted components
+        total_score = (
+            settings.CANSLIM_WEIGHT_C * score_c
+            + settings.CANSLIM_WEIGHT_A * score_a
+            + settings.CANSLIM_WEIGHT_N * score_n
+            + settings.CANSLIM_WEIGHT_S * score_s
+            + settings.CANSLIM_WEIGHT_L * score_l
+            + settings.CANSLIM_WEIGHT_I * score_i
+            + settings.CANSLIM_WEIGHT_M * score_m
+        ) * 100
     else:
-        # Speculative/Technical Score: Normalize based on 5 components (exclude C and A)
-        partial_sum = scores["L"] + scores["M"] + scores["N"] + scores["S"] + scores["I"]
-        total_score = float(partial_sum / 5 * 100)
+        # Technical-only score: redistribute C and A weights to L and M
+        # When fundamentals are missing, leadership and market direction matter more
+        tech_weight_sum = (
+            settings.CANSLIM_WEIGHT_N
+            + settings.CANSLIM_WEIGHT_S
+            + settings.CANSLIM_WEIGHT_L
+            + settings.CANSLIM_WEIGHT_I
+            + settings.CANSLIM_WEIGHT_M
+        )
+        total_score = (
+            (settings.CANSLIM_WEIGHT_N / tech_weight_sum) * score_n
+            + (settings.CANSLIM_WEIGHT_S / tech_weight_sum) * score_s
+            + (settings.CANSLIM_WEIGHT_L / tech_weight_sum) * score_l
+            + (settings.CANSLIM_WEIGHT_I / tech_weight_sum) * score_i
+            + (settings.CANSLIM_WEIGHT_M / tech_weight_sum) * score_m
+        ) * 100
+
+    total_score = float(total_score)
 
     # 7. Compile metrics for reporting
     metrics = {
         "current_growth": current_growth,
         "annual_growth": annual_growth,
         "revenue_growth": revenue_growth,
-        "s_metrics": s_metrics,  # New: volume surge, breakout, power gap details
+        "roe": roe,
+        "s_metrics": s_metrics,
         "proximity_to_high": proximity_to_high,
         "avg_volume_50": avg_volume_50,
-        "has_fundamentals": has_fundamentals
+        "has_fundamentals": has_fundamentals,
+        "shares_outstanding": shares_outstanding,
     }
 
     return {
