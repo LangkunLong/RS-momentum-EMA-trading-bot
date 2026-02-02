@@ -1,8 +1,14 @@
 """
 N - New Products, New Management, New Highs
 
-Evaluates innovative products/services through revenue growth and price leadership
-(proximity to 52-week highs). Companies making new highs often have new catalysts.
+Per William O'Neil's CANSLIM methodology:
+- Look for companies with a new product, new management, or new industry conditions
+- The stock should be emerging from a proper chart base pattern
+- Stock should be making or near NEW 52-week highs (O'Neil heavily emphasizes this)
+- Revenue growth validates the "new" catalyst
+
+O'Neil says: "It takes something new to produce a startling advance in the price of a stock."
+The 52-week high proximity is the primary signal — stocks making new highs tend to go higher.
 """
 from __future__ import annotations
 from typing import Optional
@@ -40,15 +46,6 @@ def _score_from_growth(growth: Optional[float], target: float) -> float:
     return float(np.clip(growth / target, 0, 2) / 2)
 
 
-def _score_from_ratio(value: Optional[float], cap: float) -> float:
-    """Normalize ratio between 0 and provided max-limit cap."""
-    if value is None:
-        return 0.0
-
-    import numpy as np
-    return float(np.clip(value / cap, 0, 1))
-
-
 def evaluate_n(
     quarterly_income: pd.DataFrame,
     proximity_to_high: float,
@@ -57,6 +54,15 @@ def evaluate_n(
 ) -> tuple[float, Optional[float]]:
     """
     Evaluate N (New Products/Price Leadership) score.
+
+    Per O'Neil's methodology:
+    - Stocks making new 52-week highs are the primary signal (most stocks that
+      went on to make huge gains were already at new highs when they started)
+    - Revenue growth validates the catalyst driving the stock
+
+    Scoring:
+    - Proximity to 52-week high: 50% weight (O'Neil's emphasis on new highs)
+    - Revenue growth (YoY quarterly): 50% weight
 
     Args:
         quarterly_income: Quarterly income statement DataFrame
@@ -67,11 +73,13 @@ def evaluate_n(
     Returns:
         tuple: (score, revenue_growth) where score is 0-1 and revenue_growth is decimal
     """
+    import numpy as np
+
     n_revenue_weight = n_revenue_weight or settings.N_REVENUE_GROWTH_WEIGHT
     n_proximity_weight = n_proximity_weight or settings.N_PROXIMITY_TO_HIGH_WEIGHT
     revenue_growth = None
 
-    # Calculate revenue growth
+    # Calculate revenue growth (YoY quarterly)
     if not quarterly_income.empty:
         try:
             revenue_row = quarterly_income.index[
@@ -85,9 +93,29 @@ def evaluate_n(
         except Exception:
             pass
 
-    # Combine revenue growth and price proximity
-    revenue_score = _score_from_growth(revenue_growth, 0.2)  # 20% revenue growth target
-    proximity_score = _score_from_ratio(proximity_to_high, 1.05)  # Within 5% of high gets full score
+    # Revenue score: 25%+ quarterly revenue growth = full score
+    revenue_score = _score_from_growth(revenue_growth, settings.N_REVENUE_GROWTH_TARGET)
 
+    # Proximity score: O'Neil wants stocks at or near new 52-week highs
+    # Within 2% of high = full score, drops off steeply below 85%
+    if proximity_to_high is not None and proximity_to_high > 0:
+        if proximity_to_high >= 0.98:
+            # At or near new highs — full score
+            proximity_score = 1.0
+        elif proximity_to_high >= 0.90:
+            # Within 10% of high — partial credit, linear scale
+            proximity_score = (proximity_to_high - 0.90) / (0.98 - 0.90)
+        elif proximity_to_high >= 0.75:
+            # 10-25% off high — minimal credit
+            proximity_score = (proximity_to_high - 0.75) / (0.90 - 0.75) * 0.3
+        else:
+            # More than 25% off high — O'Neil would not be interested
+            proximity_score = 0.0
+    else:
+        proximity_score = 0.0
+
+    # Weighted combination
     score = float(n_revenue_weight * revenue_score + n_proximity_weight * proximity_score)
+    score = float(np.clip(score, 0, 1))
+
     return score, revenue_growth

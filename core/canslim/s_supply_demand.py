@@ -1,12 +1,15 @@
 """
 S - Supply and Demand
 
-Evaluates the balance of supply and demand through volume analysis:
-- Volume surges (especially on up days)
-- Heavy volume on breakouts
-- Power Earnings Gaps (gap-ups with heavy volume)
+Per William O'Neil's CANSLIM methodology:
+- Prefer stocks with a reasonable number of shares outstanding (tighter supply)
+- Look for big volume increases on price advances (institutional accumulation)
+- Volume should be above average on up days and below average on down days
+- Heavy volume breakouts near 52-week highs are bullish
+- Power Earnings Gaps (gap-ups with heavy volume) are strong signals
 
-Based on William O'Neil's CANSLIM methodology focusing on institutional accumulation.
+O'Neil says: "A stock with 5 billion shares outstanding is hard to move.
+Prefer companies with reasonable float that show increasing demand."
 """
 from __future__ import annotations
 from typing import Optional, Dict
@@ -124,36 +127,117 @@ def _detect_power_earnings_gap(
     return False, None
 
 
+def _calculate_up_down_volume_ratio(price_history: pd.DataFrame, lookback: int = 50) -> float:
+    """
+    Calculate the ratio of volume on up days vs down days.
+
+    O'Neil emphasizes that healthy accumulation shows heavy volume on up days
+    and lighter volume on down days. This is a key sign of institutional buying.
+
+    Args:
+        price_history: DataFrame with OHLCV data.
+        lookback: Number of days to analyze.
+
+    Returns:
+        Ratio of average up-day volume to average down-day volume.
+        Values > 1.0 indicate accumulation, < 1.0 indicate distribution.
+    """
+    if len(price_history) < lookback:
+        lookback = len(price_history)
+
+    recent = price_history.tail(lookback).copy()
+    closes = recent['Close']
+    volumes = recent['Volume']
+
+    daily_changes = closes.diff()
+
+    up_days = daily_changes > 0
+    down_days = daily_changes < 0
+
+    up_volume = volumes[up_days].mean() if up_days.any() else 0
+    down_volume = volumes[down_days].mean() if down_days.any() else 1
+
+    if down_volume == 0:
+        return 2.0  # Cap at 2.0 if no down volume
+
+    return min(up_volume / down_volume, 3.0)  # Cap at 3.0
+
+
+def _score_float_supply(shares_outstanding: Optional[float]) -> float:
+    """
+    Score based on shares outstanding / float size.
+
+    O'Neil prefers companies with a manageable number of shares outstanding.
+    Very large floats (billions of shares) make it harder for the stock to move.
+    Very small floats can be too volatile. A "sweet spot" exists.
+
+    Args:
+        shares_outstanding: Total shares outstanding.
+
+    Returns:
+        Score 0-1 based on float attractiveness.
+    """
+    if shares_outstanding is None or shares_outstanding <= 0:
+        return 0.5  # Neutral if unknown
+
+    # Convert to millions for readability
+    shares_millions = shares_outstanding / 1e6
+
+    # O'Neil's preference: moderate float
+    # < 50M shares: excellent (tight supply)
+    # 50-200M: good
+    # 200-500M: acceptable
+    # 500M-1B: below average
+    # > 1B: low score (too much supply)
+    if shares_millions < 50:
+        return 1.0
+    elif shares_millions < 200:
+        return 0.85
+    elif shares_millions < 500:
+        return 0.65
+    elif shares_millions < 1000:
+        return 0.4
+    else:
+        return 0.2
+
+
 def evaluate_s(
     price_history: pd.DataFrame,
     avg_volume_50: float,
     current_price: float,
     high_52week: float,
+    shares_outstanding: Optional[float] = None,
     s_volume_surge_threshold: Optional[float] = None,
     s_breakout_proximity: Optional[float] = None,
     s_power_gap_lookback: Optional[int] = None
 ) -> tuple[float, Dict[str, object]]:
     """
-    Evaluate S (Supply and Demand) score based on volume analysis.
+    Evaluate S (Supply and Demand) score.
 
-    Scoring components:
-    1. Volume surge detection (40%)
-    2. Breakout with heavy volume (40%)
-    3. Power Earnings Gap (20% bonus)
+    Per O'Neil's methodology:
+    1. Shares outstanding / float size (tighter supply = better)
+    2. Volume on up days vs down days (accumulation vs distribution)
+    3. Volume surges on breakouts
+    4. Power Earnings Gaps
+
+    Scoring breakdown:
+    - 25% weight: Float / shares outstanding (supply tightness)
+    - 25% weight: Up/down volume ratio (institutional accumulation)
+    - 30% weight: Volume surge + breakout detection
+    - 20% weight: Power Earnings Gap bonus
 
     Args:
         price_history: DataFrame with OHLCV data
         avg_volume_50: Average daily volume over 50 days
         current_price: Current closing price
         high_52week: 52-week high price
+        shares_outstanding: Total shares outstanding (for float analysis)
         s_volume_surge_threshold: Volume surge multiplier (default from settings)
         s_breakout_proximity: Proximity to 52-week high (default from settings)
         s_power_gap_lookback: Days to look back for power gaps (default from settings)
 
     Returns:
         tuple: (score, metrics_dict)
-            score: 0-1 based on volume and breakout characteristics
-            metrics_dict: Dictionary containing detection results and ratios
     """
     # Load defaults from settings
     s_volume_surge_threshold = s_volume_surge_threshold or settings.S_VOLUME_SURGE_THRESHOLD
@@ -163,36 +247,46 @@ def evaluate_s(
     # Get most recent volume
     recent_volume = float(price_history['Volume'].iloc[-1]) if len(price_history) > 0 else 0.0
 
-    # Detect volume surge
+    # --- Component 1: Float / Shares Outstanding ---
+    float_score = _score_float_supply(shares_outstanding)
+
+    # --- Component 2: Up/Down Volume Ratio ---
+    up_down_ratio = _calculate_up_down_volume_ratio(price_history)
+    # Ratio > 1.25 is good (more volume on up days), normalize to 0-1
+    if up_down_ratio >= 1.5:
+        ud_score = 1.0
+    elif up_down_ratio >= 1.0:
+        ud_score = (up_down_ratio - 1.0) / 0.5  # Linear 1.0-1.5 → 0-1
+    else:
+        ud_score = max(up_down_ratio - 0.5, 0.0) / 0.5 * 0.3  # Below 1.0 gets minimal credit
+
+    # --- Component 3: Volume Surge + Breakout ---
     has_volume_surge, volume_ratio = _detect_volume_surge(
-        recent_volume,
-        avg_volume_50,
-        s_volume_surge_threshold
+        recent_volume, avg_volume_50, s_volume_surge_threshold
     )
-
-    # Detect breakout
     is_breakout, proximity = _detect_breakout(
-        current_price,
-        high_52week,
-        s_breakout_proximity
+        current_price, high_52week, s_breakout_proximity
     )
 
-    # Detect Power Earnings Gap
+    # Volume + breakout combined score
+    volume_score = min(volume_ratio / s_volume_surge_threshold, 1.0) if avg_volume_50 > 0 else 0.0
+    breakout_score = 1.0 if is_breakout else max((proximity - 0.85) / (s_breakout_proximity - 0.85), 0)
+    surge_breakout_score = 0.5 * volume_score + 0.5 * breakout_score
+
+    # --- Component 4: Power Earnings Gap ---
     has_power_gap, gap_details = _detect_power_earnings_gap(
-        price_history,
-        lookback_days=s_power_gap_lookback
+        price_history, lookback_days=s_power_gap_lookback
     )
+    power_gap_score = 1.0 if has_power_gap else 0.0
 
-    # Calculate composite score
-    # Base score from volume surge and breakout
-    volume_score = 0.4 if has_volume_surge else min(volume_ratio / s_volume_surge_threshold * 0.4, 0.4)
-    breakout_score = 0.4 if is_breakout else max((proximity - 0.85) / (s_breakout_proximity - 0.85) * 0.4, 0)
-
-    # Bonus for Power Earnings Gap (can push score above 1.0)
-    power_gap_bonus = 0.2 if has_power_gap else 0.0
-
-    # Combine scores (cap at 1.0)
-    score = min(volume_score + breakout_score + power_gap_bonus, 1.0)
+    # --- Weighted combination ---
+    score = (
+        settings.S_FLOAT_WEIGHT * float_score
+        + settings.S_UP_DOWN_VOL_WEIGHT * ud_score
+        + settings.S_SURGE_BREAKOUT_WEIGHT * surge_breakout_score
+        + settings.S_POWER_GAP_WEIGHT * power_gap_score
+    )
+    score = float(np.clip(score, 0, 1))
 
     # Compile metrics for reporting
     metrics = {
@@ -203,7 +297,10 @@ def evaluate_s(
         'proximity_to_high': proximity,
         'is_breakout': is_breakout,
         'has_power_gap': has_power_gap,
-        'power_gap_details': gap_details
+        'power_gap_details': gap_details,
+        'up_down_volume_ratio': up_down_ratio,
+        'shares_outstanding': shares_outstanding,
+        'float_score': float_score,
     }
 
     return score, metrics
