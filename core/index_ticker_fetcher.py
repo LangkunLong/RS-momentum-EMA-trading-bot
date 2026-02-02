@@ -8,6 +8,7 @@ and caches them daily to avoid repeated API calls.
 import json
 import os
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -19,11 +20,82 @@ CACHE_DIR = Path("ticker_cache")
 CACHE_FILE = CACHE_DIR / "index_tickers_cache.json"
 CACHE_EXPIRY_HOURS = 24  # Cache expires after 24 hours
 
+# Candidate column names for ticker identification
+_TICKER_COLUMN_CANDIDATES = ['Ticker', 'ticker', 'Symbol', 'symbol', 'Constituent Symbol']
+
+# Fallback tickers when fetching fails
+_FALLBACK_TICKERS = ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL']
+
+
+def _find_ticker_column(df: pd.DataFrame) -> Optional[str]:
+    """Find a valid ticker column from a list of known candidates.
+
+    Args:
+        df: DataFrame parsed from iShares CSV.
+
+    Returns:
+        The matching column name, or None if no candidate matches.
+    """
+    for candidate in _TICKER_COLUMN_CANDIDATES:
+        if candidate in df.columns:
+            return candidate
+    # Fallback: case-insensitive substring search across all columns
+    for col in df.columns:
+        col_lower = col.strip().lower()
+        if col_lower in ('ticker', 'symbol') or 'ticker' in col_lower or 'symbol' in col_lower:
+            return col
+    return None
+
+
+def _parse_ishares_csv(response_text: str, index_name: str) -> List[str]:
+    """Parse an iShares CSV response into a list of ticker strings.
+
+    Args:
+        response_text: Raw CSV text from iShares.
+        index_name: Human-readable index name for log messages.
+
+    Returns:
+        List of cleaned ticker symbols, or _FALLBACK_TICKERS on failure.
+    """
+    try:
+        lines = response_text.split("\n")
+        # Find the header row — look for any candidate column name
+        header_idx = 0
+        for i, line in enumerate(lines):
+            line_lower = line.lower()
+            if any(c.lower() in line_lower for c in _TICKER_COLUMN_CANDIDATES):
+                header_idx = i
+                break
+
+        csv_content = "\n".join(lines[header_idx:])
+        df = pd.read_csv(StringIO(csv_content))
+
+        ticker_col = _find_ticker_column(df)
+        if ticker_col is None:
+            print(f"Error: Could not find a ticker column in {index_name} CSV. "
+                  f"Available columns: {list(df.columns)}. Using fallback tickers.")
+            return list(_FALLBACK_TICKERS)
+
+        tickers = df[ticker_col].dropna().tolist()
+        tickers = [str(t).strip().replace(".", "-") for t in tickers if isinstance(t, str) and str(t).strip()]
+        # Filter out non-ticker values
+        tickers = [t for t in tickers if t.isalpha() or "-" in t]
+
+        if not tickers:
+            print(f"Warning: Parsed 0 tickers from {index_name} CSV. Using fallback tickers.")
+            return list(_FALLBACK_TICKERS)
+
+        print(f"Fetched {len(tickers)} {index_name} tickers from iShares")
+        return tickers
+    except Exception as e:
+        print(f"Error parsing {index_name} CSV: {e}. Using fallback tickers.")
+        return list(_FALLBACK_TICKERS)
+
 
 class IndexTickerFetcher:
     """Fetches and caches stock tickers from major market indices."""
 
-    # Wikipedia URLs for index constituents
+    # iShares ETF CSV download URLs
     ISHARES_URL = {
         "sp500": "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund",
         "nasdaq100": "https://www.ishares.com/us/products/239696/ishares-nasdaq-100-etf/1467271812596.ajax?fileType=csv&fileName=QQQ_holdings&dataType=fund",
@@ -67,129 +139,41 @@ class IndexTickerFetcher:
         with open(self.cache_file, "w") as f:
             json.dump(data, f, indent=2)
 
-    def fetch_sp500_tickers(self) -> List[str]:
-        try:
-            url = self.ISHARES_URL["sp500"]
+    def _fetch_index_tickers(self, index_key: str, display_name: str) -> List[str]:
+        """Fetch tickers for a given index from iShares CSV.
 
+        Args:
+            index_key: Key into ISHARES_URL dict (e.g. 'sp500').
+            display_name: Human-readable name for logging.
+
+        Returns:
+            List of ticker symbols. Falls back to _FALLBACK_TICKERS on failure.
+        """
+        try:
+            url = self.ISHARES_URL[index_key]
             response = requests.get(url, timeout=30, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             })
 
             if response.status_code == 200:
-                # Parse CSV content
-                from io import StringIO
-                # Skip metadata rows at the top
-                lines = response.text.split("\n")
-                # Find the header row
-                header_idx = 0
-                for i, line in enumerate(lines):
-                    if "Ticker" in line or "ticker" in line.lower():
-                        header_idx = i
-                        break
-
-                csv_content = "\n".join(lines[header_idx:])
-                df = pd.read_csv(StringIO(csv_content))
-
-                # Find ticker column
-                ticker_col = None
-                for col in df.columns:
-                    if "ticker" in col.lower():
-                        ticker_col = col
-                        break
-
-                if ticker_col:
-                    tickers = df[ticker_col].dropna().tolist()
-                    tickers = [str(t).replace(".", "-") for t in tickers if isinstance(t, str) and t.strip()]
-                    # Filter out non-ticker values
-                    tickers = [t for t in tickers if t.isalpha() or "-" in t]
-                    print(f"Fetched {len(tickers)} sp 500 tickers from iShares")
-                    return tickers
+                return _parse_ishares_csv(response.text, display_name)
+            else:
+                print(f"Error: iShares returned status {response.status_code} for {display_name}. "
+                      f"Using fallback tickers.")
+                return list(_FALLBACK_TICKERS)
 
         except Exception as e:
-            print(f"Error fetching sp 500 from iShares: {e}")
+            print(f"Error fetching {display_name} from iShares: {e}. Using fallback tickers.")
+            return list(_FALLBACK_TICKERS)
+
+    def fetch_sp500_tickers(self) -> List[str]:
+        return self._fetch_index_tickers("sp500", "S&P 500")
 
     def fetch_nasdaq100_tickers(self) -> List[str]:
-        try:
-            url = self.ISHARES_URL["nasdaq100"]
-
-            response = requests.get(url, timeout=30, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            })
-
-            if response.status_code == 200:
-                # Parse CSV content
-                from io import StringIO
-                # Skip metadata rows at the top
-                lines = response.text.split("\n")
-                # Find the header row
-                header_idx = 0
-                for i, line in enumerate(lines):
-                    if "Ticker" in line or "ticker" in line.lower():
-                        header_idx = i
-                        break
-
-                csv_content = "\n".join(lines[header_idx:])
-                df = pd.read_csv(StringIO(csv_content))
-
-                # Find ticker column
-                ticker_col = None
-                for col in df.columns:
-                    if "ticker" in col.lower():
-                        ticker_col = col
-                        break
-
-                if ticker_col:
-                    tickers = df[ticker_col].dropna().tolist()
-                    tickers = [str(t).replace(".", "-") for t in tickers if isinstance(t, str) and t.strip()]
-                    # Filter out non-ticker values
-                    tickers = [t for t in tickers if t.isalpha() or "-" in t]
-                    print(f"Fetched {len(tickers)} Nasdaq 100 tickers from iShares")
-                    return tickers
-
-        except Exception as e:
-            print(f"Error fetching Nasdaq 100 from iShares: {e}")
-            
+        return self._fetch_index_tickers("nasdaq100", "Nasdaq 100")
 
     def fetch_russell2000_tickers(self) -> List[str]:
-        try:
-            url = self.ISHARES_URL["russell2000"]
-
-            response = requests.get(url, timeout=30, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            })
-
-            if response.status_code == 200:
-                # Parse CSV content
-                from io import StringIO
-                # Skip metadata rows at the top
-                lines = response.text.split("\n")
-                # Find the header row
-                header_idx = 0
-                for i, line in enumerate(lines):
-                    if "Ticker" in line or "ticker" in line.lower():
-                        header_idx = i
-                        break
-
-                csv_content = "\n".join(lines[header_idx:])
-                df = pd.read_csv(StringIO(csv_content))
-
-                # Find ticker column
-                ticker_col = None
-                for col in df.columns:
-                    if "ticker" in col.lower():
-                        ticker_col = col
-                        break
-
-                if ticker_col:
-                    tickers = df[ticker_col].dropna().tolist()
-                    tickers = [str(t).replace(".", "-") for t in tickers if isinstance(t, str) and t.strip()]
-                    # Filter out non-ticker values
-                    tickers = [t for t in tickers if t.isalpha() or "-" in t]
-                    print(f"Fetched {len(tickers)} Russell 2000 tickers from iShares")
-                    return tickers
-
-        except Exception as e:
-            print(f"Error fetching Russell 2000 from iShares: {e}")
+        return self._fetch_index_tickers("russell2000", "Russell 2000")
 
     def fetch_all_index_tickers(self, indices: Optional[List[str]] = None) -> Dict[str, List[str]]:
         if indices is None:

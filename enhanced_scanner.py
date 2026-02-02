@@ -172,7 +172,10 @@ if __name__ == "__main__":
         debug=DEBUG
     )
 
-    print_analysis_results(opportunities, market_trend)
+    if not opportunities:
+        print("No stocks met the strict CANSLIM criteria.")
+    else:
+        print_analysis_results(opportunities, market_trend)
 
     # Optionally export results to CSV
     # if opportunities:
