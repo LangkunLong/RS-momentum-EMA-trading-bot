@@ -416,7 +416,7 @@ def run_backtest() -> pd.DataFrame:
     print("\n[4/4] Running backtest evaluations...")
  
     end_date = datetime.now()
-    start_date = end_date - relativedelta(years=LOOKBACK_YEARS)
+    start_date = end_date - timedelta(days=LOOKBACK_YEARS * 365)
     eval_dates = []
     d = start_date
     while d <= end_date:
