@@ -6,13 +6,14 @@ filtering for stocks with strong fundamentals, technical strength, and market le
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
 from core.canslim import evaluate_canslim, evaluate_market_direction, MarketTrend
 from core.momentum_analysis import calculate_rs_scores_for_tickers
-from config.settings import MIN_RS_SCORE, MIN_CANSLIM_SCORE
+from config.settings import MIN_RS_SCORE, MIN_CANSLIM_SCORE, MAX_WORKERS
 
 
 def evaluate_stock_canslim(
@@ -102,24 +103,52 @@ def screen_stocks_canslim(
     results: List[Dict[str, object]] = []
 
     # Calculate RS scores for all symbols at once
-    rs_scores_df = calculate_rs_scores_for_tickers(list(symbols))
+    symbols_list = list(symbols)
+    rs_scores_df = calculate_rs_scores_for_tickers(symbols_list)
 
-    for symbol in symbols:
+    # Pre-filter: discard symbols whose RS score is already below the threshold
+    # to avoid wasting yfinance API calls on weak stocks
+    filtered_symbols = []
+    for symbol in symbols_list:
         try:
-            evaluation = evaluate_stock_canslim(
-                symbol=symbol,
+            if symbol in rs_scores_df.index:
+                rs_val = float(rs_scores_df.loc[symbol].get("RS_Score", 0))
+            elif symbol in rs_scores_df.columns:
+                rs_val = float(rs_scores_df[symbol].get("RS_Score", 0))
+            else:
+                rs_val = 0
+        except Exception:
+            rs_val = 0
+
+        if rs_val >= min_rs_score:
+            filtered_symbols.append(symbol)
+        elif debug:
+            print(f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < {min_rs_score}, skipped")
+
+    if debug:
+        print(f"[DEBUG] Pre-filter kept {len(filtered_symbols)}/{len(symbols_list)} symbols")
+
+    # Evaluate remaining symbols in parallel
+    def _evaluate(sym: str) -> Optional[Dict[str, object]]:
+        try:
+            return evaluate_stock_canslim(
+                symbol=sym,
                 min_rs_score=min_rs_score,
                 min_canslim_score=min_canslim_score,
                 market_trend=market_trend,
                 rs_scores_df=rs_scores_df,
-                debug=debug
+                debug=debug,
             )
         except Exception as exc:
-            print(f"Error analyzing {symbol}: {exc}")
-            evaluation = None
+            print(f"Error analyzing {sym}: {exc}")
+            return None
 
-        if evaluation:
-            results.append(evaluation)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_evaluate, sym): sym for sym in filtered_symbols}
+        for future in as_completed(futures):
+            evaluation = future.result()
+            if evaluation:
+                results.append(evaluation)
 
     # Sort by CANSLIM total score (highest first)
     results.sort(key=lambda x: x["total_score"], reverse=True)
