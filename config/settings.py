@@ -10,7 +10,7 @@ All configurable parameters are centralized here to avoid hardcoded values
 # Stock screening thresholds
 START_DATE = '2024-01-01'           # Analysis start date
 MIN_MARKET_CAP = 10e9               # Minimum market cap ($10 billion)
-MIN_RS_SCORE = 5                    # Minimum Relative Strength score (1-99)
+MIN_RS_SCORE = 80                   # Minimum Relative Strength score (1-99) — top 20%
 MIN_CANSLIM_SCORE = 70              # Minimum composite CANSLIM score (0-100)
 
 # Performance settings
@@ -19,7 +19,7 @@ CHUNK_SIZE = 50                     # Batch size for downloading stock data
 
 # Stock selection - Now fetches from major indices (S&P 500, Nasdaq 100, Russell 2000)
 USE_API = False                     # Use API vs index-based lists
-SECTORS = None                      # List of indices to scan (None = all indices)
+SECTORS = 'large_cap'               # Default to liquid large-cap stocks
                                     # Options: 'sp500', 'nasdaq100', 'russell2000',
                                     # 'large_cap' (S&P 500 + Nasdaq 100),
                                     # 'small_cap' (Russell 2000), 'all'
