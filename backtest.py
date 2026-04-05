@@ -97,9 +97,7 @@ def _calculate_rs_at_date(all_closes: pd.DataFrame, ticker: str, eval_date: pd.T
     return float(rs_score)
 
 
-def _evaluate_market_at_date(
-    spy_data: pd.DataFrame, eval_date: pd.Timestamp
-) -> Tuple[float, bool, int, bool]:
+def _evaluate_market_at_date(spy_data: pd.DataFrame, eval_date: pd.Timestamp) -> Tuple[float, bool, int, bool]:
     """Evaluate M (Market Direction) as-of a specific date using SPY data.
 
     Returns: (score, is_bullish, distribution_days, follow_through)
@@ -187,11 +185,17 @@ def _evaluate_technical_at_date(
     ticker_data: pd.DataFrame,
     eval_date: pd.Timestamp,
     shares_outstanding: Optional[float],
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     """Evaluate N and S technical criteria as-of a specific date."""
     sliced = ticker_data.loc[:eval_date].copy()
     if len(sliced) < 60:
-        return {"n_score": 0.0, "s_score": 0.0, "proximity": 0.0}
+        return {
+            "n_score": 0.0,
+            "s_score": 0.0,
+            "proximity": 0.0,
+            "is_breakout": False,
+            "has_volume_surge": False,
+        }
 
     closes = extract_float_series(sliced, "Close")
     volumes = extract_float_series(sliced, "Volume")
@@ -216,7 +220,7 @@ def _evaluate_technical_at_date(
     n_score = float(np.clip(proximity_score, 0, 1))
 
     # S score
-    score_s, _ = evaluate_s(sliced, avg_vol_50, latest_close, high_52, shares_outstanding)
+    score_s, s_metrics = evaluate_s(sliced, avg_vol_50, latest_close, high_52, shares_outstanding)
 
     return {
         "n_score": n_score,
@@ -225,6 +229,8 @@ def _evaluate_technical_at_date(
         "close": latest_close,
         "high_52": high_52,
         "avg_vol_50": avg_vol_50,
+        "is_breakout": s_metrics.get("is_breakout", False),
+        "has_volume_surge": s_metrics.get("has_volume_surge", False),
     }
 
 
@@ -392,9 +398,7 @@ def run_backtest() -> pd.DataFrame:
             c_score = fund.get("c_score", 0.0)
             a_score = fund.get("a_score", 0.0)
             i_score = fund.get("i_score", 0.1)
-            has_fundamentals = (
-                fund.get("current_growth") is not None or fund.get("annual_growth") is not None
-            )
+            has_fundamentals = fund.get("current_growth") is not None or fund.get("annual_growth") is not None
 
             # Composite CANSLIM score
             total = _compute_canslim_score(
@@ -408,7 +412,13 @@ def run_backtest() -> pd.DataFrame:
                 has_fundamentals=has_fundamentals,
             )
 
-            buy_signal = total >= settings.MIN_CANSLIM_SCORE and rs_score >= settings.MIN_RS_SCORE
+            buy_signal = (
+                total >= settings.MIN_CANSLIM_SCORE
+                and rs_score >= settings.MIN_RS_SCORE
+                and bool(m_bullish)
+                and bool(tech.get("is_breakout", False))
+                and bool(tech.get("has_volume_surge", False))
+            )
             close_price = tech["close"]
 
             records.append(
@@ -429,6 +439,8 @@ def run_backtest() -> pd.DataFrame:
                     "Mkt_Bullish": m_bullish,
                     "Dist_Days": dist_days,
                     "FTD": ftd,
+                    "Is_Breakout": tech.get("is_breakout", False),
+                    "Has_Vol_Surge": tech.get("has_volume_surge", False),
                     "BUY_SIGNAL": buy_signal,
                 }
             )

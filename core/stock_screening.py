@@ -23,6 +23,7 @@ def evaluate_stock_canslim(
     market_trend: MarketTrend,
     rs_scores_df: pd.DataFrame,
     debug: bool = False,
+    strict_breakout: bool = True,
 ) -> Optional[Dict[str, object]]:
     """Evaluate a single stock against CANSLIM criteria.
 
@@ -57,17 +58,30 @@ def evaluate_stock_canslim(
 
     total_score = float(canslim_view["total_score"])
     if debug:
-        print(
-            f"[DEBUG] CANSLIM Total Score: {total_score:.1f} | "
-            f"Minimum Required: {min_canslim_score:.1f}"
-        )
+        print(f"[DEBUG] CANSLIM Total Score: {total_score:.1f} | Minimum Required: {min_canslim_score:.1f}")
     if total_score < min_canslim_score:
         if debug:
             print("[DEBUG] Fails CANSLIM composite threshold.")
         return None
 
     if debug:
-        print(f"[DEBUG] ✓ {symbol} meets all CANSLIM criteria!")
+        print(f"[DEBUG] ✓ {symbol} meets fundamental CANSLIM criteria!")
+
+    if strict_breakout:
+        if not market_trend.is_bullish:
+            if debug:
+                print("[DEBUG] Fails strict entry: Market is not in confirmed uptrend (is_bullish=False).")
+            return None
+        if not canslim_view.get("is_breakout"):
+            if debug:
+                print("[DEBUG] Fails strict entry: Not breaking out near 52-week high.")
+            return None
+        if not canslim_view.get("has_volume_surge"):
+            if debug:
+                print("[DEBUG] Fails strict entry: No volume surge detected.")
+            return None
+        if debug:
+            print(f"[DEBUG] ✓ {symbol} meets strict breakout criteria!")
 
     return canslim_view
 
@@ -79,6 +93,7 @@ def screen_stocks_canslim(
     min_rs_score: float = MIN_RS_SCORE,
     min_canslim_score: float = MIN_CANSLIM_SCORE,
     debug: bool = False,
+    strict_breakout: bool = True,
 ) -> Tuple[List[Dict[str, object]], MarketTrend]:
     """Screen multiple stocks for CANSLIM characteristics.
 
@@ -106,10 +121,9 @@ def screen_stocks_canslim(
     filtered_symbols = []
     for symbol in symbols_list:
         try:
-            if symbol in rs_scores_df.index:
-                rs_val = float(rs_scores_df.loc[symbol].get("RS_Score", 0))
-            elif symbol in rs_scores_df.columns:
-                rs_val = float(rs_scores_df[symbol].get("RS_Score", 0))
+            match = rs_scores_df[rs_scores_df["Ticker"] == symbol]
+            if not match.empty:
+                rs_val = float(match.iloc[0]["RS_Score"])
             else:
                 rs_val = 0
         except Exception:
@@ -133,6 +147,7 @@ def screen_stocks_canslim(
                 market_trend=market_trend,
                 rs_scores_df=rs_scores_df,
                 debug=debug,
+                strict_breakout=strict_breakout,
             )
         except Exception as exc:
             print(f"Error analyzing {sym}: {exc}")
@@ -150,9 +165,7 @@ def screen_stocks_canslim(
     return results, market_trend
 
 
-def print_analysis_results(
-    results: List[Dict[str, object]], market_trend: Optional[MarketTrend] = None
-) -> None:
+def print_analysis_results(results: List[Dict[str, object]], market_trend: Optional[MarketTrend] = None) -> None:
     """Print CANSLIM analysis results in a formatted table.
 
     Args:
