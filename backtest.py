@@ -68,7 +68,14 @@ def _download_price_data(tickers: List[str], period: str = "3y") -> Dict[str, pd
 
 
 def _download_bulk_closes(tickers: List[str], period: str = "3y") -> pd.DataFrame:
-    """Download close prices for many tickers in bulk via Alpaca."""
+    """Download close prices for many tickers in bulk via Alpaca.
+
+    NOTE ON SURVIVORSHIP BIAS:
+    The default RS universe in this backtest is built from today's S&P 500
+    constituents (see run_backtest), not point-in-time index membership.
+    That means delisted/removed names from prior years are excluded, which
+    can inflate historical RS percentile ranks versus live-trade reality.
+    """
     print(f"  Downloading bulk close data for {len(tickers)} tickers...")
     return fetch_bulk_close_prices(tickers, period=period, chunk_size=settings.CHUNK_SIZE)
 
@@ -271,6 +278,7 @@ def run_backtest() -> pd.DataFrame:
 
     # --- Step 2: Download S&P 500 closes for RS ranking ---
     print("\n[2/3] Downloading S&P 500 universe for RS ranking...")
+    print("  NOTE: Using current S&P 500 members introduces survivorship bias in historical RS ranking.")
     sp500_tickers = get_sp500_tickers()
     all_rs_tickers = list(set(BACKTEST_TICKERS + sp500_tickers))
     all_closes = _download_bulk_closes(all_rs_tickers, period="3y")
