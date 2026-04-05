@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -102,6 +103,30 @@ def _period_to_days(period: str) -> int:
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
+_US_EASTERN = ZoneInfo("America/New_York")
+
+
+def _drop_incomplete_daily_bar(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop today's bar when the regular session has not closed in US/Eastern."""
+    if df.empty:
+        return df
+
+    now_et = datetime.now(tz=_US_EASTERN)
+    if now_et.weekday() >= 5 or now_et.hour >= 16:
+        return df
+
+    idx = df.index
+    if idx.tz is not None:
+        latest_bar_date_et = idx[-1].tz_convert(_US_EASTERN).date()
+    else:
+        latest_bar_date_et = idx[-1].tz_localize("UTC").tz_convert(_US_EASTERN).date()
+
+    if latest_bar_date_et == now_et.date():
+        return df.iloc[:-1]
+    return df
+
+
 def _get_fmp_session() -> requests.Session:
     """Create a requests session with built-in retry logic."""
     session = requests.Session()
@@ -110,7 +135,15 @@ def _get_fmp_session() -> requests.Session:
         backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504]
     )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
+    pool_size = max(settings.HTTP_MAX_WORKERS, settings.MAX_WORKERS, 10)
+    session.mount(
+        "https://",
+        HTTPAdapter(
+            max_retries=retries,
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+        ),
+    )
     return session
 
 _fmp_session = _get_fmp_session()
@@ -123,7 +156,15 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
 
     resp = _fmp_session.get(url, params=params, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+
+    if isinstance(data, dict):
+        error_msg = data.get("Error Message") or data.get("error") or data.get("message")
+        if error_msg:
+            print(f"FMP API warning ({endpoint}): {error_msg}")
+            return []
+
+    return data
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -162,14 +203,16 @@ def fetch_ohlcv(
     )
 
     barset = client.get_stock_bars(request_params)
-    df = barset.df
+    frames = [barset.df]
 
     while barset.next_page_token is not None:
         request_params.page_token = barset.next_page_token
         next_barset = client.get_stock_bars(request_params)
         if not next_barset.df.empty:
-            df = pd.concat([df, next_barset.df])
+            frames.append(next_barset.df)
         barset.next_page_token = next_barset.next_page_token
+
+    df = pd.concat(frames) if frames else pd.DataFrame()
 
     if df.empty:
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -195,6 +238,8 @@ def fetch_ohlcv(
     # Strip timezone to match yfinance tz-naive output
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
+
+    df = _drop_incomplete_daily_bar(df)
 
     df = df.astype(
         {
@@ -249,14 +294,16 @@ def fetch_bulk_close_prices(
                 adjustment=Adjustment.ALL,
             )
             barset = client.get_stock_bars(request_params)
-            df = barset.df
+            frames = [barset.df]
 
             while barset.next_page_token is not None:
                 request_params.page_token = barset.next_page_token
                 next_barset = client.get_stock_bars(request_params)
                 if not next_barset.df.empty:
-                    df = pd.concat([df, next_barset.df])
+                    frames.append(next_barset.df)
                 barset.next_page_token = next_barset.next_page_token
+
+            df = pd.concat(frames) if frames else pd.DataFrame()
 
             if df.empty:
                 print(f"  Batch {batch_num} returned empty data, skipping.")
@@ -267,6 +314,8 @@ def fetch_bulk_close_prices(
 
             if close_series.index.tz is not None:
                 close_series.index = close_series.index.tz_localize(None)
+
+            close_series = _drop_incomplete_daily_bar(close_series)
 
             all_frames.append(close_series)
             time.sleep(0.5)  # respect Alpaca rate limits
