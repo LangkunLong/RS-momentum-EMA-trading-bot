@@ -15,13 +15,16 @@ Composite scoring uses O'Neil-weighted averages, not equal weights.
 from __future__ import annotations
 from typing import Dict, Optional
 import pandas as pd
-import yfinance as yf
-
 from config import settings
-from core.yahoo_finance_helper import (
+from core.data_client import (
     coerce_scalar,
     extract_float_series,
     normalize_price_dataframe,
+    fetch_ohlcv,
+    fetch_quarterly_income_statement,
+    fetch_annual_income_statement,
+    fetch_balance_sheet,
+    fetch_company_info,
 )
 
 from .c_current_earnings import evaluate_c
@@ -75,23 +78,19 @@ def evaluate_canslim(
     n_revenue_weight = n_revenue_weight or settings.N_REVENUE_GROWTH_WEIGHT
     n_proximity_weight = n_proximity_weight or settings.N_PROXIMITY_TO_HIGH_WEIGHT
 
-    ticker = yf.Ticker(symbol)
-
-    # 1. Fetch Data with Error Handling
+    # 1. Fetch Fundamental Data with Error Handling
     try:
-        # Use fast_info for market cap/shares if available
-        info = ticker.fast_info
-        # Attempt to get financials, handle empty frames
+        company_info = fetch_company_info(symbol)
+
         try:
-            quarterly_income = ticker.quarterly_income_stmt
-            annual_income = ticker.income_stmt
+            quarterly_income = fetch_quarterly_income_statement(symbol)
+            annual_income = fetch_annual_income_statement(symbol)
         except Exception:
             quarterly_income = pd.DataFrame()
             annual_income = pd.DataFrame()
 
-        # Fetch balance sheet for ROE calculation (A criterion)
         try:
-            balance_sheet = ticker.balance_sheet
+            balance_sheet = fetch_balance_sheet(symbol)
         except Exception:
             balance_sheet = pd.DataFrame()
     except Exception as e:
@@ -101,7 +100,7 @@ def evaluate_canslim(
     # 2. Market Trend & Price History
     market_trend = market_trend or evaluate_m()
     try:
-        price_history = ticker.history(period=period, interval="1d", auto_adjust=True)
+        price_history = fetch_ohlcv(symbol, period=period)
     except Exception:
         return None
 
@@ -119,12 +118,8 @@ def evaluate_canslim(
     volume_series = extract_float_series(price_history, "Volume")
     avg_volume_50 = float(volume_series.tail(50).mean()) if not volume_series.empty else 0.0
 
-    # Robust Shares Outstanding Fetch
-    shares_outstanding = None
-    if hasattr(info, 'shares_outstanding'):
-        shares_outstanding = info.shares_outstanding
-    elif hasattr(ticker, 'info') and 'sharesOutstanding' in ticker.info:
-        shares_outstanding = ticker.info['sharesOutstanding']
+    # Shares Outstanding from FMP
+    shares_outstanding = company_info.get("shares_outstanding")
 
     # 4. Evaluate Each CANSLIM Component
 
@@ -155,19 +150,8 @@ def evaluate_canslim(
     score_l, rs_score = evaluate_l(symbol, rs_scores_df)
 
     # I - Institutional Sponsorship (sweet-spot + trend)
-    held_percent_institutions = None
-    num_institutional_holders = None
-    if hasattr(info, 'held_percent_institutions'):
-        held_percent_institutions = info.held_percent_institutions
-    # Try to get number of institutional holders for trend analysis
-    try:
-        full_info = ticker.info
-        if 'heldPercentInstitutions' in full_info and held_percent_institutions is None:
-            held_percent_institutions = full_info['heldPercentInstitutions']
-        if 'institutionCount' in full_info:
-            num_institutional_holders = full_info['institutionCount']
-    except Exception:
-        pass
+    held_percent_institutions = company_info.get("held_percent_institutions")
+    num_institutional_holders = company_info.get("institution_count")
 
     score_i = evaluate_i(
         held_percent_institutions,

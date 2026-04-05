@@ -16,12 +16,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from config import settings
-from core.yahoo_finance_helper import (
+from core.data_client import (
     coerce_scalar,
     extract_float_series,
     normalize_price_dataframe,
+    fetch_ohlcv,
 )
 
 
@@ -187,12 +187,7 @@ def evaluate_m(
     rising_lookback = rising_lookback or settings.M_50EMA_RISING_LOOKBACK
 
     try:
-        data = yf.download(
-            benchmark_symbol,
-            period=period,
-            interval="1d",
-            progress=False,
-        )
+        data = fetch_ohlcv(benchmark_symbol, period=period)
     except Exception:
         data = pd.DataFrame()
 

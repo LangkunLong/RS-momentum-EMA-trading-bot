@@ -15,27 +15,22 @@ Args:
 import pandas as pd
 from datetime import datetime
 from typing import Optional
-import yfinance as yf
 
-from core.yahoo_finance_helper import normalize_price_dataframe
+from core.data_client import validate_ticker
 from core.stock_screening import screen_stocks_canslim, print_analysis_results
 from quality_stocks import get_quality_stock_list, get_index_tickers
 from config import settings
 
 
 def is_valid_ticker(symbol, retries=1):
-    """Preprocess ticker symbol, check if available on yahoo finance."""
+    """Check if ticker is available on Alpaca."""
     for attempt in range(retries):
         try:
-            df = yf.download(symbol, period="5d", progress=False, auto_adjust=True)
-            df = normalize_price_dataframe(df)
-            if not df.empty and 'Close' in df.columns:
-                close_series = df['Close'].dropna()
-                if len(close_series) > 0:
-                    return True
+            if validate_ticker(symbol):
+                return True
         except Exception as e:
             if attempt == retries - 1:
-                print(f"Failed to get ticker '{symbol}' after {retries} attempts: {e}")
+                print(f"Failed to validate ticker '{symbol}' after {retries} attempts: {e}")
     return False
 
 
@@ -127,7 +122,7 @@ def export_results_to_csv(opportunities, filename=None):
             'Current_Growth': opp['metrics']['current_growth'],
             'Annual_Growth': opp['metrics']['annual_growth'],
             'Revenue_Growth': opp['metrics']['revenue_growth'],
-            'Turnover_Ratio': opp['metrics']['turnover_ratio'],
+            'Shares_Outstanding': opp['metrics']['shares_outstanding'],
             'Proximity_to_High': opp['metrics']['proximity_to_high'],
         }
         csv_data.append(row)
