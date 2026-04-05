@@ -366,10 +366,17 @@ def run_backtest() -> pd.DataFrame:
             has_peg_today = bool(tech.get("has_power_gap", False)) and peg_details.get("days_ago") == 0
 
             # A valid buy requires a bullish market AND (either a volume breakout OR a power earnings gap)
+            # buy_signal = (
+            #     total >= settings.MIN_CANSLIM_SCORE
+            #     and rs_score >= settings.MIN_RS_SCORE
+            #     and bool(m_bullish)
+            #     and ((has_breakout and has_surge) or has_peg_today)
+            # )
+            # Testing technicals only and disregarding bear market condition:
             buy_signal = (
-                total >= settings.MIN_CANSLIM_SCORE
+                total >= 40  # Lowered to account for missing free-tier API fundamentals
                 and rs_score >= settings.MIN_RS_SCORE
-                and bool(m_bullish)
+                # and bool(m_bullish)  <-- COMMENT THIS OUT to allow buys in bad markets
                 and ((has_breakout and has_surge) or has_peg_today)
             )
             close_price = tech["close"]
