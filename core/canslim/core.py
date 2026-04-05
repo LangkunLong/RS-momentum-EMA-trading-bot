@@ -161,37 +161,31 @@ def evaluate_canslim(
     }
 
     # 6. WEIGHTED SCORING per O'Neil's methodology
-    # C, A, and L are the most critical factors
+    # Dynamically re-normalize when one or both fundamentals are missing.
     has_fundamentals = current_growth is not None or annual_growth is not None
+    weights = {
+        "C": settings.CANSLIM_WEIGHT_C if current_growth is not None else 0.0,
+        "A": settings.CANSLIM_WEIGHT_A if annual_growth is not None else 0.0,
+        "N": settings.CANSLIM_WEIGHT_N,
+        "S": settings.CANSLIM_WEIGHT_S,
+        "L": settings.CANSLIM_WEIGHT_L,
+        "I": settings.CANSLIM_WEIGHT_I,
+        "M": settings.CANSLIM_WEIGHT_M,
+    }
+    total_active_weight = sum(weights.values())
 
-    if has_fundamentals:
-        # Full CANSLIM score with O'Neil-weighted components
+    if total_active_weight > 0:
         total_score = (
-            settings.CANSLIM_WEIGHT_C * score_c
-            + settings.CANSLIM_WEIGHT_A * score_a
-            + settings.CANSLIM_WEIGHT_N * score_n
-            + settings.CANSLIM_WEIGHT_S * score_s
-            + settings.CANSLIM_WEIGHT_L * score_l
-            + settings.CANSLIM_WEIGHT_I * score_i
-            + settings.CANSLIM_WEIGHT_M * score_m
+            (weights["C"] / total_active_weight) * score_c
+            + (weights["A"] / total_active_weight) * score_a
+            + (weights["N"] / total_active_weight) * score_n
+            + (weights["S"] / total_active_weight) * score_s
+            + (weights["L"] / total_active_weight) * score_l
+            + (weights["I"] / total_active_weight) * score_i
+            + (weights["M"] / total_active_weight) * score_m
         ) * 100
     else:
-        # Technical-only score: redistribute C and A weights to L and M
-        # When fundamentals are missing, leadership and market direction matter more
-        tech_weight_sum = (
-            settings.CANSLIM_WEIGHT_N
-            + settings.CANSLIM_WEIGHT_S
-            + settings.CANSLIM_WEIGHT_L
-            + settings.CANSLIM_WEIGHT_I
-            + settings.CANSLIM_WEIGHT_M
-        )
-        total_score = (
-            (settings.CANSLIM_WEIGHT_N / tech_weight_sum) * score_n
-            + (settings.CANSLIM_WEIGHT_S / tech_weight_sum) * score_s
-            + (settings.CANSLIM_WEIGHT_L / tech_weight_sum) * score_l
-            + (settings.CANSLIM_WEIGHT_I / tech_weight_sum) * score_i
-            + (settings.CANSLIM_WEIGHT_M / tech_weight_sum) * score_m
-        ) * 100
+        total_score = 0.0
 
     total_score = float(total_score)
 
