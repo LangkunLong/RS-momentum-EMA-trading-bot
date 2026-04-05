@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
+import re
+from bs4 import BeautifulSoup
 
 # Cache configuration
 CACHE_DIR = Path("ticker_cache")
@@ -101,18 +103,9 @@ class IndexTickerFetcher:
 
     # iShares ETF CSV download URLs
     ISHARES_URL = {
-        "sp500": (
-            "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/"
-            "1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund"
-        ),
-        "nasdaq100": (
-            "https://www.ishares.com/us/products/239696/ishares-nasdaq-100-etf/"
-            "1467271812596.ajax?fileType=csv&fileName=QQQ_holdings&dataType=fund"
-        ),
-        "russell2000": (
-            "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
-            "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
-        ),
+        "sp500": "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/",
+        "nasdaq100": "https://www.ishares.com/us/products/239696/ishares-nasdaq-100-etf/",
+        "russell2000": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/",
     }
 
     def __init__(self, cache_dir: Optional[Path] = None) -> None:
@@ -164,9 +157,35 @@ class IndexTickerFetcher:
             List of ticker symbols. Falls back to _FALLBACK_TICKERS on failure.
         """
         try:
-            url = self.ISHARES_URL[index_key]
+            fund_url = self.ISHARES_URL[index_key]
+
+            # 1. Fetch the main fund page
+            page_resp = requests.get(
+                fund_url,
+                timeout=30,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            page_resp.raise_for_status()
+
+            # 2. Extract dynamic CSV link
+            csv_url = None
+            soup = BeautifulSoup(page_resp.text, 'html.parser')
+            download_link = soup.find('a', href=re.compile(r'\.ajax\?fileType=csv.*fileName=.*_holdings'))
+
+            if download_link:
+                csv_url = "https://www.ishares.com" + download_link['href']
+            else:
+                # Fallback to regex search through whole payload or scripts just in case
+                match = re.search(r"(/us/products/[^\"]+\.ajax\?fileType=csv[^\"]*fileName=[^\"]*_holdings[^\"]*)", page_resp.text)
+                if match:
+                    csv_url = "https://www.ishares.com" + match.group(1)
+
+            if not csv_url:
+                raise ValueError(f"Could not locate CSV download link on {fund_url}")
+
+            # 3. Fetch the CSV
             response = requests.get(
-                url,
+                csv_url,
                 timeout=30,
                 headers={
                     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")

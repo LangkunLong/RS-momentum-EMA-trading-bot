@@ -27,7 +27,9 @@ from config import settings
 # Session Cache
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_session_cache: Dict[tuple, Any] = {}
+from cachetools import LRUCache
+
+_session_cache = LRUCache(maxsize=500)
 
 
 def clear_session_cache() -> None:
@@ -96,12 +98,29 @@ def _period_to_days(period: str) -> int:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def _get_fmp_session() -> requests.Session:
+    """Create a requests session with built-in retry logic."""
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504]
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    return session
+
+_fmp_session = _get_fmp_session()
+
 def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
-    """Execute a GET request against the FMP API."""
+    """Execute a GET request against the FMP API with retries."""
     url = f"{settings.FMP_BASE_URL}/{endpoint}"
     params = params or {}
     params["apikey"] = _fmp_api_key()
-    resp = requests.get(url, params=params, timeout=30)
+
+    resp = _fmp_session.get(url, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -137,9 +156,18 @@ def fetch_ohlcv(
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
+        limit=10000,
     )
+
     barset = client.get_stock_bars(request_params)
     df = barset.df
+
+    while barset.next_page_token is not None:
+        request_params.page_token = barset.next_page_token
+        next_barset = client.get_stock_bars(request_params)
+        if not next_barset.df.empty:
+            df = pd.concat([df, next_barset.df])
+        barset.next_page_token = next_barset.next_page_token
 
     if df.empty:
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])

@@ -112,7 +112,9 @@ def _calculate_roe(annual_income: pd.DataFrame, balance_sheet: pd.DataFrame) -> 
             return None
 
         ni_row = annual_income.index[ni_mask][0]
-        net_income_series = annual_income.loc[ni_row].sort_index()
+        net_income_series = annual_income.loc[ni_row].dropna().sort_index()
+        if net_income_series.empty:
+            return None
         net_income = float(net_income_series.iloc[-1])
 
         # Find shareholders' equity
@@ -127,8 +129,9 @@ def _calculate_roe(annual_income: pd.DataFrame, balance_sheet: pd.DataFrame) -> 
             eq_mask = balance_sheet.index.str.contains(pattern, case=False, regex=True)
             if eq_mask.any():
                 eq_row = balance_sheet.index[eq_mask][0]
-                eq_series = balance_sheet.loc[eq_row].sort_index()
-                equity_val = float(eq_series.iloc[-1])
+                eq_series = balance_sheet.loc[eq_row].dropna().sort_index()
+                if not eq_series.empty:
+                    equity_val = float(eq_series.iloc[-1])
                 break
 
         if equity_val is None or equity_val <= 0:
