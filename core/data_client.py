@@ -10,6 +10,7 @@ Session cache prevents redundant API calls within the same scan run.
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -49,18 +50,17 @@ def _cache_set(key: tuple, value: Any) -> None:
 # Client Singletons
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_alpaca_client: Optional[StockHistoricalDataClient] = None
+_local = threading.local()
 
 
 def _get_alpaca_client() -> StockHistoricalDataClient:
-    global _alpaca_client
-    if _alpaca_client is None:
+    if not hasattr(_local, "alpaca_client"):
         api_key = settings.ALPACA_API_KEY
         secret_key = settings.ALPACA_SECRET_KEY
         if not api_key or not secret_key:
             raise EnvironmentError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. See .env.example for details.")
-        _alpaca_client = StockHistoricalDataClient(api_key, secret_key)
-    return _alpaca_client
+        _local.alpaca_client = StockHistoricalDataClient(api_key, secret_key)
+    return _local.alpaca_client
 
 
 def _fmp_api_key() -> str:
@@ -243,9 +243,17 @@ def fetch_bulk_close_prices(
                 timeframe=TimeFrame.Day,
                 start=start,
                 end=end,
+                limit=10000,
             )
             barset = client.get_stock_bars(request_params)
             df = barset.df
+
+            while barset.next_page_token is not None:
+                request_params.page_token = barset.next_page_token
+                next_barset = client.get_stock_bars(request_params)
+                if not next_barset.df.empty:
+                    df = pd.concat([df, next_barset.df])
+                barset.next_page_token = next_barset.next_page_token
 
             if df.empty:
                 print(f"  Batch {batch_num} returned empty data, skipping.")
@@ -462,6 +470,50 @@ def fetch_company_info(symbol: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _fetch_fmp_raw_history(symbol: str) -> dict:
+    """Fetch and cache the raw, full-history JSON from FMP for efficient reusing."""
+    raw_cache_key = ("fmp_raw_history", symbol)
+    cached_raw = _cache_get(raw_cache_key)
+    if cached_raw is not None:
+        return cached_raw
+
+    try:
+        qi_raw = _fmp_get(f"income-statement/{symbol}", {"period": "quarter", "limit": 80})
+    except (requests.RequestException, ValueError, EnvironmentError):
+        qi_raw = []
+    try:
+        ai_raw = _fmp_get(f"income-statement/{symbol}", {"period": "annual", "limit": 20})
+    except (requests.RequestException, ValueError, EnvironmentError):
+        ai_raw = []
+    try:
+        bs_raw = _fmp_get(f"balance-sheet-statement/{symbol}", {"limit": 20})
+    except (requests.RequestException, ValueError, EnvironmentError):
+        bs_raw = []
+    try:
+        ev_raw = _fmp_get(f"enterprise-values/{symbol}", {"limit": 80, "period": "quarter"})
+    except (requests.RequestException, ValueError, EnvironmentError):
+        ev_raw = []
+    try:
+        profile_raw = _fmp_get(f"profile/{symbol}")
+    except (requests.RequestException, ValueError, EnvironmentError):
+        profile_raw = []
+    try:
+        holders_raw = _fmp_get(f"institutional-holder/{symbol}")
+    except (requests.RequestException, ValueError, EnvironmentError):
+        holders_raw = []
+
+    result = {
+        "qi_raw": qi_raw,
+        "ai_raw": ai_raw,
+        "bs_raw": bs_raw,
+        "ev_raw": ev_raw,
+        "profile_raw": profile_raw,
+        "holders_raw": holders_raw,
+    }
+    _cache_set(raw_cache_key, result)
+    return result
+
+
 def _filter_records_as_of(records: List[dict], as_of_date: datetime) -> List[dict]:
     """Keep only records whose SEC-accepted date is on or before *as_of_date*.
 
@@ -511,42 +563,32 @@ def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
         "institution_count": None,
     }
 
+    raw_history = _fetch_fmp_raw_history(symbol)
+
     # Shares outstanding: fetch historical enterprise values and filter by date
-    try:
-        ev = _fmp_get(f"enterprise-values/{symbol}", {"limit": 20, "period": "quarter"})
-        if ev and isinstance(ev, list):
-            ev_filtered = _filter_records_as_of(ev, as_of_date)
-            if ev_filtered:
-                # Most recent record on or before the cutoff date
-                shares = ev_filtered[0].get("numberOfShares")
-                if shares is not None:
-                    result["shares_outstanding"] = int(shares)
-    except (requests.RequestException, ValueError, EnvironmentError):
-        pass
+    if raw_history["ev_raw"] and isinstance(raw_history["ev_raw"], list):
+        ev_filtered = _filter_records_as_of(raw_history["ev_raw"], as_of_date)
+        if ev_filtered:
+            # Most recent record on or before the cutoff date
+            shares = ev_filtered[0].get("numberOfShares")
+            if shares is not None:
+                result["shares_outstanding"] = int(shares)
 
     # Fallback: profile data is current-only; acceptable as last resort
     if result["shares_outstanding"] is None:
-        try:
-            profile = _fmp_get(f"profile/{symbol}")
-            if profile and isinstance(profile, list) and len(profile) > 0:
-                p = profile[0]
-                mkt_cap = p.get("mktCap")
-                price = p.get("price")
-                if mkt_cap and price and price > 0:
-                    result["shares_outstanding"] = int(mkt_cap / price)
-        except (requests.RequestException, ValueError, EnvironmentError):
-            pass
+        if raw_history["profile_raw"] and isinstance(raw_history["profile_raw"], list) and len(raw_history["profile_raw"]) > 0:
+            p = raw_history["profile_raw"][0]
+            mkt_cap = p.get("mktCap")
+            price = p.get("price")
+            if mkt_cap and price and price > 0:
+                result["shares_outstanding"] = int(mkt_cap / price)
 
     # Institutional holders: FMP free tier is current-only; best-effort for backtests
-    try:
-        holders = _fmp_get(f"institutional-holder/{symbol}")
-        if holders and isinstance(holders, list):
-            result["institution_count"] = len(holders)
-            if result["shares_outstanding"] and result["shares_outstanding"] > 0:
-                total_held = sum(h.get("shares", 0) for h in holders if h.get("shares"))
-                result["held_percent_institutions"] = min(total_held / result["shares_outstanding"], 1.0)
-    except (requests.RequestException, ValueError, EnvironmentError):
-        pass
+    if raw_history["holders_raw"] and isinstance(raw_history["holders_raw"], list):
+        result["institution_count"] = len(raw_history["holders_raw"])
+        if result["shares_outstanding"] and result["shares_outstanding"] > 0:
+            total_held = sum(h.get("shares", 0) for h in raw_history["holders_raw"] if h.get("shares"))
+            result["held_percent_institutions"] = min(total_held / result["shares_outstanding"], 1.0)
 
     _cache_set(cache_key, result)
     return result
@@ -569,23 +611,11 @@ def fetch_fundamental_data_as_of(symbol: str, as_of_date: datetime) -> dict:
     if cached is not None:
         return cached
 
-    # Fetch with generous limit so we have enough history to filter
-    try:
-        qi_raw = _fmp_get(f"income-statement/{symbol}", {"period": "quarter", "limit": 20})
-    except (requests.RequestException, ValueError, EnvironmentError):
-        qi_raw = []
-    try:
-        ai_raw = _fmp_get(f"income-statement/{symbol}", {"period": "annual", "limit": 10})
-    except (requests.RequestException, ValueError, EnvironmentError):
-        ai_raw = []
-    try:
-        bs_raw = _fmp_get(f"balance-sheet-statement/{symbol}", {"limit": 10})
-    except (requests.RequestException, ValueError, EnvironmentError):
-        bs_raw = []
+    raw_history = _fetch_fmp_raw_history(symbol)
 
-    qi_filtered = _filter_records_as_of(qi_raw, as_of_date)
-    ai_filtered = _filter_records_as_of(ai_raw, as_of_date)
-    bs_filtered = _filter_records_as_of(bs_raw, as_of_date)
+    qi_filtered = _filter_records_as_of(raw_history["qi_raw"], as_of_date)
+    ai_filtered = _filter_records_as_of(raw_history["ai_raw"], as_of_date)
+    bs_filtered = _filter_records_as_of(raw_history["bs_raw"], as_of_date)
 
     result = {
         "quarterly_income": _fmp_records_to_financial_df(qi_filtered, _FMP_INCOME_FIELD_MAP),
