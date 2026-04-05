@@ -2,6 +2,14 @@
 name = "canslim-trading-bot"
 version = "0.1.0"
 requires-python = ">=3.11"
+dependencies = [
+    "alpaca-py>=0.21.0",
+    "requests>=2.31.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "python-dateutil>=2.8.0",
+    "python-dotenv>=1.0.0",
+]
 
 # ─── Ruff ────────────────────────────────────────────────────────────────────
 
@@ -10,10 +18,7 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["F", "E", "B", "I"]
-ignore = [
-    "E501",  # Line too long — handled by formatter, not enforced as an error
-]
+select = ["F", "B"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["core", "config", "quality_stocks", "enhanced_scanner"]

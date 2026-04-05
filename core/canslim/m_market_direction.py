@@ -61,6 +61,7 @@ def _count_distribution_days(
 
     Returns:
         Number of distribution days found.
+
     """
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
@@ -107,6 +108,7 @@ def _detect_follow_through_day(
 
     Returns:
         True if a recent follow-through day was detected.
+
     """
     if len(closes) < lookback:
         return False
@@ -155,6 +157,7 @@ def evaluate_m(
     price_above_21_weight: Optional[float] = None,
     bullish_threshold: Optional[float] = None,
     rising_lookback: Optional[int] = None,
+    price_data: Optional[pd.DataFrame] = None,
 ) -> MarketTrend:
     """Evaluate M (Market Direction) using the benchmark index.
 
@@ -178,6 +181,7 @@ def evaluate_m(
 
     Returns:
         MarketTrend: Object containing market direction score and details
+
     """
     # Load defaults from configuration
     period = period or settings.MARKET_TREND_PERIOD
@@ -188,10 +192,13 @@ def evaluate_m(
     bullish_threshold = bullish_threshold or settings.M_BULLISH_THRESHOLD
     rising_lookback = rising_lookback or settings.M_50EMA_RISING_LOOKBACK
 
-    try:
-        data = fetch_ohlcv(benchmark_symbol, period=period)
-    except Exception:
-        data = pd.DataFrame()
+    if price_data is not None:
+        data = price_data
+    else:
+        try:
+            data = fetch_ohlcv(benchmark_symbol, period=period)
+        except Exception:
+            data = pd.DataFrame()
 
     if data.empty or len(data) < 50:
         return MarketTrend(

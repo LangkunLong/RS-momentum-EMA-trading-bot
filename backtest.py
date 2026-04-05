@@ -28,6 +28,7 @@ from config import settings
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
 from core.canslim.i_institutional import evaluate_i
+from core.canslim.m_market_direction import evaluate_m
 from core.canslim.s_supply_demand import evaluate_s
 from core.data_client import (
     clear_session_cache,
@@ -102,83 +103,9 @@ def _evaluate_market_at_date(spy_data: pd.DataFrame, eval_date: pd.Timestamp) ->
 
     Returns: (score, is_bullish, distribution_days, follow_through)
     """
-    sliced = spy_data.loc[:eval_date].copy()
-    if len(sliced) < 50:
-        return 0.4, False, 0, False
-
-    closes = extract_float_series(sliced, "Close")
-    volumes = extract_float_series(sliced, "Volume")
-
-    ema_21 = closes.ewm(span=21).mean()
-    ema_50 = closes.ewm(span=50).mean()
-    ema_200 = closes.ewm(span=200).mean()
-
-    latest_close = coerce_scalar(closes.iloc[-1])
-    latest_ema_21 = coerce_scalar(ema_21.iloc[-1])
-    latest_ema_50 = coerce_scalar(ema_50.iloc[-1])
-    latest_ema_200 = coerce_scalar(ema_200.iloc[-1])
-
-    # Distribution days
-    lookback = min(settings.M_DISTRIBUTION_LOOKBACK, len(closes) - 1)
-    recent_closes = closes.iloc[-(lookback + 1) :]
-    recent_volumes = volumes.iloc[-(lookback + 1) :]
-    dist_count = 0
-    for i in range(1, len(recent_closes)):
-        pct_change = (recent_closes.iloc[i] - recent_closes.iloc[i - 1]) / recent_closes.iloc[i - 1]
-        vol_increased = recent_volumes.iloc[i] > recent_volumes.iloc[i - 1]
-        if pct_change <= -settings.M_DISTRIBUTION_MIN_DECLINE and vol_increased:
-            dist_count += 1
-    dist_score = max(1.0 - dist_count / settings.M_MAX_DISTRIBUTION_DAYS, 0.0)
-
-    # Follow-through day
-    ftd = False
-    if len(closes) >= 30:
-        rc = closes.tail(30)
-        rv = volumes.tail(30)
-        rally_count = 0
-        in_rally = False
-        for i in range(1, len(rc)):
-            daily_chg = (rc.iloc[i] - rc.iloc[i - 1]) / rc.iloc[i - 1]
-            if daily_chg > 0:
-                if not in_rally:
-                    in_rally = True
-                    rally_count = 1
-                else:
-                    rally_count += 1
-                if (
-                    rally_count >= settings.M_FOLLOW_THROUGH_MIN_DAY
-                    and daily_chg >= settings.M_FOLLOW_THROUGH_MIN_PCT
-                    and rv.iloc[i] > rv.iloc[i - 1]
-                ):
-                    ftd = True
-                    break
-            elif daily_chg < -0.01:
-                in_rally = False
-                rally_count = 0
-    ftd_score = 1.0 if ftd else 0.0
-
-    # EMA trend
-    trend_score = 0.0
-    if latest_close > latest_ema_200:
-        trend_score += settings.M_PRICE_ABOVE_200EMA_WEIGHT
-    if latest_ema_21 > latest_ema_50 > latest_ema_200:
-        trend_score += settings.M_EMA_ALIGNMENT_WEIGHT
-    if len(ema_50) > settings.M_50EMA_RISING_LOOKBACK:
-        ema_50_lb = coerce_scalar(ema_50.iloc[-settings.M_50EMA_RISING_LOOKBACK])
-        if latest_ema_50 > ema_50_lb:
-            trend_score += settings.M_50EMA_RISING_WEIGHT
-    if latest_close > latest_ema_21:
-        trend_score += settings.M_PRICE_ABOVE_21EMA_WEIGHT
-
-    combined = (
-        settings.M_DISTRIBUTION_WEIGHT * dist_score
-        + settings.M_FOLLOW_THROUGH_WEIGHT * ftd_score
-        + (1.0 - settings.M_DISTRIBUTION_WEIGHT - settings.M_FOLLOW_THROUGH_WEIGHT) * trend_score
-    )
-    combined = float(np.clip(combined, 0, 1))
-    is_bullish = combined >= settings.M_BULLISH_THRESHOLD
-
-    return combined, is_bullish, dist_count, ftd
+    Sliced = spy_data.loc[:eval_date].copy()
+    trend = evaluate_m(price_data=Sliced)
+    return trend.score, trend.is_bullish, trend.distribution_days, trend.follow_through
 
 
 def _evaluate_technical_at_date(
