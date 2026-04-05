@@ -1,5 +1,4 @@
-"""
-M - Market Direction
+"""M - Market Direction.
 
 Per William O'Neil's CANSLIM methodology:
 - Only buy stocks when the general market is in a confirmed uptrend
@@ -11,23 +10,28 @@ Per William O'Neil's CANSLIM methodology:
 O'Neil says: "Three out of four stocks follow the market's overall direction,
 so you need to know the market's direction."
 """
+
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
+
 from config import settings
 from core.data_client import (
     coerce_scalar,
     extract_float_series,
-    normalize_price_dataframe,
     fetch_ohlcv,
+    normalize_price_dataframe,
 )
 
 
 @dataclass
 class MarketTrend:
     """Lightweight representation of the general market trend."""
+
     symbol: str
     score: float
     is_bullish: bool
@@ -38,13 +42,9 @@ class MarketTrend:
 
 
 def _count_distribution_days(
-    closes: pd.Series,
-    volumes: pd.Series,
-    lookback: int = 25,
-    min_decline: float = 0.002
+    closes: pd.Series, volumes: pd.Series, lookback: int = 25, min_decline: float = 0.002
 ) -> int:
-    """
-    Count distribution days in the recent lookback period.
+    """Count distribution days in the recent lookback period.
 
     A distribution day per O'Neil is:
     1. Index closes down ≥ 0.2% from the previous day
@@ -65,12 +65,13 @@ def _count_distribution_days(
     if len(closes) < lookback + 1:
         lookback = len(closes) - 1
 
-    recent_closes = closes.iloc[-(lookback + 1):]
-    recent_volumes = volumes.iloc[-(lookback + 1):]
+    recent_closes = closes.iloc[-(lookback + 1) :]
+    recent_volumes = volumes.iloc[-(lookback + 1) :]
 
     dist_count = 0
     for i in range(1, len(recent_closes)):
-        price_change = (recent_closes.iloc[i] - recent_closes.iloc[i - 1]) / recent_closes.iloc[i - 1]
+        prev = recent_closes.iloc[i - 1]
+        price_change = (recent_closes.iloc[i] - prev) / prev
         vol_today = recent_volumes.iloc[i]
         vol_yesterday = recent_volumes.iloc[i - 1]
 
@@ -86,10 +87,9 @@ def _detect_follow_through_day(
     volumes: pd.Series,
     min_rally_pct: float = 0.015,
     min_rally_day: int = 4,
-    lookback: int = 30
+    lookback: int = 30,
 ) -> bool:
-    """
-    Detect if a follow-through day has occurred recently.
+    """Detect if a follow-through day has occurred recently.
 
     A follow-through day per O'Neil:
     1. Market must first have a significant decline
@@ -119,7 +119,8 @@ def _detect_follow_through_day(
     in_rally = False
 
     for i in range(1, len(recent_closes)):
-        daily_change = (recent_closes.iloc[i] - recent_closes.iloc[i - 1]) / recent_closes.iloc[i - 1]
+        prev_close = recent_closes.iloc[i - 1]
+        daily_change = (recent_closes.iloc[i] - prev_close) / prev_close
 
         if daily_change > 0:
             if not in_rally:
@@ -129,9 +130,11 @@ def _detect_follow_through_day(
                 rally_day_count += 1
 
             # Check for follow-through: day 4+ with 1.5%+ gain on higher volume
-            if (rally_day_count >= min_rally_day
-                    and daily_change >= min_rally_pct
-                    and recent_volumes.iloc[i] > recent_volumes.iloc[i - 1]):
+            if (
+                rally_day_count >= min_rally_day
+                and daily_change >= min_rally_pct
+                and recent_volumes.iloc[i] > recent_volumes.iloc[i - 1]
+            ):
                 return True
         else:
             # Down day resets rally count (though O'Neil allows some down days
@@ -151,10 +154,9 @@ def evaluate_m(
     rising_50ema_weight: Optional[float] = None,
     price_above_21_weight: Optional[float] = None,
     bullish_threshold: Optional[float] = None,
-    rising_lookback: Optional[int] = None
+    rising_lookback: Optional[int] = None,
 ) -> MarketTrend:
-    """
-    Evaluate M (Market Direction) using the benchmark index.
+    """Evaluate M (Market Direction) using the benchmark index.
 
     Per O'Neil's methodology, combines:
     1. Distribution day counting (30% weight) — 5+ in 25 days = bearish
@@ -215,9 +217,10 @@ def evaluate_m(
 
     # --- O'Neil's Distribution Day Count ---
     dist_days = _count_distribution_days(
-        closes, volumes,
+        closes,
+        volumes,
         lookback=settings.M_DISTRIBUTION_LOOKBACK,
-        min_decline=settings.M_DISTRIBUTION_MIN_DECLINE
+        min_decline=settings.M_DISTRIBUTION_MIN_DECLINE,
     )
     # 0 dist days = full score, 5+ = 0 score
     max_dist = settings.M_MAX_DISTRIBUTION_DAYS
@@ -225,9 +228,10 @@ def evaluate_m(
 
     # --- O'Neil's Follow-Through Day Detection ---
     has_follow_through = _detect_follow_through_day(
-        closes, volumes,
+        closes,
+        volumes,
         min_rally_pct=settings.M_FOLLOW_THROUGH_MIN_PCT,
-        min_rally_day=settings.M_FOLLOW_THROUGH_MIN_DAY
+        min_rally_day=settings.M_FOLLOW_THROUGH_MIN_DAY,
     )
     ftd_score = 1.0 if has_follow_through else 0.0
 

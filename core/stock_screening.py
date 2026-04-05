@@ -1,9 +1,9 @@
-"""
-Stock screening module focused on CANSLIM evaluation.
+"""Stock screening module focused on CANSLIM evaluation.
 
 This module provides functionality to screen stocks based on CANSLIM criteria,
 filtering for stocks with strong fundamentals, technical strength, and market leadership.
 """
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,9 +11,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-from core.canslim import evaluate_canslim, evaluate_market_direction, MarketTrend
+from config.settings import MAX_WORKERS, MIN_CANSLIM_SCORE, MIN_RS_SCORE
+from core.canslim import MarketTrend, evaluate_canslim, evaluate_market_direction
 from core.momentum_analysis import calculate_rs_scores_for_tickers
-from config.settings import MIN_RS_SCORE, MIN_CANSLIM_SCORE, MAX_WORKERS
 
 
 def evaluate_stock_canslim(
@@ -22,10 +22,9 @@ def evaluate_stock_canslim(
     min_canslim_score: float,
     market_trend: MarketTrend,
     rs_scores_df: pd.DataFrame,
-    debug: bool = False
+    debug: bool = False,
 ) -> Optional[Dict[str, object]]:
-    """
-    Evaluate a single stock against CANSLIM criteria.
+    """Evaluate a single stock against CANSLIM criteria.
 
     Args:
         symbol: Stock ticker symbol
@@ -50,10 +49,7 @@ def evaluate_stock_canslim(
 
     rs_score = float(canslim_view["rs_score"])
     if debug:
-        print(
-            f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | "
-            f"Minimum Required: {min_rs_score:.1f}"
-        )
+        print(f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | Minimum Required: {min_rs_score:.1f}")
     if rs_score < min_rs_score:
         if debug:
             print("[DEBUG] Fails RS score threshold.")
@@ -84,8 +80,7 @@ def screen_stocks_canslim(
     min_canslim_score: float = MIN_CANSLIM_SCORE,
     debug: bool = False,
 ) -> Tuple[List[Dict[str, object]], MarketTrend]:
-    """
-    Screen multiple stocks for CANSLIM characteristics.
+    """Screen multiple stocks for CANSLIM characteristics.
 
     Args:
         symbols: List of stock ticker symbols to screen
@@ -155,9 +150,10 @@ def screen_stocks_canslim(
     return results, market_trend
 
 
-def print_analysis_results(results: List[Dict[str, object]], market_trend: Optional[MarketTrend] = None) -> None:
-    """
-    Print CANSLIM analysis results in a formatted table.
+def print_analysis_results(
+    results: List[Dict[str, object]], market_trend: Optional[MarketTrend] = None
+) -> None:
+    """Print CANSLIM analysis results in a formatted table.
 
     Args:
         results: List of CANSLIM evaluation results
@@ -173,10 +169,9 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
 
     if market_trend is not None:
         direction = "Bullish" if market_trend.is_bullish else "Cautious"
-        print(
-            f"Market Direction ({market_trend.symbol}): {direction} | Score: {market_trend.score * 100:.0f}%"
-        )
-        if hasattr(market_trend, 'distribution_days'):
+        score_pct = market_trend.score * 100
+        print(f"Market Direction ({market_trend.symbol}): {direction} | Score: {score_pct:.0f}%")
+        if hasattr(market_trend, "distribution_days"):
             dist_status = "WARNING" if market_trend.distribution_days >= 5 else "OK"
             ftd_status = "Yes" if market_trend.follow_through else "No"
             print(
@@ -215,7 +210,7 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
         print(f"\n{idx}. {result['symbol']}")
         print(f"   RS Score: {result['rs_score']:.1f} | CANSLIM Score: {result['total_score']:.1f}")
 
-        print(f"   Component Breakdown:")
+        print("   Component Breakdown:")
         for key in "C A N S L I M".split():
             score_pct = result["scores"].get(key, 0.0) * 100
             label = component_labels[key]
@@ -230,10 +225,10 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
             f"ROE {_fmt_pct(metrics.get('roe'))}"
         )
 
-        s_metrics = metrics.get('s_metrics', {})
-        market = result.get('market_trend')
+        s_metrics = metrics.get("s_metrics", {})
+        market = result.get("market_trend")
         dist_info = ""
-        if market and hasattr(market, 'distribution_days'):
+        if market and hasattr(market, "distribution_days"):
             dist_info = f" | Dist Days: {market.distribution_days}"
             if market.follow_through:
                 dist_info += " | FTD: Yes"

@@ -1,16 +1,16 @@
-"""
-Index Ticker Fetcher Module
+"""Index Ticker Fetcher Module.
 
 Fetches stock tickers from major indices (Russell 2000, Nasdaq 100, S&P 500)
 and caches them daily to avoid repeated API calls.
 """
 
+from __future__ import annotations
+
 import json
-import os
 from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -21,10 +21,10 @@ CACHE_FILE = CACHE_DIR / "index_tickers_cache.json"
 CACHE_EXPIRY_HOURS = 24  # Cache expires after 24 hours
 
 # Candidate column names for ticker identification
-_TICKER_COLUMN_CANDIDATES = ['Ticker', 'ticker', 'Symbol', 'symbol', 'Constituent Symbol']
+_TICKER_COLUMN_CANDIDATES = ["Ticker", "ticker", "Symbol", "symbol", "Constituent Symbol"]
 
 # Fallback tickers when fetching fails
-_FALLBACK_TICKERS = ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL']
+_FALLBACK_TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
 
 
 def _find_ticker_column(df: pd.DataFrame) -> Optional[str]:
@@ -42,7 +42,7 @@ def _find_ticker_column(df: pd.DataFrame) -> Optional[str]:
     # Fallback: case-insensitive substring search across all columns
     for col in df.columns:
         col_lower = col.strip().lower()
-        if col_lower in ('ticker', 'symbol') or 'ticker' in col_lower or 'symbol' in col_lower:
+        if col_lower in ("ticker", "symbol") or "ticker" in col_lower or "symbol" in col_lower:
             return col
     return None
 
@@ -72,12 +72,16 @@ def _parse_ishares_csv(response_text: str, index_name: str) -> List[str]:
 
         ticker_col = _find_ticker_column(df)
         if ticker_col is None:
-            print(f"Error: Could not find a ticker column in {index_name} CSV. "
-                  f"Available columns: {list(df.columns)}. Using fallback tickers.")
+            print(
+                f"Error: Could not find a ticker column in {index_name} CSV. "
+                f"Available columns: {list(df.columns)}. Using fallback tickers."
+            )
             return list(_FALLBACK_TICKERS)
 
-        tickers = df[ticker_col].dropna().tolist()
-        tickers = [str(t).strip().replace(".", "-") for t in tickers if isinstance(t, str) and str(t).strip()]
+        raw = df[ticker_col].dropna().tolist()
+        tickers = [
+            str(t).strip().replace(".", "-") for t in raw if isinstance(t, str) and str(t).strip()
+        ]
         # Filter out non-ticker values
         tickers = [t for t in tickers if t.isalpha() or "-" in t]
 
@@ -97,12 +101,22 @@ class IndexTickerFetcher:
 
     # iShares ETF CSV download URLs
     ISHARES_URL = {
-        "sp500": "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund",
-        "nasdaq100": "https://www.ishares.com/us/products/239696/ishares-nasdaq-100-etf/1467271812596.ajax?fileType=csv&fileName=QQQ_holdings&dataType=fund",
-        "russell2000": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+        "sp500": (
+            "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/"
+            "1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund"
+        ),
+        "nasdaq100": (
+            "https://www.ishares.com/us/products/239696/ishares-nasdaq-100-etf/"
+            "1467271812596.ajax?fileType=csv&fileName=QQQ_holdings&dataType=fund"
+        ),
+        "russell2000": (
+            "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+            "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+        ),
     }
 
-    def __init__(self, cache_dir: Optional[Path] = None):
+    def __init__(self, cache_dir: Optional[Path] = None) -> None:
+        """Initialise the fetcher with an optional custom cache directory."""
         self.cache_dir = cache_dir or CACHE_DIR
         self.cache_file = self.cache_dir / "index_tickers_cache.json"
         self._ensure_cache_dir()
@@ -115,7 +129,7 @@ class IndexTickerFetcher:
             return False
 
         try:
-            with open(self.cache_file, "r") as f:
+            with open(self.cache_file) as f:
                 cache_data = json.load(f)
 
             cache_time = datetime.fromisoformat(cache_data.get("timestamp", ""))
@@ -129,7 +143,7 @@ class IndexTickerFetcher:
             return None
 
         try:
-            with open(self.cache_file, "r") as f:
+            with open(self.cache_file) as f:
                 return json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
             return None
@@ -151,15 +165,21 @@ class IndexTickerFetcher:
         """
         try:
             url = self.ISHARES_URL[index_key]
-            response = requests.get(url, timeout=30, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            })
+            response = requests.get(
+                url,
+                timeout=30,
+                headers={
+                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                },
+            )
 
             if response.status_code == 200:
                 return _parse_ishares_csv(response.text, display_name)
             else:
-                print(f"Error: iShares returned status {response.status_code} for {display_name}. "
-                      f"Using fallback tickers.")
+                print(
+                    f"Error: iShares returned status {response.status_code} "
+                    f"for {display_name}. Using fallback tickers."
+                )
                 return list(_FALLBACK_TICKERS)
 
         except Exception as e:
@@ -167,19 +187,30 @@ class IndexTickerFetcher:
             return list(_FALLBACK_TICKERS)
 
     def fetch_sp500_tickers(self) -> List[str]:
+        """Fetch S&P 500 tickers from iShares."""
         return self._fetch_index_tickers("sp500", "S&P 500")
 
     def fetch_nasdaq100_tickers(self) -> List[str]:
+        """Fetch Nasdaq 100 tickers from iShares."""
         return self._fetch_index_tickers("nasdaq100", "Nasdaq 100")
 
     def fetch_russell2000_tickers(self) -> List[str]:
+        """Fetch Russell 2000 tickers from iShares."""
         return self._fetch_index_tickers("russell2000", "Russell 2000")
 
     def fetch_all_index_tickers(self, indices: Optional[List[str]] = None) -> Dict[str, List[str]]:
+        """Fetch tickers for multiple indices and return as a keyed dict.
+
+        Args:
+            indices: Index keys to fetch (default: all three indices).
+
+        Returns:
+            Dict mapping index key → list of tickers.
+        """
         if indices is None:
             indices = ["sp500", "nasdaq100", "russell2000"]
 
-        result = {}
+        result: Dict[str, List[str]] = {}
 
         for index in indices:
             index_lower = index.lower()
@@ -198,8 +229,18 @@ class IndexTickerFetcher:
         self,
         indices: Optional[List[str]] = None,
         deduplicate: bool = True,
-        force_refresh: bool = False
+        force_refresh: bool = False,
     ) -> List[str]:
+        """Return tickers for requested indices, using the cache when valid.
+
+        Args:
+            indices: Index keys to include (default: all three indices).
+            deduplicate: Remove duplicate tickers across indices.
+            force_refresh: Skip the cache and re-fetch from iShares.
+
+        Returns:
+            Flat list of ticker strings, optionally deduplicated.
+        """
         # Check cache first (unless force refresh)
         if not force_refresh:
             cache_data = self._load_cache()
@@ -207,51 +248,64 @@ class IndexTickerFetcher:
                 cached_indices = cache_data.get("indices", [])
                 requested_indices = indices or ["sp500", "nasdaq100", "russell2000"]
 
-                # If cached data covers all requested indices, use it
                 if set(requested_indices).issubset(set(cached_indices)):
                     print(f"Using cached tickers from {cache_data.get('timestamp', 'unknown')}")
-                    all_tickers = []
+                    all_tickers: List[str] = []
                     for idx in requested_indices:
                         all_tickers.extend(cache_data["tickers"].get(idx, []))
 
                     if deduplicate:
-                        return list(dict.fromkeys(all_tickers))  # Preserve order
+                        return list(dict.fromkeys(all_tickers))
                     return all_tickers
 
         # Fetch fresh data
         print("Fetching fresh ticker data from indices...")
         index_tickers = self.fetch_all_index_tickers(indices)
 
-        # Save to cache
-        self._save_cache({
-            "indices": list(index_tickers.keys()),
-            "tickers": index_tickers,
-        })
+        self._save_cache(
+            {
+                "indices": list(index_tickers.keys()),
+                "tickers": index_tickers,
+            }
+        )
 
-        # Combine all tickers
         all_tickers = []
         for tickers in index_tickers.values():
             all_tickers.extend(tickers)
 
         if deduplicate:
-            return list(dict.fromkeys(all_tickers))  # Preserve order
+            return list(dict.fromkeys(all_tickers))
 
         return all_tickers
 
     def get_tickers_by_index(self, index_name: str, force_refresh: bool = False) -> List[str]:
-        return self.get_all_tickers(indices=[index_name], deduplicate=False, force_refresh=force_refresh)
+        """Return tickers for a single named index (no deduplication).
+
+        Args:
+            index_name: Index key (e.g. ``'sp500'``).
+            force_refresh: Skip the cache.
+
+        Returns:
+            List of ticker strings for the requested index.
+        """
+        return self.get_all_tickers(
+            indices=[index_name], deduplicate=False, force_refresh=force_refresh
+        )
 
     def clear_cache(self) -> None:
+        """Delete the on-disk ticker cache file."""
         if self.cache_file.exists():
             self.cache_file.unlink()
             print("Ticker cache cleared")
 
 
-# Convenience functions for module-level access
+# ─── Module-level convenience functions ──────────────────────────────────────
+
 _fetcher_instance: Optional[IndexTickerFetcher] = None
 
 
 def get_fetcher() -> IndexTickerFetcher:
+    """Return the module-level singleton IndexTickerFetcher instance."""
     global _fetcher_instance
     if _fetcher_instance is None:
         _fetcher_instance = IndexTickerFetcher()
@@ -260,20 +314,32 @@ def get_fetcher() -> IndexTickerFetcher:
 
 def get_all_index_tickers(
     indices: Optional[List[str]] = None,
-    force_refresh: bool = False
+    force_refresh: bool = False,
 ) -> List[str]:
+    """Return deduplicated tickers for all (or specified) indices.
+
+    Args:
+        indices: Index keys to fetch (default: sp500, nasdaq100, russell2000).
+        force_refresh: Bypass the cache.
+
+    Returns:
+        Flat, deduplicated list of ticker strings.
+    """
     return get_fetcher().get_all_tickers(indices=indices, force_refresh=force_refresh)
 
 
 def get_sp500_tickers(force_refresh: bool = False) -> List[str]:
+    """Return S&P 500 tickers, using the cache when valid."""
     return get_fetcher().get_tickers_by_index("sp500", force_refresh=force_refresh)
 
 
 def get_nasdaq100_tickers(force_refresh: bool = False) -> List[str]:
+    """Return Nasdaq 100 tickers, using the cache when valid."""
     return get_fetcher().get_tickers_by_index("nasdaq100", force_refresh=force_refresh)
 
 
 def get_russell2000_tickers(force_refresh: bool = False) -> List[str]:
+    """Return Russell 2000 tickers, using the cache when valid."""
     return get_fetcher().get_tickers_by_index("russell2000", force_refresh=force_refresh)
 
 
@@ -283,17 +349,14 @@ def clear_ticker_cache() -> None:
 
 
 if __name__ == "__main__":
-    # Test the fetcher
     print("Testing Index Ticker Fetcher...")
     print("=" * 60)
 
     fetcher = IndexTickerFetcher()
 
-    # Test fetching all indices
     all_tickers = fetcher.get_all_tickers()
     print(f"\nTotal unique tickers: {len(all_tickers)}")
 
-    # Show breakdown by index
     sp500 = fetcher.get_tickers_by_index("sp500")
     nasdaq100 = fetcher.get_tickers_by_index("nasdaq100")
     russell2000 = fetcher.get_tickers_by_index("russell2000")

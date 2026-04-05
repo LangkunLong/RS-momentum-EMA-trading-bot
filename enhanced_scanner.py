@@ -1,28 +1,23 @@
-"""
-CANSLIM Stock Scanner
+"""CANSLIM Stock Scanner.
 
 Main scanning function for CANSLIM stock opportunities.
 This simplified scanner focuses purely on CANSLIM criteria without pullback entries.
-
-Args:
-    min_rs_score (float): Minimum relative strength score
-    min_canslim_score (float): Minimum CANSLIM composite score
-    sectors (list): Specific sectors to scan (e.g., ['mega_cap_tech', 'healthcare'])
-    custom_list (list): Custom list of stock symbols to scan
-    start_date (str): Start date for analysis
-    debug (bool): Enable verbose output
 """
-import pandas as pd
+
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Optional
 
-from core.data_client import validate_ticker
-from core.stock_screening import screen_stocks_canslim, print_analysis_results
-from quality_stocks import get_quality_stock_list, get_index_tickers
+import pandas as pd
+
 from config import settings
+from core.data_client import validate_ticker
+from core.stock_screening import print_analysis_results, screen_stocks_canslim
+from quality_stocks import get_index_tickers, get_quality_stock_list
 
 
-def is_valid_ticker(symbol, retries=1):
+def is_valid_ticker(symbol: str, retries: int = 1) -> bool:
     """Check if ticker is available on Alpaca."""
     for attempt in range(retries):
         try:
@@ -35,17 +30,32 @@ def is_valid_ticker(symbol, retries=1):
 
 
 def scan_for_canslim_stocks(
-    min_rs_score=None,
-    min_canslim_score=None,
-    sectors=None,
-    custom_list=None,
-    start_date=None,
-    debug=None
-):
+    min_rs_score: Optional[float] = None,
+    min_canslim_score: Optional[float] = None,
+    sectors: Optional[str] = None,
+    custom_list: Optional[list[str]] = None,
+    start_date: Optional[str] = None,
+    debug: Optional[bool] = None,
+) -> tuple[list[dict], object]:
+    """Run the full CANSLIM scan and return qualifying opportunities.
 
+    Args:
+        min_rs_score: Minimum relative strength score (overrides settings).
+        min_canslim_score: Minimum composite CANSLIM score (overrides settings).
+        sectors: Index/sector name to scan (e.g. 'nasdaq100', 'large_cap').
+        custom_list: Explicit list of tickers to evaluate instead of an index.
+        start_date: Start date for historical analysis (overrides settings).
+        debug: Enable verbose per-stock output (overrides settings).
+
+    Returns:
+        Tuple of (opportunities, market_trend) where opportunities is a list of
+        dicts for each stock that passed all CANSLIM thresholds.
+    """
     # Load defaults from configuration
     min_rs_score = min_rs_score if min_rs_score is not None else settings.MIN_RS_SCORE
-    min_canslim_score = min_canslim_score if min_canslim_score is not None else settings.MIN_CANSLIM_SCORE
+    min_canslim_score = (
+        min_canslim_score if min_canslim_score is not None else settings.MIN_CANSLIM_SCORE
+    )
     sectors = sectors if sectors is not None else settings.SECTORS
     custom_list = custom_list if custom_list is not None else settings.CUSTOM_LIST
     start_date = start_date if start_date is not None else settings.START_DATE
@@ -61,7 +71,7 @@ def scan_for_canslim_stocks(
         symbols = custom_list
     elif sectors:
         print(f"Using curated stock list for sectors: {sectors}")
-        symbols = get_index_tickers(index_name = sectors)
+        symbols = get_index_tickers(index_name=sectors)
     else:
         print("Using default curated quality stock list...")
         symbols = get_quality_stock_list()
@@ -86,17 +96,17 @@ def scan_for_canslim_stocks(
         start_date=start_date,
         min_rs_score=min_rs_score,
         min_canslim_score=min_canslim_score,
-        debug=debug
+        debug=debug,
     )
 
-    print(f"\nScan complete!")
+    print("\nScan complete!")
     print(f"Analyzed: {len(symbols)} stocks")
     print(f"Opportunities found: {len(opportunities)} stocks")
 
     return opportunities, market_trend
 
 
-def export_results_to_csv(opportunities, filename=None):
+def export_results_to_csv(opportunities: list[dict], filename: Optional[str] = None) -> None:
     """Export CANSLIM results to CSV file."""
     if not opportunities:
         print("No opportunities to export.")
@@ -109,21 +119,21 @@ def export_results_to_csv(opportunities, filename=None):
     csv_data = []
     for opp in opportunities:
         row = {
-            'Symbol': opp['symbol'],
-            'RS_Score': opp['rs_score'],
-            'CANSLIM_Score': opp['total_score'],
-            'C_Score': opp['scores']['C'] * 100,
-            'A_Score': opp['scores']['A'] * 100,
-            'N_Score': opp['scores']['N'] * 100,
-            'S_Score': opp['scores']['S'] * 100,
-            'L_Score': opp['scores']['L'] * 100,
-            'I_Score': opp['scores']['I'] * 100,
-            'M_Score': opp['scores']['M'] * 100,
-            'Current_Growth': opp['metrics']['current_growth'],
-            'Annual_Growth': opp['metrics']['annual_growth'],
-            'Revenue_Growth': opp['metrics']['revenue_growth'],
-            'Shares_Outstanding': opp['metrics']['shares_outstanding'],
-            'Proximity_to_High': opp['metrics']['proximity_to_high'],
+            "Symbol": opp["symbol"],
+            "RS_Score": opp["rs_score"],
+            "CANSLIM_Score": opp["total_score"],
+            "C_Score": opp["scores"]["C"] * 100,
+            "A_Score": opp["scores"]["A"] * 100,
+            "N_Score": opp["scores"]["N"] * 100,
+            "S_Score": opp["scores"]["S"] * 100,
+            "L_Score": opp["scores"]["L"] * 100,
+            "I_Score": opp["scores"]["I"] * 100,
+            "M_Score": opp["scores"]["M"] * 100,
+            "Current_Growth": opp["metrics"]["current_growth"],
+            "Annual_Growth": opp["metrics"]["annual_growth"],
+            "Revenue_Growth": opp["metrics"]["revenue_growth"],
+            "Shares_Outstanding": opp["metrics"]["shares_outstanding"],
+            "Proximity_to_High": opp["metrics"]["proximity_to_high"],
         }
         csv_data.append(row)
 
@@ -147,14 +157,15 @@ if __name__ == "__main__":
     MIN_CANSLIM_SCORE = None  # Uses settings.MIN_CANSLIM_SCORE
     # Available indices: 'sp500', 'nasdaq100', 'russell2000', 'large_cap', 'small_cap', 'all'
     # Set to None to scan all major indices (S&P 500 + Nasdaq 100 + Russell 2000)
-    SECTORS = 'nasdaq100'  # Uses all indices from major markets
+    SECTORS = "nasdaq100"  # Uses all indices from major markets
     CUSTOM_LIST = None
     DEBUG = True  # Override default
 
     print("CANSLIM Stock Scanner Configuration:")
     print(f"- Min RS Score: {MIN_RS_SCORE or settings.MIN_RS_SCORE}")
     print(f"- Min CANSLIM Score: {MIN_CANSLIM_SCORE or settings.MIN_CANSLIM_SCORE}")
-    print(f"- Indices: {SECTORS or settings.SECTORS or 'All (S&P 500 + Nasdaq 100 + Russell 2000)'}")
+    indices_label = SECTORS or settings.SECTORS or "All (S&P 500 + Nasdaq 100 + Russell 2000)"
+    print(f"- Indices: {indices_label}")
     print(f"- Custom List: {'Yes' if CUSTOM_LIST else 'No'}")
     print(f"- Debug Mode: {DEBUG or settings.DEBUG}")
 
@@ -164,7 +175,7 @@ if __name__ == "__main__":
         min_canslim_score=MIN_CANSLIM_SCORE,
         sectors=SECTORS,
         custom_list=CUSTOM_LIST,
-        debug=DEBUG
+        debug=DEBUG,
     )
 
     if not opportunities:

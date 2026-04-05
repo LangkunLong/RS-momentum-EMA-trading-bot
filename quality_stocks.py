@@ -1,13 +1,16 @@
+"""Ticker retrieval interface for CANSLIM stock screening."""
+
+from __future__ import annotations
+
 from typing import List, Optional
 
 from core.index_ticker_fetcher import (
+    clear_ticker_cache,
     get_all_index_tickers,
-    get_sp500_tickers,
     get_nasdaq100_tickers,
     get_russell2000_tickers,
-    clear_ticker_cache,
+    get_sp500_tickers,
 )
-
 
 # Index aliases for user-friendly sector/index selection
 INDEX_ALIASES = {
@@ -23,12 +26,10 @@ INDEX_ALIASES = {
     "russell": ["russell2000"],
     "small_cap": ["russell2000"],
     "smallcap": ["russell2000"],
-
     # Combined categories
     "large_cap": ["sp500", "nasdaq100"],
     "largecap": ["sp500", "nasdaq100"],
     "all": ["sp500", "nasdaq100", "russell2000"],
-
     # Legacy sector aliases (map to indices for backward compatibility)
     "mega_cap_tech": ["nasdaq100"],
     "growth_high_beta": ["nasdaq100"],
@@ -42,8 +43,18 @@ INDEX_ALIASES = {
 
 def get_quality_stock_list(
     sectors: Optional[List[str]] = None,
-    force_refresh: bool = False
+    force_refresh: bool = False,
 ) -> List[str]:
+    """Return a deduplicated list of tickers for the requested sectors/indices.
+
+    Args:
+        sectors: One or more sector/index names (e.g. ``['sp500', 'large_cap']``).
+            Pass ``None`` to return all indices combined.
+        force_refresh: Bypass the on-disk ticker cache and re-fetch from source.
+
+    Returns:
+        Flat, deduplicated list of ticker strings.
+    """
     # If no sectors specified, return all indices
     if sectors is None:
         return get_all_index_tickers(force_refresh=force_refresh)
@@ -60,6 +71,15 @@ def get_quality_stock_list(
 
 
 def get_index_tickers(index_name: str, force_refresh: bool = False) -> List[str]:
+    """Resolve an index name or alias to a flat list of tickers.
+
+    Args:
+        index_name: Index name or alias (e.g. ``'large_cap'``, ``'sp500'``).
+        force_refresh: Bypass the on-disk ticker cache.
+
+    Returns:
+        Deduplicated list of ticker strings for the resolved index/indices.
+    """
     index_lower = index_name.lower().strip()
 
     # Resolve aliases first (handles combined categories like 'large_cap')
@@ -97,6 +117,7 @@ def get_available_indices() -> List[str]:
 
 
 def get_available_categories() -> dict:
+    """Return a human-readable mapping of category name to description."""
     return {
         "sp500": "S&P 500 - Large-cap US stocks",
         "nasdaq100": "Nasdaq 100 - Large-cap tech-focused stocks",

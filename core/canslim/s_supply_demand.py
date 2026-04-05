@@ -1,5 +1,4 @@
-"""
-S - Supply and Demand
+"""S - Supply and Demand.
 
 Per William O'Neil's CANSLIM methodology:
 - Prefer stocks with a reasonable number of shares outstanding (tighter supply)
@@ -11,20 +10,21 @@ Per William O'Neil's CANSLIM methodology:
 O'Neil says: "A stock with 5 billion shares outstanding is hard to move.
 Prefer companies with reasonable float that show increasing demand."
 """
+
 from __future__ import annotations
-from typing import Optional, Dict
+
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
+
 from config import settings
 
 
 def _detect_volume_surge(
-    recent_volume: float,
-    avg_volume: float,
-    surge_threshold: float
+    recent_volume: float, avg_volume: float, surge_threshold: float
 ) -> tuple[bool, float]:
-    """
-    Detect if recent volume is significantly above average.
+    """Detect if recent volume is significantly above average.
 
     Args:
         recent_volume: Most recent day's volume
@@ -44,12 +44,9 @@ def _detect_volume_surge(
 
 
 def _detect_breakout(
-    current_price: float,
-    high_52week: float,
-    proximity_threshold: float
+    current_price: float, high_52week: float, proximity_threshold: float
 ) -> tuple[bool, float]:
-    """
-    Detect if price is breaking out to new highs.
+    """Detect if price is breaking out to new highs.
 
     Args:
         current_price: Current closing price
@@ -72,10 +69,9 @@ def _detect_power_earnings_gap(
     price_history: pd.DataFrame,
     lookback_days: int = 10,
     gap_threshold: float = 0.02,
-    volume_threshold: float = 1.5
+    volume_threshold: float = 1.5,
 ) -> tuple[bool, Optional[Dict[str, float]]]:
-    """
-    Detect Power Earnings Gap: significant gap-up with heavy volume.
+    """Detect Power Earnings Gap: significant gap-up with heavy volume.
 
     A Power Earnings Gap occurs when:
     1. Stock gaps up significantly (typically after earnings)
@@ -98,7 +94,7 @@ def _detect_power_earnings_gap(
     recent = price_history.tail(lookback_days + 1).copy()
 
     # Calculate average volume before lookback period
-    avg_volume = price_history['Volume'].iloc[-(lookback_days + 50):-lookback_days].mean()
+    avg_volume = price_history["Volume"].iloc[-(lookback_days + 50) : -lookback_days].mean()
 
     if avg_volume == 0:
         return False, None
@@ -109,18 +105,18 @@ def _detect_power_earnings_gap(
         previous = recent.iloc[i - 1]
 
         # Gap up detection: today's low > yesterday's high
-        gap_size = (current['Low'] - previous['High']) / previous['Close']
+        gap_size = (current["Low"] - previous["High"]) / previous["Close"]
 
         if gap_size >= gap_threshold:
-            volume_ratio = current['Volume'] / avg_volume
+            volume_ratio = current["Volume"] / avg_volume
 
             # Check if it's a power gap (heavy volume)
             if volume_ratio >= volume_threshold:
                 gap_details = {
-                    'gap_size': gap_size,
-                    'volume_ratio': volume_ratio,
-                    'gap_price': float(current['Open']),
-                    'days_ago': len(recent) - i - 1
+                    "gap_size": gap_size,
+                    "volume_ratio": volume_ratio,
+                    "gap_price": float(current["Open"]),
+                    "days_ago": len(recent) - i - 1,
                 }
                 return True, gap_details
 
@@ -128,8 +124,7 @@ def _detect_power_earnings_gap(
 
 
 def _calculate_up_down_volume_ratio(price_history: pd.DataFrame, lookback: int = 50) -> float:
-    """
-    Calculate the ratio of volume on up days vs down days.
+    """Calculate the ratio of volume on up days vs down days.
 
     O'Neil emphasizes that healthy accumulation shows heavy volume on up days
     and lighter volume on down days. This is a key sign of institutional buying.
@@ -146,8 +141,8 @@ def _calculate_up_down_volume_ratio(price_history: pd.DataFrame, lookback: int =
         lookback = len(price_history)
 
     recent = price_history.tail(lookback).copy()
-    closes = recent['Close']
-    volumes = recent['Volume']
+    closes = recent["Close"]
+    volumes = recent["Volume"]
 
     daily_changes = closes.diff()
 
@@ -164,8 +159,7 @@ def _calculate_up_down_volume_ratio(price_history: pd.DataFrame, lookback: int =
 
 
 def _score_float_supply(shares_outstanding: Optional[float]) -> float:
-    """
-    Score based on shares outstanding / float size.
+    """Score based on shares outstanding / float size.
 
     O'Neil prefers companies with a manageable number of shares outstanding.
     Very large floats (billions of shares) make it harder for the stock to move.
@@ -209,10 +203,9 @@ def evaluate_s(
     shares_outstanding: Optional[float] = None,
     s_volume_surge_threshold: Optional[float] = None,
     s_breakout_proximity: Optional[float] = None,
-    s_power_gap_lookback: Optional[int] = None
+    s_power_gap_lookback: Optional[int] = None,
 ) -> tuple[float, Dict[str, object]]:
-    """
-    Evaluate S (Supply and Demand) score.
+    """Evaluate S (Supply and Demand) score.
 
     Per O'Neil's methodology:
     1. Shares outstanding / float size (tighter supply = better)
@@ -245,7 +238,7 @@ def evaluate_s(
     s_power_gap_lookback = s_power_gap_lookback or settings.S_POWER_GAP_LOOKBACK
 
     # Get most recent volume
-    recent_volume = float(price_history['Volume'].iloc[-1]) if len(price_history) > 0 else 0.0
+    recent_volume = float(price_history["Volume"].iloc[-1]) if len(price_history) > 0 else 0.0
 
     # --- Component 1: Float / Shares Outstanding ---
     float_score = _score_float_supply(shares_outstanding)
@@ -264,13 +257,12 @@ def evaluate_s(
     has_volume_surge, volume_ratio = _detect_volume_surge(
         recent_volume, avg_volume_50, s_volume_surge_threshold
     )
-    is_breakout, proximity = _detect_breakout(
-        current_price, high_52week, s_breakout_proximity
-    )
+    is_breakout, proximity = _detect_breakout(current_price, high_52week, s_breakout_proximity)
 
     # Volume + breakout combined score
     volume_score = min(volume_ratio / s_volume_surge_threshold, 1.0) if avg_volume_50 > 0 else 0.0
-    breakout_score = 1.0 if is_breakout else max((proximity - 0.85) / (s_breakout_proximity - 0.85), 0)
+    proximity_score = (proximity - 0.85) / (s_breakout_proximity - 0.85)
+    breakout_score = 1.0 if is_breakout else max(proximity_score, 0)
     surge_breakout_score = 0.5 * volume_score + 0.5 * breakout_score
 
     # --- Component 4: Power Earnings Gap ---
@@ -290,17 +282,17 @@ def evaluate_s(
 
     # Compile metrics for reporting
     metrics = {
-        'recent_volume': recent_volume,
-        'avg_volume_50': avg_volume_50,
-        'volume_ratio': volume_ratio,
-        'has_volume_surge': has_volume_surge,
-        'proximity_to_high': proximity,
-        'is_breakout': is_breakout,
-        'has_power_gap': has_power_gap,
-        'power_gap_details': gap_details,
-        'up_down_volume_ratio': up_down_ratio,
-        'shares_outstanding': shares_outstanding,
-        'float_score': float_score,
+        "recent_volume": recent_volume,
+        "avg_volume_50": avg_volume_50,
+        "volume_ratio": volume_ratio,
+        "has_volume_surge": has_volume_surge,
+        "proximity_to_high": proximity,
+        "is_breakout": is_breakout,
+        "has_power_gap": has_power_gap,
+        "power_gap_details": gap_details,
+        "up_down_volume_ratio": up_down_ratio,
+        "shares_outstanding": shares_outstanding,
+        "float_score": float_score,
     }
 
     return score, metrics

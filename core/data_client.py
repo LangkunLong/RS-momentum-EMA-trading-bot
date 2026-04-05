@@ -1,5 +1,4 @@
-"""
-Unified data access layer for CANSLIM Trading Bot.
+"""Unified data access layer for CANSLIM Trading Bot.
 
 Provides all price data via Alpaca and all fundamental data via
 Financial Modeling Prep (FMP).  Every function returns data in the
@@ -8,9 +7,9 @@ expect, so NO downstream math changes are needed.
 
 Session cache prevents redundant API calls within the same scan run.
 """
+
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -18,7 +17,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import requests
-
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -59,8 +57,7 @@ def _get_alpaca_client() -> StockHistoricalDataClient:
         secret_key = settings.ALPACA_SECRET_KEY
         if not api_key or not secret_key:
             raise EnvironmentError(
-                "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. "
-                "See .env.example for details."
+                "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. See .env.example for details."
             )
         _alpaca_client = StockHistoricalDataClient(api_key, secret_key)
     return _alpaca_client
@@ -69,9 +66,7 @@ def _get_alpaca_client() -> StockHistoricalDataClient:
 def _fmp_api_key() -> str:
     key = settings.FMP_API_KEY
     if not key:
-        raise EnvironmentError(
-            "FMP_API_KEY must be set. See .env.example for details."
-        )
+        raise EnvironmentError("FMP_API_KEY must be set. See .env.example for details.")
     return key
 
 
@@ -80,11 +75,11 @@ def _fmp_api_key() -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _PERIOD_MAP: Dict[str, int] = {
-    "5d": 7,        # request 7 calendar days to get ~5 trading days
+    "5d": 7,  # request 7 calendar days to get ~5 trading days
     "1mo": 35,
     "3mo": 100,
     "6mo": 200,
-    "1y": 370,      # slight buffer over 365 for weekends / holidays
+    "1y": 370,  # slight buffer over 365 for weekends / holidays
     "14mo": 435,
     "2y": 740,
     "3y": 1100,
@@ -102,6 +97,7 @@ def _period_to_days(period: str) -> int:
 # FMP Generic Helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     """Execute a GET request against the FMP API."""
     url = f"{settings.FMP_BASE_URL}/{endpoint}"
@@ -115,6 +111,7 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Alpaca — Price / OHLCV Functions
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def fetch_ohlcv(
     symbol: str,
@@ -156,23 +153,30 @@ def fetch_ohlcv(
         df = df.droplevel("symbol")
 
     # Rename lowercase Alpaca columns → capitalized yfinance convention
-    df = df.rename(columns={
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "volume": "Volume",
-    })
+    df = df.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
     df = df[["Open", "High", "Low", "Close", "Volume"]]
 
     # Strip timezone to match yfinance tz-naive output
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
 
-    df = df.astype({
-        "Open": float, "High": float, "Low": float,
-        "Close": float, "Volume": float,
-    })
+    df = df.astype(
+        {
+            "Open": float,
+            "High": float,
+            "Low": float,
+            "Close": float,
+            "Volume": float,
+        }
+    )
 
     _cache_set(cache_key, df)
     return df
@@ -196,7 +200,7 @@ def fetch_bulk_close_prices(
     all_frames: List[pd.DataFrame] = []
 
     for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i: i + chunk_size]
+        chunk = tickers[i : i + chunk_size]
         batch_num = i // chunk_size + 1
         total_batches = (len(tickers) // chunk_size) + 1
         print(f"Downloading batch {batch_num}/{total_batches} ({len(chunk)} tickers)...")
@@ -311,9 +315,7 @@ def _fmp_records_to_financial_df(
     return df
 
 
-def fetch_quarterly_income_statement(
-    symbol: str, limit: int = 8
-) -> pd.DataFrame:
+def fetch_quarterly_income_statement(symbol: str, limit: int = 8) -> pd.DataFrame:
     """Fetch quarterly income statement in yfinance-compatible format."""
     cache_key = ("quarterly_income", symbol, limit)
     cached = _cache_get(cache_key)
@@ -326,9 +328,7 @@ def fetch_quarterly_income_statement(
     return df
 
 
-def fetch_annual_income_statement(
-    symbol: str, limit: int = 5
-) -> pd.DataFrame:
+def fetch_annual_income_statement(symbol: str, limit: int = 5) -> pd.DataFrame:
     """Fetch annual income statement in yfinance-compatible format."""
     cache_key = ("annual_income", symbol, limit)
     cached = _cache_get(cache_key)
@@ -380,7 +380,7 @@ def fetch_company_info(symbol: str) -> dict:
             shares = ev[0].get("numberOfShares")
             if shares is not None:
                 result["shares_outstanding"] = int(shares)
-    except Exception:
+    except (requests.RequestException, ValueError, EnvironmentError):
         pass
 
     # Fallback: derive from profile (mktCap / price)
@@ -393,7 +393,7 @@ def fetch_company_info(symbol: str) -> dict:
                 price = p.get("price")
                 if mkt_cap and price and price > 0:
                     result["shares_outstanding"] = int(mkt_cap / price)
-        except Exception:
+        except (requests.RequestException, ValueError, EnvironmentError):
             pass
 
     # 2. Institutional holders
@@ -407,7 +407,7 @@ def fetch_company_info(symbol: str) -> dict:
                 result["held_percent_institutions"] = min(
                     total_held / result["shares_outstanding"], 1.0
                 )
-    except Exception:
+    except (requests.RequestException, ValueError, EnvironmentError):
         pass
 
     _cache_set(cache_key, result)
@@ -418,9 +418,8 @@ def fetch_company_info(symbol: str) -> dict:
 # FMP — Point-in-Time Fundamentals for Backtesting
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _filter_records_as_of(
-    records: List[dict], as_of_date: datetime
-) -> List[dict]:
+
+def _filter_records_as_of(records: List[dict], as_of_date: datetime) -> List[dict]:
     """Keep only records whose SEC-accepted date is on or before *as_of_date*.
 
     FMP provides an ``acceptedDate`` field (the date the SEC accepted the
@@ -435,16 +434,83 @@ def _filter_records_as_of(
         # acceptedDate often looks like "2024-10-30 16:05:12"
         try:
             ts = pd.Timestamp(str(accepted).split(" ")[0])
-        except Exception:
+        except ValueError:
             continue
         if ts <= cutoff:
             filtered.append(rec)
     return filtered
 
 
-def fetch_fundamental_data_as_of(
-    symbol: str, as_of_date: datetime
-) -> dict:
+def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
+    """Fetch company info with point-in-time filtering for backtesting.
+
+    Uses ``acceptedDate``-filtered enterprise values for shares outstanding to
+    eliminate look-ahead bias. Institutional holder data is current-only (FMP
+    free tier limitation) and is included as a best-effort approximation.
+
+    Args:
+        symbol: Ticker symbol.
+        as_of_date: Cutoff date — only data accepted on or before this date is used.
+
+    Returns:
+        Dict with keys ``shares_outstanding``, ``held_percent_institutions``,
+        ``institution_count``.
+    """
+    cache_key = ("company_info_as_of", symbol, as_of_date.strftime("%Y-%m-%d"))
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    result: Dict[str, Any] = {
+        "shares_outstanding": None,
+        "held_percent_institutions": None,
+        "institution_count": None,
+    }
+
+    # Shares outstanding: fetch historical enterprise values and filter by date
+    try:
+        ev = _fmp_get(f"enterprise-values/{symbol}", {"limit": 20, "period": "quarter"})
+        if ev and isinstance(ev, list):
+            ev_filtered = _filter_records_as_of(ev, as_of_date)
+            if ev_filtered:
+                # Most recent record on or before the cutoff date
+                shares = ev_filtered[-1].get("numberOfShares")
+                if shares is not None:
+                    result["shares_outstanding"] = int(shares)
+    except (requests.RequestException, ValueError, EnvironmentError):
+        pass
+
+    # Fallback: profile data is current-only; acceptable as last resort
+    if result["shares_outstanding"] is None:
+        try:
+            profile = _fmp_get(f"profile/{symbol}")
+            if profile and isinstance(profile, list) and len(profile) > 0:
+                p = profile[0]
+                mkt_cap = p.get("mktCap")
+                price = p.get("price")
+                if mkt_cap and price and price > 0:
+                    result["shares_outstanding"] = int(mkt_cap / price)
+        except (requests.RequestException, ValueError, EnvironmentError):
+            pass
+
+    # Institutional holders: FMP free tier is current-only; best-effort for backtests
+    try:
+        holders = _fmp_get(f"institutional-holder/{symbol}")
+        if holders and isinstance(holders, list):
+            result["institution_count"] = len(holders)
+            if result["shares_outstanding"] and result["shares_outstanding"] > 0:
+                total_held = sum(h.get("shares", 0) for h in holders if h.get("shares"))
+                result["held_percent_institutions"] = min(
+                    total_held / result["shares_outstanding"], 1.0
+                )
+    except (requests.RequestException, ValueError, EnvironmentError):
+        pass
+
+    _cache_set(cache_key, result)
+    return result
+
+
+def fetch_fundamental_data_as_of(symbol: str, as_of_date: datetime) -> dict:
     """Fetch fundamental data that was publicly available as of *as_of_date*.
 
     Returns:
@@ -463,15 +529,15 @@ def fetch_fundamental_data_as_of(
     # Fetch with generous limit so we have enough history to filter
     try:
         qi_raw = _fmp_get(f"income-statement/{symbol}", {"period": "quarter", "limit": 20})
-    except Exception:
+    except (requests.RequestException, ValueError, EnvironmentError):
         qi_raw = []
     try:
         ai_raw = _fmp_get(f"income-statement/{symbol}", {"period": "annual", "limit": 10})
-    except Exception:
+    except (requests.RequestException, ValueError, EnvironmentError):
         ai_raw = []
     try:
         bs_raw = _fmp_get(f"balance-sheet-statement/{symbol}", {"limit": 10})
-    except Exception:
+    except (requests.RequestException, ValueError, EnvironmentError):
         bs_raw = []
 
     qi_filtered = _filter_records_as_of(qi_raw, as_of_date)
@@ -482,7 +548,7 @@ def fetch_fundamental_data_as_of(
         "quarterly_income": _fmp_records_to_financial_df(qi_filtered, _FMP_INCOME_FIELD_MAP),
         "annual_income": _fmp_records_to_financial_df(ai_filtered, _FMP_INCOME_FIELD_MAP),
         "balance_sheet": _fmp_records_to_financial_df(bs_filtered, _FMP_BALANCE_SHEET_FIELD_MAP),
-        "company_info": fetch_company_info(symbol),
+        "company_info": _fetch_company_info_as_of(symbol, as_of_date),
     }
 
     _cache_set(cache_key, result)
@@ -492,6 +558,7 @@ def fetch_fundamental_data_as_of(
 # ═══════════════════════════════════════════════════════════════════════════════
 # DataFrame Utility Functions (migrated from yahoo_finance_helper.py)
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def normalize_price_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Flatten MultiIndex columns from multi-ticker downloads."""
@@ -509,10 +576,7 @@ def normalize_price_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 df.columns = level1
         else:
-            df.columns = [
-                "_".join(str(part) for part in col if part)
-                for col in df.columns
-            ]
+            df.columns = ["_".join(str(part) for part in col if part) for col in df.columns]
     return df
 
 
