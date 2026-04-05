@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import requests
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.models import Adjustment
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
@@ -157,6 +158,7 @@ def fetch_ohlcv(
         start=start,
         end=end,
         limit=10000,
+        adjustment=Adjustment.ALL,
     )
 
     barset = client.get_stock_bars(request_params)
@@ -244,6 +246,7 @@ def fetch_bulk_close_prices(
                 start=start,
                 end=end,
                 limit=10000,
+                adjustment=Adjustment.ALL,
             )
             barset = client.get_stock_bars(request_params)
             df = barset.df

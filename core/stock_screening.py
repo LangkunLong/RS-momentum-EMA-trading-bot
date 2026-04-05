@@ -39,51 +39,57 @@ def evaluate_stock_canslim(
         Dict with CANSLIM evaluation results, or None if stock doesn't meet criteria
 
     """
-    if debug:
-        print("\n" + "-" * 60)
-        print(f"[DEBUG] Evaluating {symbol}")
+    logs: List[str] = []
+
+    def _debug(msg: str) -> None:
+        if debug:
+            logs.append(msg)
+
+    def _flush_logs() -> None:
+        if debug and logs:
+            print("\n".join(logs))
+
+    _debug("\n" + "-" * 60)
+    _debug(f"[DEBUG] Evaluating {symbol}")
 
     canslim_view = evaluate_canslim(symbol, rs_scores_df=rs_scores_df, market_trend=market_trend)
     if not canslim_view:
-        if debug:
-            print("[DEBUG] CANSLIM evaluation unavailable.")
+        _debug("[DEBUG] CANSLIM evaluation unavailable.")
+        _flush_logs()
         return None
 
     rs_score = float(canslim_view["rs_score"])
-    if debug:
-        print(f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | Minimum Required: {min_rs_score:.1f}")
+    _debug(f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | Minimum Required: {min_rs_score:.1f}")
     if rs_score < min_rs_score:
-        if debug:
-            print("[DEBUG] Fails RS score threshold.")
+        _debug("[DEBUG] Fails RS score threshold.")
+        _flush_logs()
         return None
 
     total_score = float(canslim_view["total_score"])
-    if debug:
-        print(f"[DEBUG] CANSLIM Total Score: {total_score:.1f} | Minimum Required: {min_canslim_score:.1f}")
+    _debug(f"[DEBUG] CANSLIM Total Score: {total_score:.1f} | Minimum Required: {min_canslim_score:.1f}")
     if total_score < min_canslim_score:
-        if debug:
-            print("[DEBUG] Fails CANSLIM composite threshold.")
+        _debug("[DEBUG] Fails CANSLIM composite threshold.")
+        _flush_logs()
         return None
 
-    if debug:
-        print(f"[DEBUG] ✓ {symbol} meets fundamental CANSLIM criteria!")
+    _debug(f"[DEBUG] ✓ {symbol} meets fundamental CANSLIM criteria!")
 
     if strict_breakout:
         if not market_trend.is_bullish:
-            if debug:
-                print("[DEBUG] Fails strict entry: Market is not in confirmed uptrend (is_bullish=False).")
+            _debug("[DEBUG] Fails strict entry: Market is not in confirmed uptrend (is_bullish=False).")
+            _flush_logs()
             return None
         if not canslim_view.get("is_breakout"):
-            if debug:
-                print("[DEBUG] Fails strict entry: Not breaking out near 52-week high.")
+            _debug("[DEBUG] Fails strict entry: Not breaking out near 52-week high.")
+            _flush_logs()
             return None
         if not canslim_view.get("has_volume_surge"):
-            if debug:
-                print("[DEBUG] Fails strict entry: No volume surge detected.")
+            _debug("[DEBUG] Fails strict entry: No volume surge detected.")
+            _flush_logs()
             return None
-        if debug:
-            print(f"[DEBUG] ✓ {symbol} meets strict breakout criteria!")
+        _debug(f"[DEBUG] ✓ {symbol} meets strict breakout criteria!")
 
+    _flush_logs()
     return canslim_view
 
 
