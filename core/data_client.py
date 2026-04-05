@@ -76,14 +76,16 @@ def _fmp_api_key() -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _PERIOD_MAP: Dict[str, int] = {
-    "5d": 7,  # request 7 calendar days to get ~5 trading days
+    "5d": 7,
     "1mo": 35,
     "3mo": 100,
     "6mo": 200,
-    "1y": 370,  # slight buffer over 365 for weekends / holidays
+    "1y": 370,
     "14mo": 435,
     "2y": 740,
     "3y": 1100,
+    "5y": 1825,
+    "7y": 2555,
 }
 
 
@@ -544,24 +546,27 @@ def _fetch_fmp_raw_history(symbol: str) -> dict:
 
 
 def _filter_records_as_of(records: List[dict], as_of_date: datetime) -> List[dict]:
-    """Keep only records whose SEC-accepted date is on or before *as_of_date*.
-
-    FMP provides an ``acceptedDate`` field (the date the SEC accepted the
-    filing).  Filtering on this eliminates look-ahead bias.
-    """
+    """Keep only records whose SEC-accepted date is on or before *as_of_date*."""
     cutoff = pd.Timestamp(as_of_date)
     filtered = []
     for rec in records:
-        accepted = rec.get("acceptedDate") or rec.get("date")
-        if accepted is None:
+        # Safely catch both None and empty strings ""
+        accepted = rec.get("acceptedDate")
+        if not accepted:
+            accepted = rec.get("date")
+
+        if not accepted:
             continue
+
         # acceptedDate often looks like "2024-10-30 16:05:12"
         try:
             ts = pd.Timestamp(str(accepted).split(" ")[0])
         except ValueError:
             continue
+
         if ts <= cutoff:
             filtered.append(rec)
+
     return filtered
 
 

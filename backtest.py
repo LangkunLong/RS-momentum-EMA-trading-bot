@@ -47,7 +47,6 @@ from core.momentum_analysis import calculate_weighted_performance
 BACKTEST_TICKERS = ["CRWD", "GE", "GEV", "VST", "VRT"]
 BENCHMARK = "SPY"
 LOOKBACK_YEARS = 2
-EVAL_INTERVAL_WEEKS = 4  # Evaluate every ~4 weeks
 
 
 def _download_price_data(tickers: List[str], period: str = "3y") -> Dict[str, pd.DataFrame]:
@@ -91,7 +90,17 @@ def _calculate_rs_at_date(all_closes: pd.DataFrame, ticker: str, eval_date: pd.T
     perfs = {}
     for col in sliced.columns:
         series = sliced[col].dropna()
+        if len(series) < 60:
+            continue  # Ignore stocks with less than ~3 months of history
+
         wp = calculate_weighted_performance(series)
+
+        # FALLBACK FOR IPOs/SPINOFFS (like GEV):
+        # If the stock doesn't have enough history for the standard 1-year
+        # weighted performance, calculate its raw return over its available life.
+        if wp is None and len(series) >= 60:
+            wp = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
+
         if wp is not None:
             perfs[col] = wp
 
@@ -154,7 +163,7 @@ def _evaluate_technical_at_date(
     n_score = float(np.clip(proximity_score, 0, 1))
 
     # S score
-    score_s, s_metrics = evaluate_s(sliced, avg_vol_50, latest_close, high_52, shares_outstanding)
+    score_s, s_metrics = evaluate_s(sliced, avg_vol_50, latest_close, high_52, shares_outstanding, s_breakout_proximity=0.95)
 
     return {
         "n_score": n_score,
@@ -165,6 +174,8 @@ def _evaluate_technical_at_date(
         "avg_vol_50": avg_vol_50,
         "is_breakout": s_metrics.get("is_breakout", False),
         "has_volume_surge": s_metrics.get("has_volume_surge", False),
+        "has_power_gap": s_metrics.get("has_power_gap", False),
+        "power_gap_details": s_metrics.get("power_gap_details", {}),
     }
 
 
@@ -258,7 +269,6 @@ def run_backtest() -> pd.DataFrame:
     print("=" * 70)
     print("CANSLIM BACKTEST")
     print(f"Tickers: {', '.join(BACKTEST_TICKERS)}")
-    print(f"Period: {LOOKBACK_YEARS} years, evaluated every ~{EVAL_INTERVAL_WEEKS} weeks")
     print("=" * 70)
 
     # Reset session cache for a clean run
@@ -289,14 +299,14 @@ def run_backtest() -> pd.DataFrame:
 
     end_date = datetime.now()
     start_date = end_date - timedelta(days=LOOKBACK_YEARS * 365)
-    eval_dates = []
-    d = start_date
-    while d <= end_date:
-        eval_dates.append(pd.Timestamp(d))
-        d += timedelta(weeks=EVAL_INTERVAL_WEEKS)
+
+    # Extract the exact market trading calendar from SPY
+    spy_data = ticker_ohlcv[BENCHMARK]
+    valid_trading_days = spy_data.loc[start_date:end_date].index
+    eval_dates = [pd.Timestamp(d) for d in valid_trading_days]
 
     print(
-        f"  {len(eval_dates)} evaluation dates from "
+        f"  {len(eval_dates)} trading days from "
         f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
     )
 
@@ -332,7 +342,7 @@ def run_backtest() -> pd.DataFrame:
             # Fundamental scores
             c_score = fund.get("c_score", 0.0)
             a_score = fund.get("a_score", 0.0)
-            i_score = fund.get("i_score", 0.1)
+            i_score = fund.get("i_score", 0.5)
             has_fundamentals = fund.get("current_growth") is not None or fund.get("annual_growth") is not None
 
             # Composite CANSLIM score
@@ -347,12 +357,20 @@ def run_backtest() -> pd.DataFrame:
                 has_fundamentals=has_fundamentals,
             )
 
+            # --- UPDATED SIGNAL LOGIC ---
+            has_breakout = bool(tech.get("is_breakout", False))
+            has_surge = bool(tech.get("has_volume_surge", False))
+
+            # Only count the Power Earnings Gap if it happened exactly on this eval date (days_ago == 0)
+            peg_details = tech.get("power_gap_details") or {}
+            has_peg_today = bool(tech.get("has_power_gap", False)) and peg_details.get("days_ago") == 0
+
+            # A valid buy requires a bullish market AND (either a volume breakout OR a power earnings gap)
             buy_signal = (
                 total >= settings.MIN_CANSLIM_SCORE
                 and rs_score >= settings.MIN_RS_SCORE
                 and bool(m_bullish)
-                and bool(tech.get("is_breakout", False))
-                and bool(tech.get("has_volume_surge", False))
+                and ((has_breakout and has_surge) or has_peg_today)
             )
             close_price = tech["close"]
 
@@ -376,6 +394,7 @@ def run_backtest() -> pd.DataFrame:
                     "FTD": ftd,
                     "Is_Breakout": tech.get("is_breakout", False),
                     "Has_Vol_Surge": tech.get("has_volume_surge", False),
+                    "Has_PEG": has_peg_today,
                     "BUY_SIGNAL": buy_signal,
                 }
             )
@@ -471,18 +490,23 @@ def print_results(df: pd.DataFrame) -> None:
         tdf = df[df["Ticker"] == ticker]
         if tdf.empty:
             continue
+
         buy_dates = tdf[tdf["BUY_SIGNAL"]]
         latest_close = tdf.iloc[-1]["Close"]
+
         if not buy_dates.empty:
-            first_buy = buy_dates.iloc[0]
-            buy_price = first_buy["Close"]
-            ret = (latest_close - buy_price) / buy_price * 100
-            print(
-                f"  {ticker:<6} First buy: {first_buy['Date']} @ ${buy_price:.2f} | "
-                f"Latest: ${latest_close:.2f} | Return: {ret:+.1f}%"
-            )
+            print(f"  {ticker} Buy Signals:")
+            for _idx, row in buy_dates.iterrows():
+                buy_price = row["Close"]
+                ret = (latest_close - buy_price) / buy_price * 100
+                print(
+                    f"    -> Buy: {row['Date']} @ ${buy_price:>6.2f} | "
+                    f"Latest: ${latest_close:>6.2f} | Return: {ret:+.1f}%"
+                )
+            print("-" * 60)
         else:
             print(f"  {ticker:<6} No buy signals generated | Latest: ${latest_close:.2f}")
+            print("-" * 60)
 
 
 if __name__ == "__main__":
