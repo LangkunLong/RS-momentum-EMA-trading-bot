@@ -132,14 +132,10 @@ def evaluate_canslim(
     score_a, annual_growth, roe = evaluate_a(annual_income, a_growth_target, balance_sheet)
 
     # N - New Products/Price Leadership (emphasis on new highs)
-    score_n, revenue_growth = evaluate_n(
-        quarterly_income, proximity_to_high, n_revenue_weight, n_proximity_weight
-    )
+    score_n, revenue_growth = evaluate_n(quarterly_income, proximity_to_high, n_revenue_weight, n_proximity_weight)
 
     # S - Supply and Demand (float, up/down volume, breakout, power gap)
-    score_s, s_metrics = evaluate_s(
-        price_history, avg_volume_50, latest_close, high_52, shares_outstanding
-    )
+    score_s, s_metrics = evaluate_s(price_history, avg_volume_50, latest_close, high_52, shares_outstanding)
 
     # L - Leader or Laggard
     score_l, rs_score = evaluate_l(symbol, rs_scores_df)
@@ -148,9 +144,7 @@ def evaluate_canslim(
     held_percent_institutions = company_info.get("held_percent_institutions")
     num_institutional_holders = company_info.get("institution_count")
 
-    score_i = evaluate_i(
-        held_percent_institutions, num_institutional_holders=num_institutional_holders
-    )
+    score_i = evaluate_i(held_percent_institutions, num_institutional_holders=num_institutional_holders)
 
     # M - Market Direction
     score_m = market_trend.score
@@ -221,4 +215,6 @@ def evaluate_canslim(
         "total_score": total_score,
         "rs_score": rs_score,
         "market_trend": market_trend,
+        "is_breakout": s_metrics.get("is_breakout", False),
+        "has_volume_surge": s_metrics.get("has_volume_surge", False),
     }

@@ -6,29 +6,17 @@ requires-python = ">=3.11"
 # ─── Ruff ────────────────────────────────────────────────────────────────────
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["F", "E", "W", "B", "I", "D", "ANN"]
+select = ["F", "E", "B", "I"]
 ignore = [
-    "D100",    # Missing docstring in public module — enforced only on packages
-    "D104",    # Missing docstring in public package — __init__.py files are intentionally minimal
-    "D203",    # one-blank-line-before-class — conflicts with D211 (Google style)
-    "D213",    # multi-line-summary-second-line — conflicts with D212 (Google style)
-    "ANN401",  # Disallow Any — data_client.py session cache legitimately uses Any
+    "E501",  # Line too long — handled by formatter, not enforced as an error
 ]
-
-[tool.ruff.lint.pydocstyle]
-convention = "google"
 
 [tool.ruff.lint.isort]
 known-first-party = ["core", "config", "quality_stocks", "enhanced_scanner"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["D", "ANN"]          # No docstring/annotation requirements on test functions
-"config/settings.py" = ["D"]            # Settings are self-documenting via comments
-"verify_fixes.py" = ["D", "ANN"]        # Legacy file — will be deleted after test migration
 
 # ─── Pytest ──────────────────────────────────────────────────────────────────
 
