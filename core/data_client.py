@@ -156,18 +156,10 @@ def fetch_ohlcv(
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
-        limit=10000,
     )
 
     barset = client.get_stock_bars(request_params)
     df = barset.df
-
-    while barset.next_page_token is not None:
-        request_params.page_token = barset.next_page_token
-        next_barset = client.get_stock_bars(request_params)
-        if not next_barset.df.empty:
-            df = pd.concat([df, next_barset.df])
-        barset.next_page_token = next_barset.next_page_token
 
     if df.empty:
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -243,17 +235,9 @@ def fetch_bulk_close_prices(
                 timeframe=TimeFrame.Day,
                 start=start,
                 end=end,
-                limit=10000,
             )
             barset = client.get_stock_bars(request_params)
             df = barset.df
-
-            while barset.next_page_token is not None:
-                request_params.page_token = barset.next_page_token
-                next_barset = client.get_stock_bars(request_params)
-                if not next_barset.df.empty:
-                    df = pd.concat([df, next_barset.df])
-                barset.next_page_token = next_barset.next_page_token
 
             if df.empty:
                 print(f"  Batch {batch_num} returned empty data, skipping.")

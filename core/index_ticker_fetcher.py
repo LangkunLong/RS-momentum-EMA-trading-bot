@@ -81,11 +81,20 @@ def _parse_ishares_csv(response_text: str, index_name: str) -> List[str]:
             return list(_FALLBACK_TICKERS)
 
         raw = df[ticker_col].dropna().tolist()
-        tickers = [
-            str(t).strip().replace(".", "-") for t in raw if isinstance(t, str) and str(t).strip()
-        ]
-        # Filter out non-ticker values
-        tickers = [t for t in tickers if t.isalpha() or "-" in t]
+        tickers = []
+        for t in raw:
+            if not isinstance(t, str):
+                continue
+            t = t.strip()
+            # Valid tickers are typically 1-5 letters, possibly with a hyphen (e.g. BRK.B -> BRK-B)
+            # Remove any legal-text disclaimers or trailing hyphens
+            if not t or len(t) > 8 or " " in t:
+                continue
+            t = t.replace(".", "-").upper()
+            if t.endswith("-"):
+                t = t[:-1]
+            if t.isalpha() or ("-" in t and t.replace("-", "").isalpha()):
+                tickers.append(t)
 
         if not tickers:
             print(f"Warning: Parsed 0 tickers from {index_name} CSV. Using fallback tickers.")
