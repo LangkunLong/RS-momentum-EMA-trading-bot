@@ -1,5 +1,4 @@
-"""
-CANSLIM Stock Evaluation Module
+"""CANSLIM Stock Evaluation Module.
 
 This module provides a comprehensive implementation of William O'Neil's CANSLIM
 investment strategy, breaking down each component into separate, maintainable modules.
@@ -22,16 +21,18 @@ Usage:
     # Evaluate individual stock
     result = evaluate_canslim(symbol, rs_scores_df, market_trend)
 """
-from .core import evaluate_canslim
-from .m_market_direction import evaluate_m as evaluate_market_direction, MarketTrend
+
+from .a_annual_earnings import evaluate_a
 
 # Individual component evaluators (for advanced usage)
 from .c_current_earnings import evaluate_c
-from .a_annual_earnings import evaluate_a
+from .core import evaluate_canslim
+from .i_institutional import evaluate_i
+from .l_leader_laggard import evaluate_l
+from .m_market_direction import MarketTrend
+from .m_market_direction import evaluate_m as evaluate_market_direction
 from .n_new_products import evaluate_n
 from .s_supply_demand import evaluate_s
-from .l_leader_laggard import evaluate_l
-from .i_institutional import evaluate_i
 
 __all__ = [
     "evaluate_canslim",

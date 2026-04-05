@@ -1,5 +1,4 @@
-"""
-CANSLIM Backtest Script
+"""CANSLIM Backtest Script.
 
 Evaluates specific tickers at monthly intervals over the past 2 years
 using the existing CANSLIM criteria. Records buy signals and closing prices.
@@ -10,13 +9,13 @@ eliminating the look-ahead bias present in the old yfinance approach.
 Technical criteria (N, S, L, M) are evaluated using historical Alpaca
 price data sliced to each evaluation date.
 """
+
 from __future__ import annotations
 
-import sys
 import os
+import sys
 import time
 from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -26,23 +25,20 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import settings
+from core.canslim.a_annual_earnings import evaluate_a
+from core.canslim.c_current_earnings import evaluate_c
+from core.canslim.i_institutional import evaluate_i
+from core.canslim.s_supply_demand import evaluate_s
 from core.data_client import (
+    clear_session_cache,
     coerce_scalar,
     extract_float_series,
-    fetch_ohlcv,
     fetch_bulk_close_prices,
     fetch_fundamental_data_as_of,
-    fetch_company_info,
-    clear_session_cache,
+    fetch_ohlcv,
 )
 from core.index_ticker_fetcher import get_sp500_tickers
-from core.canslim.c_current_earnings import evaluate_c
-from core.canslim.a_annual_earnings import evaluate_a
-from core.canslim.n_new_products import evaluate_n
-from core.canslim.s_supply_demand import evaluate_s
-from core.canslim.i_institutional import evaluate_i
 from core.momentum_analysis import calculate_weighted_performance
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -53,9 +49,7 @@ LOOKBACK_YEARS = 2
 EVAL_INTERVAL_WEEKS = 4  # Evaluate every ~4 weeks
 
 
-def _download_price_data(
-    tickers: List[str], period: str = "3y"
-) -> Dict[str, pd.DataFrame]:
+def _download_price_data(tickers: List[str], period: str = "3y") -> Dict[str, pd.DataFrame]:
     """Download OHLCV data for each ticker individually via Alpaca."""
     data = {}
     for ticker in tickers:
@@ -78,9 +72,7 @@ def _download_bulk_closes(tickers: List[str], period: str = "3y") -> pd.DataFram
     return fetch_bulk_close_prices(tickers, period=period, chunk_size=settings.CHUNK_SIZE)
 
 
-def _calculate_rs_at_date(
-    all_closes: pd.DataFrame, ticker: str, eval_date: pd.Timestamp
-) -> float:
+def _calculate_rs_at_date(all_closes: pd.DataFrame, ticker: str, eval_date: pd.Timestamp) -> float:
     """Calculate RS score for a ticker as-of a specific date."""
     # Slice data up to eval_date
     sliced = all_closes.loc[:eval_date].dropna(axis=1, how="all")
@@ -105,7 +97,9 @@ def _calculate_rs_at_date(
     return float(rs_score)
 
 
-def _evaluate_market_at_date(spy_data: pd.DataFrame, eval_date: pd.Timestamp) -> Tuple[float, bool, int, bool]:
+def _evaluate_market_at_date(
+    spy_data: pd.DataFrame, eval_date: pd.Timestamp
+) -> Tuple[float, bool, int, bool]:
     """Evaluate M (Market Direction) as-of a specific date using SPY data.
 
     Returns: (score, is_bullish, distribution_days, follow_through)
@@ -128,12 +122,13 @@ def _evaluate_market_at_date(spy_data: pd.DataFrame, eval_date: pd.Timestamp) ->
 
     # Distribution days
     lookback = min(settings.M_DISTRIBUTION_LOOKBACK, len(closes) - 1)
-    recent_closes = closes.iloc[-(lookback + 1):]
-    recent_volumes = volumes.iloc[-(lookback + 1):]
+    recent_closes = closes.iloc[-(lookback + 1) :]
+    recent_volumes = volumes.iloc[-(lookback + 1) :]
     dist_count = 0
     for i in range(1, len(recent_closes)):
         pct_change = (recent_closes.iloc[i] - recent_closes.iloc[i - 1]) / recent_closes.iloc[i - 1]
-        if pct_change <= -settings.M_DISTRIBUTION_MIN_DECLINE and recent_volumes.iloc[i] > recent_volumes.iloc[i - 1]:
+        vol_increased = recent_volumes.iloc[i] > recent_volumes.iloc[i - 1]
+        if pct_change <= -settings.M_DISTRIBUTION_MIN_DECLINE and vol_increased:
             dist_count += 1
     dist_score = max(1.0 - dist_count / settings.M_MAX_DISTRIBUTION_DAYS, 0.0)
 
@@ -152,9 +147,11 @@ def _evaluate_market_at_date(spy_data: pd.DataFrame, eval_date: pd.Timestamp) ->
                     rally_count = 1
                 else:
                     rally_count += 1
-                if (rally_count >= settings.M_FOLLOW_THROUGH_MIN_DAY
-                        and daily_chg >= settings.M_FOLLOW_THROUGH_MIN_PCT
-                        and rv.iloc[i] > rv.iloc[i - 1]):
+                if (
+                    rally_count >= settings.M_FOLLOW_THROUGH_MIN_DAY
+                    and daily_chg >= settings.M_FOLLOW_THROUGH_MIN_PCT
+                    and rv.iloc[i] > rv.iloc[i - 1]
+                ):
                     ftd = True
                     break
             elif daily_chg < -0.01:
@@ -219,9 +216,7 @@ def _evaluate_technical_at_date(
     n_score = float(np.clip(proximity_score, 0, 1))
 
     # S score
-    score_s, _ = evaluate_s(
-        sliced, avg_vol_50, latest_close, high_52, shares_outstanding
-    )
+    score_s, _ = evaluate_s(sliced, avg_vol_50, latest_close, high_52, shares_outstanding)
 
     return {
         "n_score": n_score,
@@ -233,9 +228,7 @@ def _evaluate_technical_at_date(
     }
 
 
-def _evaluate_fundamentals_at_date(
-    symbol: str, eval_date: pd.Timestamp
-) -> Dict[str, object]:
+def _evaluate_fundamentals_at_date(symbol: str, eval_date: pd.Timestamp) -> Dict[str, object]:
     """Fetch and evaluate C, A, I fundamental scores as-of a specific date.
 
     Uses FMP's acceptedDate to filter only data that was publicly
@@ -279,7 +272,13 @@ def _evaluate_fundamentals_at_date(
 
 
 def _compute_canslim_score(
-    c: float, a: float, n: float, s: float, l: float, i: float, m: float,
+    c: float,
+    a: float,
+    n: float,
+    s: float,
+    l_score: float,
+    i: float,
+    m: float,
     has_fundamentals: bool = True,
 ) -> float:
     """Compute weighted CANSLIM composite score (0-100)."""
@@ -289,7 +288,7 @@ def _compute_canslim_score(
             + settings.CANSLIM_WEIGHT_A * a
             + settings.CANSLIM_WEIGHT_N * n
             + settings.CANSLIM_WEIGHT_S * s
-            + settings.CANSLIM_WEIGHT_L * l
+            + settings.CANSLIM_WEIGHT_L * l_score
             + settings.CANSLIM_WEIGHT_I * i
             + settings.CANSLIM_WEIGHT_M * m
         ) * 100
@@ -304,7 +303,7 @@ def _compute_canslim_score(
         score = (
             (settings.CANSLIM_WEIGHT_N / tw) * n
             + (settings.CANSLIM_WEIGHT_S / tw) * s
-            + (settings.CANSLIM_WEIGHT_L / tw) * l
+            + (settings.CANSLIM_WEIGHT_L / tw) * l_score
             + (settings.CANSLIM_WEIGHT_I / tw) * i
             + (settings.CANSLIM_WEIGHT_M / tw) * m
         ) * 100
@@ -316,7 +315,6 @@ def _compute_canslim_score(
 # ---------------------------------------------------------------------------
 def run_backtest() -> pd.DataFrame:
     """Run the CANSLIM backtest and return a DataFrame of results."""
-
     print("=" * 70)
     print("CANSLIM BACKTEST")
     print(f"Tickers: {', '.join(BACKTEST_TICKERS)}")
@@ -356,7 +354,10 @@ def run_backtest() -> pd.DataFrame:
         eval_dates.append(pd.Timestamp(d))
         d += timedelta(weeks=EVAL_INTERVAL_WEEKS)
 
-    print(f"  {len(eval_dates)} evaluation dates from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    print(
+        f"  {len(eval_dates)} evaluation dates from "
+        f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+    )
 
     records = []
 
@@ -385,15 +386,15 @@ def run_backtest() -> pd.DataFrame:
             fund = _evaluate_fundamentals_at_date(ticker, eval_date)
 
             # Technical scores (N, S)
-            tech = _evaluate_technical_at_date(
-                tdata, eval_date, fund.get("shares_outstanding")
-            )
+            tech = _evaluate_technical_at_date(tdata, eval_date, fund.get("shares_outstanding"))
 
             # Fundamental scores
             c_score = fund.get("c_score", 0.0)
             a_score = fund.get("a_score", 0.0)
             i_score = fund.get("i_score", 0.1)
-            has_fundamentals = fund.get("current_growth") is not None or fund.get("annual_growth") is not None
+            has_fundamentals = (
+                fund.get("current_growth") is not None or fund.get("annual_growth") is not None
+            )
 
             # Composite CANSLIM score
             total = _compute_canslim_score(
@@ -401,7 +402,7 @@ def run_backtest() -> pd.DataFrame:
                 a=a_score,
                 n=tech["n_score"],
                 s=tech["s_score"],
-                l=l_score,
+                l_score=l_score,
                 i=i_score,
                 m=m_score,
                 has_fundamentals=has_fundamentals,
@@ -410,25 +411,27 @@ def run_backtest() -> pd.DataFrame:
             buy_signal = total >= settings.MIN_CANSLIM_SCORE and rs_score >= settings.MIN_RS_SCORE
             close_price = tech["close"]
 
-            records.append({
-                "Date": eval_date.strftime("%Y-%m-%d"),
-                "Ticker": ticker,
-                "Close": round(close_price, 2),
-                "RS_Score": round(rs_score, 1),
-                "CANSLIM_Score": round(total, 1),
-                "C": round(c_score * 100, 0),
-                "A": round(a_score * 100, 0),
-                "N": round(tech["n_score"] * 100, 0),
-                "S": round(tech["s_score"] * 100, 0),
-                "L": round(l_score * 100, 0),
-                "I": round(i_score * 100, 0),
-                "M": round(m_score * 100, 0),
-                "52w_Prox": round(tech["proximity"] * 100, 1),
-                "Mkt_Bullish": m_bullish,
-                "Dist_Days": dist_days,
-                "FTD": ftd,
-                "BUY_SIGNAL": buy_signal,
-            })
+            records.append(
+                {
+                    "Date": eval_date.strftime("%Y-%m-%d"),
+                    "Ticker": ticker,
+                    "Close": round(close_price, 2),
+                    "RS_Score": round(rs_score, 1),
+                    "CANSLIM_Score": round(total, 1),
+                    "C": round(c_score * 100, 0),
+                    "A": round(a_score * 100, 0),
+                    "N": round(tech["n_score"] * 100, 0),
+                    "S": round(tech["s_score"] * 100, 0),
+                    "L": round(l_score * 100, 0),
+                    "I": round(i_score * 100, 0),
+                    "M": round(m_score * 100, 0),
+                    "52w_Prox": round(tech["proximity"] * 100, 1),
+                    "Mkt_Bullish": m_bullish,
+                    "Dist_Days": dist_days,
+                    "FTD": ftd,
+                    "BUY_SIGNAL": buy_signal,
+                }
+            )
 
     df = pd.DataFrame(records)
     return df
@@ -503,11 +506,15 @@ def print_results(df: pd.DataFrame) -> None:
         buy_dates = tdf[tdf["BUY_SIGNAL"]]
         print(f"\n  Price range: ${tdf['Close'].min():.2f} — ${tdf['Close'].max():.2f}")
         print(f"  RS range: {tdf['RS_Score'].min():.1f} — {tdf['RS_Score'].max():.1f}")
-        print(f"  CANSLIM range: {tdf['CANSLIM_Score'].min():.1f} — {tdf['CANSLIM_Score'].max():.1f}")
+        cs_min = tdf["CANSLIM_Score"].min()
+        cs_max = tdf["CANSLIM_Score"].max()
+        print(f"  CANSLIM range: {cs_min:.1f} — {cs_max:.1f}")
         if not buy_dates.empty:
-            print(f"  Buy signals: {len(buy_dates)} | Buy prices: ${buy_dates['Close'].min():.2f} — ${buy_dates['Close'].max():.2f}")
+            bp_min = buy_dates["Close"].min()
+            bp_max = buy_dates["Close"].max()
+            print(f"  Buy signals: {len(buy_dates)} | Buy prices: ${bp_min:.2f} — ${bp_max:.2f}")
         else:
-            print(f"  Buy signals: 0")
+            print("  Buy signals: 0")
 
     # Current prices vs first buy
     print("\n" + "=" * 100)

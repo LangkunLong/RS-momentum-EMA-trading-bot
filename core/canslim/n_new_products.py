@@ -1,5 +1,4 @@
-"""
-N - New Products, New Management, New Highs
+"""N - New Products, New Management, New Highs.
 
 Per William O'Neil's CANSLIM methodology:
 - Look for companies with a new product, new management, or new industry conditions
@@ -10,9 +9,13 @@ Per William O'Neil's CANSLIM methodology:
 O'Neil says: "It takes something new to produce a startling advance in the price of a stock."
 The 52-week high proximity is the primary signal — stocks making new highs tend to go higher.
 """
+
 from __future__ import annotations
+
 from typing import Optional
+
 import pandas as pd
+
 from config import settings
 
 
@@ -32,6 +35,7 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
         return None
 
     import numpy as np
+
     if np.isclose(previous, 0.0):
         return None
 
@@ -52,6 +56,7 @@ def _score_from_growth(growth: Optional[float], target: float) -> float:
         return 0.0
 
     import numpy as np
+
     return float(np.clip(growth / target, 0, 2) / 2)
 
 
@@ -59,10 +64,9 @@ def evaluate_n(
     quarterly_income: pd.DataFrame,
     proximity_to_high: float,
     n_revenue_weight: Optional[float] = None,
-    n_proximity_weight: Optional[float] = None
+    n_proximity_weight: Optional[float] = None,
 ) -> tuple[float, Optional[float]]:
-    """
-    Evaluate N (New Products/Price Leadership) score.
+    """Evaluate N (New Products/Price Leadership) score.
 
     Per O'Neil's methodology:
     - Stocks making new 52-week highs are the primary signal (most stocks that
@@ -92,7 +96,7 @@ def evaluate_n(
     if not quarterly_income.empty:
         try:
             revenue_row = quarterly_income.index[
-                quarterly_income.index.str.contains('Revenue|Total Revenue', case=False, regex=True)
+                quarterly_income.index.str.contains("Revenue|Total Revenue", case=False, regex=True)
             ]
 
             if not revenue_row.empty:

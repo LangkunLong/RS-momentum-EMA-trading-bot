@@ -1,5 +1,4 @@
-"""
-Core CANSLIM evaluation that combines all seven components.
+"""Core CANSLIM evaluation that combines all seven components.
 
 This module orchestrates the evaluation of all CANSLIM criteria:
 C - Current quarterly earnings growth (YoY, with acceleration)
@@ -12,28 +11,32 @@ M - Market direction (distribution days, follow-through, EMA trend)
 
 Composite scoring uses O'Neil-weighted averages, not equal weights.
 """
+
 from __future__ import annotations
+
 from typing import Dict, Optional
+
 import pandas as pd
+
 from config import settings
 from core.data_client import (
     coerce_scalar,
     extract_float_series,
-    normalize_price_dataframe,
-    fetch_ohlcv,
-    fetch_quarterly_income_statement,
     fetch_annual_income_statement,
     fetch_balance_sheet,
     fetch_company_info,
+    fetch_ohlcv,
+    fetch_quarterly_income_statement,
+    normalize_price_dataframe,
 )
 
-from .c_current_earnings import evaluate_c
 from .a_annual_earnings import evaluate_a
+from .c_current_earnings import evaluate_c
+from .i_institutional import evaluate_i
+from .l_leader_laggard import evaluate_l
+from .m_market_direction import MarketTrend, evaluate_m
 from .n_new_products import evaluate_n
 from .s_supply_demand import evaluate_s
-from .l_leader_laggard import evaluate_l
-from .i_institutional import evaluate_i
-from .m_market_direction import evaluate_m, MarketTrend
 
 
 def evaluate_canslim(
@@ -46,10 +49,9 @@ def evaluate_canslim(
     n_revenue_weight: Optional[float] = None,
     n_proximity_weight: Optional[float] = None,
     s_turnover_cap: Optional[float] = None,
-    i_institutional_cap: Optional[float] = None
+    i_institutional_cap: Optional[float] = None,
 ) -> Optional[Dict[str, object]]:
-    """
-    Evaluate all CANSLIM components for a given stock.
+    """Evaluate all CANSLIM components for a given stock.
 
     Uses O'Neil's weighted scoring:
     - C (20%), A (15%), L (20%) are weighted highest (earnings + leadership)
@@ -131,19 +133,12 @@ def evaluate_canslim(
 
     # N - New Products/Price Leadership (emphasis on new highs)
     score_n, revenue_growth = evaluate_n(
-        quarterly_income,
-        proximity_to_high,
-        n_revenue_weight,
-        n_proximity_weight
+        quarterly_income, proximity_to_high, n_revenue_weight, n_proximity_weight
     )
 
     # S - Supply and Demand (float, up/down volume, breakout, power gap)
     score_s, s_metrics = evaluate_s(
-        price_history,
-        avg_volume_50,
-        latest_close,
-        high_52,
-        shares_outstanding
+        price_history, avg_volume_50, latest_close, high_52, shares_outstanding
     )
 
     # L - Leader or Laggard
@@ -154,8 +149,7 @@ def evaluate_canslim(
     num_institutional_holders = company_info.get("institution_count")
 
     score_i = evaluate_i(
-        held_percent_institutions,
-        num_institutional_holders=num_institutional_holders
+        held_percent_institutions, num_institutional_holders=num_institutional_holders
     )
 
     # M - Market Direction
@@ -169,12 +163,12 @@ def evaluate_canslim(
         "S": score_s,
         "L": score_l,
         "I": score_i,
-        "M": score_m
+        "M": score_m,
     }
 
     # 6. WEIGHTED SCORING per O'Neil's methodology
     # C, A, and L are the most critical factors
-    has_fundamentals = (current_growth is not None or annual_growth is not None)
+    has_fundamentals = current_growth is not None or annual_growth is not None
 
     if has_fundamentals:
         # Full CANSLIM score with O'Neil-weighted components

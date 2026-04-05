@@ -1,5 +1,4 @@
-"""
-I - Institutional Sponsorship
+"""I - Institutional Sponsorship.
 
 Per William O'Neil's CANSLIM methodology:
 - Want stocks owned by at least a few quality institutional investors
@@ -12,9 +11,13 @@ O'Neil says: "Buy stocks with at least a few institutional sponsors with
 better-than-average recent performance records... and with increasing
 total institutional ownership in recent quarters."
 """
+
 from __future__ import annotations
+
 from typing import Optional
+
 import numpy as np
+
 from config import settings
 
 
@@ -56,8 +59,7 @@ def _score_ownership_level(held_percent: float) -> float:
 
 
 def _score_ownership_trend(
-    current_holders: Optional[int],
-    previous_holders: Optional[int]
+    current_holders: Optional[int], previous_holders: Optional[int]
 ) -> float:
     """Score the trend in number of institutional holders.
 
@@ -100,10 +102,9 @@ def evaluate_i(
     held_percent_institutions: Optional[float],
     num_institutional_holders: Optional[int] = None,
     prev_num_institutional_holders: Optional[int] = None,
-    i_institutional_cap: Optional[float] = None
+    i_institutional_cap: Optional[float] = None,
 ) -> float:
-    """
-    Evaluate I (Institutional Sponsorship) score.
+    """Evaluate I (Institutional Sponsorship) score.
 
     Per O'Neil's methodology:
     1. Moderate institutional ownership is ideal (30-60% sweet spot)
@@ -132,14 +133,9 @@ def evaluate_i(
     level_score = _score_ownership_level(held_percent_institutions)
 
     # Component 2 (40%): Ownership trend
-    trend_score = _score_ownership_trend(
-        num_institutional_holders, prev_num_institutional_holders
-    )
+    trend_score = _score_ownership_trend(num_institutional_holders, prev_num_institutional_holders)
 
     # Weighted combination
-    score = (
-        settings.I_LEVEL_WEIGHT * level_score
-        + settings.I_TREND_WEIGHT * trend_score
-    )
+    score = settings.I_LEVEL_WEIGHT * level_score + settings.I_TREND_WEIGHT * trend_score
 
     return float(np.clip(score, 0, 1))

@@ -1,5 +1,4 @@
-"""
-C - Current Quarterly Earnings Growth
+"""C - Current Quarterly Earnings Growth.
 
 Evaluates the growth in current quarterly earnings per share.
 Per William O'Neil's CANSLIM methodology:
@@ -9,9 +8,13 @@ Per William O'Neil's CANSLIM methodology:
 
 Priority: EPS (Basic or Diluted) first, then fallback to Net Income.
 """
+
 from __future__ import annotations
-from typing import Optional, List
+
+from typing import List, Optional
+
 import pandas as pd
+
 from config import settings
 
 
@@ -27,6 +30,7 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
         return None
 
     import numpy as np
+
     if np.isclose(previous, 0.0):
         return None
 
@@ -50,12 +54,12 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
         The matching index label, or None if nothing found.
     """
     # Priority 1: EPS rows
-    eps_mask = df.index.str.contains(r'Basic EPS|Diluted EPS', case=False, regex=True)
+    eps_mask = df.index.str.contains(r"Basic EPS|Diluted EPS", case=False, regex=True)
     if eps_mask.any():
         return df.index[eps_mask][0]
 
     # Priority 2: Net Income
-    ni_mask = df.index.str.contains(r'Net Income', case=False, regex=True)
+    ni_mask = df.index.str.contains(r"Net Income", case=False, regex=True)
     if ni_mask.any():
         return df.index[ni_mask][0]
 
@@ -111,11 +115,9 @@ def _check_acceleration(growths: List[Optional[float]]) -> float:
 
 
 def evaluate_c(
-    quarterly_income: pd.DataFrame,
-    c_growth_target: Optional[float] = None
+    quarterly_income: pd.DataFrame, c_growth_target: Optional[float] = None
 ) -> tuple[float, Optional[float]]:
-    """
-    Evaluate C (Current Quarterly Earnings Growth) score.
+    """Evaluate C (Current Quarterly Earnings Growth) score.
 
     Per O'Neil's methodology:
     1. Current quarter EPS must be up 25%+ vs same quarter last year (YoY)

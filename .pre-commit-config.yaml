@@ -1,0 +1,17 @@
+repos:
+  # Ruff: format first, then lint (ordering matters — format can undo lint auto-fixes)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.9
+    hooks:
+      - id: ruff-format  # Equivalent to black — formats code in-place
+      - id: ruff         # Linting + auto-fixable rule application
+        args: [--fix]
+
+  # Standard pre-commit hygiene hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
