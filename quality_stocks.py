@@ -48,18 +48,41 @@ def get_quality_stock_list(
     if sectors is None:
         return get_all_index_tickers(force_refresh=force_refresh)
 
+    # Normalize sectors to a list if a single string is passed
+    if isinstance(sectors, str):
+        sectors = [sectors]
+
+    # Fetch tickers for each sector/alias and deduplicate
+    all_symbols: List[str] = []
+    for sector in sectors:
+        all_symbols.extend(get_index_tickers(sector, force_refresh=force_refresh))
+    return list(dict.fromkeys(all_symbols))
+
 
 def get_index_tickers(index_name: str, force_refresh: bool = False) -> List[str]:
     index_lower = index_name.lower().strip()
 
-    if index_lower in ["sp500", "s&p500", "s&p 500"]:
+    # Resolve aliases first (handles combined categories like 'large_cap')
+    if index_lower in INDEX_ALIASES:
+        all_tickers: List[str] = []
+        for mapped_index in INDEX_ALIASES[index_lower]:
+            all_tickers.extend(_fetch_single_index(mapped_index, force_refresh))
+        return list(dict.fromkeys(all_tickers))
+
+    # Direct index lookup
+    return _fetch_single_index(index_lower, force_refresh)
+
+
+def _fetch_single_index(index_key: str, force_refresh: bool = False) -> List[str]:
+    """Fetch tickers for a single canonical index name."""
+    if index_key == "sp500":
         return get_sp500_tickers(force_refresh=force_refresh)
-    elif index_lower in ["nasdaq100", "nasdaq 100", "nasdaq"]:
+    elif index_key == "nasdaq100":
         return get_nasdaq100_tickers(force_refresh=force_refresh)
-    elif index_lower in ["russell2000", "russell 2000", "russell"]:
+    elif index_key == "russell2000":
         return get_russell2000_tickers(force_refresh=force_refresh)
     else:
-        raise ValueError(f"Unknown index: {index_name}. Use 'sp500', 'nasdaq100', or 'russell2000'.")
+        raise ValueError(f"Unknown index: {index_key}. Use 'sp500', 'nasdaq100', or 'russell2000'.")
 
 
 def refresh_ticker_cache() -> None:

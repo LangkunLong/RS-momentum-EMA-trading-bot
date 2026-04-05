@@ -1,26 +1,11 @@
 from __future__ import annotations
 from datetime import datetime
 import pandas as pd
-import yfinance as yf
 import os
-import time
 
 from config import settings
-
-# use github csv instead 
-def get_sp500_tickers() -> list[str]:
-    print("Fetching S&P 500 ticker list from GitHub (reliable source)...")
-    url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-    try:
-        # Read directly into pandas
-        df = pd.read_csv(url)
-        tickers = df['Symbol'].tolist()
-        print(f"Found {len(tickers)} S&P 500 tickers.")
-        return tickers
-    except Exception as e:
-        print(f"Error fetching S&P 500 list: {e}")
-        # Fallback to a small list if everything fails, so code doesn't crash
-        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA']
+from core.index_ticker_fetcher import get_sp500_tickers
+from core.data_client import fetch_bulk_close_prices
 
 # Calculates the 12-month weighted performance for a single stock's data.
 def calculate_weighted_performance(
@@ -91,33 +76,13 @@ def calculate_rs_scores_for_tickers(
     sp500 = get_sp500_tickers()
     all_tickers = list(set(tickers + sp500))
 
-    print(f"Downloading data for {len(all_tickers)} tickers in batches...")
+    print(f"Downloading data for {len(all_tickers)} tickers via Alpaca...")
 
-    all_data_frames = []
+    full_data = fetch_bulk_close_prices(all_tickers, period=period, chunk_size=chunk_size)
 
-    for i in range(0, len(all_tickers), chunk_size):
-        chunk = all_tickers[i:i + chunk_size]
-        print(f"Downloading batch {i//chunk_size + 1}/{(len(all_tickers)//chunk_size)+1} ({len(chunk)} tickers)...")
-
-        try:
-            data = yf.download(chunk, period=period, progress=False, auto_adjust=True)['Close']
-            if isinstance(data, pd.Series):
-                data = data.to_frame(name=chunk[0])
-                
-            all_data_frames.append(data)
-            time.sleep(1) 
-            
-        except Exception as e:
-            print(f"Batch failed: {e}")
-            continue
-
-    if not all_data_frames:
+    if full_data.empty:
         print("All downloads failed.")
         return pd.DataFrame()
-
-    # Combine all batches
-    full_data = pd.concat(all_data_frames, axis=1)
-    full_data = full_data.dropna(axis=1, how='all')
 
     print("Calculating weighted performance...")
     rs_scores = full_data.apply(calculate_weighted_performance)

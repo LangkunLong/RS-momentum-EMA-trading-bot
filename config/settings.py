@@ -5,6 +5,18 @@ All configurable parameters are centralized here to avoid hardcoded values.
 Parameters follow William O'Neil's CANSLIM methodology from
 "How to Make Money in Stocks" as closely as possible.
 """
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ==============================================================================
+# API KEYS (loaded from environment — see .env.example)
+# ==============================================================================
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+
 
 # ==============================================================================
 # SCANNER SETTINGS
@@ -190,14 +202,11 @@ TRADING_DAYS_PER_QUARTER = 65       # Approximate trading days in a quarter
 
 
 # ==============================================================================
-# API SETTINGS (OPTIONAL - Only if USE_API=True)
+# API SETTINGS
 # ==============================================================================
 
-# Finnhub API (requires FINNHUB_API_KEY environment variable)
-FINNHUB_BASE_URL = "https://finnhub.io/api/v1/stock/symbol"
-FINNHUB_METRIC_URL = "https://finnhub.io/api/v1/stock/metric"
-FINNHUB_EXCHANGE = "US"
-FINNHUB_MAX_STOCKS = 500            # Limit API calls
+# FMP (Financial Modeling Prep) configuration
+FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 
 # HTTP Retry settings
 HTTP_RETRY_TOTAL = 5                # Maximum retry attempts

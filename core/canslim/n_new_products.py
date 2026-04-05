@@ -17,7 +17,11 @@ from config import settings
 
 
 def _safe_growth(current: float, previous: float) -> Optional[float]:
-    """Calculate YoY revenue growth as a decimal."""
+    """Calculate YoY revenue growth as a decimal.
+
+    Returns None when previous is negative to enforce the CANSLIM
+    requirement for established, positive earnings growth.
+    """
     if current is None or previous in (None, 0):
         return None
 
@@ -29,6 +33,11 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
 
     import numpy as np
     if np.isclose(previous, 0.0):
+        return None
+
+    # Reject negative prior-period values — transitioning from a loss
+    # to a profit produces misleading growth percentages for CANSLIM.
+    if previous < 0:
         return None
 
     try:
