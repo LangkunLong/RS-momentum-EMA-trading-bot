@@ -96,21 +96,19 @@ def _detect_power_earnings_gap(
 
     volumes = extract_float_series(price_history, "Volume")
     recent_volumes = extract_float_series(recent, "Volume")
-    recent_lows = extract_float_series(recent, "Low")
-    recent_highs = extract_float_series(recent, "High")
     recent_closes = extract_float_series(recent, "Close")
     recent_opens = extract_float_series(recent, "Open")
 
     # Calculate average volume before lookback period
-    avg_volume = volumes.iloc[-(lookback_days + 50) : -lookback_days].mean()
+    avg_volume = volumes.iloc[-(lookback_days + 50) : -(lookback_days + 1)].mean()
 
     if avg_volume == 0:
         return False, None
 
-    # Look for gaps in recent data
-    for i in range(1, len(recent)):
-        # Gap up detection: today's low > yesterday's high
-        gap_size = (recent_lows.iloc[i] - recent_highs.iloc[i - 1]) / recent_closes.iloc[i - 1]
+    # Look for gaps in REVERSE order (newest first) so we catch today's gap!
+    for i in range(len(recent) - 1, 0, -1):
+        # Standard Gap Up: Today's Open vs Yesterday's Close
+        gap_size = (recent_opens.iloc[i] - recent_closes.iloc[i - 1]) / recent_closes.iloc[i - 1]
 
         if gap_size >= gap_threshold:
             volume_ratio = recent_volumes.iloc[i] / avg_volume
