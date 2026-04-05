@@ -1,5 +1,4 @@
-"""
-Configuration settings for CANSLIM Trading Bot
+"""Configuration settings for CANSLIM Trading Bot
 All configurable parameters are centralized here to avoid hardcoded values.
 
 Parameters follow William O'Neil's CANSLIM methodology from
@@ -53,7 +52,7 @@ DEBUG = False  # Enable verbose output
 # Historical data periods
 RS_CALCULATION_PERIOD = "14mo"  # Period for RS score calculation
 CANSLIM_DATA_PERIOD = "1y"  # Period for CANSLIM evaluation
-MARKET_TREND_PERIOD = "1y"  # Period for market direction analysis
+MARKET_TREND_PERIOD = "14mo"  # Period for market direction analysis
 PRICE_HISTORY_BUFFER_DAYS = 120  # Extra days to download for indicators
 
 # Caching

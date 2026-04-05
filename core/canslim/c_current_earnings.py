@@ -31,7 +31,7 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
 
     import numpy as np
 
-    if np.isclose(previous, 0.0):
+    if previous < 0 or np.isclose(previous, 0.0):
         return None
 
     try:
@@ -52,6 +52,7 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
 
     Returns:
         The matching index label, or None if nothing found.
+
     """
     # Priority 1: EPS rows
     eps_mask = df.index.str.contains(r"Basic EPS|Diluted EPS", case=False, regex=True)
@@ -76,6 +77,7 @@ def _get_quarterly_yoy_growths(earnings: pd.Series) -> List[Optional[float]]:
 
     Returns:
         List of YoY growth rates for available quarters (most recent first).
+
     """
     growths = []
     n = len(earnings)
@@ -97,6 +99,7 @@ def _check_acceleration(growths: List[Optional[float]]) -> float:
 
     Returns:
         Acceleration score 0-1. 1.0 means consistent acceleration.
+
     """
     valid = [g for g in growths if g is not None]
     if len(valid) < 2:
@@ -135,6 +138,7 @@ def evaluate_c(
 
     Returns:
         tuple: (score, current_growth) where score is 0-1 and current_growth is decimal
+
     """
     import numpy as np
 

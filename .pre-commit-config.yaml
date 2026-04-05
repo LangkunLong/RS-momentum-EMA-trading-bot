@@ -1,10 +1,9 @@
 repos:
-  # Ruff: format first, then lint (ordering matters — format can undo lint auto-fixes)
+  # Ruff: lint for real bugs only (no formatting, no style)
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.9
     hooks:
-      - id: ruff-format  # Equivalent to black — formats code in-place
-      - id: ruff         # Linting + auto-fixable rule application
+      - id: ruff         # F=pyflakes (undefined names, unused imports), B=bugbear
         args: [--fix]
 
   # Standard pre-commit hygiene hooks

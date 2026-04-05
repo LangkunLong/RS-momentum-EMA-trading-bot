@@ -56,9 +56,7 @@ def _get_alpaca_client() -> StockHistoricalDataClient:
         api_key = settings.ALPACA_API_KEY
         secret_key = settings.ALPACA_SECRET_KEY
         if not api_key or not secret_key:
-            raise EnvironmentError(
-                "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. See .env.example for details."
-            )
+            raise EnvironmentError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. See .env.example for details.")
         _alpaca_client = StockHistoricalDataClient(api_key, secret_key)
     return _alpaca_client
 
@@ -191,7 +189,13 @@ def fetch_bulk_close_prices(
 
     Returns:
         DataFrame with DatetimeIndex and one column per ticker (float close prices).
+
     """
+    cache_key = ("bulk_close_prices", tuple(sorted(tickers)), period)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     client = _get_alpaca_client()
     days = _period_to_days(period)
     end = datetime.now()
@@ -236,6 +240,7 @@ def fetch_bulk_close_prices(
 
     result = pd.concat(all_frames, axis=1)
     result = result.dropna(axis=1, how="all")
+    _cache_set(cache_key, result)
     return result
 
 
@@ -246,6 +251,18 @@ def validate_ticker(symbol: str) -> bool:
         return not df.empty and len(df) > 0
     except Exception:
         return False
+
+
+def validate_tickers_bulk(symbols: List[str]) -> List[str]:
+    """Check which tickers are valid using a bulk request to minimize API calls."""
+    df = fetch_bulk_close_prices(symbols, period="5d")
+    if df.empty:
+        return []
+    valid = []
+    for col in df.columns:
+        if df[col].notna().any():
+            valid.append(str(col))
+    return valid
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -404,9 +421,7 @@ def fetch_company_info(symbol: str) -> dict:
 
             if result["shares_outstanding"] and result["shares_outstanding"] > 0:
                 total_held = sum(h.get("shares", 0) for h in holders if h.get("shares"))
-                result["held_percent_institutions"] = min(
-                    total_held / result["shares_outstanding"], 1.0
-                )
+                result["held_percent_institutions"] = min(total_held / result["shares_outstanding"], 1.0)
     except (requests.RequestException, ValueError, EnvironmentError):
         pass
 
@@ -455,6 +470,7 @@ def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
     Returns:
         Dict with keys ``shares_outstanding``, ``held_percent_institutions``,
         ``institution_count``.
+
     """
     cache_key = ("company_info_as_of", symbol, as_of_date.strftime("%Y-%m-%d"))
     cached = _cache_get(cache_key)
@@ -474,7 +490,7 @@ def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
             ev_filtered = _filter_records_as_of(ev, as_of_date)
             if ev_filtered:
                 # Most recent record on or before the cutoff date
-                shares = ev_filtered[-1].get("numberOfShares")
+                shares = ev_filtered[0].get("numberOfShares")
                 if shares is not None:
                     result["shares_outstanding"] = int(shares)
     except (requests.RequestException, ValueError, EnvironmentError):
@@ -500,9 +516,7 @@ def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
             result["institution_count"] = len(holders)
             if result["shares_outstanding"] and result["shares_outstanding"] > 0:
                 total_held = sum(h.get("shares", 0) for h in holders if h.get("shares"))
-                result["held_percent_institutions"] = min(
-                    total_held / result["shares_outstanding"], 1.0
-                )
+                result["held_percent_institutions"] = min(total_held / result["shares_outstanding"], 1.0)
     except (requests.RequestException, ValueError, EnvironmentError):
         pass
 
@@ -520,6 +534,7 @@ def fetch_fundamental_data_as_of(symbol: str, as_of_date: datetime) -> dict:
             "balance_sheet":    pd.DataFrame,
             "company_info":     dict,
         }
+
     """
     cache_key = ("fundamentals_as_of", symbol, as_of_date.strftime("%Y-%m-%d"))
     cached = _cache_get(cache_key)

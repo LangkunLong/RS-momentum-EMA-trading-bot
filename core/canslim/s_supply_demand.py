@@ -21,9 +21,7 @@ import pandas as pd
 from config import settings
 
 
-def _detect_volume_surge(
-    recent_volume: float, avg_volume: float, surge_threshold: float
-) -> tuple[bool, float]:
+def _detect_volume_surge(recent_volume: float, avg_volume: float, surge_threshold: float) -> tuple[bool, float]:
     """Detect if recent volume is significantly above average.
 
     Args:
@@ -33,6 +31,7 @@ def _detect_volume_surge(
 
     Returns:
         tuple: (is_surge, volume_ratio)
+
     """
     if avg_volume == 0:
         return False, 0.0
@@ -43,9 +42,7 @@ def _detect_volume_surge(
     return is_surge, volume_ratio
 
 
-def _detect_breakout(
-    current_price: float, high_52week: float, proximity_threshold: float
-) -> tuple[bool, float]:
+def _detect_breakout(current_price: float, high_52week: float, proximity_threshold: float) -> tuple[bool, float]:
     """Detect if price is breaking out to new highs.
 
     Args:
@@ -55,6 +52,7 @@ def _detect_breakout(
 
     Returns:
         tuple: (is_breakout, proximity_ratio)
+
     """
     if high_52week == 0:
         return False, 0.0
@@ -86,6 +84,7 @@ def _detect_power_earnings_gap(
 
     Returns:
         tuple: (has_power_gap, gap_details)
+
     """
     if len(price_history) < lookback_days + 50:
         return False, None
@@ -93,29 +92,35 @@ def _detect_power_earnings_gap(
     # Get recent data
     recent = price_history.tail(lookback_days + 1).copy()
 
+    from core.data_client import extract_float_series
+
+    volumes = extract_float_series(price_history, "Volume")
+    recent_volumes = extract_float_series(recent, "Volume")
+    recent_lows = extract_float_series(recent, "Low")
+    recent_highs = extract_float_series(recent, "High")
+    recent_closes = extract_float_series(recent, "Close")
+    recent_opens = extract_float_series(recent, "Open")
+
     # Calculate average volume before lookback period
-    avg_volume = price_history["Volume"].iloc[-(lookback_days + 50) : -lookback_days].mean()
+    avg_volume = volumes.iloc[-(lookback_days + 50) : -lookback_days].mean()
 
     if avg_volume == 0:
         return False, None
 
     # Look for gaps in recent data
     for i in range(1, len(recent)):
-        current = recent.iloc[i]
-        previous = recent.iloc[i - 1]
-
         # Gap up detection: today's low > yesterday's high
-        gap_size = (current["Low"] - previous["High"]) / previous["Close"]
+        gap_size = (recent_lows.iloc[i] - recent_highs.iloc[i - 1]) / recent_closes.iloc[i - 1]
 
         if gap_size >= gap_threshold:
-            volume_ratio = current["Volume"] / avg_volume
+            volume_ratio = recent_volumes.iloc[i] / avg_volume
 
             # Check if it's a power gap (heavy volume)
             if volume_ratio >= volume_threshold:
                 gap_details = {
-                    "gap_size": gap_size,
-                    "volume_ratio": volume_ratio,
-                    "gap_price": float(current["Open"]),
+                    "gap_size": float(gap_size),
+                    "volume_ratio": float(volume_ratio),
+                    "gap_price": float(recent_opens.iloc[i]),
                     "days_ago": len(recent) - i - 1,
                 }
                 return True, gap_details
@@ -136,13 +141,16 @@ def _calculate_up_down_volume_ratio(price_history: pd.DataFrame, lookback: int =
     Returns:
         Ratio of average up-day volume to average down-day volume.
         Values > 1.0 indicate accumulation, < 1.0 indicate distribution.
+
     """
     if len(price_history) < lookback:
         lookback = len(price_history)
 
+    from core.data_client import extract_float_series
+
     recent = price_history.tail(lookback).copy()
-    closes = recent["Close"]
-    volumes = recent["Volume"]
+    closes = extract_float_series(recent, "Close")
+    volumes = extract_float_series(recent, "Volume")
 
     daily_changes = closes.diff()
 
@@ -170,6 +178,7 @@ def _score_float_supply(shares_outstanding: Optional[float]) -> float:
 
     Returns:
         Score 0-1 based on float attractiveness.
+
     """
     if shares_outstanding is None or shares_outstanding <= 0:
         return 0.5  # Neutral if unknown
@@ -231,6 +240,7 @@ def evaluate_s(
 
     Returns:
         tuple: (score, metrics_dict)
+
     """
     # Load defaults from settings
     s_volume_surge_threshold = s_volume_surge_threshold or settings.S_VOLUME_SURGE_THRESHOLD
@@ -254,21 +264,20 @@ def evaluate_s(
         ud_score = max(up_down_ratio - 0.5, 0.0) / 0.5 * 0.3  # Below 1.0 gets minimal credit
 
     # --- Component 3: Volume Surge + Breakout ---
-    has_volume_surge, volume_ratio = _detect_volume_surge(
-        recent_volume, avg_volume_50, s_volume_surge_threshold
-    )
+    has_volume_surge, volume_ratio = _detect_volume_surge(recent_volume, avg_volume_50, s_volume_surge_threshold)
     is_breakout, proximity = _detect_breakout(current_price, high_52week, s_breakout_proximity)
 
     # Volume + breakout combined score
     volume_score = min(volume_ratio / s_volume_surge_threshold, 1.0) if avg_volume_50 > 0 else 0.0
-    proximity_score = (proximity - 0.85) / (s_breakout_proximity - 0.85)
+    if s_breakout_proximity <= 0.85:
+        proximity_score = 1.0
+    else:
+        proximity_score = (proximity - 0.85) / (s_breakout_proximity - 0.85)
     breakout_score = 1.0 if is_breakout else max(proximity_score, 0)
     surge_breakout_score = 0.5 * volume_score + 0.5 * breakout_score
 
     # --- Component 4: Power Earnings Gap ---
-    has_power_gap, gap_details = _detect_power_earnings_gap(
-        price_history, lookback_days=s_power_gap_lookback
-    )
+    has_power_gap, gap_details = _detect_power_earnings_gap(price_history, lookback_days=s_power_gap_lookback)
     power_gap_score = 1.0 if has_power_gap else 0.0
 
     # --- Weighted combination ---

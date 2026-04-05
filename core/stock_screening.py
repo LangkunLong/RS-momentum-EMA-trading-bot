@@ -23,7 +23,7 @@ def evaluate_stock_canslim(
     market_trend: MarketTrend,
     rs_scores_df: pd.DataFrame,
     debug: bool = False,
-    strict_breakout: bool = True,
+    strict_breakout: bool = False,
 ) -> Optional[Dict[str, object]]:
     """Evaluate a single stock against CANSLIM criteria.
 
@@ -37,6 +37,7 @@ def evaluate_stock_canslim(
 
     Returns:
         Dict with CANSLIM evaluation results, or None if stock doesn't meet criteria
+
     """
     if debug:
         print("\n" + "-" * 60)
@@ -93,7 +94,7 @@ def screen_stocks_canslim(
     min_rs_score: float = MIN_RS_SCORE,
     min_canslim_score: float = MIN_CANSLIM_SCORE,
     debug: bool = False,
-    strict_breakout: bool = True,
+    strict_breakout: bool = False,
 ) -> Tuple[List[Dict[str, object]], MarketTrend]:
     """Screen multiple stocks for CANSLIM characteristics.
 
@@ -108,6 +109,7 @@ def screen_stocks_canslim(
     Returns:
         Tuple of (results_list, market_trend) where results_list contains
         CANSLIM evaluations for stocks meeting criteria
+
     """
     market_trend = evaluate_market_direction()
     results: List[Dict[str, object]] = []
@@ -171,6 +173,7 @@ def print_analysis_results(results: List[Dict[str, object]], market_trend: Optio
     Args:
         results: List of CANSLIM evaluation results
         market_trend: Market trend information
+
     """
     if not results:
         print("No stocks found matching criteria.")

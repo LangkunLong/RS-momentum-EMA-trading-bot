@@ -12,7 +12,7 @@ from typing import Optional
 import pandas as pd
 
 from config import settings
-from core.data_client import validate_ticker
+from core.data_client import validate_ticker, validate_tickers_bulk
 from core.stock_screening import print_analysis_results, screen_stocks_canslim
 from quality_stocks import get_index_tickers, get_quality_stock_list
 
@@ -50,12 +50,11 @@ def scan_for_canslim_stocks(
     Returns:
         Tuple of (opportunities, market_trend) where opportunities is a list of
         dicts for each stock that passed all CANSLIM thresholds.
+
     """
     # Load defaults from configuration
     min_rs_score = min_rs_score if min_rs_score is not None else settings.MIN_RS_SCORE
-    min_canslim_score = (
-        min_canslim_score if min_canslim_score is not None else settings.MIN_CANSLIM_SCORE
-    )
+    min_canslim_score = min_canslim_score if min_canslim_score is not None else settings.MIN_CANSLIM_SCORE
     sectors = sectors if sectors is not None else settings.SECTORS
     custom_list = custom_list if custom_list is not None else settings.CUSTOM_LIST
     start_date = start_date if start_date is not None else settings.START_DATE
@@ -81,13 +80,12 @@ def scan_for_canslim_stocks(
     print(f"Minimum CANSLIM Score: {min_canslim_score}")
 
     # Filter out invalid/delisted tickers before scanning
-    print("Validating tickers with Yahoo Finance...")
-    valid_symbols = []
-    for symbol in symbols:
-        if is_valid_ticker(symbol):
-            valid_symbols.append(symbol)
-        else:
-            print(f"Skipping invalid/delisted ticker: {symbol}")
+    print("Validating tickers with Alpaca...")
+    valid_symbols = validate_tickers_bulk(symbols)
+
+    missing = set(symbols) - set(valid_symbols)
+    if missing:
+        print(f"Skipped {len(missing)} invalid/delisted tickers.")
 
     print(f"{len(valid_symbols)} valid tickers will be scanned.")
 
