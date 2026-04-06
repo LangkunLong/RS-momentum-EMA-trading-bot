@@ -6,8 +6,15 @@ from core.canslim.s_supply_demand import _calculate_up_down_volume_ratio, _detec
 
 
 def test_detect_volume_surge():
+    # Default price_up=True — backward compatible
     assert _detect_volume_surge(1500, 1000, 1.5) == (True, 1.5)
     assert _detect_volume_surge(1400, 1000, 1.5) == (False, 1.4)
+    # Explicit UP day
+    assert _detect_volume_surge(1500, 1000, 1.5, price_up=True) == (True, 1.5)
+    # Surge on DOWN day — volume exceeds threshold but direction is wrong
+    assert _detect_volume_surge(1500, 1000, 1.5, price_up=False) == (False, 1.5)
+    # Below threshold on DOWN day
+    assert _detect_volume_surge(1400, 1000, 1.5, price_up=False) == (False, 1.4)
 
 
 def test_detect_breakout():

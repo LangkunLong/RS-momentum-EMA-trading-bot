@@ -68,4 +68,4 @@ def visualize_signals(csv_file: str):
         fig.show()
 
 if __name__ == "__main__":
-    visualize_signals("backtest_results_20260405_194841.csv")
+    visualize_signals("backtest_results_20260405_203140.csv")

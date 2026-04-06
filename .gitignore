@@ -4,6 +4,12 @@
 venv/
 .vscode
 
+# Coverage testing outputs
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # Byte-compiled / optimized files
 __pycache__/
 *.pyc
@@ -22,4 +28,5 @@ dist/
 rs_score_cache/
 ticker_cache/
 
+# CSV results
 backtest_results*
