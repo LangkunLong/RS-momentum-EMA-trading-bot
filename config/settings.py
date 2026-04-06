@@ -133,6 +133,7 @@ N_REVENUE_GROWTH_TARGET = 0.25  # 25% quarterly revenue growth target
 S_VOLUME_SURGE_THRESHOLD = 1.5  # Volume multiplier for surge detection (1.5 = 50% above avg)
 S_BREAKOUT_PROXIMITY = 0.98  # Proximity to 52-week high for breakout (0.98 = within 2%)
 S_POWER_GAP_LOOKBACK = 10  # Days to look back for Power Earnings Gaps
+S_PEG_MIN_PROXIMITY = 0.85  # Min 52w proximity for a PEG to count (O'Neil: gap must be from a base near highs)
 S_TURNOVER_CAP = 1.0  # Legacy: max turnover ratio for scoring
 
 # Sub-component weights within S score (must sum to 1.0)
