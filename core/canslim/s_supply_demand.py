@@ -222,6 +222,7 @@ def evaluate_s(
     s_volume_surge_threshold: Optional[float] = None,
     s_breakout_proximity: Optional[float] = None,
     s_power_gap_lookback: Optional[int] = None,
+    s_peg_min_proximity: Optional[float] = None,
 ) -> tuple[float, Dict[str, object]]:
     """Evaluate S (Supply and Demand) score.
 
@@ -246,6 +247,7 @@ def evaluate_s(
         s_volume_surge_threshold: Volume surge multiplier (default from settings)
         s_breakout_proximity: Proximity to 52-week high (default from settings)
         s_power_gap_lookback: Days to look back for power gaps (default from settings)
+        s_peg_min_proximity: Min 52w proximity for a PEG to count (default from settings)
 
     Returns:
         tuple: (score, metrics_dict)
@@ -255,6 +257,7 @@ def evaluate_s(
     s_volume_surge_threshold = s_volume_surge_threshold or settings.S_VOLUME_SURGE_THRESHOLD
     s_breakout_proximity = s_breakout_proximity or settings.S_BREAKOUT_PROXIMITY
     s_power_gap_lookback = s_power_gap_lookback or settings.S_POWER_GAP_LOOKBACK
+    s_peg_min_proximity = s_peg_min_proximity or settings.S_PEG_MIN_PROXIMITY
 
     # Get most recent volume
     recent_volume = float(price_history["Volume"].iloc[-1]) if len(price_history) > 0 else 0.0
@@ -295,6 +298,12 @@ def evaluate_s(
 
     # --- Component 4: Power Earnings Gap ---
     has_power_gap, gap_details = _detect_power_earnings_gap(price_history, lookback_days=s_power_gap_lookback)
+    # Per O'Neil, a PEG must be the breakout FROM a base — the stock must be
+    # consolidating near its highs.  A gap-up from deep in a correction is
+    # distribution recovery, not institutional accumulation.
+    if has_power_gap and proximity < s_peg_min_proximity:
+        has_power_gap = False
+        gap_details = {}
     power_gap_score = 1.0 if has_power_gap else 0.0
 
     # --- Weighted combination ---
