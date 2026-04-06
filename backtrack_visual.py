@@ -1,3 +1,5 @@
+import os
+import glob
 import pandas as pd
 import plotly.graph_objects as go
 from alpaca.data.historical import StockHistoricalDataClient
@@ -5,6 +7,21 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
 from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY # Adjust import to your config
+
+def get_latest_backtest_file(directory="."):
+    """Finds the most recent backtest CSV in the specified directory."""
+    # Look for files matching your specific naming convention
+    search_pattern = os.path.join(directory, "backtest_results_*.csv")
+    list_of_files = glob.glob(search_pattern)
+
+    if not list_of_files:
+        raise FileNotFoundError("No backtest result CSV files found in the current directory.")
+
+    # Sort files by creation time and pick the latest one
+    latest_file = max(list_of_files, key=os.path.getctime)
+    print(f"Loaded latest backtest file: {latest_file}")
+
+    return latest_file
 
 def visualize_signals(csv_file: str):
     # 1. Load your backtest CSV
@@ -68,4 +85,5 @@ def visualize_signals(csv_file: str):
         fig.show()
 
 if __name__ == "__main__":
-    visualize_signals("backtest_results_20260405_203140.csv")
+    latest_csv = get_latest_backtest_file()
+    visualize_signals(latest_csv)
