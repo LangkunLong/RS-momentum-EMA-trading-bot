@@ -21,13 +21,24 @@ import pandas as pd
 from config import settings
 
 
-def _detect_volume_surge(recent_volume: float, avg_volume: float, surge_threshold: float) -> tuple[bool, float]:
-    """Detect if recent volume is significantly above average.
+def _detect_volume_surge(
+    recent_volume: float,
+    avg_volume: float,
+    surge_threshold: float,
+    price_up: bool = True,
+) -> tuple[bool, float]:
+    """Detect if recent volume is significantly above average on an UP day.
+
+    Per O'Neil, volume surges are only bullish when they occur on days
+    where price advances (institutional accumulation).  High volume on
+    down days indicates distribution, not demand.
 
     Args:
         recent_volume: Most recent day's volume
         avg_volume: Average volume baseline
         surge_threshold: Multiplier threshold (e.g., 1.5 = 50% above avg)
+        price_up: Whether the most recent day closed higher than the prior
+            day.  When False, the surge is not counted as bullish accumulation.
 
     Returns:
         tuple: (is_surge, volume_ratio)
@@ -37,7 +48,7 @@ def _detect_volume_surge(recent_volume: float, avg_volume: float, surge_threshol
         return False, 0.0
 
     volume_ratio = recent_volume / avg_volume
-    is_surge = volume_ratio >= surge_threshold
+    is_surge = volume_ratio >= surge_threshold and price_up
 
     return is_surge, volume_ratio
 
@@ -248,6 +259,12 @@ def evaluate_s(
     # Get most recent volume
     recent_volume = float(price_history["Volume"].iloc[-1]) if len(price_history) > 0 else 0.0
 
+    # Determine if the most recent day was an UP day (institutional accumulation)
+    if len(price_history) >= 2:
+        price_up = float(price_history["Close"].iloc[-1]) > float(price_history["Close"].iloc[-2])
+    else:
+        price_up = False
+
     # --- Component 1: Float / Shares Outstanding ---
     float_score = _score_float_supply(shares_outstanding)
 
@@ -262,7 +279,9 @@ def evaluate_s(
         ud_score = max(up_down_ratio - 0.5, 0.0) / 0.5 * 0.3  # Below 1.0 gets minimal credit
 
     # --- Component 3: Volume Surge + Breakout ---
-    has_volume_surge, volume_ratio = _detect_volume_surge(recent_volume, avg_volume_50, s_volume_surge_threshold)
+    has_volume_surge, volume_ratio = _detect_volume_surge(
+        recent_volume, avg_volume_50, s_volume_surge_threshold, price_up=price_up
+    )
     is_breakout, proximity = _detect_breakout(current_price, high_52week, s_breakout_proximity)
 
     # Volume + breakout combined score

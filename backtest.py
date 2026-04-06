@@ -44,7 +44,7 @@ from core.momentum_analysis import calculate_weighted_performance
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BACKTEST_TICKERS = ["CRWD", "GE", "GEV", "VST", "VRT"]
+BACKTEST_TICKERS = ["CRWD", "GE", "GEV", "VST", "VRT", "GLD", "SLV", "MU", "SNDK"]
 BENCHMARK = "SPY"
 LOOKBACK_YEARS = 2
 
