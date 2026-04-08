@@ -30,6 +30,9 @@ MIN_RS_SCORE = 75  # Free-tier friendly default; raise to 80 when fundamentals a
 MIN_CANSLIM_SCORE = 65  # Free-tier friendly default; raise toward 70-75 with fuller data
 WATCHLIST_MIN_CANSLIM_SCORE = 45  # Surface high-RS names worth monitoring when buys are blocked
 REQUIRE_BULLISH_MARKET_FOR_BUYS = True  # O'Neil-style market gate for actionable entries
+MAX_TERMINAL_RESULTS = 12  # Limit terminal detail; full output is exported to CSV
+AUTO_EXPORT_RESULTS = True  # Save scanner output to CSV by default
+RESULTS_DIR = "scan_results"  # Directory for exported scanner CSV files
 
 # Performance settings
 MAX_WORKERS = 3  # Maximum threads for parallel processing

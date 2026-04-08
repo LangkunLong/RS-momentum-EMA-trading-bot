@@ -353,6 +353,7 @@ def print_analysis_results(
     results: List[Dict[str, object]],
     market_trend: Optional[MarketTrend] = None,
     title: str = "CANSLIM STOCK SCREENING RESULTS",
+    max_results: Optional[int] = None,
 ) -> None:
     """Print CANSLIM analysis results in a formatted table.
 
@@ -365,9 +366,13 @@ def print_analysis_results(
         print("No stocks found matching criteria.")
         return
 
+    display_results = results[:max_results] if max_results is not None else results
+
     print("\n" + "=" * 80)
     print(f"{title} ({len(results)} stocks found)")
     print("=" * 80)
+    if max_results is not None and len(results) > max_results:
+        print(f"Showing top {len(display_results)} rows in terminal. Full set will be available in CSV.")
 
     if market_trend is not None:
         direction = "Bullish" if market_trend.is_bullish else "Cautious"
@@ -408,7 +413,7 @@ def print_analysis_results(
             return "n/a"
         return f"{value * 100:.1f}%"
 
-    for idx, result in enumerate(results, start=1):
+    for idx, result in enumerate(display_results, start=1):
         print(f"\n{idx}. {result['symbol']}")
         print(f"   RS Score: {result['rs_score']:.1f} | CANSLIM Score: {result['total_score']:.1f}")
         if result.get("scanner_category"):

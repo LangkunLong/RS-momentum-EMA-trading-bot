@@ -81,6 +81,8 @@ def evaluate_canslim(
     n_proximity_weight = n_proximity_weight or settings.N_PROXIMITY_TO_HIGH_WEIGHT
 
     # 1. Fetch Fundamental Data with Error Handling
+    income_statement_error = None
+    balance_sheet_error = None
     try:
         company_info = fetch_company_info(symbol)
 
@@ -89,6 +91,7 @@ def evaluate_canslim(
             annual_income = fetch_annual_income_statement(symbol)
         except Exception as e:
             print(f"[WARN] {symbol}: Failed to fetch income statements: {e}")
+            income_statement_error = str(e)
             quarterly_income = pd.DataFrame()
             annual_income = pd.DataFrame()
 
@@ -96,6 +99,7 @@ def evaluate_canslim(
             balance_sheet = fetch_balance_sheet(symbol)
         except Exception as e:
             print(f"[WARN] {symbol}: Failed to fetch balance sheet: {e}")
+            balance_sheet_error = str(e)
             balance_sheet = pd.DataFrame()
     except Exception as e:
         print(f"Data fetch error for {symbol}: {e}")
@@ -223,6 +227,15 @@ def evaluate_canslim(
         "avg_volume_50": avg_volume_50,
         "has_fundamentals": has_fundamentals,
         "shares_outstanding": shares_outstanding,
+        "quarterly_income_available": not quarterly_income.empty,
+        "annual_income_available": not annual_income.empty,
+        "balance_sheet_available": not balance_sheet.empty,
+        "current_earnings_available": current_growth is not None,
+        "annual_earnings_available": annual_growth is not None,
+        "revenue_growth_available": revenue_growth is not None,
+        "institutional_data_available": institutional_data_available,
+        "income_statement_error": income_statement_error,
+        "balance_sheet_error": balance_sheet_error,
     }
 
     return {
