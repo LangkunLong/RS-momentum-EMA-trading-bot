@@ -125,17 +125,21 @@ def evaluate_i(
     Returns:
         float: Score 0-1
     """
-    # If no institutional data at all, return low score
-    if held_percent_institutions is None:
-        return 0.1
+    active_components = []
 
-    # Component 1 (60%): Ownership level (sweet-spot curve)
-    level_score = _score_ownership_level(held_percent_institutions)
+    if held_percent_institutions is not None:
+        level_score = _score_ownership_level(held_percent_institutions)
+        active_components.append((settings.I_LEVEL_WEIGHT, level_score))
 
-    # Component 2 (40%): Ownership trend
-    trend_score = _score_ownership_trend(num_institutional_holders, prev_num_institutional_holders)
+    if num_institutional_holders is not None or prev_num_institutional_holders is not None:
+        trend_score = _score_ownership_trend(num_institutional_holders, prev_num_institutional_holders)
+        active_components.append((settings.I_TREND_WEIGHT, trend_score))
 
-    # Weighted combination
-    score = settings.I_LEVEL_WEIGHT * level_score + settings.I_TREND_WEIGHT * trend_score
+    # Missing free-tier holder data should be neutral, not a hidden sell signal.
+    if not active_components:
+        return 0.5
+
+    total_weight = sum(weight for weight, _ in active_components)
+    score = sum((weight / total_weight) * component for weight, component in active_components)
 
     return float(np.clip(score, 0, 1))

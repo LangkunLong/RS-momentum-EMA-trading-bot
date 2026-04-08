@@ -24,3 +24,7 @@ def test_score_ownership_trend():
 def test_evaluate_i():
     score = evaluate_i(0.40, 110, 100)
     assert score > 0.8  # Should be very high as it hits sweet spot and 10% increase
+
+
+def test_evaluate_i_missing_data_is_neutral():
+    assert evaluate_i(None, None, None) == 0.5

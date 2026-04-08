@@ -11,6 +11,28 @@ from core.data_client import fetch_bulk_close_prices
 from core.index_ticker_fetcher import get_sp500_tickers
 
 
+def _cache_covers_requested_universe(cached_df: pd.DataFrame, requested_tickers: list[str]) -> bool:
+    """Return True when the cached RS file is broad enough for the current scan.
+
+    The scanner ranks against the requested tickers plus a broad-market S&P 500
+    context. A same-day cache generated from a much smaller run can therefore
+    poison later scans. We require:
+    - the standard columns to exist,
+    - all requested tickers to be present, and
+    - a universe size large enough to resemble the intended broad context.
+    """
+    required_columns = {"Ticker", "Weighted_Perf", "RS_Score"}
+    if cached_df.empty or not required_columns.issubset(cached_df.columns):
+        return False
+
+    cached_tickers = {str(ticker).upper() for ticker in cached_df["Ticker"].dropna()}
+    requested = {str(ticker).upper() for ticker in requested_tickers if ticker}
+    if not requested.issubset(cached_tickers):
+        return False
+
+    return len(cached_tickers) >= max(400, len(requested))
+
+
 def calculate_weighted_performance(
     data_series: pd.Series,
     days_per_q: Optional[int] = None,
@@ -101,7 +123,10 @@ def calculate_rs_scores_for_tickers(
         if file_time.date() == datetime.now().date():
             try:
                 print(f"Loading cached RS scores from {cache_file}...")
-                return pd.read_csv(cache_file)
+                cached_df = pd.read_csv(cache_file)
+                if _cache_covers_requested_universe(cached_df, tickers):
+                    return cached_df
+                print("RS score cache does not match the requested universe, re-downloading...")
             except (pd.errors.ParserError, OSError) as exc:
                 print(f"RS score cache is corrupt ({exc}), re-downloading...")
 

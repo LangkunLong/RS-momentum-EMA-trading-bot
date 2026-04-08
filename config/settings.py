@@ -26,8 +26,10 @@ FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 # Stock screening thresholds
 START_DATE = "2024-01-01"  # Analysis start date
 MIN_MARKET_CAP = 10e9  # Minimum market cap ($10 billion)
-MIN_RS_SCORE = 80  # Minimum Relative Strength score (1-99) — top 20%
-MIN_CANSLIM_SCORE = 70  # Minimum composite CANSLIM score (0-100)
+MIN_RS_SCORE = 75  # Free-tier friendly default; raise to 80 when fundamentals are complete
+MIN_CANSLIM_SCORE = 65  # Free-tier friendly default; raise toward 70-75 with fuller data
+WATCHLIST_MIN_CANSLIM_SCORE = 45  # Surface high-RS names worth monitoring when buys are blocked
+REQUIRE_BULLISH_MARKET_FOR_BUYS = True  # O'Neil-style market gate for actionable entries
 
 # Performance settings
 MAX_WORKERS = 3  # Maximum threads for parallel processing
@@ -130,8 +132,8 @@ N_REVENUE_GROWTH_TARGET = 0.25  # 25% quarterly revenue growth target
 # S (SUPPLY AND DEMAND) PARAMETERS
 # ==============================================================================
 
-S_VOLUME_SURGE_THRESHOLD = 1.5  # Volume multiplier for surge detection (1.5 = 50% above avg)
-S_BREAKOUT_PROXIMITY = 0.98  # Proximity to 52-week high for breakout (0.98 = within 2%)
+S_VOLUME_SURGE_THRESHOLD = 1.3  # Volume multiplier for surge detection (1.3 = 30% above avg)
+S_BREAKOUT_PROXIMITY = 0.95  # Proximity to 52-week high for breakout (0.95 = within 5%)
 S_POWER_GAP_LOOKBACK = 10  # Days to look back for Power Earnings Gaps
 S_PEG_MIN_PROXIMITY = 0.85  # Min 52w proximity for a PEG to count (O'Neil: gap must be from a base near highs)
 S_TURNOVER_CAP = 1.0  # Legacy: max turnover ratio for scoring
