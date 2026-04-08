@@ -13,7 +13,7 @@ import pandas as pd
 
 from config import settings
 from core.data_client import validate_ticker, validate_tickers_bulk
-from core.stock_screening import print_analysis_results, screen_stocks_canslim
+from core.stock_screening import print_analysis_results, screen_stocks_canslim_detailed
 from quality_stocks import get_index_tickers, get_quality_stock_list
 
 
@@ -36,7 +36,9 @@ def scan_for_canslim_stocks(
     custom_list: Optional[list[str]] = None,
     start_date: Optional[str] = None,
     debug: Optional[bool] = None,
-) -> tuple[list[dict], object]:
+    watchlist_min_score: Optional[float] = None,
+    require_bullish_market_for_buys: Optional[bool] = None,
+) -> tuple[list[dict], list[dict], object]:
     """Run the full CANSLIM scan and return qualifying opportunities.
 
     Args:
@@ -48,13 +50,20 @@ def scan_for_canslim_stocks(
         debug: Enable verbose per-stock output (overrides settings).
 
     Returns:
-        Tuple of (opportunities, market_trend) where opportunities is a list of
-        dicts for each stock that passed all CANSLIM thresholds.
+        Tuple of (actionable_buys, watchlist_candidates, market_trend).
 
     """
     # Load defaults from configuration
     min_rs_score = min_rs_score if min_rs_score is not None else settings.MIN_RS_SCORE
     min_canslim_score = min_canslim_score if min_canslim_score is not None else settings.MIN_CANSLIM_SCORE
+    watchlist_min_score = (
+        watchlist_min_score if watchlist_min_score is not None else settings.WATCHLIST_MIN_CANSLIM_SCORE
+    )
+    require_bullish_market_for_buys = (
+        require_bullish_market_for_buys
+        if require_bullish_market_for_buys is not None
+        else settings.REQUIRE_BULLISH_MARKET_FOR_BUYS
+    )
     sectors = sectors if sectors is not None else settings.SECTORS
     custom_list = custom_list if custom_list is not None else settings.CUSTOM_LIST
     start_date = start_date if start_date is not None else settings.START_DATE
@@ -78,6 +87,8 @@ def scan_for_canslim_stocks(
     print(f"Scanning {len(symbols)} stocks for CANSLIM opportunities...")
     print(f"Minimum RS Score: {min_rs_score}")
     print(f"Minimum CANSLIM Score: {min_canslim_score}")
+    print(f"Watchlist CANSLIM Floor: {watchlist_min_score}")
+    print(f"Require Bullish Market For Buys: {require_bullish_market_for_buys}")
 
     # Filter out invalid/delisted tickers before scanning
     print("Validating tickers with Alpaca...")
@@ -89,19 +100,22 @@ def scan_for_canslim_stocks(
 
     print(f"{len(valid_symbols)} valid tickers will be scanned.")
 
-    opportunities, market_trend = screen_stocks_canslim(
+    actionable_buys, watchlist_candidates, market_trend = screen_stocks_canslim_detailed(
         symbols=valid_symbols,
         start_date=start_date,
         min_rs_score=min_rs_score,
         min_canslim_score=min_canslim_score,
         debug=debug,
+        watchlist_min_score=watchlist_min_score,
+        require_bullish_market=require_bullish_market_for_buys,
     )
 
     print("\nScan complete!")
     print(f"Analyzed: {len(symbols)} stocks")
-    print(f"Opportunities found: {len(opportunities)} stocks")
+    print(f"Actionable buys found: {len(actionable_buys)} stocks")
+    print(f"Watchlist candidates found: {len(watchlist_candidates)} stocks")
 
-    return opportunities, market_trend
+    return actionable_buys, watchlist_candidates, market_trend
 
 
 def export_results_to_csv(opportunities: list[dict], filename: Optional[str] = None) -> None:
@@ -118,6 +132,8 @@ def export_results_to_csv(opportunities: list[dict], filename: Optional[str] = N
     for opp in opportunities:
         row = {
             "Symbol": opp["symbol"],
+            "Scanner_Category": opp.get("scanner_category"),
+            "Scanner_Notes": ",".join(opp.get("scanner_notes", [])),
             "RS_Score": opp["rs_score"],
             "CANSLIM_Score": opp["total_score"],
             "C_Score": opp["scores"]["C"] * 100,
@@ -153,6 +169,8 @@ if __name__ == "__main__":
     # Or just use defaults from config/settings.py
     MIN_RS_SCORE = None  # Uses settings.MIN_RS_SCORE
     MIN_CANSLIM_SCORE = None  # Uses settings.MIN_CANSLIM_SCORE
+    WATCHLIST_MIN_SCORE = None  # Uses settings.WATCHLIST_MIN_CANSLIM_SCORE
+    REQUIRE_BULLISH_MARKET_FOR_BUYS = None  # Uses settings.REQUIRE_BULLISH_MARKET_FOR_BUYS
     # Available indices: 'sp500', 'nasdaq100', 'russell2000', 'large_cap', 'small_cap', 'all'
     # Set to None to scan all major indices (S&P 500 + Nasdaq 100 + Russell 2000)
     SECTORS = "nasdaq100"  # Uses all indices from major markets
@@ -162,27 +180,39 @@ if __name__ == "__main__":
     print("CANSLIM Stock Scanner Configuration:")
     print(f"- Min RS Score: {MIN_RS_SCORE or settings.MIN_RS_SCORE}")
     print(f"- Min CANSLIM Score: {MIN_CANSLIM_SCORE or settings.MIN_CANSLIM_SCORE}")
+    print(f"- Watchlist Min Score: {WATCHLIST_MIN_SCORE or settings.WATCHLIST_MIN_CANSLIM_SCORE}")
+    print(
+        "- Require Bullish Market For Buys: "
+        f"{REQUIRE_BULLISH_MARKET_FOR_BUYS if REQUIRE_BULLISH_MARKET_FOR_BUYS is not None else settings.REQUIRE_BULLISH_MARKET_FOR_BUYS}"
+    )
     indices_label = SECTORS or settings.SECTORS or "All (S&P 500 + Nasdaq 100 + Russell 2000)"
     print(f"- Indices: {indices_label}")
     print(f"- Custom List: {'Yes' if CUSTOM_LIST else 'No'}")
     print(f"- Debug Mode: {DEBUG or settings.DEBUG}")
 
     # Run the scan
-    opportunities, market_trend = scan_for_canslim_stocks(
+    actionable_buys, watchlist_candidates, market_trend = scan_for_canslim_stocks(
         min_rs_score=MIN_RS_SCORE,
         min_canslim_score=MIN_CANSLIM_SCORE,
         sectors=SECTORS,
         custom_list=CUSTOM_LIST,
         debug=DEBUG,
+        watchlist_min_score=WATCHLIST_MIN_SCORE,
+        require_bullish_market_for_buys=REQUIRE_BULLISH_MARKET_FOR_BUYS,
     )
 
-    if not opportunities:
-        print("No stocks met the strict CANSLIM criteria.")
+    if actionable_buys:
+        print_analysis_results(actionable_buys, market_trend, title="ACTIONABLE CANSLIM BUYS")
     else:
-        print_analysis_results(opportunities, market_trend)
+        print("No actionable CANSLIM buys met the current market and score gates.")
+
+    if watchlist_candidates:
+        print_analysis_results(watchlist_candidates, market_trend, title="WATCHLIST CANDIDATES")
+    else:
+        print("No watchlist candidates met the current RS and watchlist-score floors.")
 
     # Optionally export results to CSV
-    # if opportunities:
-    #     export_results_to_csv(opportunities)
+    # if actionable_buys or watchlist_candidates:
+    #     export_results_to_csv(actionable_buys + watchlist_candidates)
 
     print("\nScan completed!")

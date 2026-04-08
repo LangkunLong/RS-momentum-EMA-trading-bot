@@ -76,6 +76,8 @@ def evaluate_n(
     Scoring:
     - Proximity to 52-week high: 50% weight (O'Neil's emphasis on new highs)
     - Revenue growth (YoY quarterly): 50% weight
+    - If one of those inputs is unavailable, dynamically re-weight to the
+      available signal instead of treating missing free-tier data as bearish.
 
     Args:
         quarterly_income: Quarterly income statement DataFrame
@@ -128,7 +130,18 @@ def evaluate_n(
         proximity_score = 0.0
 
     # Weighted combination
-    score = float(n_revenue_weight * revenue_score + n_proximity_weight * proximity_score)
+    active_components = []
+    if revenue_growth is not None:
+        active_components.append((n_revenue_weight, revenue_score))
+    if proximity_to_high is not None and proximity_to_high > 0:
+        active_components.append((n_proximity_weight, proximity_score))
+
+    if active_components:
+        active_weight = sum(weight for weight, _ in active_components)
+        score = sum((weight / active_weight) * component for weight, component in active_components)
+    else:
+        score = 0.0
+
     score = float(np.clip(score, 0, 1))
 
     return score, revenue_growth

@@ -167,32 +167,50 @@ def evaluate_canslim(
 
     # 6. WEIGHTED SCORING per O'Neil's methodology
     # Dynamically re-normalize when one or both fundamentals are missing.
+    institutional_data_available = held_percent_institutions is not None or num_institutional_holders is not None
     has_fundamentals = current_growth is not None or annual_growth is not None
+    data_availability = {
+        "C": current_growth is not None,
+        "A": annual_growth is not None,
+        "N_revenue": revenue_growth is not None,
+        "N_price": proximity_to_high is not None and proximity_to_high > 0,
+        "I_level": held_percent_institutions is not None,
+        "I_trend": num_institutional_holders is not None,
+        "M": market_trend is not None,
+    }
     weights = {
         "C": settings.CANSLIM_WEIGHT_C if current_growth is not None else 0.0,
         "A": settings.CANSLIM_WEIGHT_A if annual_growth is not None else 0.0,
         "N": settings.CANSLIM_WEIGHT_N,
         "S": settings.CANSLIM_WEIGHT_S,
         "L": settings.CANSLIM_WEIGHT_L,
-        "I": settings.CANSLIM_WEIGHT_I,
+        "I": settings.CANSLIM_WEIGHT_I if institutional_data_available else 0.0,
         "M": settings.CANSLIM_WEIGHT_M,
     }
     total_active_weight = sum(weights.values())
 
     if total_active_weight > 0:
+        active_weights = {
+            key: (weight / total_active_weight if weight > 0 else 0.0)
+            for key, weight in weights.items()
+        }
         total_score = (
-            (weights["C"] / total_active_weight) * score_c
-            + (weights["A"] / total_active_weight) * score_a
-            + (weights["N"] / total_active_weight) * score_n
-            + (weights["S"] / total_active_weight) * score_s
-            + (weights["L"] / total_active_weight) * score_l
-            + (weights["I"] / total_active_weight) * score_i
-            + (weights["M"] / total_active_weight) * score_m
+            active_weights["C"] * score_c
+            + active_weights["A"] * score_a
+            + active_weights["N"] * score_n
+            + active_weights["S"] * score_s
+            + active_weights["L"] * score_l
+            + active_weights["I"] * score_i
+            + active_weights["M"] * score_m
         ) * 100
     else:
+        active_weights = {key: 0.0 for key in weights}
         total_score = 0.0
 
     total_score = float(total_score)
+    weighted_contributions = {
+        key: active_weights[key] * scores[key] * 100 for key in scores
+    }
 
     # 7. Compile metrics for reporting
     metrics = {
@@ -210,6 +228,10 @@ def evaluate_canslim(
     return {
         "symbol": symbol,
         "scores": scores,
+        "base_weights": weights,
+        "active_weights": active_weights,
+        "weighted_contributions": weighted_contributions,
+        "data_availability": data_availability,
         "metrics": metrics,
         "total_score": total_score,
         "rs_score": rs_score,

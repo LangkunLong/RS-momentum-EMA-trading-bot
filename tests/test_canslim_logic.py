@@ -101,3 +101,27 @@ def test_safe_growth_positive_control_n() -> None:
     result = n_new_products._safe_growth(1.25, 1.0)
     assert result is not None
     assert abs(result - 0.25) < 1e-9, f"Expected 0.25, got {result}"
+
+
+def test_rs_cache_requires_broad_universe_and_requested_symbols() -> None:
+    """A tiny same-day cache should not be reused for a broad-market RS scan."""
+    broad_df = momentum_analysis.pd.DataFrame(
+        {
+            "Ticker": [f"T{i}" for i in range(401)],
+            "Weighted_Perf": [0.1] * 401,
+            "RS_Score": [50.0] * 401,
+        }
+    )
+    broad_df.loc[0, "Ticker"] = "AAPL"
+    broad_df.loc[1, "Ticker"] = "MSFT"
+
+    tiny_df = momentum_analysis.pd.DataFrame(
+        {
+            "Ticker": ["AAPL", "MSFT"],
+            "Weighted_Perf": [0.2, 0.1],
+            "RS_Score": [90.0, 80.0],
+        }
+    )
+
+    assert momentum_analysis._cache_covers_requested_universe(broad_df, ["AAPL", "MSFT"]) is True
+    assert momentum_analysis._cache_covers_requested_universe(tiny_df, ["AAPL", "MSFT"]) is False
