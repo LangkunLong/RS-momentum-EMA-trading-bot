@@ -6,6 +6,7 @@ This simplified scanner focuses purely on CANSLIM criteria without pullback entr
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -118,18 +119,26 @@ def scan_for_canslim_stocks(
     return actionable_buys, watchlist_candidates, market_trend
 
 
-def export_results_to_csv(opportunities: list[dict], filename: Optional[str] = None) -> None:
-    """Export CANSLIM results to CSV file."""
+def export_results_to_csv(opportunities: list[dict], filename: Optional[str] = None) -> Optional[str]:
+    """Export CANSLIM results to CSV file and return the path."""
     if not opportunities:
         print("No opportunities to export.")
-        return
+        return None
 
     if filename is None:
-        filename = f"canslim_opportunities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        os.makedirs(settings.RESULTS_DIR, exist_ok=True)
+        filename = os.path.join(
+            settings.RESULTS_DIR,
+            f"canslim_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        )
 
     # Flatten the data for CSV export
     csv_data = []
     for opp in opportunities:
+        metrics = opp["metrics"]
+        market = opp.get("market_trend")
+        availability = opp.get("data_availability", {})
+        s_metrics = metrics.get("s_metrics", {})
         row = {
             "Symbol": opp["symbol"],
             "Scanner_Category": opp.get("scanner_category"),
@@ -143,17 +152,69 @@ def export_results_to_csv(opportunities: list[dict], filename: Optional[str] = N
             "L_Score": opp["scores"]["L"] * 100,
             "I_Score": opp["scores"]["I"] * 100,
             "M_Score": opp["scores"]["M"] * 100,
-            "Current_Growth": opp["metrics"]["current_growth"],
-            "Annual_Growth": opp["metrics"]["annual_growth"],
-            "Revenue_Growth": opp["metrics"]["revenue_growth"],
-            "Shares_Outstanding": opp["metrics"]["shares_outstanding"],
-            "Proximity_to_High": opp["metrics"]["proximity_to_high"],
+            "Current_Growth": metrics["current_growth"],
+            "Annual_Growth": metrics["annual_growth"],
+            "Revenue_Growth": metrics["revenue_growth"],
+            "ROE": metrics.get("roe"),
+            "Shares_Outstanding": metrics["shares_outstanding"],
+            "Proximity_to_High": metrics["proximity_to_high"],
+            "Avg_Volume_50": metrics["avg_volume_50"],
+            "UpDown_Volume_Ratio": s_metrics.get("up_down_volume_ratio"),
+            "Volume_Ratio": s_metrics.get("volume_ratio"),
+            "Is_Breakout": opp.get("is_breakout"),
+            "Has_Volume_Surge": opp.get("has_volume_surge"),
+            "Market_Bullish": getattr(market, "is_bullish", None),
+            "Market_Score": getattr(market, "score", None),
+            "Distribution_Days": getattr(market, "distribution_days", None),
+            "Follow_Through": getattr(market, "follow_through", None),
+            "Quarterly_Income_Available": metrics.get("quarterly_income_available"),
+            "Annual_Income_Available": metrics.get("annual_income_available"),
+            "Balance_Sheet_Available": metrics.get("balance_sheet_available"),
+            "Current_Earnings_Available": metrics.get("current_earnings_available"),
+            "Annual_Earnings_Available": metrics.get("annual_earnings_available"),
+            "Revenue_Growth_Available": metrics.get("revenue_growth_available"),
+            "Institutional_Data_Available": metrics.get("institutional_data_available"),
+            "Has_Fundamentals": metrics.get("has_fundamentals"),
+            "Data_Availability_C": availability.get("C"),
+            "Data_Availability_A": availability.get("A"),
+            "Data_Availability_N_Revenue": availability.get("N_revenue"),
+            "Data_Availability_I_Level": availability.get("I_level"),
+            "Data_Availability_I_Trend": availability.get("I_trend"),
+            "Income_Statement_Error": metrics.get("income_statement_error"),
+            "Balance_Sheet_Error": metrics.get("balance_sheet_error"),
         }
         csv_data.append(row)
 
     df = pd.DataFrame(csv_data)
     df.to_csv(filename, index=False)
     print(f"Results exported to {filename}")
+    return filename
+
+
+def print_result_quality_summary(results: list[dict]) -> None:
+    """Print a compact summary of missing fundamental fields in the result set."""
+    if not results:
+        return
+
+    total = len(results)
+    missing_current = sum(1 for row in results if not row["metrics"].get("current_earnings_available"))
+    missing_annual = sum(1 for row in results if not row["metrics"].get("annual_earnings_available"))
+    missing_revenue = sum(1 for row in results if not row["metrics"].get("revenue_growth_available"))
+    missing_fundamentals = sum(1 for row in results if not row["metrics"].get("has_fundamentals"))
+    market_blocked = sum(
+        1 for row in results if "market_not_bullish" in set(row.get("scanner_notes", []))
+    )
+
+    print("\nResult Quality Summary:")
+    print(
+        f"- Missing current earnings: {missing_current}/{total} | "
+        f"Missing annual earnings: {missing_annual}/{total} | "
+        f"Missing revenue growth: {missing_revenue}/{total}"
+    )
+    print(
+        f"- Missing fundamentals overall: {missing_fundamentals}/{total} | "
+        f"Blocked by market regime: {market_blocked}/{total}"
+    )
 
 
 if __name__ == "__main__":
@@ -171,6 +232,7 @@ if __name__ == "__main__":
     MIN_CANSLIM_SCORE = None  # Uses settings.MIN_CANSLIM_SCORE
     WATCHLIST_MIN_SCORE = None  # Uses settings.WATCHLIST_MIN_CANSLIM_SCORE
     REQUIRE_BULLISH_MARKET_FOR_BUYS = None  # Uses settings.REQUIRE_BULLISH_MARKET_FOR_BUYS
+    MAX_TERMINAL_RESULTS = settings.MAX_TERMINAL_RESULTS
     # Available indices: 'sp500', 'nasdaq100', 'russell2000', 'large_cap', 'small_cap', 'all'
     # Set to None to scan all major indices (S&P 500 + Nasdaq 100 + Russell 2000)
     SECTORS = "nasdaq100"  # Uses all indices from major markets
@@ -185,6 +247,7 @@ if __name__ == "__main__":
         "- Require Bullish Market For Buys: "
         f"{REQUIRE_BULLISH_MARKET_FOR_BUYS if REQUIRE_BULLISH_MARKET_FOR_BUYS is not None else settings.REQUIRE_BULLISH_MARKET_FOR_BUYS}"
     )
+    print(f"- Max Terminal Results Per Section: {MAX_TERMINAL_RESULTS}")
     indices_label = SECTORS or settings.SECTORS or "All (S&P 500 + Nasdaq 100 + Russell 2000)"
     print(f"- Indices: {indices_label}")
     print(f"- Custom List: {'Yes' if CUSTOM_LIST else 'No'}")
@@ -200,19 +263,31 @@ if __name__ == "__main__":
         watchlist_min_score=WATCHLIST_MIN_SCORE,
         require_bullish_market_for_buys=REQUIRE_BULLISH_MARKET_FOR_BUYS,
     )
+    combined_results = actionable_buys + watchlist_candidates
+
+    print_result_quality_summary(combined_results)
 
     if actionable_buys:
-        print_analysis_results(actionable_buys, market_trend, title="ACTIONABLE CANSLIM BUYS")
+        print_analysis_results(
+            actionable_buys,
+            market_trend,
+            title="ACTIONABLE CANSLIM BUYS",
+            max_results=MAX_TERMINAL_RESULTS,
+        )
     else:
         print("No actionable CANSLIM buys met the current market and score gates.")
 
     if watchlist_candidates:
-        print_analysis_results(watchlist_candidates, market_trend, title="WATCHLIST CANDIDATES")
+        print_analysis_results(
+            watchlist_candidates,
+            market_trend,
+            title="WATCHLIST CANDIDATES",
+            max_results=MAX_TERMINAL_RESULTS,
+        )
     else:
         print("No watchlist candidates met the current RS and watchlist-score floors.")
 
-    # Optionally export results to CSV
-    # if actionable_buys or watchlist_candidates:
-    #     export_results_to_csv(actionable_buys + watchlist_candidates)
+    if settings.AUTO_EXPORT_RESULTS and combined_results:
+        export_results_to_csv(combined_results)
 
     print("\nScan completed!")
