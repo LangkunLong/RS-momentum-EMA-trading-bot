@@ -157,14 +157,10 @@ def evaluate_c(
         earnings = quarterly_income.loc[row_label].sort_index()
 
         if len(earnings) < 5:
-            # Need at least 5 quarters for YoY (current + 4 back)
-            # Fallback: if we have at least 2, use what we have
-            if len(earnings) >= 2:
-                current_growth = _safe_growth(earnings.iloc[-1], earnings.iloc[-2])
-                if current_growth is None:
-                    return 0.0, None
-                growth_score = float(np.clip(current_growth / c_growth_target, 0, 2) / 2)
-                return growth_score, current_growth
+            # Need at least 5 quarters for YoY (current + 4 back).
+            # Do NOT fall back to quarter-over-quarter — O'Neil strictly
+            # requires YoY to avoid seasonal distortion (e.g., retail Q4
+            # vs Q3 would always show massive "growth").
             return 0.0, None
 
         # --- O'Neil's methodology: Year-over-Year comparison ---
