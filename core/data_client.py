@@ -10,6 +10,7 @@ Session cache prevents redundant API calls within the same scan run.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from datetime import datetime, timedelta
@@ -32,19 +33,23 @@ from config import settings
 from cachetools import LRUCache
 
 _session_cache = LRUCache(maxsize=500)
+_cache_lock = threading.Lock()
 
 
 def clear_session_cache() -> None:
     """Reset the in-memory session cache between scan runs."""
-    _session_cache.clear()
+    with _cache_lock:
+        _session_cache.clear()
 
 
 def _cache_get(key: tuple) -> Any:
-    return _session_cache.get(key)
+    with _cache_lock:
+        return _session_cache.get(key)
 
 
 def _cache_set(key: tuple, value: Any) -> None:
-    _session_cache[key] = value
+    with _cache_lock:
+        _session_cache[key] = value
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -162,7 +167,7 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     if isinstance(data, dict):
         error_msg = data.get("Error Message") or data.get("error") or data.get("message")
         if error_msg:
-            print(f"FMP API warning ({endpoint}): {error_msg}")
+            print(f"[FMP ERROR] {endpoint}: {error_msg}")
             return []
 
     return data
@@ -546,9 +551,13 @@ def _fetch_fmp_raw_history(symbol: str) -> dict:
 
 
 def _filter_records_as_of(records: List[dict], as_of_date: datetime) -> List[dict]:
-    """Keep only records whose SEC-accepted date is on or before *as_of_date*."""
+    """Keep only records whose SEC-accepted date is on or before *as_of_date*.
+
+    Returns records sorted newest-first so that ``filtered[0]`` is always the
+    most recent record available as of the cutoff date.
+    """
     cutoff = pd.Timestamp(as_of_date)
-    filtered = []
+    dated: list[tuple[pd.Timestamp, dict]] = []
     for rec in records:
         # Safely catch both None and empty strings ""
         accepted = rec.get("acceptedDate")
@@ -565,9 +574,11 @@ def _filter_records_as_of(records: List[dict], as_of_date: datetime) -> List[dic
             continue
 
         if ts <= cutoff:
-            filtered.append(rec)
+            dated.append((ts, rec))
 
-    return filtered
+    # Sort newest-first so callers using [0] get the most recent record
+    dated.sort(key=lambda x: x[0], reverse=True)
+    return [rec for _, rec in dated]
 
 
 def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
@@ -700,7 +711,11 @@ def ensure_series(data: pd.Series | pd.DataFrame) -> pd.Series:
 
 
 def coerce_scalar(value: Any) -> float:
-    """Extract a single Python float from a Series / DataFrame / ndarray."""
+    """Extract a single Python float from a Series / DataFrame / ndarray.
+
+    Raises ``ValueError`` if the result is NaN or infinite so that corrupted
+    data surfaces immediately rather than propagating silently through scores.
+    """
     if isinstance(value, pd.DataFrame):
         if value.shape[1] == 0:
             raise ValueError("Cannot extract a scalar from an empty DataFrame")
@@ -713,7 +728,10 @@ def coerce_scalar(value: Any) -> float:
         if value.size == 0:
             raise ValueError("Cannot extract a scalar from an empty ndarray")
         value = value.item()
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"coerce_scalar produced non-finite value: {result}")
+    return result
 
 
 def extract_float_series(df: pd.DataFrame, column: str) -> pd.Series:

@@ -113,13 +113,16 @@ def _detect_power_earnings_gap(
     # Calculate average volume before lookback period
     avg_volume = volumes.iloc[-(lookback_days + 50) : -(lookback_days + 1)].mean()
 
-    if avg_volume == 0:
+    if pd.isna(avg_volume) or avg_volume == 0:
         return False, None
 
     # Look for gaps in REVERSE order (newest first) so we catch today's gap!
     for i in range(len(recent) - 1, 0, -1):
+        prev_close = recent_closes.iloc[i - 1]
+        if prev_close <= 0 or pd.isna(prev_close):
+            continue
         # Standard Gap Up: Today's Open vs Yesterday's Close
-        gap_size = (recent_opens.iloc[i] - recent_closes.iloc[i - 1]) / recent_closes.iloc[i - 1]
+        gap_size = (recent_opens.iloc[i] - prev_close) / prev_close
 
         if gap_size >= gap_threshold:
             volume_ratio = recent_volumes.iloc[i] / avg_volume
@@ -292,7 +295,7 @@ def evaluate_s(
     if s_breakout_proximity <= 0.85:
         proximity_score = 1.0
     else:
-        proximity_score = (proximity - 0.85) / (s_breakout_proximity - 0.85)
+        proximity_score = float(np.clip((proximity - 0.85) / (s_breakout_proximity - 0.85), 0, 1))
     breakout_score = 1.0 if is_breakout else max(proximity_score, 0)
     surge_breakout_score = 0.5 * volume_score + 0.5 * breakout_score
 

@@ -72,6 +72,8 @@ def _count_distribution_days(
     dist_count = 0
     for i in range(1, len(recent_closes)):
         prev = recent_closes.iloc[i - 1]
+        if prev <= 0 or pd.isna(prev):
+            continue
         price_change = (recent_closes.iloc[i] - prev) / prev
         vol_today = recent_volumes.iloc[i]
         vol_yesterday = recent_volumes.iloc[i - 1]
@@ -110,7 +112,7 @@ def _detect_follow_through_day(
         True if a recent follow-through day was detected.
 
     """
-    if len(closes) < lookback:
+    if len(closes) < 5:
         return False
 
     recent_closes = closes.tail(lookback)
@@ -122,6 +124,8 @@ def _detect_follow_through_day(
 
     for i in range(1, len(recent_closes)):
         prev_close = recent_closes.iloc[i - 1]
+        if prev_close <= 0 or pd.isna(prev_close):
+            continue
         daily_change = (recent_closes.iloc[i] - prev_close) / prev_close
 
         if daily_change > 0:

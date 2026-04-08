@@ -87,17 +87,22 @@ def evaluate_canslim(
         try:
             quarterly_income = fetch_quarterly_income_statement(symbol)
             annual_income = fetch_annual_income_statement(symbol)
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] {symbol}: Failed to fetch income statements: {e}")
             quarterly_income = pd.DataFrame()
             annual_income = pd.DataFrame()
 
         try:
             balance_sheet = fetch_balance_sheet(symbol)
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] {symbol}: Failed to fetch balance sheet: {e}")
             balance_sheet = pd.DataFrame()
     except Exception as e:
         print(f"Data fetch error for {symbol}: {e}")
         return None
+
+    if quarterly_income.empty and annual_income.empty:
+        print(f"[WARN] {symbol}: No fundamental data available — C and A scores will be 0")
 
     # 2. Market Trend & Price History
     market_trend = market_trend or evaluate_m()

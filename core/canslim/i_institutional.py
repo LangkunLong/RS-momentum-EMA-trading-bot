@@ -94,8 +94,8 @@ def _score_ownership_trend(
         # 0-5% decrease — slight distribution
         return 0.5 + change_pct / 0.05 * 0.2
     else:
-        # > 5% decrease — significant distribution
-        return max(0.3 + (change_pct + 0.05) / 0.15 * 0.0, 0.1)
+        # > 5% decrease — significant distribution (linear 0.3 → 0.1)
+        return max(0.3 + (change_pct + 0.05) / 0.15 * 0.2, 0.1)
 
 
 def evaluate_i(
