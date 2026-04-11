@@ -71,10 +71,7 @@ def calculate_weighted_performance(
         perf_q4 = (data_series.iloc[-3 * days_per_q] / data_series.iloc[-4 * days_per_q]) - 1
 
         weighted_performance = (
-            (q1_weight * perf_q1)
-            + (q2_weight * perf_q2)
-            + (q3_weight * perf_q3)
-            + (q4_weight * perf_q4)
+            (q1_weight * perf_q1) + (q2_weight * perf_q2) + (q3_weight * perf_q3) + (q4_weight * perf_q4)
         )
         return weighted_performance
     except (IndexError, TypeError, ZeroDivisionError):
@@ -149,9 +146,7 @@ def calculate_rs_scores_for_tickers(
     rs_df.columns = ["Ticker", "Weighted_Perf"]
     rs_df = rs_df.dropna()
 
-    rs_df["RS_Score"] = (
-        rs_df["Weighted_Perf"].rank(pct=True) * percentile_multiplier + percentile_min
-    )
+    rs_df["RS_Score"] = rs_df["Weighted_Perf"].rank(pct=True) * percentile_multiplier + percentile_min
     rs_df = rs_df.sort_values(by="RS_Score", ascending=False).reset_index(drop=True)
 
     rs_df.to_csv(cache_file, index=False)
