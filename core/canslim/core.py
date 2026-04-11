@@ -194,10 +194,7 @@ def evaluate_canslim(
     total_active_weight = sum(weights.values())
 
     if total_active_weight > 0:
-        active_weights = {
-            key: (weight / total_active_weight if weight > 0 else 0.0)
-            for key, weight in weights.items()
-        }
+        active_weights = {key: (weight / total_active_weight if weight > 0 else 0.0) for key, weight in weights.items()}
         total_score = (
             active_weights["C"] * score_c
             + active_weights["A"] * score_a
@@ -212,9 +209,7 @@ def evaluate_canslim(
         total_score = 0.0
 
     total_score = float(total_score)
-    weighted_contributions = {
-        key: active_weights[key] * scores[key] * 100 for key in scores
-    }
+    weighted_contributions = {key: active_weights[key] * scores[key] * 100 for key in scores}
 
     # 7. Compile metrics for reporting
     metrics = {

@@ -113,6 +113,20 @@ def scan_for_canslim_stocks(
 
     print("\nScan complete!")
     print(f"Analyzed: {len(symbols)} stocks")
+
+    # Surface market regime prominently — this is the primary explainer for zero buys.
+    m = market_trend
+    bullish_label = "BULLISH" if m.is_bullish else "BEARISH / IN CORRECTION"
+    dist = getattr(m, "distribution_days", "n/a")
+    ftd = "Yes" if getattr(m, "follow_through", False) else "No"
+    print(f"Market direction (SPY): {bullish_label} | Score: {m.score * 100:.0f}%")
+    print(f"  Distribution days (25d window): {dist} | Follow-through confirmed: {ftd}")
+    if not m.is_bullish:
+        print(
+            "  NOTE: O'Neil's rule — no new positions in a correction. "
+            "Actionable buys are gated. Watchlist candidates shown below."
+        )
+
     print(f"Actionable buys found: {len(actionable_buys)} stocks")
     print(f"Watchlist candidates found: {len(watchlist_candidates)} stocks")
 
@@ -201,9 +215,7 @@ def print_result_quality_summary(results: list[dict]) -> None:
     missing_annual = sum(1 for row in results if not row["metrics"].get("annual_earnings_available"))
     missing_revenue = sum(1 for row in results if not row["metrics"].get("revenue_growth_available"))
     missing_fundamentals = sum(1 for row in results if not row["metrics"].get("has_fundamentals"))
-    market_blocked = sum(
-        1 for row in results if "market_not_bullish" in set(row.get("scanner_notes", []))
-    )
+    market_blocked = sum(1 for row in results if "market_not_bullish" in set(row.get("scanner_notes", [])))
 
     print("\nResult Quality Summary:")
     print(

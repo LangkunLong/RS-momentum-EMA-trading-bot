@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
+from alpaca.data.enums import Adjustment
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -27,8 +28,12 @@ from alpaca.data.timeframe import TimeFrame
 from config import settings
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Session Cache
+# Session Cache (in-memory, per-run)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+import hashlib
+import os
+import pickle
 
 from cachetools import LRUCache
 
@@ -50,6 +55,45 @@ def _cache_get(key: tuple) -> Any:
 def _cache_set(key: tuple, value: Any) -> None:
     with _cache_lock:
         _session_cache[key] = value
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Fundamentals Disk Cache (daily TTL — saves FMP quota across runs)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_FUND_CACHE_DIR = "fundamentals_cache"
+_FUND_CACHE_TTL_HOURS = 24
+
+
+def _fund_cache_path(key: tuple) -> str:
+    safe = hashlib.md5(str(key).encode()).hexdigest()
+    return os.path.join(_FUND_CACHE_DIR, f"{safe}.pkl")
+
+
+def _fund_cache_get(key: tuple) -> Any:
+    """Load a cached fundamental DataFrame if it exists and is fresh."""
+    path = _fund_cache_path(key)
+    if not os.path.exists(path):
+        return None
+    age_hours = (time.time() - os.path.getmtime(path)) / 3600
+    if age_hours > _FUND_CACHE_TTL_HOURS:
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _fund_cache_set(key: tuple, value: Any) -> None:
+    """Persist a fundamental DataFrame to disk."""
+    os.makedirs(_FUND_CACHE_DIR, exist_ok=True)
+    path = _fund_cache_path(key)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(value, f)
+    except Exception:
+        pass  # Cache write failure is non-fatal
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -136,11 +180,7 @@ def _drop_incomplete_daily_bar(df: pd.DataFrame) -> pd.DataFrame:
 def _get_fmp_session() -> requests.Session:
     """Create a requests session with built-in retry logic."""
     session = requests.Session()
-    retries = Retry(
-        total=5,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504]
-    )
+    retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
     pool_size = max(settings.HTTP_MAX_WORKERS, settings.MAX_WORKERS, 10)
     session.mount(
         "https://",
@@ -152,7 +192,9 @@ def _get_fmp_session() -> requests.Session:
     )
     return session
 
+
 _fmp_session = _get_fmp_session()
+
 
 def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     """Execute a GET request against the FMP API with retries."""
@@ -160,14 +202,24 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     params = params or {}
     params["apikey"] = _fmp_api_key()
 
-    resp = _fmp_session.get(url, params=params, timeout=30)
+    try:
+        resp = _fmp_session.get(url, params=params, timeout=30)
+    except requests.exceptions.RetryError:
+        # Retry adapter exhausted (all attempts returned 429) — quota exceeded.
+        return []
+    except requests.exceptions.ConnectionError:
+        return []
+
+    # 402/403 = free-tier restriction; degrade gracefully rather than crashing.
+    if resp.status_code in (402, 403):
+        return []
+
     resp.raise_for_status()
     data = resp.json()
 
     if isinstance(data, dict):
         error_msg = data.get("Error Message") or data.get("error") or data.get("message")
         if error_msg:
-            print(f"[FMP ERROR] {endpoint}: {error_msg}")
             return []
 
     return data
@@ -204,6 +256,7 @@ def fetch_ohlcv(
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
+        adjustment=Adjustment.SPLIT,  # Normalize historical prices across stock splits
     )
 
     barset = client.get_stock_bars(request_params)
@@ -285,6 +338,7 @@ def fetch_bulk_close_prices(
                 timeframe=TimeFrame.Day,
                 start=start,
                 end=end,
+                adjustment=Adjustment.SPLIT,  # Normalize RS calculation across stock splits
             )
             barset = client.get_stock_bars(request_params)
             df = barset.df
@@ -346,7 +400,7 @@ def validate_tickers_bulk(symbols: List[str]) -> List[str]:
 # a_annual_earnings._calculate_roe(), and n_new_products.evaluate_n().
 
 _FMP_INCOME_FIELD_MAP = {
-    "epsdiluted": "Diluted EPS",
+    "epsDiluted": "Diluted EPS",  # stable API uses camelCase; old v3 used lowercase
     "eps": "Basic EPS",
     "revenue": "Total Revenue",
     "netIncome": "Net Income",
@@ -404,16 +458,23 @@ def _fmp_records_to_financial_df(
     return df
 
 
-def fetch_quarterly_income_statement(symbol: str, limit: int = 8) -> pd.DataFrame:
+def fetch_quarterly_income_statement(symbol: str, limit: int = 5) -> pd.DataFrame:
     """Fetch quarterly income statement in yfinance-compatible format."""
     cache_key = ("quarterly_income", symbol, limit)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+    disk = _fund_cache_get(cache_key)
+    if disk is not None:
+        _cache_set(cache_key, disk)
+        return disk
 
-    records = _fmp_get(f"income-statement/{symbol}", {"period": "quarter", "limit": limit})
+    # stable API uses ?symbol= query param instead of /symbol/ path segment
+    records = _fmp_get("income-statement", {"symbol": symbol, "period": "quarter", "limit": limit})
     df = _fmp_records_to_financial_df(records, _FMP_INCOME_FIELD_MAP)
     _cache_set(cache_key, df)
+    if not df.empty:
+        _fund_cache_set(cache_key, df)
     return df
 
 
@@ -423,10 +484,16 @@ def fetch_annual_income_statement(symbol: str, limit: int = 5) -> pd.DataFrame:
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+    disk = _fund_cache_get(cache_key)
+    if disk is not None:
+        _cache_set(cache_key, disk)
+        return disk
 
-    records = _fmp_get(f"income-statement/{symbol}", {"period": "annual", "limit": limit})
+    records = _fmp_get("income-statement", {"symbol": symbol, "period": "annual", "limit": limit})
     df = _fmp_records_to_financial_df(records, _FMP_INCOME_FIELD_MAP)
     _cache_set(cache_key, df)
+    if not df.empty:
+        _fund_cache_set(cache_key, df)
     return df
 
 
@@ -436,10 +503,16 @@ def fetch_balance_sheet(symbol: str, limit: int = 5) -> pd.DataFrame:
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+    disk = _fund_cache_get(cache_key)
+    if disk is not None:
+        _cache_set(cache_key, disk)
+        return disk
 
-    records = _fmp_get(f"balance-sheet-statement/{symbol}", {"limit": limit})
+    records = _fmp_get("balance-sheet-statement", {"symbol": symbol, "limit": limit})
     df = _fmp_records_to_financial_df(records, _FMP_BALANCE_SHEET_FIELD_MAP)
     _cache_set(cache_key, df)
+    if not df.empty:
+        _fund_cache_set(cache_key, df)
     return df
 
 
@@ -462,32 +535,24 @@ def fetch_company_info(symbol: str) -> dict:
         "institution_count": None,
     }
 
-    # 1. Enterprise values endpoint — best source for shares outstanding
+    # 1. Profile — compute shares_outstanding from marketCap / price.
+    # (stable API removed enterprise-values; profile is the reliable source.)
     try:
-        ev = _fmp_get(f"enterprise-values/{symbol}", {"limit": 1, "period": "quarter"})
-        if ev and isinstance(ev, list) and len(ev) > 0:
-            shares = ev[0].get("numberOfShares")
-            if shares is not None:
-                result["shares_outstanding"] = int(shares)
+        profile = _fmp_get("profile", {"symbol": symbol})
+        if profile and isinstance(profile, list) and len(profile) > 0:
+            p = profile[0]
+            mkt_cap = p.get("marketCap")
+            price = p.get("price")
+            if mkt_cap and price and price > 0:
+                result["shares_outstanding"] = int(mkt_cap / price)
     except (requests.RequestException, ValueError, EnvironmentError):
         pass
 
-    # Fallback: derive from profile (mktCap / price)
-    if result["shares_outstanding"] is None:
-        try:
-            profile = _fmp_get(f"profile/{symbol}")
-            if profile and isinstance(profile, list) and len(profile) > 0:
-                p = profile[0]
-                mkt_cap = p.get("mktCap")
-                price = p.get("price")
-                if mkt_cap and price and price > 0:
-                    result["shares_outstanding"] = int(mkt_cap / price)
-        except (requests.RequestException, ValueError, EnvironmentError):
-            pass
-
-    # 2. Institutional holders
+    # 2. Institutional holders — not available on the stable free tier.
+    # The HTTP 404 is caught below; institutional data gracefully degrades to None
+    # and the I-component weight drops to 0.0 in the CANSLIM composite.
     try:
-        holders = _fmp_get(f"institutional-holder/{symbol}")
+        holders = _fmp_get("institutional-holder", {"symbol": symbol})
         if holders and isinstance(holders, list):
             result["institution_count"] = len(holders)
 
@@ -514,29 +579,25 @@ def _fetch_fmp_raw_history(symbol: str) -> dict:
         return cached_raw
 
     try:
-        qi_raw = _fmp_get(f"income-statement/{symbol}", {"period": "quarter", "limit": 80})
+        qi_raw = _fmp_get("income-statement", {"symbol": symbol, "period": "quarter", "limit": 80})
     except (requests.RequestException, ValueError, EnvironmentError):
         qi_raw = []
     try:
-        ai_raw = _fmp_get(f"income-statement/{symbol}", {"period": "annual", "limit": 20})
+        ai_raw = _fmp_get("income-statement", {"symbol": symbol, "period": "annual", "limit": 20})
     except (requests.RequestException, ValueError, EnvironmentError):
         ai_raw = []
     try:
-        bs_raw = _fmp_get(f"balance-sheet-statement/{symbol}", {"limit": 20})
+        bs_raw = _fmp_get("balance-sheet-statement", {"symbol": symbol, "limit": 20})
     except (requests.RequestException, ValueError, EnvironmentError):
         bs_raw = []
+    # enterprise-values endpoint not available on stable free tier; ev_raw stays empty.
+    ev_raw = []
     try:
-        ev_raw = _fmp_get(f"enterprise-values/{symbol}", {"limit": 80, "period": "quarter"})
-    except (requests.RequestException, ValueError, EnvironmentError):
-        ev_raw = []
-    try:
-        profile_raw = _fmp_get(f"profile/{symbol}")
+        profile_raw = _fmp_get("profile", {"symbol": symbol})
     except (requests.RequestException, ValueError, EnvironmentError):
         profile_raw = []
-    try:
-        holders_raw = _fmp_get(f"institutional-holder/{symbol}")
-    except (requests.RequestException, ValueError, EnvironmentError):
-        holders_raw = []
+    # institutional-holder not available on stable free tier; holders_raw stays empty.
+    holders_raw = []
 
     result = {
         "qi_raw": qi_raw,
@@ -619,11 +680,16 @@ def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
             if shares is not None:
                 result["shares_outstanding"] = int(shares)
 
-    # Fallback: profile data is current-only; acceptable as last resort
+    # Fallback: profile data is current-only; acceptable as last resort.
+    # stable API field is "marketCap" (not "mktCap" as in old v3 profile).
     if result["shares_outstanding"] is None:
-        if raw_history["profile_raw"] and isinstance(raw_history["profile_raw"], list) and len(raw_history["profile_raw"]) > 0:
+        if (
+            raw_history["profile_raw"]
+            and isinstance(raw_history["profile_raw"], list)
+            and len(raw_history["profile_raw"]) > 0
+        ):
             p = raw_history["profile_raw"][0]
-            mkt_cap = p.get("mktCap")
+            mkt_cap = p.get("marketCap")
             price = p.get("price")
             if mkt_cap and price and price > 0:
                 result["shares_outstanding"] = int(mkt_cap / price)

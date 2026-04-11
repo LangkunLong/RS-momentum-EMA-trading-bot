@@ -27,6 +27,7 @@ dist/
 # Cache directories
 rs_score_cache/
 ticker_cache/
+fundamentals_cache/
 
 # CSV results
 backtest_results*

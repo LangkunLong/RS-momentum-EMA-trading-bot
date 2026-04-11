@@ -157,10 +157,35 @@ def evaluate_c(
         earnings = quarterly_income.loc[row_label].sort_index()
 
         if len(earnings) < 5:
-            # Need at least 5 quarters for YoY (current + 4 back).
-            # Do NOT fall back to quarter-over-quarter — O'Neil strictly
-            # requires YoY to avoid seasonal distortion (e.g., retail Q4
-            # vs Q3 would always show massive "growth").
+            # Standard path needs 5 quarters for true YoY (current + 4 back).
+            # FMP free-tier often returns exactly 4 quarterly periods.
+            # When those 4 periods span ≥ 11 months (e.g., Q4 2023 → Q3 2024),
+            # the oldest and newest entries are effectively the same calendar
+            # quarter one year apart — we can compute a genuine YoY.
+            # Do NOT fall back to quarter-over-quarter; O'Neil strictly requires
+            # YoY to avoid seasonal distortion.
+            if len(earnings) == 4:
+                try:
+                    dates = pd.to_datetime(earnings.index)
+                    span_days = (dates[-1] - dates[0]).days
+                    if span_days >= 330:  # ≥ 11 months → valid approximate YoY
+                        current_growth = _safe_growth(float(earnings.iloc[-1]), float(earnings.iloc[0]))
+                        if current_growth is not None:
+                            growth_score = float(np.clip(current_growth / c_growth_target, 0, 2) / 2)
+                            # Consistency and acceleration are unknown with a single
+                            # YoY data point — score them neutral (0.5) rather than 0.
+                            score = float(
+                                np.clip(
+                                    settings.C_GROWTH_WEIGHT * growth_score
+                                    + settings.C_CONSISTENCY_WEIGHT * 0.5
+                                    + settings.C_ACCELERATION_WEIGHT * 0.5,
+                                    0,
+                                    1,
+                                )
+                            )
+                            return score, current_growth
+                except Exception:
+                    pass
             return 0.0, None
 
         # --- O'Neil's methodology: Year-over-Year comparison ---

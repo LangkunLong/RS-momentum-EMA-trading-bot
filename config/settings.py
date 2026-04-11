@@ -28,7 +28,12 @@ START_DATE = "2024-01-01"  # Analysis start date
 MIN_MARKET_CAP = 10e9  # Minimum market cap ($10 billion)
 MIN_RS_SCORE = 75  # Free-tier friendly default; raise to 80 when fundamentals are complete
 MIN_CANSLIM_SCORE = 65  # Free-tier friendly default; raise toward 70-75 with fuller data
-WATCHLIST_MIN_CANSLIM_SCORE = 45  # Surface high-RS names worth monitoring when buys are blocked
+# Watchlist floor is intentionally low so that high-RS stocks worth monitoring during
+# market corrections still surface even when M (market direction) is dragging composite
+# scores down.  With a bearish M score (~0.15) and no FMP fundamentals, an RS-90 stock
+# near 82% of its 52-week high scores ~44 — a floor of 30 catches these without diluting
+# the list with genuinely weak names.
+WATCHLIST_MIN_CANSLIM_SCORE = 30  # Lowered from 45 — bear-market watchlist must still populate
 REQUIRE_BULLISH_MARKET_FOR_BUYS = True  # O'Neil-style market gate for actionable entries
 MAX_TERMINAL_RESULTS = 12  # Limit terminal detail; full output is exported to CSV
 AUTO_EXPORT_RESULTS = True  # Save scanner output to CSV by default
@@ -213,7 +218,7 @@ TRADING_DAYS_PER_QUARTER = 65  # Approximate trading days in a quarter
 # ==============================================================================
 
 # FMP (Financial Modeling Prep) configuration
-FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
+FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 
 # HTTP Retry settings
 HTTP_RETRY_TOTAL = 5  # Maximum retry attempts
