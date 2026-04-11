@@ -176,20 +176,22 @@ class IndexTickerFetcher:
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                }
+                },
             )
             page_resp.raise_for_status()
 
             # 2. Extract dynamic CSV link
             csv_url = None
-            soup = BeautifulSoup(page_resp.text, 'html.parser')
-            download_link = soup.find('a', href=re.compile(r'\.ajax\?fileType=csv.*fileName=.*_holdings'))
+            soup = BeautifulSoup(page_resp.text, "html.parser")
+            download_link = soup.find("a", href=re.compile(r"\.ajax\?fileType=csv.*fileName=.*_holdings"))
 
             if download_link:
-                csv_url = "https://www.ishares.com" + download_link['href']
+                csv_url = "https://www.ishares.com" + download_link["href"]
             else:
                 # Fallback to regex search through whole payload or scripts just in case
-                match = re.search(r"(/us/products/[^\"]+\.ajax\?fileType=csv[^\"]*fileName=[^\"]*_holdings[^\"]*)", page_resp.text)
+                match = re.search(
+                    r"(/us/products/[^\"]+\.ajax\?fileType=csv[^\"]*fileName=[^\"]*_holdings[^\"]*)", page_resp.text
+                )
                 if match:
                     csv_url = "https://www.ishares.com" + match.group(1)
 
@@ -211,8 +213,7 @@ class IndexTickerFetcher:
                 return _parse_ishares_csv(response.text, display_name)
             else:
                 print(
-                    f"Error: iShares returned status {response.status_code} "
-                    f"for {display_name}. Using fallback tickers."
+                    f"Error: iShares returned status {response.status_code} for {display_name}. Using fallback tickers."
                 )
                 return list(_FALLBACK_TICKERS)
 
@@ -322,9 +323,7 @@ class IndexTickerFetcher:
         Returns:
             List of ticker strings for the requested index.
         """
-        return self.get_all_tickers(
-            indices=[index_name], deduplicate=False, force_refresh=force_refresh
-        )
+        return self.get_all_tickers(indices=[index_name], deduplicate=False, force_refresh=force_refresh)
 
     def clear_cache(self) -> None:
         """Delete the on-disk ticker cache file."""

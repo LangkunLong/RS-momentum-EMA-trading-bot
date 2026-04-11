@@ -58,9 +58,7 @@ def _score_ownership_level(held_percent: float) -> float:
         return max(0.6 - (held_percent - 0.90) / 0.10 * 0.3, 0.3)
 
 
-def _score_ownership_trend(
-    current_holders: Optional[int], previous_holders: Optional[int]
-) -> float:
+def _score_ownership_trend(current_holders: Optional[int], previous_holders: Optional[int]) -> float:
     """Score the trend in number of institutional holders.
 
     O'Neil emphasizes INCREASING institutional sponsorship — more institutions

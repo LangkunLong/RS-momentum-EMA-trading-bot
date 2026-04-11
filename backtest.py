@@ -163,7 +163,9 @@ def _evaluate_technical_at_date(
     n_score = float(np.clip(proximity_score, 0, 1))
 
     # S score
-    score_s, s_metrics = evaluate_s(sliced, avg_vol_50, latest_close, high_52, shares_outstanding, s_breakout_proximity=0.95)
+    score_s, s_metrics = evaluate_s(
+        sliced, avg_vol_50, latest_close, high_52, shares_outstanding, s_breakout_proximity=0.95
+    )
 
     return {
         "n_score": n_score,
@@ -305,10 +307,7 @@ def run_backtest() -> pd.DataFrame:
     valid_trading_days = spy_data.loc[start_date:end_date].index
     eval_dates = [pd.Timestamp(d) for d in valid_trading_days]
 
-    print(
-        f"  {len(eval_dates)} trading days from "
-        f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-    )
+    print(f"  {len(eval_dates)} trading days from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
     records = []
 
