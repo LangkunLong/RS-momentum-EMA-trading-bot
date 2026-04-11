@@ -180,7 +180,11 @@ def _drop_incomplete_daily_bar(df: pd.DataFrame) -> pd.DataFrame:
 def _get_fmp_session() -> requests.Session:
     """Create a requests session with built-in retry logic."""
     session = requests.Session()
-    retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    retries = Retry(
+        total=settings.HTTP_RETRY_TOTAL,
+        backoff_factor=settings.HTTP_RETRY_BACKOFF,
+        status_forcelist=settings.HTTP_RETRY_STATUS_CODES,
+    )
     pool_size = max(settings.HTTP_MAX_WORKERS, settings.MAX_WORKERS, 10)
     session.mount(
         "https://",
