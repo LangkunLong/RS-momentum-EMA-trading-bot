@@ -31,3 +31,4 @@ fundamentals_cache/
 
 # CSV results
 backtest_results*
+scan_results/
