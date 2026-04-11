@@ -114,9 +114,14 @@ All tuneable parameters live in `config/settings.py`:
 
 - **Ticker cache:** `ticker_cache/index_tickers_cache.json` — 24-hour TTL, handles corruption on load
 - **RS score cache:** `rs_score_cache/rs_scores_cache.csv` — daily TTL, handles corruption on load
-- **Session cache:** in-memory dict in `data_client._session_cache` — cleared between scan runs via `clear_session_cache()`
+- **Fundamentals cache:** `fundamentals_cache/*.pkl` — 24-hour TTL, pickle-based per-symbol DataFrames. Populated on the first successful FMP fetch; subsequent runs skip API calls and load from disk. Critical for staying within the FMP free-tier daily quota when scanning large universes.
+- **Session cache:** in-memory LRU dict in `data_client._session_cache` — cleared between scan runs via `clear_session_cache()`
 
-Both disk cache directories are gitignored.
+All disk cache directories are gitignored.
+
+### FMP free-tier limits
+
+The FMP free tier allows a limited number of API calls per day (~250–500). With `limit=5` per income-statement request, a full Nasdaq 100 scan (~100 stocks × 3 FMP calls) stays under budget on the first run; the fundamentals cache keeps all subsequent runs free. If you see widespread `missing_fundamentals` flags, your daily quota may be exhausted — the scanner degrades gracefully and the cache will rebuild on the next calendar day.
 
 ## Coding Conventions
 
