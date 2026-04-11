@@ -269,9 +269,28 @@ def screen_stocks_canslim_detailed(
             f"max={rs_series.max():.1f}"
         )
 
+    # Surface the market regime clearly — this is the single most important
+    # context for understanding why buy counts may be zero.
+    if debug:
+        bullish_label = "BULLISH" if market_trend.is_bullish else "BEARISH/CORRECTION"
+        m_pct = market_trend.score * 100
+        dist = getattr(market_trend, "distribution_days", "n/a")
+        ftd = getattr(market_trend, "follow_through", False)
+        print(
+            f"[DEBUG] Market regime: {bullish_label} | M score={m_pct:.0f}% | "
+            f"Distribution days={dist} | Follow-through={ftd}"
+        )
+        if not market_trend.is_bullish:
+            print(
+                "[DEBUG] NOTE: Market is not bullish — actionable buys are gated off. "
+                "Only watchlist candidates will surface."
+            )
+
     # Pre-filter: discard symbols whose RS score is already below the threshold
-    # to avoid wasting yfinance API calls on weak stocks
+    # to avoid wasting API calls on weak stocks
     filtered_symbols = []
+    rs_below_threshold = 0
+    rs_not_found = 0
     for symbol in symbols_list:
         try:
             match = rs_scores_df[rs_scores_df["Ticker"] == symbol]
@@ -279,16 +298,24 @@ def screen_stocks_canslim_detailed(
                 rs_val = float(match.iloc[0]["RS_Score"])
             else:
                 rs_val = 0
+                rs_not_found += 1
         except Exception:
             rs_val = 0
+            rs_not_found += 1
 
         if rs_val >= min_rs_score:
             filtered_symbols.append(symbol)
-        elif debug:
-            print(f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < {min_rs_score}, skipped")
+        else:
+            rs_below_threshold += 1
+            if debug:
+                print(f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < {min_rs_score}, skipped")
 
     if debug:
-        print(f"[DEBUG] Pre-filter kept {len(filtered_symbols)}/{len(symbols_list)} symbols")
+        print(
+            f"[DEBUG] Pre-filter: {rs_below_threshold} stocks below RS {min_rs_score} | "
+            f"{rs_not_found} not found in RS universe | "
+            f"{len(filtered_symbols)}/{len(symbols_list)} passed"
+        )
 
     # Evaluate remaining symbols in parallel
     def _evaluate(sym: str) -> Optional[Dict[str, object]]:
@@ -315,12 +342,22 @@ def screen_stocks_canslim_detailed(
             if evaluation:
                 results.append(evaluation)
 
-    actionable_buys = [
-        result for result in results if result.get("scanner_category") == "actionable_buy"
-    ]
-    watchlist_candidates = [
-        result for result in results if result.get("scanner_category") == "watchlist_candidate"
-    ]
+    actionable_buys = [result for result in results if result.get("scanner_category") == "actionable_buy"]
+    watchlist_candidates = [result for result in results if result.get("scanner_category") == "watchlist_candidate"]
+
+    if debug:
+        passed = len(results)
+        rejected_score = len(filtered_symbols) - passed
+        market_blocked = sum(1 for r in results if "market_not_bullish" in set(r.get("scanner_notes", [])))
+        missing_fund = sum(1 for r in results if "missing_fundamentals" in set(r.get("scanner_notes", [])))
+        print(
+            f"[DEBUG] Post-scan summary: {len(symbols_list)} total | "
+            f"{rs_below_threshold} failed RS pre-filter | "
+            f"{rejected_score} passed RS but scored below watchlist floor | "
+            f"{passed} reached watchlist/buy threshold | "
+            f"{market_blocked} watchlisted due to bearish market | "
+            f"{missing_fund} flagged for missing fundamentals"
+        )
 
     actionable_buys.sort(key=lambda x: x["total_score"], reverse=True)
     watchlist_candidates.sort(key=lambda x: x["total_score"], reverse=True)

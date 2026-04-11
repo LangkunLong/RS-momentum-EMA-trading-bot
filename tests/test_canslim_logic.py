@@ -54,8 +54,7 @@ def test_get_sp500_tickers_imported_from_index_fetcher() -> None:
     source_module = inspect.getmodule(momentum_analysis.get_sp500_tickers)
     assert source_module is not None
     assert "index_ticker_fetcher" in source_module.__name__, (
-        f"get_sp500_tickers is defined in {source_module.__name__!r}, "
-        "expected 'index_ticker_fetcher'"
+        f"get_sp500_tickers is defined in {source_module.__name__!r}, expected 'index_ticker_fetcher'"
     )
 
 

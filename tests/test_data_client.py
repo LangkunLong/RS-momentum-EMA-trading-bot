@@ -64,9 +64,7 @@ def test_export_empty_input_does_not_create_file(tmp_path: Path) -> None:
     """Calling export_results_to_csv with an empty list must not create a file."""
     out_file = str(tmp_path / "should_not_exist.csv")
     enhanced_scanner.export_results_to_csv([], filename=out_file)
-    assert not os.path.exists(out_file), (
-        "CSV file must not be created when the opportunities list is empty"
-    )
+    assert not os.path.exists(out_file), "CSV file must not be created when the opportunities list is empty"
 
 
 # ─── validate_ticker ─────────────────────────────────────────────────────────
