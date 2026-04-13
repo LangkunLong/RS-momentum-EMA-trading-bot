@@ -257,10 +257,14 @@ def evaluate_s(
 
     """
     # Load defaults from settings
-    s_volume_surge_threshold = s_volume_surge_threshold or settings.S_VOLUME_SURGE_THRESHOLD
-    s_breakout_proximity = s_breakout_proximity or settings.S_BREAKOUT_PROXIMITY
-    s_power_gap_lookback = s_power_gap_lookback or settings.S_POWER_GAP_LOOKBACK
-    s_peg_min_proximity = s_peg_min_proximity or settings.S_PEG_MIN_PROXIMITY
+    if s_volume_surge_threshold is None:
+        s_volume_surge_threshold = settings.S_VOLUME_SURGE_THRESHOLD
+    if s_breakout_proximity is None:
+        s_breakout_proximity = settings.S_BREAKOUT_PROXIMITY
+    if s_power_gap_lookback is None:
+        s_power_gap_lookback = settings.S_POWER_GAP_LOOKBACK
+    if s_peg_min_proximity is None:
+        s_peg_min_proximity = settings.S_PEG_MIN_PROXIMITY
 
     # Get most recent volume
     recent_volume = float(price_history["Volume"].iloc[-1]) if len(price_history) > 0 else 0.0

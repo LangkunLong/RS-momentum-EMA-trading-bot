@@ -21,6 +21,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# Force line-buffered stdout so output appears immediately even when redirected
+sys.stdout.reconfigure(line_buffering=True)
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -456,9 +459,9 @@ def print_results(df: pd.DataFrame) -> None:
             print(f"\n{ticker}: No data available")
             continue
 
-        print(f"\n{'─' * 100}")
+        print(f"\n{'-' * 100}")
         print(f"  {ticker}")
-        print(f"{'─' * 100}")
+        print(f"{'-' * 100}")
         print(
             f"  {'Date':<12} {'Close':>8} {'RS':>5} {'CANSLIM':>8} "
             f"{'C':>4} {'A':>4} {'N':>4} {'S':>4} {'L':>4} {'I':>4} {'M':>4} "

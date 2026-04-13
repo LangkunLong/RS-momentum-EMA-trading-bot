@@ -112,7 +112,7 @@ def scan_for_canslim_stocks(
     )
 
     print("\nScan complete!")
-    print(f"Analyzed: {len(symbols)} stocks")
+    print(f"Analyzed: {len(valid_symbols)} stocks")
 
     # Surface market regime prominently — this is the primary explainer for zero buys.
     m = market_trend

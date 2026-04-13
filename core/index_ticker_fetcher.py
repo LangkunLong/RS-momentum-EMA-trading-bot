@@ -28,6 +28,21 @@ _TICKER_COLUMN_CANDIDATES = ["Ticker", "ticker", "Symbol", "symbol", "Constituen
 # Fallback tickers when fetching fails
 _FALLBACK_TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
 
+# Sanity-check limits: iShares product URLs can occasionally point at broader
+# funds than intended.  If parsed ticker count exceeds these limits, the fetcher
+# falls back to an alternative source rather than sending thousands of invalid
+# symbols through Alpaca validation.
+_MAX_TICKERS_PER_INDEX: dict[str, int] = {
+    "sp500": 550,       # S&P 500 has 503 members; allow headroom for changes
+    "nasdaq100": 115,   # Nasdaq 100 has exactly 101 members; cap prevents URL drift
+    "russell2000": 2100,  # Russell 2000 has ~2000 members
+}
+
+# Wikipedia URL for Nasdaq 100 constituents — used as fallback when the iShares
+# URL returns an unexpectedly large set (iShares product 239696 appears to track
+# a broader universe than strictly the Nasdaq-100 index).
+_WIKIPEDIA_NASDAQ100_URL = "https://en.wikipedia.org/wiki/Nasdaq-100"
+
 
 def _find_ticker_column(df: pd.DataFrame) -> Optional[str]:
     """Find a valid ticker column from a list of known candidates.
@@ -47,6 +62,39 @@ def _find_ticker_column(df: pd.DataFrame) -> Optional[str]:
         if col_lower in ("ticker", "symbol") or "ticker" in col_lower or "symbol" in col_lower:
             return col
     return None
+
+
+def _fetch_nasdaq100_from_wikipedia() -> List[str]:
+    """Fetch Nasdaq 100 constituents from Wikipedia as a fallback source.
+
+    Returns:
+        List of Nasdaq 100 ticker symbols, or empty list on failure.
+    """
+    try:
+        resp = requests.get(
+            _WIKIPEDIA_NASDAQ100_URL,
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
+        )
+        resp.raise_for_status()
+        tables = pd.read_html(StringIO(resp.text))
+        # Find the table that has a "Ticker" or "Symbol" column
+        for table in tables:
+            for col in table.columns:
+                col_lower = str(col).lower().strip()
+                if col_lower in ("ticker", "symbol"):
+                    raw = table[col].dropna().tolist()
+                    tickers = []
+                    for t in raw:
+                        t = str(t).strip().upper()
+                        if 1 <= len(t) <= 5 and t.isalpha():
+                            tickers.append(t)
+                    if len(tickers) >= 90:  # Nasdaq 100 should have ~101
+                        print(f"Fetched {len(tickers)} Nasdaq 100 tickers from Wikipedia")
+                        return tickers
+    except Exception as e:
+        print(f"Wikipedia Nasdaq 100 fallback failed: {e}")
+    return []
 
 
 def _parse_ishares_csv(response_text: str, index_name: str) -> List[str]:
@@ -210,7 +258,18 @@ class IndexTickerFetcher:
             )
 
             if response.status_code == 200:
-                return _parse_ishares_csv(response.text, display_name)
+                tickers = _parse_ishares_csv(response.text, display_name)
+                # Sanity-check: if iShares returns far more tickers than the index
+                # has members, the product URL may have drifted to a broader fund.
+                max_expected = _MAX_TICKERS_PER_INDEX.get(index_key)
+                if max_expected and len(tickers) > max_expected:
+                    print(
+                        f"[WARN] {display_name}: iShares returned {len(tickers)} tickers "
+                        f"(expected ≤{max_expected}). The product URL may point to a broader "
+                        f"fund. Attempting alternative source."
+                    )
+                    return self._fetch_index_tickers_fallback(index_key, display_name) or tickers[:max_expected]
+                return tickers
             else:
                 print(
                     f"Error: iShares returned status {response.status_code} for {display_name}. Using fallback tickers."
@@ -220,6 +279,16 @@ class IndexTickerFetcher:
         except Exception as e:
             print(f"Error fetching {display_name} from iShares: {e}. Using fallback tickers.")
             return list(_FALLBACK_TICKERS)
+
+    def _fetch_index_tickers_fallback(self, index_key: str, display_name: str) -> List[str]:
+        """Attempt an alternative data source when the iShares URL misbehaves.
+
+        Currently only implemented for the Nasdaq 100 (Wikipedia).
+        Returns an empty list when no fallback is available.
+        """
+        if index_key == "nasdaq100":
+            return _fetch_nasdaq100_from_wikipedia()
+        return []
 
     def fetch_sp500_tickers(self) -> List[str]:
         """Fetch S&P 500 tickers from iShares."""

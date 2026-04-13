@@ -74,11 +74,16 @@ def evaluate_canslim(
         Dict containing CANSLIM scores and metrics, or None if evaluation fails
     """
     # Load defaults from configuration
-    period = period or settings.CANSLIM_DATA_PERIOD
-    c_growth_target = c_growth_target or settings.C_GROWTH_TARGET
-    a_growth_target = a_growth_target or settings.A_GROWTH_TARGET
-    n_revenue_weight = n_revenue_weight or settings.N_REVENUE_GROWTH_WEIGHT
-    n_proximity_weight = n_proximity_weight or settings.N_PROXIMITY_TO_HIGH_WEIGHT
+    if period is None:
+        period = settings.CANSLIM_DATA_PERIOD
+    if c_growth_target is None:
+        c_growth_target = settings.C_GROWTH_TARGET
+    if a_growth_target is None:
+        a_growth_target = settings.A_GROWTH_TARGET
+    if n_revenue_weight is None:
+        n_revenue_weight = settings.N_REVENUE_GROWTH_WEIGHT
+    if n_proximity_weight is None:
+        n_proximity_weight = settings.N_PROXIMITY_TO_HIGH_WEIGHT
 
     # 1. Fetch Fundamental Data with Error Handling
     income_statement_error = None

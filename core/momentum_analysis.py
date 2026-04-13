@@ -55,11 +55,16 @@ def calculate_weighted_performance(
         Weighted performance decimal (e.g. 0.25 = 25% weighted gain), or None if
         insufficient data.
     """
-    days_per_q = days_per_q or settings.TRADING_DAYS_PER_QUARTER
-    q1_weight = q1_weight or settings.RS_Q1_WEIGHT
-    q2_weight = q2_weight or settings.RS_Q2_WEIGHT
-    q3_weight = q3_weight or settings.RS_Q3_WEIGHT
-    q4_weight = q4_weight or settings.RS_Q4_WEIGHT
+    if days_per_q is None:
+        days_per_q = settings.TRADING_DAYS_PER_QUARTER
+    if q1_weight is None:
+        q1_weight = settings.RS_Q1_WEIGHT
+    if q2_weight is None:
+        q2_weight = settings.RS_Q2_WEIGHT
+    if q3_weight is None:
+        q3_weight = settings.RS_Q3_WEIGHT
+    if q4_weight is None:
+        q4_weight = settings.RS_Q4_WEIGHT
 
     try:
         if len(data_series) < 4 * days_per_q:
