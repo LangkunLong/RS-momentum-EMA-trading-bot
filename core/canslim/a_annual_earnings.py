@@ -172,7 +172,8 @@ def evaluate_a(
     """
     import numpy as np
 
-    a_growth_target = a_growth_target or settings.A_GROWTH_TARGET
+    if a_growth_target is None:
+        a_growth_target = settings.A_GROWTH_TARGET
     annual_growth = None
     roe = None
 

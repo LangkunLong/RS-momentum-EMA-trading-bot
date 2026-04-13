@@ -114,10 +114,14 @@ def calculate_rs_scores_for_tickers(
         cache_file = os.path.join(cache_dir, cache_filename)
         os.makedirs(cache_dir, exist_ok=True)
 
-    chunk_size = chunk_size or settings.CHUNK_SIZE
-    period = period or settings.RS_CALCULATION_PERIOD
-    percentile_multiplier = percentile_multiplier or settings.RS_PERCENTILE_MULTIPLIER
-    percentile_min = percentile_min or settings.RS_PERCENTILE_MIN
+    if chunk_size is None:
+        chunk_size = settings.CHUNK_SIZE
+    if period is None:
+        period = settings.RS_CALCULATION_PERIOD
+    if percentile_multiplier is None:
+        percentile_multiplier = settings.RS_PERCENTILE_MULTIPLIER
+    if percentile_min is None:
+        percentile_min = settings.RS_PERCENTILE_MIN
 
     # Check cache
     if os.path.exists(cache_file):

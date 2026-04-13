@@ -188,13 +188,20 @@ def evaluate_m(
 
     """
     # Load defaults from configuration
-    period = period or settings.MARKET_TREND_PERIOD
-    price_above_200_weight = price_above_200_weight or settings.M_PRICE_ABOVE_200EMA_WEIGHT
-    ema_alignment_weight = ema_alignment_weight or settings.M_EMA_ALIGNMENT_WEIGHT
-    rising_50ema_weight = rising_50ema_weight or settings.M_50EMA_RISING_WEIGHT
-    price_above_21_weight = price_above_21_weight or settings.M_PRICE_ABOVE_21EMA_WEIGHT
-    bullish_threshold = bullish_threshold or settings.M_BULLISH_THRESHOLD
-    rising_lookback = rising_lookback or settings.M_50EMA_RISING_LOOKBACK
+    if period is None:
+        period = settings.MARKET_TREND_PERIOD
+    if price_above_200_weight is None:
+        price_above_200_weight = settings.M_PRICE_ABOVE_200EMA_WEIGHT
+    if ema_alignment_weight is None:
+        ema_alignment_weight = settings.M_EMA_ALIGNMENT_WEIGHT
+    if rising_50ema_weight is None:
+        rising_50ema_weight = settings.M_50EMA_RISING_WEIGHT
+    if price_above_21_weight is None:
+        price_above_21_weight = settings.M_PRICE_ABOVE_21EMA_WEIGHT
+    if bullish_threshold is None:
+        bullish_threshold = settings.M_BULLISH_THRESHOLD
+    if rising_lookback is None:
+        rising_lookback = settings.M_50EMA_RISING_LOOKBACK
 
     if price_data is not None:
         data = price_data

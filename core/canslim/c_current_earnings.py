@@ -142,7 +142,8 @@ def evaluate_c(
     """
     import numpy as np
 
-    c_growth_target = c_growth_target or settings.C_GROWTH_TARGET
+    if c_growth_target is None:
+        c_growth_target = settings.C_GROWTH_TARGET
     current_growth = None
 
     if quarterly_income.empty:

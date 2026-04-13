@@ -90,8 +90,10 @@ def evaluate_n(
     """
     import numpy as np
 
-    n_revenue_weight = n_revenue_weight or settings.N_REVENUE_GROWTH_WEIGHT
-    n_proximity_weight = n_proximity_weight or settings.N_PROXIMITY_TO_HIGH_WEIGHT
+    if n_revenue_weight is None:
+        n_revenue_weight = settings.N_REVENUE_GROWTH_WEIGHT
+    if n_proximity_weight is None:
+        n_proximity_weight = settings.N_PROXIMITY_TO_HIGH_WEIGHT
     revenue_growth = None
 
     # Calculate revenue growth (YoY quarterly)
