@@ -67,6 +67,9 @@ def _find_ticker_column(df: pd.DataFrame) -> Optional[str]:
 def _fetch_nasdaq100_from_wikipedia() -> List[str]:
     """Fetch Nasdaq 100 constituents from Wikipedia as a fallback source.
 
+    Uses BeautifulSoup to parse the HTML table directly, avoiding the lxml
+    dependency that pd.read_html() would require.
+
     Returns:
         List of Nasdaq 100 ticker symbols, or empty list on failure.
     """
@@ -77,21 +80,36 @@ def _fetch_nasdaq100_from_wikipedia() -> List[str]:
             headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
         )
         resp.raise_for_status()
-        tables = pd.read_html(StringIO(resp.text))
-        # Find the table that has a "Ticker" or "Symbol" column
-        for table in tables:
-            for col in table.columns:
-                col_lower = str(col).lower().strip()
-                if col_lower in ("ticker", "symbol"):
-                    raw = table[col].dropna().tolist()
-                    tickers = []
-                    for t in raw:
-                        t = str(t).strip().upper()
-                        if 1 <= len(t) <= 5 and t.isalpha():
-                            tickers.append(t)
-                    if len(tickers) >= 90:  # Nasdaq 100 should have ~101
-                        print(f"Fetched {len(tickers)} Nasdaq 100 tickers from Wikipedia")
-                        return tickers
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        tickers: List[str] = []
+        for table in soup.find_all("table", {"class": "wikitable"}):
+            # Find the header row to locate the ticker column
+            header_row = table.find("tr")
+            if not header_row:
+                continue
+            headers = [th.get_text(strip=True).lower() for th in header_row.find_all(["th", "td"])]
+            ticker_col_idx = None
+            for idx, h in enumerate(headers):
+                if h in ("ticker", "symbol"):
+                    ticker_col_idx = idx
+                    break
+            if ticker_col_idx is None:
+                continue
+
+            # Extract tickers from data rows
+            for row in table.find_all("tr")[1:]:
+                cells = row.find_all(["td", "th"])
+                if len(cells) <= ticker_col_idx:
+                    continue
+                t = cells[ticker_col_idx].get_text(strip=True).upper()
+                if 1 <= len(t) <= 5 and t.isalpha():
+                    tickers.append(t)
+
+            if len(tickers) >= 90:  # Nasdaq 100 should have ~101
+                print(f"Fetched {len(tickers)} Nasdaq 100 tickers from Wikipedia")
+                return tickers
+
     except Exception as e:
         print(f"Wikipedia Nasdaq 100 fallback failed: {e}")
     return []
