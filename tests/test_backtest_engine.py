@@ -449,3 +449,142 @@ def test_stop_loss_fires_during_eight_week_hold() -> None:
 
     assert "VST" not in sim._open_positions
     assert sim._trades[-1].exit_reason == "stop_loss"
+
+
+def _make_full_sim(
+    positions: dict,
+    capital: float = 100_000.0,
+) -> tuple:
+    """Build a simulator with pre-loaded open positions and matching OHLCV data.
+    positions: {symbol: (entry_price, rs_score, current_close)}
+    """
+    sim = PortfolioSimulator(initial_capital=capital, stagnation_days=999)
+    ohlcv_map: dict = {}
+    for sym, (entry_px, rs, close_px) in positions.items():
+        trade = Trade(
+            symbol=sym,
+            entry_date="2026-01-01",
+            entry_price=entry_px,
+            qty=10.0,
+            stop_price=entry_px * 0.92,
+        )
+        trade.rs_score = rs
+        sim._open_positions[sym] = trade
+        ohlcv_map[sym] = _make_ohlcv(n=10, close_value=close_px)
+    return sim, ohlcv_map
+
+
+def test_eviction_pass1_evicts_underwater_lower_rs_position() -> None:
+    """Pass 1: evicts the underwater position with the lowest RS."""
+    positions = {
+        "AAPL": (100.0, 85.0, 105.0),  # profitable, rs=85
+        "MSFT": (100.0, 70.0, 95.0),   # underwater, rs=70 ← should be evicted
+        "NVDA": (100.0, 88.0, 110.0),  # profitable, rs=88
+        "CRWD": (100.0, 72.0, 98.0),   # underwater, rs=72 (higher than MSFT)
+        "MU":   (100.0, 90.0, 115.0),  # profitable, rs=90
+    }
+    sim, ohlcv_map = _make_full_sim(positions)
+    assert len(sim._open_positions) == 5
+
+    new_signal = {
+        "symbol": "GEV",
+        "rs_score": 80.0,
+        "canslim_score": 75.0,
+        "signal_reason": "Volume Breakout",
+        "buy_signal": True,
+    }
+    ohlcv_map["GEV"] = _make_ohlcv(n=10, close_value=50.0)
+    entry_date = ohlcv_map["GEV"].index[-1]
+
+    sim._enter_position(new_signal, ohlcv_map, entry_date)
+
+    assert "MSFT" not in sim._open_positions
+    assert "GEV" in sim._open_positions
+    evicted = next(t for t in sim._trades if t.symbol == "MSFT")
+    assert evicted.exit_reason == "evicted"
+
+
+def test_eviction_pass2_evicts_lowest_rs_when_no_underwater_positions() -> None:
+    """Pass 2: when no underwater positions qualify, evicts the lowest RS (profitable)."""
+    positions = {
+        "AAPL": (100.0, 85.0, 110.0),  # profitable, rs=85
+        "MSFT": (100.0, 70.0, 112.0),  # profitable, rs=70 ← lowest, evicted
+        "NVDA": (100.0, 88.0, 115.0),  # profitable, rs=88
+        "CRWD": (100.0, 78.0, 105.0),  # profitable, rs=78
+        "MU":   (100.0, 90.0, 120.0),  # profitable, rs=90
+    }
+    sim, ohlcv_map = _make_full_sim(positions)
+
+    new_signal = {
+        "symbol": "VRT",
+        "rs_score": 80.0,
+        "canslim_score": 75.0,
+        "signal_reason": "Volume Breakout",
+        "buy_signal": True,
+    }
+    ohlcv_map["VRT"] = _make_ohlcv(n=10, close_value=60.0)
+    entry_date = ohlcv_map["VRT"].index[-1]
+
+    sim._enter_position(new_signal, ohlcv_map, entry_date)
+
+    assert "MSFT" not in sim._open_positions
+    assert "VRT" in sim._open_positions
+    evicted = next(t for t in sim._trades if t.symbol == "MSFT")
+    assert evicted.exit_reason == "evicted"
+
+
+def test_eviction_skipped_when_new_signal_rs_lower_than_all_positions() -> None:
+    """No eviction if new signal's RS is not higher than any open position."""
+    positions = {
+        "AAPL": (100.0, 85.0, 110.0),
+        "MSFT": (100.0, 88.0, 112.0),
+        "NVDA": (100.0, 90.0, 115.0),
+        "CRWD": (100.0, 82.0, 105.0),
+        "MU":   (100.0, 91.0, 120.0),
+    }
+    sim, ohlcv_map = _make_full_sim(positions)
+    original = set(sim._open_positions.keys())
+
+    new_signal = {
+        "symbol": "GEV",
+        "rs_score": 79.0,
+        "canslim_score": 75.0,
+        "signal_reason": "Volume Breakout",
+        "buy_signal": True,
+    }
+    ohlcv_map["GEV"] = _make_ohlcv(n=10, close_value=40.0)
+    entry_date = ohlcv_map["GEV"].index[-1]
+
+    sim._enter_position(new_signal, ohlcv_map, entry_date)
+
+    assert set(sim._open_positions.keys()) == original
+    assert "GEV" not in sim._open_positions
+
+
+def test_eviction_disabled_when_flag_is_false() -> None:
+    """enable_eviction=False prevents all eviction logic."""
+    positions = {
+        "AAPL": (100.0, 60.0, 95.0),
+        "MSFT": (100.0, 65.0, 96.0),
+        "NVDA": (100.0, 68.0, 97.0),
+        "CRWD": (100.0, 62.0, 94.0),
+        "MU":   (100.0, 55.0, 93.0),
+    }
+    sim, ohlcv_map = _make_full_sim(positions)
+    sim.enable_eviction = False
+    original = set(sim._open_positions.keys())
+
+    new_signal = {
+        "symbol": "VST",
+        "rs_score": 95.0,
+        "canslim_score": 80.0,
+        "signal_reason": "Volume Breakout",
+        "buy_signal": True,
+    }
+    ohlcv_map["VST"] = _make_ohlcv(n=10, close_value=70.0)
+    entry_date = ohlcv_map["VST"].index[-1]
+
+    sim._enter_position(new_signal, ohlcv_map, entry_date)
+
+    assert set(sim._open_positions.keys()) == original
+    assert "VST" not in sim._open_positions

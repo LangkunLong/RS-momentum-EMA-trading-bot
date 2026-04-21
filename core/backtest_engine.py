@@ -578,6 +578,7 @@ class PortfolioSimulator:
         data_fetcher: Optional[DataFetcher] = None,
         strategy: Optional[CanslimStrategy] = None,
         benchmark_symbol: str = BENCHMARK,
+        enable_eviction: bool = settings.ENABLE_EVICTION,
     ) -> None:
         self.initial_capital = initial_capital
         self.max_positions = max_positions
@@ -605,6 +606,7 @@ class PortfolioSimulator:
             technical_only=technical_only,
         )
         self.benchmark_symbol = benchmark_symbol
+        self.enable_eviction = enable_eviction
 
         self._equity: float = initial_capital
         self._open_positions: Dict[str, Trade] = {}
@@ -771,6 +773,53 @@ class PortfolioSimulator:
         open_slots = max(self.max_positions - len(self._open_positions), 0)
         return signals[:open_slots]
 
+    def _try_evict(
+        self,
+        new_signal: dict,
+        ticker_ohlcv: Dict[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+    ) -> bool:
+        """Two-pass eviction: free a slot for a higher-RS new signal.
+
+        Pass 1: evict an underwater position (close < entry) with lower RS.
+        Pass 2: evict any position with lower RS if pass 1 finds nothing.
+        Returns True if a position was evicted.
+        """
+        if not self.enable_eviction:
+            return False
+
+        new_rs = new_signal.get("rs_score", 0.0)
+
+        def _current_close(symbol: str) -> Optional[float]:
+            ohlcv = ticker_ohlcv.get(symbol)
+            if ohlcv is None:
+                return None
+            bar = ohlcv.loc[eval_date:eval_date]
+            if bar.empty:
+                prev = ohlcv.loc[:eval_date]
+                return float(prev["Close"].iloc[-1]) if not prev.empty else None
+            return float(bar["Close"].iloc[0])
+
+        losers: list = []
+        fallback: list = []
+        for sym, trade in self._open_positions.items():
+            if trade.rs_score >= new_rs:
+                continue
+            cc = _current_close(sym)
+            if cc is None:
+                continue  # data gap guard
+            fallback.append((sym, trade, cc))
+            if cc < trade.entry_price:
+                losers.append((sym, trade, cc))
+
+        pool = losers if losers else fallback
+        if not pool:
+            return False
+
+        evict_sym, _, evict_close = min(pool, key=lambda x: x[1].rs_score)
+        self._close_trade(evict_sym, evict_close, "evicted", str(eval_date.date()))
+        return True
+
     def _enter_position(
         self,
         signal: dict,
@@ -778,8 +827,11 @@ class PortfolioSimulator:
         entry_date: pd.Timestamp,
     ) -> None:
         symbol = signal["symbol"]
-        if symbol in self._open_positions or len(self._open_positions) >= self.max_positions:
+        if symbol in self._open_positions:
             return
+        if len(self._open_positions) >= self.max_positions:
+            if not self._try_evict(signal, ticker_ohlcv, entry_date):
+                return
 
         ohlcv = ticker_ohlcv.get(symbol)
         if ohlcv is None:
