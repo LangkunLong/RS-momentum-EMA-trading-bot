@@ -860,17 +860,20 @@ class PortfolioSimulator:
             self._close_trade(symbol, trade.stop_price, "stop_loss", date_str)
             return
 
-        target_price = trade.entry_price * (1 + self.take_profit_pct)
-        if (
-            trade.scale_out_price is None
-            and trade.remaining_qty
-            and trade.remaining_qty > 0
-            and high >= target_price
-        ):
-            self._scale_out_trade(symbol, target_price, date_str, "take_profit_scale_out")
-            trade = self._open_positions.get(symbol)
-            if trade is None:
-                return
+        if not trade.eight_week_hold and (trade.remaining_qty or 0.0) > 0:
+            tiers = settings.SCALE_OUT_TIERS
+            while trade.scale_out_tier < len(tiers):
+                gain_target, fraction = tiers[trade.scale_out_tier]
+                tier_price = trade.entry_price * (1 + gain_target)
+                if high < tier_price:
+                    break
+                sell_qty = trade.qty * fraction
+                if sell_qty > 0 and (trade.remaining_qty or 0.0) >= sell_qty:
+                    self._scale_out_trade(symbol, tier_price, date_str, "take_profit_scale_out", sell_qty=sell_qty)
+                trade.scale_out_tier += 1
+                trade = self._open_positions.get(symbol)
+                if trade is None:
+                    return
 
         if (
             trade.days_held >= self.stagnation_days
