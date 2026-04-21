@@ -16,18 +16,44 @@ load_dotenv()
 # ==============================================================================
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_STOCK_FEED = os.environ.get("ALPACA_STOCK_FEED", "iex").strip().lower()
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+# ALPACA_PAPER is read directly from os.environ in order_execution.py
+# (default: "true" — paper trading). Set to "false" in .env for live trading.
+
+# Email notifications (Gmail SMTP with App Password)
+# NOTIFY_EMAIL_FROM: your Gmail address (sender)
+# NOTIFY_EMAIL_TO: recipient address (can be the same Gmail)
+# NOTIFY_EMAIL_PASSWORD: Gmail App Password (not your login password).
+#   Generate at: https://myaccount.google.com/apppasswords
+NOTIFY_EMAIL_FROM = os.environ.get("NOTIFY_EMAIL_FROM", "")
+NOTIFY_EMAIL_TO = os.environ.get("NOTIFY_EMAIL_TO", "")
+NOTIFY_EMAIL_PASSWORD = os.environ.get("NOTIFY_EMAIL_PASSWORD", "")
 
 
 # ==============================================================================
 # SCANNER SETTINGS
 # ==============================================================================
 
+ARTIFACTS_DIR = ".artifacts"
+CACHE_DIR = os.path.join(ARTIFACTS_DIR, "cache")
+PYTEST_ARTIFACTS_DIR = os.path.join(ARTIFACTS_DIR, "pytest")
+SCAN_RESULTS_DIR = os.path.join(ARTIFACTS_DIR, "scan_results")
+BACKTEST_RESULTS_DIR = os.path.join(ARTIFACTS_DIR, "backtests")
+BACKTEST_CACHE_DIR = os.path.join(CACHE_DIR, "backtest")
+BACKTEST_DATA_CACHE_DB_PATH = os.path.join(BACKTEST_CACHE_DIR, "historical_data.sqlite3")
+FUNDAMENTALS_CACHE_DIR = os.path.join(CACHE_DIR, "fundamentals")
+
 # Stock screening thresholds
 START_DATE = "2024-01-01"  # Analysis start date
 MIN_MARKET_CAP = 10e9  # Minimum market cap ($10 billion)
-MIN_RS_SCORE = 75  # Free-tier friendly default; raise to 80 when fundamentals are complete
-MIN_CANSLIM_SCORE = 65  # Free-tier friendly default; raise toward 70-75 with fuller data
+# O'Neil's IBD RS rating requires 80+ for institutional-quality leaders.
+# 75 was an earlier default when FMP fundamentals were incomplete; now that fundamentals
+# are available, 80 is the appropriate live-entry floor.
+# Tradeoff: raising to 85 further reduces false positives but also filters out
+# early-stage leaders that have not yet attracted broad attention.
+MIN_RS_SCORE = 80
+MIN_CANSLIM_SCORE = 70  # Minimum composite CANSLIM score for actionable entries
 # Watchlist floor is intentionally low so that high-RS stocks worth monitoring during
 # market corrections still surface even when M (market direction) is dragging composite
 # scores down.  With a bearish M score (~0.15) and no FMP fundamentals, an RS-90 stock
@@ -35,9 +61,15 @@ MIN_CANSLIM_SCORE = 65  # Free-tier friendly default; raise toward 70-75 with fu
 # the list with genuinely weak names.
 WATCHLIST_MIN_CANSLIM_SCORE = 30  # Lowered from 45 — bear-market watchlist must still populate
 REQUIRE_BULLISH_MARKET_FOR_BUYS = True  # O'Neil-style market gate for actionable entries
+REQUIRE_FUNDAMENTALS_FOR_BUYS = True  # Do not upgrade missing-C/A names into actionable buys
+STRICT_BREAKOUT_FOR_BUYS = True  # Actionable buys must be real breakout setups, not generic high scorers
 MAX_TERMINAL_RESULTS = 12  # Limit terminal detail; full output is exported to CSV
 AUTO_EXPORT_RESULTS = True  # Save scanner output to CSV by default
-RESULTS_DIR = "scan_results"  # Directory for exported scanner CSV files
+RESULTS_DIR = SCAN_RESULTS_DIR  # Directory for exported scanner CSV files
+EXECUTION_STORE_DB_PATH = os.environ.get(
+    "EXECUTION_STORE_DB_PATH",
+    os.path.join(os.environ.get("TEMP", "."), "trading_bot", "execution_store.sqlite3"),
+)  # Durable SQLite execution store
 
 # Performance settings
 MAX_WORKERS = 3  # Maximum threads for parallel processing
@@ -50,9 +82,55 @@ SECTORS = "large_cap"  # Default to liquid large-cap stocks
 # 'large_cap' (S&P 500 + Nasdaq 100),
 # 'small_cap' (Russell 2000), 'all'
 CUSTOM_LIST = None  # Custom stock symbols (overrides sectors if set)
+EXTRA_SYMBOLS: list[str] = [
+    # Manually tracked — evaluated alongside the index scan regardless of index membership.
+    # Add stocks here when the ground-truth model surfaces them outside our standard universe.
+    "YSS",   # micro-cap, not in any standard index
+    "WATT",  # micro-cap, not in any standard index
+    "BKSY",  # Russell 2000 (excluded from large_cap scan) — +436% 12m, at 52w high 2025-04-15
+    "PL",    # Russell 2000 (excluded from large_cap scan) — +1116% 12m, at 52w high 2025-04-15
+    "UMAC",  # micro-cap drone play, below all standard indices — ground truth 2025-04-15
+    "RNG",   # dropped from Nasdaq 100 — 96% proximity to 52w high, ground truth 2025-04-15
+]
 
 # Debugging
 DEBUG = False  # Enable verbose output
+MAX_NEW_ENTRIES_PER_CYCLE = 2  # Focus live/paper execution on only the best fresh setups each scan
+
+
+# ==============================================================================
+# ORDER EXECUTION SETTINGS (O'Neil rules)
+# ==============================================================================
+
+# Risk management
+STOP_LOSS_PCT = 0.08  # 8% hard stop below buy price (O'Neil: never exceed 7-8%)
+POSITION_RISK_PCT = 0.01  # Risk 1% of portfolio equity per trade (risk-based sizing)
+POSITION_SIZE_PCT = 0.125  # Derived: 1% risk / 8% stop = 12.5% position weight
+MAX_OPEN_POSITIONS = 5  # Maximum simultaneous positions (concentration guard)
+
+# Entry behaviour
+# When True: only submit entries during confirmed market-hours (09:30–16:00 ET).
+# When False: orders queue for next open (useful for after-hours scanner runs).
+ENTRY_MARKET_HOURS_ONLY = True
+
+# Buy-zone enforcement (O'Neil: only enter within 5% above the pivot/buy point)
+# Stocks that have already run more than BUY_ZONE_EXTENSION_PCT beyond their pivot
+# are "too extended" and should not be chased.  O'Neil's rule is strict: entries
+# beyond the buy zone have materially worse risk/reward because the stop is now
+# far below the natural support level of the base.
+BUY_ZONE_EXTENSION_PCT = 0.05  # 5% max extension above the pivot before entry is rejected
+BUY_ZONE_UNDERCUT_TOLERANCE_PCT = 0.0  # Require entries at/above the pivot by default
+
+# Staged scale-out tiers — (gain_target_pct, fraction_of_original_qty_to_sell)
+# Remaining 25% after tier 3 is held on EMA trailing stop.
+SCALE_OUT_TIERS: list[tuple[float, float]] = [
+    (0.10, 0.25),
+    (0.15, 0.25),
+    (0.20, 0.25),
+]
+
+# Two-pass eviction: when portfolio is full, compare new signal RS vs open positions.
+ENABLE_EVICTION: bool = True
 
 
 # ==============================================================================
@@ -66,9 +144,9 @@ MARKET_TREND_PERIOD = "14mo"  # Period for market direction analysis
 PRICE_HISTORY_BUFFER_DAYS = 120  # Extra days to download for indicators
 
 # Caching
-RS_CACHE_DIR = "rs_score_cache"  # Directory for RS score cache
+RS_CACHE_DIR = os.path.join(CACHE_DIR, "rs_score_cache")  # Directory for RS score cache
 RS_CACHE_FILE = "rs_scores_cache.csv"  # Cache filename
-TICKER_CACHE_DIR = "ticker_cache"  # Directory for index ticker cache
+TICKER_CACHE_DIR = os.path.join(CACHE_DIR, "ticker_cache")  # Directory for index ticker cache
 TICKER_CACHE_EXPIRY_HOURS = 24  # How often to refresh ticker lists
 
 
@@ -220,8 +298,16 @@ TRADING_DAYS_PER_QUARTER = 65  # Approximate trading days in a quarter
 # FMP (Financial Modeling Prep) configuration
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 
+# FMP fetch limits — sized for a paid plan with fuller data history.
+# Callers can override by passing an explicit limit= argument.
+FMP_QUARTERLY_LIMIT = 12           # 3 years of quarterly income statements
+FMP_ANNUAL_LIMIT = 10              # 10 years of annual income statements
+FMP_BALANCE_SHEET_LIMIT = 10       # 10 years of balance sheets
+FMP_INSTITUTIONAL_HISTORY_LIMIT = 8  # quarterly institutional ownership snapshots (live scan)
+
 # HTTP Retry settings
 HTTP_RETRY_TOTAL = 5  # Maximum retry attempts
 HTTP_RETRY_BACKOFF = 2  # Exponential backoff factor
 HTTP_RETRY_STATUS_CODES = [429, 500, 502, 503, 504]  # Retry on these codes
+FMP_SUPPRESS_REPEATED_ENDPOINT_ERRORS = True  # Log plan/404 endpoint failures once per session, then skip
 HTTP_MAX_WORKERS = 5  # Parallel API requests
