@@ -856,6 +856,17 @@ class PortfolioSimulator:
         trade.days_held += 1
         trade.peak_close = max(trade.peak_close or trade.entry_price, close)
 
+        gain_pct = (close - trade.entry_price) / trade.entry_price if trade.entry_price > 0 else 0.0
+
+        # Release 8-week hold after 40 trading days
+        if trade.eight_week_hold and trade.days_held >= 40:
+            trade.eight_week_hold = False
+            trade.scale_out_tier = 0
+
+        # Detect super-winner: 20%+ gain within first 3 weeks (15 trading days)
+        if not trade.eight_week_hold and trade.days_held <= 15 and gain_pct >= 0.20:
+            trade.eight_week_hold = True
+
         if low <= trade.stop_price:
             self._close_trade(symbol, trade.stop_price, "stop_loss", date_str)
             return

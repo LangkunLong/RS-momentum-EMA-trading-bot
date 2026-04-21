@@ -48,6 +48,7 @@ def test_take_profit_scale_out_fires_all_three_tiers_on_gap_up() -> None:
     """When high clears all 3 tier thresholds in one bar, all 3 tiers fire."""
     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
     trade = Trade(symbol="NVDA", entry_date="2026-04-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+    trade.days_held = 15  # becomes 16 after increment — outside 15-day 8-week-hold window
     sim._open_positions["NVDA"] = trade
 
     # high=121 clears tier1(110), tier2(115), tier3(120)
@@ -88,6 +89,7 @@ def test_scale_out_remaining_qty_is_25_pct_of_original_after_tier3() -> None:
     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
     qty = 20.0
     trade = Trade(symbol="MSFT", entry_date="2026-04-01", entry_price=50.0, qty=qty, stop_price=46.0)
+    trade.days_held = 15  # becomes 16 after increment — outside 15-day 8-week-hold window
     sim._open_positions["MSFT"] = trade
 
     ohlcv = _make_ohlcv(n=3, close_value=62.0, high_value=62.0, low_value=51.0)
@@ -379,3 +381,71 @@ def test_resolve_universe_supports_nasdaq100_and_russell2000() -> None:
 
     assert nasdaq == ["NASDAQ100"]
     assert russell == ["RUSSELL2000"]
+
+
+def test_eight_week_hold_triggered_by_20pct_gain_in_3_weeks() -> None:
+    """20%+ gain within 15 trading days sets eight_week_hold=True and suppresses tier exits."""
+    sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+    trade = Trade(symbol="CRWD", entry_date="2026-01-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+    trade.days_held = 13  # will become 14 after increment in _check_exits
+    sim._open_positions["CRWD"] = trade
+
+    # close=122 → 22% gain, within 15-day window → should trigger hold
+    ohlcv = _make_ohlcv(n=20, close_value=122.0, high_value=122.0, low_value=109.0)
+    sim._check_exits("CRWD", ohlcv, ohlcv.index[-1])
+
+    result = sim._open_positions["CRWD"]
+    assert result.eight_week_hold is True
+    assert result.scale_out_tier == 0  # no tiers fired
+    assert result.remaining_qty == pytest.approx(10.0)  # nothing sold
+
+
+def test_eight_week_hold_not_triggered_after_3_week_window() -> None:
+    """20%+ gain after 15 trading days does NOT trigger the 8-week hold."""
+    sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+    trade = Trade(symbol="NVDA", entry_date="2026-01-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+    trade.days_held = 15  # will become 16 after increment — outside window
+    sim._open_positions["NVDA"] = trade
+
+    # close=122 → 22% gain, but day 16 is outside the 15-day window
+    ohlcv = _make_ohlcv(n=20, close_value=122.0, high_value=122.0, low_value=109.0)
+    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1])
+
+    result = sim._open_positions["NVDA"]
+    assert result.eight_week_hold is False
+    assert result.scale_out_tier == 3  # all 3 tiers fired normally
+
+
+def test_eight_week_hold_releases_after_40_bars_and_tiers_resume() -> None:
+    """Hold expires on bar 40; scale_out_tier resets so tiers can fire."""
+    sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+    trade = Trade(symbol="MU", entry_date="2026-01-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+    trade.days_held = 39  # will become 40 after increment — release fires
+    trade.eight_week_hold = True
+    trade.scale_out_tier = 0
+    sim._open_positions["MU"] = trade
+
+    # price at 25% gain — all 3 tiers would fire once hold releases
+    ohlcv = _make_ohlcv(n=45, close_value=125.0, high_value=125.0, low_value=109.0)
+    sim._check_exits("MU", ohlcv, ohlcv.index[-1])
+
+    result = sim._open_positions["MU"]
+    assert result.eight_week_hold is False
+    assert result.scale_out_tier == 3  # all 3 tiers fired after release
+    assert result.remaining_qty == pytest.approx(2.5)
+
+
+def test_stop_loss_fires_during_eight_week_hold() -> None:
+    """Hard stop-loss is NEVER suppressed by the 8-week hold."""
+    sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+    trade = Trade(symbol="VST", entry_date="2026-01-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+    trade.days_held = 5
+    trade.eight_week_hold = True
+    sim._open_positions["VST"] = trade
+
+    # low drops below stop
+    ohlcv = _make_ohlcv(n=10, close_value=90.0, high_value=91.0, low_value=89.0)
+    sim._check_exits("VST", ohlcv, ohlcv.index[-1])
+
+    assert "VST" not in sim._open_positions
+    assert sim._trades[-1].exit_reason == "stop_loss"
