@@ -1,6 +1,7 @@
 """Tests for industry group RS ranking logic."""
 from __future__ import annotations
 
+import pytest
 
 from core.industry_group import get_top_groups
 
@@ -98,3 +99,14 @@ def test_ticker_not_in_top_group_is_blocked() -> None:
     # JPM's group (Banks) should NOT be in top_groups → gate blocks
     ticker_group = industry.get("JPM")
     assert ticker_group not in top_groups
+
+
+@pytest.mark.integration
+def test_load_industry_map_fetches_real_data() -> None:
+    """yfinance returns industry labels for known large-cap tickers."""
+    from core.industry_group import load_industry_map
+
+    result = load_industry_map(["NVDA", "AAPL", "JPM"])
+    assert result.get("NVDA") == "Semiconductors"
+    assert "AAPL" in result
+    assert "JPM" in result
