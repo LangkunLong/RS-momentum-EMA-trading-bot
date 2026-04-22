@@ -652,6 +652,10 @@ class TestPortfolioSimulatorRun:
             }),
             patch("backtest_pnl._compute_canslim_score", return_value=75.0),
             patch("backtest_pnl.clear_session_cache"),
+            patch(
+                "core.canslim.m_market_direction.MarketRegimeTracker.allows_entries",
+                new_callable=lambda: property(lambda self: True),
+            ),
         ):
             # 8 weeks = 40 business days, covers the last 40 bars (crash included)
             result = sim.run(tickers=["NVDA"], lookback_weeks=8)

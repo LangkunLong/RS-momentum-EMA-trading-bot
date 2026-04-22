@@ -25,6 +25,7 @@ from backtest import (
     _evaluate_market_at_date,
     _evaluate_technical_at_date,
 )
+from core.canslim.m_market_direction import MarketRegimeTracker
 from core.data_client import clear_session_cache, fetch_bulk_ohlcv
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
@@ -656,12 +657,29 @@ class PortfolioSimulator:
             print("ERROR: Not enough trading days in range.")
             return SimulationResult()
 
+        regime_tracker = MarketRegimeTracker()
+        regime_tracker.bootstrap(benchmark_df, start_ts)
+        self._regime_tracker = regime_tracker
+
         equity_series: Dict[str, float] = {}
         benchmark_series: Dict[str, float] = {}
         benchmark_start_price: Optional[float] = None
         pending_entries: List[dict] = []
 
         for day_idx, eval_date in enumerate(trading_days):
+            if day_idx > 0:
+                hist = benchmark_df.loc[:eval_date]
+                if len(hist) >= 2:
+                    prev_bar = hist.iloc[-2]
+                    curr_bar = hist.iloc[-1]
+                    regime_tracker.update(
+                        date=eval_date,
+                        close=float(curr_bar["Close"]),
+                        prev_close=float(prev_bar["Close"]),
+                        volume=float(curr_bar["Volume"]),
+                        prev_volume=float(prev_bar["Volume"]),
+                    )
+
             date_str = str(eval_date.date())
 
             for symbol in list(self._open_positions.keys()):
@@ -746,6 +764,9 @@ class PortfolioSimulator:
         eval_date: pd.Timestamp,
         market_state: dict,
     ) -> List[dict]:
+        if not self._regime_tracker.allows_entries:
+            return []
+
         if self.require_bullish_market and not market_state["market_is_bullish"]:
             return []
 
