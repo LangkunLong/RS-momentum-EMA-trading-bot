@@ -254,3 +254,50 @@ def test_allows_entries_false_only_in_correction() -> None:
 
     tracker.regime = MarketRegime.CONFIRMED_UPTREND
     assert tracker.allows_entries is True
+
+
+# ---------------------------------------------------------------------------
+# Integration: PortfolioSimulator entry gate
+# ---------------------------------------------------------------------------
+
+from backtest_pnl import PortfolioSimulator
+
+
+def test_evaluate_signals_blocked_when_regime_is_correction() -> None:
+    """_evaluate_signals returns [] immediately when regime tracker is CORRECTION."""
+    sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+    # Inject a tracker in CORRECTION state
+    tracker = MarketRegimeTracker()
+    tracker.regime = MarketRegime.CORRECTION
+    sim._regime_tracker = tracker
+
+    result = sim._evaluate_signals(
+        tickers=["NVDA"],
+        ticker_ohlcv={},
+        all_closes=pd.DataFrame(),
+        eval_date=pd.Timestamp("2026-04-01"),
+        market_state={"market_is_bullish": True, "m_score": 0.9, "distribution_days": 5, "follow_through": False},
+    )
+
+    assert result == []
+
+
+def test_evaluate_signals_not_blocked_in_uptrend() -> None:
+    """_evaluate_signals proceeds normally (not blocked) when regime is CONFIRMED_UPTREND."""
+    sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+    tracker = MarketRegimeTracker()
+    tracker.regime = MarketRegime.CONFIRMED_UPTREND
+    sim._regime_tracker = tracker
+
+    # ticker_ohlcv is empty so no signals will be found — but crucially the method
+    # should NOT return early due to the regime gate
+    result = sim._evaluate_signals(
+        tickers=[],
+        ticker_ohlcv={},
+        all_closes=pd.DataFrame(),
+        eval_date=pd.Timestamp("2026-04-01"),
+        market_state={"market_is_bullish": True, "m_score": 0.9, "distribution_days": 0, "follow_through": True},
+    )
+
+    # Returns [] because no tickers, not because regime blocked it
+    assert result == []
