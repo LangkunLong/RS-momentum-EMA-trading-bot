@@ -14,6 +14,7 @@ so you need to know the market's direction."
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, Optional
 
 import numpy as np
@@ -26,6 +27,166 @@ from core.data_client import (
     fetch_ohlcv,
     normalize_price_dataframe,
 )
+
+
+class MarketRegime(Enum):
+    """Discrete O'Neil market regime states."""
+
+    CONFIRMED_UPTREND = "confirmed_uptrend"
+    UNDER_PRESSURE = "under_pressure"
+    CORRECTION = "correction"
+
+
+class MarketRegimeTracker:
+    """Stateful bar-by-bar O'Neil market regime tracker.
+
+    Call bootstrap() once before the simulation loop, then update() once per bar.
+    Consult allows_entries before evaluating new signals.
+    """
+
+    def __init__(self) -> None:
+        """Initialise in CORRECTION — bootstrap() sets the real starting regime."""
+        self.regime: MarketRegime = MarketRegime.CORRECTION
+        self._dist_day_bars: list[int] = []  # bar indices of distribution days
+        self._bar_count: int = 0             # total bars processed since bootstrap
+        self._rally_day_count: int = 0
+        self._rally_active: bool = False
+        self._correction_low: float = float("inf")
+
+    @property
+    def allows_entries(self) -> bool:
+        """True when regime permits new position entries."""
+        return self.regime != MarketRegime.CORRECTION
+
+    @property
+    def distribution_days(self) -> int:
+        """Number of distribution days currently in the rolling window."""
+        return len(self._dist_day_bars)
+
+    def bootstrap(self, spy_df: pd.DataFrame, start_date: pd.Timestamp) -> None:
+        """Set initial regime from pre-simulation SPY data.
+
+        Checks SPY's position relative to 200-day EMA and replays the last
+        25 bars to populate the distribution day window.
+
+        Args:
+            spy_df: Full SPY OHLCV DataFrame (must include data before start_date).
+            start_date: First date of the simulation window.
+        """
+        hist = spy_df.loc[:start_date]
+        if len(hist) < 2:
+            return
+
+        closes = hist["Close"].astype(float)
+        volumes = hist["Volume"].astype(float)
+
+        # Initial regime from 200-day EMA position
+        ema_200 = closes.ewm(span=200, adjust=False).mean()
+        if float(closes.iloc[-1]) > float(ema_200.iloc[-1]):
+            self.regime = MarketRegime.CONFIRMED_UPTREND
+        else:
+            self.regime = MarketRegime.CORRECTION
+
+        # Replay last M_DISTRIBUTION_LOOKBACK bars to seed distribution day list.
+        # Assign negative bar indices so they age out naturally once the live
+        # simulation runs M_DISTRIBUTION_LOOKBACK more bars.
+        lookback = min(settings.M_DISTRIBUTION_LOOKBACK + 1, len(hist))
+        recent_closes = closes.iloc[-lookback:]
+        recent_volumes = volumes.iloc[-lookback:]
+
+        for i in range(1, len(recent_closes)):
+            bar_idx = i - lookback + 1  # ranges from -(lookback-1) to 0
+            close = float(recent_closes.iloc[i])
+            prev_close = float(recent_closes.iloc[i - 1])
+            vol = float(recent_volumes.iloc[i])
+            prev_vol = float(recent_volumes.iloc[i - 1])
+            if prev_close > 0:
+                pct = (close - prev_close) / prev_close
+                if pct <= -settings.M_DISTRIBUTION_MIN_DECLINE and vol > prev_vol:
+                    self._dist_day_bars.append(bar_idx)
+
+        # Apply distribution-day thresholds to the bootstrapped regime
+        dist_count = len(self._dist_day_bars)
+        if self.regime != MarketRegime.CORRECTION:
+            if dist_count >= settings.M_MAX_DISTRIBUTION_DAYS:
+                self.regime = MarketRegime.CORRECTION
+            elif dist_count >= settings.M_REGIME_PRESSURE_DIST_DAYS:
+                self.regime = MarketRegime.UNDER_PRESSURE
+
+    def update(
+        self,
+        date: pd.Timestamp,
+        close: float,
+        prev_close: float,
+        volume: float,
+        prev_volume: float,
+    ) -> MarketRegime:
+        """Update regime for one trading bar. Call once per bar in simulation loop.
+
+        Args:
+            date: Current bar date (unused internally but accepted for signature clarity).
+            close: Current bar closing price.
+            prev_close: Previous bar closing price.
+            volume: Current bar volume.
+            prev_volume: Previous bar volume.
+
+        Returns:
+            Updated MarketRegime.
+        """
+        self._bar_count += 1
+
+        # 1. Age out distribution days outside the rolling window
+        cutoff = self._bar_count - settings.M_DISTRIBUTION_LOOKBACK
+        self._dist_day_bars = [b for b in self._dist_day_bars if b > cutoff]
+
+        # 2. Check for a new distribution day
+        if prev_close > 0:
+            pct = (close - prev_close) / prev_close
+            if pct <= -settings.M_DISTRIBUTION_MIN_DECLINE and volume > prev_volume:
+                self._dist_day_bars.append(self._bar_count)
+
+        dist_count = len(self._dist_day_bars)
+
+        # 3. Hard correction gate (5+ dist days flips to CORRECTION immediately)
+        if dist_count >= settings.M_MAX_DISTRIBUTION_DAYS:
+            self.regime = MarketRegime.CORRECTION
+
+        # 4. Uptrend zone adjustments (only when NOT already in correction)
+        elif self.regime != MarketRegime.CORRECTION:
+            if dist_count >= settings.M_REGIME_PRESSURE_DIST_DAYS:
+                self.regime = MarketRegime.UNDER_PRESSURE
+            else:
+                self.regime = MarketRegime.CONFIRMED_UPTREND
+
+        # 5. Rally attempt logic (only active while in CORRECTION)
+        if self.regime == MarketRegime.CORRECTION:
+            if not self._rally_active:
+                # Track correction low before rally begins
+                self._correction_low = min(self._correction_low, close)
+                if prev_close > 0 and close > prev_close:
+                    self._rally_active = True
+                    self._rally_day_count = 1
+            else:
+                # During rally: check for undercut on any bar
+                if close < self._correction_low:
+                    self._rally_active = False
+                    self._rally_day_count = 0
+                    self._correction_low = float("inf")
+                elif prev_close > 0 and close > prev_close:
+                    self._rally_day_count += 1
+
+                # Follow-through day check
+                if self._rally_active and self._rally_day_count >= settings.M_FOLLOW_THROUGH_MIN_DAY:
+                    if prev_close > 0:
+                        gain = (close - prev_close) / prev_close
+                        if gain >= settings.M_FOLLOW_THROUGH_MIN_PCT and volume > prev_volume:
+                            self.regime = MarketRegime.CONFIRMED_UPTREND
+                            self._dist_day_bars.clear()
+                            self._rally_active = False
+                            self._rally_day_count = 0
+                            self._correction_low = float("inf")
+
+        return self.regime
 
 
 @dataclass
