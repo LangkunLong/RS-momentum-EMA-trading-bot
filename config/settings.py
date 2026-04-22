@@ -57,6 +57,19 @@ MIN_CANSLIM_SCORE = 70  # Minimum composite CANSLIM score for actionable entries
 INDUSTRY_GROUP_TOP_N: int = 20  # number of top industry groups allowed for entries
 INDUSTRY_GROUP_MIN_SIZE: int = 3  # min stocks in a group to include it in ranking
 INDUSTRY_GROUP_CACHE_PATH: str = ".artifacts/cache/industry_group_cache.json"
+
+# ==============================================================================
+# PIVOT DETECTION PARAMETERS (O'Neil cup-with-handle & flat base patterns)
+# ==============================================================================
+
+PIVOT_BUY_ZONE_PCT: float = 0.05           # max % above pivot to enter (O'Neil's 5% rule)
+PIVOT_CUP_MIN_WEEKS: int = 7               # min cup duration in weeks (35 trading days)
+PIVOT_CUP_MIN_DECLINE_PCT: float = 0.15   # min cup depth (shallower = flat base)
+PIVOT_CUP_MAX_DECLINE_PCT: float = 0.33   # max cup depth (deeper = failed base)
+PIVOT_FLAT_BASE_MIN_WEEKS: int = 5         # min flat base duration (25 trading days)
+PIVOT_FLAT_BASE_MAX_DECLINE_PCT: float = 0.15  # max decline for a valid flat base
+PIVOT_HANDLE_MAX_DECLINE_PCT: float = 0.12     # max handle pullback (12%)
+
 # Watchlist floor is intentionally low so that high-RS stocks worth monitoring during
 # market corrections still surface even when M (market direction) is dragging composite
 # scores down.  With a bearish M score (~0.15) and no FMP fundamentals, an RS-90 stock
