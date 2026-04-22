@@ -265,6 +265,9 @@ M_MAX_DISTRIBUTION_DAYS = 5  # 5+ distribution days = market top
 M_FOLLOW_THROUGH_MIN_PCT = 0.015  # 1.5% minimum gain for follow-through day
 M_FOLLOW_THROUGH_MIN_DAY = 4  # Earliest day of rally for follow-through
 
+# Market regime tracker parameters
+M_REGIME_PRESSURE_DIST_DAYS: int = 3  # distribution days to enter UNDER_PRESSURE warning zone
+
 # M score component weights (distribution/follow-through vs EMA trend)
 M_DISTRIBUTION_WEIGHT = 0.30  # Weight for distribution day analysis
 M_FOLLOW_THROUGH_WEIGHT = 0.15  # Weight for follow-through day detection
