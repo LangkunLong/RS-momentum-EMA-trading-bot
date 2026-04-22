@@ -26,6 +26,7 @@ from backtest import (
     _evaluate_technical_at_date,
 )
 from core.canslim.m_market_direction import MarketRegimeTracker
+from core.industry_group import get_top_groups, load_industry_map
 from core.data_client import clear_session_cache, fetch_bulk_ohlcv
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
@@ -615,6 +616,7 @@ class PortfolioSimulator:
         self._transactions: List[dict] = []
         self._weekly_snapshots: List[dict] = []
         self._signal_rows: List[dict] = []
+        self._ticker_industry: Dict[str, str] = {}
 
     def run(
         self,
@@ -660,6 +662,7 @@ class PortfolioSimulator:
         regime_tracker = MarketRegimeTracker()
         regime_tracker.bootstrap(benchmark_df, start_ts)
         self._regime_tracker = regime_tracker
+        self._ticker_industry = load_industry_map(tickers)
 
         equity_series: Dict[str, float] = {}
         benchmark_series: Dict[str, float] = {}
@@ -746,6 +749,7 @@ class PortfolioSimulator:
                 "stagnation_days": self.stagnation_days,
                 "stagnation_threshold_pct": self.stagnation_threshold_pct,
                 "breakeven_trigger_pct": self.breakeven_trigger_pct,
+                "industry_group_top_n": settings.INDUSTRY_GROUP_TOP_N,
                 "start_date": str(start_ts.date()),
                 "end_date": str(end_ts.date()),
             },
@@ -772,8 +776,12 @@ class PortfolioSimulator:
 
         signals: List[dict] = []
         rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date)
+        top_groups = get_top_groups(rs_snapshot, self._ticker_industry)
         for ticker in tickers:
             if ticker in self._open_positions or ticker not in ticker_ohlcv:
+                continue
+            ticker_group = self._ticker_industry.get(ticker)
+            if ticker_group is not None and ticker_group not in top_groups:
                 continue
 
             row = self.strategy.evaluate_symbol(
