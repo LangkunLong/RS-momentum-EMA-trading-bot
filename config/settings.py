@@ -54,6 +54,9 @@ MIN_MARKET_CAP = 10e9  # Minimum market cap ($10 billion)
 # early-stage leaders that have not yet attracted broad attention.
 MIN_RS_SCORE = 80
 MIN_CANSLIM_SCORE = 70  # Minimum composite CANSLIM score for actionable entries
+INDUSTRY_GROUP_TOP_N: int = 20  # number of top industry groups allowed for entries
+INDUSTRY_GROUP_MIN_SIZE: int = 3  # min stocks in a group to include it in ranking
+INDUSTRY_GROUP_CACHE_PATH: str = ".artifacts/cache/industry_group_cache.json"
 # Watchlist floor is intentionally low so that high-RS stocks worth monitoring during
 # market corrections still surface even when M (market direction) is dragging composite
 # scores down.  With a bearish M score (~0.15) and no FMP fundamentals, an RS-90 stock
