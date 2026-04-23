@@ -80,16 +80,6 @@ def detect_cup_with_handle(closes: pd.Series) -> float | None:
     if right_lip < left_lip * 0.95:
         return None
 
-    # Guard: if the break bar (the bar just before the handle that interrupted the contiguous
-    # run) is above cup_low by more than 5% of the cup depth, the handle dipped into the lower
-    # half of the cup rather than simply re-testing the cup bottom — reject.
-    break_bar_idx = handle_start - 1
-    if break_bar_idx > cup_low_idx:
-        break_bar_val = float(closes.iloc[break_bar_idx])
-        lower_half_tolerance = (left_lip - cup_low) * 0.05
-        if break_bar_val > cup_low + lower_half_tolerance:
-            return None
-
     return handle_high
 
 

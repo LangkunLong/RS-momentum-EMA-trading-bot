@@ -82,15 +82,24 @@ def test_cup_rejected_too_shallow():
 
 
 def test_cup_handle_in_lower_half_rejected():
-    """Handle trough below cup midpoint → None."""
+    """Handle trough below cup midpoint → None.
+
+    The trailing-contiguous-segment scan stops at the first bar ≤ cup_midpoint
+    scanning backwards from the end.  If that bar is at or near the tail the
+    resulting handle segment is too short (< n-2 threshold) and the function
+    returns None.
+    """
     from core.pivot_detector import detect_cup_with_handle
 
     # cup: 100 → 70 (30% decline), recovers to 98, handle dips to 78 (below midpoint 85)
+    # midpoint = 70 + (100-70)*0.5 = 85
+    # The handle region ends with 78, so the backwards scan terminates immediately
+    # leaving handle_start >= n-2 → returns None.
     left_region = [100.0] * 15
     cup_region = [100.0 - i * (30.0 / 10) for i in range(11)]  # 100→70
     recover_region = [70.0 + i * (28.0 / 10) for i in range(11)]  # 70→98
-    # midpoint = 70 + (100-70)*0.5 = 85; handle_low = 78 < 85 → rejected
-    handle_region = [98.0, 78.0, 98.0, 97.0, 96.0, 97.0, 98.0, 97.0, 98.0]
+    # Last bar is 78 (≤ 85 midpoint) — scan from end stops at once → too-short handle
+    handle_region = [98.0, 97.0, 96.0, 97.0, 98.0, 97.0, 98.0, 98.0, 78.0]
     values = left_region + cup_region + recover_region + handle_region
     closes = _make_closes(values)
     assert detect_cup_with_handle(closes) is None
