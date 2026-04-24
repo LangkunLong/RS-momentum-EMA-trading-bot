@@ -500,6 +500,7 @@ class CanslimStrategy:
         has_peg_today = bool(tech.get("has_power_gap")) and peg_details.get("days_ago") == 0
         has_breakout = bool(tech.get("is_breakout"))
         has_surge = bool(tech.get("has_volume_surge"))
+        in_buy_zone = bool(tech.get("in_buy_zone", True))
         technical_score = self._compute_technical_score(
             n_score=tech["n_score"],
             s_score=tech["s_score"],
@@ -511,7 +512,7 @@ class CanslimStrategy:
         a_pass = a_growth is not None and a_growth >= self.min_c_a_growth
         l_pass = rs_score >= self.min_rs_score
         m_pass = bool(market_state["market_is_bullish"])
-        tech_pass = (has_breakout and has_surge) or has_peg_today
+        tech_pass = (has_breakout and has_surge and in_buy_zone) or has_peg_today
         composite_pass = total_score >= self.min_canslim_score
         technical_composite_pass = technical_score >= self.min_technical_score
         if self.technical_only:
@@ -545,6 +546,8 @@ class CanslimStrategy:
             "has_breakout": has_breakout,
             "has_volume_surge": has_surge,
             "has_peg_today": has_peg_today,
+            "pivot": tech.get("pivot"),
+            "in_buy_zone": in_buy_zone,
             "buy_signal": buy_signal,
             "signal_reason": signal_reason,
             "technical_only": self.technical_only,
