@@ -82,13 +82,7 @@ def test_cup_rejected_too_shallow():
 
 
 def test_cup_handle_in_lower_half_rejected():
-    """Handle trough below cup midpoint → None.
-
-    The trailing-contiguous-segment scan stops at the first bar ≤ cup_midpoint
-    scanning backwards from the end.  If that bar is at or near the tail the
-    resulting handle segment is too short (< n-2 threshold) and the function
-    returns None.
-    """
+    """Handle trough below cup midpoint is rejected."""
     from core.pivot_detector import detect_cup_with_handle
 
     # cup: 100 → 70 (30% decline), recovers to 98, handle dips to 78 (below midpoint 85)
@@ -150,3 +144,42 @@ def test_peg_bypasses_buy_zone():
     in_buy_zone = False
     tech_pass = (has_breakout and has_surge and in_buy_zone) or has_peg_today
     assert tech_pass is True
+
+
+# ---------------------------------------------------------------------------
+# find_pivot (integration paths)
+# ---------------------------------------------------------------------------
+
+
+def test_find_pivot_cup_path():
+    """find_pivot returns cup pivot when a cup-with-handle pattern is present."""
+    from core.pivot_detector import find_pivot
+
+    # 30-bar left lip at 100; cup dips 25% to 75 (midpoint=87.5); recovery to 98;
+    # one transition bar at 85 (below midpoint) to anchor handle_start cleanly;
+    # handle then forms above midpoint with a ~8% decline.
+    left_region = [100.0] * 30
+    cup_down = [100.0 - i * (25.0 / 12) for i in range(13)]  # 100→75
+    cup_up = [75.0 + i * (23.0 / 12) for i in range(13)]  # 75→98
+    transition = [85.0]  # dips below cup_midpoint so handle_start anchors after this bar
+    handle_region = [90.0, 95.0, 98.0, 96.0, 98.0, 95.0, 98.0, 97.0, 98.0]
+    values = left_region + cup_down + cup_up + transition + handle_region
+    closes = _make_closes(values)
+    result = find_pivot(closes)
+    assert result is not None
+    assert isinstance(result, float)
+
+
+def test_find_pivot_noisy_series_no_crash():
+    """find_pivot completes without raising on noisy data that forms no clean pattern."""
+    from core.pivot_detector import find_pivot
+
+    import numpy as np
+
+    rng = np.random.default_rng(42)
+    # High-volatility random walk — unlikely to form a clean base or cup
+    returns = rng.standard_normal(70) * 0.03
+    prices = 100.0 * (1 + returns).cumprod()
+    closes = _make_closes(list(prices))
+    result = find_pivot(closes)
+    assert result is None or isinstance(result, float)

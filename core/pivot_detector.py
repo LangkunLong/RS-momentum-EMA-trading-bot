@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""O'Neil-style pivot pattern detection: flat base and cup-with-handle."""
+
 import pandas as pd
 
 import config.settings as settings
@@ -20,7 +22,7 @@ def detect_flat_base(closes: pd.Series) -> float | None:
     if base_high <= 0:
         return None
     decline = (base_high - base_low) / base_high
-    if decline > settings.PIVOT_FLAT_BASE_MAX_DECLINE_PCT:
+    if decline > settings.PIVOT_FLAT_BASE_MAX_DECLINE_PCT:  # inclusive: exactly 15% is accepted
         return None
     return base_high
 
@@ -105,5 +107,5 @@ def is_in_buy_zone(
     pivot: float,
     zone_pct: float = settings.PIVOT_BUY_ZONE_PCT,
 ) -> bool:
-    """Return True if current_price is within zone_pct above pivot."""
-    return current_price <= pivot * (1 + zone_pct)
+    """Return True if current_price is at or above pivot and within zone_pct above it."""
+    return pivot <= current_price <= pivot * (1 + zone_pct)
