@@ -485,8 +485,6 @@ class CanslimStrategy:
         c_score = fund.get("c_score", 0.0)
         a_score = fund.get("a_score", 0.0)
         i_score = fund.get("i_score", 0.5)
-        has_fundamentals = c_growth is not None or a_growth is not None
-
         total_score = _compute_canslim_score(
             c=c_score,
             a=a_score,
@@ -495,7 +493,6 @@ class CanslimStrategy:
             l_score=l_score,
             i=i_score,
             m=market_state["m_score"],
-            has_fundamentals=has_fundamentals,
             institutional_data_available=bool(fund.get("institutional_data_available", False)),
         )
 

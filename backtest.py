@@ -249,11 +249,9 @@ def _compute_canslim_score(
     l_score: float,
     i: float,
     m: float,
-    has_fundamentals: bool = True,
     institutional_data_available: bool = True,
 ) -> float:
     """Compute weighted CANSLIM composite score (0-100)."""
-    _ = has_fundamentals  # C and A remain weighted even when the underlying data is missing.
     weights = {
         "C": settings.CANSLIM_WEIGHT_C,
         "A": settings.CANSLIM_WEIGHT_A,
@@ -382,8 +380,6 @@ def run_backtest() -> pd.DataFrame:
             c_score = fund.get("c_score", 0.0)
             a_score = fund.get("a_score", 0.0)
             i_score = fund.get("i_score", 0.5)
-            has_fundamentals = fund.get("current_growth") is not None or fund.get("annual_growth") is not None
-
             # Composite CANSLIM score
             total = _compute_canslim_score(
                 c=c_score,
@@ -393,7 +389,6 @@ def run_backtest() -> pd.DataFrame:
                 l_score=l_score,
                 i=i_score,
                 m=m_score,
-                has_fundamentals=has_fundamentals,
                 institutional_data_available=bool(fund.get("institutional_data_available", False)),
             )
 
