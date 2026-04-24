@@ -768,11 +768,9 @@ class PortfolioSimulator:
         eval_date: pd.Timestamp,
         market_state: dict,
     ) -> List[dict]:
-        if not self._regime_tracker.allows_entries:
-            return []
-
-        if self.require_bullish_market and not market_state["market_is_bullish"]:
-            return []
+        entries_allowed = self._regime_tracker.allows_entries and (
+            not self.require_bullish_market or market_state["market_is_bullish"]
+        )
 
         signals: List[dict] = []
         rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date)
@@ -781,7 +779,7 @@ class PortfolioSimulator:
             if ticker in self._open_positions or ticker not in ticker_ohlcv:
                 continue
             ticker_group = self._ticker_industry.get(ticker)
-            if ticker_group is not None and ticker_group not in top_groups:
+            if top_groups and ticker_group is not None and ticker_group not in top_groups:
                 continue
 
             row = self.strategy.evaluate_symbol(
@@ -795,8 +793,11 @@ class PortfolioSimulator:
             if row is None:
                 continue
             self._signal_rows.append(row)
-            if row["buy_signal"]:
+            if entries_allowed and row["buy_signal"]:
                 signals.append(row)
+
+        if not entries_allowed:
+            return []
 
         signals.sort(key=lambda item: (item["canslim_score"], item["rs_score"]), reverse=True)
         open_slots = max(self.max_positions - len(self._open_positions), 0)
