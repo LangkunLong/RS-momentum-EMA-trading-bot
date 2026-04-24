@@ -43,6 +43,7 @@ from core.data_client import (
 )
 from core.index_ticker_fetcher import get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
+from core.pivot_detector import find_pivot, is_in_buy_zone
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -100,9 +101,12 @@ def _calculate_rs_at_date(all_closes: pd.DataFrame, ticker: str, eval_date: pd.T
 
         # FALLBACK FOR IPOs/SPINOFFS (like GEV):
         # If the stock doesn't have enough history for the standard 1-year
-        # weighted performance, calculate its raw return over its available life.
+        # weighted performance, annualize its return so it's comparable to
+        # the 1-year weighted performance used for all other stocks.
         if wp is None and len(series) >= 60:
-            wp = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
+            raw_return = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
+            trading_days = len(series)
+            wp = (1 + raw_return) ** (252 / trading_days) - 1
 
         if wp is not None:
             perfs[col] = wp
@@ -141,6 +145,8 @@ def _evaluate_technical_at_date(
             "proximity": 0.0,
             "is_breakout": False,
             "has_volume_surge": False,
+            "pivot": None,
+            "in_buy_zone": True,
         }
 
     closes = extract_float_series(sliced, "Close")
@@ -170,6 +176,9 @@ def _evaluate_technical_at_date(
         sliced, avg_vol_50, latest_close, high_52, shares_outstanding, s_breakout_proximity=0.95
     )
 
+    pivot = find_pivot(closes)
+    in_buy_zone = is_in_buy_zone(latest_close, pivot) if pivot is not None else True
+
     return {
         "n_score": n_score,
         "s_score": score_s,
@@ -181,6 +190,8 @@ def _evaluate_technical_at_date(
         "has_volume_surge": s_metrics.get("has_volume_surge", False),
         "has_power_gap": s_metrics.get("has_power_gap", False),
         "power_gap_details": s_metrics.get("power_gap_details", {}),
+        "pivot": pivot,
+        "in_buy_zone": in_buy_zone,
     }
 
 
@@ -204,6 +215,7 @@ def _evaluate_fundamentals_at_date(symbol: str, eval_date: pd.Timestamp) -> Dict
         num_holders = info.get("institution_count")
         score_i = evaluate_i(held_pct, num_institutional_holders=num_holders)
         shares = info.get("shares_outstanding")
+        institutional_data_available = held_pct is not None or num_holders is not None
 
         return {
             "c_score": score_c,
@@ -213,6 +225,7 @@ def _evaluate_fundamentals_at_date(symbol: str, eval_date: pd.Timestamp) -> Dict
             "annual_growth": annual_growth,
             "roe": roe,
             "shares_outstanding": shares,
+            "institutional_data_available": institutional_data_available,
         }
     except Exception as e:
         print(f"    ERROR fetching fundamentals for {symbol} @ {eval_date.date()}: {e}")
@@ -224,6 +237,7 @@ def _evaluate_fundamentals_at_date(symbol: str, eval_date: pd.Timestamp) -> Dict
             "annual_growth": None,
             "roe": None,
             "shares_outstanding": None,
+            "institutional_data_available": False,
         }
 
 
@@ -236,34 +250,57 @@ def _compute_canslim_score(
     i: float,
     m: float,
     has_fundamentals: bool = True,
+    institutional_data_available: bool = True,
 ) -> float:
     """Compute weighted CANSLIM composite score (0-100)."""
-    if has_fundamentals:
-        score = (
-            settings.CANSLIM_WEIGHT_C * c
-            + settings.CANSLIM_WEIGHT_A * a
-            + settings.CANSLIM_WEIGHT_N * n
-            + settings.CANSLIM_WEIGHT_S * s
-            + settings.CANSLIM_WEIGHT_L * l_score
-            + settings.CANSLIM_WEIGHT_I * i
-            + settings.CANSLIM_WEIGHT_M * m
-        ) * 100
-    else:
-        tw = (
-            settings.CANSLIM_WEIGHT_N
-            + settings.CANSLIM_WEIGHT_S
-            + settings.CANSLIM_WEIGHT_L
-            + settings.CANSLIM_WEIGHT_I
-            + settings.CANSLIM_WEIGHT_M
-        )
-        score = (
-            (settings.CANSLIM_WEIGHT_N / tw) * n
-            + (settings.CANSLIM_WEIGHT_S / tw) * s
-            + (settings.CANSLIM_WEIGHT_L / tw) * l_score
-            + (settings.CANSLIM_WEIGHT_I / tw) * i
-            + (settings.CANSLIM_WEIGHT_M / tw) * m
-        ) * 100
+    _ = has_fundamentals  # C and A remain weighted even when the underlying data is missing.
+    weights = {
+        "C": settings.CANSLIM_WEIGHT_C,
+        "A": settings.CANSLIM_WEIGHT_A,
+        "N": settings.CANSLIM_WEIGHT_N,
+        "S": settings.CANSLIM_WEIGHT_S,
+        "L": settings.CANSLIM_WEIGHT_L,
+        "I": settings.CANSLIM_WEIGHT_I,
+        "M": settings.CANSLIM_WEIGHT_M,
+    }
+    if not institutional_data_available:
+        removed_weight = weights["I"]
+        weights["I"] = 0.0
+        remaining_weight = 1.0 - removed_weight
+        if remaining_weight > 0:
+            for key in weights:
+                if key != "I":
+                    weights[key] = weights[key] / remaining_weight
+
+    score = (
+        weights["C"] * c
+        + weights["A"] * a
+        + weights["N"] * n
+        + weights["S"] * s
+        + weights["L"] * l_score
+        + weights["I"] * i
+        + weights["M"] * m
+    ) * 100
     return float(score)
+
+
+def _should_emit_buy_signal(
+    *,
+    total_score: float,
+    rs_score: float,
+    market_is_bullish: bool,
+    has_breakout: bool,
+    has_volume_surge: bool,
+    has_peg_today: bool,
+    in_buy_zone: bool = True,
+) -> bool:
+    """Return True only for signals that satisfy the live-style buy gates."""
+    return (
+        total_score >= settings.MIN_CANSLIM_SCORE
+        and rs_score >= settings.MIN_RS_SCORE
+        and market_is_bullish
+        and ((has_breakout and has_volume_surge and in_buy_zone) or has_peg_today)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +394,7 @@ def run_backtest() -> pd.DataFrame:
                 i=i_score,
                 m=m_score,
                 has_fundamentals=has_fundamentals,
+                institutional_data_available=bool(fund.get("institutional_data_available", False)),
             )
 
             # --- UPDATED SIGNAL LOGIC ---
@@ -367,19 +405,14 @@ def run_backtest() -> pd.DataFrame:
             peg_details = tech.get("power_gap_details") or {}
             has_peg_today = bool(tech.get("has_power_gap", False)) and peg_details.get("days_ago") == 0
 
-            # A valid buy requires a bullish market AND (either a volume breakout OR a power earnings gap)
-            # buy_signal = (
-            #     total >= settings.MIN_CANSLIM_SCORE
-            #     and rs_score >= settings.MIN_RS_SCORE
-            #     and bool(m_bullish)
-            #     and ((has_breakout and has_surge) or has_peg_today)
-            # )
-            # Testing technicals only and disregarding bear market condition:
-            buy_signal = (
-                total >= 40  # Lowered to account for missing free-tier API fundamentals
-                and rs_score >= settings.MIN_RS_SCORE
-                # and bool(m_bullish)  <-- COMMENT THIS OUT to allow buys in bad markets
-                and ((has_breakout and has_surge) or has_peg_today)
+            buy_signal = _should_emit_buy_signal(
+                total_score=total,
+                rs_score=rs_score,
+                market_is_bullish=bool(m_bullish),
+                has_breakout=has_breakout,
+                has_volume_surge=has_surge,
+                has_peg_today=has_peg_today,
+                in_buy_zone=bool(tech.get("in_buy_zone", True)),
             )
             close_price = tech["close"]
 
@@ -523,6 +556,10 @@ if __name__ == "__main__":
     print_results(results_df)
 
     # Save to CSV
-    csv_file = f"backtest_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    os.makedirs(settings.BACKTEST_RESULTS_DIR, exist_ok=True)
+    csv_file = os.path.join(
+        settings.BACKTEST_RESULTS_DIR,
+        f"backtest_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+    )
     results_df.to_csv(csv_file, index=False)
     print(f"\nResults saved to {csv_file}")
