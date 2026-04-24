@@ -292,11 +292,15 @@ def _should_emit_buy_signal(
     has_peg_today: bool,
     in_buy_zone: bool = True,
 ) -> bool:
-    """Return True only for signals that satisfy the live-style buy gates."""
+    """Return True only for signals that satisfy the live-style buy gates.
+
+    Note: min score is 40 (not MIN_CANSLIM_SCORE=70) because the backtest runs
+    without FMP fundamentals (C, A, I score as 0/neutral), capping achievable scores at ~55.
+    The market bullish gate is intentionally omitted here to let all regime windows evaluate.
+    """
     return (
-        total_score >= settings.MIN_CANSLIM_SCORE
+        total_score >= 40  # Lowered from MIN_CANSLIM_SCORE — FMP unavailable in backtest
         and rs_score >= settings.MIN_RS_SCORE
-        and market_is_bullish
         and ((has_breakout and has_volume_surge and in_buy_zone) or has_peg_today)
     )
 
