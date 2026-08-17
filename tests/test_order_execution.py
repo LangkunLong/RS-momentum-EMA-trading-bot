@@ -571,6 +571,26 @@ class TestCancelOpenOrders:
         assert count == 1
 
 
+class TestStrictBrokerInspection:
+    """Safety-sensitive callers must be able to distinguish empty state from API failure."""
+
+    def test_get_open_positions_can_propagate_broker_errors(self) -> None:
+        client = MagicMock()
+        client.get_all_positions.side_effect = RuntimeError("broker unavailable")
+
+        with patch("core.order_execution._get_trading_client", return_value=client):
+            with pytest.raises(RuntimeError, match="broker unavailable"):
+                get_open_positions(raise_on_error=True)
+
+    def test_get_open_orders_can_propagate_broker_errors(self) -> None:
+        client = MagicMock()
+        client.get_orders.side_effect = RuntimeError("broker unavailable")
+
+        with patch("core.order_execution._get_trading_client", return_value=client):
+            with pytest.raises(RuntimeError, match="broker unavailable"):
+                get_open_orders("SPY", raise_on_error=True)
+
+
 # ===========================================================================
 # check_exit_signals
 # ===========================================================================

@@ -512,12 +512,12 @@ def close_position(
 # ---------------------------------------------------------------------------
 
 
-def get_open_positions() -> list[PositionSummary]:
+def get_open_positions(*, raise_on_error: bool = False) -> list[PositionSummary]:
     """Return all open positions with unrealized P&L percentages.
 
     Returns:
         List of PositionSummary objects, one per open position.
-        Returns an empty list on any error.
+        Returns an empty list on any error unless ``raise_on_error`` is true.
     """
     client = _get_trading_client()
     try:
@@ -533,24 +533,33 @@ def get_open_positions() -> list[PositionSummary]:
             for p in positions
         ]
     except Exception as exc:  # noqa: BLE001
+        if raise_on_error:
+            raise
         print(f"[ORDER ERROR] get_open_positions: {exc}")
         return []
 
 
-def get_open_orders(symbol: Optional[str] = None) -> list[Order]:
+def get_open_orders(
+    symbol: Optional[str] = None,
+    *,
+    raise_on_error: bool = False,
+) -> list[Order]:
     """Return pending orders, optionally filtered to a single symbol.
 
     Args:
         symbol: If provided, only return orders for this ticker.
 
     Returns:
-        List of Alpaca Order objects. Empty list on error.
+        List of Alpaca Order objects. Empty on error unless
+        ``raise_on_error`` is true.
     """
     client = _get_trading_client()
     try:
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol] if symbol else None)
         return client.get_orders(req)
     except Exception as exc:  # noqa: BLE001
+        if raise_on_error:
+            raise
         print(f"[ORDER ERROR] get_open_orders: {exc}")
         return []
 
