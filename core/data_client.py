@@ -37,6 +37,7 @@ from core.fmp_provider import (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import hashlib
+import json
 import os
 import pickle
 
@@ -50,12 +51,14 @@ _fmp_reported_endpoint_failures: set[str] = set()
 
 def clear_session_cache() -> None:
     """Reset the in-memory session cache between scan runs."""
-    global _fmp_quota_exhausted
+    global _fmp_budget_warning_emitted, _fmp_quota_exhausted
     with _cache_lock:
         _session_cache.clear()
     _fmp_unavailable_endpoints.clear()
     _fmp_reported_endpoint_failures.clear()
     _fmp_quota_exhausted = False
+    _fmp_budget_warning_emitted = False
+    reset_fmp_request_context()
 
 
 def _cache_get(key: tuple) -> Any:
@@ -87,7 +90,7 @@ def _fund_cache_get(key: tuple) -> Any:
     if not os.path.exists(path):
         return None
     age_hours = (time.time() - os.path.getmtime(path)) / 3600
-    if age_hours > _FUND_CACHE_TTL_HOURS:
+    if age_hours > settings.FMP_FUND_CACHE_TTL_HOURS:
         return None
     try:
         with open(path, "rb") as f:
@@ -183,6 +186,106 @@ from urllib3.util.retry import Retry
 _US_EASTERN = ZoneInfo("America/New_York")
 _REGULAR_SESSION_START = dtime(9, 30)
 _REGULAR_SESSION_END = dtime(16, 0)
+_fmp_budget_lock = threading.Lock()
+_fmp_request_context = threading.local()
+_fmp_budget_warning_emitted = False
+
+
+def _is_fmp_free_plan() -> bool:
+    return str(getattr(settings, "FMP_PLAN", "free")).strip().lower() == "free"
+
+
+def reset_fmp_request_context() -> None:
+    """Clear request-defer state for the current scanner worker."""
+    _fmp_request_context.quota_deferred = False
+
+
+def fmp_request_was_deferred() -> bool:
+    """Return whether the current worker was denied by the local FMP budget."""
+    return bool(getattr(_fmp_request_context, "quota_deferred", False))
+
+
+def _fmp_now_et() -> datetime:
+    """Return the current provider-accounting time in US Eastern."""
+    return datetime.now(tz=_US_EASTERN)
+
+
+def _fmp_window_start(now_et: datetime) -> datetime:
+    """Return the 3 p.m. Eastern start of the active provider reset window."""
+    if now_et.tzinfo is None:
+        now_et = now_et.replace(tzinfo=_US_EASTERN)
+    else:
+        now_et = now_et.astimezone(_US_EASTERN)
+    reset_hour = int(getattr(settings, "FMP_RESET_HOUR_EASTERN", 15))
+    start = now_et.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+    if now_et < start:
+        start -= timedelta(days=1)
+    return start
+
+
+def _write_fmp_usage(path: str, usage: dict[str, Any]) -> bool:
+    """Atomically persist request usage; fail closed if accounting cannot be saved."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(usage, handle, sort_keys=True)
+        os.replace(temp_path, path)
+        return True
+    except OSError:
+        return False
+
+
+def _reserve_fmp_request() -> bool:
+    """Reserve one persisted free-tier request before any network I/O."""
+    global _fmp_budget_warning_emitted
+
+    if not _is_fmp_free_plan():
+        return True
+
+    path = str(settings.FMP_REQUEST_LEDGER_PATH)
+    window_start = _fmp_window_start(_fmp_now_et()).isoformat()
+    budget = int(settings.FMP_DAILY_REQUEST_BUDGET)
+
+    with _fmp_budget_lock:
+        usage: dict[str, Any] = {"window_start": window_start, "count": 0}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            if not isinstance(saved, dict):
+                raise ValueError("FMP usage ledger must contain a JSON object")
+            if saved.get("window_start") == window_start:
+                usage["count"] = max(int(saved.get("count", 0)), 0)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            _fmp_request_context.quota_deferred = True
+            if not _fmp_budget_warning_emitted:
+                print("[FMP] Request usage ledger is unreadable; failing closed to protect the free-plan quota.")
+                _fmp_budget_warning_emitted = True
+            return False
+
+        if usage["count"] >= budget:
+            _fmp_request_context.quota_deferred = True
+            if not _fmp_budget_warning_emitted:
+                print(
+                    f"[FMP] Local daily request budget ({budget}) reached; "
+                    "remaining uncached candidates will be quota_deferred."
+                )
+                _fmp_budget_warning_emitted = True
+            return False
+
+        usage["count"] += 1
+        if _write_fmp_usage(path, usage):
+            return True
+
+        _fmp_request_context.quota_deferred = True
+        if not _fmp_budget_warning_emitted:
+            print("[FMP] Could not persist request usage; failing closed to protect the free-plan quota.")
+            _fmp_budget_warning_emitted = True
+        return False
 
 
 def _drop_incomplete_daily_bar(df: pd.DataFrame) -> pd.DataFrame:
@@ -229,10 +332,12 @@ def _filter_regular_session(df: pd.DataFrame) -> pd.DataFrame:
 def _get_fmp_session() -> requests.Session:
     """Create a requests session with built-in retry logic."""
     session = requests.Session()
+    retry_total = 0 if _is_fmp_free_plan() else settings.HTTP_RETRY_TOTAL
+    retry_statuses = [] if _is_fmp_free_plan() else settings.HTTP_RETRY_STATUS_CODES
     retries = Retry(
-        total=settings.HTTP_RETRY_TOTAL,
+        total=retry_total,
         backoff_factor=settings.HTTP_RETRY_BACKOFF,
-        status_forcelist=settings.HTTP_RETRY_STATUS_CODES,
+        status_forcelist=retry_statuses,
     )
     pool_size = max(settings.HTTP_MAX_WORKERS, settings.MAX_WORKERS, 10)
     session.mount(
@@ -271,7 +376,17 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
 
     url = f"{settings.FMP_BASE_URL}/{endpoint}"
     request_params = dict(params or {})
+    if _is_fmp_free_plan() and "limit" in request_params:
+        try:
+            request_params["limit"] = min(
+                int(request_params["limit"]),
+                int(settings.FMP_FREE_MAX_RECORDS),
+            )
+        except (TypeError, ValueError):
+            request_params["limit"] = int(settings.FMP_FREE_MAX_RECORDS)
     request_params["apikey"] = _fmp_api_key()
+    if not _reserve_fmp_request():
+        return []
 
     try:
         resp = _fmp_session.get(url, params=request_params, timeout=30)
@@ -925,6 +1040,12 @@ def fetch_company_info(symbol: str) -> dict:
         "prev_institution_count": None,
     }
 
+    # Keep free-tier live scoring to the three statement endpoints. Missing
+    # shares and institutional inputs already have neutral/redistributed scoring.
+    if _is_fmp_free_plan():
+        _cache_set(cache_key, result)
+        return result
+
     # 1. Profile — compute shares_outstanding from marketCap / price.
     # (stable API removed enterprise-values; profile is the reliable source.)
     try:
@@ -981,18 +1102,21 @@ def _fetch_fmp_raw_history(symbol: str) -> dict:
         bs_raw = []
     # enterprise-values endpoint not available on stable free tier; ev_raw stays empty.
     ev_raw: list = []
-    try:
-        profile_raw = _fmp_get("profile", {"symbol": symbol})
-    except (requests.RequestException, ValueError, EnvironmentError):
-        profile_raw = []
+    profile_raw: list = []
+    inst_ownership_raw: list = []
+    if not _is_fmp_free_plan():
+        try:
+            profile_raw = _fmp_get("profile", {"symbol": symbol})
+        except (requests.RequestException, ValueError, EnvironmentError):
+            profile_raw = []
 
-    # Institutional ownership history for PIT backtesting. The provider adds a
-    # conservative assumed acceptedDate after the Form 13F reporting lag.
-    inst_ownership_raw = _fetch_inst_ownership_history(
-        symbol,
-        fmp_get_fn=_fmp_get,
-        limit=settings.FMP_INSTITUTIONAL_BACKTEST_LIMIT,
-    )
+        # Institutional ownership history for PIT backtesting. The provider adds a
+        # conservative assumed acceptedDate after the Form 13F reporting lag.
+        inst_ownership_raw = _fetch_inst_ownership_history(
+            symbol,
+            fmp_get_fn=_fmp_get,
+            limit=settings.FMP_INSTITUTIONAL_BACKTEST_LIMIT,
+        )
 
     result = {
         "qi_raw": qi_raw,

@@ -53,7 +53,8 @@ def load_industry_map(tickers: list[str]) -> dict[str, str]:
     """Load ticker → industry label map, fetching from FMP and caching to disk.
 
     Uses profile["industry"] with fallback to profile["sector"]. Tickers with neither
-    are omitted from the returned map. Cache TTL is 7 days.
+    are omitted from the returned map. Cache TTL is 7 days. Free-plan mode reuses
+    fresh cached labels but never spends quota to fetch missing profiles.
 
     Args:
         tickers: List of ticker symbols to look up.
@@ -76,7 +77,7 @@ def load_industry_map(tickers: list[str]) -> dict[str, str]:
             cached_map = {}
 
     missing = [t for t in tickers if t not in cached_map]
-    if missing:
+    if missing and settings.FMP_PLAN != "free":
         logger.info("Fetching industry labels for %d tickers from FMP", len(missing))
         for sym in missing:
             try:

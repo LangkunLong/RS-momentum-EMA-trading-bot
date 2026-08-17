@@ -52,6 +52,9 @@ def _classify_canslim_candidate(
     if rs_score < min_rs_score:
         return "rejected", ["below_rs_threshold"]
 
+    if bool(metrics.get("fmp_quota_deferred", False)):
+        return "quota_deferred", ["quota_deferred"]
+
     bullish_gate_ok = market_is_bullish if require_bullish_market else True
     fundamentals_gate_ok = has_fundamentals if require_fundamentals else True
     breakout_gate_ok = True
@@ -251,6 +254,11 @@ def evaluate_stock_canslim(
     canslim_view["scanner_category"] = category
     canslim_view["scanner_notes"] = notes
 
+    if category == "quota_deferred":
+        _debug(f"[DEBUG] {symbol} deferred because the local FMP request budget was reached.")
+        _flush_logs()
+        return canslim_view
+
     if category == "rejected":
         _debug(f"[DEBUG] Rejected by scanner: {', '.join(notes)}")
         _flush_logs()
@@ -344,6 +352,7 @@ def screen_stocks_canslim_detailed(
     # Pre-filter: discard symbols whose RS score is already below the threshold
     # to avoid wasting API calls on weak stocks
     filtered_symbols = []
+    rs_score_by_symbol: Dict[str, float] = {}
     rs_below_threshold = 0
     rs_not_found = 0
     for symbol in symbols_list:
@@ -360,6 +369,7 @@ def screen_stocks_canslim_detailed(
 
         if rs_val >= min_rs_score:
             filtered_symbols.append(symbol)
+            rs_score_by_symbol[symbol] = rs_val
         else:
             rs_below_threshold += 1
             if debug:
@@ -371,6 +381,8 @@ def screen_stocks_canslim_detailed(
             f"{rs_not_found} not found in RS universe | "
             f"{len(filtered_symbols)}/{len(symbols_list)} passed"
         )
+
+    filtered_symbols.sort(key=lambda symbol: rs_score_by_symbol[symbol], reverse=True)
 
     # Evaluate remaining symbols in parallel
     def _evaluate(sym: str) -> Optional[Dict[str, object]]:
@@ -400,17 +412,26 @@ def screen_stocks_canslim_detailed(
 
     actionable_buys = [result for result in results if result.get("scanner_category") == "actionable_buy"]
     watchlist_candidates = [result for result in results if result.get("scanner_category") == "watchlist_candidate"]
+    quota_deferred = [result for result in results if result.get("scanner_category") == "quota_deferred"]
+
+    if quota_deferred:
+        print(
+            f"[FMP] {len(quota_deferred)} candidate(s) quota_deferred; "
+            "they were excluded from actionable buys and watchlists."
+        )
 
     if debug:
         passed = len(results)
         rejected_score = len(filtered_symbols) - passed
+        classified = len(actionable_buys) + len(watchlist_candidates)
         market_blocked = sum(1 for r in results if "market_not_bullish" in set(r.get("scanner_notes", [])))
         missing_fund = sum(1 for r in results if "missing_fundamentals" in set(r.get("scanner_notes", [])))
         print(
             f"[DEBUG] Post-scan summary: {len(symbols_list)} total | "
             f"{rs_below_threshold} failed RS pre-filter | "
             f"{rejected_score} passed RS but scored below watchlist floor | "
-            f"{passed} reached watchlist/buy threshold | "
+            f"{classified} reached watchlist/buy threshold | "
+            f"{len(quota_deferred)} quota-deferred | "
             f"{market_blocked} watchlisted due to bearish market | "
             f"{missing_fund} flagged for missing fundamentals"
         )

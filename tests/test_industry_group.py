@@ -137,6 +137,7 @@ def test_load_industry_map_uses_fmp_and_reuses_disk_cache(tmp_path) -> None:
 
     with (
         patch("core.industry_group.settings.INDUSTRY_GROUP_CACHE_PATH", str(cache_path)),
+        patch("core.industry_group.settings.FMP_PLAN", "paid", create=True),
         patch("core.industry_group.fetch_company_profile", side_effect=lambda symbol: profiles[symbol]) as fetch,
     ):
         first = load_industry_map(["NVDA", "BRK.B", "EMPTY"])
@@ -145,6 +146,21 @@ def test_load_industry_map_uses_fmp_and_reuses_disk_cache(tmp_path) -> None:
     assert first == {"NVDA": "Semiconductors", "BRK.B": "Financial Services"}
     assert second == first
     assert fetch.call_count == 3
+
+
+def test_free_plan_industry_map_uses_cache_without_profile_calls(tmp_path) -> None:
+    """Free mode must not spend quota on company profiles for industry labels."""
+    cache_path = tmp_path / "industry_map.json"
+
+    with (
+        patch("core.industry_group.settings.INDUSTRY_GROUP_CACHE_PATH", str(cache_path)),
+        patch("core.industry_group.settings.FMP_PLAN", "free", create=True),
+        patch("core.industry_group.fetch_company_profile") as fetch,
+    ):
+        result = load_industry_map(["NVDA", "AAPL"])
+
+    assert result == {}
+    fetch.assert_not_called()
 
 
 @pytest.mark.integration

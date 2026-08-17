@@ -142,9 +142,9 @@ Inspect `git diff main...HEAD` for correctness, architecture drift, secret expos
 - Consumes: a newly rotated FMP credential stored outside Git and a verified clean tracked tree.
 - Produces: a revoked exposed credential and, after coordinated approval, a public history that no longer contains the generated scan CSV secret.
 
-- [ ] **Step 1: Obtain confirmation that the exposed FMP key was rotated**
+- [x] **Step 1: Obtain confirmation that the exposed FMP key was rotated**
 
-The operator rotates the key at FMP, updates only the local environment/secret store, and confirms the old key is revoked. Never paste either value into chat, logs, commands, or tracked files.
+The operator confirmed on 2026-08-17 that the old key was revoked and a replacement was stored locally. Neither value was pasted into chat, logs, commands, or tracked files.
 
 - [x] **Step 2: Prepare history cleanup locally**
 

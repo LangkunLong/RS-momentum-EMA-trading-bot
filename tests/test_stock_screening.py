@@ -1,7 +1,16 @@
 """Tests for scanner classification between actionable buys and watchlist names."""
 
+from unittest.mock import patch
+
+import pandas as pd
+
+from core.canslim import evaluate_canslim
 from core.canslim.m_market_direction import MarketTrend
-from core.stock_screening import _classify_canslim_candidate
+from core.stock_screening import (
+    _classify_canslim_candidate,
+    evaluate_stock_canslim,
+    screen_stocks_canslim_detailed,
+)
 
 
 def _make_view(
@@ -14,11 +23,15 @@ def _make_view(
     has_volume_surge: bool = True,
     buy_point: float | None = 100.0,
     latest_close_price: float | None = 103.0,
+    fmp_quota_deferred: bool = False,
 ) -> dict:
     return {
         "rs_score": rs_score,
         "total_score": total_score,
-        "metrics": {"has_fundamentals": has_fundamentals},
+        "metrics": {
+            "has_fundamentals": has_fundamentals,
+            "fmp_quota_deferred": fmp_quota_deferred,
+        },
         "market_trend": MarketTrend(
             symbol="SPY",
             score=0.8 if is_bullish else 0.1,
@@ -73,6 +86,20 @@ def test_classifier_marks_bullish_missing_fundamentals_name_as_watchlist() -> No
 
     assert category == "watchlist_candidate"
     assert "missing_fundamentals" in notes
+
+
+def test_classifier_marks_budget_skipped_name_as_quota_deferred() -> None:
+    """A budget skip is explicit and can never become actionable or watchlisted."""
+    category, notes = _classify_canslim_candidate(
+        _make_view(fmp_quota_deferred=True, has_fundamentals=False),
+        min_rs_score=75,
+        min_canslim_score=65,
+        watchlist_min_score=45,
+        require_bullish_market=True,
+    )
+
+    assert category == "quota_deferred"
+    assert notes == ["quota_deferred"]
 
 
 def test_classifier_rejects_name_below_watchlist_floor() -> None:
@@ -168,3 +195,126 @@ def test_strict_breakout_blocks_price_above_buy_zone_from_actionable_buys() -> N
 
     assert category == "watchlist_candidate"
     assert "beyond_buy_zone" in notes
+
+
+def test_quota_deferred_candidate_survives_strict_breakout_filter() -> None:
+    """Deferred names must remain visible even if technical entry gates are not met."""
+    view = _make_view(
+        has_fundamentals=False,
+        fmp_quota_deferred=True,
+        is_breakout=False,
+        has_volume_surge=False,
+        buy_point=None,
+        latest_close_price=95.0,
+    )
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 80.0}])
+
+    with patch("core.stock_screening.evaluate_canslim", return_value=view):
+        result = evaluate_stock_canslim(
+            symbol="AAPL",
+            min_rs_score=75,
+            min_canslim_score=65,
+            market_trend=view["market_trend"],
+            rs_scores_df=rs_scores,
+            strict_breakout=True,
+        )
+
+    assert result is view
+    assert result["scanner_category"] == "quota_deferred"
+
+
+def test_scanner_evaluates_highest_rs_candidates_first() -> None:
+    """The scarce free-tier request budget goes to the strongest RS names first."""
+    rs_scores = pd.DataFrame(
+        [
+            {"Ticker": "LOW", "RS_Score": 81.0},
+            {"Ticker": "HIGH", "RS_Score": 98.0},
+            {"Ticker": "MID", "RS_Score": 90.0},
+        ]
+    )
+    market = _make_view()["market_trend"]
+    evaluated: list[str] = []
+
+    def fake_evaluate(*, symbol: str, **_kwargs) -> None:
+        evaluated.append(symbol)
+        return None
+
+    with (
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.stock_screening.evaluate_stock_canslim", side_effect=fake_evaluate),
+        patch("core.stock_screening.MAX_WORKERS", 1),
+    ):
+        screen_stocks_canslim_detailed(
+            symbols=["LOW", "HIGH", "MID"],
+            start_date="2026-01-01",
+            min_rs_score=80,
+        )
+
+    assert evaluated == ["HIGH", "MID", "LOW"]
+
+
+def test_scanner_reports_and_excludes_quota_deferred_names(capsys) -> None:
+    """Deferred symbols get an explicit count and stay out of both output lists."""
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 95.0}])
+    market = _make_view()["market_trend"]
+    deferred = _make_view(fmp_quota_deferred=True, has_fundamentals=False)
+    deferred.update(
+        {
+            "symbol": "AAPL",
+            "scanner_category": "quota_deferred",
+            "scanner_notes": ["quota_deferred"],
+        }
+    )
+
+    with (
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.stock_screening.evaluate_stock_canslim", return_value=deferred),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"],
+            start_date="2026-01-01",
+            min_rs_score=80,
+        )
+
+    assert buys == []
+    assert watchlist == []
+    assert "1 candidate(s) quota_deferred" in capsys.readouterr().out
+
+
+def test_canslim_marks_missing_statements_as_quota_deferred() -> None:
+    """A request-boundary denial must propagate into the scanner-facing metrics."""
+    dates = pd.bdate_range("2026-01-01", periods=60)
+    prices = pd.DataFrame(
+        {
+            "Open": [100.0] * 60,
+            "High": [101.0] * 60,
+            "Low": [99.0] * 60,
+            "Close": [100.0] * 60,
+            "Volume": [1_000_000.0] * 60,
+        },
+        index=dates,
+    )
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    neutral_company = {
+        "shares_outstanding": None,
+        "held_percent_institutions": None,
+        "institution_count": None,
+        "prev_institution_count": None,
+    }
+
+    with (
+        patch("core.canslim.core.fetch_company_info", return_value=neutral_company),
+        patch("core.canslim.core.fetch_quarterly_income_statement", return_value=pd.DataFrame()),
+        patch("core.canslim.core.fetch_annual_income_statement", return_value=pd.DataFrame()),
+        patch("core.canslim.core.fetch_balance_sheet", return_value=pd.DataFrame()),
+        patch("core.canslim.core.fetch_ohlcv", return_value=prices),
+        patch("core.canslim.core.fmp_request_was_deferred", return_value=True, create=True),
+        patch("core.canslim.core.reset_fmp_request_context", create=True),
+    ):
+        result = evaluate_canslim("AAPL", rs_scores_df=rs_scores, market_trend=market)
+
+    assert result is not None
+    assert result["metrics"]["fmp_quota_deferred"] is True

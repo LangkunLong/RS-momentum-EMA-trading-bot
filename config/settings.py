@@ -320,12 +320,27 @@ TRADING_DAYS_PER_QUARTER = 65  # Approximate trading days in a quarter
 
 # FMP (Financial Modeling Prep) configuration
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
+FMP_PLAN = os.environ.get("FMP_PLAN", "free").strip().lower()
+if FMP_PLAN not in {"free", "paid"}:
+    raise ValueError("FMP_PLAN must be either 'free' or 'paid'.")
 
-# FMP fetch limits — sized for a paid plan with fuller data history.
-# Callers can override by passing an explicit limit= argument.
-FMP_QUARTERLY_LIMIT = 12           # 3 years of quarterly income statements
-FMP_ANNUAL_LIMIT = 10              # 10 years of annual income statements
-FMP_BALANCE_SHEET_LIMIT = 10       # 10 years of balance sheets
+# The free plan permits 250 provider requests per reset window. The bot's
+# ceiling stays at 198, preserving 52 requests for manual and administrative use.
+FMP_FREE_MAX_RECORDS = 5
+FMP_FREE_DAILY_REQUEST_BUDGET_CAP = 198
+FMP_DAILY_REQUEST_BUDGET = min(
+    max(int(os.environ.get("FMP_DAILY_REQUEST_BUDGET", "198")), 0),
+    FMP_FREE_DAILY_REQUEST_BUDGET_CAP,
+)
+FMP_REQUEST_LEDGER_PATH = os.path.join(CACHE_DIR, "fmp_request_usage.json")
+FMP_RESET_HOUR_EASTERN = 15
+FMP_FUND_CACHE_TTL_HOURS = 168 if FMP_PLAN == "free" else 72
+
+# FMP fetch limits are free-tier-safe by default; paid mode keeps fuller history.
+# The HTTP boundary always enforces the free-plan maximum even for explicit limits.
+FMP_QUARTERLY_LIMIT = 5 if FMP_PLAN == "free" else 12
+FMP_ANNUAL_LIMIT = 5 if FMP_PLAN == "free" else 10
+FMP_BALANCE_SHEET_LIMIT = 5 if FMP_PLAN == "free" else 10
 FMP_INSTITUTIONAL_HISTORY_LIMIT = 1  # current snapshot includes previous holder count
 FMP_INSTITUTIONAL_BACKTEST_LIMIT = 20  # five years of period-specific snapshots
 

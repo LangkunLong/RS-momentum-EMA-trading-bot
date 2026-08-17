@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -28,15 +31,35 @@ from core.fmp_provider import fetch_institutional_ownership_history, company_inf
 
 
 @pytest.fixture(autouse=True)
-def reset_fmp_session_state():
-    """Reset the module-level FMP quota flag between tests to prevent state leakage."""
+def reset_fmp_session_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Reset FMP state and keep request accounting isolated from real usage."""
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "paid", raising=False)
+    monkeypatch.setattr(_dc_module.settings, "FMP_DAILY_REQUEST_BUDGET", 198, raising=False)
+    monkeypatch.setattr(_dc_module.settings, "FMP_FUND_CACHE_TTL_HOURS", 72, raising=False)
+    monkeypatch.setattr(
+        _dc_module.settings,
+        "FMP_REQUEST_LEDGER_PATH",
+        str(tmp_path / "fmp-request-usage.json"),
+        raising=False,
+    )
     _dc_module._fmp_quota_exhausted = False
+    _dc_module._fmp_budget_warning_emitted = False
     _dc_module._fmp_unavailable_endpoints.clear()
     _dc_module._fmp_reported_endpoint_failures.clear()
+    if hasattr(_dc_module, "reset_fmp_request_context"):
+        _dc_module.reset_fmp_request_context()
     yield
     _dc_module._fmp_quota_exhausted = False
+    _dc_module._fmp_budget_warning_emitted = False
     _dc_module._fmp_unavailable_endpoints.clear()
     _dc_module._fmp_reported_endpoint_failures.clear()
+
+
+def _success_response(payload: object | None = None) -> MagicMock:
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = [] if payload is None else payload
+    return response
 
 
 # ─── _fmp_get error handling ─────────────────────────────────────────────────
@@ -205,6 +228,109 @@ def test_fmp_get_redacts_prepared_url_credentials(capsys) -> None:
     assert "exposed-fixture-secret" not in output
 
 
+def test_free_plan_budget_hard_stops_before_network_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The bot must reserve persisted quota before making an HTTP request."""
+    ledger_path = tmp_path / "usage.json"
+    fixed_now = datetime(2026, 8, 17, 16, 0, tzinfo=ZoneInfo("America/New_York"))
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "free", raising=False)
+    monkeypatch.setattr(_dc_module.settings, "FMP_DAILY_REQUEST_BUDGET", 2, raising=False)
+    monkeypatch.setattr(_dc_module.settings, "FMP_REQUEST_LEDGER_PATH", str(ledger_path), raising=False)
+    monkeypatch.setattr(_dc_module, "_fmp_now_et", lambda: fixed_now, raising=False)
+
+    with (
+        patch("core.data_client._fmp_session") as mock_session,
+        patch("core.data_client._fmp_api_key", return_value="test-key"),
+    ):
+        mock_session.get.return_value = _success_response()
+        assert _fmp_get("income-statement", {"symbol": "AAPL"}) == []
+        assert _fmp_get("income-statement", {"symbol": "MSFT"}) == []
+        assert _fmp_get("income-statement", {"symbol": "NVDA"}) == []
+        assert _fmp_get("income-statement", {"symbol": "AMZN"}) == []
+
+    assert mock_session.get.call_count == 2
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["count"] == 2
+    assert capsys.readouterr().out.count("daily request budget") == 1
+    assert _dc_module.fmp_request_was_deferred() is True
+
+
+def test_free_plan_budget_resets_at_next_3pm_eastern_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A request after 3 p.m. Eastern belongs to a new FMP reset window."""
+    ledger_path = tmp_path / "usage.json"
+    moments = iter(
+        [
+            datetime(2026, 8, 17, 14, 59, tzinfo=ZoneInfo("America/New_York")),
+            datetime(2026, 8, 17, 15, 1, tzinfo=ZoneInfo("America/New_York")),
+        ]
+    )
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "free", raising=False)
+    monkeypatch.setattr(_dc_module.settings, "FMP_DAILY_REQUEST_BUDGET", 1, raising=False)
+    monkeypatch.setattr(_dc_module.settings, "FMP_REQUEST_LEDGER_PATH", str(ledger_path), raising=False)
+    monkeypatch.setattr(_dc_module, "_fmp_now_et", lambda: next(moments), raising=False)
+
+    with (
+        patch("core.data_client._fmp_session") as mock_session,
+        patch("core.data_client._fmp_api_key", return_value="test-key"),
+    ):
+        mock_session.get.return_value = _success_response()
+        _fmp_get("income-statement", {"symbol": "AAPL"})
+        _fmp_get("income-statement", {"symbol": "MSFT"})
+
+    usage = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert mock_session.get.call_count == 2
+    assert usage["window_start"] == "2026-08-17T15:00:00-04:00"
+    assert usage["count"] == 1
+
+
+def test_free_plan_caps_limit_at_five_without_mutating_caller_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Free-tier requests must never ask FMP for more than five records."""
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "free", raising=False)
+    caller_params = {"symbol": "AAPL", "limit": 80}
+
+    with (
+        patch("core.data_client._fmp_session") as mock_session,
+        patch("core.data_client._fmp_api_key", return_value="test-key"),
+    ):
+        mock_session.get.return_value = _success_response()
+        _fmp_get("income-statement", caller_params)
+
+    assert caller_params == {"symbol": "AAPL", "limit": 80}
+    assert mock_session.get.call_args.kwargs["params"]["limit"] == 5
+
+
+@pytest.mark.parametrize("ledger_contents", ["not-json", "[]"])
+def test_free_plan_corrupt_usage_ledger_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    ledger_contents: str,
+) -> None:
+    """Unreadable accounting must block network use rather than reset usage to zero."""
+    ledger_path = tmp_path / "usage.json"
+    ledger_path.write_text(ledger_contents, encoding="utf-8")
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "free", raising=False)
+    monkeypatch.setattr(_dc_module.settings, "FMP_REQUEST_LEDGER_PATH", str(ledger_path), raising=False)
+
+    with (
+        patch("core.data_client._fmp_session") as mock_session,
+        patch("core.data_client._fmp_api_key", return_value="test-key"),
+    ):
+        result = _fmp_get("income-statement", {"symbol": "AAPL", "limit": 5})
+
+    assert result == []
+    mock_session.get.assert_not_called()
+    assert "usage ledger" in capsys.readouterr().out
+    assert _dc_module.fmp_request_was_deferred() is True
+
+
 # ─── Disk fundamentals cache ─────────────────────────────────────────────────
 
 
@@ -248,6 +374,27 @@ def test_fund_cache_miss_on_expired_file(tmp_path: Path) -> None:
             with patch("core.data_client._FUND_CACHE_DIR", str(tmp_path)):
                 result = _fund_cache_get(key)
             assert result is None, "Expected cache MISS for stale file (>72h old)"
+
+
+def test_free_plan_fund_cache_remains_fresh_for_seven_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A four-day-old successful statement should remain cached on the free plan."""
+    df = pd.DataFrame({"Diluted EPS": [2.5]})
+    key = ("quarterly_income", "AAPL", 5)
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "free", raising=False)
+    monkeypatch.setattr(_dc_module.settings, "FMP_FUND_CACHE_TTL_HOURS", 168, raising=False)
+
+    with patch("core.data_client._FUND_CACHE_DIR", str(tmp_path)):
+        _fund_cache_set(key, df)
+        cache_file = Path(_dc_module._fund_cache_path(key))
+        four_days_ago = time.time() - (4 * 24 * 3600)
+        os.utime(cache_file, (four_days_ago, four_days_ago))
+        cached = _fund_cache_get(key)
+
+    assert cached is not None
+    pd.testing.assert_frame_equal(cached, df)
 
 
 def test_fetch_quarterly_uses_disk_cache_on_second_call(tmp_path: Path) -> None:
@@ -465,6 +612,27 @@ def test_fetch_company_info_populates_prev_institution_count() -> None:
     assert abs(info["held_percent_institutions"] - 0.55) < 0.001
 
 
+def test_free_plan_company_info_uses_no_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live free-tier scoring skips profile and premium institutional calls."""
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "free", raising=False)
+    clear_session_cache()
+
+    with (
+        patch("core.data_client._fmp_get") as mock_get,
+        patch("core.data_client._fetch_inst_ownership_history") as mock_institutional,
+    ):
+        info = fetch_company_info("AAPL")
+
+    assert info == {
+        "shares_outstanding": None,
+        "held_percent_institutions": None,
+        "institution_count": None,
+        "prev_institution_count": None,
+    }
+    mock_get.assert_not_called()
+    mock_institutional.assert_not_called()
+
+
 # ─── Point-in-time institutional data filtering ───────────────────────────────
 
 
@@ -513,6 +681,30 @@ def test_raw_history_includes_inst_ownership_key() -> None:
         raw = _fetch_fmp_raw_history("TESTKEY")
 
     assert "inst_ownership_raw" in raw, "raw history dict must contain inst_ownership_raw"
+
+
+def test_free_plan_raw_history_skips_profile_and_institutional_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fundamental backtests on free mode use only the three statement requests."""
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "free", raising=False)
+    clear_session_cache()
+    calls: list[str] = []
+
+    def fake_get(endpoint: str, params: dict | None = None) -> list:
+        calls.append(endpoint)
+        return []
+
+    with (
+        patch("core.data_client._fmp_get", side_effect=fake_get),
+        patch("core.data_client._fetch_inst_ownership_history") as mock_institutional,
+    ):
+        raw = _fetch_fmp_raw_history("AAPL")
+
+    assert calls == ["income-statement", "income-statement", "balance-sheet-statement"]
+    assert raw["profile_raw"] == []
+    assert raw["inst_ownership_raw"] == []
+    mock_institutional.assert_not_called()
 
 
 # ─── C score 4-quarter YoY fallback ─────────────────────────────────────────

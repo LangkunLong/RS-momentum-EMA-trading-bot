@@ -670,7 +670,7 @@ class PortfolioSimulator:
         regime_tracker = MarketRegimeTracker()
         regime_tracker.bootstrap(benchmark_df, start_ts)
         self._regime_tracker = regime_tracker
-        self._ticker_industry = load_industry_map(tickers)
+        self._ticker_industry = {} if self.technical_only else load_industry_map(tickers)
 
         equity_series: Dict[str, float] = {}
         benchmark_series: Dict[str, float] = {}

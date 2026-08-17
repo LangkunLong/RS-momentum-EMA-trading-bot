@@ -33,7 +33,7 @@ Tests verify:
 from __future__ import annotations
 
 from typing import Dict
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -588,6 +588,38 @@ class TestPortfolioSimulatorRun:
 
         assert isinstance(result, SimulationResult)
         assert not result.equity_curve.empty
+
+    def test_technical_only_run_does_not_load_fmp_industry_profiles(self) -> None:
+        """Technical-only mode must make zero calls through the FMP industry path."""
+        prices = self._make_full_signal_ticker_ohlcv("NVDA", n=60)
+        all_closes = pd.DataFrame(
+            {"NVDA": prices["NVDA"]["Close"]},
+            index=prices["NVDA"].index,
+        )
+        fetcher = MagicMock()
+        fetcher.fetch_price_data.return_value = prices
+        fetcher.fetch_rs_universe_closes.return_value = all_closes
+        strategy = MagicMock()
+        strategy.evaluate_market.return_value = {"market_is_bullish": False}
+        sim = _make_simulator(
+            technical_only=True,
+            data_fetcher=fetcher,
+            strategy=strategy,
+        )
+
+        with (
+            patch("core.backtest_engine.get_sp500_tickers", return_value=[]),
+            patch("backtest_pnl.get_sp500_tickers", return_value=[]),
+            patch("core.backtest_engine.load_industry_map") as mock_industry_map,
+        ):
+            result = sim.run(
+                tickers=["NVDA"],
+                start_date=str(prices["SPY"].index[0].date()),
+                end_date=str(prices["SPY"].index[-1].date()),
+            )
+
+        assert isinstance(result, SimulationResult)
+        mock_industry_map.assert_not_called()
 
     def test_run_enters_position_on_buy_signal(self) -> None:
         sim = _make_simulator(min_canslim_score=40.0, min_rs_score=70.0, signal_every_n_days=1)

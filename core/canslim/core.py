@@ -27,7 +27,9 @@ from core.data_client import (
     fetch_company_info,
     fetch_ohlcv,
     fetch_quarterly_income_statement,
+    fmp_request_was_deferred,
     normalize_price_dataframe,
+    reset_fmp_request_context,
 )
 
 from .a_annual_earnings import evaluate_a
@@ -105,6 +107,7 @@ def evaluate_canslim(
         n_proximity_weight = settings.N_PROXIMITY_TO_HIGH_WEIGHT
 
     # 1. Fetch Fundamental Data with Error Handling
+    reset_fmp_request_context()
     income_statement_error = None
     balance_sheet_error = None
     try:
@@ -201,6 +204,9 @@ def evaluate_canslim(
     # redistributed when institutional data is unavailable.
     institutional_data_available = held_percent_institutions is not None or num_institutional_holders is not None
     has_fundamentals = current_growth is not None or annual_growth is not None
+    fmp_quota_deferred = fmp_request_was_deferred() and (
+        quarterly_income.empty or annual_income.empty
+    )
     data_availability = {
         "C": current_growth is not None,
         "A": annual_growth is not None,
@@ -253,6 +259,7 @@ def evaluate_canslim(
         "proximity_to_high": proximity_to_high,
         "avg_volume_50": avg_volume_50,
         "has_fundamentals": has_fundamentals,
+        "fmp_quota_deferred": fmp_quota_deferred,
         "shares_outstanding": shares_outstanding,
         "quarterly_income_available": not quarterly_income.empty,
         "annual_income_available": not annual_income.empty,

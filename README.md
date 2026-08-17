@@ -1,6 +1,6 @@
 # CANSLIM Trading Bot
 
-A CANSLIM stock scanner, historical portfolio backtester, and Alpaca paper-trading workflow. Market prices and broker state come from Alpaca; fundamentals and company profiles come from Financial Modeling Prep (FMP).
+A CANSLIM stock scanner, historical portfolio backtester, and Alpaca paper-trading workflow. Market prices and broker state come from Alpaca; financial statements come from Financial Modeling Prep (FMP). Company profiles and institutional data are intentionally skipped in the default free-plan mode.
 
 The project is being stabilized for supervised paper trading. Live-account trading is out of scope.
 
@@ -19,7 +19,7 @@ The active values are in `config/settings.py`. Treat older design plans as histo
 
 - Python 3.11 or newer
 - An Alpaca account and API credentials
-- An FMP API key whose plan includes the income-statement and balance-sheet endpoints used by the configured CANSLIM fundamental gate; institutional scoring additionally requires the stable Positions Summary endpoint
+- An FMP API key with access to the stable income-statement and balance-sheet endpoints used by the configured CANSLIM fundamental gate; institutional scoring is optional and disabled in the default free-plan mode
 - Windows only for the optional Task Scheduler integration; scanning, backtesting, tests, and manual paper operation are ordinary Python workflows
 
 Create an isolated environment and install the verified dependency set:
@@ -35,7 +35,7 @@ python -m pip install -r requirements-lock.txt
 
 ## Configuration
 
-Create a local `.env` file or set equivalent environment variables. `.env*` is ignored by Git.
+Copy `.env.example` to a local `.env` file or set equivalent environment variables. Real `.env*` files are ignored by Git; the credential-free example is tracked.
 
 Required:
 
@@ -50,6 +50,8 @@ Optional:
 
 ```text
 ALPACA_STOCK_FEED=iex
+FMP_PLAN=free
+FMP_DAILY_REQUEST_BUDGET=198
 EXECUTION_STORE_DB_PATH
 NOTIFY_EMAIL_FROM
 NOTIFY_EMAIL_TO
@@ -59,6 +61,14 @@ NOTIFY_EMAIL_PASSWORD
 Keep `ALPACA_PAPER=true`. Every execution entry point rejects a false value before constructing an Alpaca trading client or fill stream; `auto_trader.py --enable-orders` enables paper-account orders only. Notification credentials are optional; when absent, email delivery is skipped without blocking execution.
 
 Never commit credentials, generated scan results, execution databases, `.claude/settings.local.json`, or recovery artifacts. A previously exposed FMP key must be rotated at FMP even if the generated CSV is deleted locally; deletion does not revoke a key or remove it from Git history.
+
+### FMP free-plan controls
+
+`FMP_PLAN=free` is the default. [FMP documents 250 requests per day on that tier](https://site.financialmodelingprep.com/how-to/how-to-create-a-financial-modeling-prep-account); the bot persists a hard ceiling of 198 requests per 3 p.m. Eastern reset window, preserving 52 requests for manual or administrative use. Lower values are allowed through `FMP_DAILY_REQUEST_BUDGET`; higher values are capped at 198.
+
+Free mode enforces `limit=5`, disables automatic HTTP retries, caches successful statements for seven days, and makes only three requests for each uncached live candidate: quarterly income, annual income, and balance sheet. Candidates are submitted in descending RS order. Once the local budget is exhausted, affected candidates are labeled `quota_deferred` and excluded from both actionable buys and watchlists rather than being treated as ordinary missing data. The persisted counter is `.artifacts/cache/fmp_request_usage.json`; deleting or editing it can invalidate the safety guarantee.
+
+Profile and institutional-ownership calls are skipped in free mode. Unknown shares/float score neutrally, and the unavailable institutional weight is redistributed. `REQUIRE_FUNDAMENTALS_FOR_BUYS=true` remains in force, so missing statement evidence never becomes a free pass into an order.
 
 ## System layout
 
@@ -97,11 +107,13 @@ Run a read-only scan against configured providers:
 python enhanced_scanner.py
 ```
 
-Run a historical backtest and export equity/holdings artifacts:
+On the free FMP plan, use technical-only mode for broad-universe historical backtests; this path makes zero FMP calls:
 
 ```powershell
-python backtest_pnl.py --tickers AAPL MSFT NVDA --start-date 2023-04-01 --end-date 2026-04-01 --export-equity --export-holdings
+python backtest_pnl.py --universe sp500 --start-date 2023-04-01 --end-date 2026-04-01 --technical-only --export-equity --export-holdings
 ```
+
+Full fundamental backtests can use three FMP requests per uncached ticker and free-tier history is limited to five records. Run them only on small explicit ticker lists after checking the persisted daily budget.
 
 Generated outputs are ignored under `scan_results/`, `backtest_results*`, and `.artifacts/`.
 
@@ -148,7 +160,7 @@ Windows scheduled-task installation has a separate approval gate. Invoke setup t
 - On startup, the scheduler reconciles protective stops for broker positions.
 - Replayed final fills are idempotent; partial fills can still advance to a larger cumulative final quantity.
 - Sell notifications recover entry cost basis from the workflow or active-position store. If neither exists, P&L is reported as unavailable instead of zero.
-- FMP 402/403/404/429 and retry failures degrade without exposing the API key. `clear_session_cache()` resets the per-scan circuit breaker. Persistent `402` responses indicate a plan-entitlement mismatch, not a transient retry condition. Institutional ownership uses the current period-specific `institutional-ownership/symbol-positions-summary` endpoint; older `symbol-ownership` and `institutional-holder` routes are legacy APIs.
+- FMP 402/403/404/429 failures degrade without exposing the API key. `clear_session_cache()` resets only the per-scan circuit breaker; it does not reset persisted daily usage. Free mode performs no automatic retries. Persistent `402` responses indicate a plan-entitlement mismatch, not a transient retry condition. Paid mode can use the current period-specific `institutional-ownership/symbol-positions-summary` endpoint; older `symbol-ownership` and `institutional-holder` routes are legacy APIs.
 - If broker and SQLite state disagree, preserve broker/order ids, stop automated submission, and reconcile against Alpaca before retrying.
 
 The stabilization design and execution plans are under `docs/superpowers/`.
