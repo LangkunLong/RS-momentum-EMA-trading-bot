@@ -1,5 +1,7 @@
 # Portfolio State & Exit Engine Implementation Plan
 
+> **Superseded for implementation:** The canonical execution architecture is defined in `docs/superpowers/specs/2026-08-16-paper-trading-stabilization-design.md`. This file remains historical design context and must not be used to introduce a second portfolio state subsystem.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build an event-sourced portfolio state layer with O'Neil-principled exit rules and position sizing on top of the existing CANSLIM scanner, without modifying any existing code.

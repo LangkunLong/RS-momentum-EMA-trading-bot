@@ -9,7 +9,7 @@ Design principles:
   to ``false`` only when ready for live trading.
 - Buy entries are submitted first; protective stops are reconciled after the
   actual fill so the stop is anchored to the real fill price.
-- Stop-loss distance follows O'Neil: 7% below the *fill price* (configurable via
+- Stop-loss distance follows O'Neil: 8% below the *fill price* (configurable via
   ``STOP_LOSS_PCT`` in settings).
 - Callers never import alpaca directly — this is the single seam for trading ops.
 """

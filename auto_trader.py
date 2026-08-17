@@ -11,7 +11,7 @@ Safety features:
 - Paper mode is ON by default.  Set ALPACA_PAPER=false in .env for live orders.
 - Position limit: will not open more than MAX_OPEN_POSITIONS at once.
 - Per-position size: at most POSITION_SIZE_PCT of account equity per stock.
-- Hard stop: 7% below the actual fill price (STOP_LOSS_PCT).
+- Hard stop: 8% below the actual fill price (STOP_LOSS_PCT).
 - All exits are market-day orders; entries are day orders and the fill monitor
   reconciles protective stops after the fill is confirmed.
 """
@@ -223,7 +223,7 @@ def monitor_and_exit_positions(
     """Check all open positions for exit conditions and submit sell orders.
 
     Exit triggers (O'Neil rules):
-    1. **Hard stop**: position is down >= ``stop_loss_pct`` (default 7%).
+    1. **Hard stop**: position is down >= ``stop_loss_pct`` (default 8%).
     2. **Moving-average violation**: daily close has fallen below the
        ``ema_exit_period``-day EMA on two consecutive closes.
 
