@@ -101,10 +101,12 @@ def run_scheduler(dry_run: bool = False, run_now: bool = False) -> None:
     print(f"[SCHEDULER] Starting CANSLIM scheduler [{mode}]")
     print("[SCHEDULER] Press Ctrl-C to stop.")
 
-    monitor = FillMonitor()
-    monitor.start()
-
-    if not dry_run:
+    monitor: FillMonitor | None = None
+    if dry_run:
+        print("[SCHEDULER] Fill monitor disabled in dry-run mode.")
+    else:
+        monitor = FillMonitor()
+        monitor.start()
         _run_startup_stop_reconciliation()
 
     last_scan_date: date | None = None
@@ -126,7 +128,8 @@ def run_scheduler(dry_run: bool = False, run_now: bool = False) -> None:
 
     try:
         while True:
-            monitor = _ensure_fill_monitor_running(monitor, dry_run=dry_run)
+            if monitor is not None:
+                monitor = _ensure_fill_monitor_running(monitor, dry_run=False)
             now = _now_et()
             today = now.date()
 
@@ -179,7 +182,7 @@ def run_scheduler(dry_run: bool = False, run_now: bool = False) -> None:
                 ):
                     print(f"\n[SCHEDULER] {now.strftime('%H:%M ET')} — Hourly exit check")
                     try:
-                        exited = monitor_exits_hourly()
+                        exited = monitor_exits_hourly(dry_run=dry_run)
                         if exited:
                             print(f"[SCHEDULER] Hourly exits: {', '.join(exited)}")
                             notify_cycle_summary(entered=[], exited=exited, paper=_is_paper_mode())
@@ -191,7 +194,7 @@ def run_scheduler(dry_run: bool = False, run_now: bool = False) -> None:
                 elapsed = (now - last_daily_exit).total_seconds()
                 if elapsed >= _DAILY_EXIT_INTERVAL_SECS:
                     try:
-                        exited = monitor_and_exit_positions()
+                        exited = monitor_and_exit_positions(dry_run=dry_run)
                         if exited:
                             print(f"[SCHEDULER] Daily fallback exits: {', '.join(exited)}")
                         last_daily_exit = now
@@ -217,8 +220,11 @@ def run_scheduler(dry_run: bool = False, run_now: bool = False) -> None:
     except KeyboardInterrupt:
         print("\n[SCHEDULER] Shutdown requested.")
     finally:
-        monitor.stop()
-        print("[SCHEDULER] Fill monitor stopped. Goodbye.")
+        if monitor is not None:
+            monitor.stop()
+            print("[SCHEDULER] Fill monitor stopped. Goodbye.")
+        else:
+            print("[SCHEDULER] Dry-run scheduler stopped. Goodbye.")
 
 
 def _ensure_fill_monitor_running(monitor: FillMonitor, *, dry_run: bool) -> FillMonitor:

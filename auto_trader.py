@@ -219,6 +219,8 @@ def _rank_entry_candidates(actionable_buys: list[dict]) -> list[dict]:
 def monitor_and_exit_positions(
     stop_loss_pct: Optional[float] = None,
     ema_exit_period: int = 21,
+    *,
+    dry_run: bool = False,
 ) -> list[str]:
     """Check all open positions for exit conditions and submit sell orders.
 
@@ -233,6 +235,7 @@ def monitor_and_exit_positions(
     Args:
         stop_loss_pct: Override stop-loss percentage (default: settings value).
         ema_exit_period: EMA period for MA-violation check (default: 21-day).
+        dry_run: Report exit signals without submitting orders.
 
     Returns:
         List of ticker symbols for which an exit order was submitted.
@@ -256,6 +259,10 @@ def monitor_and_exit_positions(
             f"[EXIT] Hard stop triggered for {pos.symbol}: "
             f"{pct:.1f}% loss (threshold {-stop_loss_pct * 100:.0f}%)"
         )
+        if dry_run:
+            print(f"[DRY RUN] Would submit hard-stop exit for {pos.symbol}")
+            exited.append(pos.symbol)
+            continue
         result = order_manager.submit_exit(pos.symbol, exit_reason="hard stop triggered")
         if result.success:
             exited.append(pos.symbol)
@@ -276,6 +283,10 @@ def monitor_and_exit_positions(
                     f"[EXIT] MA violation for {pos.symbol}: "
                     f"2 consecutive closes below {ema_exit_period}-day EMA"
                 )
+                if dry_run:
+                    print(f"[DRY RUN] Would submit MA-violation exit for {pos.symbol}")
+                    exited.append(pos.symbol)
+                    continue
                 result = order_manager.submit_exit(
                     pos.symbol,
                     exit_reason=f"{ema_exit_period}-day EMA violation",
@@ -292,6 +303,8 @@ def monitor_exits_hourly(
     ema_period: int = 21,
     consecutive: int = 2,
     history_days: int = 10,
+    *,
+    dry_run: bool = False,
 ) -> list[str]:
     """Check open positions for exit signals using hourly OHLCV bars.
 
@@ -312,6 +325,7 @@ def monitor_exits_hourly(
         ema_period: EMA look-back in hourly bars (default 21 ≈ ~2.6 trading days).
         consecutive: Number of consecutive hourly closes below EMA to trigger.
         history_days: Calendar days of 1H history to fetch (default 10 trading days).
+        dry_run: Report exit signals without submitting orders.
 
     Returns:
         List of symbols for which an exit order was submitted.
@@ -330,6 +344,10 @@ def monitor_exits_hourly(
         print(
             f"[HOURLY EXIT] Hard stop for {pos.symbol}: {pct:.1f}% loss"
         )
+        if dry_run:
+            print(f"[DRY RUN] Would submit hourly hard-stop exit for {pos.symbol}")
+            exited.append(pos.symbol)
+            continue
         result = order_manager.submit_exit(pos.symbol, exit_reason="hourly hard stop triggered")
         if result.success:
             exited.append(pos.symbol)
@@ -349,6 +367,10 @@ def monitor_exits_hourly(
                     f"[HOURLY EXIT] MA violation for {pos.symbol}: "
                     f"{consecutive} consecutive hourly closes below {ema_period}-period hourly EMA"
                 )
+                if dry_run:
+                    print(f"[DRY RUN] Would submit hourly MA-violation exit for {pos.symbol}")
+                    exited.append(pos.symbol)
+                    continue
                 result = order_manager.submit_exit(
                     pos.symbol,
                     exit_reason=f"{consecutive} hourly closes below {ema_period}-period EMA",
@@ -391,9 +413,14 @@ def execute_entries(
 
     market_open = _is_market_open()
 
-    positions = get_open_positions()
+    try:
+        positions = get_open_positions(raise_on_error=True)
+        open_orders = get_open_orders(raise_on_error=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] Cannot inspect broker positions/orders; entries aborted: {exc}")
+        return []
+
     held_symbols = {p.symbol for p in positions}
-    open_orders = get_open_orders()
     open_order_symbols = {o.symbol for o in open_orders}
     pending_entry_symbols = {o.symbol for o in open_orders if _is_buy_order(o)}
     already_active = held_symbols | open_order_symbols
@@ -503,7 +530,7 @@ def run_auto_trader(
     # --- Phase 1: Exit monitoring ---
     if not skip_exits:
         print("\n--- Phase 1: Exit monitoring ---")
-        exited = monitor_and_exit_positions()
+        exited = monitor_and_exit_positions(dry_run=dry_run)
         if exited:
             print(f"Exited {len(exited)} position(s): {', '.join(exited)}")
         else:

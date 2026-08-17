@@ -488,11 +488,12 @@ class TestPathF_SchedulerCycle:
         with patch("scheduler._now_et", side_effect=_mock_now), \
              patch("scheduler.time.sleep", side_effect=_sleep), \
              patch("scheduler.FillMonitor") as MockFM, \
+             patch("scheduler._run_startup_stop_reconciliation"), \
              patch("scheduler.monitor_and_exit_positions", return_value=[]), \
              patch("scheduler.monitor_exits_hourly", return_value=[]):
             mock_inst = MagicMock()
             MockFM.return_value = mock_inst
-            run_scheduler(dry_run=True)
+            run_scheduler(dry_run=False)
 
         mock_inst.start.assert_called_once()
         mock_inst.stop.assert_called()
@@ -549,11 +550,12 @@ class TestPathF_SchedulerCycle:
         with patch("scheduler._now_et", side_effect=_mock_now), \
              patch("scheduler.time.sleep", side_effect=_sleep), \
              patch("scheduler.FillMonitor") as MockFM, \
+             patch("scheduler._run_startup_stop_reconciliation"), \
              patch("scheduler.monitor_and_exit_positions", return_value=[]), \
              patch("scheduler.monitor_exits_hourly", return_value=[]):
             mock_inst = MagicMock()
             MockFM.return_value = mock_inst
-            run_scheduler(dry_run=True)
+            run_scheduler(dry_run=False)
 
         mock_inst.stop.assert_called_once()
 

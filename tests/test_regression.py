@@ -226,8 +226,8 @@ class TestBug4LastHourlyCheckFires:
             if tick["count"] >= 2:
                 raise KeyboardInterrupt
 
-        def _mock_hourly():
-            hourly_call_times.append(True)
+        def _mock_hourly(*, dry_run: bool = False):
+            hourly_call_times.append(dry_run)
             return []
 
         with patch("scheduler._now_et", side_effect=_mock_now), \
@@ -239,7 +239,9 @@ class TestBug4LastHourlyCheckFires:
             mock_fm.return_value.stop = MagicMock()
             run_scheduler(dry_run=True)
 
-        assert hourly_call_times, "monitor_exits_hourly not called at 16:01 — last bar missed"
+        assert hourly_call_times == [True], (
+            "monitor_exits_hourly not called safely at 16:01 — last bar missed"
+        )
 
 
 class TestSchedulerSkipsHolidayWhenClockClosed:
@@ -354,10 +356,11 @@ class TestFillMonitorRecovery:
 
         with patch("scheduler._now_et", side_effect=_mock_now), \
              patch("scheduler.time.sleep", side_effect=_mock_sleep), \
+             patch("scheduler._run_startup_stop_reconciliation"), \
              patch("scheduler.monitor_and_exit_positions", return_value=[]), \
              patch("scheduler.monitor_exits_hourly", return_value=[]), \
              patch("scheduler.FillMonitor", side_effect=[first_monitor, replacement_monitor]):
-            run_scheduler(dry_run=True)
+            run_scheduler(dry_run=False)
 
         first_monitor.start.assert_called_once()
         first_monitor.stop.assert_called_once()
