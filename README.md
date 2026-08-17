@@ -19,7 +19,7 @@ The active values are in `config/settings.py`. Treat older design plans as histo
 
 - Python 3.11 or newer
 - An Alpaca account and API credentials
-- An FMP API key
+- An FMP API key whose plan includes the income-statement and balance-sheet endpoints used by the configured CANSLIM fundamental gate
 - Windows only for the optional Task Scheduler integration; scanning, backtesting, tests, and manual paper operation are ordinary Python workflows
 
 Create an isolated environment and install the verified dependency set:
@@ -118,6 +118,8 @@ python auto_trader.py --dry-run
 
 The dry run still performs provider reads and may take time. It prints intended entries/exits but does not submit them.
 
+Treat FMP `402` responses for income statements or balance sheets as a deployment blocker for strategy entries when `REQUIRE_FUNDAMENTALS_FOR_BUYS=true`. The scan still completes and reports technical/watchlist results, but candidates with unavailable fundamentals intentionally cannot pass the buy gate. Upgrade the FMP plan or select and validate a replacement fundamental-data provider; do not weaken the gate merely to make orders appear.
+
 Run the scheduler in dry-run mode:
 
 ```powershell
@@ -146,7 +148,7 @@ Windows scheduled-task installation has a separate approval gate. Inspect the in
 - On startup, the scheduler reconciles protective stops for broker positions.
 - Replayed final fills are idempotent; partial fills can still advance to a larger cumulative final quantity.
 - Sell notifications recover entry cost basis from the workflow or active-position store. If neither exists, P&L is reported as unavailable instead of zero.
-- FMP 402/403/404/429 and retry failures degrade without exposing the API key. `clear_session_cache()` resets the per-scan circuit breaker.
+- FMP 402/403/404/429 and retry failures degrade without exposing the API key. `clear_session_cache()` resets the per-scan circuit breaker. Persistent `402` responses indicate a plan-entitlement mismatch, not a transient retry condition.
 - If broker and SQLite state disagree, preserve broker/order ids, stop automated submission, and reconcile against Alpaca before retrying.
 
 The stabilization design and execution plans are under `docs/superpowers/`.
