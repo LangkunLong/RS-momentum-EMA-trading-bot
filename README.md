@@ -124,7 +124,7 @@ Validate configuration and broker connectivity without submitting an order:
 ```powershell
 python paper_trading_console.py doctor
 python paper_trading_console.py checklist
-python paper_trading_console.py run-now --dry-run
+python paper_trading_console.py run-now
 python auto_trader.py --dry-run
 ```
 
@@ -135,14 +135,24 @@ Treat FMP `402` responses for income statements or balance sheets as a deploymen
 Run the scheduler in dry-run mode:
 
 ```powershell
-python scheduler.py --dry-run --now
+python scheduler.py --now
 ```
 
-The scheduler continues running after the immediate cycle; press Ctrl-C to stop it.
+Both commands default to dry run. `paper_trading_console.py run-now` is
+intentionally dry-run only and refuses `--enable-orders`. Use the canonical
+scheduler path for a supervised order-enabled cycle:
+
+```powershell
+python scheduler.py --enable-orders --now
+```
+
+The scheduler continues running after the immediate cycle; press Ctrl-C to
+stop it, or add `--session` to exit after 16:05 ET.
 
 ## Supervised paper validation
 
-Do not run `verify_paper_trading.py`, `paper_trading_console.py run-now` without `--dry-run`, or task installation as an unattended first step.
+Do not run `verify_paper_trading.py --execute`, pass `--enable-orders` to an
+operator command, or install an order-enabled task as an unattended first step.
 
 Before the one-share paper lifecycle:
 
@@ -161,7 +171,20 @@ python verify_paper_trading.py --execute
 
 `--execute` authorizes one SPY paper buy/fill/protective-stop/cleanup lifecycle. Omitting it refuses before broker access.
 
-Windows scheduled-task installation has a separate approval gate. Invoke setup through the stable project interpreter (`.venv\Scripts\python.exe`) and inspect the interpreter, repository path, arguments, trigger, working directory, user identity, and log destination before running `paper_trading_console.py install-task` or `setup_windows_task.py`. The registered action changes into the repository and writes to `.artifacts/logs/scheduler.log`. The default installed task includes `--dry-run`; enabling paper order submission requires the separate `--enable-orders` flag and a second explicit approval after the dry-run task is observed.
+Windows scheduled-task installation has a separate approval gate. Invoke setup
+through the stable project interpreter (`.venv\Scripts\python.exe`) and inspect
+the interpreter path, repository path, mode, trigger, user identity, and log
+destination before running `paper_trading_console.py install-task` or
+`setup_windows_task.py`. The XML task action runs the project virtual
+environment directly, sets the repository as its working directory, and writes
+through the scheduler's unbuffered task log. The default task runs
+`--dry-run --session --fmp-daily-budget 0`; enabling paper orders requires the
+separate `--enable-orders` flag after that task is observed. The order-enabled
+task uses `--fmp-daily-budget 20`, a conservative per-process allowance for the
+FMP free plan; it does not raise the persisted daily hard ceiling.
+Only one scheduler process can run on the host, and live order paths remain
+disabled until the fill stream is connected and startup stop reconciliation
+succeeds.
 
 ## Recovery and troubleshooting
 

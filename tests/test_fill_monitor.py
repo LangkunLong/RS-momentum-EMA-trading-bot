@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -143,7 +144,6 @@ class TestHandlerRegistration:
         mock_cls.assert_called_once()
         _, kwargs = mock_cls.call_args
         assert kwargs.get("paper") is True or mock_cls.call_args[0][2] is True
-
 
 # ---------------------------------------------------------------------------
 # Fill event → notify_buy_filled
@@ -373,19 +373,57 @@ class TestLifecycle:
             monitor.start()  # second call — should be a no-op
             assert monitor._thread is thread_1
 
-    def test_stop_calls_stream_stop(self):
+    def test_stop_returns_true_after_stream_worker_terminates(self):
         monitor, mock_stream, _ = _build_monitor_with_mock_stream()
-        mock_stream.run = MagicMock()
+        worker_release = threading.Event()
 
-        with patch.object(monitor, "_run_stream"):
-            monitor.start()
+        def finish_worker():
+            worker_release.wait()
+            time.sleep(0.05)
 
-        monitor.stop()
+        worker = threading.Thread(target=finish_worker, daemon=True)
+        worker.start()
+        mock_stream.stop.side_effect = worker_release.set
+        monitor._thread = worker
+        monitor._running = True
+
+        try:
+            stopped = monitor.stop()
+        finally:
+            worker_release.set()
+            worker.join(timeout=1)
+
         mock_stream.stop.assert_called_once()
+        assert stopped is True
+        assert worker.is_alive() is False
         assert monitor._running is False
 
-    def test_stop_is_safe_when_not_running(self):
+    def test_stop_returns_false_without_blocking_on_wedged_stream_stop(self):
         monitor, mock_stream, _ = _build_monitor_with_mock_stream()
-        # Should not raise even though we never called start()
-        monitor.stop()
-        mock_stream.stop.assert_not_called()
+        stop_release = threading.Event()
+        stop_started = threading.Event()
+        worker_release = threading.Event()
+        worker = threading.Thread(target=worker_release.wait, daemon=True)
+        worker.start()
+
+        def wedged_stop():
+            stop_started.set()
+            stop_release.wait(timeout=1)
+
+        mock_stream.stop.side_effect = wedged_stop
+        monitor._thread = worker
+        monitor._running = True
+
+        started_at = time.monotonic()
+        try:
+            with patch("fill_monitor._STOP_JOIN_TIMEOUT_SECS", 0.05):
+                stopped = monitor.stop()
+            elapsed = time.monotonic() - started_at
+        finally:
+            stop_release.set()
+            worker_release.set()
+            worker.join(timeout=1)
+
+        assert stop_started.is_set()
+        assert elapsed < 0.4
+        assert stopped is False

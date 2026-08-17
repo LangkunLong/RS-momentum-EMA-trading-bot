@@ -171,23 +171,23 @@ After approval, force-push only the verified rewritten refs with lease protectio
 - Consumes: rotated provider credentials, `ALPACA_PAPER=true`, green offline release gate, and the canonical execution workflow.
 - Produces: evidence that one paper buy/fill/protective-stop/sell lifecycle is auditable and recoverable.
 
-- [ ] **Step 1: Verify the external-operation preconditions**
+- [x] **Step 1: Verify the external-operation preconditions**
 
 Confirm `ALPACA_PAPER=true`, account endpoint is the paper endpoint, symbol and one-share quantity are displayed, market status is known, notifications are configured as intended, and no live-account credential is active.
 
-- [ ] **Step 2: Request explicit approval for the one-share paper order**
+- [x] **Step 2: Request explicit approval for the one-share paper order**
 
 State the exact symbol, quantity, order type, and cleanup behavior. Do not submit before approval.
 
-- [ ] **Step 3: Run the supervised verification lifecycle**
+- [x] **Step 3: Run the supervised verification lifecycle**
 
 Run `verify_paper_trading.py` with its documented confirmation gate. Observe the buy submission/fill, actual-fill protective stop, durable transitions, restart resolution, and cleanup sell/cancel behavior.
 
-- [ ] **Step 4: Inspect broker and local audit state**
+- [x] **Step 4: Inspect broker and local audit state**
 
 Compare Alpaca orders/positions with SQLite workflow snapshots, order references, active-position ownership, and append-only transition history. Verify no orphan position or order remains.
 
-- [ ] **Step 5: Diagnose any mismatch before repeating**
+- [x] **Step 5: Diagnose any mismatch before repeating**
 
 If validation fails, capture broker ids and sanitized state, reproduce offline with a failing test, implement one root-cause fix, rerun the full offline gate, and request approval again before another paper order.
 
@@ -204,21 +204,21 @@ If validation fails, capture broker ids and sanitized state, reproduce offline w
 
 Show task name, interpreter path, repository path, arguments, trigger time/time zone, working directory, user identity, and log destination.
 
-- [ ] **Step 2: Request explicit installation approval**
+- [x] **Step 2: Request explicit installation approval**
 
 Do not create or replace a scheduled task until the user approves the displayed configuration.
 
-- [ ] **Step 3: Install and inspect the task**
+- [x] **Step 3: Install and inspect the task**
 
 Run the setup script, query the resulting Windows task, and verify command, trigger, working directory, and paper-mode environment.
 
-- [ ] **Step 4: Run one supervised scheduled dry run**
+- [x] **Step 4: Run one supervised scheduled dry run**
 
 Trigger the task with dry-run arguments, inspect exit status and logs, and confirm no broker mutation occurred.
 
 - [ ] **Step 5: Enable the validated paper schedule**
 
-Replace the dry-run arguments only after the user explicitly approves automated paper order submission. Inspect the final task once more and record rollback/removal instructions.
+Replace the dry-run arguments only after the user explicitly approves automated paper order submission. Keep the live task on the conservative free-plan process cap `--fmp-daily-budget 20`, inspect the final task once more, and record rollback/removal instructions.
 
 ### Task 7: Finalize Branch and Worktree Hygiene
 

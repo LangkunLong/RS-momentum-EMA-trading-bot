@@ -6,7 +6,8 @@ Alpaca paper account. Live-account trading is out of scope.
 Examples:
     python paper_trading_console.py doctor
     python paper_trading_console.py status --limit 10
-    python paper_trading_console.py run-now --dry-run
+    python paper_trading_console.py run-now
+    python scheduler.py --enable-orders --now
     python paper_trading_console.py install-task
     python paper_trading_console.py task-status
 """
@@ -495,8 +496,24 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Show paper account, signals, and workflow status")
     status_parser.add_argument("--limit", type=int, default=10, help="Rows to show in status sections")
 
-    run_now_parser = subparsers.add_parser("run-now", help="Run the bot immediately")
-    run_now_parser.add_argument("--dry-run", action="store_true", help="Observe signals without submitting paper orders")
+    run_now_parser = subparsers.add_parser(
+        "run-now",
+        help="Run one cycle immediately (dry run by default)",
+    )
+    run_now_mode = run_now_parser.add_mutually_exclusive_group()
+    run_now_mode.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=True,
+        help="Observe signals without submitting paper orders (default)",
+    )
+    run_now_mode.add_argument(
+        "--enable-orders",
+        dest="dry_run",
+        action="store_false",
+        help="Refused here; use scheduler.py --enable-orders --now",
+    )
 
     install_parser = subparsers.add_parser(
         "install-task",
@@ -523,7 +540,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.command == "status":
         return print_status(limit=args.limit)
     if args.command == "run-now":
-        return run_now(dry_run=args.dry_run)
+        if not args.dry_run:
+            parser.error(
+                "paper_trading_console.py run-now is dry-run only; "
+                "use `python scheduler.py --enable-orders --now` for the canonical order path"
+            )
+        return run_now(dry_run=True)
     if args.command == "install-task":
         return register_task(dry_run=not args.enable_orders)
     if args.command == "task-status":

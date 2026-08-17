@@ -14,6 +14,10 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def _execution_ready() -> bool:
+    return True
+
+
 def _make_hourly_bars(n: int = 60, trend: str = "flat", base: float = 100.0) -> pd.DataFrame:
     """Generate synthetic 1H OHLCV bars.
 
@@ -228,7 +232,7 @@ class TestMonitorExitsHourly:
         from auto_trader import monitor_exits_hourly
 
         with self._patch_positions([]):
-            result = monitor_exits_hourly()
+            result = monitor_exits_hourly(execution_ready=_execution_ready)
 
         assert result == []
 
@@ -244,7 +248,7 @@ class TestMonitorExitsHourly:
              self._patch_hourly_bars(bars), \
              patch("auto_trader.check_exit_signals", return_value=[pos]), \
              patch("auto_trader.OrderManager", return_value=manager):
-            result = monitor_exits_hourly()
+            result = monitor_exits_hourly(execution_ready=_execution_ready)
 
         assert "NVDA" in result
 
@@ -258,7 +262,7 @@ class TestMonitorExitsHourly:
              self._patch_hourly_bars(bars), \
              patch("auto_trader.check_exit_signals", return_value=[]), \
              patch("auto_trader.OrderManager") as mock_manager_cls:
-            result = monitor_exits_hourly()
+            result = monitor_exits_hourly(execution_ready=_execution_ready)
 
         mock_manager_cls.return_value.submit_exit.assert_not_called()
         assert result == []
@@ -282,7 +286,11 @@ class TestMonitorExitsHourly:
              self._patch_hourly_bars(bars_up), \
              patch("auto_trader.check_exit_signals", return_value=[]), \
              patch("auto_trader.OrderManager", return_value=manager):
-            result = monitor_exits_hourly(ema_period=21, consecutive=2)
+            result = monitor_exits_hourly(
+                ema_period=21,
+                consecutive=2,
+                execution_ready=_execution_ready,
+            )
 
         assert "AAPL" in result
 
@@ -297,7 +305,7 @@ class TestMonitorExitsHourly:
              self._patch_hourly_bars(bars), \
              patch("auto_trader.check_exit_signals", return_value=[]), \
              patch("auto_trader.OrderManager") as mock_manager_cls:
-            result = monitor_exits_hourly()
+            result = monitor_exits_hourly(execution_ready=_execution_ready)
 
         mock_manager_cls.return_value.submit_exit.assert_not_called()
         assert result == []
@@ -314,7 +322,10 @@ class TestMonitorExitsHourly:
              self._patch_hourly_bars(bars), \
              patch("auto_trader.check_exit_signals", return_value=[]), \
              patch("auto_trader.OrderManager") as mock_manager_cls:
-            result = monitor_exits_hourly(ema_period=21)
+            result = monitor_exits_hourly(
+                ema_period=21,
+                execution_ready=_execution_ready,
+            )
 
         mock_manager_cls.return_value.submit_exit.assert_not_called()
         assert result == []
@@ -333,7 +344,7 @@ class TestMonitorExitsHourly:
              self._patch_hourly_bars(bars), \
              patch("auto_trader.check_exit_signals", return_value=[pos]), \
              patch("auto_trader.OrderManager", return_value=manager):
-            result = monitor_exits_hourly()
+            result = monitor_exits_hourly(execution_ready=_execution_ready)
 
         assert manager.submit_exit.call_count == 1
         assert result == ["NVDA"]

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from typing import Any
 
 from alpaca.trading.stream import TradingStream
@@ -15,6 +16,9 @@ from alpaca.trading.stream import TradingStream
 from config import settings
 from core.order_execution import require_paper_mode
 from core.order_manager import OrderManager
+
+
+_STOP_JOIN_TIMEOUT_SECS = 5.0
 
 
 class FillMonitor:
@@ -55,16 +59,50 @@ class FillMonitor:
         self._thread.start()
         print("[FILL MONITOR] Started (paper mode) — listening for trade updates")
 
-    def stop(self) -> None:
-        """Signal the WebSocket stream to close."""
-        if not self._running:
-            return
+    def stop(self) -> bool:
+        """Stop the stream within one time budget and report full termination."""
         self._running = False
-        try:
-            self._stream.stop()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[FILL MONITOR] Error stopping stream: {exc}")
-        print("[FILL MONITOR] Stop requested.")
+        deadline = time.monotonic() + _STOP_JOIN_TIMEOUT_SECS
+        stop_errors: list[Exception] = []
+
+        def request_stream_stop() -> None:
+            try:
+                self._stream.stop()
+            except Exception as exc:  # noqa: BLE001
+                stop_errors.append(exc)
+
+        stop_request = threading.Thread(
+            target=request_stream_stop,
+            name="FillMonitorStop",
+            daemon=True,
+        )
+        stop_request.start()
+        stop_request.join(timeout=max(0.0, deadline - time.monotonic()))
+        request_finished = not stop_request.is_alive()
+
+        if not request_finished:
+            print("[FILL MONITOR] Stream stop request did not finish before timeout.")
+        elif stop_errors:
+            print(f"[FILL MONITOR] Error stopping stream: {stop_errors[0]}")
+
+        thread = self._thread
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+        ):
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        worker_stopped = thread is None or not thread.is_alive()
+        if not worker_stopped:
+            print("[FILL MONITOR] Stream thread did not stop before timeout.")
+
+        stopped = request_finished and not stop_errors and worker_stopped
+        if stopped:
+            print("[FILL MONITOR] Stopped.")
+        else:
+            print("[FILL MONITOR] Shutdown incomplete.")
+        return stopped
 
     def is_running(self) -> bool:
         """Return True when the background thread is alive."""

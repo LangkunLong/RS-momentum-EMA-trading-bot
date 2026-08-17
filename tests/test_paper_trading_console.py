@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 import paper_trading_console as console
 
@@ -233,12 +234,30 @@ def test_recent_signal_quality_reports_top_executable_setups(tmp_path: Path) -> 
     assert "top=MSFT, AAPL" in result.detail
 
 
-def test_main_run_now_delegates_to_auto_trader() -> None:
+def test_main_run_now_defaults_to_dry_run() -> None:
+    with patch("paper_trading_console.run_auto_trader") as mock_run:
+        rc = console.main(["run-now"])
+
+    assert rc == 0
+    mock_run.assert_called_once_with(dry_run=True)
+
+
+def test_main_run_now_preserves_explicit_dry_run_flag() -> None:
     with patch("paper_trading_console.run_auto_trader") as mock_run:
         rc = console.main(["run-now", "--dry-run"])
 
     assert rc == 0
     mock_run.assert_called_once_with(dry_run=True)
+
+
+def test_main_run_now_refuses_orders_and_directs_to_canonical_scheduler(capsys) -> None:
+    with patch("paper_trading_console.run_auto_trader") as mock_run:
+        with pytest.raises(SystemExit) as exc_info:
+            console.main(["run-now", "--enable-orders"])
+
+    assert exc_info.value.code == 2
+    mock_run.assert_not_called()
+    assert "python scheduler.py --enable-orders --now" in capsys.readouterr().err
 
 
 def test_main_install_task_delegates_to_setup() -> None:

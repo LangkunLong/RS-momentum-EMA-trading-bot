@@ -62,6 +62,7 @@ class TestBug1LatestCloseColumnName:
              patch("auto_trader.get_open_positions", return_value=[]), \
              patch("auto_trader.get_open_orders", return_value=[]), \
              patch("auto_trader.fetch_ohlcv", return_value=self._make_bars()), \
+             patch("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", False), \
              patch("auto_trader.OrderManager") as mock_manager_cls, \
              patch("builtins.print", side_effect=lambda *a: logged.append(" ".join(str(x) for x in a))):
             mock_manager_cls.return_value.submit_entry.return_value = SimpleNamespace(
@@ -69,7 +70,7 @@ class TestBug1LatestCloseColumnName:
                 dry_run=False,
                 workflow_id="wf-nvda-regression",
             )
-            execute_entries([opp])
+            execute_entries([opp], execution_ready=lambda: True)
 
         # The bug caused: "could not fetch price — skipping"
         price_skip = [m for m in logged if "could not fetch price" in m]
@@ -339,11 +340,13 @@ class TestFillMonitorRecovery:
 
         first_monitor = MagicMock()
         first_monitor.is_running.return_value = False
+        first_monitor.is_connected.side_effect = [True, False]
         first_monitor.start = MagicMock()
         first_monitor.stop = MagicMock()
 
         replacement_monitor = MagicMock()
         replacement_monitor.is_running.return_value = True
+        replacement_monitor.is_connected.return_value = True
         replacement_monitor.start = MagicMock()
         replacement_monitor.stop = MagicMock()
 

@@ -109,8 +109,9 @@ class TestPathA_BuySignalToOrder:
              patch("auto_trader.get_open_positions", return_value=[]), \
              patch("auto_trader.get_open_orders", return_value=[]), \
              patch("auto_trader.fetch_ohlcv", return_value=bars), \
+             patch("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", False), \
              patch("auto_trader.OrderManager", return_value=manager):
-            result = execute_entries([signal])
+            result = execute_entries([signal], execution_ready=lambda: True)
 
         assert "NVDA" in result
         manager.submit_entry.assert_called_once()
@@ -150,9 +151,13 @@ class TestPathA_BuySignalToOrder:
              patch("auto_trader.get_open_positions", return_value=[]), \
              patch("auto_trader.get_open_orders", return_value=[]), \
              patch("auto_trader.fetch_ohlcv", return_value=bars), \
+             patch("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", False), \
              patch("auto_trader.OrderManager", return_value=manager):
-            execute_entries([{"symbol": "NVDA", "total_score": 75, "rs_score": 88,
-                              "is_breakout": True, "has_volume_surge": True, "buy_point": 850.0}])
+            execute_entries(
+                [{"symbol": "NVDA", "total_score": 75, "rs_score": 88,
+                  "is_breakout": True, "has_volume_surge": True, "buy_point": 850.0}],
+                execution_ready=lambda: True,
+            )
 
         actual_qty = manager.submit_entry.call_args.args[0].qty
         assert actual_qty == pytest.approx(expected_qty, rel=0.01)
@@ -360,7 +365,10 @@ class TestPathD_SoftwareStopLoss:
              patch("auto_trader.check_exit_signals", return_value=[pos]), \
              patch("auto_trader.OrderManager", return_value=manager), \
              patch("auto_trader.fetch_ohlcv", return_value=_make_ohlcv()):
-            exited = monitor_and_exit_positions(stop_loss_pct=0.07)
+            exited = monitor_and_exit_positions(
+                stop_loss_pct=0.07,
+                execution_ready=lambda: True,
+            )
 
         assert "AAPL" in exited
         manager.submit_exit.assert_called_once()
@@ -377,7 +385,10 @@ class TestPathD_SoftwareStopLoss:
              patch("auto_trader.check_exit_signals", return_value=[pos]), \
              patch("auto_trader.OrderManager", return_value=manager), \
              patch("auto_trader.fetch_ohlcv", return_value=_make_ohlcv()):
-            monitor_and_exit_positions(stop_loss_pct=0.07)
+            monitor_and_exit_positions(
+                stop_loss_pct=0.07,
+                execution_ready=lambda: True,
+            )
 
         manager.submit_exit.assert_called_once()
 
@@ -431,7 +442,11 @@ class TestPathE_HourlyMAViolation:
              patch("auto_trader.check_exit_signals", return_value=[]), \
              patch("auto_trader.fetch_hourly_ohlcv", return_value=bars), \
              patch("auto_trader.OrderManager", return_value=manager):
-            exited = monitor_exits_hourly(ema_period=21, consecutive=2)
+            exited = monitor_exits_hourly(
+                ema_period=21,
+                consecutive=2,
+                execution_ready=lambda: True,
+            )
 
         assert "CRWD" in exited
         manager.submit_exit.assert_called_once()
@@ -448,7 +463,7 @@ class TestPathE_HourlyMAViolation:
              patch("auto_trader.check_exit_signals", return_value=[pos]), \
              patch("auto_trader.OrderManager", return_value=manager), \
              patch("auto_trader.fetch_hourly_ohlcv", return_value=_make_ohlcv()):
-            monitor_exits_hourly()
+            monitor_exits_hourly(execution_ready=lambda: True)
 
         manager.submit_exit.assert_called_once()
 
@@ -683,6 +698,7 @@ class TestPathG_AlpacaMockBrokerLifecycle:
                 patch("auto_trader.get_open_orders", return_value=[]),
                 patch("auto_trader.fetch_ohlcv", return_value=bars),
                 patch("auto_trader._is_market_open", return_value=False),
+                patch("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", False),
                 patch("auto_trader._is_paper_mode", return_value=True),
                 patch("core.order_execution._get_trading_client", return_value=mock_client),
                 patch(
@@ -693,7 +709,11 @@ class TestPathG_AlpacaMockBrokerLifecycle:
                 patch("core.order_manager.notify_buy_filled", return_value=True),
                 patch("core.order_manager.notify_sell_filled", return_value=True),
             ):
-                entered = execute_entries([signal], dry_run=False)
+                entered = execute_entries(
+                    [signal],
+                    dry_run=False,
+                    execution_ready=lambda: True,
+                )
                 assert entered == ["NVDA"]
 
                 entry_req = mock_client.submit_order.call_args_list[0][0][0]

@@ -18,6 +18,7 @@ Safety features:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -36,6 +37,45 @@ from core.order_execution import (
     require_paper_mode,
 )
 from enhanced_scanner import scan_for_canslim_stocks
+
+
+ExecutionReadinessCheck = Callable[[], bool]
+
+
+class ExecutionReadinessError(RuntimeError):
+    """Raised when a live order cannot prove execution monitoring is healthy."""
+
+
+def _validate_execution_readiness_callback(
+    *,
+    dry_run: bool,
+    execution_ready: ExecutionReadinessCheck | None,
+) -> None:
+    """Require an explicit dynamic readiness source for every live path."""
+    if not dry_run and execution_ready is None:
+        raise ExecutionReadinessError(
+            "Live execution requires a readiness callback"
+        )
+
+
+def _require_execution_ready(
+    execution_ready: ExecutionReadinessCheck | None,
+) -> None:
+    """Re-check live monitoring immediately before a broker mutation."""
+    if execution_ready is None:
+        raise ExecutionReadinessError(
+            "Live execution requires a readiness callback"
+        )
+    try:
+        ready = bool(execution_ready())
+    except Exception as exc:  # noqa: BLE001
+        raise ExecutionReadinessError(
+            "Live execution readiness check failed"
+        ) from exc
+    if not ready:
+        raise ExecutionReadinessError(
+            "Live execution readiness check failed"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +262,7 @@ def monitor_and_exit_positions(
     ema_exit_period: int = 21,
     *,
     dry_run: bool = False,
+    execution_ready: ExecutionReadinessCheck | None = None,
 ) -> list[str]:
     """Check all open positions for exit conditions and submit sell orders.
 
@@ -237,6 +278,8 @@ def monitor_and_exit_positions(
         stop_loss_pct: Override stop-loss percentage (default: settings value).
         ema_exit_period: EMA period for MA-violation check (default: 21-day).
         dry_run: Report exit signals without submitting orders.
+        execution_ready: Dynamic live-monitor readiness check. Required for
+            order-enabled execution and re-evaluated immediately before submit.
 
     Returns:
         List of ticker symbols for which an exit order was submitted.
@@ -264,6 +307,7 @@ def monitor_and_exit_positions(
             print(f"[DRY RUN] Would submit hard-stop exit for {pos.symbol}")
             exited.append(pos.symbol)
             continue
+        _require_execution_ready(execution_ready)
         result = order_manager.submit_exit(pos.symbol, exit_reason="hard stop triggered")
         if result.success:
             exited.append(pos.symbol)
@@ -288,12 +332,15 @@ def monitor_and_exit_positions(
                     print(f"[DRY RUN] Would submit MA-violation exit for {pos.symbol}")
                     exited.append(pos.symbol)
                     continue
+                _require_execution_ready(execution_ready)
                 result = order_manager.submit_exit(
                     pos.symbol,
                     exit_reason=f"{ema_exit_period}-day EMA violation",
                 )
                 if result.success:
                     exited.append(pos.symbol)
+        except ExecutionReadinessError:
+            raise
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] MA check failed for {pos.symbol}: {exc}")
 
@@ -306,6 +353,7 @@ def monitor_exits_hourly(
     history_days: int = 10,
     *,
     dry_run: bool = False,
+    execution_ready: ExecutionReadinessCheck | None = None,
 ) -> list[str]:
     """Check open positions for exit signals using hourly OHLCV bars.
 
@@ -327,6 +375,8 @@ def monitor_exits_hourly(
         consecutive: Number of consecutive hourly closes below EMA to trigger.
         history_days: Calendar days of 1H history to fetch (default 10 trading days).
         dry_run: Report exit signals without submitting orders.
+        execution_ready: Dynamic live-monitor readiness check. Required for
+            order-enabled execution and re-evaluated immediately before submit.
 
     Returns:
         List of symbols for which an exit order was submitted.
@@ -349,6 +399,7 @@ def monitor_exits_hourly(
             print(f"[DRY RUN] Would submit hourly hard-stop exit for {pos.symbol}")
             exited.append(pos.symbol)
             continue
+        _require_execution_ready(execution_ready)
         result = order_manager.submit_exit(pos.symbol, exit_reason="hourly hard stop triggered")
         if result.success:
             exited.append(pos.symbol)
@@ -372,12 +423,15 @@ def monitor_exits_hourly(
                     print(f"[DRY RUN] Would submit hourly MA-violation exit for {pos.symbol}")
                     exited.append(pos.symbol)
                     continue
+                _require_execution_ready(execution_ready)
                 result = order_manager.submit_exit(
                     pos.symbol,
                     exit_reason=f"{consecutive} hourly closes below {ema_period}-period EMA",
                 )
                 if result.success:
                     exited.append(pos.symbol)
+        except ExecutionReadinessError:
+            raise
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] Hourly MA check failed for {pos.symbol}: {exc}")
 
@@ -392,6 +446,8 @@ def monitor_exits_hourly(
 def execute_entries(
     actionable_buys: list[dict],
     dry_run: bool = False,
+    *,
+    execution_ready: ExecutionReadinessCheck | None = None,
 ) -> list[str]:
     """Submit buy entry orders for CANSLIM actionable-buy signals.
 
@@ -403,6 +459,8 @@ def execute_entries(
     Args:
         actionable_buys: List of CANSLIM result dicts from ``scan_for_canslim_stocks``.
         dry_run: If True, print what *would* be ordered without submitting.
+        execution_ready: Dynamic live-monitor readiness check. Required for
+            order-enabled execution and re-evaluated immediately before submit.
 
     Returns:
         List of symbols for which an order was submitted (or would be in dry_run).
@@ -474,6 +532,12 @@ def execute_entries(
             f"source={plan.price_source}"
         )
 
+        if not dry_run:
+            if settings.ENTRY_MARKET_HOURS_ONLY and not _is_market_open():
+                raise ExecutionReadinessError(
+                    "Alpaca market clock is not authoritatively open"
+                )
+            _require_execution_ready(execution_ready)
         submission = order_manager.submit_entry(
             plan,
             signal_payload=opp,
@@ -507,6 +571,8 @@ def run_auto_trader(
     dry_run: bool = False,
     skip_entries: bool = False,
     skip_exits: bool = False,
+    *,
+    execution_ready: ExecutionReadinessCheck | None = None,
 ) -> AutoTraderCycleResult:
     """Full CANSLIM scan → exit monitoring → entry execution cycle.
 
@@ -514,6 +580,8 @@ def run_auto_trader(
         dry_run: If True, print all intended actions without submitting orders.
         skip_entries: Skip the entry phase (monitor-only mode).
         skip_exits: Skip the exit check (entry-only mode, use with caution).
+        execution_ready: Dynamic live-monitor readiness check. Required for
+            order-enabled execution and propagated to every mutation path.
     """
     require_paper_mode()
     mode_label = "DRY RUN" if dry_run else "paper"
@@ -526,13 +594,24 @@ def run_auto_trader(
             print("[WARN] Market is closed. Set ENTRY_MARKET_HOURS_ONLY=False to queue orders anyway.")
             return AutoTraderCycleResult()
 
+    _validate_execution_readiness_callback(
+        dry_run=dry_run,
+        execution_ready=execution_ready,
+    )
+
     entered: list[str] = []
     exited: list[str] = []
 
     # --- Phase 1: Exit monitoring ---
     if not skip_exits:
         print("\n--- Phase 1: Exit monitoring ---")
-        exited = monitor_and_exit_positions(dry_run=dry_run)
+        if execution_ready is None:
+            exited = monitor_and_exit_positions(dry_run=dry_run)
+        else:
+            exited = monitor_and_exit_positions(
+                dry_run=dry_run,
+                execution_ready=execution_ready,
+            )
         if exited:
             print(f"Exited {len(exited)} position(s): {', '.join(exited)}")
         else:
@@ -550,7 +629,14 @@ def run_auto_trader(
     if not skip_entries:
         print("\n--- Phase 3: Entry orders ---")
         if actionable_buys:
-            entered = execute_entries(actionable_buys, dry_run=dry_run)
+            if execution_ready is None:
+                entered = execute_entries(actionable_buys, dry_run=dry_run)
+            else:
+                entered = execute_entries(
+                    actionable_buys,
+                    dry_run=dry_run,
+                    execution_ready=execution_ready,
+                )
             if entered:
                 print(f"Submitted entries for: {', '.join(entered)}")
             else:

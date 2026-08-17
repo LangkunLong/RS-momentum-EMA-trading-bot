@@ -1,65 +1,70 @@
 """Safety and reporting tests for Windows scheduled-task configuration."""
 
-import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import patch
+from xml.etree import ElementTree
 
 import paper_trading_console as console
 import setup_windows_task as task_setup
 
 
-def test_default_task_action_is_dry_run() -> None:
-    action = task_setup._build_action_command(dry_run=True)
+def _xml_values(xml_text: str) -> dict[str, str]:
+    root = ElementTree.fromstring(xml_text)
+    namespace = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    paths = {
+        "command": ".//t:Exec/t:Command",
+        "arguments": ".//t:Exec/t:Arguments",
+        "working_directory": ".//t:Exec/t:WorkingDirectory",
+        "multiple_instances": ".//t:MultipleInstancesPolicy",
+        "start_when_available": ".//t:StartWhenAvailable",
+        "execution_limit": ".//t:ExecutionTimeLimit",
+        "run_level": ".//t:RunLevel",
+    }
+    return {
+        key: str(root.find(path, namespace).text)
+        for key, path in paths.items()
+    }
 
-    assert "scheduler.py" in action
-    assert "--dry-run" in action
+
+def test_default_task_xml_is_direct_bounded_zero_budget_dry_run() -> None:
+    values = _xml_values(task_setup._build_task_xml(dry_run=True))
+
+    assert values["command"] == str(task_setup.PYTHON_EXE)
+    assert values["working_directory"] == str(task_setup.PROJECT_DIR)
+    assert "--dry-run" in values["arguments"]
+    assert "--enable-orders" not in values["arguments"]
+    assert "--session" in values["arguments"]
+    assert "--fmp-daily-budget 0" in values["arguments"]
+    assert "--task-log .artifacts/logs/scheduler.log" in values["arguments"]
+    assert values["multiple_instances"] == "IgnoreNew"
+    assert values["start_when_available"] == "true"
+    assert values["execution_limit"] == "PT8H"
+    assert values["run_level"] == "LeastPrivilege"
 
 
-def test_enable_orders_task_action_omits_dry_run() -> None:
-    action = task_setup._build_action_command(dry_run=False)
+def test_enable_orders_task_xml_is_explicit_and_uses_conservative_free_plan_budget() -> None:
+    values = _xml_values(task_setup._build_task_xml(dry_run=False))
 
-    assert "scheduler.py" in action
-    assert "--dry-run" not in action
-
-
-def test_task_action_sets_working_directory_and_creates_ignored_log_path(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project with spaces"
-    project_dir.mkdir()
-    probe = project_dir / "probe.py"
-    probe.write_text("from pathlib import Path\nprint(Path.cwd())\n", encoding="utf-8")
-    log_file = project_dir / ".artifacts" / "logs" / "scheduler.log"
-
-    with (
-        patch("setup_windows_task.PROJECT_DIR", project_dir),
-        patch("setup_windows_task.PYTHON_EXE", sys.executable),
-        patch("setup_windows_task.SCHEDULER_SCRIPT", probe),
-        patch("setup_windows_task.LOG_FILE", log_file),
-    ):
-        action = task_setup._build_action_command(dry_run=False)
-
-    result = subprocess.run(
-        action,
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert log_file.read_text(encoding="utf-8").strip() == str(project_dir)
+    assert "--enable-orders" in values["arguments"]
+    assert "--dry-run" not in values["arguments"]
+    assert "--fmp-daily-budget 20" in values["arguments"]
 
 
 def test_register_task_defaults_to_dry_run_and_returns_success() -> None:
-    with patch("setup_windows_task._schtasks", return_value=(0, "created")) as schtasks:
+    captured: dict[str, str] = {}
+
+    def fake_schtasks(*args: str) -> tuple[int, str]:
+        xml_path = Path(args[args.index("/XML") + 1])
+        captured["xml"] = xml_path.read_text(encoding="utf-16")
+        captured["args"] = " ".join(args)
+        return 0, "created"
+
+    with patch("setup_windows_task._schtasks", side_effect=fake_schtasks):
         rc = task_setup.register_task()
 
     assert rc == 0
-    args = schtasks.call_args.args
-    action = args[args.index("/TR") + 1]
-    assert "--dry-run" in action
+    assert "/Create /F /TN CANSLIM-Scheduler /XML" in captured["args"]
+    assert "--dry-run" in _xml_values(captured["xml"])["arguments"]
 
 
 def test_console_requires_explicit_enable_orders_flag() -> None:

@@ -2678,7 +2678,10 @@ class TestMonitorAndExitPositions:
             patch("auto_trader.OrderManager", return_value=manager),
             patch("auto_trader.fetch_ohlcv", return_value=self._healthy_ohlcv()),
         ):
-            exited = monitor_and_exit_positions(stop_loss_pct=0.07)
+            exited = monitor_and_exit_positions(
+                stop_loss_pct=0.07,
+                execution_ready=lambda: True,
+            )
 
         manager.submit_exit.assert_called_once_with("STOP7", exit_reason="hard stop triggered")
         assert "STOP7" in exited
@@ -2696,7 +2699,10 @@ class TestMonitorAndExitPositions:
             patch("auto_trader.OrderManager", return_value=manager),
             patch("auto_trader.fetch_ohlcv", return_value=self._healthy_ohlcv(n=60, above_ema=False)),
         ):
-            exited = monitor_and_exit_positions(stop_loss_pct=0.07)
+            exited = monitor_and_exit_positions(
+                stop_loss_pct=0.07,
+                execution_ready=lambda: True,
+            )
 
         manager.submit_exit.assert_called_once()
         assert "MABREAK" in exited
@@ -2713,7 +2719,10 @@ class TestMonitorAndExitPositions:
             patch("auto_trader.OrderManager", return_value=manager),
             patch("auto_trader.fetch_ohlcv", return_value=self._healthy_ohlcv(n=60, above_ema=True)),
         ):
-            exited = monitor_and_exit_positions(stop_loss_pct=0.07)
+            exited = monitor_and_exit_positions(
+                stop_loss_pct=0.07,
+                execution_ready=lambda: True,
+            )
 
         manager.submit_exit.assert_not_called()
         assert exited == []
@@ -2739,7 +2748,10 @@ class TestMonitorAndExitPositions:
             patch("auto_trader.OrderManager", return_value=manager),
             patch("auto_trader.fetch_ohlcv", return_value=self._healthy_ohlcv(n=60, above_ema=False)),
         ):
-            exited = monitor_and_exit_positions(stop_loss_pct=0.07)
+            exited = monitor_and_exit_positions(
+                stop_loss_pct=0.07,
+                execution_ready=lambda: True,
+            )
 
         assert manager.submit_exit.call_count == 1
         assert exited.count("BOTH") == 1
@@ -2811,6 +2823,7 @@ class TestExecuteEntries:
             mock_settings.MAX_OPEN_POSITIONS = 5
             mock_settings.POSITION_SIZE_PCT = 0.10
             mock_settings.STOP_LOSS_PCT = 0.07
+            mock_settings.ENTRY_MARKET_HOURS_ONLY = False
             mock_plan.return_value = SimpleNamespace(
                 symbol="NVDA",
                 entry_price=500.0,
@@ -2829,7 +2842,10 @@ class TestExecuteEntries:
             manager = MagicMock()
             manager.submit_entry.return_value = SimpleNamespace(success=True, dry_run=False, workflow_id="wf-nvda-1")
             mock_manager_cls.return_value = manager
-            entered = execute_entries([_make_buy_signal("NVDA")])
+            entered = execute_entries(
+                [_make_buy_signal("NVDA")],
+                execution_ready=lambda: True,
+            )
 
         manager.submit_entry.assert_called_once_with(
             mock_plan.return_value,
@@ -2896,6 +2912,7 @@ class TestExecuteEntries:
             mock_settings.MAX_OPEN_POSITIONS = 5
             mock_settings.POSITION_SIZE_PCT = 0.10
             mock_settings.STOP_LOSS_PCT = 0.07
+            mock_settings.ENTRY_MARKET_HOURS_ONLY = False
             mock_plan.return_value = SimpleNamespace(
                 symbol="AMD",
                 entry_price=200.0,
@@ -2966,6 +2983,7 @@ class TestExecuteEntries:
             mock_settings.MAX_OPEN_POSITIONS = 5
             mock_settings.POSITION_SIZE_PCT = 0.10
             mock_settings.STOP_LOSS_PCT = 0.07
+            mock_settings.ENTRY_MARKET_HOURS_ONLY = False
             mock_plan.return_value = SimpleNamespace(
                 symbol="NEW1",
                 entry_price=100.0,
@@ -2984,7 +3002,7 @@ class TestExecuteEntries:
             manager = MagicMock()
             manager.submit_entry.return_value = SimpleNamespace(success=True, dry_run=False, workflow_id="wf-new1-1")
             mock_manager_cls.return_value = manager
-            entered = execute_entries(signals)
+            entered = execute_entries(signals, execution_ready=lambda: True)
 
         assert len(entered) == 1
         assert entered[0] == "NEW1"
@@ -3025,10 +3043,11 @@ class TestExecuteEntries:
             mock_settings.MAX_NEW_ENTRIES_PER_CYCLE = 1
             mock_settings.POSITION_SIZE_PCT = 0.10
             mock_settings.STOP_LOSS_PCT = 0.07
+            mock_settings.ENTRY_MARKET_HOURS_ONLY = False
             manager = MagicMock()
             manager.submit_entry.return_value = SimpleNamespace(success=True, dry_run=False, workflow_id="wf-high-1")
             mock_manager_cls.return_value = manager
-            entered = execute_entries([low, high])
+            entered = execute_entries([low, high], execution_ready=lambda: True)
 
         assert entered == ["HIGH"]
         submitted_plan = manager.submit_entry.call_args.args[0]
@@ -3071,6 +3090,7 @@ class TestExecuteEntries:
             mock_settings.MAX_OPEN_POSITIONS = 5
             mock_settings.POSITION_SIZE_PCT = 0.10
             mock_settings.STOP_LOSS_PCT = 0.07
+            mock_settings.ENTRY_MARKET_HOURS_ONLY = False
             mock_plan.return_value = SimpleNamespace(
                 symbol="NVDA",
                 entry_price=500.0,
@@ -3089,7 +3109,10 @@ class TestExecuteEntries:
             manager = MagicMock()
             manager.submit_entry.return_value = SimpleNamespace(success=True, dry_run=False, workflow_id="wf-nvda-42")
             mock_manager_cls.return_value = manager
-            entered = execute_entries([_make_buy_signal("NVDA")])
+            entered = execute_entries(
+                [_make_buy_signal("NVDA")],
+                execution_ready=lambda: True,
+            )
 
         assert entered == ["NVDA"]
         manager.submit_entry.assert_called_once()
