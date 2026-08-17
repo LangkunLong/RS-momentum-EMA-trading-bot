@@ -801,7 +801,10 @@ class PortfolioSimulator:
 
         signals.sort(key=lambda item: (item["canslim_score"], item["rs_score"]), reverse=True)
         open_slots = max(self.max_positions - len(self._open_positions), 0)
-        return signals[:open_slots]
+        candidate_limit = open_slots
+        if candidate_limit == 0 and self.enable_eviction and self.max_positions > 0:
+            candidate_limit = 1
+        return signals[:candidate_limit]
 
     def _try_evict(
         self,

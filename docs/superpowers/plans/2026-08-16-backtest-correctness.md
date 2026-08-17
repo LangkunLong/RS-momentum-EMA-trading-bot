@@ -57,9 +57,13 @@ Keep the existing score sort. Compute open slots and use this contract:
 
 ```python
 open_slots = max(self.max_positions - len(self._open_positions), 0)
-candidate_limit = self.max_positions if self.enable_eviction else open_slots
+candidate_limit = open_slots
+if candidate_limit == 0 and self.enable_eviction and self.max_positions > 0:
+    candidate_limit = 1
 return signals[:candidate_limit]
 ```
+
+Only the top-ranked candidate receives an eviction attempt on a full-portfolio signal day. This prevents a single evaluation batch from churning several existing positions.
 
 Do not move the RS comparison or loser preference out of `_try_evict()`.
 
@@ -71,7 +75,7 @@ Expected: every capacity, ranking, and data-gap case passes.
 
 - [ ] **Step 6: Run the complete backtest suite**
 
-Run: `python -m pytest tests/test_backtest_pnl.py tests/test_backtest_engine_pivots.py tests/test_backtest_market_regime.py -q --no-cov`
+Run: `python -m pytest tests/test_backtest_pnl.py tests/test_backtest_engine.py tests/test_backtest_logic.py tests/test_market_regime.py -q --no-cov`
 
 Expected: all selected tests pass.
 
