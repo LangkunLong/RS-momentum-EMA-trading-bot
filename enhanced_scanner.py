@@ -6,9 +6,10 @@ This simplified scanner focuses purely on CANSLIM criteria without pullback entr
 
 from __future__ import annotations
 
+import argparse
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 
@@ -247,7 +248,17 @@ def print_result_quality_summary(results: list[dict]) -> None:
     )
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
+    """Build the scanner CLI without starting provider work."""
+    return argparse.ArgumentParser(
+        description="Scan the configured universe for CANSLIM opportunities",
+    )
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    """Run one scanner cycle after parsing CLI arguments."""
+    build_parser().parse_args(list(argv) if argv is not None else None)
+
     # You can override default settings here or edit config/settings.py
 
     # Example: Override specific settings (uncomment to use)
@@ -321,3 +332,8 @@ if __name__ == "__main__":
         export_results_to_csv(combined_results)
 
     print("\nScan completed!")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
