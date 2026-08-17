@@ -19,7 +19,7 @@ The active values are in `config/settings.py`. Treat older design plans as histo
 
 - Python 3.11 or newer
 - An Alpaca account and API credentials
-- An FMP API key whose plan includes the income-statement and balance-sheet endpoints used by the configured CANSLIM fundamental gate
+- An FMP API key whose plan includes the income-statement and balance-sheet endpoints used by the configured CANSLIM fundamental gate; institutional scoring additionally requires the stable Positions Summary endpoint
 - Windows only for the optional Task Scheduler integration; scanning, backtesting, tests, and manual paper operation are ordinary Python workflows
 
 Create an isolated environment and install the verified dependency set:
@@ -148,7 +148,7 @@ Windows scheduled-task installation has a separate approval gate. Invoke setup t
 - On startup, the scheduler reconciles protective stops for broker positions.
 - Replayed final fills are idempotent; partial fills can still advance to a larger cumulative final quantity.
 - Sell notifications recover entry cost basis from the workflow or active-position store. If neither exists, P&L is reported as unavailable instead of zero.
-- FMP 402/403/404/429 and retry failures degrade without exposing the API key. `clear_session_cache()` resets the per-scan circuit breaker. Persistent `402` responses indicate a plan-entitlement mismatch, not a transient retry condition.
+- FMP 402/403/404/429 and retry failures degrade without exposing the API key. `clear_session_cache()` resets the per-scan circuit breaker. Persistent `402` responses indicate a plan-entitlement mismatch, not a transient retry condition. Institutional ownership uses the current period-specific `institutional-ownership/symbol-positions-summary` endpoint; older `symbol-ownership` and `institutional-holder` routes are legacy APIs.
 - If broker and SQLite state disagree, preserve broker/order ids, stop automated submission, and reconcile against Alpaca before retrying.
 
 The stabilization design and execution plans are under `docs/superpowers/`.

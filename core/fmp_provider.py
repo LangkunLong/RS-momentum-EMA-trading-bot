@@ -1,18 +1,47 @@
-"""FMP institutional ownership provider.
+"""FMP company profile and institutional ownership helpers.
 
-Encapsulates the /institutional-ownership/symbol-ownership endpoint which
-provides quarterly historical snapshots of institutional ownership.  This
-endpoint is available on paid FMP plans and gives richer, time-series data
-than the current-only /institutional-holder endpoint.
+Institutional data comes from the current, period-specific
+``/institutional-ownership/symbol-positions-summary`` endpoint. FMP's older
+``/institutional-ownership/symbol-ownership`` and ``/institutional-holder``
+routes are legacy APIs and are not valid beneath the stable base URL.
 
-The module is a pure leaf: it has no imports from data_client and receives
-the FMP HTTP callable as a parameter (dependency injection), avoiding any
-circular dependency.
+This module is a pure leaf: it has no imports from ``data_client`` and receives
+the FMP HTTP callable as a parameter, avoiding a circular dependency.
 """
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, List, Optional
+
+
+# Form 13F reports are due up to 45 days after quarter end. Five additional
+# calendar days keep weekend/holiday deadlines from leaking future data into
+# point-in-time backtests.
+_INSTITUTIONAL_REPORTING_LAG_DAYS = 50
+
+
+def _quarter_end(year: int, quarter: int) -> date:
+    """Return the calendar quarter-end date."""
+    month_day = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+    month, day = month_day[quarter]
+    return date(year, month, day)
+
+
+def _previous_quarter(year: int, quarter: int) -> tuple[int, int]:
+    """Return the period immediately before ``year``/``quarter``."""
+    return (year - 1, 4) if quarter == 1 else (year, quarter - 1)
+
+
+def _latest_available_quarter(as_of_date: date) -> tuple[int, int]:
+    """Return the latest quarter whose conservative reporting lag elapsed."""
+    year = as_of_date.year
+    quarter = ((as_of_date.month - 1) // 3) + 1
+    period_end = _quarter_end(year, quarter)
+    while period_end + timedelta(days=_INSTITUTIONAL_REPORTING_LAG_DAYS) > as_of_date:
+        year, quarter = _previous_quarter(year, quarter)
+        period_end = _quarter_end(year, quarter)
+    return year, quarter
 
 
 def fetch_company_profile(
@@ -36,67 +65,62 @@ def fetch_institutional_ownership_history(
     symbol: str,
     fmp_get_fn: Callable[..., Any],
     limit: int = 8,
+    as_of_date: date | datetime | None = None,
 ) -> List[dict]:
-    """Fetch quarterly institutional ownership snapshots from FMP.
+    """Fetch normalized quarterly institutional ownership snapshots from FMP.
 
-    Calls ``/institutional-ownership/symbol-ownership``.  Each record contains
-    the quarter-end date, total number of 13-F filers, and the percentage of
-    shares outstanding they hold.  Returns an empty list when the endpoint is
-    unavailable (e.g. 402 plan restriction) so callers degrade gracefully.
-
-    Args:
-        symbol: Ticker symbol.
-        fmp_get_fn: Callable matching ``data_client._fmp_get`` — takes
-            ``(endpoint, params)`` and returns a list or empty list.
-        limit: Number of quarterly periods to retrieve (default 8 = 2 years).
-
-    Returns:
-        List of dicts sorted newest-first.  Each dict contains at minimum:
-            date (str), institution_count (int), ownership_percent (float).
-        Empty list on any failure.
+    The stable Positions Summary API is called once per requested quarter. Its
+    response omits dates, so the requested quarter end and a conservative
+    assumed public-availability date are added to each record. An empty list is
+    returned when the endpoint is unavailable, including plan restrictions.
     """
-    raw = fmp_get_fn(
-        "institutional-ownership/symbol-ownership",
-        {"symbol": symbol, "limit": limit},
-    )
-    if not isinstance(raw, list) or not raw:
+    if limit <= 0:
         return []
 
+    if as_of_date is None:
+        cutoff = date.today()
+    elif isinstance(as_of_date, datetime):
+        cutoff = as_of_date.date()
+    else:
+        cutoff = as_of_date
+
+    year, quarter = _latest_available_quarter(cutoff)
     result: List[dict] = []
-    for rec in raw:
-        date_str = rec.get("date")
-        if not date_str:
-            continue
+    for _ in range(limit):
+        period_end = _quarter_end(year, quarter)
+        assumed_available = period_end + timedelta(days=_INSTITUTIONAL_REPORTING_LAG_DAYS)
+        raw = fmp_get_fn(
+            "institutional-ownership/symbol-positions-summary",
+            {"symbol": symbol, "year": year, "quarter": quarter},
+        )
+        if not isinstance(raw, list) or not raw or not isinstance(raw[0], dict):
+            break
 
-        entry: dict = {"date": date_str}
+        record = raw[0]
+        entry: dict = {
+            "date": period_end.isoformat(),
+            "acceptedDate": assumed_available.isoformat(),
+        }
 
-        investors = rec.get("investorsHolding")
+        investors = record.get("investorsHolding")
         if investors is not None:
             entry["institution_count"] = int(investors)
 
-        prev_investors = rec.get("lastInvestorsHolding")
-        if prev_investors is not None:
-            entry["prev_institution_count"] = int(prev_investors)
+        previous_investors = record.get("lastInvestorsHolding")
+        if previous_investors is not None:
+            entry["prev_institution_count"] = int(previous_investors)
 
-        pct = rec.get("ownershipPercent")
-        if pct is not None:
+        ownership_percent = record.get("ownershipPercent")
+        if ownership_percent is not None:
             try:
-                # FMP returns a percentage (e.g. 59.21); normalise to decimal.
-                entry["ownership_percent"] = float(pct)
-            except (TypeError, ValueError):
-                pass
-
-        prev_pct = rec.get("lastOwnershipPercent")
-        if prev_pct is not None:
-            try:
-                entry["prev_ownership_percent"] = float(prev_pct)
+                entry["ownership_percent"] = float(ownership_percent)
             except (TypeError, ValueError):
                 pass
 
         result.append(entry)
+        year, quarter = _previous_quarter(year, quarter)
 
-    # Sort newest-first so callers get [0] == most recent quarter.
-    result.sort(key=lambda r: r.get("date", ""), reverse=True)
+    result.sort(key=lambda item: item.get("date", ""), reverse=True)
     return result
 
 
@@ -104,25 +128,7 @@ def company_info_from_inst_history(
     history: List[dict],
     shares_outstanding: Optional[int] = None,
 ) -> dict:
-    """Derive institutional ownership fields from quarterly history.
-
-    Uses the most recent record for the current-snapshot fields and exposes
-    the quarter-over-quarter holder count change so the I-component scorer
-    can compute a proper trend score.
-
-    Args:
-        history: Sorted newest-first list from
-            ``fetch_institutional_ownership_history``.
-        shares_outstanding: Unused — kept for API symmetry with the legacy
-            ``/institutional-holder`` code path that computed ownership from
-            raw share counts.
-
-    Returns:
-        Dict with keys:
-            held_percent_institutions (float 0-1 | None)
-            institution_count         (int | None)
-            prev_institution_count    (int | None)   ← new field
-    """
+    """Derive company-level institutional fields from normalized history."""
     if not history:
         return {
             "held_percent_institutions": None,
@@ -131,20 +137,16 @@ def company_info_from_inst_history(
         }
 
     latest = history[0]
-
-    # Convert percentage to decimal fraction capped at 1.0.
-    held_pct: Optional[float] = None
-    raw_pct = latest.get("ownership_percent")
-    if raw_pct is not None:
+    held_percent: Optional[float] = None
+    raw_percent = latest.get("ownership_percent")
+    if raw_percent is not None:
         try:
-            held_pct = min(float(raw_pct) / 100.0, 1.0)
+            held_percent = min(float(raw_percent) / 100.0, 1.0)
         except (TypeError, ValueError):
-            held_pct = None
+            held_percent = None
 
     return {
-        "held_percent_institutions": held_pct,
+        "held_percent_institutions": held_percent,
         "institution_count": latest.get("institution_count"),
-        # prev_institution_count comes from lastInvestorsHolding in the same
-        # record — the change within the same snapshot period.
         "prev_institution_count": latest.get("prev_institution_count"),
     }

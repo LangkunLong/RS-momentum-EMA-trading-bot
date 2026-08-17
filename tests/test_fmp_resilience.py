@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -139,7 +140,7 @@ def test_fmp_get_402_logs_message(capsys) -> None:
 
     with patch("core.data_client._fmp_session") as mock_session:
         mock_session.get.return_value = mock_resp
-        _fmp_get("institutional-ownership/symbol-ownership", {"symbol": "FAKE"})
+        _fmp_get("institutional-ownership/symbol-positions-summary", {"symbol": "FAKE"})
 
     captured = capsys.readouterr()
     assert "402" in captured.out, "Expected HTTP 402 to be mentioned in output"
@@ -165,8 +166,8 @@ def test_fmp_get_404_logs_once_and_skips_repeated_endpoint_calls(capsys) -> None
 
     with patch("core.data_client._fmp_session") as mock_session:
         mock_session.get.return_value = mock_resp
-        result_1 = _fmp_get("institutional-holder", {"symbol": "FAKE"})
-        result_2 = _fmp_get("institutional-holder", {"symbol": "AGAIN"})
+        result_1 = _fmp_get("unavailable-endpoint", {"symbol": "FAKE"})
+        result_2 = _fmp_get("unavailable-endpoint", {"symbol": "AGAIN"})
 
     assert result_1 == []
     assert result_2 == []
@@ -340,37 +341,73 @@ def test_annual_default_limit_is_paid_plan_value() -> None:
 # ─── Institutional ownership history ─────────────────────────────────────────
 
 
-def test_fetch_institutional_history_returns_normalized_records() -> None:
-    """fetch_institutional_ownership_history must return dicts with normalised fields."""
-    raw_api_data = [
-        {
-            "date": "2024-09-30",
-            "investorsHolding": 4500,
-            "lastInvestorsHolding": 4400,
-            "ownershipPercent": 58.5,
-            "lastOwnershipPercent": 57.1,
-        },
-        {
-            "date": "2024-06-30",
-            "investorsHolding": 4400,
-            "lastInvestorsHolding": 4300,
-            "ownershipPercent": 57.1,
-        },
-    ]
+def test_fetch_institutional_history_uses_stable_period_endpoint() -> None:
+    """Institutional snapshots must use FMP's current period-specific stable API."""
+    calls: list[tuple[str, dict]] = []
+    period_data = {
+        (2024, 4): [
+            {
+                "symbol": "AAPL",
+                "investorsHolding": 4500,
+                "lastInvestorsHolding": 4400,
+                "ownershipPercent": 58.5,
+            }
+        ],
+        (2024, 3): [
+            {
+                "symbol": "AAPL",
+                "investorsHolding": 4400,
+                "lastInvestorsHolding": 4300,
+                "ownershipPercent": 57.1,
+            }
+        ],
+    }
 
     def fake_fmp_get(endpoint, params=None):
-        if "symbol-ownership" in endpoint:
-            return raw_api_data
-        return []
+        calls.append((endpoint, dict(params or {})))
+        return period_data.get((params["year"], params["quarter"]), [])
 
-    result = fetch_institutional_ownership_history("AAPL", fmp_get_fn=fake_fmp_get, limit=8)
+    result = fetch_institutional_ownership_history(
+        "AAPL",
+        fmp_get_fn=fake_fmp_get,
+        limit=2,
+        as_of_date=date(2025, 4, 1),
+    )
 
-    assert len(result) == 2
-    # Should be sorted newest-first
-    assert result[0]["date"] == "2024-09-30"
+    assert calls == [
+        (
+            "institutional-ownership/symbol-positions-summary",
+            {"symbol": "AAPL", "year": 2024, "quarter": 4},
+        ),
+        (
+            "institutional-ownership/symbol-positions-summary",
+            {"symbol": "AAPL", "year": 2024, "quarter": 3},
+        ),
+    ]
+    assert [record["date"] for record in result] == ["2024-12-31", "2024-09-30"]
+    assert result[0]["acceptedDate"] == "2025-02-19"
     assert result[0]["institution_count"] == 4500
     assert result[0]["prev_institution_count"] == 4400
     assert abs(result[0]["ownership_percent"] - 58.5) < 0.01
+
+
+def test_live_institutional_snapshot_needs_one_successful_period_call() -> None:
+    """A live snapshot should not multiply API traffic across historical quarters."""
+    calls: list[dict] = []
+
+    def fake_fmp_get(endpoint, params=None):
+        calls.append(dict(params or {}))
+        return [{"investorsHolding": 100, "lastInvestorsHolding": 90, "ownershipPercent": 40.0}]
+
+    result = fetch_institutional_ownership_history(
+        "AAPL",
+        fmp_get_fn=fake_fmp_get,
+        limit=1,
+        as_of_date=date(2025, 4, 1),
+    )
+
+    assert len(calls) == 1
+    assert len(result) == 1
 
 
 def test_fetch_institutional_history_returns_empty_on_402() -> None:
@@ -449,6 +486,23 @@ def test_institutional_pit_filters_future_quarters() -> None:
     assert "2024-03-31" in dates, "Q1 2024 data must be included"
     # newest-first order
     assert filtered[0]["date"] == "2024-06-30"
+
+
+def test_institutional_pit_respects_assumed_public_availability_date() -> None:
+    """A quarter-end snapshot must not be visible before its reporting lag."""
+    from datetime import datetime
+
+    records = [
+        {
+            "date": "2024-12-31",
+            "acceptedDate": "2025-02-19",
+            "ownership_percent": 58.5,
+            "institution_count": 4500,
+        }
+    ]
+
+    assert _filter_records_as_of(records, datetime(2025, 2, 18)) == []
+    assert _filter_records_as_of(records, datetime(2025, 2, 19)) == records
 
 
 def test_raw_history_includes_inst_ownership_key() -> None:

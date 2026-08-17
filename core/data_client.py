@@ -938,8 +938,8 @@ def fetch_company_info(symbol: str) -> dict:
     except (requests.RequestException, ValueError, EnvironmentError):
         pass
 
-    # 2. Institutional ownership history — paid-plan endpoint providing quarterly
-    # snapshots with ownership percentage and holder count trend built in.
+    # 2. Current stable Positions Summary snapshot. It includes the previous
+    # holder count, so live scans need only one period-specific API call.
     inst_history = _fetch_inst_ownership_history(
         symbol,
         fmp_get_fn=_fmp_get,
@@ -950,20 +950,6 @@ def fetch_company_info(symbol: str) -> dict:
         result["held_percent_institutions"] = inst_info["held_percent_institutions"]
         result["institution_count"] = inst_info["institution_count"]
         result["prev_institution_count"] = inst_info["prev_institution_count"]
-
-    # 3. Fallback: institutional-holder list (current-only, lower tier).
-    # Used when the quarterly-snapshot endpoint returns nothing (e.g. 402).
-    if result["held_percent_institutions"] is None:
-        try:
-            holders = _fmp_get("institutional-holder", {"symbol": symbol})
-            if holders and isinstance(holders, list):
-                result["institution_count"] = len(holders)
-
-                if result["shares_outstanding"] and result["shares_outstanding"] > 0:
-                    total_held = sum(h.get("shares", 0) for h in holders if h.get("shares"))
-                    result["held_percent_institutions"] = min(total_held / result["shares_outstanding"], 1.0)
-        except (requests.RequestException, ValueError, EnvironmentError):
-            pass
 
     _cache_set(cache_key, result)
     return result
@@ -1000,19 +986,13 @@ def _fetch_fmp_raw_history(symbol: str) -> dict:
     except (requests.RequestException, ValueError, EnvironmentError):
         profile_raw = []
 
-    # Institutional ownership history — quarterly snapshots for PIT backtesting.
-    # Uses acceptedDate-equivalent (date field) for point-in-time filtering.
-    # Note: 13F filings are due ~45 days after quarter end, so using the quarter
-    # date directly is slightly optimistic; still far better than no history.
-    try:
-        inst_ownership_raw = _fmp_get(
-            "institutional-ownership/symbol-ownership",
-            {"symbol": symbol, "limit": 20},
-        )
-        if not isinstance(inst_ownership_raw, list):
-            inst_ownership_raw = []
-    except (requests.RequestException, ValueError, EnvironmentError):
-        inst_ownership_raw = []
+    # Institutional ownership history for PIT backtesting. The provider adds a
+    # conservative assumed acceptedDate after the Form 13F reporting lag.
+    inst_ownership_raw = _fetch_inst_ownership_history(
+        symbol,
+        fmp_get_fn=_fmp_get,
+        limit=settings.FMP_INSTITUTIONAL_BACKTEST_LIMIT,
+    )
 
     result = {
         "qi_raw": qi_raw,
@@ -1112,16 +1092,16 @@ def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
         pit_records = _filter_records_as_of(raw_history["inst_ownership_raw"], as_of_date)
         if pit_records:
             latest = pit_records[0]
-            ownership_pct = latest.get("ownershipPercent")
+            ownership_pct = latest.get("ownership_percent")
             if ownership_pct is not None:
                 try:
                     result["held_percent_institutions"] = min(float(ownership_pct) / 100.0, 1.0)
                 except (TypeError, ValueError):
                     pass
-            investors = latest.get("investorsHolding")
+            investors = latest.get("institution_count")
             if investors is not None:
                 result["institution_count"] = int(investors)
-            prev_investors = latest.get("lastInvestorsHolding")
+            prev_investors = latest.get("prev_institution_count")
             if prev_investors is not None:
                 result["prev_institution_count"] = int(prev_investors)
 

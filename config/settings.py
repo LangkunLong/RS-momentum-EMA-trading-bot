@@ -326,7 +326,8 @@ FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 FMP_QUARTERLY_LIMIT = 12           # 3 years of quarterly income statements
 FMP_ANNUAL_LIMIT = 10              # 10 years of annual income statements
 FMP_BALANCE_SHEET_LIMIT = 10       # 10 years of balance sheets
-FMP_INSTITUTIONAL_HISTORY_LIMIT = 8  # quarterly institutional ownership snapshots (live scan)
+FMP_INSTITUTIONAL_HISTORY_LIMIT = 1  # current snapshot includes previous holder count
+FMP_INSTITUTIONAL_BACKTEST_LIMIT = 20  # five years of period-specific snapshots
 
 # HTTP Retry settings
 HTTP_RETRY_TOTAL = 5  # Maximum retry attempts
