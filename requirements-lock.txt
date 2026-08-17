@@ -1,4 +1,4 @@
-# Exact dependency set verified with Python 3.13 on Windows.
+# Exact dependency set verified with Python 3.11 and 3.13 on Windows.
 # Regenerate from a clean environment after changing requirements.txt.
 alpaca-py==0.44.0
 annotated-types==0.8.0
@@ -17,7 +17,7 @@ iniconfig==2.3.0
 msgpack==1.2.1
 narwhals==2.24.0
 nodeenv==1.10.0
-numpy==2.5.2
+numpy==2.4.6
 packaging==26.3
 pandas==3.0.5
 platformdirs==4.11.3
@@ -39,6 +39,7 @@ ruff==0.16.3
 six==1.17.0
 soupsieve==2.9.2
 sseclient-py==1.9.0
+tomli==2.4.1
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 tzdata==2026.3
