@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.execution_store import get_execution_store
-from core.execution_workflow import EntryExecutionPlan, reset_workflow_state
+from core.execution_workflow import EntryExecutionPlan, create_entry_workflow, reset_workflow_state
 from core.order_execution import OrderResult
 from core.order_manager import OrderManager
 
@@ -85,6 +85,7 @@ class TestSubmitEntry:
 class TestHandleFill:
     def test_handle_buy_fill_reconciles_stop_and_notifies(self) -> None:
         workflow = SimpleNamespace(
+            transitions=[],
             mark_buy_fill=MagicMock(),
             mark_protective_stop=MagicMock(),
             mark_buy_fill_notification=MagicMock(),
@@ -132,6 +133,7 @@ class TestHandleFill:
 
     def test_handle_sell_fill_marks_workflow_and_notifies(self) -> None:
         workflow = SimpleNamespace(
+            transitions=[],
             mark_sell_fill=MagicMock(),
             mark_sell_notification=MagicMock(),
         )
@@ -208,8 +210,128 @@ class TestHandleFill:
 
         assert result is None
 
+    def test_duplicate_final_buy_fill_is_idempotent(self, tmp_path) -> None:
+        """A replayed broker fill must not duplicate transitions, stops, or notifications."""
+        db_path = tmp_path / "execution.sqlite3"
+
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            reset_workflow_state()
+            workflow = create_entry_workflow(_plan(), signal_payload={"symbol": "NVDA"})
+            workflow.mark_order_submitted(broker_order_id="entry-1")
+            protection = SimpleNamespace(
+                success=True,
+                order_id="stop-1",
+                stop_price=465.0,
+                action="submitted",
+                error="",
+            )
+
+            with (
+                patch("core.order_manager.ensure_protective_stop", return_value=protection) as ensure_stop,
+                patch("core.order_manager.notify_buy_filled", return_value=True) as notify,
+            ):
+                manager = OrderManager(paper=True)
+                for _ in range(2):
+                    manager.handle_fill(
+                        symbol="NVDA",
+                        broker_order_id="entry-1",
+                        client_order_id=workflow.workflow_id,
+                        side="buy",
+                        filled_qty=20.0,
+                        fill_price=500.0,
+                        order_type="limit",
+                    )
+
+            events = [transition.event for transition in workflow.transitions]
+            assert events.count("buy_fill_received") == 1
+            assert events.count("protective_stop_reconciled") == 1
+            assert events.count("buy_fill_notified") == 1
+            assert ensure_stop.call_count == 1
+            assert notify.call_count == 1
+            reset_workflow_state()
+
+    def test_partial_then_final_buy_fill_reconciles_final_quantity(self, tmp_path) -> None:
+        """A larger cumulative final fill is not mistaken for a partial-fill replay."""
+        db_path = tmp_path / "execution.sqlite3"
+
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            reset_workflow_state()
+            workflow = create_entry_workflow(_plan(), signal_payload={"symbol": "NVDA"})
+            workflow.mark_order_submitted(broker_order_id="entry-1")
+            protection = SimpleNamespace(
+                success=True,
+                order_id="stop-1",
+                stop_price=465.0,
+                action="submitted",
+                error="",
+            )
+
+            with (
+                patch("core.order_manager.ensure_protective_stop", return_value=protection) as ensure_stop,
+                patch("core.order_manager.notify_buy_filled", return_value=True) as notify,
+            ):
+                manager = OrderManager(paper=True)
+                manager.handle_partial_fill(
+                    symbol="NVDA",
+                    broker_order_id="entry-1",
+                    client_order_id=workflow.workflow_id,
+                    side="buy",
+                    filled_qty=5.0,
+                    fill_price=500.0,
+                    order_type="limit",
+                )
+                manager.handle_fill(
+                    symbol="NVDA",
+                    broker_order_id="entry-1",
+                    client_order_id=workflow.workflow_id,
+                    side="buy",
+                    filled_qty=20.0,
+                    fill_price=500.0,
+                    order_type="limit",
+                )
+
+            fill_quantities = [
+                transition.details["qty"]
+                for transition in workflow.transitions
+                if transition.event == "buy_fill_received"
+            ]
+            assert fill_quantities == [5.0, 20.0]
+            assert [call.kwargs["qty"] for call in ensure_stop.call_args_list] == [5.0, 20.0]
+            assert notify.call_count == 1
+            reset_workflow_state()
+
+    def test_duplicate_sell_fill_is_idempotent(self, tmp_path) -> None:
+        """A replayed terminal sell cannot duplicate P&L notification or audit transitions."""
+        db_path = tmp_path / "execution.sqlite3"
+
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            reset_workflow_state()
+            workflow = create_entry_workflow(_plan(), signal_payload={"symbol": "NVDA"})
+            workflow.mark_buy_fill(qty=20.0, fill_price=500.0, broker_order_id="entry-1")
+
+            with patch("core.order_manager.notify_sell_filled", return_value=True) as notify:
+                manager = OrderManager(paper=True)
+                for _ in range(2):
+                    manager.handle_fill(
+                        symbol="NVDA",
+                        broker_order_id="sell-1",
+                        client_order_id=workflow.workflow_id,
+                        side="sell",
+                        filled_qty=20.0,
+                        fill_price=465.0,
+                        order_type="stop",
+                    )
+
+            events = [transition.event for transition in workflow.transitions]
+            assert events.count("sell_fill_received") == 1
+            assert events.count("sell_fill_notified") == 1
+            assert notify.call_count == 1
+            assert get_execution_store().load_active_position("NVDA") is None
+            reset_workflow_state()
+
     def test_handle_partial_buy_fill_reconciles_stop_without_notification(self) -> None:
         workflow = SimpleNamespace(
+            transitions=[],
             mark_buy_fill=MagicMock(),
             mark_protective_stop=MagicMock(),
         )

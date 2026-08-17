@@ -20,6 +20,7 @@ from core.execution_workflow import (
     get_or_recover_workflow,
     normalize_workflow_id,
     reset_workflow_state,
+    resolve_workflow,
 )
 
 
@@ -133,3 +134,40 @@ class TestExecutionWorkflow:
             clear_workflow_registry()
 
             assert get_active_workflow_for_symbol("MSFT") is None
+
+    def test_resolve_workflow_uses_strongest_reference_precedence(self, tmp_path) -> None:
+        """Explicit, client, broker, active, then latest references win in that order."""
+        db_path = tmp_path / "execution.sqlite3"
+
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            reset_workflow_state()
+            active = create_entry_workflow(_plan("NVDA"), signal_payload={"source": "active"})
+            active.mark_order_submitted(broker_order_id="broker-active")
+            active.mark_buy_fill(qty=20.0, fill_price=500.0, broker_order_id="broker-active")
+
+            latest = create_entry_workflow(_plan("NVDA"), signal_payload={"source": "latest"})
+            latest.mark_order_submitted(broker_order_id="broker-latest")
+            clear_workflow_registry()
+
+            assert resolve_workflow(
+                symbol="NVDA",
+                workflow_id=active.workflow_id,
+                client_order_id=latest.workflow_id,
+            ).workflow_id == active.workflow_id
+            assert resolve_workflow(
+                symbol="NVDA",
+                client_order_id=latest.workflow_id,
+                broker_order_id="broker-active",
+            ).workflow_id == latest.workflow_id
+            assert resolve_workflow(
+                symbol="NVDA",
+                broker_order_id="broker-active",
+            ).workflow_id == active.workflow_id
+            assert resolve_workflow(symbol="NVDA").workflow_id == active.workflow_id
+
+            from core.execution_store import get_execution_store
+
+            get_execution_store().clear_active_position("NVDA")
+            clear_workflow_registry()
+            assert resolve_workflow(symbol="NVDA").workflow_id == latest.workflow_id
+            reset_workflow_state()

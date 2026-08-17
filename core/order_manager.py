@@ -147,6 +147,15 @@ class OrderManager:
             broker_order_id=broker_order_id,
         )
 
+        if self._has_recorded_fill(
+            workflow,
+            side=side,
+            broker_order_id=broker_order_id,
+            filled_qty=filled_qty,
+            fill_price=fill_price,
+        ):
+            return
+
         if side == "buy":
             if workflow is None and workflow_id:
                 workflow = get_or_recover_workflow(workflow_id, symbol=symbol, broker_order_id=broker_order_id)
@@ -217,6 +226,31 @@ class OrderManager:
             return float(active_position["entry_price"])
         return None
 
+    @staticmethod
+    def _has_recorded_fill(
+        workflow: Any | None,
+        *,
+        side: str,
+        broker_order_id: str,
+        filled_qty: float,
+        fill_price: float,
+    ) -> bool:
+        """Return True when this cumulative broker fill was already processed."""
+        if workflow is None or not broker_order_id:
+            return False
+
+        expected_event = "buy_fill_received" if side == "buy" else "sell_fill_received"
+        for transition in reversed(workflow.transitions):
+            if transition.event != expected_event:
+                continue
+            details = transition.details
+            return (
+                str(details.get("broker_order_id", "")) == broker_order_id
+                and float(details.get("qty", -1.0)) == filled_qty
+                and float(details.get("fill_price", -1.0)) == fill_price
+            )
+        return False
+
     def handle_partial_fill(
         self,
         *,
@@ -239,6 +273,15 @@ class OrderManager:
             client_order_id=client_order_id,
             broker_order_id=broker_order_id,
         )
+
+        if self._has_recorded_fill(
+            workflow,
+            side=side,
+            broker_order_id=broker_order_id,
+            filled_qty=filled_qty,
+            fill_price=fill_price,
+        ):
+            return
 
         if workflow is None and workflow_id:
             workflow = get_or_recover_workflow(workflow_id, symbol=symbol, broker_order_id=broker_order_id)

@@ -547,4 +547,4 @@ def _workflow_from_payload(payload: dict[str, Any]) -> ExecutionWorkflow:
 
 
 def _timestamp_utc() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
