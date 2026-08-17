@@ -19,7 +19,7 @@ def test_wikipedia_parser_normalizes_share_class_symbols() -> None:
     </table>
     """
 
-    assert _parse_wikipedia_tickers(html) == ["BRK-B", "AAPL"]
+    assert _parse_wikipedia_tickers(html) == ["BRK.B", "AAPL"]
 
 
 def test_ishares_403_uses_index_specific_fallback(tmp_path) -> None:

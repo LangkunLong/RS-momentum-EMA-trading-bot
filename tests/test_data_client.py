@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -172,3 +173,54 @@ def test_fetch_bulk_ohlcv_returns_symbol_frames() -> None:
     assert set(result.keys()) == {"NVDA", "MSFT"}
     assert list(result["NVDA"].columns) == ["Open", "High", "Low", "Close", "Volume"]
     assert result["MSFT"]["Close"].iloc[-1] == 201.5
+
+
+def _mock_bulk_barset_for_request(request):
+    symbols = request.symbol_or_symbols
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    if "BAD" in symbols:
+        raise RuntimeError("invalid symbol: BAD")
+
+    index = pd.MultiIndex.from_product(
+        [symbols, pd.DatetimeIndex(["2024-01-02"], tz="UTC")],
+        names=["symbol", "timestamp"],
+    )
+    return SimpleNamespace(
+        df=pd.DataFrame(
+            {
+                "open": [100.0] * len(index),
+                "high": [101.0] * len(index),
+                "low": [99.0] * len(index),
+                "close": [100.5] * len(index),
+                "volume": [1_000_000] * len(index),
+            },
+            index=index,
+        )
+    )
+
+
+def test_bulk_close_prices_isolate_one_invalid_symbol() -> None:
+    with (
+        patch("core.data_client._get_alpaca_client") as mock_client,
+        patch("core.data_client._cache_get", return_value=None),
+        patch("core.data_client._cache_set"),
+        patch("core.data_client.time.sleep"),
+    ):
+        mock_client.return_value.get_stock_bars.side_effect = _mock_bulk_barset_for_request
+        result = enhanced_scanner.validate_tickers_bulk(["GOOD1", "BAD", "GOOD2"])
+
+    assert set(result) == {"GOOD1", "GOOD2"}
+
+
+def test_bulk_ohlcv_isolates_one_invalid_symbol() -> None:
+    with (
+        patch("core.data_client._get_alpaca_client") as mock_client,
+        patch("core.data_client._cache_get", return_value=None),
+        patch("core.data_client._cache_set"),
+        patch("core.data_client.time.sleep"),
+    ):
+        mock_client.return_value.get_stock_bars.side_effect = _mock_bulk_barset_for_request
+        result = fetch_bulk_ohlcv(["GOOD1", "BAD", "GOOD2"], period="5d", chunk_size=3)
+
+    assert set(result) == {"GOOD1", "GOOD2"}

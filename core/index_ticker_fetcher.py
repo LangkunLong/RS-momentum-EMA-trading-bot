@@ -73,8 +73,9 @@ def _parse_wikipedia_tickers(response_text: str) -> List[str]:
             cells = row.find_all(["td", "th"])
             if len(cells) <= ticker_col_idx:
                 continue
-            ticker = cells[ticker_col_idx].get_text(strip=True).upper().replace(".", "-")
-            if 1 <= len(ticker) <= 8 and ticker.replace("-", "").isalpha():
+            ticker = cells[ticker_col_idx].get_text(strip=True).upper()
+            normalized_letters = ticker.replace(".", "").replace("-", "")
+            if 1 <= len(ticker) <= 8 and normalized_letters.isalpha():
                 tickers.append(ticker)
         if tickers:
             return list(dict.fromkeys(tickers))
@@ -182,14 +183,15 @@ def _parse_ishares_csv(response_text: str, index_name: str) -> List[str]:
             if not isinstance(t, str):
                 continue
             t = t.strip()
-            # Valid tickers are typically 1-5 letters, possibly with a hyphen (e.g. BRK.B -> BRK-B)
+            # Alpaca accepts class-share symbols with a dot (for example BRK.B).
             # Remove any legal-text disclaimers or trailing hyphens
             if not t or len(t) > 8 or " " in t:
                 continue
-            t = t.replace(".", "-").upper()
+            t = t.upper()
             if t.endswith("-"):
                 t = t[:-1]
-            if t.isalpha() or ("-" in t and t.replace("-", "").isalpha()):
+            normalized_letters = t.replace(".", "").replace("-", "")
+            if normalized_letters.isalpha():
                 tickers.append(t)
 
         if not tickers:

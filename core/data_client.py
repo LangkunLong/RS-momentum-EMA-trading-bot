@@ -568,7 +568,7 @@ def fetch_bulk_close_prices(
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i : i + chunk_size]
         batch_num = i // chunk_size + 1
-        total_batches = (len(tickers) // chunk_size) + 1
+        total_batches = (len(tickers) + chunk_size - 1) // chunk_size
         print(f"Downloading batch {batch_num}/{total_batches} ({len(chunk)} tickers)...")
 
         try:
@@ -599,6 +599,18 @@ def fetch_bulk_close_prices(
             time.sleep(0.5)  # respect Alpaca rate limits
         except Exception as e:
             print(f"  Batch {batch_num} failed: {e}")
+            if len(chunk) > 1:
+                retry_size = max(1, len(chunk) // 2)
+                print(f"  Retrying failed batch in groups of {retry_size}.")
+                recovered = fetch_bulk_close_prices(
+                    chunk,
+                    period=period,
+                    chunk_size=retry_size,
+                )
+                if not recovered.empty:
+                    all_frames.append(recovered)
+            else:
+                print(f"  Skipping invalid/unavailable symbol: {chunk[0]}")
             continue
 
     if not all_frames:
@@ -651,6 +663,18 @@ def fetch_bulk_ohlcv(
             df = barset.df
         except Exception as e:
             print(f"  OHLCV batch {batch_num} failed: {e}")
+            if len(chunk) > 1:
+                retry_size = max(1, len(chunk) // 2)
+                print(f"  Retrying failed OHLCV batch in groups of {retry_size}.")
+                result.update(
+                    fetch_bulk_ohlcv(
+                        chunk,
+                        period=period,
+                        chunk_size=retry_size,
+                    )
+                )
+            else:
+                print(f"  Skipping invalid/unavailable symbol: {chunk[0]}")
             continue
 
         if df.empty:
