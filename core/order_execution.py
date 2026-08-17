@@ -5,8 +5,7 @@ and exit logic (MA violations, trailing stops). All order management functions
 operate through a single TradingClient instance per process.
 
 Design principles:
-- Paper trading by default (``paper=True``) — set ``ALPACA_PAPER`` in ``.env``
-  to ``false`` only when ready for live trading.
+- Paper trading is mandatory. Live-account trading is deliberately disabled.
 - Buy entries are submitted first; protective stops are reconciled after the
   actual fill so the stop is anchored to the real fill price.
 - Stop-loss distance follows O'Neil: 8% below the *fill price* (configurable via
@@ -44,6 +43,7 @@ _trading_client: Optional[TradingClient] = None
 def _get_trading_client() -> TradingClient:
     """Return the module-level TradingClient, creating it on first call."""
     global _trading_client
+    require_paper_mode()
     if _trading_client is None:
         api_key = settings.ALPACA_API_KEY
         secret_key = settings.ALPACA_SECRET_KEY
@@ -51,8 +51,7 @@ def _get_trading_client() -> TradingClient:
             raise EnvironmentError(
                 "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. See .env.example."
             )
-        paper = _is_paper_mode()
-        _trading_client = TradingClient(api_key, secret_key, paper=paper)
+        _trading_client = TradingClient(api_key, secret_key, paper=True)
     return _trading_client
 
 
@@ -60,10 +59,18 @@ def _is_paper_mode() -> bool:
     """Return True when operating in paper (simulated) trading mode.
 
     Reads ALPACA_PAPER from the environment (default: True — paper mode).
-    Set ALPACA_PAPER=false in .env only when ready for live trading.
     """
     raw = os.environ.get("ALPACA_PAPER", "true").strip().lower()
     return raw not in ("false", "0", "no")
+
+
+def require_paper_mode(paper: bool | None = None) -> None:
+    """Reject any attempt to connect execution components to a live account."""
+    if paper is False or not _is_paper_mode():
+        raise RuntimeError(
+            "Live-account trading is disabled for this project. "
+            "Set ALPACA_PAPER=true and use paper-account credentials."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +194,7 @@ def submit_bracket_buy(
             )
 
         order: Order = client.submit_order(req)
-        mode = "paper" if _is_paper_mode() else "LIVE"
+        mode = "paper"
         print(
             f"[ORDER/{mode}] BUY {qty} {symbol}"
             f"{f' @ limit ${limit_price:.2f}' if limit_price else ' @ market'}"
@@ -245,7 +252,7 @@ def submit_stop_loss(
             client_order_id=client_order_id,
         )
         order: Order = client.submit_order(req)
-        mode = "paper" if _is_paper_mode() else "LIVE"
+        mode = "paper"
         print(f"[ORDER/{mode}] STOP SELL {qty} {symbol} @ ${stop_price:.2f} | order_id={order.id}")
         return OrderResult(
             success=True,
@@ -455,7 +462,7 @@ def submit_market_sell(
             client_order_id=client_order_id,
         )
         order: Order = client.submit_order(req)
-        mode = "paper" if _is_paper_mode() else "LIVE"
+        mode = "paper"
         print(f"[ORDER/{mode}] SELL {qty} {symbol} @ market | order_id={order.id}")
         return OrderResult(
             success=True,

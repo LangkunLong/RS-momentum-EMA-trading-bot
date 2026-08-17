@@ -149,17 +149,6 @@ class TestNotifyBuyFilled:
 
         assert "Paper Trading" in bodies[0]
 
-    def test_live_label_in_body(self):
-        bodies = []
-
-        with _patch_settings():
-            with patch("core.notifier.send_email") as mock_send:
-                mock_send.side_effect = lambda s, b: bodies.append(b) or True
-                notify_buy_filled("X", qty=1, fill_price=50.0, stop_price=46.5, paper=False)
-
-        assert "LIVE Trading" in bodies[0]
-
-
 # ---------------------------------------------------------------------------
 # notify_entry_submitted
 # ---------------------------------------------------------------------------

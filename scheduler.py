@@ -32,7 +32,7 @@ from auto_trader import (
     run_auto_trader,
 )
 from core.notifier import notify_cycle_summary
-from core.order_execution import _get_trading_client, _is_paper_mode
+from core.order_execution import _get_trading_client, _is_paper_mode, require_paper_mode
 from core.order_manager import OrderManager
 from fill_monitor import FillMonitor
 
@@ -97,7 +97,8 @@ def run_scheduler(dry_run: bool = False, run_now: bool = False) -> None:
         run_now: When True, run the full scan immediately at startup instead of
             waiting for 09:31 ET.  Useful for manual testing during market hours.
     """
-    mode = "DRY RUN" if dry_run else ("paper" if _is_paper_mode() else "LIVE")
+    require_paper_mode()
+    mode = "DRY RUN" if dry_run else "paper"
     print(f"[SCHEDULER] Starting CANSLIM scheduler [{mode}]")
     print("[SCHEDULER] Press Ctrl-C to stop.")
 

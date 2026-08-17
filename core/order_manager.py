@@ -29,6 +29,7 @@ from core.order_execution import (
     close_position,
     ensure_protective_stop,
     reconcile_open_position_stops,
+    require_paper_mode,
     submit_bracket_buy,
 )
 
@@ -49,7 +50,9 @@ class OrderManager:
     """Own the end-to-end execution lifecycle for orders."""
 
     def __init__(self, *, paper: Optional[bool] = None) -> None:
-        self._paper = _is_paper_mode() if paper is None else paper
+        resolved_paper = _is_paper_mode() if paper is None else paper
+        require_paper_mode(resolved_paper)
+        self._paper = True
 
     def submit_entry(
         self,

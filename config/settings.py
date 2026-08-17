@@ -20,7 +20,7 @@ ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_STOCK_FEED = os.environ.get("ALPACA_STOCK_FEED", "iex").strip().lower()
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 # ALPACA_PAPER is read directly from os.environ in order_execution.py
-# (default: "true" — paper trading). Set to "false" in .env for live trading.
+# (default: "true" — paper trading). Any false value is rejected at runtime.
 
 # Email notifications (Gmail SMTP with App Password)
 # NOTIFY_EMAIL_FROM: your Gmail address (sender)

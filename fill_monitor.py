@@ -1,6 +1,6 @@
 """Real-time Alpaca order-fill monitor using the Trade Updates WebSocket stream.
 
-Listens for fill events on the paper (or live) account and routes them through
+Listens for fill events on the paper account and routes them through
 the OrderManager so workflow transitions stay centralized and auditable.
 """
 
@@ -13,7 +13,7 @@ from typing import Any
 from alpaca.trading.stream import TradingStream
 
 from config import settings
-from core.order_execution import _is_paper_mode
+from core.order_execution import require_paper_mode
 from core.order_manager import OrderManager
 
 
@@ -21,7 +21,8 @@ class FillMonitor:
     """Wrap Alpaca's TradingStream and forward meaningful events to OrderManager."""
 
     def __init__(self) -> None:
-        self._paper = _is_paper_mode()
+        require_paper_mode()
+        self._paper = True
         self._order_manager = OrderManager(paper=self._paper)
         self._stream = TradingStream(
             api_key=settings.ALPACA_API_KEY,
@@ -46,8 +47,7 @@ class FillMonitor:
             daemon=True,
         )
         self._thread.start()
-        mode = "paper" if self._paper else "LIVE"
-        print(f"[FILL MONITOR] Started ({mode} mode) — listening for trade updates")
+        print("[FILL MONITOR] Started (paper mode) — listening for trade updates")
 
     def stop(self) -> None:
         """Signal the WebSocket stream to close."""

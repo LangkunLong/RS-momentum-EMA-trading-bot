@@ -21,10 +21,17 @@ from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 from config import settings
+from core.order_execution import require_paper_mode
 
 _ET = ZoneInfo("America/New_York")
 _SMTP_HOST = "smtp.gmail.com"
 _SMTP_PORT = 587
+
+
+def _paper_mode_label(paper: bool) -> str:
+    """Return the only supported execution label after enforcing paper mode."""
+    require_paper_mode(paper)
+    return "Paper Trading"
 
 
 def _is_configured() -> bool:
@@ -94,7 +101,7 @@ def notify_buy_filled(
         stop_loss_pct = settings.STOP_LOSS_PCT
 
     position_value = qty * fill_price
-    mode = "Paper Trading" if paper else "LIVE Trading"
+    mode = _paper_mode_label(paper)
     now_str = datetime.now(tz=_ET).strftime("%Y-%m-%d %H:%M ET")
     workflow_line = f"Workflow ID: {workflow_id}\n" if workflow_id else ""
 
@@ -131,7 +138,7 @@ def notify_entry_submitted(
     if stop_loss_pct is None:
         stop_loss_pct = settings.STOP_LOSS_PCT
 
-    mode = "Paper Trading" if paper else "LIVE Trading"
+    mode = _paper_mode_label(paper)
     now_str = datetime.now(tz=_ET).strftime("%Y-%m-%d %H:%M ET")
     workflow_line = f"Workflow ID:   {workflow_id}\n" if workflow_id else ""
 
@@ -186,7 +193,7 @@ def notify_sell_filled(
     else:
         entry_price_line = "Entry price: unavailable"
         pnl_line = "P&L:         unavailable"
-    mode = "Paper Trading" if paper else "LIVE Trading"
+    mode = _paper_mode_label(paper)
     now_str = datetime.now(tz=_ET).strftime("%Y-%m-%d %H:%M ET")
     workflow_line = f"Workflow ID: {workflow_id}\n" if workflow_id else ""
 
@@ -225,7 +232,7 @@ def notify_cycle_summary(
     if not entered and not exited:
         return False  # Nothing to report
 
-    mode = "Paper Trading" if paper else "LIVE Trading"
+    mode = _paper_mode_label(paper)
     now_str = datetime.now(tz=_ET).strftime("%Y-%m-%d %H:%M ET")
 
     entered_str = ", ".join(entered) if entered else "none"

@@ -53,7 +53,7 @@ def _build_monitor_with_mock_stream():
     mock_stream.on = mock_on
 
     with patch("fill_monitor.TradingStream", return_value=mock_stream), \
-         patch("fill_monitor._is_paper_mode", return_value=True):
+         patch("fill_monitor.require_paper_mode"):
         from fill_monitor import FillMonitor
         monitor = FillMonitor()
 
@@ -73,7 +73,7 @@ class TestHandlerRegistration:
 
     def test_fill_monitor_constructed_with_paper_true(self):
         with patch("fill_monitor.TradingStream") as mock_cls, \
-             patch("fill_monitor._is_paper_mode", return_value=True):
+             patch("fill_monitor.require_paper_mode"):
             mock_cls.return_value.on = lambda e: lambda fn: fn
             from fill_monitor import FillMonitor
             FillMonitor()

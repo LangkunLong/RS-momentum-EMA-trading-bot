@@ -195,7 +195,7 @@ class TestPathB_BuyFillNotification:
         mock_stream.on = mock_on
 
         with patch("fill_monitor.TradingStream", return_value=mock_stream), \
-             patch("fill_monitor._is_paper_mode", return_value=True):
+             patch("fill_monitor.require_paper_mode"):
             from fill_monitor import FillMonitor
             monitor = FillMonitor()
         return monitor
@@ -273,7 +273,7 @@ class TestPathC_StopLossFillNotification:
         mock_stream.on = mock_on
 
         with patch("fill_monitor.TradingStream", return_value=mock_stream), \
-             patch("fill_monitor._is_paper_mode", return_value=True):
+             patch("fill_monitor.require_paper_mode"):
             from fill_monitor import FillMonitor
             monitor = FillMonitor()
         return monitor
@@ -574,7 +574,7 @@ class TestPathG_AlpacaMockBrokerLifecycle:
         mock_stream.on = mock_on
 
         with patch("fill_monitor.TradingStream", return_value=mock_stream), \
-             patch("fill_monitor._is_paper_mode", return_value=True):
+             patch("fill_monitor.require_paper_mode"):
             from fill_monitor import FillMonitor
 
             return FillMonitor()

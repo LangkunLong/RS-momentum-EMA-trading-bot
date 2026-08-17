@@ -8,7 +8,7 @@ Usage:
     python auto_trader.py
 
 Safety features:
-- Paper mode is ON by default.  Set ALPACA_PAPER=false in .env for live orders.
+- Paper mode is mandatory. Live-account trading is disabled.
 - Position limit: will not open more than MAX_OPEN_POSITIONS at once.
 - Per-position size: at most POSITION_SIZE_PCT of account equity per stock.
 - Hard stop: 8% below the actual fill price (STOP_LOSS_PCT).
@@ -33,6 +33,7 @@ from core.order_execution import (
     check_exit_signals,
     get_open_orders,
     get_open_positions,
+    require_paper_mode,
 )
 from enhanced_scanner import scan_for_canslim_stocks
 
@@ -514,7 +515,8 @@ def run_auto_trader(
         skip_entries: Skip the entry phase (monitor-only mode).
         skip_exits: Skip the exit check (entry-only mode, use with caution).
     """
-    mode_label = "DRY RUN" if dry_run else ("paper" if _is_paper_mode() else "LIVE")
+    require_paper_mode()
+    mode_label = "DRY RUN" if dry_run else "paper"
     print("=" * 60)
     print(f"CANSLIM AUTO TRADER  [{mode_label}]  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
@@ -573,14 +575,14 @@ if __name__ == "__main__":
         help="Print intended orders without submitting (default: True for safety)",
     )
     parser.add_argument(
-        "--live",
+        "--enable-orders",
         action="store_true",
         default=False,
-        help="Actually submit orders (overrides --dry-run). Requires ALPACA_PAPER=false for live.",
+        help="Submit orders to the configured Alpaca paper account (overrides the default dry run)",
     )
     parser.add_argument("--skip-entries", action="store_true", help="Skip entry phase")
     parser.add_argument("--skip-exits", action="store_true", help="Skip exit phase")
     args = parser.parse_args()
 
-    dry = not args.live  # --live disables dry_run
+    dry = not args.enable_orders
     run_auto_trader(dry_run=dry, skip_entries=args.skip_entries, skip_exits=args.skip_exits)

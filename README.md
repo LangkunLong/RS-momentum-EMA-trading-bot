@@ -56,7 +56,7 @@ NOTIFY_EMAIL_TO
 NOTIFY_EMAIL_PASSWORD
 ```
 
-Keep `ALPACA_PAPER=true`. Notification credentials are optional; when absent, email delivery is skipped without blocking execution.
+Keep `ALPACA_PAPER=true`. Every execution entry point rejects a false value before constructing an Alpaca trading client or fill stream; `auto_trader.py --enable-orders` enables paper-account orders only. Notification credentials are optional; when absent, email delivery is skipped without blocking execution.
 
 Never commit credentials, generated scan results, execution databases, `.claude/settings.local.json`, or recovery artifacts. A previously exposed FMP key must be rotated at FMP even if the generated CSV is deleted locally; deletion does not revoke a key or remove it from Git history.
 
