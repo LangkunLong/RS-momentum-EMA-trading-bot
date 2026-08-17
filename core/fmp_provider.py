@@ -15,6 +15,23 @@ from __future__ import annotations
 from typing import Any, Callable, List, Optional
 
 
+def fetch_company_profile(
+    symbol: str,
+    fmp_get_fn: Callable[..., Any],
+) -> dict[str, str]:
+    """Return normalized FMP industry and sector labels for a symbol."""
+    raw = fmp_get_fn("profile", {"symbol": symbol})
+    if not isinstance(raw, list) or not raw or not isinstance(raw[0], dict):
+        return {}
+
+    record = raw[0]
+    return {
+        key: str(record[key]).strip()
+        for key in ("industry", "sector")
+        if record.get(key) and str(record[key]).strip()
+    }
+
+
 def fetch_institutional_ownership_history(
     symbol: str,
     fmp_get_fn: Callable[..., Any],

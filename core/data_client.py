@@ -28,6 +28,7 @@ from alpaca.data.timeframe import TimeFrame
 from config import settings
 from core.fmp_provider import (
     company_info_from_inst_history as _company_info_from_inst_history,
+    fetch_company_profile as _fetch_company_profile,
     fetch_institutional_ownership_history as _fetch_inst_ownership_history,
 )
 
@@ -337,6 +338,11 @@ def _mark_fmp_endpoint_unavailable(endpoint: str, message: str) -> None:
     if endpoint not in _fmp_reported_endpoint_failures:
         print(f"[FMP] {message}")
         _fmp_reported_endpoint_failures.add(endpoint)
+
+
+def fetch_company_profile(symbol: str) -> dict[str, str]:
+    """Fetch normalized company industry and sector labels from FMP."""
+    return _fetch_company_profile(symbol, _fmp_get)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

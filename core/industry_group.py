@@ -7,9 +7,8 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yfinance as yf
-
 from config import settings
+from core.data_client import fetch_company_profile
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +50,9 @@ def get_top_groups(
 
 
 def load_industry_map(tickers: list[str]) -> dict[str, str]:
-    """Load ticker → industry label map, fetching from yfinance and caching to disk.
+    """Load ticker → industry label map, fetching from FMP and caching to disk.
 
-    Uses info["industry"] with fallback to info["sector"]. Tickers with neither
+    Uses profile["industry"] with fallback to profile["sector"]. Tickers with neither
     are omitted from the returned map. Cache TTL is 7 days.
 
     Args:
@@ -78,11 +77,11 @@ def load_industry_map(tickers: list[str]) -> dict[str, str]:
 
     missing = [t for t in tickers if t not in cached_map]
     if missing:
-        logger.info("Fetching industry labels for %d tickers from yfinance", len(missing))
+        logger.info("Fetching industry labels for %d tickers from FMP", len(missing))
         for sym in missing:
             try:
-                info = yf.Ticker(sym).info
-                label = (info.get("industry") or "").strip() or (info.get("sector") or "").strip()
+                profile = fetch_company_profile(sym)
+                label = (profile.get("industry") or "").strip() or (profile.get("sector") or "").strip()
                 if label:
                     cached_map[sym] = label
             except Exception:
