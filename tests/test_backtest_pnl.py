@@ -121,6 +121,15 @@ def _make_simulator(**kwargs) -> PortfolioSimulator:
     return PortfolioSimulator(**defaults)
 
 
+def test_compatibility_types_delegate_to_production_engine() -> None:
+    """The root backtest module must not define competing result or trade types."""
+    from core import backtest_engine
+
+    assert Trade is backtest_engine.Trade
+    assert SimulationResult is backtest_engine.SimulationResult
+    assert issubclass(PortfolioSimulator, backtest_engine.PortfolioSimulator)
+
+
 def _make_trade(
     symbol: str = "TEST",
     entry_price: float = 100.0,
@@ -568,6 +577,7 @@ class TestPortfolioSimulatorRun:
             }),
             patch("backtest_pnl._compute_canslim_score", return_value=75.0),
             patch("backtest_pnl.clear_session_cache"),
+            patch("core.backtest_engine.load_industry_map", return_value={}),
         ):
             # lookback_weeks=8 → 40 business days, well within 150 bars
             result = sim.run(

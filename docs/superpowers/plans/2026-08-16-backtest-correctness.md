@@ -4,7 +4,7 @@
 
 **Goal:** Make portfolio eviction reachable, preserve signal-ranking semantics, and leave one authoritative backtest engine.
 
-**Architecture:** `core.backtest_engine.BacktestEngine` remains the production simulation engine. Candidate selection returns ranked signals that can be considered by `_enter_position()` when eviction is enabled; capacity and eviction decisions stay centralized in `_enter_position()` and `_try_evict()`.
+**Architecture:** `core.backtest_engine.PortfolioSimulator` remains the production simulation engine. Candidate selection returns ranked signals that can be considered by `_enter_position()` when eviction is enabled; capacity and eviction decisions stay centralized in `_enter_position()` and `_try_evict()`.
 
 **Tech Stack:** Python 3.11+, pandas, pytest
 
@@ -27,7 +27,7 @@
 - Modify: `core/backtest_engine.py`
 
 **Interfaces:**
-- Consumes: `BacktestEngine._evaluate_signals(...) -> list[dict]`, `_enter_position(signal, ticker_ohlcv, entry_date) -> None`, and `_try_evict(...) -> bool`.
+- Consumes: `PortfolioSimulator._evaluate_signals(...) -> list[dict]`, `_enter_position(signal, ticker_ohlcv, entry_date) -> None`, and `_try_evict(...) -> bool`.
 - Produces: ranked candidate flow that can reach `_try_evict()` only when eviction is enabled.
 
 - [ ] **Step 1: Write a failing integration regression test**
@@ -93,12 +93,12 @@ git commit -m "fix: allow ranked signals to reach portfolio eviction"
 - Modify: `tests/test_backtest_pnl.py`
 
 **Interfaces:**
-- Consumes: `core.backtest_engine.Trade`, `SimulationResult`, `BacktestEngine`, CLI parser, and compatibility helper functions used by tests/callers.
+- Consumes: `core.backtest_engine.Trade`, `SimulationResult`, `PortfolioSimulator`, CLI parser, and compatibility helper functions used by tests/callers.
 - Produces: one root CLI/import module that delegates simulation to `core.backtest_engine` without duplicate model or engine definitions.
 
 - [ ] **Step 1: Characterize the compatibility API**
 
-Add a test that imports `Trade`, `SimulationResult`, and `BacktestEngine` from both modules and asserts identity with the production classes. Add a CLI parser smoke test covering the documented defaults without executing downloads.
+Add a test that imports `Trade`, `SimulationResult`, and `PortfolioSimulator` from the root module, asserts the data types are identical to the production classes, and asserts the compatibility simulator subclasses the production simulator. Run the CLI help command without executing downloads.
 
 - [ ] **Step 2: Run the characterization tests**
 
