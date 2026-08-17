@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from config import settings
 
@@ -357,17 +358,23 @@ class ExecutionStore:
             row = conn.execute(query, params).fetchone()
         return str(row[0]) if row and row[0] else ""
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield one transactional connection and always close it."""
         db_file = Path(self.db_path)
         db_file.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(db_file, timeout=30, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError:
-            conn.execute("PRAGMA journal_mode=DELETE")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _ensure_schema(self) -> None:
         with self._lock, self._connect() as conn:

@@ -7,9 +7,10 @@ import os
 import pickle
 import sqlite3
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -312,8 +313,15 @@ class DataFetcher:
         except (OSError, sqlite3.Error):
             self._db_available = False
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield one transactional cache connection and always close it."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
