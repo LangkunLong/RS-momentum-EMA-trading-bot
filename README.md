@@ -182,6 +182,8 @@ through the scheduler's unbuffered task log. The default task runs
 separate `--enable-orders` flag after that task is observed. The order-enabled
 task uses `--fmp-daily-budget 20`, a conservative per-process allowance for the
 FMP free plan; it does not raise the persisted daily hard ceiling.
+To stop unattended paper trading, run `python setup_windows_task.py --remove`
+from this checkout.
 Only one scheduler process can run on the host, and live order paths remain
 disabled until the fill stream is connected and startup stop reconciliation
 succeeds.

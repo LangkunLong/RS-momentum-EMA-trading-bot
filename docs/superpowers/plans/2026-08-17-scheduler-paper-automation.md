@@ -67,6 +67,6 @@
 ## Task 5: Graduate to paper orders deliberately
 
 - [x] Review the dry-run shortlist, sizing, current broker account, and FMP headroom.
-- [ ] Run exactly one monitored order-enabled scheduler cycle with all other order-enabled processes stopped.
-- [ ] Verify fills, workflow transitions, protective stops, pending intents, and absence of orphan orders.
-- [ ] Only after that evidence, replace the scheduled task with its explicit `--enable-orders` action and re-inspect the installed configuration.
+- [x] Run exactly one monitored order-enabled scheduler cycle with all other order-enabled processes stopped.
+- [x] Verify any resulting fills and workflows; when no signal qualifies, verify zero positions, orders, active owners, and pending intents.
+- [x] Only after that evidence, replace the scheduled task with its explicit `--enable-orders` action and re-inspect the installed configuration.

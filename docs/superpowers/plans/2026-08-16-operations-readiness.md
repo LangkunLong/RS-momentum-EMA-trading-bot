@@ -216,7 +216,7 @@ Run the setup script, query the resulting Windows task, and verify command, trig
 
 Trigger the task with dry-run arguments, inspect exit status and logs, and confirm no broker mutation occurred.
 
-- [ ] **Step 5: Enable the validated paper schedule**
+- [x] **Step 5: Enable the validated paper schedule**
 
 Replace the dry-run arguments only after the user explicitly approves automated paper order submission. Keep the live task on the conservative free-plan process cap `--fmp-daily-budget 20`, inspect the final task once more, and record rollback/removal instructions.
 
