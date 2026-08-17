@@ -24,6 +24,7 @@ _ROW_FIELDS = (
     "technical_eligible",
     "tomorrow_executable",
     "blocking_reasons",
+    "execution_blocking_reasons",
     "warnings",
     "rs_score",
     "weighted_performance",
@@ -68,9 +69,11 @@ def build_after_close_snapshot(
 
     performances = pd.Series(
         {
-            symbol: _weighted_performance(history)
-            for symbol, history in normalized_prices.items()
-            if _is_current_and_sufficient(history, as_of_session)
+            symbol: _weighted_performance(normalized_prices[symbol])
+            for symbol in symbols
+            if symbol != "SPY"
+            and symbol in normalized_prices
+            and _is_current_and_sufficient(normalized_prices[symbol], as_of_session)
         },
         dtype="float64",
     ).dropna()
@@ -136,6 +139,7 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
         "technical_eligible": False,
         "tomorrow_executable": False,
         "blocking_reasons": "",
+        "execution_blocking_reasons": "",
         "warnings": "",
         "rs_score": None,
         "weighted_performance": None,
@@ -173,7 +177,7 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
     prior_close = float(close.iloc[-2])
     prior_252_close_max = float(close.iloc[-253:-1].max()) if len(close) >= 253 else float(close.iloc[:-1].max())
     pivot = prior_252_close_max
-    average_volume = float(volume.iloc[-51:-1].mean())
+    average_volume = float(volume.tail(50).mean())
     price_up = latest_close > prior_close
     has_volume_surge, volume_ratio = _detect_volume_surge(
         float(volume.iloc[-1]), average_volume, settings.S_VOLUME_SURGE_THRESHOLD, price_up=price_up
@@ -189,7 +193,7 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
             "extension": extension,
             "proximity_to_52week_high": proximity,
             "volume_ratio_50d": volume_ratio,
-            "average_dollar_volume_50d": float((close.iloc[-51:-1] * volume.iloc[-51:-1]).mean()),
+            "average_dollar_volume_50d": float((close.tail(50) * volume.tail(50)).mean()),
             "atr_pct_20d": _atr_pct(high, low, close),
             "realized_volatility_20d": _realized_volatility(close),
         }
@@ -201,9 +205,10 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
     if not has_volume_surge:
         _add_blocker(row, "no_up_day_volume_surge")
         gaps.append(max((settings.S_VOLUME_SURGE_THRESHOLD - volume_ratio) / settings.S_VOLUME_SURGE_THRESHOLD, 0.0))
-    if pivot <= 0 or latest_close < pivot:
+    buy_zone_min = pivot * (1 - settings.BUY_ZONE_UNDERCUT_TOLERANCE_PCT)
+    if pivot <= 0 or latest_close < buy_zone_min:
         _add_blocker(row, "below_pivot")
-        gaps.append((pivot - latest_close) / pivot if pivot > 0 else 1.0)
+        gaps.append((buy_zone_min - latest_close) / buy_zone_min if buy_zone_min > 0 else 1.0)
     elif latest_close > pivot * (1 + settings.BUY_ZONE_EXTENSION_PCT):
         _add_blocker(row, "beyond_buy_zone")
         gaps.append((extension - settings.BUY_ZONE_EXTENSION_PCT) / settings.BUY_ZONE_EXTENSION_PCT)
@@ -212,20 +217,29 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
 
 
 def _apply_rs_gate(row: dict[str, object], *, market: MarketTrend) -> None:
-    if row["blocking_reasons"]:
+    structural_blockers = {
+        "missing_price_history",
+        "stale_price_history",
+        "insufficient_price_history",
+        "invalid_price_history",
+    }
+    blockers = set(str(row["blocking_reasons"]).split(","))
+    if blockers & structural_blockers:
         return
     score = row["rs_score"]
     if score is None:
         _add_blocker(row, "rs_unavailable")
-        return
-    score_float = float(score)
-    if score_float < settings.MIN_RS_SCORE:
-        _add_blocker(row, "rs_below_threshold")
-        gap = (settings.MIN_RS_SCORE - score_float) / settings.MIN_RS_SCORE
-        existing_gap = row["normalized_trigger_gap"]
-        row["normalized_trigger_gap"] = float(existing_gap or 0.0) + gap
+    else:
+        score_float = float(score)
+        if score_float < settings.MIN_RS_SCORE:
+            _add_blocker(row, "rs_below_threshold")
+            gap = (settings.MIN_RS_SCORE - score_float) / settings.MIN_RS_SCORE
+            existing_gap = row["normalized_trigger_gap"]
+            row["normalized_trigger_gap"] = float(existing_gap or 0.0) + gap
     row["technical_eligible"] = not bool(row["blocking_reasons"])
     row["tomorrow_executable"] = bool(row["technical_eligible"]) and market.is_bullish
+    if row["technical_eligible"] and not market.is_bullish:
+        _add_execution_blocker(row, "market_not_bullish")
 
 
 def _is_current_and_sufficient(history: pd.DataFrame, as_of_session: date) -> bool:
@@ -239,7 +253,8 @@ def _weighted_performance(history: pd.DataFrame) -> float | None:
         return float(weighted)
     if len(close) < 30 or close.iloc[0] <= 0:
         return None
-    fallback = (close.iloc[-1] / close.iloc[0]) - 1
+    raw_return = (close.iloc[-1] - close.iloc[0]) / close.iloc[0]
+    fallback = (1 + raw_return) ** (252 / len(close)) - 1
     return float(fallback) if math.isfinite(float(fallback)) else None
 
 
@@ -269,6 +284,10 @@ def _add_blocker(row: dict[str, object], reason: str) -> None:
 
 def _add_warning(row: dict[str, object], warning: str) -> None:
     row["warnings"] = _append_reason(str(row["warnings"]), warning)
+
+
+def _add_execution_blocker(row: dict[str, object], reason: str) -> None:
+    row["execution_blocking_reasons"] = _append_reason(str(row["execution_blocking_reasons"]), reason)
 
 
 def _append_reason(existing: str, reason: str) -> str:
