@@ -401,6 +401,41 @@ class TestBug5VerifyPaperTradingColumnName:
 # ---------------------------------------------------------------------------
 
 
+class TestAutoTraderCycleResult:
+    """The auto-trader must return exact outcomes for scheduler reporting."""
+
+    def test_run_auto_trader_returns_entered_and_exited_symbols(self):
+        from auto_trader import AutoTraderCycleResult, run_auto_trader
+
+        with (
+            patch("auto_trader.monitor_and_exit_positions", return_value=["AAPL"]),
+            patch("auto_trader.scan_for_canslim_stocks", return_value=([{"symbol": "NVDA"}], [], "uptrend")),
+            patch("auto_trader.execute_entries", return_value=["NVDA"]),
+        ):
+            result = run_auto_trader(dry_run=True)
+
+        assert result == AutoTraderCycleResult(entered=("NVDA",), exited=("AAPL",))
+
+    def test_run_auto_trader_skip_flags_return_empty_outcomes(self):
+        from auto_trader import AutoTraderCycleResult, run_auto_trader
+
+        with patch("auto_trader.scan_for_canslim_stocks", return_value=([], [], "uptrend")):
+            result = run_auto_trader(dry_run=True, skip_entries=True, skip_exits=True)
+
+        assert result == AutoTraderCycleResult()
+
+    def test_market_closed_guard_returns_empty_outcomes(self):
+        from auto_trader import AutoTraderCycleResult, run_auto_trader
+
+        with (
+            patch("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", True),
+            patch("auto_trader._is_market_open", return_value=False),
+        ):
+            result = run_auto_trader(dry_run=False)
+
+        assert result == AutoTraderCycleResult()
+
+
 class TestBug6CycleSummaryEmail:
     """_run_cycle must call notify_cycle_summary after run_auto_trader completes."""
 

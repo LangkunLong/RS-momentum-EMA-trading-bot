@@ -18,6 +18,7 @@ Safety features:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -466,11 +467,19 @@ def execute_entries(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class AutoTraderCycleResult:
+    """Immutable symbols acted on during one auto-trader cycle."""
+
+    entered: tuple[str, ...] = ()
+    exited: tuple[str, ...] = ()
+
+
 def run_auto_trader(
     dry_run: bool = False,
     skip_entries: bool = False,
     skip_exits: bool = False,
-) -> None:
+) -> AutoTraderCycleResult:
     """Full CANSLIM scan → exit monitoring → entry execution cycle.
 
     Args:
@@ -486,7 +495,10 @@ def run_auto_trader(
     if settings.ENTRY_MARKET_HOURS_ONLY and not dry_run:
         if not _is_market_open():
             print("[WARN] Market is closed. Set ENTRY_MARKET_HOURS_ONLY=False to queue orders anyway.")
-            return
+            return AutoTraderCycleResult()
+
+    entered: list[str] = []
+    exited: list[str] = []
 
     # --- Phase 1: Exit monitoring ---
     if not skip_exits:
@@ -520,6 +532,7 @@ def run_auto_trader(
         print("\n--- Phase 3: Entry orders (skipped) ---")
 
     print("\nAuto-trader cycle complete.")
+    return AutoTraderCycleResult(entered=tuple(entered), exited=tuple(exited))
 
 
 if __name__ == "__main__":
