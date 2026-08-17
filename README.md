@@ -107,6 +107,17 @@ Run a read-only scan against configured providers:
 python enhanced_scanner.py
 ```
 
+### After-close candidate preparation
+
+Create a completed-bar, technical-only advisory snapshot for the next session:
+
+```powershell
+$env:FMP_DAILY_REQUEST_BUDGET='0'
+.\.venv\Scripts\python.exe -u .\prepare_after_close.py
+```
+
+This command downloads completed daily prices once, writes full CSV and JSON artifacts under `scan_results/after_close`, never submits orders, and never consumes FMP quota. Its shortlist is advisory only: execution-time price and safety revalidation remains mandatory before any paper order.
+
 On the free FMP plan, use technical-only mode for broad-universe historical backtests; this path makes zero FMP calls:
 
 ```powershell
