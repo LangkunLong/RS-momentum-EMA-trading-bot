@@ -49,10 +49,12 @@ _fmp_reported_endpoint_failures: set[str] = set()
 
 def clear_session_cache() -> None:
     """Reset the in-memory session cache between scan runs."""
+    global _fmp_quota_exhausted
     with _cache_lock:
         _session_cache.clear()
     _fmp_unavailable_endpoints.clear()
     _fmp_reported_endpoint_failures.clear()
+    _fmp_quota_exhausted = False
 
 
 def _cache_get(key: tuple) -> Any:
@@ -309,8 +311,8 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
 
     try:
         resp.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"[FMP] HTTP error on '{endpoint}': {exc}")
+    except requests.RequestException:
+        print(f"[FMP] HTTP {resp.status_code} on '{endpoint}'.")
         return []
     data = resp.json()
 

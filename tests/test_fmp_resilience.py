@@ -143,6 +143,35 @@ def test_fmp_get_404_logs_once_and_skips_repeated_endpoint_calls(capsys) -> None
     assert captured.out.count("HTTP 404") == 1
 
 
+def test_clear_session_cache_resets_quota_circuit_breaker() -> None:
+    """A new scan must retry FMP after an earlier scan exhausted its quota."""
+    _dc_module._fmp_quota_exhausted = True
+
+    clear_session_cache()
+
+    assert _dc_module._fmp_quota_exhausted is False
+
+
+def test_fmp_get_redacts_prepared_url_credentials(capsys) -> None:
+    """HTTP errors must identify the endpoint without echoing query credentials."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 500
+    mock_resp.raise_for_status.side_effect = requests.HTTPError(
+        "500 Server Error for url: https://example.invalid/profile?apikey=exposed-fixture-secret"
+    )
+
+    with patch("core.data_client._fmp_session") as mock_session:
+        mock_session.get.return_value = mock_resp
+        result = _fmp_get("profile", {"symbol": "AAPL"})
+
+    output = capsys.readouterr().out
+    assert result == []
+    assert "profile" in output
+    assert "500" in output
+    assert "apikey=" not in output
+    assert "exposed-fixture-secret" not in output
+
+
 # ─── Disk fundamentals cache ─────────────────────────────────────────────────
 
 
