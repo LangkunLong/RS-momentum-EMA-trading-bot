@@ -523,6 +523,7 @@ class TestPathF_SchedulerCycle:
 
         with patch("scheduler._now_et", side_effect=_mock_now), \
              patch("scheduler.time.sleep", side_effect=_sleep), \
+             patch("scheduler._market_clock_is_open", return_value=True), \
              patch("scheduler._run_cycle", side_effect=_mock_cycle), \
              patch("scheduler.FillMonitor") as MockFM, \
              patch("scheduler.monitor_and_exit_positions", return_value=[]), \

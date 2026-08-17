@@ -164,6 +164,7 @@ class TestBug3SchedulerNoRetryLoop:
 
         with patch("scheduler._now_et", side_effect=_mock_now), \
              patch("scheduler.time.sleep", side_effect=_mock_sleep), \
+             patch("scheduler._market_clock_is_open", return_value=True), \
              patch("scheduler._run_cycle", side_effect=_failing_cycle), \
              patch("scheduler.FillMonitor") as mock_fm, \
              patch("scheduler.monitor_and_exit_positions", return_value=[]), \
@@ -232,6 +233,7 @@ class TestBug4LastHourlyCheckFires:
 
         with patch("scheduler._now_et", side_effect=_mock_now), \
              patch("scheduler.time.sleep", side_effect=_mock_sleep), \
+             patch("scheduler._market_clock_is_open", return_value=None), \
              patch("scheduler.monitor_exits_hourly", side_effect=_mock_hourly), \
              patch("scheduler.monitor_and_exit_positions", return_value=[]), \
              patch("scheduler.FillMonitor") as mock_fm:
