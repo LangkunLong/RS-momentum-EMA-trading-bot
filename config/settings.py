@@ -6,6 +6,7 @@ Parameters follow William O'Neil's CANSLIM methodology from
 """
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -19,7 +20,7 @@ ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_STOCK_FEED = os.environ.get("ALPACA_STOCK_FEED", "iex").strip().lower()
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 # ALPACA_PAPER is read directly from os.environ in order_execution.py
-# (default: "true" — paper trading). Set to "false" in .env for live trading.
+# (default: "true" — paper trading). Any false value is rejected at runtime.
 
 # Email notifications (Gmail SMTP with App Password)
 # NOTIFY_EMAIL_FROM: your Gmail address (sender)
@@ -35,7 +36,8 @@ NOTIFY_EMAIL_PASSWORD = os.environ.get("NOTIFY_EMAIL_PASSWORD", "")
 # SCANNER SETTINGS
 # ==============================================================================
 
-ARTIFACTS_DIR = ".artifacts"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ARTIFACTS_DIR = str(_PROJECT_ROOT / ".artifacts")
 CACHE_DIR = os.path.join(ARTIFACTS_DIR, "cache")
 PYTEST_ARTIFACTS_DIR = os.path.join(ARTIFACTS_DIR, "pytest")
 SCAN_RESULTS_DIR = os.path.join(ARTIFACTS_DIR, "scan_results")
@@ -56,7 +58,7 @@ MIN_RS_SCORE = 80
 MIN_CANSLIM_SCORE = 70  # Minimum composite CANSLIM score for actionable entries
 INDUSTRY_GROUP_TOP_N: int = 20  # number of top industry groups allowed for entries
 INDUSTRY_GROUP_MIN_SIZE: int = 3  # min stocks in a group to include it in ranking
-INDUSTRY_GROUP_CACHE_PATH: str = ".artifacts/cache/industry_group_cache.json"
+INDUSTRY_GROUP_CACHE_PATH: str = os.path.join(CACHE_DIR, "industry_group_cache.json")
 
 # ==============================================================================
 # PIVOT DETECTION PARAMETERS (O'Neil cup-with-handle & flat base patterns)
@@ -86,6 +88,8 @@ EXECUTION_STORE_DB_PATH = os.environ.get(
     "EXECUTION_STORE_DB_PATH",
     os.path.join(os.environ.get("TEMP", "."), "trading_bot", "execution_store.sqlite3"),
 )  # Durable SQLite execution store
+if not os.path.isabs(EXECUTION_STORE_DB_PATH):
+    EXECUTION_STORE_DB_PATH = str(_PROJECT_ROOT / EXECUTION_STORE_DB_PATH)
 
 # Performance settings
 MAX_WORKERS = 3  # Maximum threads for parallel processing
@@ -316,13 +320,29 @@ TRADING_DAYS_PER_QUARTER = 65  # Approximate trading days in a quarter
 
 # FMP (Financial Modeling Prep) configuration
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
+FMP_PLAN = os.environ.get("FMP_PLAN", "free").strip().lower()
+if FMP_PLAN not in {"free", "paid"}:
+    raise ValueError("FMP_PLAN must be either 'free' or 'paid'.")
 
-# FMP fetch limits — sized for a paid plan with fuller data history.
-# Callers can override by passing an explicit limit= argument.
-FMP_QUARTERLY_LIMIT = 12           # 3 years of quarterly income statements
-FMP_ANNUAL_LIMIT = 10              # 10 years of annual income statements
-FMP_BALANCE_SHEET_LIMIT = 10       # 10 years of balance sheets
-FMP_INSTITUTIONAL_HISTORY_LIMIT = 8  # quarterly institutional ownership snapshots (live scan)
+# The free plan permits 250 provider requests per reset window. The bot's
+# ceiling stays at 198, preserving 52 requests for manual and administrative use.
+FMP_FREE_MAX_RECORDS = 5
+FMP_FREE_DAILY_REQUEST_BUDGET_CAP = 198
+FMP_DAILY_REQUEST_BUDGET = min(
+    max(int(os.environ.get("FMP_DAILY_REQUEST_BUDGET", "198")), 0),
+    FMP_FREE_DAILY_REQUEST_BUDGET_CAP,
+)
+FMP_REQUEST_LEDGER_PATH = os.path.join(CACHE_DIR, "fmp_request_usage.json")
+FMP_RESET_HOUR_EASTERN = 15
+FMP_FUND_CACHE_TTL_HOURS = 168 if FMP_PLAN == "free" else 72
+
+# FMP fetch limits are free-tier-safe by default; paid mode keeps fuller history.
+# The HTTP boundary always enforces the free-plan maximum even for explicit limits.
+FMP_QUARTERLY_LIMIT = 5 if FMP_PLAN == "free" else 12
+FMP_ANNUAL_LIMIT = 5 if FMP_PLAN == "free" else 10
+FMP_BALANCE_SHEET_LIMIT = 5 if FMP_PLAN == "free" else 10
+FMP_INSTITUTIONAL_HISTORY_LIMIT = 1  # current snapshot includes previous holder count
+FMP_INSTITUTIONAL_BACKTEST_LIMIT = 20  # five years of period-specific snapshots
 
 # HTTP Retry settings
 HTTP_RETRY_TOTAL = 5  # Maximum retry attempts

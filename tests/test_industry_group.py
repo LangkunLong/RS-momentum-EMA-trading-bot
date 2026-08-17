@@ -1,9 +1,11 @@
 """Tests for industry group RS ranking logic."""
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
-from core.industry_group import get_top_groups
+from core.industry_group import get_top_groups, load_industry_map
 
 
 def test_top_groups_returns_top_n() -> None:
@@ -101,10 +103,69 @@ def test_ticker_not_in_top_group_is_blocked() -> None:
     assert ticker_group not in top_groups
 
 
+def test_fmp_company_profile_normalizes_industry_and_sector() -> None:
+    """The FMP adapter must return only non-empty normalized labels."""
+    from core.fmp_provider import fetch_company_profile
+
+    def fake_fmp_get(endpoint: str, params: dict) -> list[dict]:
+        assert endpoint == "profile"
+        assert params == {"symbol": "NVDA"}
+        return [{"industry": " Semiconductors ", "sector": "Technology", "companyName": "NVIDIA"}]
+
+    assert fetch_company_profile("NVDA", fake_fmp_get) == {
+        "industry": "Semiconductors",
+        "sector": "Technology",
+    }
+
+
+@pytest.mark.parametrize("payload", [[], {}, [None], [{"industry": " ", "sector": ""}]])
+def test_fmp_company_profile_rejects_empty_or_malformed_payloads(payload: object) -> None:
+    """Malformed provider payloads must degrade to an empty profile."""
+    from core.fmp_provider import fetch_company_profile
+
+    assert fetch_company_profile("EMPTY", lambda *_args, **_kwargs: payload) == {}
+
+
+def test_load_industry_map_uses_fmp_and_reuses_disk_cache(tmp_path) -> None:
+    """Industry labels use FMP industry-first fallback and a seven-day cache."""
+    cache_path = tmp_path / "industry_map.json"
+    profiles = {
+        "NVDA": {"industry": "Semiconductors", "sector": "Technology"},
+        "BRK.B": {"sector": "Financial Services"},
+        "EMPTY": {},
+    }
+
+    with (
+        patch("core.industry_group.settings.INDUSTRY_GROUP_CACHE_PATH", str(cache_path)),
+        patch("core.industry_group.settings.FMP_PLAN", "paid", create=True),
+        patch("core.industry_group.fetch_company_profile", side_effect=lambda symbol: profiles[symbol]) as fetch,
+    ):
+        first = load_industry_map(["NVDA", "BRK.B", "EMPTY"])
+        second = load_industry_map(["NVDA", "BRK.B"])
+
+    assert first == {"NVDA": "Semiconductors", "BRK.B": "Financial Services"}
+    assert second == first
+    assert fetch.call_count == 3
+
+
+def test_free_plan_industry_map_uses_cache_without_profile_calls(tmp_path) -> None:
+    """Free mode must not spend quota on company profiles for industry labels."""
+    cache_path = tmp_path / "industry_map.json"
+
+    with (
+        patch("core.industry_group.settings.INDUSTRY_GROUP_CACHE_PATH", str(cache_path)),
+        patch("core.industry_group.settings.FMP_PLAN", "free", create=True),
+        patch("core.industry_group.fetch_company_profile") as fetch,
+    ):
+        result = load_industry_map(["NVDA", "AAPL"])
+
+    assert result == {}
+    fetch.assert_not_called()
+
+
 @pytest.mark.integration
 def test_load_industry_map_fetches_real_data() -> None:
-    """yfinance returns industry labels for known large-cap tickers."""
-    from core.industry_group import load_industry_map
+    """FMP returns industry labels for known large-cap tickers."""
 
     result = load_industry_map(["NVDA", "AAPL", "JPM"])
     assert result.get("NVDA") == "Semiconductors"

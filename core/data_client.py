@@ -13,25 +13,31 @@ from __future__ import annotations
 import math
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
-from alpaca.data.enums import Adjustment
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 from config import settings
+from core.fmp_provider import (
+    company_info_from_inst_history as _company_info_from_inst_history,
+    fetch_company_profile as _fetch_company_profile,
+    fetch_institutional_ownership_history as _fetch_inst_ownership_history,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Session Cache (in-memory, per-run)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import hashlib
+import json
 import os
 import pickle
 
@@ -39,12 +45,20 @@ from cachetools import LRUCache
 
 _session_cache = LRUCache(maxsize=500)
 _cache_lock = threading.Lock()
+_fmp_unavailable_endpoints: dict[str, str] = {}
+_fmp_reported_endpoint_failures: set[str] = set()
 
 
 def clear_session_cache() -> None:
     """Reset the in-memory session cache between scan runs."""
+    global _fmp_budget_warning_emitted, _fmp_quota_exhausted
     with _cache_lock:
         _session_cache.clear()
+    _fmp_unavailable_endpoints.clear()
+    _fmp_reported_endpoint_failures.clear()
+    _fmp_quota_exhausted = False
+    _fmp_budget_warning_emitted = False
+    reset_fmp_request_context()
 
 
 def _cache_get(key: tuple) -> Any:
@@ -58,11 +72,11 @@ def _cache_set(key: tuple, value: Any) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Fundamentals Disk Cache (daily TTL — saves FMP quota across runs)
+# Fundamentals Disk Cache (72-hour TTL — saves FMP quota across runs)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_FUND_CACHE_DIR = "fundamentals_cache"
-_FUND_CACHE_TTL_HOURS = 24
+_FUND_CACHE_DIR = settings.FUNDAMENTALS_CACHE_DIR
+_FUND_CACHE_TTL_HOURS = 72  # 3 days — quarterly statements rarely change
 
 
 def _fund_cache_path(key: tuple) -> str:
@@ -76,7 +90,7 @@ def _fund_cache_get(key: tuple) -> Any:
     if not os.path.exists(path):
         return None
     age_hours = (time.time() - os.path.getmtime(path)) / 3600
-    if age_hours > _FUND_CACHE_TTL_HOURS:
+    if age_hours > settings.FMP_FUND_CACHE_TTL_HOURS:
         return None
     try:
         with open(path, "rb") as f:
@@ -101,6 +115,7 @@ def _fund_cache_set(key: tuple, value: Any) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _local = threading.local()
+_ALPACA_FEED_WARNING_EMITTED = False
 
 
 def _get_alpaca_client() -> StockHistoricalDataClient:
@@ -111,6 +126,20 @@ def _get_alpaca_client() -> StockHistoricalDataClient:
             raise EnvironmentError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. See .env.example for details.")
         _local.alpaca_client = StockHistoricalDataClient(api_key, secret_key)
     return _local.alpaca_client
+
+
+def _get_alpaca_stock_feed() -> DataFeed:
+    """Return the configured Alpaca stock feed, defaulting safely to IEX."""
+    global _ALPACA_FEED_WARNING_EMITTED
+
+    raw_value = str(getattr(settings, "ALPACA_STOCK_FEED", "iex") or "iex").strip().lower()
+    try:
+        return DataFeed(raw_value)
+    except ValueError:
+        if not _ALPACA_FEED_WARNING_EMITTED:
+            print(f"[ALPACA] Unknown ALPACA_STOCK_FEED={raw_value!r}; defaulting to 'iex'.")
+            _ALPACA_FEED_WARNING_EMITTED = True
+        return DataFeed.IEX
 
 
 def _fmp_api_key() -> str:
@@ -155,6 +184,108 @@ from urllib3.util.retry import Retry
 
 
 _US_EASTERN = ZoneInfo("America/New_York")
+_REGULAR_SESSION_START = dtime(9, 30)
+_REGULAR_SESSION_END = dtime(16, 0)
+_fmp_budget_lock = threading.Lock()
+_fmp_request_context = threading.local()
+_fmp_budget_warning_emitted = False
+
+
+def _is_fmp_free_plan() -> bool:
+    return str(getattr(settings, "FMP_PLAN", "free")).strip().lower() == "free"
+
+
+def reset_fmp_request_context() -> None:
+    """Clear request-defer state for the current scanner worker."""
+    _fmp_request_context.quota_deferred = False
+
+
+def fmp_request_was_deferred() -> bool:
+    """Return whether the current worker was denied by the local FMP budget."""
+    return bool(getattr(_fmp_request_context, "quota_deferred", False))
+
+
+def _fmp_now_et() -> datetime:
+    """Return the current provider-accounting time in US Eastern."""
+    return datetime.now(tz=_US_EASTERN)
+
+
+def _fmp_window_start(now_et: datetime) -> datetime:
+    """Return the 3 p.m. Eastern start of the active provider reset window."""
+    if now_et.tzinfo is None:
+        now_et = now_et.replace(tzinfo=_US_EASTERN)
+    else:
+        now_et = now_et.astimezone(_US_EASTERN)
+    reset_hour = int(getattr(settings, "FMP_RESET_HOUR_EASTERN", 15))
+    start = now_et.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+    if now_et < start:
+        start -= timedelta(days=1)
+    return start
+
+
+def _write_fmp_usage(path: str, usage: dict[str, Any]) -> bool:
+    """Atomically persist request usage; fail closed if accounting cannot be saved."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(usage, handle, sort_keys=True)
+        os.replace(temp_path, path)
+        return True
+    except OSError:
+        return False
+
+
+def _reserve_fmp_request() -> bool:
+    """Reserve one persisted free-tier request before any network I/O."""
+    global _fmp_budget_warning_emitted
+
+    if not _is_fmp_free_plan():
+        return True
+
+    path = str(settings.FMP_REQUEST_LEDGER_PATH)
+    window_start = _fmp_window_start(_fmp_now_et()).isoformat()
+    budget = int(settings.FMP_DAILY_REQUEST_BUDGET)
+
+    with _fmp_budget_lock:
+        usage: dict[str, Any] = {"window_start": window_start, "count": 0}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            if not isinstance(saved, dict):
+                raise ValueError("FMP usage ledger must contain a JSON object")
+            if saved.get("window_start") == window_start:
+                usage["count"] = max(int(saved.get("count", 0)), 0)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            _fmp_request_context.quota_deferred = True
+            if not _fmp_budget_warning_emitted:
+                print("[FMP] Request usage ledger is unreadable; failing closed to protect the free-plan quota.")
+                _fmp_budget_warning_emitted = True
+            return False
+
+        if usage["count"] >= budget:
+            _fmp_request_context.quota_deferred = True
+            if not _fmp_budget_warning_emitted:
+                print(
+                    f"[FMP] Local daily request budget ({budget}) reached; "
+                    "remaining uncached candidates will be quota_deferred."
+                )
+                _fmp_budget_warning_emitted = True
+            return False
+
+        usage["count"] += 1
+        if _write_fmp_usage(path, usage):
+            return True
+
+        _fmp_request_context.quota_deferred = True
+        if not _fmp_budget_warning_emitted:
+            print("[FMP] Could not persist request usage; failing closed to protect the free-plan quota.")
+            _fmp_budget_warning_emitted = True
+        return False
 
 
 def _drop_incomplete_daily_bar(df: pd.DataFrame) -> pd.DataFrame:
@@ -177,13 +308,36 @@ def _drop_incomplete_daily_bar(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _to_eastern_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Convert a DatetimeIndex to US/Eastern."""
+    if index.tz is None:
+        return index.tz_localize("UTC").tz_convert(_US_EASTERN)
+    return index.tz_convert(_US_EASTERN)
+
+
+def _filter_regular_session(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only regular-session bars using US/Eastern timestamps."""
+    if df.empty:
+        return df
+
+    result = df.copy()
+    result.index = _to_eastern_index(result.index)
+    return result.between_time(
+        _REGULAR_SESSION_START.strftime("%H:%M"),
+        _REGULAR_SESSION_END.strftime("%H:%M"),
+        inclusive="left",
+    )
+
+
 def _get_fmp_session() -> requests.Session:
     """Create a requests session with built-in retry logic."""
     session = requests.Session()
+    retry_total = 0 if _is_fmp_free_plan() else settings.HTTP_RETRY_TOTAL
+    retry_statuses = [] if _is_fmp_free_plan() else settings.HTTP_RETRY_STATUS_CODES
     retries = Retry(
-        total=settings.HTTP_RETRY_TOTAL,
+        total=retry_total,
         backoff_factor=settings.HTTP_RETRY_BACKOFF,
-        status_forcelist=settings.HTTP_RETRY_STATUS_CODES,
+        status_forcelist=retry_statuses,
     )
     pool_size = max(settings.HTTP_MAX_WORKERS, settings.MAX_WORKERS, 10)
     session.mount(
@@ -199,34 +353,111 @@ def _get_fmp_session() -> requests.Session:
 
 _fmp_session = _get_fmp_session()
 
+# Session-level flag: once FMP is unreachable (all retries exhausted), skip
+# further calls rather than burning time on guaranteed failures.
+_fmp_quota_exhausted: bool = False
+
 
 def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
-    """Execute a GET request against the FMP API with retries."""
+    """Execute a GET request against the FMP API with retries.
+
+    Returns an empty list on any unrecoverable error (quota, auth, network)
+    so callers always receive a consistent type.
+
+    Material failures (auth errors, plan restrictions) are printed so they
+    are visible in logs rather than silently degrading data quality.
+    """
+    global _fmp_quota_exhausted
+
+    if _fmp_quota_exhausted:
+        return []
+    if settings.FMP_SUPPRESS_REPEATED_ENDPOINT_ERRORS and endpoint in _fmp_unavailable_endpoints:
+        return []
+
     url = f"{settings.FMP_BASE_URL}/{endpoint}"
-    params = params or {}
-    params["apikey"] = _fmp_api_key()
+    request_params = dict(params or {})
+    if _is_fmp_free_plan() and "limit" in request_params:
+        try:
+            request_params["limit"] = min(
+                int(request_params["limit"]),
+                int(settings.FMP_FREE_MAX_RECORDS),
+            )
+        except (TypeError, ValueError):
+            request_params["limit"] = int(settings.FMP_FREE_MAX_RECORDS)
+    request_params["apikey"] = _fmp_api_key()
+    if not _reserve_fmp_request():
+        return []
 
     try:
-        resp = _fmp_session.get(url, params=params, timeout=30)
+        resp = _fmp_session.get(url, params=request_params, timeout=30)
     except requests.exceptions.RetryError:
-        # Retry adapter exhausted (all attempts returned 429) — quota exceeded.
+        # Retry adapter exhausted all attempts — treat as a persistent failure.
+        _fmp_quota_exhausted = True
+        print("[FMP] All retries exhausted. Skipping FMP for remainder of session.")
         return []
-    except requests.exceptions.ConnectionError:
-        return []
-
-    # 402/403 = free-tier restriction; degrade gracefully rather than crashing.
-    if resp.status_code in (402, 403):
+    except requests.exceptions.RequestException:
         return []
 
-    resp.raise_for_status()
+    # 402: endpoint not included in the current plan.
+    if resp.status_code == 402:
+        _mark_fmp_endpoint_unavailable(endpoint, f"HTTP 402 on '{endpoint}': endpoint not available in current plan tier.")
+        return []
+
+    # 403: authentication or permission failure — surface it clearly.
+    if resp.status_code == 403:
+        _mark_fmp_endpoint_unavailable(
+            endpoint,
+            f"HTTP 403 on '{endpoint}': access denied — verify FMP_API_KEY and plan permissions.",
+        )
+        return []
+
+    # 404: endpoint unavailable on current base URL / plan tier. Suppress repeats.
+    if resp.status_code == 404:
+        _mark_fmp_endpoint_unavailable(
+            endpoint,
+            f"HTTP 404 on '{endpoint}': endpoint unavailable on the current FMP base URL or plan tier.",
+        )
+        return []
+
+    # 429: quota/rate limit reached. Stop hammering the provider for this run.
+    if resp.status_code == 429:
+        _fmp_quota_exhausted = True
+        print(f"[FMP] HTTP 429 on '{endpoint}': rate limit or quota reached. Skipping FMP for remainder of session.")
+        return []
+
+    try:
+        resp.raise_for_status()
+    except requests.RequestException:
+        print(f"[FMP] HTTP {resp.status_code} on '{endpoint}'.")
+        return []
     data = resp.json()
 
     if isinstance(data, dict):
         error_msg = data.get("Error Message") or data.get("error") or data.get("message")
         if error_msg:
+            quota_keywords = ("limit reached", "too many request", "quota", "upgrade", "subscribe")
+            if any(kw in str(error_msg).lower() for kw in quota_keywords):
+                _fmp_quota_exhausted = True
+                print(f"[FMP] Quota/limit error: {error_msg}. Skipping FMP for remainder of session.")
+            else:
+                print(f"[FMP] Error on '{endpoint}': {error_msg}")
             return []
 
     return data
+
+
+def _mark_fmp_endpoint_unavailable(endpoint: str, message: str) -> None:
+    """Record a session-scoped unavailable endpoint and log it once."""
+    if settings.FMP_SUPPRESS_REPEATED_ENDPOINT_ERRORS:
+        _fmp_unavailable_endpoints[endpoint] = message
+    if endpoint not in _fmp_reported_endpoint_failures:
+        print(f"[FMP] {message}")
+        _fmp_reported_endpoint_failures.add(endpoint)
+
+
+def fetch_company_profile(symbol: str) -> dict[str, str]:
+    """Fetch normalized company industry and sector labels from FMP."""
+    return _fetch_company_profile(symbol, _fmp_get)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -260,6 +491,7 @@ def fetch_ohlcv(
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
+        feed=_get_alpaca_stock_feed(),
         adjustment=Adjustment.SPLIT,  # Normalize historical prices across stock splits
     )
 
@@ -307,6 +539,124 @@ def fetch_ohlcv(
     return df
 
 
+def fetch_hourly_ohlcv(
+    symbol: str,
+    days: int = 30,
+) -> pd.DataFrame:
+    """Fetch 1-hour OHLCV bars for a single ticker via Alpaca.
+
+    Returns a DataFrame with the same column conventions as ``fetch_ohlcv``:
+        Index   : DatetimeIndex (tz-naive, bar open timestamp)
+        Columns : Open, High, Low, Close, Volume  (capitalized, float64)
+
+    Hourly bars allow exit monitoring to react to within-day MA violations
+    rather than waiting for the daily close.
+
+    Args:
+        symbol: Ticker symbol (e.g. ``'NVDA'``).
+        days: Number of calendar days of history to fetch (default: 30 ≈ ~195 bars).
+
+    Returns:
+        DataFrame of 1H bars, or an empty DataFrame on error.
+    """
+    cache_key = ("hourly_ohlcv", symbol, days)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    client = _get_alpaca_client()
+    end = datetime.now()
+    start = end - timedelta(days=days)
+
+    request_params = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Hour,
+        start=start,
+        end=end,
+        feed=_get_alpaca_stock_feed(),
+        adjustment=Adjustment.SPLIT,
+    )
+
+    try:
+        barset = client.get_stock_bars(request_params)
+        df = barset.df
+    except Exception:  # noqa: BLE001
+        empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        return empty
+
+    if df.empty:
+        empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        _cache_set(cache_key, empty)
+        return empty
+
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.droplevel("symbol")
+
+    df = df.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
+    df = df[["Open", "High", "Low", "Close", "Volume"]]
+    df = _filter_regular_session(df)
+
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    df = df.astype(
+        {"Open": float, "High": float, "Low": float, "Close": float, "Volume": float}
+    )
+
+    _cache_set(cache_key, df)
+    return df
+
+
+def fetch_latest_intraday_price(
+    symbol: str,
+    lookback_minutes: int = 120,
+) -> Optional[float]:
+    """Fetch the latest regular-session minute close for entry sizing."""
+    client = _get_alpaca_client()
+    end = datetime.now()
+    start = end - timedelta(minutes=max(lookback_minutes, 30))
+
+    request_params = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Minute,
+        start=start,
+        end=end,
+        feed=_get_alpaca_stock_feed(),
+        adjustment=Adjustment.SPLIT,
+    )
+
+    try:
+        barset = client.get_stock_bars(request_params)
+        df = barset.df
+    except Exception:  # noqa: BLE001
+        return None
+
+    if df.empty:
+        return None
+
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.droplevel("symbol")
+
+    df = df.rename(columns={"close": "Close"})
+    if "Close" not in df.columns:
+        return None
+
+    df = df[["Close"]]
+    df = _filter_regular_session(df)
+    if df.empty:
+        return None
+
+    return float(df["Close"].iloc[-1])
+
+
 def fetch_bulk_close_prices(
     tickers: List[str],
     period: str = "14mo",
@@ -333,7 +683,7 @@ def fetch_bulk_close_prices(
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i : i + chunk_size]
         batch_num = i // chunk_size + 1
-        total_batches = (len(tickers) // chunk_size) + 1
+        total_batches = (len(tickers) + chunk_size - 1) // chunk_size
         print(f"Downloading batch {batch_num}/{total_batches} ({len(chunk)} tickers)...")
 
         try:
@@ -342,6 +692,7 @@ def fetch_bulk_close_prices(
                 timeframe=TimeFrame.Day,
                 start=start,
                 end=end,
+                feed=_get_alpaca_stock_feed(),
                 adjustment=Adjustment.SPLIT,  # Normalize RS calculation across stock splits
             )
             barset = client.get_stock_bars(request_params)
@@ -363,6 +714,18 @@ def fetch_bulk_close_prices(
             time.sleep(0.5)  # respect Alpaca rate limits
         except Exception as e:
             print(f"  Batch {batch_num} failed: {e}")
+            if len(chunk) > 1:
+                retry_size = max(1, len(chunk) // 2)
+                print(f"  Retrying failed batch in groups of {retry_size}.")
+                recovered = fetch_bulk_close_prices(
+                    chunk,
+                    period=period,
+                    chunk_size=retry_size,
+                )
+                if not recovered.empty:
+                    all_frames.append(recovered)
+            else:
+                print(f"  Skipping invalid/unavailable symbol: {chunk[0]}")
             continue
 
     if not all_frames:
@@ -370,6 +733,132 @@ def fetch_bulk_close_prices(
 
     result = pd.concat(all_frames, axis=1)
     result = result.dropna(axis=1, how="all")
+    _cache_set(cache_key, result)
+    return result
+
+
+def fetch_bulk_ohlcv(
+    tickers: List[str],
+    period: str = "14mo",
+    chunk_size: int = 100,
+) -> Dict[str, pd.DataFrame]:
+    """Download daily OHLCV data for many tickers in batches via Alpaca.
+
+    Returns:
+        Dict mapping symbol -> DataFrame(Open, High, Low, Close, Volume)
+    """
+    cache_key = ("bulk_ohlcv", tuple(sorted(tickers)), period, chunk_size)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    client = _get_alpaca_client()
+    days = _period_to_days(period)
+    end = datetime.now()
+    start = end - timedelta(days=days)
+
+    result: Dict[str, pd.DataFrame] = {}
+
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i : i + chunk_size]
+        batch_num = i // chunk_size + 1
+        total_batches = (len(tickers) + chunk_size - 1) // chunk_size
+        print(f"Downloading OHLCV batch {batch_num}/{total_batches} ({len(chunk)} tickers)...")
+
+        try:
+            request_params = StockBarsRequest(
+                symbol_or_symbols=chunk,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+                feed=_get_alpaca_stock_feed(),
+                adjustment=Adjustment.SPLIT,
+            )
+            barset = client.get_stock_bars(request_params)
+            df = barset.df
+        except Exception as e:
+            print(f"  OHLCV batch {batch_num} failed: {e}")
+            if len(chunk) > 1:
+                retry_size = max(1, len(chunk) // 2)
+                print(f"  Retrying failed OHLCV batch in groups of {retry_size}.")
+                result.update(
+                    fetch_bulk_ohlcv(
+                        chunk,
+                        period=period,
+                        chunk_size=retry_size,
+                    )
+                )
+            else:
+                print(f"  Skipping invalid/unavailable symbol: {chunk[0]}")
+            continue
+
+        if df.empty:
+            print(f"  OHLCV batch {batch_num} returned empty data, skipping.")
+            continue
+
+        if isinstance(df.index, pd.MultiIndex):
+            symbols_in_batch = [str(sym) for sym in df.index.get_level_values("symbol").unique()]
+            for symbol in symbols_in_batch:
+                try:
+                    symbol_df = df.xs(symbol, level="symbol").copy()
+                except KeyError:
+                    continue
+
+                symbol_df = symbol_df.rename(
+                    columns={
+                        "open": "Open",
+                        "high": "High",
+                        "low": "Low",
+                        "close": "Close",
+                        "volume": "Volume",
+                    }
+                )
+                symbol_df = symbol_df[["Open", "High", "Low", "Close", "Volume"]]
+
+                if symbol_df.index.tz is not None:
+                    symbol_df.index = symbol_df.index.tz_localize(None)
+
+                symbol_df = _drop_incomplete_daily_bar(symbol_df)
+                if symbol_df.empty:
+                    continue
+
+                result[symbol] = symbol_df.astype(
+                    {
+                        "Open": float,
+                        "High": float,
+                        "Low": float,
+                        "Close": float,
+                        "Volume": float,
+                    }
+                )
+        else:
+            single_symbol = chunk[0]
+            symbol_df = df.rename(
+                columns={
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close",
+                    "volume": "Volume",
+                }
+            )
+            symbol_df = symbol_df[["Open", "High", "Low", "Close", "Volume"]]
+            if symbol_df.index.tz is not None:
+                symbol_df.index = symbol_df.index.tz_localize(None)
+            symbol_df = _drop_incomplete_daily_bar(symbol_df)
+            if not symbol_df.empty:
+                result[single_symbol] = symbol_df.astype(
+                    {
+                        "Open": float,
+                        "High": float,
+                        "Low": float,
+                        "Close": float,
+                        "Volume": float,
+                    }
+                )
+
+        time.sleep(0.5)
+
     _cache_set(cache_key, result)
     return result
 
@@ -462,7 +951,9 @@ def _fmp_records_to_financial_df(
     return df
 
 
-def fetch_quarterly_income_statement(symbol: str, limit: int = 5) -> pd.DataFrame:
+def fetch_quarterly_income_statement(
+    symbol: str, limit: int = settings.FMP_QUARTERLY_LIMIT
+) -> pd.DataFrame:
     """Fetch quarterly income statement in yfinance-compatible format."""
     cache_key = ("quarterly_income", symbol, limit)
     cached = _cache_get(cache_key)
@@ -475,6 +966,8 @@ def fetch_quarterly_income_statement(symbol: str, limit: int = 5) -> pd.DataFram
 
     # stable API uses ?symbol= query param instead of /symbol/ path segment
     records = _fmp_get("income-statement", {"symbol": symbol, "period": "quarter", "limit": limit})
+    if isinstance(records, list) and 0 < len(records) < limit:
+        print(f"[INFO] {symbol}: FMP returned {len(records)}/{limit} quarterly records")
     df = _fmp_records_to_financial_df(records, _FMP_INCOME_FIELD_MAP)
     _cache_set(cache_key, df)
     if not df.empty:
@@ -482,7 +975,9 @@ def fetch_quarterly_income_statement(symbol: str, limit: int = 5) -> pd.DataFram
     return df
 
 
-def fetch_annual_income_statement(symbol: str, limit: int = 5) -> pd.DataFrame:
+def fetch_annual_income_statement(
+    symbol: str, limit: int = settings.FMP_ANNUAL_LIMIT
+) -> pd.DataFrame:
     """Fetch annual income statement in yfinance-compatible format."""
     cache_key = ("annual_income", symbol, limit)
     cached = _cache_get(cache_key)
@@ -494,6 +989,8 @@ def fetch_annual_income_statement(symbol: str, limit: int = 5) -> pd.DataFrame:
         return disk
 
     records = _fmp_get("income-statement", {"symbol": symbol, "period": "annual", "limit": limit})
+    if isinstance(records, list) and 0 < len(records) < limit:
+        print(f"[INFO] {symbol}: FMP returned {len(records)}/{limit} annual records")
     df = _fmp_records_to_financial_df(records, _FMP_INCOME_FIELD_MAP)
     _cache_set(cache_key, df)
     if not df.empty:
@@ -501,7 +998,9 @@ def fetch_annual_income_statement(symbol: str, limit: int = 5) -> pd.DataFrame:
     return df
 
 
-def fetch_balance_sheet(symbol: str, limit: int = 5) -> pd.DataFrame:
+def fetch_balance_sheet(
+    symbol: str, limit: int = settings.FMP_BALANCE_SHEET_LIMIT
+) -> pd.DataFrame:
     """Fetch annual balance sheet in yfinance-compatible format."""
     cache_key = ("balance_sheet", symbol, limit)
     cached = _cache_get(cache_key)
@@ -527,6 +1026,7 @@ def fetch_company_info(symbol: str) -> dict:
         shares_outstanding:         int | None
         held_percent_institutions:  float (0-1) | None
         institution_count:          int | None
+        prev_institution_count:     int | None  (quarter-over-quarter change)
     """
     cache_key = ("company_info", symbol)
     cached = _cache_get(cache_key)
@@ -537,7 +1037,14 @@ def fetch_company_info(symbol: str) -> dict:
         "shares_outstanding": None,
         "held_percent_institutions": None,
         "institution_count": None,
+        "prev_institution_count": None,
     }
+
+    # Keep free-tier live scoring to the three statement endpoints. Missing
+    # shares and institutional inputs already have neutral/redistributed scoring.
+    if _is_fmp_free_plan():
+        _cache_set(cache_key, result)
+        return result
 
     # 1. Profile — compute shares_outstanding from marketCap / price.
     # (stable API removed enterprise-values; profile is the reliable source.)
@@ -552,19 +1059,18 @@ def fetch_company_info(symbol: str) -> dict:
     except (requests.RequestException, ValueError, EnvironmentError):
         pass
 
-    # 2. Institutional holders — not available on the stable free tier.
-    # The HTTP 404 is caught below; institutional data gracefully degrades to None
-    # and the I-component weight drops to 0.0 in the CANSLIM composite.
-    try:
-        holders = _fmp_get("institutional-holder", {"symbol": symbol})
-        if holders and isinstance(holders, list):
-            result["institution_count"] = len(holders)
-
-            if result["shares_outstanding"] and result["shares_outstanding"] > 0:
-                total_held = sum(h.get("shares", 0) for h in holders if h.get("shares"))
-                result["held_percent_institutions"] = min(total_held / result["shares_outstanding"], 1.0)
-    except (requests.RequestException, ValueError, EnvironmentError):
-        pass
+    # 2. Current stable Positions Summary snapshot. It includes the previous
+    # holder count, so live scans need only one period-specific API call.
+    inst_history = _fetch_inst_ownership_history(
+        symbol,
+        fmp_get_fn=_fmp_get,
+        limit=settings.FMP_INSTITUTIONAL_HISTORY_LIMIT,
+    )
+    if inst_history:
+        inst_info = _company_info_from_inst_history(inst_history, shares_outstanding=result["shares_outstanding"])
+        result["held_percent_institutions"] = inst_info["held_percent_institutions"]
+        result["institution_count"] = inst_info["institution_count"]
+        result["prev_institution_count"] = inst_info["prev_institution_count"]
 
     _cache_set(cache_key, result)
     return result
@@ -595,13 +1101,22 @@ def _fetch_fmp_raw_history(symbol: str) -> dict:
     except (requests.RequestException, ValueError, EnvironmentError):
         bs_raw = []
     # enterprise-values endpoint not available on stable free tier; ev_raw stays empty.
-    ev_raw = []
-    try:
-        profile_raw = _fmp_get("profile", {"symbol": symbol})
-    except (requests.RequestException, ValueError, EnvironmentError):
-        profile_raw = []
-    # institutional-holder not available on stable free tier; holders_raw stays empty.
-    holders_raw = []
+    ev_raw: list = []
+    profile_raw: list = []
+    inst_ownership_raw: list = []
+    if not _is_fmp_free_plan():
+        try:
+            profile_raw = _fmp_get("profile", {"symbol": symbol})
+        except (requests.RequestException, ValueError, EnvironmentError):
+            profile_raw = []
+
+        # Institutional ownership history for PIT backtesting. The provider adds a
+        # conservative assumed acceptedDate after the Form 13F reporting lag.
+        inst_ownership_raw = _fetch_inst_ownership_history(
+            symbol,
+            fmp_get_fn=_fmp_get,
+            limit=settings.FMP_INSTITUTIONAL_BACKTEST_LIMIT,
+        )
 
     result = {
         "qi_raw": qi_raw,
@@ -609,7 +1124,7 @@ def _fetch_fmp_raw_history(symbol: str) -> dict:
         "bs_raw": bs_raw,
         "ev_raw": ev_raw,
         "profile_raw": profile_raw,
-        "holders_raw": holders_raw,
+        "inst_ownership_raw": inst_ownership_raw,
     }
     _cache_set(raw_cache_key, result)
     return result
@@ -649,17 +1164,16 @@ def _filter_records_as_of(records: List[dict], as_of_date: datetime) -> List[dic
 def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
     """Fetch company info with point-in-time filtering for backtesting.
 
-    Uses ``acceptedDate``-filtered enterprise values for shares outstanding to
-    eliminate look-ahead bias. Institutional holder data is current-only (FMP
-    free tier limitation) and is included as a best-effort approximation.
+    Uses date-filtered institutional ownership snapshots when available,
+    eliminating look-ahead bias for the I-component in backtests.
 
     Args:
         symbol: Ticker symbol.
-        as_of_date: Cutoff date — only data accepted on or before this date is used.
+        as_of_date: Cutoff date — only data dated on or before this date is used.
 
     Returns:
         Dict with keys ``shares_outstanding``, ``held_percent_institutions``,
-        ``institution_count``.
+        ``institution_count``, ``prev_institution_count``.
 
     """
     cache_key = ("company_info_as_of", symbol, as_of_date.strftime("%Y-%m-%d"))
@@ -671,21 +1185,20 @@ def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
         "shares_outstanding": None,
         "held_percent_institutions": None,
         "institution_count": None,
+        "prev_institution_count": None,
     }
 
     raw_history = _fetch_fmp_raw_history(symbol)
 
-    # Shares outstanding: fetch historical enterprise values and filter by date
+    # Shares outstanding: filter historical enterprise values by date
     if raw_history["ev_raw"] and isinstance(raw_history["ev_raw"], list):
         ev_filtered = _filter_records_as_of(raw_history["ev_raw"], as_of_date)
         if ev_filtered:
-            # Most recent record on or before the cutoff date
             shares = ev_filtered[0].get("numberOfShares")
             if shares is not None:
                 result["shares_outstanding"] = int(shares)
 
     # Fallback: profile data is current-only; acceptable as last resort.
-    # stable API field is "marketCap" (not "mktCap" as in old v3 profile).
     if result["shares_outstanding"] is None:
         if (
             raw_history["profile_raw"]
@@ -698,12 +1211,23 @@ def _fetch_company_info_as_of(symbol: str, as_of_date: datetime) -> dict:
             if mkt_cap and price and price > 0:
                 result["shares_outstanding"] = int(mkt_cap / price)
 
-    # Institutional holders: FMP free tier is current-only; best-effort for backtests
-    if raw_history["holders_raw"] and isinstance(raw_history["holders_raw"], list):
-        result["institution_count"] = len(raw_history["holders_raw"])
-        if result["shares_outstanding"] and result["shares_outstanding"] > 0:
-            total_held = sum(h.get("shares", 0) for h in raw_history["holders_raw"] if h.get("shares"))
-            result["held_percent_institutions"] = min(total_held / result["shares_outstanding"], 1.0)
+    # Institutional ownership: use quarterly snapshots filtered by date.
+    if raw_history["inst_ownership_raw"] and isinstance(raw_history["inst_ownership_raw"], list):
+        pit_records = _filter_records_as_of(raw_history["inst_ownership_raw"], as_of_date)
+        if pit_records:
+            latest = pit_records[0]
+            ownership_pct = latest.get("ownership_percent")
+            if ownership_pct is not None:
+                try:
+                    result["held_percent_institutions"] = min(float(ownership_pct) / 100.0, 1.0)
+                except (TypeError, ValueError):
+                    pass
+            investors = latest.get("institution_count")
+            if investors is not None:
+                result["institution_count"] = int(investors)
+            prev_investors = latest.get("prev_institution_count")
+            if prev_investors is not None:
+                result["prev_institution_count"] = int(prev_investors)
 
     _cache_set(cache_key, result)
     return result

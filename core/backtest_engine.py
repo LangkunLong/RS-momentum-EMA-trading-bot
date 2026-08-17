@@ -7,9 +7,10 @@ import os
 import pickle
 import sqlite3
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -312,8 +313,15 @@ class DataFetcher:
         except (OSError, sqlite3.Error):
             self._db_available = False
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield one transactional cache connection and always close it."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
@@ -662,7 +670,7 @@ class PortfolioSimulator:
         regime_tracker = MarketRegimeTracker()
         regime_tracker.bootstrap(benchmark_df, start_ts)
         self._regime_tracker = regime_tracker
-        self._ticker_industry = load_industry_map(tickers)
+        self._ticker_industry = {} if self.technical_only else load_industry_map(tickers)
 
         equity_series: Dict[str, float] = {}
         benchmark_series: Dict[str, float] = {}
@@ -801,7 +809,10 @@ class PortfolioSimulator:
 
         signals.sort(key=lambda item: (item["canslim_score"], item["rs_score"]), reverse=True)
         open_slots = max(self.max_positions - len(self._open_positions), 0)
-        return signals[:open_slots]
+        candidate_limit = open_slots
+        if candidate_limit == 0 and self.enable_eviction and self.max_positions > 0:
+            candidate_limit = 1
+        return signals[:candidate_limit]
 
     def _try_evict(
         self,

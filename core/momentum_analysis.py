@@ -149,7 +149,31 @@ def calculate_rs_scores_for_tickers(
         return pd.DataFrame()
 
     print("Calculating weighted performance...")
-    rs_scores = full_data.apply(calculate_weighted_performance)
+
+    def _wp_with_fallback(series: pd.Series) -> float | None:
+        """Weighted performance with annualized fallback for short-history stocks (IPOs).
+
+        Stocks with < 4 quarters of data (e.g. recent IPOs) cannot use the
+        standard 4-quarter weighted formula.  For these, we annualize the raw
+        return over the available history so they are comparable to 1-year
+        peers in the cross-sectional ranking.  Minimum 21 bars (~1 month).
+
+        We strip NaNs before calling calculate_weighted_performance so that a
+        DataFrame aligned to a longer universe (e.g. 299-row S&P 500 frame)
+        doesn't fool the length guard into attempting a calculation it will
+        produce NaN from (dividing by a missing quarterly anchor price).
+        """
+        clean = series.dropna()
+        wp = calculate_weighted_performance(clean)
+        if wp is not None:
+            return wp
+        n = len(clean)
+        if n < 21:
+            return None
+        raw_return = (clean.iloc[-1] - clean.iloc[0]) / clean.iloc[0]
+        return (1 + raw_return) ** (252 / n) - 1
+
+    rs_scores = full_data.apply(_wp_with_fallback)
 
     rs_df = rs_scores.reset_index()
     rs_df.columns = ["Ticker", "Weighted_Perf"]

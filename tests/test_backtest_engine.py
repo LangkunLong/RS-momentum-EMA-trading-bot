@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -472,6 +473,114 @@ def _make_full_sim(
         sim._open_positions[sym] = trade
         ohlcv_map[sym] = _make_ohlcv(n=10, close_value=close_px)
     return sim, ohlcv_map
+
+
+def test_full_portfolio_signal_reaches_eviction_and_replaces_lower_rs_position() -> None:
+    """A ranked buy signal must reach eviction even when there are no open slots."""
+    sim, ohlcv_map = _make_full_sim({"MSFT": (100.0, 60.0, 95.0)})
+    sim.max_positions = 1
+    sim.enable_eviction = True
+    sim._regime_tracker = SimpleNamespace(allows_entries=True)
+    sim._ticker_industry = {}
+
+    signal = {
+        "symbol": "GEV",
+        "rs_score": 90.0,
+        "canslim_score": 80.0,
+        "signal_reason": "Volume Breakout",
+        "buy_signal": True,
+    }
+    sim.strategy = SimpleNamespace(evaluate_symbol=lambda **_kwargs: signal)
+    ohlcv_map["GEV"] = _make_ohlcv(n=60, close_value=120.0)
+    entry_date = ohlcv_map["GEV"].index[-1]
+
+    signals = sim._evaluate_signals(
+        tickers=["GEV"],
+        ticker_ohlcv=ohlcv_map,
+        all_closes=pd.DataFrame(index=ohlcv_map["GEV"].index),
+        eval_date=entry_date,
+        market_state={"market_is_bullish": True},
+    )
+
+    assert [row["symbol"] for row in signals] == ["GEV"]
+    sim._enter_position(signals[0], ohlcv_map, entry_date)
+    assert set(sim._open_positions) == {"GEV"}
+    assert [(trade.symbol, trade.exit_reason) for trade in sim._trades] == [("MSFT", "evicted")]
+
+
+def test_full_portfolio_without_eviction_returns_no_candidates() -> None:
+    """A disabled eviction policy must retain the hard capacity gate."""
+    sim, ohlcv_map = _make_full_sim({"MSFT": (100.0, 60.0, 95.0)})
+    sim.max_positions = 1
+    sim.enable_eviction = False
+    sim._regime_tracker = SimpleNamespace(allows_entries=True)
+    sim._ticker_industry = {}
+    sim.strategy = SimpleNamespace(
+        evaluate_symbol=lambda **_kwargs: {
+            "symbol": "GEV",
+            "rs_score": 90.0,
+            "canslim_score": 80.0,
+            "buy_signal": True,
+        }
+    )
+    ohlcv_map["GEV"] = _make_ohlcv(n=60, close_value=120.0)
+
+    signals = sim._evaluate_signals(
+        tickers=["GEV"],
+        ticker_ohlcv=ohlcv_map,
+        all_closes=pd.DataFrame(index=ohlcv_map["GEV"].index),
+        eval_date=ohlcv_map["GEV"].index[-1],
+        market_state={"market_is_bullish": True},
+    )
+
+    assert signals == []
+
+
+def test_open_slot_returns_only_best_ranked_candidate() -> None:
+    """Normal capacity admits only the highest-ranked signal for one free slot."""
+    sim, ohlcv_map = _make_full_sim({"MSFT": (100.0, 60.0, 95.0)})
+    sim.max_positions = 2
+    sim.enable_eviction = True
+    sim._regime_tracker = SimpleNamespace(allows_entries=True)
+    sim._ticker_industry = {}
+    rows = {
+        "LOW": {"symbol": "LOW", "rs_score": 99.0, "canslim_score": 70.0, "buy_signal": True},
+        "BEST": {"symbol": "BEST", "rs_score": 80.0, "canslim_score": 90.0, "buy_signal": True},
+    }
+    sim.strategy = SimpleNamespace(evaluate_symbol=lambda **kwargs: rows[kwargs["ticker"]])
+    ohlcv_map["LOW"] = _make_ohlcv(n=60, close_value=50.0)
+    ohlcv_map["BEST"] = _make_ohlcv(n=60, close_value=60.0)
+    eval_date = ohlcv_map["BEST"].index[-1]
+
+    signals = sim._evaluate_signals(
+        tickers=["LOW", "BEST"],
+        ticker_ohlcv=ohlcv_map,
+        all_closes=pd.DataFrame(index=ohlcv_map["BEST"].index),
+        eval_date=eval_date,
+        market_state={"market_is_bullish": True},
+    )
+
+    assert [row["symbol"] for row in signals] == ["BEST"]
+
+
+def test_eviction_skips_incumbent_with_missing_price_data() -> None:
+    """A candidate cannot evict a holding whose current value is unknown."""
+    sim, ohlcv_map = _make_full_sim({"MSFT": (100.0, 60.0, 95.0)})
+    sim.max_positions = 1
+    del ohlcv_map["MSFT"]
+    ohlcv_map["GEV"] = _make_ohlcv(n=60, close_value=120.0)
+    signal = {
+        "symbol": "GEV",
+        "rs_score": 90.0,
+        "canslim_score": 80.0,
+        "signal_reason": "Volume Breakout",
+        "buy_signal": True,
+    }
+
+    sim._enter_position(signal, ohlcv_map, ohlcv_map["GEV"].index[-1])
+
+    assert set(sim._open_positions) == {"MSFT"}
+    assert sim._trades == []
 
 
 def test_eviction_pass1_evicts_underwater_lower_rs_position() -> None:

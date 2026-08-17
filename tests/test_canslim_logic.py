@@ -7,10 +7,12 @@ skipped by default. Run them explicitly with: pytest -m integration
 import inspect
 
 import pytest
+import pandas as pd
 
 import quality_stocks
 from core import momentum_analysis
 from core.canslim import a_annual_earnings, n_new_products
+from core.canslim.core import _approximate_buy_point
 
 # ─── Index routing ───────────────────────────────────────────────────────────
 
@@ -124,3 +126,19 @@ def test_rs_cache_requires_broad_universe_and_requested_symbols() -> None:
 
     assert momentum_analysis._cache_covers_requested_universe(broad_df, ["AAPL", "MSFT"]) is True
     assert momentum_analysis._cache_covers_requested_universe(tiny_df, ["AAPL", "MSFT"]) is False
+
+
+def test_buy_point_uses_prior_high_not_current_breakout_close() -> None:
+    closes = pd.Series([90.0, 95.0, 100.0, 104.0])
+
+    buy_point = _approximate_buy_point(closes, is_breakout=True, lookback_252=len(closes))
+
+    assert buy_point == pytest.approx(100.0)
+
+
+def test_buy_point_absent_without_breakout() -> None:
+    closes = pd.Series([90.0, 95.0, 100.0, 104.0])
+
+    buy_point = _approximate_buy_point(closes, is_breakout=False, lookback_252=len(closes))
+
+    assert buy_point is None

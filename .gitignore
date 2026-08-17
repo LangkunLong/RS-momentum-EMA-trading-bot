@@ -1,8 +1,11 @@
 # Environments
 .env*
+!.env.example
 .venv
 venv/
 .vscode
+.claude/settings.local.json
+.worktrees/
 
 # Coverage testing outputs
 .coverage
@@ -28,6 +31,11 @@ dist/
 rs_score_cache/
 ticker_cache/
 fundamentals_cache/
+.artifacts/
+pytest-cache-files-*/
+.tmp_*/
+tmp_*/
+execution_audit/
 
 # CSV results
 backtest_results*

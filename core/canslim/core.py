@@ -27,7 +27,9 @@ from core.data_client import (
     fetch_company_info,
     fetch_ohlcv,
     fetch_quarterly_income_statement,
+    fmp_request_was_deferred,
     normalize_price_dataframe,
+    reset_fmp_request_context,
 )
 
 from .a_annual_earnings import evaluate_a
@@ -37,6 +39,25 @@ from .l_leader_laggard import evaluate_l
 from .m_market_direction import MarketTrend, evaluate_m
 from .n_new_products import evaluate_n
 from .s_supply_demand import evaluate_s
+
+
+def _approximate_buy_point(closes: pd.Series, *, is_breakout: bool, lookback_252: int) -> Optional[float]:
+    """Approximate a breakout pivot from the prior 52-week high before the latest bar.
+
+    This is intentionally a pragmatic approximation, not a full chart-pattern
+    pivot detector. The key invariant is that the pivot must be derived from
+    price history *before* the latest bar; otherwise buy-zone enforcement
+    becomes a no-op because the current breakout close would define its own
+    pivot.
+    """
+    if not is_breakout or lookback_252 <= 1 or len(closes) <= 1:
+        return None
+
+    prior_window = closes.iloc[-lookback_252:-1]
+    if prior_window.empty:
+        return None
+
+    return float(coerce_scalar(prior_window.max()))
 
 
 def evaluate_canslim(
@@ -86,6 +107,7 @@ def evaluate_canslim(
         n_proximity_weight = settings.N_PROXIMITY_TO_HIGH_WEIGHT
 
     # 1. Fetch Fundamental Data with Error Handling
+    reset_fmp_request_context()
     income_statement_error = None
     balance_sheet_error = None
     try:
@@ -127,7 +149,8 @@ def evaluate_canslim(
     price_history = normalize_price_dataframe(price_history)
     closes = extract_float_series(price_history, "Close")
     latest_close = coerce_scalar(closes.iloc[-1])
-    high_52 = coerce_scalar(closes.max())
+    lookback_252 = min(252, len(closes))
+    high_52 = coerce_scalar(closes.iloc[-lookback_252:].max())
     proximity_to_high = latest_close / high_52 if high_52 else 0.0
 
     # Volume
@@ -175,9 +198,15 @@ def evaluate_canslim(
     }
 
     # 6. WEIGHTED SCORING per O'Neil's methodology
-    # Dynamically re-normalize when one or both fundamentals are missing.
+    # C and A remain part of the composite even when unavailable so that missing
+    # fundamentals behave as missing evidence, not as an implicit free pass.
+    # The I component is optional on the free tier, so only that weight is
+    # redistributed when institutional data is unavailable.
     institutional_data_available = held_percent_institutions is not None or num_institutional_holders is not None
     has_fundamentals = current_growth is not None or annual_growth is not None
+    fmp_quota_deferred = fmp_request_was_deferred() and (
+        quarterly_income.empty or annual_income.empty
+    )
     data_availability = {
         "C": current_growth is not None,
         "A": annual_growth is not None,
@@ -187,31 +216,35 @@ def evaluate_canslim(
         "I_trend": num_institutional_holders is not None,
         "M": market_trend is not None,
     }
-    weights = {
-        "C": settings.CANSLIM_WEIGHT_C if current_growth is not None else 0.0,
-        "A": settings.CANSLIM_WEIGHT_A if annual_growth is not None else 0.0,
+    base_weights = {
+        "C": settings.CANSLIM_WEIGHT_C,
+        "A": settings.CANSLIM_WEIGHT_A,
         "N": settings.CANSLIM_WEIGHT_N,
         "S": settings.CANSLIM_WEIGHT_S,
         "L": settings.CANSLIM_WEIGHT_L,
-        "I": settings.CANSLIM_WEIGHT_I if institutional_data_available else 0.0,
+        "I": settings.CANSLIM_WEIGHT_I,
         "M": settings.CANSLIM_WEIGHT_M,
     }
-    total_active_weight = sum(weights.values())
 
-    if total_active_weight > 0:
-        active_weights = {key: (weight / total_active_weight if weight > 0 else 0.0) for key, weight in weights.items()}
-        total_score = (
-            active_weights["C"] * score_c
-            + active_weights["A"] * score_a
-            + active_weights["N"] * score_n
-            + active_weights["S"] * score_s
-            + active_weights["L"] * score_l
-            + active_weights["I"] * score_i
-            + active_weights["M"] * score_m
-        ) * 100
-    else:
-        active_weights = {key: 0.0 for key in weights}
-        total_score = 0.0
+    active_weights = dict(base_weights)
+    if not institutional_data_available:
+        removed_weight = active_weights["I"]
+        active_weights["I"] = 0.0
+        remaining_weight = 1.0 - removed_weight
+        if remaining_weight > 0:
+            for key in active_weights:
+                if key != "I":
+                    active_weights[key] = active_weights[key] / remaining_weight
+
+    total_score = (
+        active_weights["C"] * score_c
+        + active_weights["A"] * score_a
+        + active_weights["N"] * score_n
+        + active_weights["S"] * score_s
+        + active_weights["L"] * score_l
+        + active_weights["I"] * score_i
+        + active_weights["M"] * score_m
+    ) * 100
 
     total_score = float(total_score)
     weighted_contributions = {key: active_weights[key] * scores[key] * 100 for key in scores}
@@ -226,6 +259,7 @@ def evaluate_canslim(
         "proximity_to_high": proximity_to_high,
         "avg_volume_50": avg_volume_50,
         "has_fundamentals": has_fundamentals,
+        "fmp_quota_deferred": fmp_quota_deferred,
         "shares_outstanding": shares_outstanding,
         "quarterly_income_available": not quarterly_income.empty,
         "annual_income_available": not annual_income.empty,
@@ -238,10 +272,16 @@ def evaluate_canslim(
         "balance_sheet_error": balance_sheet_error,
     }
 
+    # buy_point is the pivot price for buy-zone enforcement.
+    # Only set for confirmed breakout stocks — for non-breakout names there is no
+    # well-defined pivot, so None signals that buy-zone enforcement does not apply.
+    is_breakout = s_metrics.get("is_breakout", False)
+    buy_point = _approximate_buy_point(closes, is_breakout=is_breakout, lookback_252=lookback_252)
+
     return {
         "symbol": symbol,
         "scores": scores,
-        "base_weights": weights,
+        "base_weights": base_weights,
         "active_weights": active_weights,
         "weighted_contributions": weighted_contributions,
         "data_availability": data_availability,
@@ -249,6 +289,8 @@ def evaluate_canslim(
         "total_score": total_score,
         "rs_score": rs_score,
         "market_trend": market_trend,
-        "is_breakout": s_metrics.get("is_breakout", False),
+        "is_breakout": is_breakout,
         "has_volume_surge": s_metrics.get("has_volume_surge", False),
+        "buy_point": buy_point,
+        "latest_close_price": float(latest_close),
     }

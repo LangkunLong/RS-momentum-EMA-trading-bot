@@ -11,11 +11,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
+from config import settings
 from config.settings import (
     MAX_WORKERS,
     MIN_CANSLIM_SCORE,
     MIN_RS_SCORE,
+    REQUIRE_FUNDAMENTALS_FOR_BUYS,
     REQUIRE_BULLISH_MARKET_FOR_BUYS,
+    STRICT_BREAKOUT_FOR_BUYS,
     WATCHLIST_MIN_CANSLIM_SCORE,
 )
 from core.canslim import MarketTrend, evaluate_canslim, evaluate_market_direction
@@ -28,7 +31,8 @@ def _classify_canslim_candidate(
     min_canslim_score: float,
     watchlist_min_score: float = WATCHLIST_MIN_CANSLIM_SCORE,
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
-    strict_breakout: bool = False,
+    require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
+    strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> tuple[str, List[str]]:
     """Classify a scored stock into actionable buy, watchlist, or rejected."""
     notes: List[str] = []
@@ -42,16 +46,27 @@ def _classify_canslim_candidate(
     has_fundamentals = bool(metrics.get("has_fundamentals", False))
     is_breakout = bool(canslim_view.get("is_breakout", False))
     has_volume_surge = bool(canslim_view.get("has_volume_surge", False))
+    buy_point = canslim_view.get("buy_point")
+    latest_close_price = canslim_view.get("latest_close_price")
 
     if rs_score < min_rs_score:
         return "rejected", ["below_rs_threshold"]
 
+    if bool(metrics.get("fmp_quota_deferred", False)):
+        return "quota_deferred", ["quota_deferred"]
+
     bullish_gate_ok = market_is_bullish if require_bullish_market else True
+    fundamentals_gate_ok = has_fundamentals if require_fundamentals else True
     breakout_gate_ok = True
     if strict_breakout:
-        breakout_gate_ok = is_breakout and has_volume_surge
+        breakout_gate_ok = _meets_breakout_entry_requirements(
+            is_breakout=is_breakout,
+            has_volume_surge=has_volume_surge,
+            buy_point=buy_point,
+            latest_close_price=latest_close_price,
+        )
 
-    if total_score >= min_canslim_score and bullish_gate_ok and breakout_gate_ok:
+    if total_score >= min_canslim_score and bullish_gate_ok and fundamentals_gate_ok and breakout_gate_ok:
         return "actionable_buy", []
 
     if total_score < watchlist_min_score:
@@ -67,10 +82,50 @@ def _classify_canslim_candidate(
         notes.append("not_in_breakout")
     if strict_breakout and not has_volume_surge:
         notes.append("no_volume_surge")
+    if strict_breakout and not _has_valid_buy_point(buy_point):
+        notes.append("missing_buy_point")
+    if strict_breakout and _has_valid_buy_point(buy_point) and latest_close_price is not None:
+        if float(latest_close_price) < float(buy_point):
+            notes.append("below_buy_point")
+        elif not _is_price_within_breakout_buy_zone(float(latest_close_price), float(buy_point)):
+            notes.append("beyond_buy_zone")
     if not notes:
         notes.append("monitor_setup")
 
     return "watchlist_candidate", notes
+
+
+def _has_valid_buy_point(buy_point: object) -> bool:
+    """Return True when the scanner produced a usable pivot price."""
+    try:
+        return buy_point is not None and float(buy_point) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_price_within_breakout_buy_zone(latest_close_price: float, buy_point: float) -> bool:
+    """Return True when the close is inside the actionable pivot-to-buy-zone window."""
+    buy_zone_max = buy_point * (1 + settings.BUY_ZONE_EXTENSION_PCT)
+    buy_zone_min = buy_point * (1 - settings.BUY_ZONE_UNDERCUT_TOLERANCE_PCT)
+    return buy_zone_min <= latest_close_price <= buy_zone_max
+
+
+def _meets_breakout_entry_requirements(
+    *,
+    is_breakout: bool,
+    has_volume_surge: bool,
+    buy_point: object,
+    latest_close_price: object,
+) -> bool:
+    """Return True when a stock is a real executable breakout setup."""
+    if not (is_breakout and has_volume_surge and _has_valid_buy_point(buy_point)):
+        return False
+    try:
+        if latest_close_price is None:
+            return False
+        return _is_price_within_breakout_buy_zone(float(latest_close_price), float(buy_point))
+    except (TypeError, ValueError):
+        return False
 
 
 def evaluate_stock_canslim(
@@ -82,7 +137,8 @@ def evaluate_stock_canslim(
     debug: bool = False,
     watchlist_min_score: float = WATCHLIST_MIN_CANSLIM_SCORE,
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
-    strict_breakout: bool = False,
+    require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
+    strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> Optional[Dict[str, object]]:
     """Evaluate a single stock against CANSLIM criteria.
 
@@ -192,10 +248,16 @@ def evaluate_stock_canslim(
         min_canslim_score=min_canslim_score,
         watchlist_min_score=watchlist_min_score,
         require_bullish_market=require_bullish_market,
+        require_fundamentals=require_fundamentals,
         strict_breakout=strict_breakout,
     )
     canslim_view["scanner_category"] = category
     canslim_view["scanner_notes"] = notes
+
+    if category == "quota_deferred":
+        _debug(f"[DEBUG] {symbol} deferred because the local FMP request budget was reached.")
+        _flush_logs()
+        return canslim_view
 
     if category == "rejected":
         _debug(f"[DEBUG] Rejected by scanner: {', '.join(notes)}")
@@ -235,7 +297,8 @@ def screen_stocks_canslim_detailed(
     debug: bool = False,
     watchlist_min_score: float = WATCHLIST_MIN_CANSLIM_SCORE,
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
-    strict_breakout: bool = False,
+    require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
+    strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], MarketTrend]:
     """Screen multiple stocks for CANSLIM characteristics.
 
@@ -289,6 +352,7 @@ def screen_stocks_canslim_detailed(
     # Pre-filter: discard symbols whose RS score is already below the threshold
     # to avoid wasting API calls on weak stocks
     filtered_symbols = []
+    rs_score_by_symbol: Dict[str, float] = {}
     rs_below_threshold = 0
     rs_not_found = 0
     for symbol in symbols_list:
@@ -305,6 +369,7 @@ def screen_stocks_canslim_detailed(
 
         if rs_val >= min_rs_score:
             filtered_symbols.append(symbol)
+            rs_score_by_symbol[symbol] = rs_val
         else:
             rs_below_threshold += 1
             if debug:
@@ -316,6 +381,8 @@ def screen_stocks_canslim_detailed(
             f"{rs_not_found} not found in RS universe | "
             f"{len(filtered_symbols)}/{len(symbols_list)} passed"
         )
+
+    filtered_symbols.sort(key=lambda symbol: rs_score_by_symbol[symbol], reverse=True)
 
     # Evaluate remaining symbols in parallel
     def _evaluate(sym: str) -> Optional[Dict[str, object]]:
@@ -329,6 +396,7 @@ def screen_stocks_canslim_detailed(
                 debug=debug,
                 watchlist_min_score=watchlist_min_score,
                 require_bullish_market=require_bullish_market,
+                require_fundamentals=require_fundamentals,
                 strict_breakout=strict_breakout,
             )
         except Exception as exc:
@@ -344,17 +412,26 @@ def screen_stocks_canslim_detailed(
 
     actionable_buys = [result for result in results if result.get("scanner_category") == "actionable_buy"]
     watchlist_candidates = [result for result in results if result.get("scanner_category") == "watchlist_candidate"]
+    quota_deferred = [result for result in results if result.get("scanner_category") == "quota_deferred"]
+
+    if quota_deferred:
+        print(
+            f"[FMP] {len(quota_deferred)} candidate(s) quota_deferred; "
+            "they were excluded from actionable buys and watchlists."
+        )
 
     if debug:
         passed = len(results)
         rejected_score = len(filtered_symbols) - passed
+        classified = len(actionable_buys) + len(watchlist_candidates)
         market_blocked = sum(1 for r in results if "market_not_bullish" in set(r.get("scanner_notes", [])))
         missing_fund = sum(1 for r in results if "missing_fundamentals" in set(r.get("scanner_notes", [])))
         print(
             f"[DEBUG] Post-scan summary: {len(symbols_list)} total | "
             f"{rs_below_threshold} failed RS pre-filter | "
             f"{rejected_score} passed RS but scored below watchlist floor | "
-            f"{passed} reached watchlist/buy threshold | "
+            f"{classified} reached watchlist/buy threshold | "
+            f"{len(quota_deferred)} quota-deferred | "
             f"{market_blocked} watchlisted due to bearish market | "
             f"{missing_fund} flagged for missing fundamentals"
         )
@@ -371,7 +448,7 @@ def screen_stocks_canslim(
     min_rs_score: float = MIN_RS_SCORE,
     min_canslim_score: float = MIN_CANSLIM_SCORE,
     debug: bool = False,
-    strict_breakout: bool = False,
+    strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> Tuple[List[Dict[str, object]], MarketTrend]:
     """Backward-compatible wrapper that returns only actionable buys."""
     actionable_buys, _watchlist_candidates, market_trend = screen_stocks_canslim_detailed(
