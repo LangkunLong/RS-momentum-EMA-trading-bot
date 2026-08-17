@@ -1,6 +1,33 @@
 """Shared pytest fixtures for the CANSLIM trading bot test suite."""
 
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+from uuid import uuid4
+
 import pytest
+
+
+_TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".artifacts" / "pytest" / "tmp_test_roots"
+
+
+@pytest.fixture()
+def tmp_path() -> Path:
+    """Provide a repo-local temporary directory.
+
+    Pytest's built-in ``tmp_path`` has been flaky on this Windows environment
+    during session cleanup, causing false-negative test failures unrelated to
+    application logic. This fixture keeps temp I/O inside the repo workspace
+    and performs best-effort cleanup per test.
+    """
+    _TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    path = _TEST_TMP_ROOT / f"test_{uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture()

@@ -11,11 +11,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
+from config import settings
 from config.settings import (
     MAX_WORKERS,
     MIN_CANSLIM_SCORE,
     MIN_RS_SCORE,
+    REQUIRE_FUNDAMENTALS_FOR_BUYS,
     REQUIRE_BULLISH_MARKET_FOR_BUYS,
+    STRICT_BREAKOUT_FOR_BUYS,
     WATCHLIST_MIN_CANSLIM_SCORE,
 )
 from core.canslim import MarketTrend, evaluate_canslim, evaluate_market_direction
@@ -28,7 +31,8 @@ def _classify_canslim_candidate(
     min_canslim_score: float,
     watchlist_min_score: float = WATCHLIST_MIN_CANSLIM_SCORE,
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
-    strict_breakout: bool = False,
+    require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
+    strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> tuple[str, List[str]]:
     """Classify a scored stock into actionable buy, watchlist, or rejected."""
     notes: List[str] = []
@@ -42,16 +46,24 @@ def _classify_canslim_candidate(
     has_fundamentals = bool(metrics.get("has_fundamentals", False))
     is_breakout = bool(canslim_view.get("is_breakout", False))
     has_volume_surge = bool(canslim_view.get("has_volume_surge", False))
+    buy_point = canslim_view.get("buy_point")
+    latest_close_price = canslim_view.get("latest_close_price")
 
     if rs_score < min_rs_score:
         return "rejected", ["below_rs_threshold"]
 
     bullish_gate_ok = market_is_bullish if require_bullish_market else True
+    fundamentals_gate_ok = has_fundamentals if require_fundamentals else True
     breakout_gate_ok = True
     if strict_breakout:
-        breakout_gate_ok = is_breakout and has_volume_surge
+        breakout_gate_ok = _meets_breakout_entry_requirements(
+            is_breakout=is_breakout,
+            has_volume_surge=has_volume_surge,
+            buy_point=buy_point,
+            latest_close_price=latest_close_price,
+        )
 
-    if total_score >= min_canslim_score and bullish_gate_ok and breakout_gate_ok:
+    if total_score >= min_canslim_score and bullish_gate_ok and fundamentals_gate_ok and breakout_gate_ok:
         return "actionable_buy", []
 
     if total_score < watchlist_min_score:
@@ -67,10 +79,50 @@ def _classify_canslim_candidate(
         notes.append("not_in_breakout")
     if strict_breakout and not has_volume_surge:
         notes.append("no_volume_surge")
+    if strict_breakout and not _has_valid_buy_point(buy_point):
+        notes.append("missing_buy_point")
+    if strict_breakout and _has_valid_buy_point(buy_point) and latest_close_price is not None:
+        if float(latest_close_price) < float(buy_point):
+            notes.append("below_buy_point")
+        elif not _is_price_within_breakout_buy_zone(float(latest_close_price), float(buy_point)):
+            notes.append("beyond_buy_zone")
     if not notes:
         notes.append("monitor_setup")
 
     return "watchlist_candidate", notes
+
+
+def _has_valid_buy_point(buy_point: object) -> bool:
+    """Return True when the scanner produced a usable pivot price."""
+    try:
+        return buy_point is not None and float(buy_point) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_price_within_breakout_buy_zone(latest_close_price: float, buy_point: float) -> bool:
+    """Return True when the close is inside the actionable pivot-to-buy-zone window."""
+    buy_zone_max = buy_point * (1 + settings.BUY_ZONE_EXTENSION_PCT)
+    buy_zone_min = buy_point * (1 - settings.BUY_ZONE_UNDERCUT_TOLERANCE_PCT)
+    return buy_zone_min <= latest_close_price <= buy_zone_max
+
+
+def _meets_breakout_entry_requirements(
+    *,
+    is_breakout: bool,
+    has_volume_surge: bool,
+    buy_point: object,
+    latest_close_price: object,
+) -> bool:
+    """Return True when a stock is a real executable breakout setup."""
+    if not (is_breakout and has_volume_surge and _has_valid_buy_point(buy_point)):
+        return False
+    try:
+        if latest_close_price is None:
+            return False
+        return _is_price_within_breakout_buy_zone(float(latest_close_price), float(buy_point))
+    except (TypeError, ValueError):
+        return False
 
 
 def evaluate_stock_canslim(
@@ -82,7 +134,8 @@ def evaluate_stock_canslim(
     debug: bool = False,
     watchlist_min_score: float = WATCHLIST_MIN_CANSLIM_SCORE,
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
-    strict_breakout: bool = False,
+    require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
+    strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> Optional[Dict[str, object]]:
     """Evaluate a single stock against CANSLIM criteria.
 
@@ -192,6 +245,7 @@ def evaluate_stock_canslim(
         min_canslim_score=min_canslim_score,
         watchlist_min_score=watchlist_min_score,
         require_bullish_market=require_bullish_market,
+        require_fundamentals=require_fundamentals,
         strict_breakout=strict_breakout,
     )
     canslim_view["scanner_category"] = category
@@ -235,7 +289,8 @@ def screen_stocks_canslim_detailed(
     debug: bool = False,
     watchlist_min_score: float = WATCHLIST_MIN_CANSLIM_SCORE,
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
-    strict_breakout: bool = False,
+    require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
+    strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], MarketTrend]:
     """Screen multiple stocks for CANSLIM characteristics.
 
@@ -329,6 +384,7 @@ def screen_stocks_canslim_detailed(
                 debug=debug,
                 watchlist_min_score=watchlist_min_score,
                 require_bullish_market=require_bullish_market,
+                require_fundamentals=require_fundamentals,
                 strict_breakout=strict_breakout,
             )
         except Exception as exc:
@@ -371,7 +427,7 @@ def screen_stocks_canslim(
     min_rs_score: float = MIN_RS_SCORE,
     min_canslim_score: float = MIN_CANSLIM_SCORE,
     debug: bool = False,
-    strict_breakout: bool = False,
+    strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> Tuple[List[Dict[str, object]], MarketTrend]:
     """Backward-compatible wrapper that returns only actionable buys."""
     actionable_buys, _watchlist_candidates, market_trend = screen_stocks_canslim_detailed(

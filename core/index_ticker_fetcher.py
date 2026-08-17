@@ -197,7 +197,7 @@ class IndexTickerFetcher:
             return False
 
         try:
-            with open(self.cache_file) as f:
+            with open(self.cache_file, encoding="utf-8") as f:
                 cache_data = json.load(f)
 
             cache_time = datetime.fromisoformat(cache_data.get("timestamp", ""))
@@ -211,14 +211,14 @@ class IndexTickerFetcher:
             return None
 
         try:
-            with open(self.cache_file) as f:
+            with open(self.cache_file, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
             return None
 
     def _save_cache(self, data: Dict) -> None:
         data["timestamp"] = datetime.now().isoformat()
-        with open(self.cache_file, "w") as f:
+        with open(self.cache_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     def _fetch_index_tickers(self, index_key: str, display_name: str) -> List[str]:
@@ -283,7 +283,7 @@ class IndexTickerFetcher:
                 if max_expected and len(tickers) > max_expected:
                     print(
                         f"[WARN] {display_name}: iShares returned {len(tickers)} tickers "
-                        f"(expected ≤{max_expected}). The product URL may point to a broader "
+                        f"(expected <={max_expected}). The product URL may point to a broader "
                         f"fund. Attempting alternative source."
                     )
                     return self._fetch_index_tickers_fallback(index_key, display_name) or tickers[:max_expected]

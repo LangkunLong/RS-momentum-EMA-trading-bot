@@ -29,6 +29,8 @@ known-first-party = ["core", "config", "quality_stocks", "enhanced_scanner"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+cache_dir = ".artifacts/pytest/cache"
+norecursedirs = [".artifacts", ".git", "__pycache__"]
 markers = [
     "integration: marks tests that make real network calls (deselect with -m 'not integration')",
 ]

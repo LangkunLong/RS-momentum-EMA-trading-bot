@@ -6,10 +6,10 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY  # Adjust import to your config
+from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, BACKTEST_RESULTS_DIR  # Adjust import to your config
 
 
-def get_latest_backtest_file(directory="."):
+def get_latest_backtest_file(directory=BACKTEST_RESULTS_DIR):
     """Finds the most recent backtest CSV in the specified directory."""
     # Look for files matching your specific naming convention
     search_pattern = os.path.join(directory, "backtest_results_*.csv")

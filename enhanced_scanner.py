@@ -39,6 +39,7 @@ def scan_for_canslim_stocks(
     debug: Optional[bool] = None,
     watchlist_min_score: Optional[float] = None,
     require_bullish_market_for_buys: Optional[bool] = None,
+    strict_breakout_for_buys: Optional[bool] = None,
 ) -> tuple[list[dict], list[dict], object]:
     """Run the full CANSLIM scan and return qualifying opportunities.
 
@@ -65,6 +66,11 @@ def scan_for_canslim_stocks(
         if require_bullish_market_for_buys is not None
         else settings.REQUIRE_BULLISH_MARKET_FOR_BUYS
     )
+    strict_breakout_for_buys = (
+        strict_breakout_for_buys
+        if strict_breakout_for_buys is not None
+        else settings.STRICT_BREAKOUT_FOR_BUYS
+    )
     sectors = sectors if sectors is not None else settings.SECTORS
     custom_list = custom_list if custom_list is not None else settings.CUSTOM_LIST
     start_date = start_date if start_date is not None else settings.START_DATE
@@ -75,6 +81,8 @@ def scan_for_canslim_stocks(
     print("=" * 60)
 
     # Get stock list
+    extra_symbols: list[str] = list(settings.EXTRA_SYMBOLS) if hasattr(settings, "EXTRA_SYMBOLS") else []
+
     if custom_list:
         print("Using custom stock list...")
         symbols = custom_list
@@ -85,11 +93,20 @@ def scan_for_canslim_stocks(
         print("Using default curated quality stock list...")
         symbols = get_quality_stock_list()
 
+    # Always append EXTRA_SYMBOLS so manually tracked stocks are evaluated
+    # even when they fall outside major index membership.
+    if extra_symbols:
+        added = [s for s in extra_symbols if s not in symbols]
+        if added:
+            print(f"Adding {len(added)} extra symbol(s) to scan: {', '.join(added)}")
+        symbols = list(dict.fromkeys(symbols + extra_symbols))  # deduplicate, preserve order
+
     print(f"Scanning {len(symbols)} stocks for CANSLIM opportunities...")
     print(f"Minimum RS Score: {min_rs_score}")
     print(f"Minimum CANSLIM Score: {min_canslim_score}")
     print(f"Watchlist CANSLIM Floor: {watchlist_min_score}")
     print(f"Require Bullish Market For Buys: {require_bullish_market_for_buys}")
+    print(f"Require Strict Breakout For Buys: {strict_breakout_for_buys}")
 
     # Filter out invalid/delisted tickers before scanning
     print("Validating tickers with Alpaca...")
@@ -109,6 +126,7 @@ def scan_for_canslim_stocks(
         debug=debug,
         watchlist_min_score=watchlist_min_score,
         require_bullish_market=require_bullish_market_for_buys,
+        strict_breakout=strict_breakout_for_buys,
     )
 
     print("\nScan complete!")
@@ -246,8 +264,8 @@ if __name__ == "__main__":
     REQUIRE_BULLISH_MARKET_FOR_BUYS = None  # Uses settings.REQUIRE_BULLISH_MARKET_FOR_BUYS
     MAX_TERMINAL_RESULTS = settings.MAX_TERMINAL_RESULTS
     # Available indices: 'sp500', 'nasdaq100', 'russell2000', 'large_cap', 'small_cap', 'all'
-    # Set to None to scan all major indices (S&P 500 + Nasdaq 100 + Russell 2000)
-    SECTORS = "nasdaq100"  # Uses all indices from major markets
+    # Set to None to use settings.SECTORS (currently "large_cap" = S&P 500 + Nasdaq 100)
+    SECTORS = None  # Defers to settings.SECTORS
     CUSTOM_LIST = None
     DEBUG = True  # Override default
 

@@ -105,8 +105,10 @@ def evaluate_n(
 
             if not revenue_row.empty:
                 revs = quarterly_income.loc[revenue_row[0]].sort_index()
-                if len(revs) >= 4:  # YoY Quarterly
-                    revenue_growth = _safe_growth(revs.iloc[-1], revs.iloc[-4])
+                if len(revs) >= 5:  # Same fiscal quarter one year earlier
+                    revenue_growth = _safe_growth(revs.iloc[-1], revs.iloc[-5])
+                elif len(revs) == 4:
+                    revenue_growth = _safe_growth(revs.iloc[-1], revs.iloc[0])
         except Exception:
             pass
 
