@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.execution_workflow import EntryExecutionPlan
+from core.execution_store import get_execution_store
+from core.execution_workflow import EntryExecutionPlan, reset_workflow_state
 from core.order_execution import OrderResult
 from core.order_manager import OrderManager
 
@@ -153,6 +154,59 @@ class TestHandleFill:
         mock_notify.assert_called_once()
         workflow.mark_sell_fill.assert_called_once()
         workflow.mark_sell_notification.assert_called_once_with(sent=True)
+
+    def test_sell_fill_recovers_cost_basis_from_orphaned_active_position(self, tmp_path) -> None:
+        """A restart-recovery sell must report persisted P&L without an in-memory workflow."""
+        db_path = tmp_path / "execution.sqlite3"
+        now = "2026-08-16T20:00:00+00:00"
+
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            reset_workflow_state()
+            store = get_execution_store()
+            store.upsert_active_position(
+                symbol="AAPL",
+                workflow_id="orphaned-workflow",
+                qty=10.0,
+                entry_price=100.0,
+                opened_at_utc=now,
+                updated_at_utc=now,
+            )
+
+            with patch("core.notifier.send_email", return_value=True) as send_email:
+                OrderManager(paper=True).handle_fill(
+                    symbol="AAPL",
+                    broker_order_id="sell-1",
+                    client_order_id="",
+                    side="sell",
+                    filled_qty=10.0,
+                    fill_price=110.0,
+                    order_type="market",
+                )
+
+            body = send_email.call_args.args[1]
+            assert "Entry price: $100.00" in body
+            assert "P&L:         +$100.00 (+10.00%)" in body
+            assert store.load_active_position("AAPL") is None
+            reset_workflow_state()
+
+    def test_workflow_cost_basis_precedes_active_position_fallback(self) -> None:
+        """A fully resolved workflow is more specific than symbol-level recovery state."""
+        workflow = SimpleNamespace(entry_plan=SimpleNamespace(entry_price=95.0))
+        store = SimpleNamespace(load_active_position=lambda _symbol: {"entry_price": 100.0})
+
+        with patch("core.order_manager.get_execution_store", return_value=store):
+            result = OrderManager._resolve_entry_price("AAPL", workflow)
+
+        assert result == 95.0
+
+    def test_missing_cost_basis_returns_none(self) -> None:
+        """Missing workflow and active ownership must remain explicitly unknown."""
+        store = SimpleNamespace(load_active_position=lambda _symbol: None)
+
+        with patch("core.order_manager.get_execution_store", return_value=store):
+            result = OrderManager._resolve_entry_price("AAPL", None)
+
+        assert result is None
 
     def test_handle_partial_buy_fill_reconciles_stop_without_notification(self) -> None:
         workflow = SimpleNamespace(

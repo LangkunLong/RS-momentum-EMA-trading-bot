@@ -277,6 +277,25 @@ class TestNotifySellFilled:
 
         assert "MA violation exit" in bodies[0]
 
+    def test_unknown_entry_price_reports_pnl_unavailable(self):
+        """Missing recovery state must not be presented as a zero-gain trade."""
+        bodies = []
+
+        with _patch_settings():
+            with patch("core.notifier.send_email") as mock_send:
+                mock_send.side_effect = lambda _subject, body: bodies.append(body) or True
+                notify_sell_filled(
+                    "ORPHAN",
+                    qty=10,
+                    fill_price=110.0,
+                    entry_price=None,
+                    exit_reason="exit order filled",
+                )
+
+        assert "Entry price: unavailable" in bodies[0]
+        assert "P&L:         unavailable" in bodies[0]
+        assert "+$0.00" not in bodies[0]
+
 
 # ---------------------------------------------------------------------------
 # notify_cycle_summary

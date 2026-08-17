@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from core.execution_store import get_execution_store
 from core.execution_workflow import (
     EntryExecutionPlan,
     create_entry_workflow,
@@ -182,10 +183,7 @@ class OrderManager:
             return
 
         exit_reason = self._infer_exit_reason(order_type=order_type, client_order_id=client_order_id)
-        entry_price = fill_price
-        entry_plan = getattr(workflow, "entry_plan", None) if workflow is not None else None
-        if entry_plan is not None:
-            entry_price = entry_plan.entry_price
+        entry_price = self._resolve_entry_price(symbol, workflow)
         if workflow is not None:
             workflow.mark_sell_fill(
                 qty=filled_qty,
@@ -193,6 +191,8 @@ class OrderManager:
                 exit_reason=exit_reason,
                 broker_order_id=broker_order_id,
             )
+        else:
+            get_execution_store().clear_active_position(symbol)
         sent = notify_sell_filled(
             symbol=symbol,
             qty=filled_qty,
@@ -204,6 +204,18 @@ class OrderManager:
         )
         if workflow is not None:
             workflow.mark_sell_notification(sent=sent)
+
+    @staticmethod
+    def _resolve_entry_price(symbol: str, workflow: Any | None) -> float | None:
+        """Resolve cost basis before a sell transition clears active ownership."""
+        entry_plan = getattr(workflow, "entry_plan", None) if workflow is not None else None
+        if entry_plan is not None and float(entry_plan.entry_price) > 0:
+            return float(entry_plan.entry_price)
+
+        active_position = get_execution_store().load_active_position(symbol)
+        if active_position is not None and float(active_position["entry_price"]) > 0:
+            return float(active_position["entry_price"])
+        return None
 
     def handle_partial_fill(
         self,

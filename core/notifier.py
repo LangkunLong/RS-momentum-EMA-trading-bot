@@ -159,7 +159,7 @@ def notify_sell_filled(
     symbol: str,
     qty: float,
     fill_price: float,
-    entry_price: float,
+    entry_price: float | None,
     exit_reason: str,
     workflow_id: str | None = None,
     paper: bool = True,
@@ -170,16 +170,22 @@ def notify_sell_filled(
         symbol: Ticker that was sold.
         qty: Number of shares sold.
         fill_price: Average fill price per share.
-        entry_price: Original average entry price (for P&L display).
+        entry_price: Original average entry price, or None when recovery failed.
         exit_reason: Human-readable reason (e.g. 'stop-loss', 'MA violation').
         paper: Whether this is a paper-trading fill.
 
     Returns:
         True if the email was sent successfully.
     """
-    pnl = (fill_price - entry_price) * qty
-    pnl_pct = (fill_price - entry_price) / entry_price if entry_price else 0.0
-    sign = "+" if pnl >= 0 else ""
+    if entry_price is not None and entry_price > 0:
+        pnl = (fill_price - entry_price) * qty
+        pnl_pct = (fill_price - entry_price) / entry_price
+        sign = "+" if pnl >= 0 else ""
+        entry_price_line = f"Entry price: ${entry_price:,.2f}"
+        pnl_line = f"P&L:         {sign}${pnl:,.2f} ({sign}{pnl_pct * 100:.2f}%)"
+    else:
+        entry_price_line = "Entry price: unavailable"
+        pnl_line = "P&L:         unavailable"
     mode = "Paper Trading" if paper else "LIVE Trading"
     now_str = datetime.now(tz=_ET).strftime("%Y-%m-%d %H:%M ET")
     workflow_line = f"Workflow ID: {workflow_id}\n" if workflow_id else ""
@@ -191,8 +197,8 @@ def notify_sell_filled(
         f"Symbol:      {symbol}\n"
         f"Qty:         {qty:,.4g} shares\n"
         f"Fill price:  ${fill_price:,.2f}\n"
-        f"Entry price: ${entry_price:,.2f}\n"
-        f"P&L:         {sign}${pnl:,.2f} ({sign}{pnl_pct * 100:.2f}%)\n"
+        f"{entry_price_line}\n"
+        f"{pnl_line}\n"
         f"Exit reason: {exit_reason}\n"
         f"{workflow_line}"
         f"Mode:        {mode}\n"
