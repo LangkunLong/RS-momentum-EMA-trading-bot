@@ -120,7 +120,10 @@ class TestPathA_BuySignalToOrder:
         from core.order_execution import submit_bracket_buy
 
         mock_client = MagicMock()
-        mock_client.submit_order.return_value = SimpleNamespace(id="order-abc")
+        mock_client.submit_order.return_value = SimpleNamespace(
+            id="order-abc",
+            status="accepted",
+        )
 
         with patch("core.order_execution._get_trading_client", return_value=mock_client), \
              patch("core.order_execution._is_paper_mode", return_value=True):
@@ -184,15 +187,7 @@ class TestPathB_BuyFillNotification:
 
     def _build_monitor(self):
         mock_stream = MagicMock()
-        handlers = {}
-
-        def mock_on(event_name):
-            def decorator(fn):
-                handlers.setdefault(event_name, []).append(fn)
-                return fn
-            return decorator
-
-        mock_stream.on = mock_on
+        mock_stream.subscribe_trade_updates = MagicMock()
 
         with patch("fill_monitor.TradingStream", return_value=mock_stream), \
              patch("fill_monitor.require_paper_mode"):
@@ -216,6 +211,8 @@ class TestPathB_BuyFillNotification:
             filled_qty=10.0,
             fill_price=875.0,
             order_type="limit",
+            replaces="",
+            replaced_by="",
         )
 
     def test_buy_fill_reconciles_stop_from_actual_fill(self):
@@ -262,15 +259,7 @@ class TestPathC_StopLossFillNotification:
 
     def _build_monitor(self):
         mock_stream = MagicMock()
-        handlers = {}
-
-        def mock_on(event_name):
-            def decorator(fn):
-                handlers.setdefault(event_name, []).append(fn)
-                return fn
-            return decorator
-
-        mock_stream.on = mock_on
+        mock_stream.subscribe_trade_updates = MagicMock()
 
         with patch("fill_monitor.TradingStream", return_value=mock_stream), \
              patch("fill_monitor.require_paper_mode"):
@@ -298,6 +287,8 @@ class TestPathC_StopLossFillNotification:
             filled_qty=10.0,
             fill_price=813.75,
             order_type="stop",
+            replaces="",
+            replaced_by="",
         )
 
     def test_stop_sell_email_body_contains_exit_reason(self):
@@ -566,13 +557,7 @@ class TestPathG_AlpacaMockBrokerLifecycle:
 
     def _build_monitor(self):
         mock_stream = MagicMock()
-
-        def mock_on(_event_name):
-            def decorator(fn):
-                return fn
-            return decorator
-
-        mock_stream.on = mock_on
+        mock_stream.subscribe_trade_updates = MagicMock()
 
         with patch("fill_monitor.TradingStream", return_value=mock_stream), \
              patch("fill_monitor.require_paper_mode"):
@@ -602,20 +587,91 @@ class TestPathG_AlpacaMockBrokerLifecycle:
         }
         bars = _make_ohlcv(close=500.0)
         mock_client = MagicMock()
-        mock_client.submit_order.side_effect = [
-            SimpleNamespace(id="entry-1"),
-            SimpleNamespace(id="stop-1"),
-            SimpleNamespace(id="sell-1"),
-        ]
-        mock_client.get_open_position.return_value = SimpleNamespace(qty="20")
+        broker_position = SimpleNamespace(
+            symbol="NVDA",
+            qty="20",
+            avg_entry_price="500.00",
+            current_price="500.00",
+            unrealized_plpc="0",
+        )
+        mock_client.get_all_positions.return_value = [broker_position]
+        mock_client.get_open_position.return_value = broker_position
+        mock_client.get_order_by_id.return_value = SimpleNamespace(
+            id="entry-1",
+            symbol="NVDA",
+            side="buy",
+            status="filled",
+            filled_qty="20",
+            replaced_by=None,
+        )
         stop_open_order = SimpleNamespace(
             id="stop-1",
             symbol="NVDA",
             side="sell",
             type="stop",
+            time_in_force="gtc",
             qty="20",
-            stop_price="465.0",
+            filled_qty="0",
+            stop_price="460.0",
+            client_order_id="",
+            status="new",
         )
+        broker_order_state = {
+            "stop_submitted": False,
+            "stop_cancelled": False,
+        }
+
+        def _get_open_orders(*_args, **_kwargs):
+            if (
+                broker_order_state["stop_submitted"]
+                and not broker_order_state["stop_cancelled"]
+            ):
+                return [stop_open_order]
+            return []
+
+        def _cancel_order_by_id(order_id):
+            assert order_id == "stop-1"
+            assert broker_order_state["stop_submitted"] is True
+            assert broker_order_state["stop_cancelled"] is False
+            broker_order_state["stop_cancelled"] = True
+
+        def _submit_order(request):
+            if isinstance(request, LimitOrderRequest):
+                return SimpleNamespace(
+                    id="entry-1",
+                    status="accepted",
+                    client_order_id=request.client_order_id,
+                    symbol=request.symbol,
+                    side="buy",
+                    type="limit",
+                    time_in_force="day",
+                )
+            if isinstance(request, StopOrderRequest):
+                stop_open_order.client_order_id = request.client_order_id
+                broker_order_state["stop_submitted"] = True
+                return SimpleNamespace(
+                    id="stop-1",
+                    status="accepted",
+                    client_order_id=request.client_order_id,
+                    symbol=request.symbol,
+                    side="sell",
+                    type="stop",
+                    time_in_force="gtc",
+                )
+            if isinstance(request, MarketOrderRequest):
+                return SimpleNamespace(
+                    id="sell-1",
+                    status="accepted",
+                    client_order_id=request.client_order_id,
+                    symbol=request.symbol,
+                    side="sell",
+                    type="market",
+                    time_in_force="day",
+                )
+            raise AssertionError(f"Unexpected order request: {type(request).__name__}")
+
+        mock_client.submit_order.side_effect = _submit_order
+        mock_client.cancel_order_by_id.side_effect = _cancel_order_by_id
 
         db_path = Path(tempfile.gettempdir()) / f"alpaca_lifecycle_{uuid4().hex}.sqlite3"
 
@@ -629,7 +685,10 @@ class TestPathG_AlpacaMockBrokerLifecycle:
                 patch("auto_trader._is_market_open", return_value=False),
                 patch("auto_trader._is_paper_mode", return_value=True),
                 patch("core.order_execution._get_trading_client", return_value=mock_client),
-                patch("core.order_execution.get_open_orders", side_effect=[[], [stop_open_order]]),
+                patch(
+                    "core.order_execution.get_open_orders",
+                    side_effect=_get_open_orders,
+                ),
                 patch("core.order_manager.notify_entry_submitted", return_value=True),
                 patch("core.order_manager.notify_buy_filled", return_value=True),
                 patch("core.order_manager.notify_sell_filled", return_value=True),
@@ -658,7 +717,7 @@ class TestPathG_AlpacaMockBrokerLifecycle:
 
                 stop_req = mock_client.submit_order.call_args_list[1][0][0]
                 assert isinstance(stop_req, StopOrderRequest)
-                assert stop_req.client_order_id == f"{workflow_id}-sl"
+                assert stop_req.client_order_id.startswith(f"{workflow_id}-sl-")
                 active_workflow = get_active_workflow_for_symbol("NVDA")
                 assert active_workflow is not None
                 assert active_workflow.workflow_id == workflow_id
@@ -666,11 +725,13 @@ class TestPathG_AlpacaMockBrokerLifecycle:
                 exit_result = OrderManager(paper=True).submit_exit("NVDA", exit_reason="hard stop triggered")
                 assert exit_result.success is True
                 mock_client.cancel_order_by_id.assert_called_once_with("stop-1")
+                assert broker_order_state["stop_cancelled"] is True
 
                 sell_req = mock_client.submit_order.call_args_list[2][0][0]
                 assert isinstance(sell_req, MarketOrderRequest)
-                assert sell_req.client_order_id == workflow_id
+                assert sell_req.client_order_id == f"{workflow_id}-exit"
 
+                mock_client.get_all_positions.return_value = []
                 monitor._dispatch(
                     _make_fill_event(
                         side="sell",
@@ -678,7 +739,7 @@ class TestPathG_AlpacaMockBrokerLifecycle:
                         filled_qty="20",
                         filled_avg_price="465.00",
                         order_type="market",
-                        client_order_id=workflow_id,
+                        client_order_id=f"{workflow_id}-exit",
                         order_id="sell-1",
                     )
                 )

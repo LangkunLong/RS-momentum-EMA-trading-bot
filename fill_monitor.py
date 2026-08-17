@@ -31,10 +31,16 @@ class FillMonitor:
         )
         self._thread: threading.Thread | None = None
         self._running = False
+        self._handler_fault = False
 
-        @self._stream.on("trade_updates")
         async def _on_trade_update(data: Any) -> None:  # noqa: ANN401
-            self._dispatch(data)
+            try:
+                await asyncio.to_thread(self._dispatch, data)
+            except Exception as exc:  # noqa: BLE001
+                self._handler_fault = True
+                print(f"[FILL MONITOR] Trade update handler error: {exc}")
+
+        self._stream.subscribe_trade_updates(_on_trade_update)
 
     def start(self) -> None:
         """Start the fill monitor in a background daemon thread."""
@@ -64,6 +70,15 @@ class FillMonitor:
         """Return True when the background thread is alive."""
         return self._thread is not None and self._thread.is_alive()
 
+    def is_connected(self) -> bool:
+        """Return True only while the wrapper and SDK stream are healthy."""
+        return (
+            self._running
+            and self.is_running()
+            and bool(getattr(self._stream, "_running", False))
+            and not self._handler_fault
+        )
+
     def _run_stream(self) -> None:
         """Entry point for the daemon thread — runs the asyncio event loop."""
         loop = asyncio.new_event_loop()
@@ -78,7 +93,7 @@ class FillMonitor:
 
     def _dispatch(self, data: Any) -> None:  # noqa: ANN401
         """Forward fill events to the OrderManager."""
-        event: str = getattr(data, "event", "unknown")
+        event = _normalize_enum_like(getattr(data, "event", "unknown"))
         order = getattr(data, "order", None)
 
         if order is None:
@@ -86,6 +101,10 @@ class FillMonitor:
 
         symbol = str(order.symbol)
         broker_order_id = str(getattr(order, "id", "") or "")
+        client_order_id = str(getattr(order, "client_order_id", "") or "")
+        order_type = str(getattr(order, "type", "") or "")
+        replaces = str(getattr(order, "replaces", "") or "")
+        replaced_by = str(getattr(order, "replaced_by", "") or "")
 
         if event == "fill":
             filled_qty = float(order.filled_qty or 0)
@@ -98,11 +117,13 @@ class FillMonitor:
             self._order_manager.handle_fill(
                 symbol=symbol,
                 broker_order_id=broker_order_id,
-                client_order_id=str(getattr(order, "client_order_id", "") or ""),
+                client_order_id=client_order_id,
                 side=side,
                 filled_qty=filled_qty,
                 fill_price=fill_price,
-                order_type=str(getattr(order, "type", "") or ""),
+                order_type=order_type,
+                replaces=replaces,
+                replaced_by=replaced_by,
             )
             return
 
@@ -114,18 +135,35 @@ class FillMonitor:
                 f"[FILL MONITOR] PARTIAL FILL {order.side} {filled_qty}/{order.qty} "
                 f"{symbol} @ ${fill_price:.2f}"
             )
-            if side == "buy":
+            if side in {"buy", "sell"}:
                 self._order_manager.handle_partial_fill(
                     symbol=symbol,
                     broker_order_id=broker_order_id,
-                    client_order_id=str(getattr(order, "client_order_id", "") or ""),
+                    client_order_id=client_order_id,
                     side=side,
                     filled_qty=filled_qty,
                     fill_price=fill_price,
-                    order_type=str(getattr(order, "type", "") or ""),
+                    order_type=order_type,
+                    replaces=replaces,
+                    replaced_by=replaced_by,
                 )
-        elif event in ("canceled", "expired"):
+            return
+
+        if event in {"canceled", "expired", "rejected", "replaced", "restated"}:
             print(f"[FILL MONITOR] ORDER {event.upper()}: {order.side} {symbol}")
+            side = _normalize_enum_like(getattr(order, "side", ""))
+            self._order_manager.handle_order_failure(
+                symbol=symbol,
+                broker_order_id=broker_order_id,
+                client_order_id=client_order_id,
+                side=side,
+                order_type=order_type,
+                status=event,
+                filled_qty=float(getattr(order, "filled_qty", 0) or 0),
+                fill_price=float(getattr(order, "filled_avg_price", 0) or 0),
+                replaces=replaces,
+                replaced_by=replaced_by,
+            )
 
 
 def _normalize_enum_like(value: object) -> str:

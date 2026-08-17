@@ -82,7 +82,7 @@ Profile and institutional-ownership calls are skipped in free mode. Unknown shar
 - `scheduler.py` runs the 09:31 ET daily cycle and hourly exit checks.
 - `paper_trading_console.py` provides deployment diagnostics and supervised operations.
 
-Alpaca is the execution source of truth. SQLite is the audit and recovery view. Workflow resolution uses explicit workflow id, client order id, broker order id, active symbol ownership, then latest symbol history.
+Alpaca is the execution source of truth. SQLite is the audit and recovery view. With no explicit reference, workflow resolution uses active symbol ownership and then latest symbol history. When a workflow id, client order id, or broker order id is supplied but unknown, resolution fails closed instead of falling back to another workflow.
 
 ## Offline quality gates
 
@@ -152,6 +152,14 @@ Before the one-share paper lifecycle:
 4. Obtain explicit operator approval.
 5. Observe the buy fill, protective stop derived from the actual fill, durable transitions, restart recovery, and cleanup sell/cancel.
 6. Confirm no orphan position or order remains in Alpaca and no active-position record remains locally.
+
+Run the separately gated verifier only after those checks and explicit operator approval:
+
+```powershell
+python verify_paper_trading.py --execute
+```
+
+`--execute` authorizes one SPY paper buy/fill/protective-stop/cleanup lifecycle. Omitting it refuses before broker access.
 
 Windows scheduled-task installation has a separate approval gate. Invoke setup through the stable project interpreter (`.venv\Scripts\python.exe`) and inspect the interpreter, repository path, arguments, trigger, working directory, user identity, and log destination before running `paper_trading_console.py install-task` or `setup_windows_task.py`. The registered action changes into the repository and writes to `.artifacts/logs/scheduler.log`. The default installed task includes `--dry-run`; enabling paper order submission requires the separate `--enable-orders` flag and a second explicit approval after the dry-run task is observed.
 

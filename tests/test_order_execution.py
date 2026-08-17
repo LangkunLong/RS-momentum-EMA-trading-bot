@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pandas as pd
 import pytest
@@ -35,10 +35,13 @@ from core.order_execution import (
     OrderResult,
     PositionSummary,
     cancel_open_orders,
+    cancel_open_orders_verified,
     check_exit_signals,
     close_position,
     ensure_protective_stop,
+    get_closed_orders,
     reconcile_open_position_stops,
+    reconcile_symbol_after_exit_failure,
     get_open_orders,
     get_open_positions,
     submit_bracket_buy,
@@ -68,7 +71,11 @@ def _mock_order(
     order.side = side
     order.type = order_type
     order.qty = str(qty)
+    order.filled_qty = "0"
     order.stop_price = None if stop_price is None else str(stop_price)
+    order.client_order_id = ""
+    order.status = "new"
+    order.time_in_force = "gtc" if order_type == "stop" else "day"
     return order
 
 
@@ -94,12 +101,43 @@ def _patched_client(client_mock: MagicMock) -> Any:
     return patch("core.order_execution._get_trading_client", return_value=client_mock)
 
 
+def _submission_ready_workflow() -> SimpleNamespace:
+    """Return a workflow double that can durably fence a mocked STOP submit."""
+    return SimpleNamespace(
+        transitions=[],
+        mark_protective_stop=lambda **_kwargs: None,
+    )
+
+
 # ===========================================================================
 # submit_bracket_buy
 # ===========================================================================
 
 
 class TestSubmitBracketBuy:
+    @pytest.mark.parametrize(
+        "status",
+        [
+            "accepted",
+            "accepted_for_bidding",
+            "pending_new",
+            "new",
+            "partially_filled",
+            "filled",
+        ],
+    )
+    def test_allowlisted_broker_status_is_accepted(self, status: str) -> None:
+        client = MagicMock()
+        order = _mock_order("order-accepted")
+        order.status = status
+        client.submit_order.return_value = order
+
+        with _patched_client(client):
+            result = submit_bracket_buy("AAPL", qty=1.0, limit_price=100.0)
+
+        assert result.success is True
+        assert result.order_id == "order-accepted"
+
     def test_limit_entry_order_is_accepted(self) -> None:
         """submit_bracket_buy with a limit price must return success=True."""
         client = MagicMock()
@@ -155,6 +193,58 @@ class TestSubmitBracketBuy:
         assert result.success is False
         assert "connection timeout" in result.error
         assert result.symbol == "FAIL"
+        assert result.outcome_uncertain is True
+
+    def test_pre_submission_client_failure_is_definitive(self) -> None:
+        with patch(
+            "core.order_execution._get_trading_client",
+            side_effect=EnvironmentError("paper credentials missing"),
+        ):
+            result = submit_bracket_buy("FAIL", qty=1.0, limit_price=100.0)
+
+        assert result.success is False
+        assert result.outcome_uncertain is False
+        assert "credentials" in result.error
+
+    @pytest.mark.parametrize("status", ["rejected", "canceled", "pending_replace"])
+    def test_unsafe_broker_status_returns_failure(self, status: str) -> None:
+        client = MagicMock()
+        order = _mock_order("order-unsafe")
+        order.status = status
+        client.submit_order.return_value = order
+
+        with _patched_client(client):
+            result = submit_bracket_buy("AAPL", qty=1.0, limit_price=100.0)
+
+        assert result.success is False
+        assert result.order_id == ""
+        assert status in result.error
+        assert result.outcome_uncertain is (status == "pending_replace")
+
+    def test_missing_broker_status_returns_failure(self) -> None:
+        client = MagicMock()
+        client.submit_order.return_value = SimpleNamespace(id="order-no-status")
+
+        with _patched_client(client):
+            result = submit_bracket_buy("AAPL", qty=1.0, limit_price=100.0)
+
+        assert result.success is False
+        assert result.order_id == ""
+        assert "status" in result.error.lower()
+
+    def test_missing_broker_order_id_returns_failure(self) -> None:
+        client = MagicMock()
+        order = _mock_order("")
+        order.status = "accepted"
+        client.submit_order.return_value = order
+
+        with _patched_client(client):
+            result = submit_bracket_buy("AAPL", qty=1.0, limit_price=100.0)
+
+        assert result.success is False
+        assert result.order_id == ""
+        assert "order id" in result.error.lower()
+        assert result.outcome_uncertain is True
 
     def test_default_stop_pct_is_retained_for_logging_compatibility(self) -> None:
         """When stop_loss_pct is omitted, the entry path should still succeed."""
@@ -185,7 +275,13 @@ class TestSubmitStopLoss:
         from alpaca.trading.requests import StopOrderRequest
 
         client = MagicMock()
-        client.submit_order.return_value = _mock_order("stop-id-1")
+        client.submit_order.return_value = _mock_order(
+            "stop-id-1",
+            symbol="AAPL",
+            side="sell",
+            order_type="stop",
+            stop_price=93.0,
+        )
 
         with _patched_client(client):
             result = submit_stop_loss("AAPL", qty=10.0, stop_price=93.0)
@@ -210,6 +306,96 @@ class TestSubmitStopLoss:
         assert result.success is False
         assert "bad request" in result.error
 
+    def test_post_submit_transport_error_is_outcome_uncertain(self) -> None:
+        client = MagicMock()
+        client.submit_order.side_effect = ConnectionError("response lost")
+
+        with _patched_client(client):
+            result = submit_stop_loss(
+                "AAPL",
+                qty=5.0,
+                stop_price=90.0,
+                client_order_id="wf-aapl-1-sl-a1b2c3",
+            )
+
+        assert result.success is False
+        assert result.outcome_uncertain is True
+        assert result.client_order_id == "wf-aapl-1-sl-a1b2c3"
+
+    @pytest.mark.parametrize(
+        "broker_response",
+        [
+            SimpleNamespace(
+                id="stop-no-status",
+                symbol="AAPL",
+                side="sell",
+                type="stop",
+                time_in_force="gtc",
+                client_order_id="wf-aapl-1-sl-a1b2c3",
+            ),
+            SimpleNamespace(
+                id="",
+                status="new",
+                symbol="AAPL",
+                side="sell",
+                type="stop",
+                time_in_force="gtc",
+                client_order_id="wf-aapl-1-sl-a1b2c3",
+            ),
+            SimpleNamespace(
+                id="stop-wrong-client",
+                status="rejected",
+                symbol="AAPL",
+                side="sell",
+                type="stop",
+                time_in_force="gtc",
+                client_order_id="wf-foreign-sl-a1b2c3",
+            ),
+        ],
+    )
+    def test_malformed_post_submit_response_is_outcome_uncertain(
+        self,
+        broker_response: SimpleNamespace,
+    ) -> None:
+        client = MagicMock()
+        client.submit_order.return_value = broker_response
+
+        with _patched_client(client):
+            result = submit_stop_loss(
+                "AAPL",
+                qty=5.0,
+                stop_price=90.0,
+                client_order_id="wf-aapl-1-sl-a1b2c3",
+            )
+
+        assert result.success is False
+        assert result.order_id == ""
+        assert result.outcome_uncertain is True
+
+    def test_explicit_rejected_zero_fill_is_definitive(self) -> None:
+        client = MagicMock()
+        rejected = _mock_order(
+            "stop-rejected",
+            symbol="AAPL",
+            side="sell",
+            order_type="stop",
+            stop_price=90.0,
+        )
+        rejected.status = "rejected"
+        rejected.client_order_id = "wf-aapl-1-sl-a1b2c3"
+        client.submit_order.return_value = rejected
+
+        with _patched_client(client):
+            result = submit_stop_loss(
+                "AAPL",
+                qty=5.0,
+                stop_price=90.0,
+                client_order_id="wf-aapl-1-sl-a1b2c3",
+            )
+
+        assert result.success is False
+        assert result.outcome_uncertain is False
+
 
 # ===========================================================================
 # ensure_protective_stop
@@ -217,26 +403,747 @@ class TestSubmitStopLoss:
 
 
 class TestEnsureProtectiveStop:
-    def test_submits_new_stop_when_none_exists(self) -> None:
+    @pytest.mark.parametrize("seed_id", ["entry-1", "entry-2"])
+    def test_replacement_chain_returns_total_terminal_filled_quantity(
+        self,
+        seed_id: str,
+    ) -> None:
+        original = SimpleNamespace(
+            id="entry-1",
+            symbol="AAPL",
+            side="buy",
+            type="limit",
+            status="replaced",
+            qty="10",
+            filled_qty="4",
+            client_order_id="wf-aapl-1",
+            replaced_by="entry-2",
+            replaces=None,
+        )
+        replacement = SimpleNamespace(
+            id="entry-2",
+            symbol="AAPL",
+            side="buy",
+            type="limit",
+            status="filled",
+            qty="6",
+            filled_qty="6",
+            client_order_id="wf-aapl-1",
+            replaced_by=None,
+            replaces="entry-1",
+        )
         client = MagicMock()
+        orders_by_id = {
+            "entry-1": original,
+            "entry-2": replacement,
+        }
+        client.get_order_by_id.side_effect = orders_by_id.__getitem__
+        workflow = SimpleNamespace(
+            repair_entry_order_reference=lambda **_kwargs: None,
+        )
 
         with (
             _patched_client(client),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=workflow,
+                create=True,
+            ),
+            patch("core.order_execution.time.sleep"),
+        ):
+            filled_qty = oe._wait_for_terminal_buy_order_chain(
+                "AAPL",
+                {seed_id},
+                workflow_id="wf-aapl-1",
+                timeout=1.0,
+                poll_interval=0.0,
+            )
+
+        assert filled_qty == pytest.approx(10.0)
+        assert {
+            broker_call.args[0] for broker_call in client.get_order_by_id.call_args_list
+        } == {"entry-1", "entry-2"}
+        client.cancel_order_by_id.assert_not_called()
+
+    def test_replaced_order_waits_for_traversable_replacement_link(self) -> None:
+        unlinked_parent = SimpleNamespace(
+            id="entry-1",
+            symbol="AAPL",
+            side="buy",
+            status="replaced",
+            filled_qty="4",
+            client_order_id="wf-aapl-1",
+            replaced_by=None,
+            replaces=None,
+        )
+        linked_parent = SimpleNamespace(
+            **{
+                **vars(unlinked_parent),
+                "replaced_by": "entry-2",
+            },
+        )
+        replacement = SimpleNamespace(
+            id="entry-2",
+            symbol="AAPL",
+            side="buy",
+            status="filled",
+            filled_qty="6",
+            client_order_id="wf-aapl-1-r1",
+            replaced_by=None,
+            replaces="entry-1",
+        )
+        parent_responses = iter([unlinked_parent, linked_parent, linked_parent])
+        client = MagicMock()
+
+        def get_order(order_id: str) -> SimpleNamespace:
+            if order_id == "entry-1":
+                return next(parent_responses)
+            assert order_id == "entry-2"
+            return replacement
+
+        client.get_order_by_id.side_effect = get_order
+        workflow = SimpleNamespace(
+            repair_entry_order_reference=lambda **_kwargs: None,
+        )
+
+        with (
+            _patched_client(client),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=workflow,
+                create=True,
+            ),
+            patch("core.order_execution.time.sleep"),
+        ):
+            filled_qty = oe._wait_for_terminal_buy_order_chain(
+                "AAPL",
+                {"entry-1"},
+                workflow_id="wf-aapl-1",
+                timeout=1.0,
+                poll_interval=0.0,
+            )
+
+        assert filled_qty == pytest.approx(10.0)
+        assert [
+            broker_call.args[0] for broker_call in client.get_order_by_id.call_args_list
+        ].count("entry-1") >= 2
+
+    def test_entry_fence_persists_each_trusted_replacement_order_id(self) -> None:
+        original = SimpleNamespace(
+            id="entry-1",
+            symbol="AAPL",
+            side="buy",
+            status="replaced",
+            filled_qty="4",
+            client_order_id="wf-aapl-1",
+            replaced_by="entry-2",
+            replaces=None,
+        )
+        replacement = SimpleNamespace(
+            id="entry-2",
+            symbol="AAPL",
+            side="buy",
+            status="filled",
+            filled_qty="6",
+            client_order_id="wf-aapl-1-r1",
+            replaced_by=None,
+            replaces="entry-1",
+        )
+        client = MagicMock()
+        client.get_order_by_id.side_effect = {
+            "entry-1": original,
+            "entry-2": replacement,
+        }.__getitem__
+        repairs: list[dict[str, str]] = []
+        workflow = SimpleNamespace(
+            repair_entry_order_reference=lambda **kwargs: repairs.append(kwargs),
+        )
+
+        with (
+            _patched_client(client),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=workflow,
+                create=True,
+            ),
+            patch("core.order_execution.time.sleep"),
+        ):
+            filled_qty = oe._wait_for_terminal_buy_order_chain(
+                "AAPL",
+                {"entry-1"},
+                workflow_id="wf-aapl-1",
+                timeout=1.0,
+                poll_interval=0.0,
+            )
+
+        assert filled_qty == pytest.approx(10.0)
+        assert {
+            (repair["broker_order_id"], repair["client_order_id"])
+            for repair in repairs
+        } == {
+            ("entry-1", "wf-aapl-1"),
+            ("entry-2", "wf-aapl-1-r1"),
+        }
+
+    def test_terminal_entry_quantity_fences_stop_reconciliation(self) -> None:
+        protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-1",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+
+        with (
             patch("core.order_execution.get_open_orders", return_value=[]),
             patch(
-                "core.order_execution.submit_stop_loss",
-                return_value=OrderResult(True, "stop-1", "AAPL", "sell", 10.0),
-            ) as mock_submit,
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                return_value=10.0,
+            ) as terminal,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=protected,
+            ) as reconcile,
         ):
-            result = ensure_protective_stop("AAPL", qty=10.0, fill_price=100.0, stop_loss_pct=0.07)
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=4.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+                entry_order_id="entry-1",
+            )
 
-        mock_submit.assert_called_once_with(symbol="AAPL", qty=10.0, stop_price=93.0, client_order_id=None)
-        assert result.success is True
-        assert result.action == "submitted"
-        assert result.stop_price == pytest.approx(93.0)
+        terminal.assert_called_once_with(
+            "AAPL",
+            {"entry-1"},
+            workflow_id="wf-aapl-1",
+        )
+        reconcile.assert_called_once_with(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+            minimum_position_qty=10.0,
+        )
+        assert result == protected
+
+    @pytest.mark.parametrize(
+        ("observed_qty", "durable_sell_fill_qty", "expected_minimum"),
+        [
+            (6.0, 4.0, 6.0),
+            (7.0, 4.0, 7.0),
+        ],
+    )
+    def test_terminal_entry_fence_uses_net_causal_exposure_and_observed_floor(
+        self,
+        observed_qty: float,
+        durable_sell_fill_qty: float,
+        expected_minimum: float,
+    ) -> None:
+        protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-1",
+            symbol="AAPL",
+            qty=observed_qty,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+
+        with (
+            patch("core.order_execution.get_open_orders", return_value=[]),
+            patch(
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                return_value=10.0,
+            ),
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=protected,
+            ) as reconcile,
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=observed_qty,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+                entry_order_id="entry-1",
+                durable_sell_fill_qty=durable_sell_fill_qty,
+            )
+
+        reconcile.assert_called_once_with(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+            minimum_position_qty=expected_minimum,
+        )
+        assert result == protected
+
+    def test_terminal_entry_fence_rejects_sell_offset_above_terminal_buys(
+        self,
+    ) -> None:
+        with (
+            patch("core.order_execution.get_open_orders", return_value=[]),
+            patch(
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                return_value=10.0,
+            ),
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure"
+            ) as reconcile,
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=1.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+                entry_order_id="entry-1",
+                durable_sell_fill_qty=11.0,
+            )
+
+        assert result.success is False
+        assert result.action == "reconciliation_failed"
+        assert "exceed terminal entry fills" in result.error
+        reconcile.assert_not_called()
+
+    def test_entry_fence_reloads_newer_durable_sell_offset(self) -> None:
+        protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-1",
+            symbol="AAPL",
+            qty=6.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+        refreshed_workflow = SimpleNamespace(
+            transitions=[
+                SimpleNamespace(
+                    event="sell_partial_fill_received",
+                    details={"broker_order_id": "sell-1", "qty": 4.0},
+                )
+            ]
+        )
+
+        with (
+            patch("core.order_execution.get_open_orders", return_value=[]),
+            patch(
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                return_value=10.0,
+            ),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=refreshed_workflow,
+            ),
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=protected,
+            ) as reconcile,
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=4.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+                entry_order_id="entry-1",
+                durable_sell_fill_qty=2.0,
+            )
+
+        reconcile.assert_called_once_with(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+            minimum_position_qty=6.0,
+        )
+        assert result == protected
+
+    def test_durable_entry_ids_are_unioned_with_single_and_open_buy_ids(self) -> None:
+        open_buy = _mock_order(
+            "entry-open",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            qty=12.0,
+        )
+        protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-1",
+            symbol="AAPL",
+            qty=12.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+
+        with (
+            patch(
+                "core.order_execution.get_open_orders",
+                side_effect=[[open_buy], []],
+            ),
+            patch("core.order_execution._cancel_order_ids_verified"),
+            patch(
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                return_value=12.0,
+            ) as terminal,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=protected,
+            ) as reconcile,
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=4.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+                entry_order_id="entry-single",
+                entry_order_ids={"entry-durable-1", "entry-durable-2"},
+            )
+
+        terminal.assert_called_once_with(
+            "AAPL",
+            {
+                "entry-single",
+                "entry-durable-1",
+                "entry-durable-2",
+                "entry-open",
+            },
+            workflow_id="wf-aapl-1",
+        )
+        reconcile.assert_called_once_with(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+            minimum_position_qty=12.0,
+        )
+        assert result == protected
+
+    def test_new_buy_seen_after_initial_fence_is_refenced_before_protection(
+        self,
+    ) -> None:
+        replacement = _mock_order(
+            "entry-2",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            qty=6.0,
+        )
+        pending = oe.ProtectiveStopResult(
+            success=False,
+            order_id="",
+            symbol="AAPL",
+            qty=4.0,
+            stop_price=93.0,
+            action="position_sync_pending",
+        )
+        protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-1",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+
+        with (
+            patch(
+                "core.order_execution.get_open_orders",
+                side_effect=[[], [replacement], []],
+            ),
+            patch("core.order_execution._cancel_order_ids_verified") as cancel,
+            patch(
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                side_effect=[4.0, 10.0],
+            ) as terminal,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                side_effect=[pending, protected],
+            ) as reconcile,
+            patch("core.order_execution.time.sleep"),
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=4.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+                entry_order_id="entry-1",
+            )
+
+        assert terminal.call_args_list == [
+            call("AAPL", {"entry-1"}, workflow_id="wf-aapl-1"),
+            call("AAPL", {"entry-1", "entry-2"}, workflow_id="wf-aapl-1"),
+        ]
+        cancel.assert_called_once_with("AAPL", {"entry-2"})
+        assert reconcile.call_args_list[-1] == call(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+            minimum_position_qty=10.0,
+        )
+        assert result == protected
+
+    def test_buy_appearing_after_success_is_refenced_before_return(self) -> None:
+        replacement = _mock_order(
+            "entry-2",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            qty=6.0,
+        )
+        initially_protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-4",
+            symbol="AAPL",
+            qty=4.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+        finally_protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-10",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+
+        with (
+            patch(
+                "core.order_execution.get_open_orders",
+                side_effect=[[], [replacement], [], []],
+            ),
+            patch("core.order_execution._cancel_order_ids_verified") as cancel,
+            patch(
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                side_effect=[4.0, 10.0],
+            ) as terminal,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                side_effect=[initially_protected, finally_protected],
+            ) as reconcile,
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=4.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+                entry_order_id="entry-1",
+            )
+
+        cancel.assert_called_once_with("AAPL", {"entry-2"})
+        assert terminal.call_args_list == [
+            call("AAPL", {"entry-1"}, workflow_id="wf-aapl-1"),
+            call(
+                "AAPL",
+                {"entry-1", "entry-2"},
+                workflow_id="wf-aapl-1",
+            ),
+        ]
+        assert reconcile.call_args_list[-1] == call(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+            minimum_position_qty=10.0,
+        )
+        assert result == finally_protected
+
+    def test_durable_buy_transition_after_success_forces_refence(self) -> None:
+        initial_workflow = SimpleNamespace(
+            transitions=[
+                SimpleNamespace(
+                    event="buy_fill_received",
+                    details={"broker_order_id": "entry-1", "qty": 4.0},
+                )
+            ]
+        )
+        changed_workflow = SimpleNamespace(
+            transitions=[
+                *initial_workflow.transitions,
+                SimpleNamespace(
+                    event="buy_fill_received",
+                    details={"broker_order_id": "entry-2", "qty": 6.0},
+                ),
+            ]
+        )
+        initially_protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-4",
+            symbol="AAPL",
+            qty=4.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+        finally_protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-10",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+
+        with (
+            patch("core.order_execution.get_open_orders", return_value=[]),
+            patch(
+                "core.order_execution.get_workflow",
+                side_effect=[
+                    initial_workflow,
+                    changed_workflow,
+                    changed_workflow,
+                    changed_workflow,
+                ],
+            ),
+            patch(
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                side_effect=[4.0, 10.0],
+            ) as terminal,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                side_effect=[initially_protected, finally_protected],
+            ) as reconcile,
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=4.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+                entry_order_id="entry-1",
+            )
+
+        assert terminal.call_args_list == [
+            call("AAPL", {"entry-1"}, workflow_id="wf-aapl-1"),
+            call(
+                "AAPL",
+                {"entry-1", "entry-2"},
+                workflow_id="wf-aapl-1",
+            ),
+        ]
+        assert reconcile.call_args_list[-1] == call(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+            minimum_position_qty=10.0,
+        )
+        assert result == finally_protected
+
+    def test_workflow_fill_cancels_buy_remainder_before_strict_reconciliation(self) -> None:
+        buy_remainder = _mock_order(
+            "entry-1",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            qty=10.0,
+        )
+        protected = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-1",
+            symbol="AAPL",
+            qty=4.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
+
+        with (
+            patch(
+                "core.order_execution.get_open_orders",
+                side_effect=[[buy_remainder], []],
+            ),
+            patch(
+                "core.order_execution._cancel_order_ids_verified",
+                create=True,
+            ) as cancel,
+            patch(
+                "core.order_execution._wait_for_terminal_buy_order_chain",
+                return_value=4.0,
+            ) as terminal,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=protected,
+            ) as reconcile,
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=4.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+            )
+
+        cancel.assert_called_once_with("AAPL", {"entry-1"})
+        terminal.assert_called_once_with(
+            "AAPL",
+            {"entry-1"},
+            workflow_id="wf-aapl-1",
+        )
+        reconcile.assert_called_once_with(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+            minimum_position_qty=4.0,
+        )
+        assert result == protected
+
+    def test_missing_workflow_fails_without_submitting_unlinked_stop(self) -> None:
+        with patch("core.order_execution.submit_stop_loss") as submit:
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=10.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id=None,
+            )
+
+        assert result.success is False
+        assert result.action == "missing_workflow"
+        submit.assert_not_called()
+
+    def test_submits_new_stop_when_none_exists(self) -> None:
+        submitted = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-1",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="submitted",
+            client_order_id="wf-aapl-1-sl-retry1",
+        )
+
+        with (
+            patch("core.order_execution.get_open_orders", return_value=[]),
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=submitted,
+            ) as reconcile,
+        ):
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=10.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+            )
+
+        reconcile.assert_called_once_with(
+            "AAPL",
+            workflow_id="wf-aapl-1",
+            stop_loss_pct=0.07,
+        )
+        assert result == submitted
 
     def test_reuses_existing_matching_stop(self) -> None:
-        client = MagicMock()
         existing = _mock_order(
             "stop-keep",
             symbol="AAPL",
@@ -245,22 +1152,34 @@ class TestEnsureProtectiveStop:
             qty=10.0,
             stop_price=93.0,
         )
+        reused = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-keep",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="reused",
+            client_order_id="wf-aapl-1-sl",
+        )
 
         with (
-            _patched_client(client),
             patch("core.order_execution.get_open_orders", return_value=[existing]),
-            patch("core.order_execution.submit_stop_loss") as mock_submit,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=reused,
+            ),
         ):
-            result = ensure_protective_stop("AAPL", qty=10.0, fill_price=100.0, stop_loss_pct=0.07)
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=10.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+            )
 
-        mock_submit.assert_not_called()
-        client.cancel_order_by_id.assert_not_called()
-        assert result.success is True
-        assert result.order_id == "stop-keep"
-        assert result.action == "reused"
+        assert result == reused
 
     def test_replaces_stale_stop_with_fill_anchored_stop(self) -> None:
-        client = MagicMock()
         stale = _mock_order(
             "stop-old",
             symbol="AAPL",
@@ -269,54 +1188,72 @@ class TestEnsureProtectiveStop:
             qty=10.0,
             stop_price=95.0,
         )
+        unsafe = oe.ProtectiveStopResult(
+            success=False,
+            order_id="stop-old",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="unsafe_orders",
+        )
+        submitted = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-new",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="submitted",
+        )
 
         with (
-            _patched_client(client),
             patch("core.order_execution.get_open_orders", return_value=[stale]),
             patch(
-                "core.order_execution.submit_stop_loss",
-                return_value=OrderResult(True, "stop-new", "AAPL", "sell", 10.0),
-            ) as mock_submit,
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                side_effect=[unsafe, submitted],
+            ) as reconcile,
+            patch("core.order_execution.cancel_open_orders_verified") as cancel,
         ):
-            result = ensure_protective_stop("AAPL", qty=10.0, fill_price=100.0, stop_loss_pct=0.07)
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=10.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+            )
 
-        client.cancel_order_by_id.assert_called_once_with("stop-old")
-        mock_submit.assert_called_once_with(symbol="AAPL", qty=10.0, stop_price=93.0, client_order_id=None)
-        assert result.success is True
-        assert result.action == "replaced"
-        assert result.order_id == "stop-new"
+        cancel.assert_called_once_with("AAPL")
+        assert reconcile.call_count == 2
+        assert result == submitted
 
-    def test_cleans_duplicate_matching_stops(self) -> None:
-        client = MagicMock()
-        keep = _mock_order(
-            "stop-keep",
+    def test_pending_exit_is_not_reported_as_stop_protection(self) -> None:
+        pending_exit = oe.ProtectiveStopResult(
+            success=True,
+            order_id="exit-1",
             symbol="AAPL",
-            side="sell",
-            order_type="stop",
             qty=10.0,
             stop_price=93.0,
-        )
-        duplicate = _mock_order(
-            "stop-dup",
-            symbol="AAPL",
-            side="sell",
-            order_type="stop",
-            qty=10.0,
-            stop_price=93.0,
+            action="pending_exit",
         )
 
         with (
-            _patched_client(client),
-            patch("core.order_execution.get_open_orders", return_value=[keep, duplicate]),
-            patch("core.order_execution.submit_stop_loss") as mock_submit,
+            patch("core.order_execution.get_open_orders", return_value=[]),
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=pending_exit,
+            ),
+            patch("core.order_execution.cancel_open_orders_verified") as cancel,
         ):
-            result = ensure_protective_stop("AAPL", qty=10.0, fill_price=100.0, stop_loss_pct=0.07)
+            result = ensure_protective_stop(
+                "AAPL",
+                qty=10.0,
+                fill_price=100.0,
+                stop_loss_pct=0.07,
+                workflow_id="wf-aapl-1",
+            )
 
-        client.cancel_order_by_id.assert_called_once_with("stop-dup")
-        mock_submit.assert_not_called()
-        assert result.success is True
-        assert result.order_id == "stop-keep"
-        assert result.action == "cleaned"
+        cancel.assert_not_called()
+        assert result.success is False
+        assert result.action == "pending_exit"
 
 
 # ===========================================================================
@@ -325,47 +1262,94 @@ class TestEnsureProtectiveStop:
 
 
 class TestReconcileOpenPositionStops:
-    def test_repairs_open_position_using_avg_entry_price(self) -> None:
+    def test_recovers_workflow_and_strictly_reconciles_open_position(self) -> None:
         positions = [PositionSummary("AAPL", 10.0, 100.0, 102.0, 0.02)]
-
-        with (
-            patch("core.order_execution.get_open_orders", return_value=[]),
-            patch("core.order_execution.ensure_protective_stop") as mock_ensure,
-        ):
-            mock_ensure.return_value = oe.ProtectiveStopResult(
-                success=True,
-                order_id="stop-1",
-                symbol="AAPL",
-                qty=10.0,
-                stop_price=93.0,
-                action="submitted",
-            )
-            results = reconcile_open_position_stops(stop_loss_pct=0.07, positions=positions)
-
-        mock_ensure.assert_called_once_with(
+        recovered_workflow = SimpleNamespace(workflow_id="wf-aapl-recovered")
+        repaired = oe.ProtectiveStopResult(
+            success=True,
+            order_id="stop-1",
             symbol="AAPL",
             qty=10.0,
-            fill_price=100.0,
-            stop_loss_pct=0.07,
-            open_orders=[],
+            stop_price=93.0,
+            action="submitted",
+            client_order_id="wf-aapl-recovered-sl-a1b2c3",
         )
-        assert len(results) == 1
-        assert results[0].action == "submitted"
-
-    def test_skips_positions_with_pending_exit_orders(self) -> None:
-        positions = [PositionSummary("AAPL", 10.0, 100.0, 95.0, -0.05)]
-        pending_exit = _mock_order("sell-1", symbol="AAPL", side="sell", order_type="limit", qty=10.0)
 
         with (
-            patch("core.order_execution.get_open_orders", return_value=[pending_exit]),
-            patch("core.order_execution.ensure_protective_stop") as mock_ensure,
+            patch(
+                "core.order_execution._get_trading_client",
+                side_effect=AssertionError("unexpected broker access"),
+            ),
+            patch(
+                "core.order_execution.get_active_workflow_for_symbol",
+                return_value=None,
+            ) as get_active_workflow,
+            patch(
+                "core.order_execution.recover_active_position_workflow",
+                return_value=recovered_workflow,
+            ) as recover_workflow,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=repaired,
+            ) as strict_reconcile,
         ):
             results = reconcile_open_position_stops(stop_loss_pct=0.07, positions=positions)
 
-        mock_ensure.assert_not_called()
-        assert len(results) == 1
-        assert results[0].action == "skipped_pending_exit"
-        assert results[0].stop_price == pytest.approx(93.0)
+        get_active_workflow.assert_called_once_with("AAPL")
+        recover_workflow.assert_called_once_with(
+            "AAPL",
+            qty=10.0,
+            avg_entry_price=100.0,
+        )
+        strict_reconcile.assert_called_once_with(
+            "AAPL",
+            workflow_id="wf-aapl-recovered",
+            stop_loss_pct=0.07,
+            minimum_position_qty=10.0,
+        )
+        assert results == [repaired]
+
+    def test_active_workflow_uses_strict_reconciliation_for_pending_exit(self) -> None:
+        positions = [PositionSummary("AAPL", 10.0, 100.0, 95.0, -0.05)]
+        active_workflow = SimpleNamespace(workflow_id="wf-aapl-active")
+        pending_exit = oe.ProtectiveStopResult(
+            success=True,
+            order_id="exit-1",
+            symbol="AAPL",
+            qty=10.0,
+            stop_price=93.0,
+            action="pending_exit",
+            client_order_id="wf-aapl-active-exit",
+        )
+
+        with (
+            patch(
+                "core.order_execution._get_trading_client",
+                side_effect=AssertionError("unexpected broker access"),
+            ),
+            patch(
+                "core.order_execution.get_active_workflow_for_symbol",
+                return_value=active_workflow,
+            ) as get_active_workflow,
+            patch(
+                "core.order_execution.recover_active_position_workflow",
+            ) as recover_workflow,
+            patch(
+                "core.order_execution.reconcile_symbol_after_exit_failure",
+                return_value=pending_exit,
+            ) as strict_reconcile,
+        ):
+            results = reconcile_open_position_stops(stop_loss_pct=0.07, positions=positions)
+
+        get_active_workflow.assert_called_once_with("AAPL")
+        recover_workflow.assert_not_called()
+        strict_reconcile.assert_called_once_with(
+            "AAPL",
+            workflow_id="wf-aapl-active",
+            stop_loss_pct=0.07,
+            minimum_position_qty=10.0,
+        )
+        assert results == [pending_exit]
 
     def test_returns_empty_when_no_open_positions(self) -> None:
         assert reconcile_open_position_stops(positions=[]) == []
@@ -377,9 +1361,15 @@ class TestReconcileOpenPositionStops:
 
 
 class TestSubmitMarketSell:
-    def test_market_sell_returns_success(self) -> None:
+    @pytest.mark.parametrize(
+        "status",
+        ["accepted", "accepted_for_bidding", "pending_new", "new", "partially_filled", "filled"],
+    )
+    def test_market_sell_returns_success_for_valid_broker_status(self, status: str) -> None:
         client = MagicMock()
-        client.submit_order.return_value = _mock_order("sell-1")
+        order = _mock_order("sell-1")
+        order.status = status
+        client.submit_order.return_value = order
 
         with _patched_client(client):
             result = submit_market_sell("AAPL", qty=10.0)
@@ -387,6 +1377,45 @@ class TestSubmitMarketSell:
         assert result.success is True
         assert result.side == "sell"
         assert result.qty == 10.0
+
+    def test_market_sell_fails_when_broker_response_has_no_status(self) -> None:
+        client = MagicMock()
+        client.submit_order.return_value = SimpleNamespace(id="sell-1")
+
+        with _patched_client(client):
+            result = submit_market_sell("AAPL", qty=10.0)
+
+        assert result.success is False
+        assert "status" in result.error.lower()
+        assert result.outcome_uncertain is True
+
+    def test_market_sell_missing_broker_order_id_is_uncertain(self) -> None:
+        client = MagicMock()
+        order = _mock_order("")
+        order.status = "accepted"
+        client.submit_order.return_value = order
+
+        with _patched_client(client):
+            result = submit_market_sell("AAPL", qty=10.0)
+
+        assert result.success is False
+        assert result.order_id == ""
+        assert "order id" in result.error.lower()
+        assert result.outcome_uncertain is True
+
+    @pytest.mark.parametrize("status", ["rejected", "canceled", "expired"])
+    def test_market_sell_fails_for_terminal_rejection_status(self, status: str) -> None:
+        client = MagicMock()
+        order = _mock_order("sell-1")
+        order.status = status
+        client.submit_order.return_value = order
+
+        with _patched_client(client):
+            result = submit_market_sell("AAPL", qty=10.0)
+
+        assert result.success is False
+        assert status in result.error.lower()
+        assert result.outcome_uncertain is False
 
     def test_api_error_returns_failure(self) -> None:
         client = MagicMock()
@@ -397,6 +1426,7 @@ class TestSubmitMarketSell:
 
         assert result.success is False
         assert result.error == "rejected"
+        assert result.outcome_uncertain is True
 
 
 # ===========================================================================
@@ -570,6 +1600,147 @@ class TestCancelOpenOrders:
 
         assert count == 1
 
+    def test_verified_cancel_waits_until_broker_reports_no_open_orders(self) -> None:
+        client = MagicMock()
+        working = SimpleNamespace(
+            id="stop-1",
+            symbol="SPY",
+            side="sell",
+            type="stop",
+            status="new",
+        )
+        pending = SimpleNamespace(
+            id="stop-1",
+            symbol="SPY",
+            side="sell",
+            type="stop",
+            status="pending_cancel",
+        )
+        client.get_orders.side_effect = [[working], [pending], [], []]
+
+        with (
+            _patched_client(client),
+            patch("core.order_execution.time.sleep") as sleep,
+        ):
+            count = cancel_open_orders_verified("SPY", timeout=1.0)
+
+        assert count == 1
+        client.cancel_order_by_id.assert_called_once_with("stop-1")
+        assert client.get_orders.call_count == 4
+        assert sleep.call_count == 3
+
+    def test_verified_cancel_propagates_inspection_failure(self) -> None:
+        client = MagicMock()
+        client.get_orders.side_effect = RuntimeError("broker unavailable")
+
+        with _patched_client(client):
+            with pytest.raises(RuntimeError, match="broker unavailable"):
+                cancel_open_orders_verified("SPY", timeout=1.0)
+
+        client.cancel_order_by_id.assert_not_called()
+
+    def test_verified_cancel_propagates_cancellation_failure(self) -> None:
+        client = MagicMock()
+        order = SimpleNamespace(
+            id="stop-1",
+            symbol="SPY",
+            side="sell",
+            type="stop",
+            status="new",
+        )
+        client.get_orders.return_value = [order]
+        client.cancel_order_by_id.side_effect = RuntimeError("cancel rejected")
+
+        with _patched_client(client):
+            with pytest.raises(RuntimeError, match="cancel rejected"):
+                cancel_open_orders_verified("SPY", timeout=0.0)
+
+    def test_verified_cancel_preserves_stop_when_buy_cancel_persists(self) -> None:
+        client = MagicMock()
+        stop = SimpleNamespace(
+            id="stop-1",
+            symbol="SPY",
+            side="sell",
+            type="stop",
+            status="new",
+        )
+        buy = SimpleNamespace(
+            id="entry-1",
+            symbol="SPY",
+            side="buy",
+            type="limit",
+            status="new",
+        )
+        client.get_orders.return_value = [stop, buy]
+        client.cancel_order_by_id.side_effect = RuntimeError("buy cancel rejected")
+
+        with (
+            _patched_client(client),
+            patch("core.order_execution.time.monotonic", side_effect=[0.0, 2.0]),
+        ):
+            with pytest.raises(RuntimeError, match="entry-1"):
+                cancel_open_orders_verified("SPY", timeout=1.0)
+
+        assert client.cancel_order_by_id.call_args_list == [call("entry-1")]
+
+    def test_verified_cancel_accepts_lost_response_after_stable_empty_proof(self) -> None:
+        client = MagicMock()
+        working = SimpleNamespace(
+            id="entry-1",
+            symbol="SPY",
+            side="buy",
+            type="limit",
+            status="new",
+        )
+        pending = SimpleNamespace(
+            id="entry-1",
+            symbol="SPY",
+            side="buy",
+            type="limit",
+            status="pending_cancel",
+        )
+        client.get_orders.side_effect = [[working], [pending], [], []]
+        client.cancel_order_by_id.side_effect = RuntimeError("response lost")
+
+        with (
+            _patched_client(client),
+            patch("core.order_execution.time.sleep"),
+        ):
+            count = cancel_open_orders_verified("SPY", timeout=1.0)
+
+        assert count == 1
+        client.cancel_order_by_id.assert_called_once_with("entry-1")
+
+    def test_verified_cancel_catches_new_order_before_returning(self) -> None:
+        client = MagicMock()
+        first = SimpleNamespace(
+            id="entry-1",
+            symbol="SPY",
+            side="buy",
+            type="limit",
+            status="new",
+        )
+        raced = SimpleNamespace(
+            id="exit-1",
+            symbol="SPY",
+            side="sell",
+            type="market",
+            status="new",
+        )
+        client.get_orders.side_effect = [[first], [raced], [], []]
+
+        with (
+            _patched_client(client),
+            patch("core.order_execution.time.sleep"),
+        ):
+            count = cancel_open_orders_verified("SPY", timeout=1.0)
+
+        assert count == 2
+        assert client.cancel_order_by_id.call_args_list == [
+            call("entry-1"),
+            call("exit-1"),
+        ]
+
 
 class TestStrictBrokerInspection:
     """Safety-sensitive callers must be able to distinguish empty state from API failure."""
@@ -589,6 +1760,853 @@ class TestStrictBrokerInspection:
         with patch("core.order_execution._get_trading_client", return_value=client):
             with pytest.raises(RuntimeError, match="broker unavailable"):
                 get_open_orders("SPY", raise_on_error=True)
+
+    def test_get_closed_orders_requests_closed_symbol_history(self) -> None:
+        client = MagicMock()
+        filled_order = SimpleNamespace(id="sell-1")
+        client.get_orders.return_value = [filled_order]
+
+        with patch("core.order_execution._get_trading_client", return_value=client):
+            assert get_closed_orders("SPY", limit=25, raise_on_error=True) == [filled_order]
+
+        request = client.get_orders.call_args.args[0]
+        assert str(request.status).split(".")[-1].lower() == "closed"
+        assert request.symbols == ["SPY"]
+        assert request.limit == 25
+        assert str(request.direction).split(".")[-1].lower() == "desc"
+
+
+class TestExitFailureSafety:
+    def test_pending_cancel_stop_is_never_accepted_as_protection(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        stop = SimpleNamespace(
+            id="stop-1",
+            side="sell",
+            type="stop",
+            status="pending_cancel",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id="wf-spy-1-sl",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch("core.order_execution.get_open_orders", return_value=[stop]),
+            patch("core.order_execution._SAFETY_SNAPSHOT_TIMEOUT", 0.0, create=True),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is False
+        assert result.action in {"orders_transitioning", "snapshot_unstable"}
+
+    def test_mixed_time_position_snapshot_never_returns_flat_success(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+
+        with (
+            patch(
+                "core.order_execution.get_open_positions",
+                side_effect=[[], [position]],
+            ),
+            patch("core.order_execution.get_open_orders", return_value=[]),
+            patch("core.order_execution.time.monotonic", side_effect=[0.0, 0.0, 2.0]),
+            patch("core.order_execution.time.sleep"),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is False
+        assert result.action == "snapshot_unstable"
+
+    def test_live_buy_prevents_flat_or_protected_success(self) -> None:
+        position = PositionSummary("SPY", 0.1, 100.0, 100.0, 0.0)
+        live_buy = SimpleNamespace(
+            id="entry-1",
+            side="buy",
+            type="limit",
+            status="new",
+            qty="1.0",
+            filled_qty="0.1",
+            client_order_id="wf-spy-1",
+        )
+        stop = SimpleNamespace(
+            id="stop-1",
+            side="sell",
+            type="stop",
+            status="new",
+            qty="0.1",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id="wf-spy-1-sl",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch("core.order_execution.get_open_orders", return_value=[live_buy, stop]),
+            patch("core.order_execution.submit_stop_loss") as submit,
+        ):
+            result = reconcile_symbol_after_exit_failure("SPY", workflow_id="wf-spy-1")
+
+        assert result.success is False
+        assert result.action == "pending_buy"
+        submit.assert_not_called()
+
+    def test_rejects_position_below_terminal_entry_filled_quantity(self) -> None:
+        position = PositionSummary("SPY", 0.5, 100.0, 100.0, 0.0)
+        undersized_stop = SimpleNamespace(
+            id="stop-1",
+            side="sell",
+            type="stop",
+            status="new",
+            qty="0.5",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id="wf-spy-1-sl",
+        )
+
+        with (
+            patch(
+                "core.order_execution._sample_stable_symbol_state",
+                return_value=(position, [undersized_stop]),
+            ),
+            patch("core.order_execution.submit_stop_loss") as submit,
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+                minimum_position_qty=1.0,
+            )
+
+        assert result.success is False
+        assert result.action == "position_sync_pending"
+        assert result.qty == pytest.approx(0.5)
+        assert "terminal entry fills 1.0" in result.error
+        submit.assert_not_called()
+
+    def test_pending_exit_requires_one_full_workflow_linked_exit(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        full_exit = SimpleNamespace(
+            id="exit-1",
+            side="sell",
+            type="market",
+            status="new",
+            qty="1.0",
+            filled_qty="0",
+            client_order_id="wf-spy-1-exit",
+        )
+        partial_exit = SimpleNamespace(
+            id="exit-2",
+            side="sell",
+            type="market",
+            status="new",
+            qty="0.5",
+            filled_qty="0",
+            client_order_id="wf-spy-1-exit",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch("core.order_execution.get_open_orders", return_value=[full_exit]),
+        ):
+            full = reconcile_symbol_after_exit_failure("SPY", workflow_id="wf-spy-1")
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch("core.order_execution.get_open_orders", return_value=[partial_exit]),
+        ):
+            partial = reconcile_symbol_after_exit_failure("SPY", workflow_id="wf-spy-1")
+
+        assert full.success is True
+        assert full.action == "pending_exit"
+        assert partial.success is False
+        assert partial.action == "unsafe_orders"
+
+    def test_workflow_exit_role_rejects_non_market_sell(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        limit_exit = SimpleNamespace(
+            id="exit-1",
+            side="sell",
+            type="limit",
+            status="new",
+            qty="1.0",
+            filled_qty="0",
+            client_order_id="wf-spy-1-exit",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch("core.order_execution.get_open_orders", return_value=[limit_exit]),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is False
+        assert result.action == "unsafe_orders"
+
+    def test_workflow_exit_role_rejects_market_sell_with_stop_client_id(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        wrong_role_exit = SimpleNamespace(
+            id="exit-1",
+            side="sell",
+            type="market",
+            status="new",
+            qty="1.0",
+            filled_qty="0",
+            client_order_id="wf-spy-1-sl",
+        )
+
+        with patch(
+            "core.order_execution._sample_stable_symbol_state",
+            return_value=(position, [wrong_role_exit]),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is False
+        assert result.action == "unsafe_orders"
+
+    def test_reuses_only_full_workflow_linked_stop(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        stop = SimpleNamespace(
+            id="stop-1",
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id="wf-spy-1-sl-retry1",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch("core.order_execution.get_open_orders", return_value=[stop]),
+        ):
+            result = reconcile_symbol_after_exit_failure("SPY", workflow_id="wf-spy-1")
+
+        assert result.success is True
+        assert result.action == "reused"
+        assert result.order_id == "stop-1"
+        assert result.client_order_id == "wf-spy-1-sl-retry1"
+
+    @pytest.mark.parametrize(
+        ("order_type", "time_in_force"),
+        [("stop_limit", "gtc"), ("stop", "day"), ("stop", None)],
+    )
+    def test_rejects_noncanonical_workflow_stop_protection(
+        self,
+        order_type: str,
+        time_in_force: str | None,
+    ) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        stop_fields = {
+            "id": "stop-1",
+            "side": "sell",
+            "type": order_type,
+            "status": "new",
+            "qty": "1.0",
+            "filled_qty": "0",
+            "stop_price": "92.0",
+            "client_order_id": "wf-spy-1-sl-retry1",
+        }
+        if time_in_force is not None:
+            stop_fields["time_in_force"] = time_in_force
+        stop = SimpleNamespace(**stop_fields)
+
+        with patch(
+            "core.order_execution._sample_stable_symbol_state",
+            return_value=(position, [stop]),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is False
+        assert result.action == "unsafe_orders"
+
+    def test_missing_stop_submits_unique_linked_retry_and_proves_postcondition(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        submitted_stop = SimpleNamespace(
+            id="stop-2",
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id="wf-spy-1-sl-a1b2c3",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch(
+                "core.order_execution.get_open_orders",
+                side_effect=[[], [], [submitted_stop], [submitted_stop]],
+            ),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=_submission_ready_workflow(),
+            ),
+            patch("core.order_execution.uuid4", return_value=SimpleNamespace(hex="a1b2c3ffff")),
+            patch(
+                "core.order_execution.submit_stop_loss",
+                return_value=OrderResult(
+                    True,
+                    "stop-2",
+                    "SPY",
+                    "sell",
+                    1.0,
+                    client_order_id="wf-spy-1-sl-a1b2c3",
+                ),
+            ) as submit,
+        ):
+            result = reconcile_symbol_after_exit_failure("SPY", workflow_id="wf-spy-1")
+
+        submit.assert_called_once_with(
+            symbol="SPY",
+            qty=1.0,
+            stop_price=92.0,
+            client_order_id="wf-spy-1-sl-a1b2c3",
+        )
+        assert result.success is True
+        assert result.action == "submitted"
+        assert result.client_order_id == "wf-spy-1-sl-a1b2c3"
+
+    def test_response_lost_after_acceptance_recovers_exact_stop_before_success(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        stop_client_order_id = "wf-spy-1-sl-a1b2c3"
+        recovered_stop = SimpleNamespace(
+            id="stop-recovered",
+            symbol="SPY",
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id=stop_client_order_id,
+        )
+        client = MagicMock()
+        client.get_order_by_client_id.return_value = recovered_stop
+
+        with (
+            patch(
+                "core.order_execution._sample_stable_symbol_state",
+                side_effect=[(position, []), (position, [recovered_stop])],
+            ),
+            patch("core.order_execution.uuid4", return_value=SimpleNamespace(hex="a1b2c3ffff")),
+            patch(
+                "core.order_execution.submit_stop_loss",
+                return_value=OrderResult(
+                    success=False,
+                    order_id="",
+                    symbol="SPY",
+                    side="sell",
+                    qty=1.0,
+                    error="response lost",
+                    client_order_id=stop_client_order_id,
+                    outcome_uncertain=True,
+                ),
+            ),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=_submission_ready_workflow(),
+            ),
+            _patched_client(client),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is True
+        assert result.action == "submitted"
+        assert result.order_id == "stop-recovered"
+        assert result.client_order_id == stop_client_order_id
+        client.get_order_by_client_id.assert_called_once_with(stop_client_order_id)
+
+    def test_process_death_after_stop_acceptance_recovers_durable_exact_identity(
+        self,
+        tmp_path,
+    ) -> None:
+        from core.execution_store import get_execution_store
+        from core.execution_workflow import (
+            ExecutionWorkflow,
+            clear_workflow_registry,
+            register_workflow,
+            reset_workflow_state,
+        )
+
+        db_path = tmp_path / "stop-submission-crash.sqlite3"
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        stop_client_order_id = "wf-spy-1-sl-a1b2c3"
+        accepted_stop = SimpleNamespace(
+            id="stop-accepted-before-crash",
+            symbol="SPY",
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id=stop_client_order_id,
+        )
+        client = MagicMock()
+        client.get_order_by_client_id.return_value = accepted_stop
+
+        with patch(
+            "core.execution_store.settings.EXECUTION_STORE_DB_PATH",
+            str(db_path),
+        ):
+            reset_workflow_state()
+            workflow = ExecutionWorkflow(workflow_id="wf-spy-1", symbol="SPY")
+            workflow.mark_signal_accepted(signal_payload={"symbol": "SPY"})
+            register_workflow(workflow)
+
+            with (
+                patch(
+                    "core.order_execution._sample_stable_symbol_state",
+                    side_effect=[(position, []), (position, [accepted_stop])],
+                ),
+                patch(
+                    "core.order_execution.uuid4",
+                    return_value=SimpleNamespace(hex="a1b2c3ffff"),
+                ),
+                patch(
+                    "core.order_execution.submit_stop_loss",
+                    side_effect=SystemExit("simulated process death after broker acceptance"),
+                ) as submit,
+                _patched_client(client),
+            ):
+                with pytest.raises(SystemExit, match="simulated process death"):
+                    reconcile_symbol_after_exit_failure(
+                        "SPY",
+                        workflow_id="wf-spy-1",
+                    )
+
+                persisted = get_execution_store().load_workflow("wf-spy-1")
+                assert persisted is not None
+                latest = persisted["transitions"][-1]
+                assert latest["event"] == "protective_stop_reconciled"
+                assert latest["details"]["action"] == "submission_unknown"
+                assert latest["details"]["client_order_id"] == stop_client_order_id
+
+                clear_workflow_registry()
+                recovered = reconcile_symbol_after_exit_failure(
+                    "SPY",
+                    workflow_id="wf-spy-1",
+                )
+
+            assert recovered.success is True
+            assert recovered.action == "reused"
+            assert recovered.order_id == "stop-accepted-before-crash"
+            assert recovered.client_order_id == stop_client_order_id
+            assert submit.call_count == 1
+            client.get_order_by_client_id.assert_called_once_with(stop_client_order_id)
+            reset_workflow_state()
+
+    def test_persisted_unknown_stop_retries_same_identity_without_resubmitting(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        stop_client_order_id = "wf-spy-1-sl-a1b2c3"
+        workflow = SimpleNamespace(
+            transitions=[
+                SimpleNamespace(
+                    event="protective_stop_reconciled",
+                    details={
+                        "action": "submission_unknown",
+                        "client_order_id": stop_client_order_id,
+                    },
+                ),
+            ],
+        )
+        client = MagicMock()
+        client.get_order_by_client_id.side_effect = RuntimeError("lookup unavailable")
+
+        with (
+            patch(
+                "core.order_execution._sample_stable_symbol_state",
+                return_value=(position, []),
+            ),
+            patch("core.order_execution.get_workflow", return_value=workflow),
+            patch(
+                "core.order_execution.submit_stop_loss",
+                return_value=OrderResult(
+                    success=False,
+                    order_id="",
+                    symbol="SPY",
+                    side="sell",
+                    qty=1.0,
+                    error="must not resubmit",
+                ),
+            ) as submit,
+            _patched_client(client),
+        ):
+            first = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+            second = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert first.success is False
+        assert second.success is False
+        assert first.action == second.action == "submission_unknown"
+        assert first.client_order_id == second.client_order_id == stop_client_order_id
+        assert client.get_order_by_client_id.call_args_list == [
+            call(stop_client_order_id),
+            call(stop_client_order_id),
+        ]
+        submit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("id", ""),
+            ("client_order_id", "wf-foreign-sl-a1b2c3"),
+            ("symbol", "QQQ"),
+            ("side", "buy"),
+            ("type", "market"),
+            ("time_in_force", "day"),
+        ],
+    )
+    def test_unknown_stop_lookup_rejects_foreign_or_mismatched_order(
+        self,
+        field: str,
+        value: str,
+    ) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        stop_client_order_id = "wf-spy-1-sl-a1b2c3"
+        order_fields = {
+            "id": "stop-recovered",
+            "symbol": "SPY",
+            "side": "sell",
+            "type": "stop",
+            "status": "new",
+            "time_in_force": "gtc",
+            "qty": "1.0",
+            "filled_qty": "0",
+            "stop_price": "92.0",
+            "client_order_id": stop_client_order_id,
+        }
+        order_fields[field] = value
+        lookup_order = SimpleNamespace(**order_fields)
+        workflow = SimpleNamespace(
+            transitions=[
+                SimpleNamespace(
+                    event="protective_stop_reconciled",
+                    details={
+                        "action": "submission_unknown",
+                        "client_order_id": stop_client_order_id,
+                    },
+                ),
+            ],
+        )
+        client = MagicMock()
+        client.get_order_by_client_id.return_value = lookup_order
+
+        with (
+            patch(
+                "core.order_execution._sample_stable_symbol_state",
+                return_value=(position, []),
+            ),
+            patch("core.order_execution.get_workflow", return_value=workflow),
+            patch(
+                "core.order_execution.submit_stop_loss",
+                return_value=OrderResult(
+                    success=False,
+                    order_id="",
+                    symbol="SPY",
+                    side="sell",
+                    qty=1.0,
+                    error="must not resubmit",
+                ),
+            ) as submit,
+            patch("core.order_execution._cleanup_submitted_stop") as cleanup,
+            _patched_client(client),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is False
+        assert result.action == "submission_unknown"
+        assert result.client_order_id == stop_client_order_id
+        submit.assert_not_called()
+        cleanup.assert_not_called()
+
+    def test_failed_stop_postcondition_cancels_the_new_orphan(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        client = MagicMock()
+        submitted_stop = SimpleNamespace(
+            id="stop-2",
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id="wf-spy-1-sl-a1b2c3",
+        )
+        duplicate_stop = SimpleNamespace(
+            id="stop-raced",
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id="wf-spy-1-sl-raced1",
+        )
+
+        with (
+            patch(
+                "core.order_execution._sample_stable_symbol_state",
+                side_effect=[
+                    (position, []),
+                    (position, [submitted_stop, duplicate_stop]),
+                ],
+            ),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=_submission_ready_workflow(),
+            ),
+            patch("core.order_execution.uuid4", return_value=SimpleNamespace(hex="a1b2c3ffff")),
+            patch(
+                "core.order_execution.submit_stop_loss",
+                return_value=OrderResult(
+                    True,
+                    "stop-2",
+                    "SPY",
+                    "sell",
+                    1.0,
+                    client_order_id="wf-spy-1-sl-a1b2c3",
+                ),
+            ),
+            _patched_client(client),
+            patch("core.order_execution._cancel_order_ids_verified") as cancel_new,
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is False
+        assert result.action == "postcondition_failed"
+        client.cancel_order_by_id.assert_called_once_with("stop-2")
+        cancel_new.assert_called_once_with("SPY", {"stop-2"})
+
+    @pytest.mark.parametrize(
+        ("observed_id", "observed_client_order_id"),
+        [
+            ("stop-raced", "wf-spy-1-sl-a1b2c3"),
+            ("stop-2", "wf-spy-1-sl-raced1"),
+        ],
+    )
+    def test_postcondition_rejects_another_stop_and_targets_submitted_id_first(
+        self,
+        observed_id: str,
+        observed_client_order_id: str,
+    ) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        observed_stop = SimpleNamespace(
+            id=observed_id,
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id=observed_client_order_id,
+        )
+        client = MagicMock()
+        cleanup_events: list[str] = []
+        client.cancel_order_by_id.side_effect = (
+            lambda order_id: cleanup_events.append(f"cancel:{order_id}")
+        )
+
+        def prove_absent(_symbol: str, order_ids: set[str]) -> int:
+            cleanup_events.append(f"prove:{next(iter(order_ids))}")
+            return 1
+
+        with (
+            patch(
+                "core.order_execution._sample_stable_symbol_state",
+                side_effect=[(position, []), (position, [observed_stop])],
+            ),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=_submission_ready_workflow(),
+            ),
+            patch("core.order_execution.uuid4", return_value=SimpleNamespace(hex="a1b2c3ffff")),
+            patch(
+                "core.order_execution.submit_stop_loss",
+                return_value=OrderResult(
+                    True,
+                    "stop-2",
+                    "SPY",
+                    "sell",
+                    1.0,
+                    client_order_id="wf-spy-1-sl-a1b2c3",
+                ),
+            ),
+            _patched_client(client),
+            patch(
+                "core.order_execution._cancel_order_ids_verified",
+                side_effect=prove_absent,
+            ),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+            )
+
+        assert result.success is False
+        assert result.action == "postcondition_failed"
+        assert cleanup_events == ["cancel:stop-2", "prove:stop-2"]
+
+    def test_stop_loss_override_is_used_for_submit_and_postcondition(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+        submitted_stop = SimpleNamespace(
+            id="stop-2",
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="90.0",
+            client_order_id="wf-spy-1-sl-a1b2c3",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch(
+                "core.order_execution.get_open_orders",
+                side_effect=[[], [], [submitted_stop], [submitted_stop]],
+            ),
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=_submission_ready_workflow(),
+            ),
+            patch("core.order_execution.uuid4", return_value=SimpleNamespace(hex="a1b2c3ffff")),
+            patch(
+                "core.order_execution.submit_stop_loss",
+                return_value=OrderResult(
+                    True,
+                    "stop-2",
+                    "SPY",
+                    "sell",
+                    1.0,
+                    client_order_id="wf-spy-1-sl-a1b2c3",
+                ),
+            ) as submit,
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY",
+                workflow_id="wf-spy-1",
+                stop_loss_pct=0.10,
+            )
+
+        submit.assert_called_once_with(
+            symbol="SPY",
+            qty=1.0,
+            stop_price=90.0,
+            client_order_id="wf-spy-1-sl-a1b2c3",
+        )
+        assert result.success is True
+        assert result.stop_price == 90.0
+
+    def test_restores_workflow_linked_stop_when_position_remains(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 99.0, -0.01)
+        confirmed_stop = SimpleNamespace(
+            id="stop-2",
+            side="sell",
+            type="stop",
+            status="new",
+            time_in_force="gtc",
+            qty="1.0",
+            filled_qty="0",
+            stop_price="92.0",
+            client_order_id="wf-spy-1-sl-a1b2c3",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]) as positions,
+            patch(
+                "core.order_execution.get_open_orders",
+                side_effect=[[], [], [confirmed_stop], [confirmed_stop]],
+            ) as orders,
+            patch(
+                "core.order_execution.get_workflow",
+                return_value=_submission_ready_workflow(),
+            ),
+            patch("core.order_execution.uuid4", return_value=SimpleNamespace(hex="a1b2c3ffff")),
+            patch(
+                "core.order_execution.submit_stop_loss",
+                return_value=OrderResult(
+                    True,
+                    "stop-2",
+                    "SPY",
+                    "sell",
+                    1.0,
+                    client_order_id="wf-spy-1-sl-a1b2c3",
+                ),
+            ) as submit,
+        ):
+            result = reconcile_symbol_after_exit_failure("SPY", workflow_id="wf-spy-1")
+
+        assert result.success is True
+        assert result.action == "submitted"
+        assert positions.call_count == 4
+        assert orders.call_count == 4
+        submit.assert_called_once_with(
+            symbol="SPY",
+            qty=1.0,
+            stop_price=92.0,
+            client_order_id="wf-spy-1-sl-a1b2c3",
+        )
+
+    def test_does_not_add_stop_while_exit_order_is_pending(self) -> None:
+        position = PositionSummary("SPY", 1.0, 100.0, 99.0, -0.01)
+        pending_exit = SimpleNamespace(
+            id="exit-1",
+            side="sell",
+            type="market",
+            status="new",
+            qty="1.0",
+            filled_qty="0",
+            client_order_id="wf-spy-1-exit",
+        )
+
+        with (
+            patch("core.order_execution.get_open_positions", return_value=[position]),
+            patch("core.order_execution.get_open_orders", return_value=[pending_exit]),
+            patch("core.order_execution.submit_stop_loss") as submit,
+        ):
+            result = reconcile_symbol_after_exit_failure("SPY", workflow_id="wf-spy-1")
+
+        assert result.success is True
+        assert result.action == "pending_exit"
+        submit.assert_not_called()
 
 
 # ===========================================================================
