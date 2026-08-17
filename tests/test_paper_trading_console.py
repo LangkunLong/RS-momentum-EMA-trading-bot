@@ -80,6 +80,29 @@ def test_checklist_fails_on_hard_failure(capsys) -> None:
     assert "Do not enable paper automation yet." in output
 
 
+def test_checklist_fails_for_any_not_ok_result_even_with_default_severity(capsys) -> None:
+    """The summary must agree with a row rendered as FAIL."""
+    with (
+        patch(
+            "paper_trading_console._check_paper_mode",
+            return_value=console.CheckResult("Paper mode", False, "live mode"),
+        ),
+        patch("paper_trading_console._check_api_keys_present", return_value=console.CheckResult("API keys", True, "ok")),
+        patch("paper_trading_console._check_execution_store_path", return_value=console.CheckResult("Store", True, "ok")),
+        patch("paper_trading_console._check_execution_store_health", return_value=console.CheckResult("Store health", True, "ok")),
+        patch("paper_trading_console._check_scan_results_dir", return_value=console.CheckResult("Scan dir", True, "ok")),
+        patch("paper_trading_console._check_recent_signal_quality", return_value=console.CheckResult("Signals", True, "ok")),
+        patch("paper_trading_console._check_email_configuration", return_value=console.CheckResult("Email", True, "ok")),
+        patch("paper_trading_console._check_alpaca_connectivity", return_value=console.CheckResult("Alpaca", True, "ok")),
+    ):
+        rc = console.run_checklist(limit=5)
+
+    assert rc == 1
+    output = capsys.readouterr().out
+    assert "[FAIL] Paper mode: live mode" in output
+    assert "Do not enable paper automation yet." in output
+
+
 def test_status_reads_recent_workflows_and_latest_scan(tmp_path: Path, capsys) -> None:
     scan_dir = tmp_path / "scan_results"
     scan_dir.mkdir()
@@ -219,11 +242,11 @@ def test_main_run_now_delegates_to_auto_trader() -> None:
 
 
 def test_main_install_task_delegates_to_setup() -> None:
-    with patch("paper_trading_console.register_task") as mock_register:
+    with patch("paper_trading_console.register_task", return_value=0) as mock_register:
         rc = console.main(["install-task"])
 
     assert rc == 0
-    mock_register.assert_called_once()
+    mock_register.assert_called_once_with(dry_run=True)
 
 
 def test_main_checklist_delegates_to_checklist_runner() -> None:

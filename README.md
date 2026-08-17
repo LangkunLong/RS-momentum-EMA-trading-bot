@@ -139,7 +139,7 @@ Before the one-share paper lifecycle:
 5. Observe the buy fill, protective stop derived from the actual fill, durable transitions, restart recovery, and cleanup sell/cancel.
 6. Confirm no orphan position or order remains in Alpaca and no active-position record remains locally.
 
-Windows scheduled-task installation has a separate approval gate. Inspect the interpreter, repository path, arguments, trigger, working directory, user identity, and log destination before running `paper_trading_console.py install-task` or `setup_windows_task.py`.
+Windows scheduled-task installation has a separate approval gate. Inspect the interpreter, repository path, arguments, trigger, working directory, user identity, and log destination before running `paper_trading_console.py install-task` or `setup_windows_task.py`. The default installed task includes `--dry-run`; enabling paper order submission requires the separate `--enable-orders` flag and a second explicit approval after the dry-run task is observed.
 
 ## Recovery and troubleshooting
 

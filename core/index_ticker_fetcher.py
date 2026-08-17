@@ -17,10 +17,12 @@ import requests
 import re
 from bs4 import BeautifulSoup
 
+from config import settings
+
 # Cache configuration
-CACHE_DIR = Path("ticker_cache")
+CACHE_DIR = Path(settings.TICKER_CACHE_DIR)
 CACHE_FILE = CACHE_DIR / "index_tickers_cache.json"
-CACHE_EXPIRY_HOURS = 24  # Cache expires after 24 hours
+CACHE_EXPIRY_HOURS = settings.TICKER_CACHE_EXPIRY_HOURS
 
 # Candidate column names for ticker identification
 _TICKER_COLUMN_CANDIDATES = ["Ticker", "ticker", "Symbol", "symbol", "Constituent Symbol"]

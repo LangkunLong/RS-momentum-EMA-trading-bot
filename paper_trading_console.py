@@ -99,7 +99,7 @@ def run_checklist(limit: int = 10) -> int:
     for check in checks:
         marker = _format_check_marker(check)
         print(f"[{marker}] {check.name}: {check.detail}")
-        if check.severity == "fail":
+        if not check.ok or check.severity == "fail":
             failures += 1
         elif check.severity == "warn":
             warnings += 1
@@ -498,7 +498,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_now_parser = subparsers.add_parser("run-now", help="Run the bot immediately")
     run_now_parser.add_argument("--dry-run", action="store_true", help="Observe signals without submitting paper orders")
 
-    subparsers.add_parser("install-task", help="Register the Windows scheduler task")
+    install_parser = subparsers.add_parser(
+        "install-task",
+        help="Register the Windows scheduler task (dry-run by default)",
+    )
+    install_parser.add_argument(
+        "--enable-orders",
+        action="store_true",
+        help="Register the order-enabled paper scheduler after validation and approval",
+    )
     subparsers.add_parser("task-status", help="Show Windows task scheduler status")
 
     return parser
@@ -517,11 +525,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.command == "run-now":
         return run_now(dry_run=args.dry_run)
     if args.command == "install-task":
-        register_task()
-        return 0
+        return register_task(dry_run=not args.enable_orders)
     if args.command == "task-status":
-        show_status()
-        return 0
+        return show_status()
 
     parser.error(f"Unsupported command: {args.command}")
     return 2

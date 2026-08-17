@@ -6,6 +6,7 @@ Parameters follow William O'Neil's CANSLIM methodology from
 """
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -35,7 +36,8 @@ NOTIFY_EMAIL_PASSWORD = os.environ.get("NOTIFY_EMAIL_PASSWORD", "")
 # SCANNER SETTINGS
 # ==============================================================================
 
-ARTIFACTS_DIR = ".artifacts"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ARTIFACTS_DIR = str(_PROJECT_ROOT / ".artifacts")
 CACHE_DIR = os.path.join(ARTIFACTS_DIR, "cache")
 PYTEST_ARTIFACTS_DIR = os.path.join(ARTIFACTS_DIR, "pytest")
 SCAN_RESULTS_DIR = os.path.join(ARTIFACTS_DIR, "scan_results")
@@ -56,7 +58,7 @@ MIN_RS_SCORE = 80
 MIN_CANSLIM_SCORE = 70  # Minimum composite CANSLIM score for actionable entries
 INDUSTRY_GROUP_TOP_N: int = 20  # number of top industry groups allowed for entries
 INDUSTRY_GROUP_MIN_SIZE: int = 3  # min stocks in a group to include it in ranking
-INDUSTRY_GROUP_CACHE_PATH: str = ".artifacts/cache/industry_group_cache.json"
+INDUSTRY_GROUP_CACHE_PATH: str = os.path.join(CACHE_DIR, "industry_group_cache.json")
 
 # ==============================================================================
 # PIVOT DETECTION PARAMETERS (O'Neil cup-with-handle & flat base patterns)
@@ -86,6 +88,8 @@ EXECUTION_STORE_DB_PATH = os.environ.get(
     "EXECUTION_STORE_DB_PATH",
     os.path.join(os.environ.get("TEMP", "."), "trading_bot", "execution_store.sqlite3"),
 )  # Durable SQLite execution store
+if not os.path.isabs(EXECUTION_STORE_DB_PATH):
+    EXECUTION_STORE_DB_PATH = str(_PROJECT_ROOT / EXECUTION_STORE_DB_PATH)
 
 # Performance settings
 MAX_WORKERS = 3  # Maximum threads for parallel processing
