@@ -32,7 +32,6 @@ Tests verify:
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Dict
 from unittest.mock import patch
 
@@ -50,6 +49,13 @@ from backtest_pnl import (
 # Synthetic price data helpers
 # ---------------------------------------------------------------------------
 
+_FIXTURE_END = pd.Timestamp("2026-07-31")
+
+
+def _business_dates(periods: int) -> pd.DatetimeIndex:
+    """Return an exact, wall-clock-independent number of business dates."""
+    return pd.bdate_range(end=_FIXTURE_END, periods=periods)
+
 
 def _make_ohlcv(
     n: int = 60,
@@ -65,7 +71,7 @@ def _make_ohlcv(
         trend: Daily drift applied to close (e.g. 0.001 = +0.1%/day).
         low_override: Map of {bar_index: low_price} to force specific lows.
     """
-    dates = pd.date_range(end=datetime.now().date(), periods=n, freq="B")
+    dates = _business_dates(n)
     closes = [start_price * (1 + trend) ** i for i in range(n)]
     lows = [c * 0.99 for c in closes]
     highs = [c * 1.01 for c in closes]
@@ -87,7 +93,7 @@ def _make_ohlcv(
 
 def _make_declining_ohlcv(n: int = 60, start_price: float = 100.0) -> pd.DataFrame:
     """OHLCV where close drops steadily so last 2 bars are well below 21-EMA."""
-    dates = pd.date_range(end=datetime.now().date(), periods=n, freq="B")
+    dates = _business_dates(n)
     # First 50 bars: flat at start_price so EMA anchors there
     closes = [start_price] * (n - 10) + [start_price * 0.85] * 10
     lows = [c * 0.99 for c in closes]
@@ -421,7 +427,7 @@ class TestMAViolationExit:
         # Build: first 50 bars flat at 100 (EMA anchors near 100), last 10 close at 95.
         # EMA will still be near 100 → 95 < EMA → MA violation fires. Stop=93 not hit.
         n = 60
-        dates = pd.date_range(end=datetime.now().date(), periods=n, freq="B")
+        dates = _business_dates(n)
         closes = [100.0] * 50 + [95.0] * 10
         lows = [c * 0.99 for c in closes]  # min low = 95*0.99 = 94.05 > stop=93
         highs = [c * 1.01 for c in closes]
@@ -524,7 +530,7 @@ class TestPortfolioSimulatorRun:
 
     def _make_full_signal_ticker_ohlcv(self, symbol: str, n: int = 150) -> Dict[str, pd.DataFrame]:
         """Return ticker_ohlcv dict with SPY + one ticker that rises +20% over n bars."""
-        dates = pd.date_range(end=datetime.now().date(), periods=n, freq="B")
+        dates = _business_dates(n)
         closes = [100.0 * (1.001 ** i) for i in range(n)]
         lows = [c * 0.99 for c in closes]
         highs = [c * 1.01 for c in closes]
@@ -564,7 +570,11 @@ class TestPortfolioSimulatorRun:
             patch("backtest_pnl.clear_session_cache"),
         ):
             # lookback_weeks=8 → 40 business days, well within 150 bars
-            result = sim.run(tickers=["NVDA"], lookback_weeks=8)
+            result = sim.run(
+                tickers=["NVDA"],
+                lookback_weeks=8,
+                end_date=str(_FIXTURE_END.date()),
+            )
 
         assert isinstance(result, SimulationResult)
         assert not result.equity_curve.empty
@@ -598,7 +608,11 @@ class TestPortfolioSimulatorRun:
             patch("backtest_pnl.clear_session_cache"),
             patch("core.backtest_engine.load_industry_map", return_value={}),
         ):
-            result = sim.run(tickers=["NVDA"], lookback_weeks=8)
+            result = sim.run(
+                tickers=["NVDA"],
+                lookback_weeks=8,
+                end_date=str(_FIXTURE_END.date()),
+            )
 
         # At least one trade should have been recorded
         assert len(result.trades) >= 1
@@ -612,7 +626,7 @@ class TestPortfolioSimulatorRun:
         # then 10 bars at 105 (signal fires in lookback, position opens),
         # then 30 bars crash to 80 (below stop of 105*0.93≈97.65 → stop triggers).
         n = 150
-        dates = pd.date_range(end=datetime.now().date(), periods=n, freq="B")
+        dates = _business_dates(n)
         closes = [100.0] * 110 + [105.0] * 10 + [80.0] * 30
         lows = [c * 0.99 for c in closes[:120]] + [c * 0.98 for c in closes[120:]]
         highs = [c * 1.01 for c in closes]
@@ -660,8 +674,15 @@ class TestPortfolioSimulatorRun:
             patch("core.backtest_engine.load_industry_map", return_value={}),
         ):
             # 8 weeks = 40 business days, covers the last 40 bars (crash included)
-            result = sim.run(tickers=["NVDA"], lookback_weeks=8)
+            result = sim.run(
+                tickers=["NVDA"],
+                lookback_weeks=8,
+                end_date=str(_FIXTURE_END.date()),
+            )
 
         stop_exits = [t for t in result.trades if t.exit_reason == "stop_loss"]
         # The crash should have triggered at least one stop-loss exit
-        assert len(stop_exits) >= 1
+        assert len(stop_exits) >= 1, [
+            (trade.entry_date, trade.entry_price, trade.exit_date, trade.exit_price, trade.exit_reason)
+            for trade in result.trades
+        ]

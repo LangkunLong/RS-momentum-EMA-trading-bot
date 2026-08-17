@@ -620,8 +620,6 @@ class TestMonitorAndExitPositions:
 
     def _healthy_ohlcv(self, n: int = 60, above_ema: bool = True) -> pd.DataFrame:
         """Return a synthetic OHLCV DataFrame where price is above/below 21-day EMA."""
-        import numpy as np
-
         prices = [100.0] * n
         if not above_ema:
             # Last 2 bars drop well below an EMA anchored around 100

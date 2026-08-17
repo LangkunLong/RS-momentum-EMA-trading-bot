@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from core import notifier
 from core.notifier import (
     notify_buy_filled,
     notify_cycle_summary,

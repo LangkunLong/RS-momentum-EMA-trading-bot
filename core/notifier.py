@@ -95,6 +95,7 @@ def notify_buy_filled(
     position_value = qty * fill_price
     mode = "Paper Trading" if paper else "LIVE Trading"
     now_str = datetime.now(tz=_ET).strftime("%Y-%m-%d %H:%M ET")
+    workflow_line = f"Workflow ID: {workflow_id}\n" if workflow_id else ""
 
     subject = f"[CANSLIM] BUY FILLED: {symbol}"
     body = (
@@ -105,7 +106,7 @@ def notify_buy_filled(
         f"Fill price:  ${fill_price:,.2f}\n"
         f"Stop-loss:   ${stop_price:,.2f} ({stop_loss_pct * 100:.1f}% below fill)\n"
         f"Position:    ~${position_value:,.0f}\n"
-        f"{f'Workflow ID: {workflow_id}\\n' if workflow_id else ''}"
+        f"{workflow_line}"
         f"Mode:        {mode}\n"
         f"Time:        {now_str}\n"
     )
@@ -131,6 +132,7 @@ def notify_entry_submitted(
 
     mode = "Paper Trading" if paper else "LIVE Trading"
     now_str = datetime.now(tz=_ET).strftime("%Y-%m-%d %H:%M ET")
+    workflow_line = f"Workflow ID:   {workflow_id}\n" if workflow_id else ""
 
     subject = f"[CANSLIM] BUY SUBMITTED: {symbol}"
     body = (
@@ -144,7 +146,7 @@ def notify_entry_submitted(
         f"Planned risk:  ~${risk_amount:,.2f}\n"
         f"Price source:  {price_source}\n"
         f"Order ID:      {order_id}\n"
-        f"{f'Workflow ID:   {workflow_id}\\n' if workflow_id else ''}"
+        f"{workflow_line}"
         f"Mode:          {mode}\n"
         f"Time:          {now_str}\n"
         f"Note: final protective stop is reconciled from the actual fill price.\n"
@@ -179,6 +181,7 @@ def notify_sell_filled(
     sign = "+" if pnl >= 0 else ""
     mode = "Paper Trading" if paper else "LIVE Trading"
     now_str = datetime.now(tz=_ET).strftime("%Y-%m-%d %H:%M ET")
+    workflow_line = f"Workflow ID: {workflow_id}\n" if workflow_id else ""
 
     subject = f"[CANSLIM] SELL FILLED: {symbol}"
     body = (
@@ -190,7 +193,7 @@ def notify_sell_filled(
         f"Entry price: ${entry_price:,.2f}\n"
         f"P&L:         {sign}${pnl:,.2f} ({sign}{pnl_pct * 100:.2f}%)\n"
         f"Exit reason: {exit_reason}\n"
-        f"{f'Workflow ID: {workflow_id}\\n' if workflow_id else ''}"
+        f"{workflow_line}"
         f"Mode:        {mode}\n"
         f"Time:        {now_str}\n"
     )

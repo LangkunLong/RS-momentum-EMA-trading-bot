@@ -14,11 +14,10 @@ Paths verified:
 
 from __future__ import annotations
 
-import asyncio
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pandas as pd

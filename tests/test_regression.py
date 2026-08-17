@@ -6,8 +6,7 @@ self-documenting in CI output.
 
 from __future__ import annotations
 
-import importlib
-from datetime import datetime, time as dtime
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo

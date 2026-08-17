@@ -5,7 +5,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -115,7 +114,7 @@ class TestFetchHourlyOhlcv:
 
         cached = _make_hourly_bars(30)
 
-        with patch("core.data_client._cache_get", return_value=cached) as mock_cache, \
+        with patch("core.data_client._cache_get", return_value=cached), \
              patch("core.data_client._get_alpaca_client") as mock_api:
             result = fetch_hourly_ohlcv("SPY", days=10)
 

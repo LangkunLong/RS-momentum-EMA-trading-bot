@@ -68,7 +68,7 @@ BENCHMARK = "SPY"
 
 
 @dataclass
-class Trade:
+class _LegacyTrade:
     """Record of a single completed (or open) position."""
 
     symbol: str
@@ -104,7 +104,7 @@ class Trade:
 
 
 @dataclass
-class SimulationResult:
+class _LegacySimulationResult:
     """Full results from a PnL simulation run."""
 
     trades: List[Trade] = field(default_factory=list)
