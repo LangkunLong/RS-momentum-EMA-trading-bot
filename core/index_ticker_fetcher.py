@@ -40,10 +40,77 @@ _MAX_TICKERS_PER_INDEX: dict[str, int] = {
     "russell2000": 2100,  # Russell 2000 has ~2000 members
 }
 
+_MIN_TICKERS_PER_INDEX: dict[str, int] = {
+    "sp500": 450,
+    "nasdaq100": 90,
+    "russell2000": 1500,
+}
+
 # Wikipedia URL for Nasdaq 100 constituents — used as fallback when the iShares
 # URL returns an unexpectedly large set (iShares product 239696 appears to track
 # a broader universe than strictly the Nasdaq-100 index).
-_WIKIPEDIA_NASDAQ100_URL = "https://en.wikipedia.org/wiki/Nasdaq-100"
+_WIKIPEDIA_NASDAQ100_URL = "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies"
+_WIKIPEDIA_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+
+def _parse_wikipedia_tickers(response_text: str) -> List[str]:
+    """Extract and normalize ticker symbols from a Wikipedia index table."""
+    soup = BeautifulSoup(response_text, "html.parser")
+    for table in soup.find_all("table", {"class": "wikitable"}):
+        header_row = table.find("tr")
+        if not header_row:
+            continue
+        headers = [th.get_text(strip=True).lower() for th in header_row.find_all(["th", "td"])]
+        ticker_col_idx = next(
+            (idx for idx, header in enumerate(headers) if header in ("ticker", "symbol")),
+            None,
+        )
+        if ticker_col_idx is None:
+            continue
+
+        tickers: List[str] = []
+        for row in table.find_all("tr")[1:]:
+            cells = row.find_all(["td", "th"])
+            if len(cells) <= ticker_col_idx:
+                continue
+            ticker = cells[ticker_col_idx].get_text(strip=True).upper().replace(".", "-")
+            if 1 <= len(ticker) <= 8 and ticker.replace("-", "").isalpha():
+                tickers.append(ticker)
+        if tickers:
+            return list(dict.fromkeys(tickers))
+    return []
+
+
+def _fetch_index_from_wikipedia(index_key: str, display_name: str) -> List[str]:
+    """Fetch a validated index universe from its Wikipedia component table."""
+    urls = {
+        "sp500": _WIKIPEDIA_SP500_URL,
+        "nasdaq100": _WIKIPEDIA_NASDAQ100_URL,
+    }
+    url = urls.get(index_key)
+    if not url:
+        return []
+
+    try:
+        response = requests.get(
+            url,
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
+        )
+        response.raise_for_status()
+        tickers = _parse_wikipedia_tickers(response.text)
+        minimum = _MIN_TICKERS_PER_INDEX[index_key]
+        maximum = _MAX_TICKERS_PER_INDEX[index_key]
+        if minimum <= len(tickers) <= maximum:
+            print(f"Fetched {len(tickers)} {display_name} tickers from Wikipedia")
+            return tickers
+        print(
+            f"Wikipedia {display_name} fallback returned {len(tickers)} tickers; "
+            f"expected {minimum}-{maximum}."
+        )
+    except Exception as exc:
+        print(f"Wikipedia {display_name} fallback failed: {exc}")
+    return []
 
 
 def _find_ticker_column(df: pd.DataFrame) -> Optional[str]:
@@ -75,46 +142,7 @@ def _fetch_nasdaq100_from_wikipedia() -> List[str]:
     Returns:
         List of Nasdaq 100 ticker symbols, or empty list on failure.
     """
-    try:
-        resp = requests.get(
-            _WIKIPEDIA_NASDAQ100_URL,
-            timeout=30,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
-        )
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        tickers: List[str] = []
-        for table in soup.find_all("table", {"class": "wikitable"}):
-            # Find the header row to locate the ticker column
-            header_row = table.find("tr")
-            if not header_row:
-                continue
-            headers = [th.get_text(strip=True).lower() for th in header_row.find_all(["th", "td"])]
-            ticker_col_idx = None
-            for idx, h in enumerate(headers):
-                if h in ("ticker", "symbol"):
-                    ticker_col_idx = idx
-                    break
-            if ticker_col_idx is None:
-                continue
-
-            # Extract tickers from data rows
-            for row in table.find_all("tr")[1:]:
-                cells = row.find_all(["td", "th"])
-                if len(cells) <= ticker_col_idx:
-                    continue
-                t = cells[ticker_col_idx].get_text(strip=True).upper()
-                if 1 <= len(t) <= 5 and t.isalpha():
-                    tickers.append(t)
-
-            if len(tickers) >= 90:  # Nasdaq 100 should have ~101
-                print(f"Fetched {len(tickers)} Nasdaq 100 tickers from Wikipedia")
-                return tickers
-
-    except Exception as e:
-        print(f"Wikipedia Nasdaq 100 fallback failed: {e}")
-    return []
+    return _fetch_index_from_wikipedia("nasdaq100", "Nasdaq 100")
 
 
 def _parse_ishares_csv(response_text: str, index_name: str) -> List[str]:
@@ -279,6 +307,13 @@ class IndexTickerFetcher:
 
             if response.status_code == 200:
                 tickers = _parse_ishares_csv(response.text, display_name)
+                minimum = _MIN_TICKERS_PER_INDEX.get(index_key)
+                if minimum and len(tickers) < minimum:
+                    print(
+                        f"[WARN] {display_name}: iShares returned only {len(tickers)} tickers "
+                        f"(expected >={minimum}). Attempting alternative source."
+                    )
+                    return self._fetch_index_tickers_fallback(index_key, display_name) or tickers
                 # Sanity-check: if iShares returns far more tickers than the index
                 # has members, the product URL may have drifted to a broader fund.
                 max_expected = _MAX_TICKERS_PER_INDEX.get(index_key)
@@ -292,22 +327,23 @@ class IndexTickerFetcher:
                 return tickers
             else:
                 print(
-                    f"Error: iShares returned status {response.status_code} for {display_name}. Using fallback tickers."
+                    f"Error: iShares returned status {response.status_code} for {display_name}. "
+                    "Attempting alternative source."
                 )
-                return list(_FALLBACK_TICKERS)
+                return self._fetch_index_tickers_fallback(index_key, display_name) or list(_FALLBACK_TICKERS)
 
         except Exception as e:
-            print(f"Error fetching {display_name} from iShares: {e}. Using fallback tickers.")
-            return list(_FALLBACK_TICKERS)
+            print(f"Error fetching {display_name} from iShares: {e}. Attempting alternative source.")
+            return self._fetch_index_tickers_fallback(index_key, display_name) or list(_FALLBACK_TICKERS)
 
     def _fetch_index_tickers_fallback(self, index_key: str, display_name: str) -> List[str]:
         """Attempt an alternative data source when the iShares URL misbehaves.
 
-        Currently only implemented for the Nasdaq 100 (Wikipedia).
+        Implemented for the S&P 500 and Nasdaq 100 (Wikipedia).
         Returns an empty list when no fallback is available.
         """
-        if index_key == "nasdaq100":
-            return _fetch_nasdaq100_from_wikipedia()
+        if index_key in {"sp500", "nasdaq100"}:
+            return _fetch_index_from_wikipedia(index_key, display_name)
         return []
 
     def fetch_sp500_tickers(self) -> List[str]:
@@ -373,14 +409,21 @@ class IndexTickerFetcher:
                 requested_indices = indices or ["sp500", "nasdaq100", "russell2000"]
 
                 if set(requested_indices).issubset(set(cached_indices)):
-                    print(f"Using cached tickers from {cache_data.get('timestamp', 'unknown')}")
-                    all_tickers: List[str] = []
-                    for idx in requested_indices:
-                        all_tickers.extend(cache_data["tickers"].get(idx, []))
+                    cache_is_complete = all(
+                        len(cache_data["tickers"].get(idx, []))
+                        >= _MIN_TICKERS_PER_INDEX.get(idx, 1)
+                        for idx in requested_indices
+                    )
+                    if cache_is_complete:
+                        print(f"Using cached tickers from {cache_data.get('timestamp', 'unknown')}")
+                        all_tickers: List[str] = []
+                        for idx in requested_indices:
+                            all_tickers.extend(cache_data["tickers"].get(idx, []))
 
-                    if deduplicate:
-                        return list(dict.fromkeys(all_tickers))
-                    return all_tickers
+                        if deduplicate:
+                            return list(dict.fromkeys(all_tickers))
+                        return all_tickers
+                    print("[WARN] Cached ticker universe is incomplete; refreshing it.")
 
         # Fetch fresh data
         print("Fetching fresh ticker data from indices...")
