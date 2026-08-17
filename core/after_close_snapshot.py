@@ -171,14 +171,14 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
     volume = _float_series(history, "Volume")
     latest_close = float(close.iloc[-1])
     prior_close = float(close.iloc[-2])
-    pivot = float(close.iloc[-253:-1].max()) if len(close) >= 253 else float(close.iloc[:-1].max())
-    high_52week = float(high.tail(252).max())
+    prior_252_close_max = float(close.iloc[-253:-1].max()) if len(close) >= 253 else float(close.iloc[:-1].max())
+    pivot = prior_252_close_max
     average_volume = float(volume.iloc[-51:-1].mean())
     price_up = latest_close > prior_close
     has_volume_surge, volume_ratio = _detect_volume_surge(
         float(volume.iloc[-1]), average_volume, settings.S_VOLUME_SURGE_THRESHOLD, price_up=price_up
     )
-    near_high, proximity = _detect_breakout(latest_close, high_52week, settings.S_BREAKOUT_PROXIMITY)
+    near_high, proximity = _detect_breakout(latest_close, prior_252_close_max, settings.S_BREAKOUT_PROXIMITY)
     extension = (latest_close / pivot) - 1 if pivot > 0 else None
 
     row.update(
@@ -206,7 +206,7 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
         gaps.append((pivot - latest_close) / pivot if pivot > 0 else 1.0)
     elif latest_close > pivot * (1 + settings.BUY_ZONE_EXTENSION_PCT):
         _add_blocker(row, "beyond_buy_zone")
-        gaps.append((latest_close - pivot * (1 + settings.BUY_ZONE_EXTENSION_PCT)) / (pivot * (1 + settings.BUY_ZONE_EXTENSION_PCT)))
+        gaps.append((extension - settings.BUY_ZONE_EXTENSION_PCT) / settings.BUY_ZONE_EXTENSION_PCT)
     row["normalized_trigger_gap"] = sum(gaps) if gaps else 0.0
     return row
 

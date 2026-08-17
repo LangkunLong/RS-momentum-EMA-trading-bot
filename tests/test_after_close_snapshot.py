@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from core.after_close_snapshot import build_after_close_snapshot, write_after_close_snapshot
 from core.canslim import MarketTrend
@@ -120,6 +121,33 @@ def test_snapshot_catches_beyond_buy_zone_break() -> None:
     )
 
     assert _rows(snapshot)["EXTENDED"]["blocking_reasons"] == "beyond_buy_zone"
+
+
+def test_snapshot_uses_prior_close_max_when_latest_high_is_intraday_spike() -> None:
+    """A regression that lets the latest intraday high lower breakout proximity must fail here."""
+    spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
+    leader = _history()
+    leader.loc[leader.index[-1], "High"] = 120.0
+
+    snapshot = build_after_close_snapshot({"SPY": spy, "LEAD": leader}, market=_market(), expected_symbols=["LEAD"])
+    row = _rows(snapshot)["LEAD"]
+
+    assert row["pivot"] == 100.0
+    assert row["proximity_to_52week_high"] == 1.02
+    assert row["technical_eligible"] is True
+
+
+def test_snapshot_normalizes_extended_gap_by_buy_zone_extension_threshold() -> None:
+    """A regression that divides extension excess by price instead of the 5% threshold must fail here."""
+    spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
+    leader = _history()
+    extended = _history(anchors=(5.0, 35.0, 60.0, 85.0), latest_close=106.0)
+
+    snapshot = build_after_close_snapshot(
+        {"SPY": spy, "LEAD": leader, "EXTENDED": extended}, market=_market(), expected_symbols=["EXTENDED"]
+    )
+
+    assert _rows(snapshot)["EXTENDED"]["normalized_trigger_gap"] == pytest.approx(0.2)
 
 
 def test_snapshot_catches_under_thirty_bar_history_break() -> None:
