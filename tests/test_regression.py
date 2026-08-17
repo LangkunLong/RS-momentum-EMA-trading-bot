@@ -439,22 +439,26 @@ class TestAutoTraderCycleResult:
 class TestBug6CycleSummaryEmail:
     """_run_cycle must call notify_cycle_summary after run_auto_trader completes."""
 
-    def test_run_cycle_calls_notify_cycle_summary(self):
+    def test_run_cycle_reports_actual_cycle_outcomes(self):
+        from auto_trader import AutoTraderCycleResult
         from scheduler import _run_cycle
 
-        with patch("scheduler.run_auto_trader") as mock_trader, \
-             patch("scheduler.notify_cycle_summary") as mock_notify, \
+        result = AutoTraderCycleResult(entered=("NVDA",), exited=("AAPL",))
+        with patch("scheduler.run_auto_trader", return_value=result), \
+             patch("core.notifier.send_email", return_value=True) as send_email, \
              patch("scheduler._is_paper_mode", return_value=True):
             _run_cycle(dry_run=True)
 
-        mock_trader.assert_called_once_with(dry_run=True)
-        mock_notify.assert_called_once()
+        body = send_email.call_args.args[1]
+        assert "Entries submitted: NVDA" in body
+        assert "Exits submitted:   AAPL" in body
 
     def test_run_cycle_does_not_crash_if_notify_fails(self):
         """notify_cycle_summary failure must be swallowed — trading must not be blocked."""
+        from auto_trader import AutoTraderCycleResult
         from scheduler import _run_cycle
 
-        with patch("scheduler.run_auto_trader"), \
+        with patch("scheduler.run_auto_trader", return_value=AutoTraderCycleResult()), \
              patch("scheduler.notify_cycle_summary", side_effect=RuntimeError("SMTP down")), \
              patch("scheduler._is_paper_mode", return_value=True):
             # Must not raise

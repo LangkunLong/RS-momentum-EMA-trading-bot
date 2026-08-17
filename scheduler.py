@@ -275,19 +275,23 @@ def _run_cycle(dry_run: bool) -> None:
     """Run the full auto-trader cycle and send a cycle summary email.
 
     Wraps run_auto_trader() and fires notify_cycle_summary() so the user
-    gets a daily email summary of what was entered/exited.  Because
-    run_auto_trader() prints entries/exits to stdout rather than returning
-    them, we capture the scan results separately for the notification.
+    gets a daily email summary of what was entered/exited.  The auto-trader
+    returns the exact symbols acted on so reporting stays consistent with the
+    execution cycle.
     """
     # run_auto_trader handles its own market-clock guard and prints everything.
     # The cycle summary email is best-effort — notification failure must not
     # prevent the trading cycle from completing.
-    run_auto_trader(dry_run=dry_run)
+    result = run_auto_trader(dry_run=dry_run)
 
     # Send a lightweight "cycle ran" notification.  Full per-fill notifications
     # come from FillMonitor when orders are actually filled by Alpaca.
     try:
-        notify_cycle_summary(entered=[], exited=[], paper=_is_paper_mode())
+        notify_cycle_summary(
+            entered=result.entered,
+            exited=result.exited,
+            paper=_is_paper_mode(),
+        )
     except Exception:  # noqa: BLE001
         pass  # notification failure is non-fatal
 

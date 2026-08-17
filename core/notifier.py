@@ -14,6 +14,7 @@ so the rest of the trading workflow is never blocked by a misconfigured mailer.
 from __future__ import annotations
 
 import smtplib
+from collections.abc import Sequence
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -201,8 +202,8 @@ def notify_sell_filled(
 
 
 def notify_cycle_summary(
-    entered: list[str],
-    exited: list[str],
+    entered: Sequence[str],
+    exited: Sequence[str],
     paper: bool = True,
 ) -> bool:
     """Send a daily trading cycle summary.
