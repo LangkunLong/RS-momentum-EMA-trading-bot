@@ -33,6 +33,7 @@ from core.fmp_provider import fetch_institutional_ownership_history, company_inf
 @pytest.fixture(autouse=True)
 def reset_fmp_session_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Reset FMP state and keep request accounting isolated from real usage."""
+    monkeypatch.setattr(_dc_module.settings, "FMP_API_KEY", "test-key", raising=False)
     monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "paid", raising=False)
     monkeypatch.setattr(_dc_module.settings, "FMP_DAILY_REQUEST_BUDGET", 198, raising=False)
     monkeypatch.setattr(_dc_module.settings, "FMP_FUND_CACHE_TTL_HOURS", 72, raising=False)
