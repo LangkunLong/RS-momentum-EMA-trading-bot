@@ -26,12 +26,32 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 from config import settings
-from core.fmp_provider import (
-    company_info_from_inst_history as _company_info_from_inst_history,
-    fetch_company_profile as _fetch_company_profile,
-    fetch_institutional_ownership_history as _fetch_inst_ownership_history,
-)
 
+
+def _fetch_company_profile(symbol: str, fmp_get_fn):
+    """Lazily load the optional FMP profile provider."""
+    from core.fmp_provider import fetch_company_profile
+
+    return fetch_company_profile(symbol, fmp_get_fn)
+
+
+def _fetch_inst_ownership_history(symbol: str, *, fmp_get_fn, limit: int, as_of_date=None):
+    """Lazily load the optional FMP institutional-history provider."""
+    from core.fmp_provider import fetch_institutional_ownership_history
+
+    return fetch_institutional_ownership_history(
+        symbol,
+        fmp_get_fn=fmp_get_fn,
+        limit=limit,
+        as_of_date=as_of_date,
+    )
+
+
+def _company_info_from_inst_history(history, shares_outstanding=None):
+    """Lazily load the optional FMP institutional-history normalizer."""
+    from core.fmp_provider import company_info_from_inst_history
+
+    return company_info_from_inst_history(history, shares_outstanding=shares_outstanding)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Session Cache (in-memory, per-run)
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import subprocess
 import sys
 from datetime import date
 from types import SimpleNamespace
@@ -111,3 +112,43 @@ def test_importing_command_does_not_import_fmp_or_broker_modules() -> None:
 
     assert module is not None
     assert after == before
+
+
+def test_price_and_market_import_path_keeps_fmp_provider_unloaded() -> None:
+    """The actual price-only preparation path must not import FMP provider helpers."""
+    code = """
+import sys
+import pandas as pd
+import prepare_after_close as command
+import core.data_client as data_client
+dates = pd.date_range(end='2026-08-17', periods=260, freq='B')
+closes = [100.0] * 258 + [100.0, 102.0]
+history = pd.DataFrame({'Open': closes, 'High': closes, 'Low': closes, 'Close': closes, 'Volume': [1000.0] * 259 + [1300.0]}, index=dates)
+data_client.fetch_bulk_ohlcv = lambda *_args, **_kwargs: {'SPY': history, 'LEAD': history}
+prices = command.fetch_bulk_ohlcv(['SPY', 'LEAD'], period=command.settings.RS_CALCULATION_PERIOD, chunk_size=100)
+command.evaluate_m(price_data=prices['SPY'])
+assert 'core.fmp_provider' not in sys.modules
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_configured_universe_appends_and_deduplicates_extra_symbols(monkeypatch) -> None:
+    """Configured runs include extras once, while preserving configured ticker order."""
+    import prepare_after_close as command
+    import quality_stocks
+
+    monkeypatch.setattr(quality_stocks, "get_index_tickers", lambda _sectors: ["AAPL", "MSFT", "AAPL"])
+    monkeypatch.setattr(command.settings, "EXTRA_SYMBOLS", ["MSFT", "RNG", "rng"])
+
+    assert command._resolve_symbols(sectors="large_cap", custom_symbols=None) == ["AAPL", "MSFT", "RNG"]
+
+
+def test_custom_symbols_do_not_append_configured_extras(monkeypatch) -> None:
+    """Explicit preparation must remain scoped to the symbols the operator supplied."""
+    import prepare_after_close as command
+
+    monkeypatch.setattr(command.settings, "EXTRA_SYMBOLS", ["RNG"])
+
+    assert command._resolve_symbols(sectors=None, custom_symbols=["AAPL", "aapl", "MSFT"]) == ["AAPL", "MSFT"]
