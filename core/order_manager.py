@@ -2311,6 +2311,11 @@ class OrderManager:
             protection,
             action=f"{action}_{protection.action}",
         )
+        # Canceling the protective stop is expected while an exact full-size
+        # workflow exit is already working.  That state is safe to monitor to
+        # completion and must not poison FillMonitor health.
+        if protection.action == "pending_exit":
+            return protection
         if not protection.success:
             raise RuntimeError(
                 f"Safety remains unproven for {normalized_symbol}: "
