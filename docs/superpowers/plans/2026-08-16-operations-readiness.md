@@ -33,11 +33,11 @@
 - Consumes: environment-backed settings, dry-run CLI, execution SQLite path, scheduler CLI, and active risk defaults.
 - Produces: one operator-facing setup and recovery runbook.
 
-- [ ] **Step 1: Correct stale risk prose in production modules**
+- [x] **Step 1: Correct stale risk prose in production modules**
 
 Change active-default descriptions from 7%/10% to the actual settings contract: 8% hard stop and 12.5% maximum position weight derived from 1% portfolio risk. Preserve examples that explicitly pass a non-default value.
 
-- [ ] **Step 2: Replace the placeholder README with an operational guide**
+- [x] **Step 2: Replace the placeholder README with an operational guide**
 
 Document:
 
@@ -50,11 +50,11 @@ Document:
 - generated artifact locations and `.gitignore` behavior;
 - credential rotation and public-history cleanup requirements.
 
-- [ ] **Step 3: Verify every documented command locally where it is non-mutating**
+- [x] **Step 3: Verify every documented command locally where it is non-mutating**
 
 Run CLI `--help` for `enhanced_scanner.py`, `backtest_pnl.py`, `auto_trader.py`, `paper_trading_console.py`, and `scheduler.py`. Run the documented lint and test commands. Do not run commands that submit an order or install a task.
 
-- [ ] **Step 4: Commit operator documentation**
+- [x] **Step 4: Commit operator documentation**
 
 ```bash
 git add README.md auto_trader.py core/order_execution.py core/notifier.py docs/superpowers/plans/2026-04-12-portfolio-exit-engine.md
@@ -71,19 +71,19 @@ git commit -m "docs: add paper-trading operations runbook"
 - Consumes: the aligned runtime/development manifests and the environment used for verification.
 - Produces: an exact constraints file usable with `pip install -r requirements-lock.txt`.
 
-- [ ] **Step 1: Generate the lock from a clean supported environment**
+- [x] **Step 1: Generate the lock from a clean supported environment**
 
 Install the aligned manifests into an isolated virtual environment, run `python -m pip check`, and write exact installed versions to `requirements-lock.txt`. Exclude unrelated globally installed packages by generating from the isolated environment only.
 
-- [ ] **Step 2: Verify a second clean install**
+- [x] **Step 2: Verify a second clean install**
 
 Create a fresh temporary virtual environment, install `requirements-lock.txt`, run Ruff, import all production modules, and execute the non-integration pytest suite.
 
-- [ ] **Step 3: Document lock usage**
+- [x] **Step 3: Document lock usage**
 
 Explain that `requirements.txt` expresses supported ranges while `requirements-lock.txt` records the verified operational/CI set.
 
-- [ ] **Step 4: Commit reproducibility artifacts**
+- [x] **Step 4: Commit reproducibility artifacts**
 
 ```bash
 git add requirements-lock.txt README.md
@@ -99,11 +99,11 @@ git commit -m "build: lock verified Python dependencies"
 - Consumes: the complete stabilized tree.
 - Produces: fresh evidence for lint, compilation, tests, secret hygiene, dependency integrity, and CLI startup.
 
-- [ ] **Step 1: Verify repository state and diff scope**
+- [x] **Step 1: Verify repository state and diff scope**
 
 Run `git status --short --branch`, `git diff --check`, `git diff --stat main...HEAD`, and inspect every commit since `c526fea`. Confirm no generated artifact, local settings file, execution database, or credential value is tracked.
 
-- [ ] **Step 2: Run static gates**
+- [x] **Step 2: Run static gates**
 
 Run: `python -m ruff check . --no-cache --exclude .artifacts`
 
@@ -113,13 +113,13 @@ Run: `python -m pip check`
 
 Expected: all exit zero.
 
-- [ ] **Step 3: Run the complete offline suite with coverage**
+- [x] **Step 3: Run the complete offline suite with coverage**
 
 Run: `python -m pytest -q -m "not integration"`
 
 Expected: every selected test passes; coverage report is freshly generated under ignored artifacts.
 
-- [ ] **Step 4: Run safe operational diagnostics**
+- [x] **Step 4: Run safe operational diagnostics**
 
 Run: `python paper_trading_console.py doctor`
 
@@ -129,7 +129,7 @@ Run: `python scheduler.py --dry-run --now`
 
 If a command can submit an order despite its flag, stop and fix that safety defect before retrying. Network/provider unavailability is reported separately from code failure.
 
-- [ ] **Step 5: Review the final branch as a pull request**
+- [x] **Step 5: Review the final branch as a pull request**
 
 Inspect `git diff main...HEAD` for correctness, architecture drift, secret exposure, and documentation accuracy. Correct any finding through its own failing test and focused commit before claiming readiness.
 
@@ -146,11 +146,11 @@ Inspect `git diff main...HEAD` for correctness, architecture drift, secret expos
 
 The operator rotates the key at FMP, updates only the local environment/secret store, and confirms the old key is revoked. Never paste either value into chat, logs, commands, or tracked files.
 
-- [ ] **Step 2: Prepare history cleanup locally**
+- [x] **Step 2: Prepare history cleanup locally**
 
 From a fresh clone or disposable mirror, use a history-filtering tool to remove `scan_results/canslim_scan_20260408_003511.csv` and credential-bearing generated scan artifacts from every ref intended for publication. Do not alter the preserved recovery bundle.
 
-- [ ] **Step 3: Verify the rewritten object database**
+- [x] **Step 3: Verify the rewritten object database**
 
 Search every rewritten commit and reachable blob by filename and credential fingerprint. Confirm normal source/tests remain, then run the full offline release gate on the rewritten branch.
 
@@ -200,7 +200,7 @@ If validation fails, capture broker ids and sanitized state, reproduce offline w
 - Consumes: green supervised paper validation and `setup_windows_task.py`.
 - Produces: one inspectable Windows scheduled task running paper mode.
 
-- [ ] **Step 1: Display the exact proposed task configuration**
+- [x] **Step 1: Display the exact proposed task configuration**
 
 Show task name, interpreter path, repository path, arguments, trigger time/time zone, working directory, user identity, and log destination.
 
@@ -229,11 +229,11 @@ Replace the dry-run arguments only after the user explicitly approves automated 
 - Consumes: the recovery commit `c526fea`, the verified stabilization commits, and the stale `claude/portfolio-exit-engine` worktree.
 - Produces: a reviewable branch/PR and an explicit disposition for obsolete local worktrees.
 
-- [ ] **Step 1: Verify recovery and stabilization refs**
+- [x] **Step 1: Verify recovery and stabilization refs**
 
 Run `git log --oneline --decorate --graph --all`, `git worktree list --porcelain`, and `git branch -vv`. Confirm `main` still points at the pre-stabilization commit, the recovery branch contains `c526fea`, and the stabilization branch contains only focused follow-up commits.
 
-- [ ] **Step 2: Preserve the stale worktree's remaining change**
+- [x] **Step 2: Preserve the stale worktree's remaining change**
 
 Inspect `C:\Users\llong\.config\superpowers\worktrees\RS-momentum-EMA-trading-bot\portfolio-exit-engine\config\settings.py`, export its diff into the ignored recovery area, and verify the archive before proposing retirement.
 
