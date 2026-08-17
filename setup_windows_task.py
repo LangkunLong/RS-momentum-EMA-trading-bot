@@ -4,7 +4,7 @@ Creates a task named "CANSLIM-Scheduler" that:
   - Runs at 09:00 ET every weekday (Mon–Fri)
   - Uses the same Python interpreter that runs this script
   - Starts in the project directory so relative paths resolve correctly
-  - Logs stdout/stderr to scheduler_log.txt in the project root
+  - Logs stdout/stderr under the ignored .artifacts/logs directory
 
 Usage:
     python setup_windows_task.py            # register/update a dry-run task
@@ -14,7 +14,7 @@ Usage:
 
 Requirements:
     - Run from an Administrator command prompt (schtasks needs elevated rights)
-    - Python must be on the system PATH (verify with: where python)
+    - Run this script with the stable project virtual-environment interpreter
 
 After setup, the scheduler runs automatically at 09:00 ET on weekdays.
 You can also start/stop it manually from Task Scheduler (taskschd.msc).
@@ -32,7 +32,7 @@ TASK_NAME = "CANSLIM-Scheduler"
 PROJECT_DIR = Path(__file__).resolve().parent
 PYTHON_EXE = sys.executable
 SCHEDULER_SCRIPT = PROJECT_DIR / "scheduler.py"
-LOG_FILE = PROJECT_DIR / "scheduler_log.txt"
+LOG_FILE = PROJECT_DIR / ".artifacts" / "logs" / "scheduler.log"
 
 
 def _schtasks(*args: str) -> tuple[int, str]:
@@ -45,13 +45,20 @@ def _schtasks(*args: str) -> tuple[int, str]:
 
 def _build_action_command(*, dry_run: bool) -> str:
     """Build the scheduled command, defaulting installation to observation only."""
-    scheduler_args = " --dry-run" if dry_run else ""
-    # Build the action command.  We wrap in cmd /c so stdout redirects work.
-    # The redirect ensures we can read logs even when the task runs in background.
-    return (
-        f'cmd /c "{PYTHON_EXE}" "{SCHEDULER_SCRIPT}"{scheduler_args} '
-        f'>> "{LOG_FILE}" 2>&1'
+    scheduler_argv = [PYTHON_EXE, str(SCHEDULER_SCRIPT)]
+    if dry_run:
+        scheduler_argv.append("--dry-run")
+
+    project_dir = subprocess.list2cmdline([str(PROJECT_DIR)])
+    log_dir = subprocess.list2cmdline([str(LOG_FILE.parent)])
+    log_file = subprocess.list2cmdline([str(LOG_FILE)])
+    scheduler_command = subprocess.list2cmdline(scheduler_argv)
+    inner_command = (
+        f"if not exist {log_dir} mkdir {log_dir} "
+        f"&& cd /d {project_dir} "
+        f"&& {scheduler_command} >> {log_file} 2>&1"
     )
+    return f'cmd.exe /d /s /c "{inner_command}"'
 
 
 def register_task(*, dry_run: bool = True) -> int:

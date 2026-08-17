@@ -1,7 +1,7 @@
 """Operator console for paper-trading deployment and observation.
 
-This script is the day-to-day control surface for running the bot safely in a
-paper Alpaca account before live capital is introduced.
+This script is the day-to-day control surface for supervised operation in an
+Alpaca paper account. Live-account trading is out of scope.
 
 Examples:
     python paper_trading_console.py doctor
@@ -31,12 +31,12 @@ from core.order_execution import (
     get_open_orders,
     get_open_positions,
 )
+from setup_windows_task import LOG_FILE as SCHEDULER_LOG
 from setup_windows_task import register_task, show_status
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 SCAN_RESULTS_DIR = PROJECT_DIR / settings.RESULTS_DIR
-SCHEDULER_LOG = PROJECT_DIR / "scheduler_log.txt"
 
 
 @dataclass(frozen=True)
