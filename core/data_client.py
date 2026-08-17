@@ -270,17 +270,17 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
         return []
 
     url = f"{settings.FMP_BASE_URL}/{endpoint}"
-    params = params or {}
-    params["apikey"] = _fmp_api_key()
+    request_params = dict(params or {})
+    request_params["apikey"] = _fmp_api_key()
 
     try:
-        resp = _fmp_session.get(url, params=params, timeout=30)
+        resp = _fmp_session.get(url, params=request_params, timeout=30)
     except requests.exceptions.RetryError:
         # Retry adapter exhausted all attempts — treat as a persistent failure.
         _fmp_quota_exhausted = True
         print("[FMP] All retries exhausted. Skipping FMP for remainder of session.")
         return []
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.RequestException:
         return []
 
     # 402: endpoint not included in the current plan.

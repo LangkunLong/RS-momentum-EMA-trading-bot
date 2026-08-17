@@ -100,6 +100,38 @@ def test_fmp_get_returns_empty_on_connection_error() -> None:
     assert result == [], "Expected [] on ConnectionError"
 
 
+def test_fmp_get_returns_empty_on_timeout() -> None:
+    """A provider timeout must degrade like other network failures."""
+    with (
+        patch("core.data_client._fmp_session") as mock_session,
+        patch("core.data_client._fmp_api_key", return_value="test-key"),
+    ):
+        mock_session.get.side_effect = requests.exceptions.Timeout("timed out")
+        result = _fmp_get("income-statement", {"symbol": "FAKE"})
+
+    assert result == []
+
+
+def test_fmp_get_does_not_inject_api_key_into_caller_params() -> None:
+    """Credential injection must stay inside the HTTP request boundary."""
+    caller_params = {"symbol": "FAKE"}
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = []
+
+    with (
+        patch("core.data_client._fmp_session") as mock_session,
+        patch("core.data_client._fmp_api_key", return_value="test-key"),
+    ):
+        mock_session.get.return_value = mock_resp
+        result = _fmp_get("profile", caller_params)
+
+    assert result == []
+    assert caller_params == {"symbol": "FAKE"}
+    request_params = mock_session.get.call_args.kwargs["params"]
+    assert "apikey" in request_params
+
+
 def test_fmp_get_402_logs_message(capsys) -> None:
     """HTTP 402 must print a plan-restriction message rather than silently returning []."""
     mock_resp = MagicMock()
