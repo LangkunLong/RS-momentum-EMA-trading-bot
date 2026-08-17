@@ -52,7 +52,9 @@ from core.order_manager import OrderManager
 from fill_monitor import FillMonitor
 
 _ET = ZoneInfo("America/New_York")
-_ENTRY_TIMEOUT = 60
+# Alpaca paper orders can remain queued until the next minute-bar simulation.
+# Leave enough room for that boundary plus durable fill/stop reconciliation.
+_ENTRY_TIMEOUT = 180
 _EXIT_TIMEOUT = 60
 _MONITOR_CONNECT_TIMEOUT = 15
 _MONITOR_STOP_TIMEOUT = 10
