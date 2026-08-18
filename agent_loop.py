@@ -2530,8 +2530,73 @@ class SandboxRunner:
         if item.get("Id") != container_id or item.get("Name") != f"/{name}" or item.get("Image") != image_id:
             raise SandboxError("created container image ID differs from the inspected image")
         network = item.get("NetworkSettings")
-        if not isinstance(network, dict) or network.get("Ports") != {}:
-            raise SandboxError("created container exposes or publishes a port")
+        expected_network = {
+            "Bridge": "",
+            "SandboxID": "",
+            "SandboxKey": "",
+            "Ports": {},
+            "HairpinMode": False,
+            "LinkLocalIPv6Address": "",
+            "LinkLocalIPv6PrefixLen": 0,
+            "SecondaryIPAddresses": None,
+            "SecondaryIPv6Addresses": None,
+            "EndpointID": "",
+            "Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "MacAddress": "",
+        }
+        if (
+            not isinstance(network, dict)
+            or set(network) != {*expected_network, "Networks"}
+            or any(
+                type(network[key]) is not type(wanted) or network[key] != wanted
+                for key, wanted in expected_network.items()
+            )
+        ):
+            raise SandboxError("created container network isolation differs")
+        networks = network["Networks"]
+        if not isinstance(networks, dict) or set(networks) != {"none"}:
+            raise SandboxError("created container must have only the none network")
+        none_network = networks["none"]
+        expected_none_network = {
+            "IPAMConfig": None,
+            "Links": None,
+            "Aliases": None,
+            "MacAddress": "",
+            "DriverOpts": None,
+            "GwPriority": 0,
+            "EndpointID": "",
+            "Gateway": "",
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "DNSNames": None,
+        }
+        if (
+            not isinstance(none_network, dict)
+            or set(none_network) != {*expected_none_network, "NetworkID"}
+            or any(
+                type(none_network[key]) is not type(wanted)
+                or none_network[key] != wanted
+                for key, wanted in expected_none_network.items()
+            )
+        ):
+            raise SandboxError("created container none-network isolation differs")
+        network_id = none_network["NetworkID"]
+        if not isinstance(network_id, str) or (
+            network_id and _SHA256_RE.fullmatch(network_id) is None
+        ):
+            raise SandboxError("created container none-network ID is malformed")
+        normalized_none_network = dict(none_network)
+        normalized_none_network["NetworkID"] = ""
+        normalized_network = dict(network)
+        normalized_network["Networks"] = {"none": normalized_none_network}
         actual_environment = config.get("Env")
         if not isinstance(actual_environment, list) or any(
             not isinstance(value, str) or "=" not in value for value in actual_environment
@@ -2575,7 +2640,7 @@ class SandboxRunner:
             "HostConfig": normalized_host,
             "Mounts": mounts,
             "Image": item["Image"],
-            "NetworkSettings": network,
+            "NetworkSettings": normalized_network,
         }
         return item, _canonical_json_sha256(attested)
 

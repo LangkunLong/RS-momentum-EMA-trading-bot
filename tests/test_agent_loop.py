@@ -2107,7 +2107,44 @@ class FaithfulSandboxEngine:
                     "PublishAllPorts": False,
                 },
                 "Mounts": mounts,
-                "NetworkSettings": {"Ports": {}},
+                "NetworkSettings": {
+                    "Bridge": "",
+                    "SandboxID": "",
+                    "SandboxKey": "",
+                    "Ports": {},
+                    "HairpinMode": False,
+                    "LinkLocalIPv6Address": "",
+                    "LinkLocalIPv6PrefixLen": 0,
+                    "SecondaryIPAddresses": None,
+                    "SecondaryIPv6Addresses": None,
+                    "EndpointID": "",
+                    "Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "IPAddress": "",
+                    "IPPrefixLen": 0,
+                    "IPv6Gateway": "",
+                    "MacAddress": "",
+                    "Networks": {
+                        "none": {
+                            "IPAMConfig": None,
+                            "Links": None,
+                            "Aliases": None,
+                            "MacAddress": "",
+                            "DriverOpts": None,
+                            "GwPriority": 0,
+                            "NetworkID": "",
+                            "EndpointID": "",
+                            "Gateway": "",
+                            "IPAddress": "",
+                            "IPPrefixLen": 0,
+                            "IPv6Gateway": "",
+                            "GlobalIPv6Address": "",
+                            "GlobalIPv6PrefixLen": 0,
+                            "DNSNames": None,
+                        }
+                    },
+                },
                 "State": {
                     "OOMKilled": False,
                     "Status": "created",
@@ -2271,6 +2308,64 @@ def test_container_attestation_normalizes_only_docker_null_capability_lists(
 
     assert result.gate_observation is True
     assert result.observed_exit_zero is True
+    assert engine.removed and engine.absence_verified
+
+
+def test_container_config_hash_normalizes_none_network_id_assigned_after_start(
+    tmp_path: Path,
+) -> None:
+    """Docker assigns the none-network ID after start without changing confinement."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+
+    def assign_network_id_after_start(item: dict[str, Any]) -> None:
+        if engine.started:
+            item["NetworkSettings"]["Networks"]["none"]["NetworkID"] = "d" * 64
+
+    engine.mutate_inspection = assign_network_id_after_start
+
+    result = run_test_gate(candidate, _faithful_runner(image, engine))
+
+    assert result.gate_observation is True
+    assert result.observed_exit_zero is True
+    assert engine.removed and engine.absence_verified
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda network: network.pop("Networks"),
+        lambda network: network["Networks"].update({"bridge": {}}),
+        lambda network: network["Networks"]["none"].update(IPAMConfig={}),
+        lambda network: network["Networks"]["none"].update(MacAddress="02:42:ac:11:00:02"),
+        lambda network: network["Networks"]["none"].update(Gateway="172.17.0.1"),
+        lambda network: network["Networks"]["none"].update(IPAddress="172.17.0.2"),
+        lambda network: network["Networks"]["none"].update(IPPrefixLen=16),
+        lambda network: network["Networks"]["none"].update(NetworkID="D" * 64),
+        lambda network: network["Networks"]["none"].update(Unexpected=""),
+        lambda network: network.update(IPAddress="172.17.0.2"),
+        lambda network: network.update(Unexpected=""),
+    ],
+)
+def test_container_attestation_rejects_nonempty_or_nonexact_none_network(
+    tmp_path: Path,
+    mutator: Any,
+) -> None:
+    """Break caught: stable but connected or malformed none-network state was trusted."""
+    from agent_loop import SandboxError, export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    engine.mutate_inspection = lambda item: mutator(item["NetworkSettings"])
+
+    with pytest.raises(SandboxError):
+        run_test_gate(candidate, _faithful_runner(image, engine))
     assert engine.removed and engine.absence_verified
 
 
