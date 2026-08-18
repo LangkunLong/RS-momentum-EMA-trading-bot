@@ -23,11 +23,12 @@ import textwrap
 import threading
 import time
 import secrets
+import unicodedata
 import urllib.request
 from urllib.parse import quote
 from contextlib import closing
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -171,6 +172,10 @@ class CandidateMutationError(RuntimeError):
 
 class DataBundleError(ValueError):
     """The approved historical cache bundle is unsafe or incomplete."""
+
+
+class AuditError(RuntimeError):
+    """A sanitized audit artifact could not be written or verified safely."""
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -4155,7 +4160,8 @@ class SourceSnapshot:
         if len(self.sanitized_text.encode("utf-8")) > _SOURCE_SNAPSHOT_LIMIT:
             raise ConfigurationError("source snapshot text exceeds the provider limit")
         if any(
-            ord(character) < 32 and character not in "\t\n\r"
+            character not in "\t\n\r"
+            and unicodedata.category(character) in {"Cc", "Cf", "Cs"}
             for character in self.sanitized_text
         ):
             raise ConfigurationError("source snapshot contains a control character")
@@ -4242,6 +4248,22 @@ class LoopConfig:
         artifacts = _absolute_configuration_path(self.artifact_root, "artifact_root")
         if _configuration_paths_overlap(source, runtime):
             raise ConfigurationError("permanent runtime root must not overlap source_root")
+        if _configuration_paths_overlap(artifacts, runtime):
+            raise ConfigurationError("artifact_root must not overlap the permanent runtime")
+        if _configuration_paths_overlap(controller, source) or _configuration_paths_overlap(
+            controller, runtime
+        ):
+            raise ConfigurationError(
+                "controller_temp_parent must not overlap source or permanent runtime"
+            )
+        if _configuration_paths_overlap(git, source) or _configuration_paths_overlap(git, runtime):
+            raise ConfigurationError("git_executable must not overlap source or permanent runtime")
+        if isinstance(self.gate, BacktestGateConfig) and _configuration_paths_overlap(
+            self.gate.historical_data_bundle, runtime
+        ):
+            raise ConfigurationError(
+                "historical_data_bundle must not overlap the permanent runtime"
+            )
         if not isinstance(self.mode, ExecutionMode):
             raise ConfigurationError("mode must be ExecutionMode")
         if not isinstance(self.gate, (TestGateConfig, BacktestGateConfig)):
@@ -4329,3 +4351,619 @@ class LoopResult:
         object.__setattr__(self, "audit_path", audit)
         object.__setattr__(self, "quarantine_path", quarantine)
         object.__setattr__(self, "handoff_artifacts", tuple(normalized_handoffs))
+
+
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"(?im)\b(?P<name>OPENROUTER(?:_API_KEY)?|"
+    r"(?:[A-Z][A-Z0-9_]{1,48}_)?(?:API_KEY|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|ACCESS_KEY))"
+    r"\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;}\]]+)"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
+_SECRET_TOKEN_RE = re.compile(
+    r"(?i)\b(?:sk-or-v1-|sk-proj-|sk-)[A-Za-z0-9_-]{12,}"
+)
+_AUDIT_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+_AUDIT_FACT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}")
+_AUDIT_JSON_LIMIT = 1024 * 1024
+_AUDIT_CHAIN_LIMIT = 4 * 1024 * 1024
+_AUDIT_ZERO_HASH = "0" * 64
+
+
+@dataclass(frozen=True)
+class SanitizedText:
+    text: str
+    original_sha256: str
+    original_byte_count: int
+    truncated: bool
+    redaction_count: int
+    provider_safe: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ConfigurationError("sanitized text must be a string")
+        if not isinstance(self.original_sha256, str) or _SHA256_RE.fullmatch(
+            self.original_sha256
+        ) is None:
+            raise ConfigurationError("sanitized text hash must be lowercase SHA-256")
+        if type(self.original_byte_count) is not int or self.original_byte_count < 0:
+            raise ConfigurationError("sanitized text byte count must be nonnegative")
+        if type(self.truncated) is not bool or self.provider_safe is not True:
+            raise ConfigurationError("sanitized text safety flags are invalid")
+        if type(self.redaction_count) is not int or self.redaction_count < 0:
+            raise ConfigurationError("sanitized text redaction count must be nonnegative")
+
+
+def _truncate_utf8(value: str, maximum: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum:
+        return value, False
+    marker = "\n[TRUNCATED]\n"
+    marker_bytes = marker.encode("utf-8")
+    if maximum <= len(marker_bytes):
+        return encoded[:maximum].decode("utf-8", errors="ignore"), True
+    prefix = encoded[: maximum - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return prefix + marker, True
+
+
+def sanitize_untrusted_text(
+    value: str | bytes,
+    *,
+    known_secrets: Sequence[str] = (),
+    max_bytes: int = _SOURCE_SNAPSHOT_LIMIT,
+) -> SanitizedText:
+    """Normalize, redact, and cap untrusted text while hashing the original byte stream."""
+    if type(max_bytes) is not int or not 1 <= max_bytes <= _AUDIT_JSON_LIMIT:
+        raise ConfigurationError("sanitized text byte limit is invalid")
+    if isinstance(value, bytes):
+        raw = value
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, str):
+        raw = value.encode("utf-8")
+        text = value
+    else:
+        raise ConfigurationError("untrusted text must be str or bytes")
+    if not isinstance(known_secrets, (tuple, list)) or any(
+        not isinstance(secret, str) for secret in known_secrets
+    ):
+        raise ConfigurationError("known secrets must be a sequence of strings")
+
+    text = unicodedata.normalize("NFC", text.replace("\r\n", "\n").replace("\r", "\n"))
+    control_count = sum(
+        1
+        for character in text
+        if character not in "\t\n" and unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+    )
+    text = "".join(
+        character
+        for character in text
+        if character in "\t\n" or unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+    )
+    redactions = control_count
+    def redact_assignment(match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return f"{match.group('name')}=[REDACTED]"
+
+    text = _CREDENTIAL_ASSIGNMENT_RE.sub(redact_assignment, text)
+    for pattern, replacement in (
+        (_BEARER_TOKEN_RE, "Bearer [REDACTED]"),
+        (_SECRET_TOKEN_RE, "[REDACTED]"),
+    ):
+        text, count = pattern.subn(replacement, text)
+        redactions += count
+    for secret in sorted(set(known_secrets), key=len, reverse=True):
+        if not secret:
+            continue
+        occurrences = text.count(secret)
+        if occurrences:
+            text = text.replace(secret, "[REDACTED]")
+            redactions += occurrences
+    text, truncated = _truncate_utf8(text, max_bytes)
+    return SanitizedText(
+        text=text,
+        original_sha256=hashlib.sha256(raw).hexdigest(),
+        original_byte_count=len(raw),
+        truncated=truncated,
+        redaction_count=redactions,
+    )
+
+
+def read_candidate_source_snapshot(
+    candidate: Candidate,
+    relative_path: str,
+    *,
+    approved_paths: Sequence[str],
+    known_secrets: Sequence[str] = (),
+    start_line: int = 1,
+    end_line: int | None = None,
+    max_bytes: int = _SOURCE_SNAPSHOT_LIMIT,
+) -> SourceSnapshot:
+    """Read one stable, approved tracked candidate file into a bounded provider-safe excerpt."""
+    root = _require_candidate(candidate)
+    try:
+        canonical = canonical_patch_path(relative_path)
+        approved = tuple(canonical_patch_path(value) for value in approved_paths)
+    except PatchPolicyError as exc:
+        raise ConfigurationError("source snapshot path is invalid") from exc
+    if canonical not in approved:
+        raise ConfigurationError("source snapshot path is outside approved readable scope")
+    if _is_denied_path(canonical):
+        raise ConfigurationError("source snapshot path is permanently denied")
+    if canonical not in candidate.tracked_files or _credential_like_tracked_path(canonical):
+        raise ConfigurationError("source snapshot path is not an approved tracked source file")
+    if type(start_line) is not int or start_line < 1:
+        raise ConfigurationError("source snapshot start line is invalid")
+    if end_line is not None and (type(end_line) is not int or end_line < start_line):
+        raise ConfigurationError("source snapshot end line is invalid")
+    if type(max_bytes) is not int or not 1 <= max_bytes <= _SOURCE_SNAPSHOT_LIMIT:
+        raise ConfigurationError("source snapshot byte limit is invalid")
+    target = root / canonical
+    try:
+        before = target.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or _has_reparse_point(target)
+            or before.st_nlink != 1
+            or before.st_size > _SOURCE_FILE_LIMIT
+        ):
+            raise ConfigurationError("source snapshot requires a bounded regular file")
+        raw = target.read_bytes()
+        after = target.lstat()
+    except OSError as exc:
+        raise ConfigurationError("source snapshot file cannot be read") from exc
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after or len(raw) != before.st_size:
+        raise ConfigurationError("source snapshot file changed while it was read")
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigurationError("source snapshot must be UTF-8 text") from exc
+    if "\x00" in decoded:
+        raise ConfigurationError("source snapshot must be UTF-8 text without NUL bytes")
+    normalized = decoded.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.splitlines(keepends=True)
+    if not lines:
+        raise ConfigurationError("source snapshot file must not be empty")
+    selected_end = min(end_line or len(lines), len(lines))
+    if start_line > len(lines) or selected_end < start_line:
+        raise ConfigurationError("source snapshot line range is outside the file")
+    selected: list[str] = []
+    selected_size = 0
+    last_line = start_line
+    for number in range(start_line, selected_end + 1):
+        line = lines[number - 1]
+        line_size = len(line.encode("utf-8"))
+        if selected and selected_size + line_size > max_bytes:
+            break
+        selected.append(line)
+        selected_size += line_size
+        last_line = number
+        if selected_size > max_bytes:
+            break
+    sanitized = sanitize_untrusted_text(
+        "".join(selected), known_secrets=known_secrets, max_bytes=max_bytes
+    )
+    return SourceSnapshot(
+        path=canonical,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        byte_count=len(raw),
+        line_count=len(lines),
+        selected_start_line=start_line,
+        selected_end_line=last_line,
+        truncated=(
+            start_line > 1
+            or last_line < len(lines)
+            or selected_end < len(lines)
+            or sanitized.truncated
+        ),
+        sanitized_text=sanitized.text,
+    )
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise AuditError("audit value is not canonical JSON") from exc
+
+
+def _safe_audit_fact(value: object, field: str) -> str:
+    if not isinstance(value, str) or _AUDIT_FACT_RE.fullmatch(value) is None:
+        raise AuditError(f"{field} must be a closed audit fact")
+    return value
+
+
+def _closed_audit_value(
+    value: object,
+    known_secrets: Sequence[str] = (),
+    *,
+    depth: int = 0,
+) -> object:
+    if depth > 4:
+        raise AuditError("audit event details are nested too deeply")
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise AuditError("audit event contains a non-finite number")
+        return value
+    if isinstance(value, str):
+        fact = _safe_audit_fact(value, "audit detail")
+        sanitized = sanitize_untrusted_text(
+            fact, known_secrets=known_secrets, max_bytes=1024
+        )
+        if sanitized.redaction_count or sanitized.text != fact or sanitized.truncated:
+            raise AuditError("audit detail must be a closed audit fact without credentials")
+        return fact
+    if isinstance(value, (tuple, list)):
+        if len(value) > 32:
+            raise AuditError("audit event detail list is too long")
+        return [
+            _closed_audit_value(item, known_secrets, depth=depth + 1)
+            for item in value
+        ]
+    if isinstance(value, Mapping):
+        if len(value) > 32:
+            raise AuditError("audit event detail mapping is too large")
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            canonical_key = _closed_audit_value(key, known_secrets, depth=depth + 1)
+            if not isinstance(canonical_key, str):
+                raise AuditError("audit detail key must be a closed audit fact")
+            if canonical_key in result:
+                raise AuditError("audit event contains a duplicate detail key")
+            result[canonical_key] = _closed_audit_value(
+                item, known_secrets, depth=depth + 1
+            )
+        return result
+    raise AuditError("audit event detail has an unsupported type")
+
+
+def _sanitize_audit_value(
+    value: object,
+    known_secrets: Sequence[str],
+    *,
+    depth: int = 0,
+) -> object:
+    if depth > 8:
+        raise AuditError("audit payload is nested too deeply")
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise AuditError("audit payload contains a non-finite number")
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Path):
+        return sanitize_untrusted_text(
+            str(value), known_secrets=known_secrets, max_bytes=4096
+        ).text
+    if isinstance(value, str):
+        return sanitize_untrusted_text(
+            value, known_secrets=known_secrets, max_bytes=_MAX_DIFF_BYTES
+        ).text
+    if isinstance(value, (tuple, list)):
+        if len(value) > 256:
+            raise AuditError("audit payload list is too long")
+        return [
+            _sanitize_audit_value(item, known_secrets, depth=depth + 1)
+            for item in value
+        ]
+    if isinstance(value, Mapping):
+        if len(value) > 256:
+            raise AuditError("audit payload mapping is too large")
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key.encode("utf-8")) > 256:
+                raise AuditError("audit payload key is invalid")
+            sanitized_key = sanitize_untrusted_text(
+                key, known_secrets=known_secrets, max_bytes=256
+            ).text
+            if sanitized_key in result:
+                raise AuditError("audit payload keys collide after sanitization")
+            result[sanitized_key] = _sanitize_audit_value(
+                item, known_secrets, depth=depth + 1
+            )
+        return result
+    raise AuditError("audit payload has an unsupported type")
+
+
+def _assert_directory_chain_no_links(path: Path) -> None:
+    for current in reversed((path, *path.parents)):
+        if not current.exists():
+            continue
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise AuditError("audit directory chain cannot be inspected") from exc
+        if stat.S_ISLNK(info.st_mode) or _has_reparse_point(current):
+            raise AuditError("audit directory chain contains a link or reparse point")
+
+
+def _atomic_write_audit(path: Path, payload: bytes) -> None:
+    if len(payload) > _AUDIT_JSON_LIMIT:
+        raise AuditError("audit artifact exceeds the byte limit")
+    try:
+        if path.exists() or path.is_symlink():
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or _has_reparse_point(path)
+                or info.st_nlink != 1
+            ):
+                raise AuditError("audit target is not a private regular file")
+        temporary = path.parent / f".{path.name}.tmp-{secrets.token_hex(12)}"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                descriptor = -1
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary.exists() and not temporary.is_symlink():
+                temporary.unlink()
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or path.is_symlink() or _has_reparse_point(path):
+            raise AuditError("atomic audit target verification failed")
+    except AuditError:
+        raise
+    except OSError as exc:
+        raise AuditError("audit artifact could not be written atomically") from exc
+
+
+class AuditTrail:
+    """Atomic, redacted, hash-chained local evidence for one controller run."""
+
+    def __init__(
+        self,
+        artifact_root: Path,
+        run_id: str,
+        *,
+        known_secrets: Sequence[str] = (),
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not isinstance(artifact_root, Path) or not artifact_root.is_absolute():
+            raise AuditError("audit root must be an absolute Path")
+        if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+            raise AuditError("audit run id is not canonical")
+        if not isinstance(known_secrets, (tuple, list)) or any(
+            not isinstance(value, str) for value in known_secrets
+        ):
+            raise AuditError("audit secrets must be a sequence of strings")
+        requested = Path(os.path.abspath(artifact_root))
+        _assert_directory_chain_no_links(requested)
+        try:
+            requested.mkdir(parents=True, exist_ok=True)
+            _assert_directory_chain_no_links(requested)
+            root = requested / run_id
+            root.mkdir(mode=0o700)
+        except (OSError, AuditError) as exc:
+            raise AuditError("audit run directory could not be created privately") from exc
+        if root.is_symlink() or _has_reparse_point(root) or not root.is_dir():
+            raise AuditError("audit run directory is not a private regular directory")
+        self.artifact_root = requested
+        self.run_root = root
+        self.run_id = run_id
+        self.events_path = root / "events.jsonl"
+        self._known_secrets = tuple(value for value in known_secrets if value)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._events: list[dict[str, object]] = []
+        self._last_hash = _AUDIT_ZERO_HASH
+        self._lock = threading.Lock()
+        self._manifest_written = False
+
+    def _artifact_path(self, prefix: str, name: str, suffix: str = ".json") -> Path:
+        if _AUDIT_NAME_RE.fullmatch(name) is None:
+            raise AuditError("audit artifact name is not canonical")
+        return self.run_root / f"{prefix}{name}{suffix}"
+
+    def _write_json(self, path: Path, value: object) -> Path:
+        sanitized = _sanitize_audit_value(value, self._known_secrets)
+        payload = _canonical_json_bytes(sanitized) + b"\n"
+        _atomic_write_audit(path, payload)
+        return path
+
+    def write_manifest(
+        self,
+        config: LoopConfig,
+        *,
+        source_head: str,
+        source_fingerprint_sha256: str,
+    ) -> Path:
+        if self._manifest_written:
+            raise AuditError("audit manifest is immutable once written")
+        if not isinstance(config, LoopConfig):
+            raise AuditError("audit manifest requires LoopConfig")
+        if re.fullmatch(r"[0-9a-f]{40,64}", source_head) is None:
+            raise AuditError("audit manifest source head is invalid")
+        if _SHA256_RE.fullmatch(source_fingerprint_sha256) is None:
+            raise AuditError("audit manifest source fingerprint is invalid")
+        if isinstance(config.gate, TestGateConfig):
+            gate: dict[str, object] = {
+                "kind": "test",
+                "selectors": config.gate.selectors,
+            }
+        else:
+            gate = {
+                "kind": "backtest",
+                "tickers": config.gate.tickers,
+                "benchmark": config.gate.benchmark,
+                "start_date": config.gate.start_date,
+                "end_date": config.gate.end_date,
+                "historical_data_bundle": config.gate.historical_data_bundle,
+                "historical_data_sha256": config.gate.historical_data_sha256,
+                "thresholds": asdict(config.gate.thresholds),
+            }
+        policy = {
+            "editable_paths": tuple(sorted(DEFAULT_EDITABLE_PATHS)),
+            "denied_paths": tuple(sorted(_DENIED_EXACT)),
+            "max_iterations": MAX_ITERATIONS,
+        }
+        manifest = {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "source_head": source_head,
+            "source_fingerprint_sha256": source_fingerprint_sha256,
+            "source_root": config.source_root,
+            "permanent_runtime_root": config.permanent_runtime_root,
+            "git_executable": config.git_executable,
+            "controller_temp_parent": config.controller_temp_parent,
+            "artifact_root": config.artifact_root,
+            "mode": asdict(config.mode),
+            "models": asdict(config.models),
+            "limits": asdict(config.limits),
+            "gate": gate,
+            "policy": policy,
+            "policy_sha256": hashlib.sha256(_canonical_json_bytes(policy)).hexdigest(),
+            "security_attestation": False,
+        }
+        path = self._write_json(self.run_root / "manifest.json", manifest)
+        self._manifest_written = True
+        return path
+
+    def append_event(
+        self,
+        state: LoopState,
+        event: str,
+        details: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        if not isinstance(state, LoopState):
+            raise AuditError("audit event state must be LoopState")
+        event_code = _safe_audit_fact(event, "audit event")
+        closed_details = _closed_audit_value(details or {}, self._known_secrets)
+        if not isinstance(closed_details, dict):
+            raise AuditError("audit event details must be a mapping")
+        with self._lock:
+            timestamp = self._clock()
+            if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
+                raise AuditError("audit clock must return a timezone-aware datetime")
+            core: dict[str, object] = {
+                "sequence": len(self._events) + 1,
+                "timestamp_utc": timestamp.astimezone(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "state": state.value,
+                "event": event_code,
+                "details": closed_details,
+                "previous_sha256": self._last_hash,
+            }
+            digest = hashlib.sha256(_canonical_json_bytes(core)).hexdigest()
+            record = {**core, "event_sha256": digest}
+            candidate_events = [*self._events, record]
+            payload = b"".join(_canonical_json_bytes(item) + b"\n" for item in candidate_events)
+            if len(payload) > _AUDIT_CHAIN_LIMIT:
+                raise AuditError("audit event chain exceeds the byte limit")
+            _atomic_write_audit(self.events_path, payload)
+            self._events.append(record)
+            self._last_hash = digest
+            return dict(record)
+
+    def write_redacted_log(self, name: str, raw: str | bytes) -> Path:
+        sanitized = sanitize_untrusted_text(
+            raw, known_secrets=self._known_secrets, max_bytes=64 * 1024
+        )
+        return self._write_json(
+            self._artifact_path("log-", name),
+            {
+                "original_sha256": sanitized.original_sha256,
+                "original_byte_count": sanitized.original_byte_count,
+                "truncated": sanitized.truncated,
+                "redaction_count": sanitized.redaction_count,
+                "text": sanitized.text,
+            },
+        )
+
+    def write_validated_payload(
+        self,
+        name: str,
+        payload: Route | ReasoningPlan | CodingProposal,
+    ) -> Path:
+        roles: tuple[tuple[type[object], str], ...] = (
+            (Route, "orchestrator"),
+            (ReasoningPlan, "reasoner"),
+            (CodingProposal, "coder"),
+        )
+        role = next((value for expected, value in roles if isinstance(payload, expected)), None)
+        if role is None:
+            raise AuditError("audit payload must be a validated agent protocol")
+        return self._write_json(
+            self._artifact_path("payload-", name),
+            {"role": role, "payload": asdict(payload)},
+        )
+
+
+def verify_audit_chain(path: Path) -> tuple[dict[str, object], ...]:
+    """Verify exact event ordering and every previous/current SHA-256 link."""
+    if not isinstance(path, Path):
+        raise AuditError("audit chain path must be a Path")
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or _has_reparse_point(path)
+            or info.st_nlink != 1
+            or info.st_size > _AUDIT_CHAIN_LIMIT
+        ):
+            raise AuditError("audit hash chain is not a bounded private regular file")
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise AuditError("audit hash chain cannot be read") from exc
+    expected_keys = {
+        "sequence",
+        "timestamp_utc",
+        "state",
+        "event",
+        "details",
+        "previous_sha256",
+        "event_sha256",
+    }
+    records: list[dict[str, object]] = []
+    previous = _AUDIT_ZERO_HASH
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise AuditError("audit hash chain is not UTF-8") from exc
+    if not lines:
+        raise AuditError("audit hash chain is empty")
+    for sequence, line in enumerate(lines, start=1):
+        try:
+            value = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
+        except (json.JSONDecodeError, ProtocolValidationError) as exc:
+            raise AuditError("audit hash chain contains malformed JSON") from exc
+        if not isinstance(value, dict) or set(value) != expected_keys:
+            raise AuditError("audit hash chain record shape is invalid")
+        if value["sequence"] != sequence or value["previous_sha256"] != previous:
+            raise AuditError("audit hash chain sequence or previous hash is invalid")
+        try:
+            LoopState(value["state"])
+            _safe_audit_fact(value["event"], "audit event")
+            _closed_audit_value(value["details"])
+        except (ValueError, AuditError) as exc:
+            raise AuditError("audit hash chain contains an invalid closed fact") from exc
+        core = {key: item for key, item in value.items() if key != "event_sha256"}
+        digest = hashlib.sha256(_canonical_json_bytes(core)).hexdigest()
+        if value["event_sha256"] != digest:
+            raise AuditError("audit hash chain digest is invalid")
+        previous = digest
+        records.append(value)
+    return tuple(records)
