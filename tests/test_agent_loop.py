@@ -522,6 +522,132 @@ def test_task3_audit_events_reject_free_form_or_secret_facts(
         )
 
 
+def test_task3_handoff_exports_exact_inert_diff_and_hashes(tmp_path: Path) -> None:
+    """Break caught: proposal handoff could mutate source or export unverifiable candidate bytes."""
+    from agent_loop import (
+        AuditTrail,
+        dispose_candidate,
+        export_candidate,
+        export_inert_handoff,
+        preflight_source,
+    )
+
+    repo = _task2_repo(tmp_path)
+    source_before = (repo / "core" / "backtest_engine.py").read_bytes()
+    with tempfile.TemporaryDirectory(prefix="agent-loop-task3-handoff-") as controller_name:
+        controller = Path(controller_name)
+        state = preflight_source(
+            repo, acquire_lock=False, controller_temp_parent=controller,
+        )
+        candidate = export_candidate(state)
+        (candidate.root / "core" / "backtest_engine.py").write_text(
+            "VALUE = 2\n", encoding="utf-8", newline="\n"
+        )
+        audit = AuditTrail((tmp_path / "audit").resolve(), "run-12345678")
+        handoff = export_inert_handoff(candidate, audit, gate="test")
+
+        diff = handoff.diff_path.read_bytes()
+        metadata = json.loads(handoff.metadata_path.read_text(encoding="utf-8"))
+        assert hashlib.sha256(diff).hexdigest() == handoff.diff_sha256
+        assert metadata["diff_sha256"] == handoff.diff_sha256
+        assert metadata["candidate_manifest_sha256"] == handoff.candidate_manifest_sha256
+        assert metadata["base_head"] == state.head == candidate.source_head
+        assert handoff.files == ("core/backtest_engine.py",)
+        assert b"-VALUE = 1" in diff and b"+VALUE = 2" in diff
+        assert (repo / "core" / "backtest_engine.py").read_bytes() == source_before
+        assert candidate.root.is_dir()
+        if os.name != "nt":
+            assert handoff.diff_path.stat().st_mode & 0o111 == 0
+        dispose_candidate(candidate)
+
+
+def test_task3_handoff_rejects_secret_shaped_candidate_diff(tmp_path: Path) -> None:
+    """Break caught: a generated patch could smuggle a credential through the inert export."""
+    from agent_loop import (
+        AuditError,
+        AuditTrail,
+        dispose_candidate,
+        export_candidate,
+        export_inert_handoff,
+        preflight_source,
+    )
+
+    repo = _task2_repo(tmp_path)
+    with tempfile.TemporaryDirectory(prefix="agent-loop-task3-handoff-") as controller_name:
+        controller = Path(controller_name)
+        state = preflight_source(
+            repo, acquire_lock=False, controller_temp_parent=controller,
+        )
+        candidate = export_candidate(state)
+        (candidate.root / "core" / "backtest_engine.py").write_text(
+            'VALUE = 1\nAPI_KEY = "sk-or-v1-abcdefghijklmnopqrstuvwxyz012345"\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        audit = AuditTrail((tmp_path / "audit").resolve(), "run-12345678")
+        with pytest.raises(AuditError, match="credential|redaction"):
+            export_inert_handoff(candidate, audit, gate="test")
+        assert not (audit.run_root / "candidate.diff").exists()
+        dispose_candidate(candidate)
+
+
+@pytest.mark.parametrize("retain_candidate", (False, True))
+def test_task3_cleanup_releases_source_lock_and_obeys_retention(
+    tmp_path: Path,
+    retain_candidate: bool,
+) -> None:
+    """Break caught: cleanup could leak quarantine, retain a lock, or erase a requested handoff."""
+    from agent_loop import (
+        cleanup_run_resources,
+        dispose_candidate,
+        export_candidate,
+        preflight_source,
+    )
+
+    repo = _task2_repo(tmp_path)
+    with tempfile.TemporaryDirectory(prefix="agent-loop-task3-cleanup-") as controller_name:
+        controller = Path(controller_name)
+        state = preflight_source(repo, controller_temp_parent=controller)
+        candidate = export_candidate(state)
+        candidate_root = candidate.root
+        cleanup = cleanup_run_resources(
+            state,
+            candidate,
+            retain_candidate=retain_candidate,
+        )
+        assert cleanup.cleanup_complete
+        assert cleanup.source_lock_released
+        assert cleanup.quarantine_retained is retain_candidate
+        assert cleanup.candidate_removed is (not retain_candidate)
+        assert candidate_root.exists() is retain_candidate
+        reacquired = preflight_source(
+            repo, controller_temp_parent=controller, acquire_lock=True,
+        )
+        reacquired.close()
+        if retain_candidate:
+            dispose_candidate(candidate)
+
+
+def test_task3_cleanup_reports_external_source_change_without_overwriting_it(
+    tmp_path: Path,
+) -> None:
+    """Break caught: final cleanup could reset or conceal a concurrent source modification."""
+    from agent_loop import cleanup_run_resources, export_candidate, preflight_source
+
+    repo = _task2_repo(tmp_path)
+    with tempfile.TemporaryDirectory(prefix="agent-loop-task3-cleanup-") as controller_name:
+        controller = Path(controller_name)
+        state = preflight_source(repo, controller_temp_parent=controller)
+        candidate = export_candidate(state)
+        changed = repo / "core" / "backtest_engine.py"
+        changed.write_text("EXTERNAL = 99\n", encoding="utf-8", newline="\n")
+
+        cleanup = cleanup_run_resources(state, candidate, retain_candidate=False)
+        assert cleanup.source_modified
+        assert changed.read_text(encoding="utf-8") == "EXTERNAL = 99\n"
+        assert cleanup.source_lock_released and cleanup.candidate_removed
+
+
 def test_protocol_rejects_duplicate_and_unknown_json_keys() -> None:
     """Break caught: permissive JSON parsing could hide conflicting model instructions."""
     from agent_loop import ProtocolValidationError, Route

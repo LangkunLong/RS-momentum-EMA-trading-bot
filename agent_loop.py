@@ -4910,6 +4910,30 @@ class AuditTrail:
             {"role": role, "payload": asdict(payload)},
         )
 
+    def write_inert_diff(self, raw: str) -> tuple[Path, str]:
+        """Persist one exact sanitized diff as inert bytes; never execute or apply the export."""
+        if not isinstance(raw, str) or not raw:
+            raise AuditError("inert candidate diff must be nonblank text")
+        normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+        sanitized = sanitize_untrusted_text(
+            normalized,
+            known_secrets=self._known_secrets,
+            max_bytes=_MAX_DIFF_BYTES,
+        )
+        if (
+            sanitized.truncated
+            or sanitized.redaction_count
+            or sanitized.text != normalized
+        ):
+            raise AuditError("candidate diff requires credential redaction or normalization")
+        payload = normalized.encode("utf-8")
+        path = self.run_root / "candidate.diff"
+        _atomic_write_audit(path, payload)
+        return path, hashlib.sha256(payload).hexdigest()
+
+    def write_handoff_metadata(self, value: Mapping[str, object]) -> Path:
+        return self._write_json(self.run_root / "handoff.json", value)
+
 
 def verify_audit_chain(path: Path) -> tuple[dict[str, object], ...]:
     """Verify exact event ordering and every previous/current SHA-256 link."""
@@ -4967,3 +4991,222 @@ def verify_audit_chain(path: Path) -> tuple[dict[str, object], ...]:
         previous = digest
         records.append(value)
     return tuple(records)
+
+
+def _candidate_tracked_manifest_sha256(candidate: Candidate) -> str:
+    root = _require_candidate(candidate)
+    if tuple(sorted(_tracked_paths(root))) != tuple(sorted(candidate.tracked_files)):
+        raise QuarantineError("candidate tracked paths differ from its captured manifest")
+    status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
+    for record in status.split(b"\0"):
+        if record and (len(record) < 4 or record[:3] != b" M "):
+            raise QuarantineError("candidate contains staged, untracked, or structural changes")
+    index = _git(root, "ls-files", "-s", "-z").stdout
+    modes: dict[str, str] = {}
+    for entry in index.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            fields = entry.decode("utf-8").split(None, 3)
+        except UnicodeDecodeError as exc:
+            raise QuarantineError("candidate index path is not UTF-8") from exc
+        if len(fields) != 4 or fields[2] != "0" or fields[0] not in {"100644", "100755"}:
+            raise QuarantineError("candidate index has an unsupported tracked entry")
+        modes[fields[3]] = fields[0]
+    digest = hashlib.sha256()
+    for relative in sorted(candidate.tracked_files):
+        canonical = canonical_patch_path(relative)
+        path = root / canonical
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise QuarantineError("candidate tracked file cannot be inspected") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or _has_reparse_point(path)
+            or info.st_nlink != 1
+            or canonical not in modes
+        ):
+            raise QuarantineError("candidate manifest contains an unsafe tracked file")
+        digest.update(canonical.encode("utf-8") + b"\0")
+        digest.update(modes[canonical].encode("ascii") + b"\0")
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class HandoffArtifact:
+    diff_path: Path
+    metadata_path: Path
+    base_head: str
+    candidate_manifest_sha256: str
+    diff_sha256: str
+    files: tuple[str, ...]
+    provider_safe: bool = True
+
+    def __post_init__(self) -> None:
+        _absolute_configuration_path(self.diff_path, "handoff diff path")
+        _absolute_configuration_path(self.metadata_path, "handoff metadata path")
+        if re.fullmatch(r"[0-9a-f]{40,64}", self.base_head) is None:
+            raise ConfigurationError("handoff base head is invalid")
+        for value in (self.candidate_manifest_sha256, self.diff_sha256):
+            if _SHA256_RE.fullmatch(value) is None:
+                raise ConfigurationError("handoff digest is invalid")
+        if not isinstance(self.files, tuple) or not self.files:
+            raise ConfigurationError("handoff files must be a nonempty immutable tuple")
+        for value in self.files:
+            _configuration_relative_path(value, "handoff file")
+        if self.provider_safe is not True:
+            raise ConfigurationError("handoff observation must be provider-safe")
+
+
+def export_inert_handoff(
+    candidate: Candidate,
+    audit: AuditTrail,
+    *,
+    gate: str,
+    editable_paths: Sequence[str] = (),
+) -> HandoffArtifact:
+    """Validate and export the candidate diff without applying it outside quarantine."""
+    if not isinstance(audit, AuditTrail):
+        raise ConfigurationError("handoff requires an AuditTrail")
+    root = _require_candidate(candidate)
+    before = _candidate_tracked_manifest_sha256(candidate)
+    result = _git(
+        root,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--full-index",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--",
+    )
+    if result.stderr:
+        raise QuarantineError("candidate diff emitted unexpected stderr")
+    try:
+        raw = result.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise QuarantineError("candidate diff is not UTF-8") from exc
+    if not raw:
+        raise QuarantineError("candidate has no diff to hand off")
+    parsed = _parse_unified_diff(raw)
+    validate_unified_diff(
+        root,
+        raw,
+        parsed.files,
+        editable_paths=editable_paths,
+        gate=gate,
+    )
+    after = _candidate_tracked_manifest_sha256(candidate)
+    if after != before:
+        raise CandidateMutationError("candidate changed while its handoff was exported")
+    diff_path, diff_sha256 = audit.write_inert_diff(raw)
+    metadata = {
+        "schema_version": 1,
+        "kind": "inert_candidate_diff",
+        "base_head": candidate.source_head,
+        "candidate_manifest_sha256": after,
+        "diff_sha256": diff_sha256,
+        "diff_byte_count": len(raw.encode("utf-8")),
+        "files": parsed.files,
+        "gate": gate,
+        "security_attestation": False,
+    }
+    metadata_path = audit.write_handoff_metadata(metadata)
+    return HandoffArtifact(
+        diff_path=diff_path,
+        metadata_path=metadata_path,
+        base_head=candidate.source_head,
+        candidate_manifest_sha256=after,
+        diff_sha256=diff_sha256,
+        files=parsed.files,
+    )
+
+
+def dispose_candidate(candidate: Candidate) -> None:
+    """Remove exactly one controller-owned quarantine and revoke its capability."""
+    root = _require_candidate(candidate)
+    parent = candidate.controller_temp_parent.resolve()
+    if root.parent != parent or not root.name.startswith("agent-loop-candidate-"):
+        raise QuarantineError("candidate cleanup target is outside its controller parent")
+    _remove_private_tree(root)
+    if root.exists() or root.is_symlink():
+        raise QuarantineError("candidate cleanup did not remove the exact quarantine root")
+    _CANDIDATE_CAPABILITIES.pop(root, None)
+
+
+@dataclass(frozen=True)
+class CleanupObservation:
+    candidate_removed: bool
+    quarantine_retained: bool
+    source_modified: bool
+    source_lock_released: bool
+    cleanup_complete: bool
+    failure_codes: tuple[str, ...]
+    provider_safe: bool = True
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("candidate_removed", self.candidate_removed),
+            ("quarantine_retained", self.quarantine_retained),
+            ("source_modified", self.source_modified),
+            ("source_lock_released", self.source_lock_released),
+            ("cleanup_complete", self.cleanup_complete),
+            ("provider_safe", self.provider_safe),
+        ):
+            if type(value) is not bool:
+                raise ConfigurationError(f"{field} must be boolean")
+        allowed = {"candidate_cleanup_failed", "source_lock_release_failed"}
+        if (
+            not isinstance(self.failure_codes, tuple)
+            or len(set(self.failure_codes)) != len(self.failure_codes)
+            or any(value not in allowed for value in self.failure_codes)
+        ):
+            raise ConfigurationError("cleanup failure codes are invalid")
+        if self.provider_safe is not True:
+            raise ConfigurationError("cleanup observation must be provider-safe")
+
+
+def cleanup_run_resources(
+    state: SourceState,
+    candidate: Candidate | None,
+    *,
+    retain_candidate: bool,
+) -> CleanupObservation:
+    """Release controller-owned resources and report, never overwrite, external source changes."""
+    if not isinstance(state, SourceState) or type(retain_candidate) is not bool:
+        raise ConfigurationError("cleanup requires SourceState and an explicit retention flag")
+    failures: list[str] = []
+    candidate_removed = False
+    quarantine_retained = candidate is not None and retain_candidate
+    candidate_handled = candidate is None or retain_candidate
+    if candidate is not None and not retain_candidate:
+        try:
+            dispose_candidate(candidate)
+            candidate_removed = True
+            candidate_handled = True
+        except (ConfigurationError, QuarantineError, OSError):
+            failures.append("candidate_cleanup_failed")
+    recheck = recheck_source_unchanged(state)
+    lock = state.lock
+    try:
+        state.close()
+    except OSError:
+        failures.append("source_lock_release_failed")
+    source_lock_released = lock is None or lock._stream is None
+    if not source_lock_released and "source_lock_release_failed" not in failures:
+        failures.append("source_lock_release_failed")
+    cleanup_complete = candidate_handled and source_lock_released and not failures
+    return CleanupObservation(
+        candidate_removed=candidate_removed,
+        quarantine_retained=quarantine_retained,
+        source_modified=recheck.source_modified,
+        source_lock_released=source_lock_released,
+        cleanup_complete=cleanup_complete,
+        failure_codes=tuple(failures),
+    )
