@@ -2089,6 +2089,7 @@ class FaithfulSandboxEngine:
                 "HostConfig": {
                     "NetworkMode": "none",
                     "ReadonlyRootfs": True,
+                    "OomKillDisable": False,
                     "CapDrop": ["ALL"],
                     "CapAdd": [],
                     "Privileged": False,
@@ -2308,6 +2309,81 @@ def test_container_attestation_normalizes_only_docker_null_capability_lists(
 
     assert result.gate_observation is True
     assert result.observed_exit_zero is True
+    assert engine.removed and engine.absence_verified
+
+
+def test_container_config_hash_normalizes_oom_kill_disable_null_after_start(
+    tmp_path: Path,
+) -> None:
+    """Docker reports the enabled OOM killer as false before start and null after exit."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+
+    def clear_oom_kill_disable_after_start(item: dict[str, Any]) -> None:
+        if engine.started:
+            item["HostConfig"]["OomKillDisable"] = None
+
+    engine.mutate_inspection = clear_oom_kill_disable_after_start
+
+    result = run_test_gate(candidate, _faithful_runner(image, engine))
+
+    assert result.gate_observation is True
+    assert result.observed_exit_zero is True
+    assert engine.removed and engine.absence_verified
+
+
+def test_container_config_hash_canonicalizes_mount_order_after_exact_validation(
+    tmp_path: Path,
+) -> None:
+    """Docker may reorder otherwise identical inspected mounts after the container exits."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+
+    def reverse_mounts_after_start(item: dict[str, Any]) -> None:
+        if engine.started:
+            item["Mounts"].reverse()
+
+    engine.mutate_inspection = reverse_mounts_after_start
+
+    result = run_test_gate(candidate, _faithful_runner(image, engine))
+
+    assert result.gate_observation is True
+    assert result.observed_exit_zero is True
+    assert engine.removed and engine.absence_verified
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        pytest.param(lambda host: host.pop("OomKillDisable"), id="missing"),
+        pytest.param(lambda host: host.update(OomKillDisable=True), id="true"),
+        pytest.param(lambda host: host.update(OomKillDisable=0), id="integer-zero"),
+        pytest.param(lambda host: host.update(OomKillDisable="false"), id="string-false"),
+    ],
+)
+def test_container_attestation_rejects_nonboolean_or_missing_oom_kill_policy(
+    tmp_path: Path,
+    mutator: Any,
+) -> None:
+    """Break caught: a missing or truthy/equality-compatible OOM policy was trusted."""
+    from agent_loop import SandboxError, export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    engine.mutate_inspection = lambda item: mutator(item["HostConfig"])
+
+    with pytest.raises(SandboxError):
+        run_test_gate(candidate, _faithful_runner(image, engine))
     assert engine.removed and engine.absence_verified
 
 

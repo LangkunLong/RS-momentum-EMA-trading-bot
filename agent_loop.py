@@ -2502,9 +2502,16 @@ class SandboxRunner:
         for key in ("CapAdd", "DeviceRequests"):
             if key in normalized_host and normalized_host[key] is None:
                 normalized_host[key] = []
+        if "OomKillDisable" not in normalized_host or (
+            normalized_host["OomKillDisable"] is not False
+            and normalized_host["OomKillDisable"] is not None
+        ):
+            raise SandboxError("created container OOM-kill policy differs")
+        normalized_host["OomKillDisable"] = False
         expected_host = {
             "NetworkMode": "none",
             "ReadonlyRootfs": True,
+            "OomKillDisable": False,
             "PidsLimit": 64,
             "Memory": 1024 * 1024 * 1024,
             "NanoCpus": 1_000_000_000,
@@ -2639,12 +2646,16 @@ class SandboxRunner:
             actual_mounts.add((str(Path(str(mount["Source"])).resolve()), mount["Destination"], mount["RW"], mount["Mode"]))
         if actual_mounts != expected_mounts:
             raise SandboxError("created container mount differs from controller contract")
+        normalized_mounts = sorted(
+            (dict(mount) for mount in mounts),
+            key=lambda mount: mount["Destination"],
+        )
         normalized_config = dict(config)
         normalized_config["Env"] = dict(value.split("=", 1) for value in actual_environment)
         attested = {
             "Config": normalized_config,
             "HostConfig": normalized_host,
-            "Mounts": mounts,
+            "Mounts": normalized_mounts,
             "Image": item["Image"],
             "NetworkSettings": normalized_network,
         }
