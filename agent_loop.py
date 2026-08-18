@@ -28,6 +28,7 @@ from urllib.parse import quote
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, BinaryIO, Callable, Generic, Mapping, Protocol, Sequence, TypeVar
@@ -3831,3 +3832,500 @@ def run_hidden_backtest_worker(
         raise GateConfigurationError("SimulationResult contains non-finite metrics")
     print(BACKTEST_SENTINEL + json.dumps(payload, sort_keys=True, separators=(",", ":")))
     return 0
+
+
+class LoopState(str, Enum):
+    """Closed controller states; model output can never introduce a new transition name."""
+
+    PREPARE = "prepare"
+    RUN_PRIMARY_GATE = "run_primary_gate"
+    RUN_FINAL_QUALITY = "run_final_quality"
+    CALL_ORCHESTRATOR = "call_orchestrator"
+    CALL_REASONER = "call_reasoner"
+    CALL_CODER = "call_coder"
+    VALIDATE_PROPOSAL = "validate_proposal"
+    RECORD_SKIP = "record_skip"
+    RECORD_REJECTION = "record_rejection"
+    EXPORT_DIFF = "export_diff"
+    APPLY_TO_CANDIDATE = "apply_to_candidate"
+    NEXT_ITERATION = "next_iteration"
+    FINISH_GATE_OBSERVED = "finish_gate_observed"
+    FINISH_PROPOSAL_EXPORTED = "finish_proposal_exported"
+    FINISH_AGENT_ABORTED = "finish_agent_aborted"
+    FINISH_LIMITS_EXHAUSTED = "finish_limits_exhausted"
+    FINISH_CONTROLLER_ERROR = "finish_controller_error"
+
+
+class TerminalStatus(str, Enum):
+    """Stable machine-readable outcomes and their CLI exit-code contract."""
+
+    GATE_OBSERVED_PASS = "gate_observed_pass"
+    PROPOSAL_EXPORTED = "proposal_exported"
+    AGENT_ABORTED = "agent_aborted"
+    LIMITS_EXHAUSTED = "limits_exhausted"
+    CONTROLLER_ERROR = "controller_error"
+
+
+_TERMINAL_CONTRACT = MappingProxyType(
+    {
+        LoopState.FINISH_GATE_OBSERVED: (TerminalStatus.GATE_OBSERVED_PASS, 0),
+        LoopState.FINISH_PROPOSAL_EXPORTED: (TerminalStatus.PROPOSAL_EXPORTED, 10),
+        LoopState.FINISH_AGENT_ABORTED: (TerminalStatus.AGENT_ABORTED, 20),
+        LoopState.FINISH_LIMITS_EXHAUSTED: (TerminalStatus.LIMITS_EXHAUSTED, 21),
+        LoopState.FINISH_CONTROLLER_ERROR: (TerminalStatus.CONTROLLER_ERROR, 22),
+    }
+)
+_MODEL_SLUG_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+)
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}")
+_SOURCE_SNAPSHOT_LIMIT = 32 * 1024
+_SOURCE_FILE_LIMIT = 1024 * 1024
+_PROVIDER_GATE_KINDS = frozenset({"test", "backtest", "quality"})
+_PROVIDER_GATE_OUTCOMES = frozenset(
+    {
+        "exit_zero",
+        "exit_nonzero",
+        "timed_out",
+        "thresholds_met",
+        "thresholds_not_met",
+        "sentinel_invalid",
+        "source_modified",
+        "worker_unconfined",
+        "controller_error",
+    }
+)
+_PROVIDER_FAILURE_CODES = frozenset(
+    {
+        "pytest_failed",
+        "backtest_failed",
+        "ruff_failed",
+        "compile_failed",
+        "diff_check_failed",
+        "process_failed",
+        "timed_out",
+        "thresholds_not_met",
+        "sentinel_invalid",
+        "source_modified",
+        "worker_unconfined",
+        "security_unattested",
+    }
+)
+
+
+def _configuration_relative_path(value: object, field: str) -> str:
+    try:
+        return _relative_path(value, field)
+    except ProtocolValidationError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
+def _configuration_symbol(value: object, field: str) -> str:
+    try:
+        return _validate_symbol(value)  # type: ignore[arg-type]
+    except DataBundleError as exc:
+        raise ConfigurationError(f"{field} must be a canonical symbol") from exc
+
+
+def _absolute_configuration_path(value: object, field: str) -> Path:
+    if not isinstance(value, Path) or not value.is_absolute():
+        raise ConfigurationError(f"{field} must be an absolute Path")
+    return value.resolve(strict=False)
+
+
+def _configuration_paths_overlap(first: Path, second: Path) -> bool:
+    try:
+        first.relative_to(second)
+        return True
+    except ValueError:
+        pass
+    try:
+        second.relative_to(first)
+        return True
+    except ValueError:
+        return False
+
+
+def _finite_positive(value: object, field: str) -> float:
+    if type(value) not in {int, float} or not math.isfinite(value) or value <= 0:
+        raise ConfigurationError(f"{field} must be finite and positive")
+    return float(value)
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Exact OpenRouter model slugs selected by the operator-controlled controller."""
+
+    orchestrator: str = ORCHESTRATOR_MODEL
+    reasoner: str = REASONER_MODEL
+    coder: str = CODER_MODEL
+
+    def __post_init__(self) -> None:
+        for value in (self.orchestrator, self.reasoner, self.coder):
+            if not isinstance(value, str) or _MODEL_SLUG_RE.fullmatch(value) is None:
+                raise ConfigurationError("model slug must be provider/model")
+
+
+@dataclass(frozen=True)
+class LoopLimits:
+    """Controller-owned hard ceilings; the CLI may lower but never raise these limits."""
+
+    max_usd: float
+    max_iterations: int = MAX_ITERATIONS
+    max_api_calls: int = DEFAULT_MAX_CALLS
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    api_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    child_timeout_seconds: float = 300.0
+    wall_timeout_seconds: float = 3600.0
+    output_limit_bytes: int = 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if type(self.max_iterations) is not int or not 0 <= self.max_iterations <= MAX_ITERATIONS:
+            raise ConfigurationError(f"max iterations must be between 0 and {MAX_ITERATIONS}")
+        if type(self.max_api_calls) is not int or not 1 <= self.max_api_calls <= DEFAULT_MAX_CALLS:
+            raise ConfigurationError("max_api_calls is outside the hard controller limit")
+        if type(self.max_tokens) is not int or not 1 <= self.max_tokens <= DEFAULT_MAX_TOKENS:
+            raise ConfigurationError("max_tokens is outside the hard controller limit")
+        _finite_positive(self.max_usd, "max_usd")
+        _finite_positive(self.api_timeout_seconds, "API timeout")
+        _finite_positive(self.child_timeout_seconds, "child timeout")
+        _finite_positive(self.wall_timeout_seconds, "wall timeout")
+        if (
+            type(self.output_limit_bytes) is not int
+            or not 1 <= self.output_limit_bytes <= 4 * 1024 * 1024
+        ):
+            raise ConfigurationError("output_limit_bytes is outside the hard controller limit")
+
+
+@dataclass(frozen=True)
+class TestGateConfig:
+    """Optional fixed pytest file selection; an empty tuple means the complete test suite."""
+
+    selectors: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selectors, tuple):
+            raise ConfigurationError("test selectors must be an immutable tuple")
+        if len(self.selectors) > 32:
+            raise ConfigurationError("too many test selectors")
+        normalized: list[str] = []
+        for value in self.selectors:
+            path = _configuration_relative_path(value, "test selector")
+            if re.fullmatch(r"tests/(?:[A-Za-z0-9_.-]+/)*test_[A-Za-z0-9_.-]+\.py", path) is None:
+                raise ConfigurationError("test selector must match tests/.../test_*.py")
+            normalized.append(path)
+        if len(set(normalized)) != len(normalized):
+            raise ConfigurationError("duplicate test selector")
+        object.__setattr__(self, "selectors", tuple(normalized))
+
+
+@dataclass(frozen=True)
+class BacktestGateConfig:
+    """Immutable identity for one approved, technical-only historical simulation."""
+
+    tickers: tuple[str, ...]
+    benchmark: str
+    start_date: str
+    end_date: str
+    historical_data_bundle: Path
+    historical_data_sha256: str
+    thresholds: BacktestThresholds
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tickers, tuple):
+            raise ConfigurationError("backtest tickers must be an immutable tuple")
+        if not self.tickers or len(self.tickers) > 128:
+            raise ConfigurationError("backtest requires 1 to 128 tickers")
+        symbols = tuple(_configuration_symbol(value, "ticker") for value in self.tickers)
+        if len(set(symbols)) != len(symbols):
+            raise ConfigurationError("duplicate backtest ticker")
+        benchmark = _configuration_symbol(self.benchmark, "benchmark")
+        if benchmark in symbols:
+            raise ConfigurationError("benchmark must not be duplicated in tickers")
+        try:
+            start = date.fromisoformat(self.start_date)
+            end = date.fromisoformat(self.end_date)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError("backtest dates must be ISO calendar dates") from exc
+        if start >= end:
+            raise ConfigurationError("backtest date range must have start before end")
+        bundle = _absolute_configuration_path(
+            self.historical_data_bundle, "historical_data_bundle"
+        )
+        if not isinstance(self.historical_data_sha256, str) or _SHA256_RE.fullmatch(
+            self.historical_data_sha256
+        ) is None:
+            raise ConfigurationError("historical_data_sha256 must be lowercase SHA-256")
+        if not isinstance(self.thresholds, BacktestThresholds):
+            raise ConfigurationError("thresholds must be BacktestThresholds")
+        object.__setattr__(self, "tickers", symbols)
+        object.__setattr__(self, "benchmark", benchmark)
+        object.__setattr__(self, "historical_data_bundle", bundle)
+
+
+@dataclass(frozen=True)
+class ProviderGateEvidence:
+    """Closed provider-safe gate facts; worker output and exception strings are never present."""
+
+    gate_kind: str
+    outcome: str
+    gate_observation: bool
+    observed_exit_zero: bool
+    worker_confined: bool
+    returncode: int
+    stdout_sha256: str
+    stderr_sha256: str
+    failure_codes: tuple[str, ...] = ()
+    provider_safe: bool = True
+
+    def __post_init__(self) -> None:
+        if self.gate_kind not in _PROVIDER_GATE_KINDS:
+            raise ConfigurationError("gate kind is not allowed")
+        if self.outcome not in _PROVIDER_GATE_OUTCOMES:
+            raise ConfigurationError("gate outcome is not allowed")
+        for field, value in (
+            ("gate_observation", self.gate_observation),
+            ("observed_exit_zero", self.observed_exit_zero),
+            ("worker_confined", self.worker_confined),
+            ("provider_safe", self.provider_safe),
+        ):
+            if type(value) is not bool:
+                raise ConfigurationError(f"{field} must be boolean")
+        if self.provider_safe is not True:
+            raise ConfigurationError("provider evidence must be provider-safe")
+        if type(self.returncode) is not int or not -255 <= self.returncode <= 255:
+            raise ConfigurationError("returncode is outside the bounded range")
+        for name, value in (
+            ("stdout_sha256", self.stdout_sha256),
+            ("stderr_sha256", self.stderr_sha256),
+        ):
+            if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+                raise ConfigurationError(f"{name} must be lowercase SHA-256")
+        if not isinstance(self.failure_codes, tuple):
+            raise ConfigurationError("failure codes must be an immutable tuple")
+        if len(self.failure_codes) > 16 or len(set(self.failure_codes)) != len(
+            self.failure_codes
+        ):
+            raise ConfigurationError("failure codes must be unique and bounded")
+        if any(value not in _PROVIDER_FAILURE_CODES for value in self.failure_codes):
+            raise ConfigurationError("failure code is not allowed")
+        if self.gate_observation and not (self.observed_exit_zero and self.worker_confined):
+            raise ConfigurationError(
+                "successful gate observation requires exit zero and a confined worker"
+            )
+
+
+@dataclass(frozen=True)
+class SourceSnapshot:
+    """Controller-read, bounded source excerpt explicitly safe for a provider prompt."""
+
+    path: str
+    sha256: str
+    byte_count: int
+    line_count: int
+    selected_start_line: int
+    selected_end_line: int
+    truncated: bool
+    sanitized_text: str
+    provider_safe: bool = True
+
+    def __post_init__(self) -> None:
+        path = _configuration_relative_path(self.path, "source snapshot path")
+        if _credential_like_tracked_path(path):
+            raise ConfigurationError("source snapshot path is credential-like")
+        if not isinstance(self.sha256, str) or _SHA256_RE.fullmatch(self.sha256) is None:
+            raise ConfigurationError("source snapshot sha256 must be lowercase SHA-256")
+        if type(self.byte_count) is not int or not 0 <= self.byte_count <= _SOURCE_FILE_LIMIT:
+            raise ConfigurationError("source snapshot byte_count is outside the limit")
+        if type(self.line_count) is not int or self.line_count < 1:
+            raise ConfigurationError("source snapshot line_count must be positive")
+        if (
+            type(self.selected_start_line) is not int
+            or type(self.selected_end_line) is not int
+            or not 1 <= self.selected_start_line <= self.selected_end_line <= self.line_count
+        ):
+            raise ConfigurationError("source snapshot selected line range is invalid")
+        if type(self.truncated) is not bool or type(self.provider_safe) is not bool:
+            raise ConfigurationError("source snapshot flags must be boolean")
+        if self.provider_safe is not True:
+            raise ConfigurationError("source snapshot must be provider-safe")
+        if not isinstance(self.sanitized_text, str):
+            raise ConfigurationError("source snapshot text must be a string")
+        if len(self.sanitized_text.encode("utf-8")) > _SOURCE_SNAPSHOT_LIMIT:
+            raise ConfigurationError("source snapshot text exceeds the provider limit")
+        if any(
+            ord(character) < 32 and character not in "\t\n\r"
+            for character in self.sanitized_text
+        ):
+            raise ConfigurationError("source snapshot contains a control character")
+        object.__setattr__(self, "path", path)
+
+
+@dataclass(frozen=True)
+class QualityObservation:
+    """Provider-safe final-quality facts without process output or candidate-authored text."""
+
+    test_gate_passed: bool
+    ruff_passed: bool
+    compile_passed: bool
+    diff_check_passed: bool
+    failure_codes: tuple[str, ...] = ()
+    provider_safe: bool = True
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("test_gate_passed", self.test_gate_passed),
+            ("ruff_passed", self.ruff_passed),
+            ("compile_passed", self.compile_passed),
+            ("diff_check_passed", self.diff_check_passed),
+            ("provider_safe", self.provider_safe),
+        ):
+            if type(value) is not bool:
+                raise ConfigurationError(f"{field} must be boolean")
+        if self.provider_safe is not True:
+            raise ConfigurationError("quality observation must be provider-safe")
+        if not isinstance(self.failure_codes, tuple) or any(
+            value not in _PROVIDER_FAILURE_CODES for value in self.failure_codes
+        ):
+            raise ConfigurationError("quality failure code is not allowed")
+
+
+@dataclass(frozen=True)
+class BudgetSnapshot:
+    api_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    reserved_tokens: int
+    reserved_usd: float
+    spent_usd: float
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("api_calls", self.api_calls),
+            ("prompt_tokens", self.prompt_tokens),
+            ("completion_tokens", self.completion_tokens),
+            ("total_tokens", self.total_tokens),
+            ("reserved_tokens", self.reserved_tokens),
+        ):
+            if type(value) is not int or value < 0:
+                raise ConfigurationError(f"{field} must be a nonnegative integer")
+        if self.total_tokens != self.prompt_tokens + self.completion_tokens:
+            raise ConfigurationError("total_tokens must equal prompt plus completion tokens")
+        for field, value in (("reserved_usd", self.reserved_usd), ("spent_usd", self.spent_usd)):
+            if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+                raise ConfigurationError(f"{field} must be finite and nonnegative")
+
+
+@dataclass(frozen=True)
+class LoopConfig:
+    source_root: Path
+    permanent_runtime_root: Path
+    git_executable: Path
+    controller_temp_parent: Path
+    artifact_root: Path
+    mode: ExecutionMode
+    gate: TestGateConfig | BacktestGateConfig
+    models: ModelConfig
+    limits: LoopLimits
+
+    def __post_init__(self) -> None:
+        source = _absolute_configuration_path(self.source_root, "source_root")
+        runtime = _absolute_configuration_path(
+            self.permanent_runtime_root, "permanent runtime root"
+        )
+        git = _absolute_configuration_path(self.git_executable, "git_executable")
+        controller = _absolute_configuration_path(
+            self.controller_temp_parent, "controller_temp_parent"
+        )
+        artifacts = _absolute_configuration_path(self.artifact_root, "artifact_root")
+        if _configuration_paths_overlap(source, runtime):
+            raise ConfigurationError("permanent runtime root must not overlap source_root")
+        if not isinstance(self.mode, ExecutionMode):
+            raise ConfigurationError("mode must be ExecutionMode")
+        if not isinstance(self.gate, (TestGateConfig, BacktestGateConfig)):
+            raise ConfigurationError("gate must be a validated gate config")
+        if not isinstance(self.models, ModelConfig) or not isinstance(self.limits, LoopLimits):
+            raise ConfigurationError("models and limits must be validated configs")
+        object.__setattr__(self, "source_root", source)
+        object.__setattr__(self, "permanent_runtime_root", runtime)
+        object.__setattr__(self, "git_executable", git)
+        object.__setattr__(self, "controller_temp_parent", controller)
+        object.__setattr__(self, "artifact_root", artifacts)
+
+
+@dataclass(frozen=True)
+class LoopResult:
+    terminal_state: LoopState
+    status: TerminalStatus
+    exit_code: int
+    run_id: str
+    iterations_started: int
+    patches_applied: int
+    gate_observation: bool
+    worker_confined: bool
+    source_modified: bool
+    security_attestation: bool
+    budget: BudgetSnapshot
+    audit_path: Path
+    quarantine_path: Path | None
+    quarantine_retained: bool
+    handoff_artifacts: tuple[tuple[Path, str], ...]
+    cleanup_complete: bool
+
+    def __post_init__(self) -> None:
+        expected = _TERMINAL_CONTRACT.get(self.terminal_state)
+        if expected is None or expected != (self.status, self.exit_code):
+            raise ConfigurationError("terminal contract does not match state/status/exit code")
+        if not isinstance(self.run_id, str) or _RUN_ID_RE.fullmatch(self.run_id) is None:
+            raise ConfigurationError("run_id is not canonical")
+        for field, value in (
+            ("iterations_started", self.iterations_started),
+            ("patches_applied", self.patches_applied),
+        ):
+            if type(value) is not int or value < 0:
+                raise ConfigurationError(f"{field} must be nonnegative")
+        if self.iterations_started > MAX_ITERATIONS or self.patches_applied > self.iterations_started:
+            raise ConfigurationError("loop counters exceed the controller limit")
+        for field, value in (
+            ("gate_observation", self.gate_observation),
+            ("worker_confined", self.worker_confined),
+            ("source_modified", self.source_modified),
+            ("security_attestation", self.security_attestation),
+            ("quarantine_retained", self.quarantine_retained),
+            ("cleanup_complete", self.cleanup_complete),
+        ):
+            if type(value) is not bool:
+                raise ConfigurationError(f"{field} must be boolean")
+        if self.security_attestation is not False:
+            raise ConfigurationError("security_attestation must remain false")
+        if not isinstance(self.budget, BudgetSnapshot):
+            raise ConfigurationError("budget must be BudgetSnapshot")
+        audit = _absolute_configuration_path(self.audit_path, "audit_path")
+        quarantine: Path | None = None
+        if self.quarantine_path is not None:
+            quarantine = _absolute_configuration_path(self.quarantine_path, "quarantine_path")
+        if not isinstance(self.handoff_artifacts, tuple) or len(self.handoff_artifacts) > 16:
+            raise ConfigurationError("handoff_artifacts must be a bounded immutable tuple")
+        normalized_handoffs: list[tuple[Path, str]] = []
+        for artifact in self.handoff_artifacts:
+            if not isinstance(artifact, tuple) or len(artifact) != 2:
+                raise ConfigurationError("handoff artifact must contain path and SHA-256")
+            path, digest = artifact
+            normalized_path = _absolute_configuration_path(path, "handoff artifact path")
+            if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+                raise ConfigurationError("handoff artifact digest must be lowercase SHA-256")
+            normalized_handoffs.append((normalized_path, digest))
+        if self.status is TerminalStatus.GATE_OBSERVED_PASS and not (
+            self.gate_observation
+            and self.worker_confined
+            and not self.source_modified
+            and self.cleanup_complete
+        ):
+            raise ConfigurationError(
+                "successful terminal result requires a confined pass, unchanged source, and cleanup"
+            )
+        object.__setattr__(self, "audit_path", audit)
+        object.__setattr__(self, "quarantine_path", quarantine)
+        object.__setattr__(self, "handoff_artifacts", tuple(normalized_handoffs))
