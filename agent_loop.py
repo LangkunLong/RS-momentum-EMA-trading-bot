@@ -2933,6 +2933,23 @@ def _is_default_editable(path: str) -> bool:
     )
 
 
+def _is_provider_readable_path(path: str, extra_paths: Sequence[str] = ()) -> bool:
+    """Apply the controller-owned read policy before any candidate text reaches a provider."""
+    try:
+        canonical = canonical_patch_path(path)
+        extra = {canonical_patch_path(value) for value in extra_paths}
+    except PatchPolicyError:
+        return False
+    if _credential_like_tracked_path(canonical) or canonical.casefold() in {
+        value.casefold() for value in _DENIED_EXACT
+    }:
+        return False
+    readable_test = bool(
+        re.fullmatch(r"tests/(?:[A-Za-z0-9_.-]+/)*test_[A-Za-z0-9_.-]+\.py", canonical)
+    )
+    return _is_default_editable(canonical) or canonical in extra or readable_test
+
+
 @dataclass(frozen=True)
 class ParsedPatch:
     files: tuple[str, ...]
@@ -4191,8 +4208,11 @@ class QualityObservation:
                 raise ConfigurationError(f"{field} must be boolean")
         if self.provider_safe is not True:
             raise ConfigurationError("quality observation must be provider-safe")
-        if not isinstance(self.failure_codes, tuple) or any(
-            value not in _PROVIDER_FAILURE_CODES for value in self.failure_codes
+        if (
+            not isinstance(self.failure_codes, tuple)
+            or len(self.failure_codes) > 16
+            or len(set(self.failure_codes)) != len(self.failure_codes)
+            or any(value not in _PROVIDER_FAILURE_CODES for value in self.failure_codes)
         ):
             raise ConfigurationError("quality failure code is not allowed")
 
@@ -4610,7 +4630,7 @@ def read_candidate_source_snapshot(
         raise ConfigurationError("source snapshot path is invalid") from exc
     if canonical not in approved:
         raise ConfigurationError("source snapshot path is outside approved readable scope")
-    if _is_denied_path(canonical):
+    if _is_denied_path(canonical) and not _is_provider_readable_path(canonical):
         raise ConfigurationError("source snapshot path is permanently denied")
     if canonical not in candidate.tracked_files or _credential_like_tracked_path(canonical):
         raise ConfigurationError("source snapshot path is not an approved tracked source file")
@@ -5332,4 +5352,566 @@ def cleanup_run_resources(
         source_lock_released=source_lock_released,
         cleanup_complete=cleanup_complete,
         failure_codes=tuple(failures),
+    )
+
+
+class AgentGatewayProtocol(Protocol):
+    ledger: BudgetLedger
+
+    def request(
+        self,
+        role: str,
+        dynamic_input: str,
+        parser: Callable[[str], Any],
+    ) -> AgentCompletion[Any]: ...
+
+
+@dataclass(frozen=True)
+class LoopServices:
+    """Injected controller boundaries; tests can exercise the state machine without providers."""
+
+    gateway: AgentGatewayProtocol
+    run_primary_gate: Callable[[Candidate, int], ProviderGateEvidence]
+    run_final_quality: Callable[[Candidate, int], QualityObservation]
+    read_snapshots: Callable[[Candidate, tuple[str, ...]], tuple[SourceSnapshot, ...]]
+    compile_runner: Callable[[WorkerLayout, tuple[str, ...]], bool]
+    monotonic: Callable[[], float] = time.monotonic
+    known_secrets: tuple[str, ...] = ()
+    editable_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.run_primary_gate,
+            self.run_final_quality,
+            self.read_snapshots,
+            self.compile_runner,
+            self.monotonic,
+        ):
+            if not callable(value):
+                raise ConfigurationError("loop service boundary must be callable")
+        if not hasattr(self.gateway, "request") or not isinstance(
+            getattr(self.gateway, "ledger", None), BudgetLedger
+        ):
+            raise ConfigurationError("loop gateway must expose request and BudgetLedger")
+        if not isinstance(self.known_secrets, tuple) or any(
+            not isinstance(value, str) for value in self.known_secrets
+        ):
+            raise ConfigurationError("loop secrets must be an immutable string tuple")
+        try:
+            editable = tuple(canonical_patch_path(value) for value in self.editable_paths)
+        except PatchPolicyError as exc:
+            raise ConfigurationError("loop editable path is invalid") from exc
+        if len(set(editable)) != len(editable):
+            raise ConfigurationError("loop editable paths must be unique")
+        object.__setattr__(self, "editable_paths", editable)
+
+
+class _LoopLimitReached(RuntimeError):
+    pass
+
+
+def _budget_snapshot(ledger: BudgetLedger) -> BudgetSnapshot:
+    return BudgetSnapshot(
+        api_calls=ledger.calls,
+        prompt_tokens=ledger.prompt_tokens,
+        completion_tokens=ledger.completion_tokens,
+        total_tokens=ledger.prompt_tokens + ledger.completion_tokens,
+        reserved_tokens=ledger.reserved_tokens,
+        reserved_usd=ledger.reserved_usd,
+        spent_usd=ledger.spent_usd,
+    )
+
+
+def _provider_dynamic_payload(value: Mapping[str, object], secrets: Sequence[str]) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return sanitize_untrusted_text(
+        raw,
+        known_secrets=secrets,
+        max_bytes=_MAX_DIFF_BYTES,
+    ).text
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def export_inert_proposal(
+    candidate: Candidate,
+    audit: AuditTrail,
+    proposal: CodingProposal,
+    *,
+    gate: str,
+    editable_paths: Sequence[str] = (),
+) -> HandoffArtifact:
+    """Export one validated model proposal as inert bytes without mutating quarantine."""
+    if not isinstance(proposal, CodingProposal) or not isinstance(audit, AuditTrail):
+        raise ConfigurationError("proposal handoff requires validated proposal and audit")
+    root = _require_candidate(candidate)
+    before = _candidate_tracked_manifest_sha256(candidate)
+    parsed = validate_unified_diff(
+        root,
+        proposal.unified_diff,
+        proposal.files,
+        editable_paths=editable_paths,
+        gate=gate,
+    )
+    after = _candidate_tracked_manifest_sha256(candidate)
+    if after != before:
+        raise CandidateMutationError("candidate changed while proposal handoff was validated")
+    diff_path, diff_sha256 = audit.write_inert_diff(proposal.unified_diff)
+    metadata_path = audit.write_handoff_metadata(
+        {
+            "schema_version": 1,
+            "kind": "inert_model_proposal",
+            "base_head": candidate.source_head,
+            "candidate_manifest_sha256": after,
+            "diff_sha256": diff_sha256,
+            "diff_byte_count": len(proposal.unified_diff.encode("utf-8")),
+            "files": parsed.files,
+            "gate": gate,
+            "security_attestation": False,
+        }
+    )
+    return HandoffArtifact(
+        diff_path=diff_path,
+        metadata_path=metadata_path,
+        base_head=candidate.source_head,
+        candidate_manifest_sha256=after,
+        diff_sha256=diff_sha256,
+        files=parsed.files,
+    )
+
+
+def run_agent_loop(
+    config: LoopConfig,
+    state: SourceState,
+    candidate: Candidate,
+    audit: AuditTrail,
+    services: LoopServices,
+) -> LoopResult:
+    """Run the exact bounded proposal/refinement state machine against one quarantine."""
+    if not isinstance(config, LoopConfig) or not isinstance(state, SourceState):
+        raise ConfigurationError("agent loop requires validated config and source state")
+    if not isinstance(audit, AuditTrail) or not isinstance(services, LoopServices):
+        raise ConfigurationError("agent loop requires audit and injected services")
+    candidate_root = _require_candidate(candidate)
+    if (
+        state.root.resolve() != config.source_root
+        or state.head != candidate.source_head
+        or state.fingerprint is None
+        or state.lock is None
+        or state.lock._stream is None
+        or candidate_root.parent != config.controller_temp_parent
+        or audit.artifact_root != config.artifact_root
+    ):
+        raise ConfigurationError("agent loop ownership does not match validated configuration")
+    ledger = services.gateway.ledger
+    if (
+        ledger.max_calls != config.limits.max_api_calls
+        or ledger.max_tokens != config.limits.max_tokens
+        or ledger.max_usd != config.limits.max_usd
+    ):
+        raise ConfigurationError("gateway budget must exactly match loop limits")
+    gate_kind = "test" if isinstance(config.gate, TestGateConfig) else "backtest"
+    started = services.monotonic()
+    if type(started) not in {int, float} or not math.isfinite(started):
+        raise ConfigurationError("monotonic clock returned an invalid value")
+    deadline = float(started) + config.limits.wall_timeout_seconds
+    iterations_started = 0
+    patches_applied = 0
+    last_evidence: ProviderGateEvidence | None = None
+    handoff: HandoffArtifact | None = None
+    terminal_state: LoopState | None = None
+    controller_failure_code = "none"
+
+    def check_wall() -> None:
+        current = services.monotonic()
+        if type(current) not in {int, float} or not math.isfinite(current):
+            raise ConfigurationError("monotonic clock returned an invalid value")
+        if float(current) >= deadline:
+            raise _LoopLimitReached("wall deadline reached")
+
+    def emit(
+        loop_state: LoopState,
+        event: str,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        if loop_state not in _TERMINAL_CONTRACT:
+            check_wall()
+        audit.append_event(loop_state, event, details)
+
+    def call_role(
+        role: str,
+        dynamic: Mapping[str, object],
+        parser: Callable[[str], Any],
+        expected: type[object],
+    ) -> object:
+        check_wall()
+        if ledger.calls >= config.limits.max_api_calls:
+            raise _LoopLimitReached("API call limit reached")
+        completion = services.gateway.request(
+            role,
+            _provider_dynamic_payload(dynamic, services.known_secrets),
+            parser,
+        )
+        check_wall()
+        if not isinstance(completion, AgentCompletion) or not isinstance(
+            completion.payload, expected
+        ):
+            raise ResponseValidationError("gateway returned the wrong validated payload type")
+        return completion.payload
+
+    def load_snapshots(paths: tuple[str, ...]) -> tuple[SourceSnapshot, ...]:
+        approved = tuple(
+            dict.fromkeys(
+                path
+                for path in paths
+                if _is_provider_readable_path(path, services.editable_paths)
+            )
+        )
+        values = services.read_snapshots(candidate, approved)
+        if not isinstance(values, tuple) or len(values) > _MAX_FILES:
+            raise ConfigurationError("snapshot service returned an invalid collection")
+        seen: set[str] = set()
+        for value in values:
+            if (
+                not isinstance(value, SourceSnapshot)
+                or value.path not in approved
+                or value.path in seen
+            ):
+                raise ConfigurationError("snapshot service expanded or duplicated provider scope")
+            seen.add(value.path)
+        return values
+
+    def skip_iteration(role: str, code: str) -> None:
+        emit(
+            LoopState.RECORD_SKIP,
+            "iteration_skipped",
+            {"iteration": iterations_started, "role": role, "code": code},
+        )
+        emit(
+            LoopState.NEXT_ITERATION,
+            "next_iteration",
+            {"iteration": iterations_started},
+        )
+
+    def call_or_skip(
+        role: str,
+        dynamic: Mapping[str, object],
+        parser: Callable[[str], Any],
+        expected: type[object],
+    ) -> object | None:
+        nonlocal controller_failure_code, terminal_state
+        try:
+            return call_role(role, dynamic, parser, expected)
+        except BudgetExceededError:
+            raise _LoopLimitReached("provider budget reached") from None
+        except GatewayError as exc:
+            if exc.status_code in {400, 401, 402, 403, 422}:
+                controller_failure_code = "provider_fatal_error"
+                terminal_state = LoopState.FINISH_CONTROLLER_ERROR
+                return None
+            skip_iteration(role, "gateway_unavailable")
+            return None
+        except (ResponseValidationError, ProtocolValidationError):
+            skip_iteration(role, "malformed_response")
+            return None
+
+    try:
+        emit(LoopState.PREPARE, "prepared", {"iteration": 0, "gate": gate_kind})
+        while terminal_state is None:
+            check_wall()
+            if iterations_started >= config.limits.max_iterations:
+                controller_failure_code = "iteration_limit"
+                terminal_state = LoopState.FINISH_LIMITS_EXHAUSTED
+                break
+            iterations_started += 1
+            emit(
+                LoopState.RUN_PRIMARY_GATE,
+                "primary_gate_started",
+                {"iteration": iterations_started, "gate": gate_kind},
+            )
+            evidence = services.run_primary_gate(candidate, iterations_started)
+            if (
+                not isinstance(evidence, ProviderGateEvidence)
+                or evidence.gate_kind != gate_kind
+            ):
+                raise ConfigurationError("primary gate did not return provider-safe evidence")
+            last_evidence = evidence
+            emit(
+                LoopState.RUN_PRIMARY_GATE,
+                "primary_gate_observed",
+                {
+                    "iteration": iterations_started,
+                    "outcome": evidence.outcome,
+                    "gate_observation": evidence.gate_observation,
+                    "worker_confined": evidence.worker_confined,
+                },
+            )
+            if (
+                not evidence.worker_confined
+                or bool(
+                    {"source_modified", "worker_unconfined", "security_unattested"}
+                    & set(evidence.failure_codes)
+                )
+            ):
+                controller_failure_code = "primary_gate_security_unattested"
+                terminal_state = LoopState.FINISH_CONTROLLER_ERROR
+                break
+            quality: QualityObservation | None = None
+            if evidence.gate_observation:
+                emit(
+                    LoopState.RUN_FINAL_QUALITY,
+                    "final_quality_started",
+                    {"iteration": iterations_started},
+                )
+                quality = services.run_final_quality(candidate, iterations_started)
+                if not isinstance(quality, QualityObservation):
+                    raise ConfigurationError("final quality did not return closed evidence")
+                emit(
+                    LoopState.RUN_FINAL_QUALITY,
+                    "final_quality_observed",
+                    {
+                        "iteration": iterations_started,
+                        "passed": quality.passed,
+                        "failure_count": len(quality.failure_codes),
+                    },
+                )
+                if bool(
+                    {"source_modified", "worker_unconfined", "security_unattested"}
+                    & set(quality.failure_codes)
+                ):
+                    controller_failure_code = "final_quality_security_unattested"
+                    terminal_state = LoopState.FINISH_CONTROLLER_ERROR
+                    break
+                if quality.passed:
+                    if patches_applied:
+                        emit(
+                            LoopState.EXPORT_DIFF,
+                            "candidate_handoff_started",
+                            {"iteration": iterations_started},
+                        )
+                        handoff = export_inert_handoff(
+                            candidate,
+                            audit,
+                            gate=gate_kind,
+                            editable_paths=services.editable_paths,
+                        )
+                    terminal_state = LoopState.FINISH_GATE_OBSERVED
+                    break
+
+            evidence_payload: dict[str, object] = {"primary": asdict(evidence)}
+            if quality is not None:
+                evidence_payload["quality"] = asdict(quality)
+            emit(
+                LoopState.CALL_ORCHESTRATOR,
+                "orchestrator_called",
+                {"iteration": iterations_started},
+            )
+            route = call_or_skip(
+                "orchestrator",
+                evidence_payload,
+                Route.from_json,
+                Route,
+            )
+            if terminal_state is not None:
+                break
+            if route is None:
+                continue
+            assert isinstance(route, Route)
+            audit.write_validated_payload(f"orchestrator-{iterations_started:02d}", route)
+            if route.action == "abort":
+                terminal_state = LoopState.FINISH_AGENT_ABORTED
+                break
+            snapshots = load_snapshots(route.relevant_files)
+            emit(
+                LoopState.CALL_REASONER,
+                "reasoner_called",
+                {"iteration": iterations_started, "file_count": len(snapshots)},
+            )
+            plan = call_or_skip(
+                "reasoner",
+                {
+                    "evidence": evidence_payload,
+                    "route": asdict(route),
+                    "source_snapshots": [asdict(value) for value in snapshots],
+                },
+                ReasoningPlan.from_json,
+                ReasoningPlan,
+            )
+            if terminal_state is not None:
+                break
+            if plan is None:
+                continue
+            assert isinstance(plan, ReasoningPlan)
+            audit.write_validated_payload(f"reasoner-{iterations_started:02d}", plan)
+            readable = {value.path for value in snapshots}
+            if plan.skip or not set(plan.files_to_change).issubset(readable):
+                skip_iteration("reasoner", "plan_skipped" if plan.skip else "scope_rejected")
+                continue
+            emit(
+                LoopState.CALL_CODER,
+                "coder_called",
+                {"iteration": iterations_started, "file_count": len(snapshots)},
+            )
+            proposal = call_or_skip(
+                "coder",
+                {
+                    "plan": asdict(plan),
+                    "source_snapshots": [asdict(value) for value in snapshots],
+                },
+                CodingProposal.from_json,
+                CodingProposal,
+            )
+            if terminal_state is not None:
+                break
+            if proposal is None:
+                continue
+            assert isinstance(proposal, CodingProposal)
+            audit.write_validated_payload(f"coder-{iterations_started:02d}", proposal)
+            emit(
+                LoopState.VALIDATE_PROPOSAL,
+                "proposal_validation_started",
+                {"iteration": iterations_started, "file_count": len(proposal.files)},
+            )
+            try:
+                if not set(proposal.files).issubset(set(plan.files_to_change)):
+                    raise PatchPolicyError("proposal expands the reasoner-approved file set")
+                validate_unified_diff(
+                    candidate.root,
+                    proposal.unified_diff,
+                    proposal.files,
+                    editable_paths=services.editable_paths,
+                    gate=gate_kind,
+                )
+            except (PatchPolicyError, PreflightError):
+                emit(
+                    LoopState.RECORD_REJECTION,
+                    "proposal_rejected",
+                    {"iteration": iterations_started, "code": "patch_policy"},
+                )
+                emit(
+                    LoopState.NEXT_ITERATION,
+                    "next_iteration",
+                    {"iteration": iterations_started},
+                )
+                continue
+            if not config.mode.apply:
+                emit(
+                    LoopState.EXPORT_DIFF,
+                    "proposal_handoff_started",
+                    {"iteration": iterations_started},
+                )
+                handoff = export_inert_proposal(
+                    candidate,
+                    audit,
+                    proposal,
+                    gate=gate_kind,
+                    editable_paths=services.editable_paths,
+                )
+                terminal_state = LoopState.FINISH_PROPOSAL_EXPORTED
+                break
+            emit(
+                LoopState.APPLY_TO_CANDIDATE,
+                "candidate_apply_started",
+                {"iteration": iterations_started},
+            )
+            try:
+                apply_candidate_patch(
+                    candidate,
+                    proposal,
+                    gate=gate_kind,
+                    editable_paths=services.editable_paths,
+                    compile_runner=services.compile_runner,
+                )
+            except (PatchApplicationError, CandidateMutationError, PatchPolicyError):
+                emit(
+                    LoopState.RECORD_REJECTION,
+                    "proposal_rejected",
+                    {"iteration": iterations_started, "code": "apply_failed"},
+                )
+                emit(
+                    LoopState.NEXT_ITERATION,
+                    "next_iteration",
+                    {"iteration": iterations_started},
+                )
+                continue
+            patches_applied += 1
+            emit(
+                LoopState.NEXT_ITERATION,
+                "candidate_patch_applied",
+                {"iteration": iterations_started, "patches_applied": patches_applied},
+            )
+    except _LoopLimitReached:
+        controller_failure_code = "limit_reached"
+        terminal_state = LoopState.FINISH_LIMITS_EXHAUSTED
+    except CandidateMutationError:
+        controller_failure_code = "candidate_mutation"
+        terminal_state = LoopState.FINISH_CONTROLLER_ERROR
+    except (ConfigurationError, PreflightError, QuarantineError, AuditError, SandboxError):
+        controller_failure_code = "controller_boundary_error"
+        terminal_state = LoopState.FINISH_CONTROLLER_ERROR
+    except Exception:
+        controller_failure_code = "unexpected_controller_error"
+        terminal_state = LoopState.FINISH_CONTROLLER_ERROR
+
+    assert terminal_state is not None
+    retain_candidate = terminal_state in {
+        LoopState.FINISH_PROPOSAL_EXPORTED,
+        LoopState.FINISH_CONTROLLER_ERROR,
+    }
+    cleanup = cleanup_run_resources(
+        state,
+        candidate,
+        retain_candidate=retain_candidate,
+    )
+    if cleanup.source_modified or not cleanup.cleanup_complete:
+        controller_failure_code = (
+            "source_modified" if cleanup.source_modified else "cleanup_incomplete"
+        )
+        terminal_state = LoopState.FINISH_CONTROLLER_ERROR
+    status, exit_code = _TERMINAL_CONTRACT[terminal_state]
+    audit.append_event(
+        terminal_state,
+        "terminal",
+        {
+            "iterations_started": iterations_started,
+            "patches_applied": patches_applied,
+            "cleanup_complete": cleanup.cleanup_complete,
+            "source_modified": cleanup.source_modified,
+            "code": controller_failure_code,
+        },
+    )
+    artifacts: list[tuple[Path, str]] = []
+    if handoff is not None:
+        artifacts.extend(
+            (
+                (handoff.diff_path, handoff.diff_sha256),
+                (handoff.metadata_path, _file_sha256(handoff.metadata_path)),
+            )
+        )
+    passed = terminal_state is LoopState.FINISH_GATE_OBSERVED
+    quarantine_present = cleanup.quarantine_retained or candidate.root.exists()
+    quarantine_path = candidate.root if quarantine_present else None
+    return LoopResult(
+        terminal_state=terminal_state,
+        status=status,
+        exit_code=exit_code,
+        run_id=audit.run_id,
+        iterations_started=iterations_started,
+        patches_applied=patches_applied,
+        gate_observation=passed,
+        worker_confined=bool(passed and last_evidence and last_evidence.worker_confined),
+        source_modified=cleanup.source_modified,
+        security_attestation=False,
+        budget=_budget_snapshot(ledger),
+        audit_path=audit.run_root,
+        quarantine_path=quarantine_path,
+        quarantine_retained=quarantine_present,
+        handoff_artifacts=tuple(artifacts),
+        cleanup_complete=cleanup.cleanup_complete,
     )

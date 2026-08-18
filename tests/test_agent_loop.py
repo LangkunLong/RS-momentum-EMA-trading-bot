@@ -3751,3 +3751,489 @@ def test_final_quality_reports_git_diff_check_failure_after_all_workers(
     assert result.passed is False
     assert result.failure_codes == ("diff_check_failed",)
     assert len(sandbox.calls) == 3
+
+
+class _StateMachineGateway:
+    def __init__(self, limits: Any, outcomes: list[object]) -> None:
+        from agent_loop import BudgetLedger
+
+        self.ledger = BudgetLedger(
+            max_usd=limits.max_usd,
+            max_calls=limits.max_api_calls,
+            max_tokens=limits.max_tokens,
+        )
+        self.outcomes = list(outcomes)
+        self.roles: list[str] = []
+
+    def request(self, role: str, _dynamic_input: str, _parser: Any) -> Any:
+        from agent_loop import AgentCompletion, BudgetExceededError, Usage
+
+        if self.ledger.calls >= self.ledger.max_calls:
+            raise BudgetExceededError("fake gateway call limit")
+        self.ledger.calls += 1
+        self.roles.append(role)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return AgentCompletion(outcome, Usage(), "stop", None)
+
+
+def _gate_evidence(passed: bool) -> Any:
+    from agent_loop import ProviderGateEvidence
+
+    return ProviderGateEvidence(
+        gate_kind="test",
+        outcome="exit_zero" if passed else "exit_nonzero",
+        gate_observation=passed,
+        observed_exit_zero=passed,
+        worker_confined=True,
+        returncode=0 if passed else 1,
+        stdout_sha256="a" * 64,
+        stderr_sha256="b" * 64,
+        failure_codes=() if passed else ("pytest_failed",),
+    )
+
+
+def _loop_route() -> Any:
+    from agent_loop import Route
+
+    return Route(
+        action="reason",
+        failure_summary="The deterministic test gate failed.",
+        relevant_files=("core/backtest_engine.py",),
+        reasoning_focus="Repair the isolated arithmetic defect.",
+    )
+
+
+def _loop_plan() -> Any:
+    from agent_loop import ReasoningPlan
+
+    return ReasoningPlan(
+        diagnosis="The constant is incorrect.",
+        root_cause="The implementation retained the old value.",
+        invariants=("Keep the public interface unchanged.",),
+        files_to_change=("core/backtest_engine.py",),
+        steps=("Change the constant from one to two.",),
+        skip=False,
+        skip_reason="",
+    )
+
+
+def _loop_proposal(*, path: str = "core/backtest_engine.py") -> Any:
+    from agent_loop import CodingProposal
+
+    return CodingProposal(
+        summary="Correct the isolated constant.",
+        files=(path,),
+        unified_diff=_task2_diff(path=path),
+    )
+
+
+def _run_state_machine_fixture(
+    tmp_path: Path,
+    *,
+    outcomes: list[object],
+    primary_results: list[Any],
+    apply: bool,
+    max_iterations: int = 3,
+    max_api_calls: int = 12,
+    clock: Any = None,
+    quality_result: Any = None,
+) -> tuple[Any, Any, Any, Any, list[str]]:
+    from agent_loop import (
+        AuditTrail,
+        ExecutionMode,
+        LoopConfig,
+        LoopLimits,
+        LoopServices,
+        ModelConfig,
+        QualityObservation,
+        TestGateConfig,
+        export_candidate,
+        preflight_source,
+        read_candidate_source_snapshot,
+        run_agent_loop,
+    )
+
+    source = _task2_repo(tmp_path)
+    external = tempfile.TemporaryDirectory(prefix="agent-loop-state-machine-")
+    external_root = Path(external.name).resolve()
+    controller = external_root / "controller"
+    controller.mkdir()
+    runtime = external_root / "permanent-runtime"
+    limits = LoopLimits(
+        max_usd=0.25,
+        max_iterations=max_iterations,
+        max_api_calls=max_api_calls,
+        wall_timeout_seconds=1.0 if clock is not None else 300.0,
+    )
+    config = LoopConfig(
+        source_root=source.resolve(),
+        permanent_runtime_root=runtime.resolve(),
+        git_executable=_trusted_git_path(),
+        controller_temp_parent=controller,
+        artifact_root=(controller / "artifacts").resolve(),
+        mode=ExecutionMode(apply=apply),
+        gate=TestGateConfig(),
+        models=ModelConfig(),
+        limits=limits,
+    )
+    state = preflight_source(
+        source,
+        permanent_runtime_root=runtime,
+        controller_temp_parent=controller,
+    )
+    candidate = export_candidate(state)
+    audit = AuditTrail(config.artifact_root, "run-state-machine")
+    assert state.fingerprint is not None
+    audit.write_manifest(
+        config,
+        source_head=state.head,
+        source_fingerprint_sha256=state.fingerprint.sha256,
+    )
+    gateway = _StateMachineGateway(limits, outcomes)
+    remaining = list(primary_results)
+    observed_values: list[str] = []
+
+    def primary(current: Any, _iteration: int) -> Any:
+        observed_values.append(
+            (current.root / "core" / "backtest_engine.py").read_text(encoding="utf-8")
+        )
+        return remaining.pop(0)
+
+    def snapshots(current: Any, paths: tuple[str, ...]) -> tuple[Any, ...]:
+        return tuple(
+            read_candidate_source_snapshot(current, path, approved_paths=paths)
+            for path in paths
+        )
+
+    services = LoopServices(
+        gateway=gateway,
+        run_primary_gate=primary,
+        run_final_quality=lambda _candidate, _iteration: quality_result
+        or QualityObservation(True, True, True, True),
+        read_snapshots=snapshots,
+        compile_runner=lambda _layout, _paths: True,
+        monotonic=clock or time.monotonic,
+    )
+    result = run_agent_loop(config, state, candidate, audit, services)
+    return result, gateway, candidate, external, observed_values
+
+
+def test_state_machine_gate_pass_calls_no_agents_and_cleans_quarantine(
+    tmp_path: Path,
+) -> None:
+    result, gateway, candidate, external, observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[],
+        primary_results=[_gate_evidence(True)],
+        apply=False,
+    )
+    try:
+        assert result.status.value == "gate_observed_pass"
+        assert result.exit_code == 0
+        assert result.iterations_started == 1
+        assert result.patches_applied == 0
+        assert gateway.roles == []
+        assert observed == ["VALUE = 1\n"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_dry_run_exports_exact_proposal_without_mutating_candidate(
+    tmp_path: Path,
+) -> None:
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[_loop_route(), _loop_plan(), _loop_proposal()],
+        primary_results=[_gate_evidence(False)],
+        apply=False,
+    )
+    try:
+        assert result.status.value == "proposal_exported"
+        assert result.exit_code == 10
+        assert result.iterations_started == 1
+        assert result.patches_applied == 0
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        assert candidate.root.exists()
+        assert (candidate.root / "core" / "backtest_engine.py").read_text() == "VALUE = 1\n"
+        assert Path(result.handoff_artifacts[0][0]).read_text(encoding="utf-8") == _task2_diff()
+    finally:
+        from agent_loop import dispose_candidate
+
+        dispose_candidate(candidate)
+        external.cleanup()
+
+
+def test_state_machine_applies_only_to_candidate_then_passes_next_iteration(
+    tmp_path: Path,
+) -> None:
+    result, gateway, candidate, external, observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[_loop_route(), _loop_plan(), _loop_proposal()],
+        primary_results=[_gate_evidence(False), _gate_evidence(True)],
+        apply=True,
+    )
+    try:
+        assert result.status.value == "gate_observed_pass"
+        assert result.iterations_started == 2
+        assert result.patches_applied == 1
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        assert observed == ["VALUE = 1\n", "VALUE = 2\n"]
+        assert len(result.handoff_artifacts) == 2
+        canonical_diff = result.handoff_artifacts[0][0].read_text(encoding="utf-8")
+        assert "-VALUE = 1\n+VALUE = 2\n" in canonical_diff
+        assert result.handoff_artifacts[0][1] == hashlib.sha256(
+            canonical_diff.encode()
+        ).hexdigest()
+        assert not candidate.root.exists()
+        assert result.source_modified is False
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_orchestrator_abort_never_calls_reasoner_or_coder(
+    tmp_path: Path,
+) -> None:
+    from agent_loop import Route
+
+    abort = Route(
+        action="abort",
+        failure_summary="The requested repair is outside approved scope.",
+        relevant_files=(),
+        reasoning_focus="No safe repair is available.",
+    )
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[abort],
+        primary_results=[_gate_evidence(False)],
+        apply=True,
+    )
+    try:
+        assert result.status.value == "agent_aborted"
+        assert result.exit_code == 20
+        assert gateway.roles == ["orchestrator"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_malformed_responses_skip_until_exact_iteration_limit(
+    tmp_path: Path,
+) -> None:
+    from agent_loop import ResponseValidationError, verify_audit_chain
+
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[ResponseValidationError("bad one"), ResponseValidationError("bad two")],
+        primary_results=[_gate_evidence(False), _gate_evidence(False)],
+        apply=True,
+        max_iterations=2,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert result.exit_code == 21
+        assert result.iterations_started == 2
+        assert gateway.roles == ["orchestrator", "orchestrator"]
+        assert not candidate.root.exists()
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        assert [event["state"] for event in events].count("record_skip") == 2
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_rejects_unsafe_patch_and_never_mutates_source_or_candidate(
+    tmp_path: Path,
+) -> None:
+    unsafe = _loop_proposal(path="auto_trader.py")
+    result, gateway, candidate, external, observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[_loop_route(), _loop_plan(), unsafe],
+        primary_results=[_gate_evidence(False)],
+        apply=True,
+        max_iterations=1,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert result.patches_applied == 0
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        assert observed == ["VALUE = 1\n"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_final_quality_failure_routes_to_agents_instead_of_passing(
+    tmp_path: Path,
+) -> None:
+    from agent_loop import QualityObservation
+
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[_loop_route(), _loop_plan(), _loop_proposal()],
+        primary_results=[_gate_evidence(True)],
+        quality_result=QualityObservation(
+            True, False, True, True, failure_codes=("ruff_failed",)
+        ),
+        apply=False,
+    )
+    try:
+        assert result.status.value == "proposal_exported"
+        assert result.gate_observation is False
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+    finally:
+        from agent_loop import dispose_candidate
+
+        dispose_candidate(candidate)
+        external.cleanup()
+
+
+def test_state_machine_zero_iteration_limit_starts_no_gate_or_provider_call(
+    tmp_path: Path,
+) -> None:
+    result, gateway, candidate, external, observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[],
+        primary_results=[],
+        apply=True,
+        max_iterations=0,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert result.iterations_started == 0
+        assert gateway.roles == []
+        assert observed == []
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_api_call_limit_stops_before_reasoner(tmp_path: Path) -> None:
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[_loop_route()],
+        primary_results=[_gate_evidence(False)],
+        apply=True,
+        max_api_calls=1,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert result.budget.api_calls == 1
+        assert gateway.roles == ["orchestrator"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+class _StepClock:
+    def __init__(self, allowed_calls: int) -> None:
+        self.allowed_calls = allowed_calls
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        return 0.0 if self.calls <= self.allowed_calls else 2.0
+
+
+def test_state_machine_wall_deadline_stops_after_primary_without_provider_call(
+    tmp_path: Path,
+) -> None:
+    clock = _StepClock(4)
+    result, gateway, candidate, external, observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[],
+        primary_results=[_gate_evidence(False)],
+        apply=True,
+        clock=clock,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert result.iterations_started == 1
+        assert gateway.roles == []
+        assert observed == ["VALUE = 1\n"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_intersects_orchestrator_paths_with_controller_read_policy(
+    tmp_path: Path,
+) -> None:
+    from agent_loop import Route
+
+    route = Route(
+        action="reason",
+        failure_summary="The test failed.",
+        relevant_files=("auto_trader.py",),
+        reasoning_focus="Inspect the forbidden live module.",
+    )
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[route, _loop_plan()],
+        primary_results=[_gate_evidence(False)],
+        apply=True,
+        max_iterations=1,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert gateway.roles == ["orchestrator", "reasoner"]
+        assert result.patches_applied == 0
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_security_failure_never_reaches_any_agent(tmp_path: Path) -> None:
+    from agent_loop import QualityObservation, dispose_candidate
+
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[],
+        primary_results=[_gate_evidence(True)],
+        quality_result=QualityObservation(
+            False,
+            False,
+            False,
+            False,
+            failure_codes=("security_unattested",),
+        ),
+        apply=True,
+    )
+    try:
+        assert result.status.value == "controller_error"
+        assert result.exit_code == 22
+        assert gateway.roles == []
+        assert result.quarantine_retained is True
+        assert candidate.root.exists()
+    finally:
+        dispose_candidate(candidate)
+        external.cleanup()
+
+
+def test_state_machine_reasoner_skip_never_calls_coder(tmp_path: Path) -> None:
+    from agent_loop import ReasoningPlan
+
+    skipped = ReasoningPlan(
+        diagnosis="The failure is environmental.",
+        root_cause="No safe code change is justified.",
+        invariants=("Do not change strategy code.",),
+        files_to_change=(),
+        steps=(),
+        skip=True,
+        skip_reason="The deterministic evidence is insufficient.",
+    )
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[_loop_route(), skipped],
+        primary_results=[_gate_evidence(False)],
+        apply=True,
+        max_iterations=1,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert gateway.roles == ["orchestrator", "reasoner"]
+        assert result.patches_applied == 0
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
