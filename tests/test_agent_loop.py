@@ -1409,6 +1409,19 @@ def test_worker_dockerfile_uses_fixed_numeric_identity_without_build_args() -> N
     assert "useradd --uid 65532 --gid 65532" in dockerfile
 
 
+def test_agent_loop_docker_build_context_is_deny_by_default() -> None:
+    """Break caught: Docker could receive ignored credentials or runtime artifacts as build context."""
+    ignore_path = Path(__file__).parents[1] / "Dockerfile.agent-loop.dockerignore"
+
+    rules = tuple(
+        line.strip()
+        for line in ignore_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+    assert rules == ("**", "!Dockerfile.agent-loop", "!requirements-lock.txt")
+
+
 def _process_result(returncode: int, stdout: str = "", stderr: str = "", *, timed_out: bool = False):
     import hashlib
 
