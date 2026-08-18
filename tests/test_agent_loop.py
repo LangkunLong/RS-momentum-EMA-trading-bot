@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import importlib
 import json
 import os
 import re
@@ -94,21 +93,24 @@ class FakeClient:
         self.chat = SimpleNamespace(completions=self.completions)
 
 
-def test_import_is_lazy_and_never_reads_key_or_execution_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_import_is_lazy_and_never_reads_key_or_execution_modules(tmp_path: Path) -> None:
     """Break caught: adding import-time credential, dotenv, or live-runtime side effects."""
-    import agent_loop
-
-    def forbidden_getenv(*_args: object, **_kwargs: object) -> str:
-        raise AssertionError("import must not inspect environment")
-
-    monkeypatch.setattr(agent_loop.os, "getenv", forbidden_getenv)
-    monkeypatch.delitem(sys.modules, "agent_loop")
-    reloaded = importlib.import_module("agent_loop")
-
-    assert reloaded.MAX_ITERATIONS == 10
-    assert "auto_trader" not in sys.modules
-    assert "paper_trading_console" not in sys.modules
-    assert "scheduler" not in sys.modules
+    marker = tmp_path / "getenv-called"
+    code = (
+        "import os,pathlib; marker=pathlib.Path(" + repr(str(marker)) + "); "
+        "os.getenv=lambda *_a,**_k: (marker.write_text('called'), (_ for _ in ()).throw(AssertionError()))[1]; "
+        "import agent_loop,sys; "
+        "assert agent_loop.MAX_ITERATIONS==10; "
+        "assert not {'auto_trader','paper_trading_console','scheduler'} & set(sys.modules)"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1])
+    completed = subprocess.run(
+        [sys.executable, "-c", code], cwd=tmp_path, env=environment,
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
 
 
 def test_protocol_rejects_duplicate_and_unknown_json_keys() -> None:
@@ -958,8 +960,8 @@ def test_sandbox_command_and_inspection_contract_is_fail_closed(tmp_path: Path) 
     source = _task2_repo(tmp_path)
     candidate = export_candidate(preflight_source(source, acquire_lock=False))
     image = "registry.invalid/agent-loop@sha256:" + "a" * 64
-    with pytest.raises(SandboxError):
-        run_test_gate(candidate, SandboxRunner(engine_path=Path("C:/missing/docker.exe"), image=image))
+    with pytest.raises(SandboxError, match="capability"):
+        run_test_gate(candidate, SandboxRunner(image=image))
 
 
 def _create_bundle(path: Path, keys: list[tuple[str, str]]) -> str:
@@ -1635,7 +1637,11 @@ def _faithful_runner(image: str, engine: FaithfulSandboxEngine):
     from agent_loop import SandboxRunner
 
     return SandboxRunner(
-        engine_path=Path("relative/fake/docker.exe"),
+        injected_engine_path=(
+            Path("C:/agent-loop-test/docker.exe")
+            if os.name == "nt"
+            else Path("/agent-loop-test/docker")
+        ),
         image=image,
         process_runner=engine,
         run_id="run-1234567890abcdef",
@@ -2488,7 +2494,7 @@ def test_round3_canonical_environment_drops_case_variants_and_credentials() -> N
         "SYSTEMROOT": "C:/Windows",
         "OpenRouter_Api_Key": "secret",
     }
-    assert agent_loop._canonical_environment(source, {"PATH", "SYSTEMROOT"}) == {
+    assert agent_loop._canonical_environment(source, {"PATH", "SYSTEMROOT"}, windows=False) == {
         "PATH": "/trusted/bin",
         "SYSTEMROOT": "C:/Windows",
     }
@@ -2731,3 +2737,244 @@ def test_round3_worktree_promisor_config_is_rejected_before_object_reads(tmp_pat
     _run_git(repo, "config", "--worktree", "remote.origin.promisor", "true")
     with pytest.raises(PreflightError, match="local Git config"):
         preflight_source(repo, acquire_lock=False)
+
+
+def test_round4_compile_cache_routes_to_writable_output_with_read_only_source(tmp_path: Path) -> None:
+    """Break caught: py_compile/compileall try to create __pycache__ below the read-only source bind."""
+    del tmp_path
+    test_parent = Path(__file__).parents[1]
+    root = test_parent / f".alc-{time.time_ns()}"
+    root.mkdir(mode=0o777)
+    try:
+        source = root / "src"
+        output = root / "out"
+        source.mkdir()
+        output.mkdir()
+        module = source / "module.py"
+        module.write_text("VALUE = 1\n", encoding="utf-8")
+        module.chmod(0o444)
+        source.chmod(0o555)
+        environment = dict(os.environ)
+        environment["PYTHONPYCACHEPREFIX"] = (
+            "\\\\?\\" + str(output) if os.name == "nt" else str(output)
+        )
+        relative_module = module.relative_to(root)
+        try:
+            cache_target = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import importlib.util,sys; print(importlib.util.cache_from_source(sys.argv[1]))",
+                    str(relative_module),
+                ],
+                cwd=root,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            cache_path = Path(cache_target)
+            if not cache_path.is_absolute():
+                cache_path = root / cache_path
+            cache_path.parent.mkdir(parents=True)
+            compiled = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(relative_module)],
+                cwd=root, env=environment, check=False, capture_output=True, text=True,
+            )
+            compileall = subprocess.run(
+                [sys.executable, "-m", "compileall", "-q", "src"],
+                cwd=root, env=environment, check=False, capture_output=True, text=True,
+            )
+            assert compiled.returncode == compileall.returncode == 0, (
+                compiled.stdout + compiled.stderr + compileall.stdout + compileall.stderr
+            )
+            assert not (source / "__pycache__").exists()
+            assert any(output.rglob("module.*.pyc"))
+        finally:
+            source.chmod(0o755)
+            module.chmod(0o644)
+    finally:
+        shutil.rmtree(root)
+
+
+def test_round4_container_compile_and_ruff_cache_policy_is_exact(tmp_path: Path) -> None:
+    """Break caught: the fixed gate omits writable bytecode routing or lets Ruff cache in source."""
+    from agent_loop import (
+        build_ruff_gate_argv,
+        export_candidate,
+        preflight_source,
+        run_in_disposable_worker,
+        run_test_gate,
+    )
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    run_test_gate(candidate, _faithful_runner(image, engine))
+    environment = dict(
+        item.split("=", 1) for item in engine.inspect_payload["Config"]["Env"]  # type: ignore[index]
+    )
+    assert environment["PYTHONPYCACHEPREFIX"] == "/workspace/output/pycache"
+    assert environment["RUFF_CACHE_DIR"] == "/workspace/output/ruff-cache"
+    assert build_ruff_gate_argv() == ("-m", "ruff", "check", "--no-cache", ".")
+    cache_ready = run_in_disposable_worker(
+        candidate,
+        lambda layout: (
+            (layout.output / "pycache" / "workspace" / "src" / "core").is_dir(),
+            stat.S_IMODE(
+                (layout.output / "pycache" / "workspace" / "src" / "core").stat().st_mode
+            ),
+        ),
+    )
+    assert cache_ready[0]
+    if os.name != "nt":
+        assert cache_ready[1] == 0o777
+
+
+def test_round4_git_replacement_refs_are_rejected_before_object_reads(tmp_path: Path) -> None:
+    """Break caught: refs/replace can substitute attacker-selected bytes for captured commit objects."""
+    from agent_loop import PreflightError, preflight_source
+
+    repo = _task2_repo(tmp_path)
+    original = subprocess.run(
+        [str(_trusted_git_path()), "rev-parse", "HEAD:core/backtest_engine.py"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    replacement = subprocess.run(
+        [str(_trusted_git_path()), "hash-object", "-w", "--stdin"],
+        cwd=repo, input="REPLACED = True\n", check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _run_git(repo, "replace", original, replacement)
+    with pytest.raises(PreflightError, match="replacement"):
+        preflight_source(repo, acquire_lock=False)
+
+
+def test_round4_docker_capability_revalidates_bytes_before_bounded_spawn(tmp_path: Path) -> None:
+    """Break caught: a validated Docker path can be swapped before the next host-engine call."""
+    from agent_loop import (
+        SandboxError,
+        SandboxRunner,
+        configure_docker_executable,
+    )
+
+    external = tmp_path / "approved-tools"
+    external.mkdir()
+    executable = external / ("docker.exe" if os.name == "nt" else "docker")
+    executable.write_bytes(b"trusted docker bytes")
+    capability = configure_docker_executable(
+        executable.resolve(),
+        source_root=tmp_path / "source",
+        controller_root=tmp_path / "controller",
+        permanent_runtime_root=tmp_path / "runtime",
+    )
+    runner = SandboxRunner(
+        engine=capability,
+        image="registry.invalid/agent-loop@sha256:" + "a" * 64,
+    )
+    runner._engine_env = {}
+    executable.write_bytes(b"changed docker bytes")
+    with pytest.raises(SandboxError, match="Docker executable"):
+        runner._call("version")
+
+
+@pytest.mark.parametrize("contained", ("source", "controller", "runtime"))
+def test_round4_docker_capability_rejects_controller_containment(
+    tmp_path: Path,
+    contained: str,
+) -> None:
+    """Break caught: a candidate/controller/runtime-owned path is approved as the host Docker TCB."""
+    from agent_loop import ConfigurationError, configure_docker_executable
+
+    roots = {name: tmp_path / name for name in ("source", "controller", "runtime")}
+    for root in roots.values():
+        root.mkdir()
+    executable = roots[contained] / ("docker.exe" if os.name == "nt" else "docker")
+    executable.write_bytes(b"untrusted contained tool")
+    with pytest.raises(ConfigurationError, match="contained"):
+        configure_docker_executable(
+            executable.resolve(),
+            source_root=roots["source"],
+            controller_root=roots["controller"],
+            permanent_runtime_root=roots["runtime"],
+        )
+
+
+def test_round4_windows_environment_canonicalizes_names_and_rejects_conflicts() -> None:
+    """Break caught: Windows drops Path/SystemRoot or silently chooses a conflicting case variant."""
+    from agent_loop import ConfigurationError, _canonical_environment
+
+    assert _canonical_environment(
+        {"Path": "C:/safe", "systemroot": "C:/Windows"},
+        {"PATH", "SYSTEMROOT"},
+        windows=True,
+    ) == {"PATH": "C:/safe", "SYSTEMROOT": "C:/Windows"}
+    with pytest.raises(ConfigurationError, match="case variants"):
+        _canonical_environment(
+            {"PATH": "C:/safe", "Path": "C:/hostile"}, {"PATH"}, windows=True
+        )
+    assert _canonical_environment(
+        {"PATH": "/safe", "PaTh": "/hostile"}, {"PATH"}, windows=False
+    ) == {"PATH": "/safe"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "secrets/module.py",
+        "safe/api-token/module.py",
+        "safe/credentials/config.json",
+        "safe/.env.production/value.txt",
+        "safe/private-key/material.txt",
+    ),
+)
+def test_round4_credential_path_policy_checks_every_component(path: str) -> None:
+    """Break caught: credential-like parent directories bypass basename-only export policy."""
+    from agent_loop import _credential_like_tracked_path
+
+    assert _credential_like_tracked_path(path)
+    assert not _credential_like_tracked_path("examples/.env.example")
+    assert not _credential_like_tracked_path("examples/.env.template")
+
+
+def test_round4_unsafe_local_entry_owns_lock_and_excludes_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: unsafe-local bypasses source locking and permanent-runtime exclusion."""
+    import agent_loop
+    from agent_loop import ExecutionMode, PreflightError, ProcessResult, run_unsafe_local_test_baseline
+
+    source = _task2_repo(tmp_path)
+    mode = ExecutionMode(unsafe_local=True, apply=False)
+    with pytest.raises(PreflightError, match="permanent"):
+        run_unsafe_local_test_baseline(source, mode, permanent_runtime_root=source)
+
+    def observe_locked(state: Any, _runner: Any) -> ProcessResult:
+        assert state.lock is not None
+        with pytest.raises(PreflightError, match="lock"):
+            agent_loop.preflight_source(source)
+        return ProcessResult.ok()
+
+    monkeypatch.setattr(agent_loop, "run_source_commit_in_disposable_worker", observe_locked)
+    run_unsafe_local_test_baseline(
+        source, mode, permanent_runtime_root=tmp_path / "permanent-runtime"
+    )
+    released = agent_loop.preflight_source(source)
+    released.close()
+
+
+def test_round4_source_lock_rejects_hardlink_without_touching_target(tmp_path: Path) -> None:
+    """Break caught: a pre-existing hardlinked lock lets the controller write/lock an outside file."""
+    from agent_loop import PreflightError, SourceLock
+
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    lock_path = tmp_path / "agent-loop.lock"
+    try:
+        os.link(outside, lock_path)
+    except OSError as exc:
+        pytest.skip(f"hardlink creation unavailable: {exc}")
+    with pytest.raises(PreflightError, match="hardlink"):
+        SourceLock(lock_path).acquire()
+    assert outside.read_bytes() == b"outside"

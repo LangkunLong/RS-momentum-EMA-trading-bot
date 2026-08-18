@@ -921,6 +921,7 @@ _GIT_ENV_KEYS = frozenset({"SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP",
 _NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
 _GIT_FIXED_ARGS = (
     "--no-lazy-fetch",
+    "--no-replace-objects",
     "-c", f"core.hooksPath={_NULL_DEVICE}",
     "-c", "core.fsmonitor=false",
     "-c", "diff.external=",
@@ -996,13 +997,31 @@ def _approved_git_executable(capability: GitCapability | None = None) -> Path:
     return approved.executable
 
 
-def _canonical_environment(source: Mapping[str, str], allowed: set[str] | frozenset[str]) -> dict[str, str]:
-    """Copy only exact canonical allowlist names; case variants are never normalized into policy."""
-    return {
-        key: value
-        for key, value in source.items()
-        if type(key) is str and type(value) is str and key in allowed
-    }
+def _canonical_environment(
+    source: Mapping[str, str],
+    allowed: set[str] | frozenset[str],
+    *,
+    windows: bool | None = None,
+) -> dict[str, str]:
+    """Emit canonical allowlist names, with conflict detection for Windows case folding."""
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        return {
+            key: value
+            for key, value in source.items()
+            if type(key) is str and type(value) is str and key in allowed
+        }
+    canonical = {key.casefold(): key for key in allowed}
+    environment: dict[str, str] = {}
+    for key, value in source.items():
+        if type(key) is not str or type(value) is not str or key.casefold() not in canonical:
+            continue
+        name = canonical[key.casefold()]
+        if name in environment and environment[name] != value:
+            raise ConfigurationError("Windows environment contains conflicting case variants")
+        environment[name] = value
+    return environment
 
 
 def _git_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -1015,6 +1034,7 @@ def _git_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_PAGER": "cat",
             "PAGER": "cat",
             "LC_ALL": "C",
@@ -1162,8 +1182,10 @@ class SourceLock:
                 not stat.S_ISREG(existing.st_mode)
                 or stat.S_ISLNK(existing.st_mode)
                 or _has_reparse_point(self.path)
+                or existing.st_nlink != 1
             ):
-                raise PreflightError("source lock path is a link, reparse point, or non-file")
+                detail = "hardlink" if existing.st_nlink != 1 else "link, reparse point, or non-file"
+                raise PreflightError(f"source lock path is a {detail}")
             flags = os.O_RDWR | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -1175,6 +1197,7 @@ class SourceLock:
                 or stat.S_ISLNK(current.st_mode)
                 or _has_reparse_point(self.path)
                 or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+                or current.st_nlink != 1
             ):
                 os.close(descriptor)
                 raise PreflightError("source lock identity changed while opening")
@@ -1204,6 +1227,7 @@ class SourceLock:
                 or stat.S_ISLNK(current.st_mode)
                 or _has_reparse_point(self.path)
                 or (locked.st_dev, locked.st_ino) != (current.st_dev, current.st_ino)
+                or current.st_nlink != 1
             ):
                 raise OSError("source lock identity changed after locking")
         except (OSError, BlockingIOError) as exc:
@@ -1330,10 +1354,19 @@ def preflight_source(
     lock_path = _resolved_git_path(root, "agent-loop.lock")
     lock = SourceLock(lock_path).acquire() if acquire_lock else None
     try:
+        replacement_refs = _git(
+            root, "for-each-ref", "--format=%(refname)", "refs/replace", git=capability
+        ).stdout
+        if replacement_refs.strip():
+            raise PreflightError("Git replacement refs are forbidden")
         first_fingerprint = source_fingerprint(root)
         first_status = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.decode()
         second_fingerprint = source_fingerprint(root)
         second_status = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.decode()
+        if _git(
+            root, "for-each-ref", "--format=%(refname)", "refs/replace", git=capability
+        ).stdout.strip():
+            raise PreflightError("Git replacement refs are forbidden")
         if first_fingerprint != second_fingerprint or first_status != second_status:
             raise PreflightError("source did not remain stable across clean capture")
         head = second_fingerprint.head
@@ -1432,19 +1465,24 @@ def _has_reparse_point(path: Path) -> bool:
 
 
 def _credential_like_tracked_path(path: str) -> bool:
-    basename = path.rsplit("/", 1)[-1].casefold()
-    if basename in {".env.example", ".env.template"}:
-        return False
-    if basename == ".env" or basename.startswith(".env."):
-        return True
-    if basename in {"id_rsa", "id_ed25519", "credentials.json"} or basename.endswith(
-        (".pem", ".key", ".p12", ".pfx", ".jks")
-    ):
-        return True
-    return re.search(
-        r"(?:^|[._-])(?:secret|secrets|token|tokens|credential|credentials|private[_-]?key|api[_-]?key)(?:$|[._-])",
-        basename,
-    ) is not None
+    components = tuple(component.casefold() for component in path.split("/"))
+    for index, component in enumerate(components):
+        public_env_example = (
+            index == len(components) - 1
+            and component in {".env.example", ".env.template"}
+        )
+        if not public_env_example and (component == ".env" or component.startswith(".env.")):
+            return True
+        if component in {"id_rsa", "id_ed25519", "credentials.json"} or component.endswith(
+            (".pem", ".key", ".p12", ".pfx", ".jks")
+        ):
+            return True
+        if re.search(
+            r"(?:^|[._-])(?:secret|secrets|token|tokens|credential|credentials|private[_-]?key|api[_-]?key)(?:$|[._-])",
+            component,
+        ) is not None:
+            return True
+    return False
 
 
 def _write_commit_export(source: Path, commit: str, destination: Path) -> tuple[str, ...]:
@@ -1737,6 +1775,27 @@ def _install_protected_gate(layout: WorkerLayout) -> None:
     shutil.copyfile(source, layout.gate / "agent_loop.py")
 
 
+def _prepare_worker_cache_directories(layout: WorkerLayout) -> None:
+    """Pre-create the writable pycache mirror required by Python's read-only source compilation."""
+    prefix = layout.output / "pycache"
+    for source, virtual in (
+        (layout.source, Path("workspace/src")),
+        (layout.gate, Path("workspace/gate")),
+    ):
+        mirror = prefix / virtual
+        mirror.mkdir(parents=True, exist_ok=True)
+        for parent in (prefix, *mirror.parents):
+            if parent == layout.output.parent:
+                break
+            if _is_relative_to(parent, layout.output):
+                parent.chmod(0o777)
+        mirror.chmod(0o777)
+        for directory in (path for path in source.rglob("*") if path.is_dir()):
+            cached = mirror / directory.relative_to(source)
+            cached.mkdir(parents=True, exist_ok=True)
+            cached.chmod(0o777)
+
+
 def _make_inputs_read_only(layout: WorkerLayout) -> None:
     if os.name == "nt":
         return
@@ -1828,6 +1887,7 @@ def run_in_disposable_worker(candidate: Candidate, runner: Callable[[WorkerLayou
             if tuple(exported) != tuple(candidate.tracked_files):
                 raise CandidateMutationError("worker manifest differs from candidate tracked manifest")
             _install_protected_gate(layout)
+            _prepare_worker_cache_directories(layout)
             _make_inputs_read_only(layout)
             result = runner(layout)
         finally:
@@ -1855,6 +1915,7 @@ def run_source_commit_in_disposable_worker(
         layout = _make_worker_layout(temporary)
         _write_commit_export(state.root, state.head, layout.source)
         _install_protected_gate(layout)
+        _prepare_worker_cache_directories(layout)
         _make_inputs_read_only(layout)
         return runner(layout)
     finally:
@@ -2199,14 +2260,96 @@ def _manifest_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+@dataclass(frozen=True)
+class DockerCapability:
+    executable: Path
+    device: int
+    inode: int
+    size: int
+    sha256: str
+    forbidden_roots: tuple[Path, ...]
+
+
+def configure_docker_executable(
+    executable: Path,
+    *,
+    source_root: Path,
+    controller_root: Path,
+    permanent_runtime_root: Path,
+) -> DockerCapability:
+    """Approve one exact external Docker executable for the controller lifetime."""
+    roots = (source_root, controller_root, permanent_runtime_root)
+    if not isinstance(executable, Path) or not executable.is_absolute() or any(
+        not isinstance(root, Path) or not root.is_absolute() for root in roots
+    ):
+        raise ConfigurationError("Docker approval requires absolute executable and containment roots")
+    try:
+        canonical = _existing_path_without_links(executable)
+        info = canonical.lstat()
+    except OSError as exc:
+        raise ConfigurationError("approved Docker executable is absent") from exc
+    forbidden = tuple(Path(os.path.abspath(root)) for root in roots)
+    if (
+        canonical != executable
+        or not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or _has_reparse_point(canonical)
+        or canonical.name.casefold() not in {"docker", "docker.exe"}
+        or any(_is_relative_to(canonical, root) for root in forbidden)
+    ):
+        raise ConfigurationError(
+            "approved Docker executable must be canonical, regular, non-reparse, and externally contained"
+        )
+    digest = hashlib.sha256()
+    with canonical.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return DockerCapability(
+        canonical, info.st_dev, info.st_ino, info.st_size, digest.hexdigest(), forbidden
+    )
+
+
+def _approved_docker_executable(
+    capability: DockerCapability,
+    extra_forbidden_roots: Sequence[Path] = (),
+) -> Path:
+    try:
+        canonical = _existing_path_without_links(capability.executable)
+        info = canonical.lstat()
+    except OSError as exc:
+        raise SandboxError("approved Docker executable disappeared") from exc
+    forbidden = (*capability.forbidden_roots, *(root.resolve() for root in extra_forbidden_roots))
+    if (
+        canonical != capability.executable
+        or not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or _has_reparse_point(canonical)
+        or (info.st_dev, info.st_ino) != (capability.device, capability.inode)
+        or info.st_size != capability.size
+        or any(_is_relative_to(canonical, root) for root in forbidden)
+    ):
+        raise SandboxError("approved Docker executable identity or containment changed")
+    digest = hashlib.sha256()
+    try:
+        with canonical.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise SandboxError("approved Docker executable cannot be revalidated") from exc
+    if digest.hexdigest() != capability.sha256:
+        raise SandboxError("approved Docker executable bytes changed")
+    return canonical
+
+
 class SandboxRunner:
     """Digest-pinned observational runner with an exact inspected confinement contract."""
 
     def __init__(
         self,
         *,
-        engine_path: Path,
         image: str,
+        engine: DockerCapability | None = None,
+        injected_engine_path: Path | None = None,
         process_runner: ProcessRunner = _bounded_process,
         timeout_seconds: float = 300.0,
         output_limit: int = 1024 * 1024,
@@ -2214,9 +2357,19 @@ class SandboxRunner:
     ) -> None:
         if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
             raise SandboxError("worker image must be repository-digest pinned")
-        self.engine_path = engine_path.resolve()
         self.image = image
         self._run = process_runner
+        self._engine_capability = engine
+        if self._run is _bounded_process:
+            if engine is None or injected_engine_path is not None:
+                raise SandboxError("production sandbox requires an approved Docker capability")
+            self.engine_path = _approved_docker_executable(engine)
+        else:
+            if engine is not None or injected_engine_path is None or not injected_engine_path.is_absolute():
+                raise SandboxError("injected sandbox requires one explicit absolute simulated endpoint")
+            if injected_engine_path.name.casefold() not in {"docker", "docker.exe"}:
+                raise SandboxError("injected sandbox endpoint must retain Docker command shape")
+            self.engine_path = injected_engine_path
         self.timeout_seconds = timeout_seconds
         self.output_limit = output_limit
         self.run_id = run_id or secrets.token_hex(16)
@@ -2253,8 +2406,14 @@ class SandboxRunner:
     def _call(self, *args: str, timeout: float | None = None) -> ProcessResult:
         if self._engine_env is None:
             raise SandboxError("sandbox engine environment is not initialized")
+        if self._run is _bounded_process:
+            if self._engine_capability is None:
+                raise SandboxError("production sandbox lost its Docker capability")
+            engine_path = _approved_docker_executable(self._engine_capability)
+        else:
+            engine_path = self.engine_path
         return self._run(
-            (str(self.engine_path), *args),
+            (str(engine_path), *args),
             timeout=timeout or self.timeout_seconds,
             output_limit=self.output_limit,
             env=self._engine_env,
@@ -2262,9 +2421,8 @@ class SandboxRunner:
 
     def _attest_engine_and_image(self) -> tuple[str, tuple[str, ...]]:
         if self._run is _bounded_process:
-            engine = self.engine_path.resolve()
-            if not engine.is_file() or engine.is_symlink() or _has_reparse_point(engine):
-                raise SandboxError("sandbox engine executable is absent or unsafe")
+            assert self._engine_capability is not None
+            engine = _approved_docker_executable(self._engine_capability)
             if engine.name.lower() not in {"docker", "docker.exe"}:
                 raise SandboxError("unsupported sandbox engine executable")
         version = self._call("version", "--format", "{{json .}}", timeout=15)
@@ -2437,7 +2595,10 @@ class SandboxRunner:
                 if not path.endswith(".py") or not (source / path).is_file():
                     raise SandboxError("compile path is not a worker Python file")
             return
-        if args in {("-m", "compileall", "-q", "."), ("-m", "ruff", "check", ".")}:
+        if args in {
+            ("-m", "compileall", "-q", "."),
+            ("-m", "ruff", "check", "--no-cache", "."),
+        }:
             return
         if len(args) >= 16 and args[:3] == ("/workspace/gate/agent_loop.py", "--_hidden-backtest", "--tickers"):
             try:
@@ -2543,6 +2704,12 @@ class SandboxRunner:
             digest_index = tuple(python_args).index("--historical-data-sha256") + 1
             if python_args[digest_index] != data_bundle.sha256:
                 raise SandboxError("hidden backtest digest differs from the approved data bundle")
+        if self._run is _bounded_process:
+            assert self._engine_capability is not None
+            _approved_docker_executable(
+                self._engine_capability,
+                (worker.root, worker.source, worker.gate, worker.data),
+            )
         self._prepare_engine_environment(worker)
         image_id, base_environment = self._attest_engine_and_image()
         for path in (worker.root, worker.source, worker.gate, worker.data, worker.tmp, worker.home, worker.output):
@@ -2593,11 +2760,13 @@ class SandboxRunner:
             "FMP_DAILY_REQUEST_BUDGET": "0",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": "/workspace/output/pycache",
             "PYTHONHASHSEED": "0",
             "HOME": "/workspace/home",
             "USERPROFILE": "/workspace/home",
             "XDG_CACHE_HOME": "/workspace/home/.cache",
             "PIP_CACHE_DIR": "/workspace/home/.cache/pip",
+            "RUFF_CACHE_DIR": "/workspace/output/ruff-cache",
             "TEMP": "/workspace/tmp",
             "TMP": "/workspace/tmp",
             "HTTP_PROXY": "http://127.0.0.1:9",
@@ -3083,7 +3252,7 @@ def build_compileall_gate_argv() -> tuple[str, ...]:
 
 def build_ruff_gate_argv() -> tuple[str, ...]:
     """Return the only whole-candidate Ruff command admitted by the sandbox."""
-    return ("-m", "ruff", "check", ".")
+    return ("-m", "ruff", "check", "--no-cache", ".")
 
 
 @dataclass(frozen=True)
@@ -3134,11 +3303,17 @@ def run_unsafe_local_test_baseline(
     source_root: Path,
     mode: ExecutionMode,
     selectors: Sequence[str] = (),
+    *,
+    permanent_runtime_root: Path,
 ) -> GateResult:
     """Explicit development escape hatch for the unchanged baseline only; never candidate apply."""
     if not mode.unsafe_local or mode.apply:
         raise ConfigurationError("local execution requires unsafe baseline-only mode")
-    state = preflight_source(source_root, acquire_lock=False)
+    state = preflight_source(
+        source_root,
+        acquire_lock=True,
+        permanent_runtime_root=permanent_runtime_root,
+    )
     def execute(layout: WorkerLayout) -> ProcessResult:
         argv = build_test_gate_argv(layout.source, selectors)
         environment = build_child_environment(os.environ, layout.home)
@@ -3149,8 +3324,11 @@ def run_unsafe_local_test_baseline(
             timeout=300,
         )
 
-    result = run_source_commit_in_disposable_worker(state, execute)
-    source_recheck = recheck_source_unchanged(state)
+    try:
+        result = run_source_commit_in_disposable_worker(state, execute)
+        source_recheck = recheck_source_unchanged(state)
+    finally:
+        state.close()
     return GateResult(
         True,
         result.returncode == 0 and not result.timed_out,

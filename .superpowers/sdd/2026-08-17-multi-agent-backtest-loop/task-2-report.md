@@ -522,3 +522,105 @@ Docker Desktop is now available on the host, but per coordination this round did
 or run any image/container. Therefore real daemon/image provenance remains deliberately unverified;
 all sandbox contract coverage here uses the faithful injected Docker-shaped backend, which always
 reports `worker_confined=false` and `security_attestation=false`.
+
+## Review fix round 4/5 - cache routing and host capability tightening
+
+### Files, APIs, and named breaks
+
+- `agent_loop.py`: added `DockerCapability` and
+  `configure_docker_executable(executable, *, source_root, controller_root,
+  permanent_runtime_root)`, revalidated Docker identity/bytes before every production engine
+  spawn, disabled Git replacement objects, canonicalized Windows allowlisted environments,
+  rejected hardlinked source locks, classified every tracked-path component, pre-created a
+  writable output pycache mirror, made Ruff explicitly cacheless, and made unsafe-local acquire
+  and retain the source lock while enforcing permanent-runtime exclusion.
+- `tests/test_agent_loop.py`: added round-four behavior regressions and moved import-laziness into
+  a fresh interpreter so its result cannot depend on earlier collection/import order.
+- `Dockerfile.agent-loop`: unchanged in this round.
+
+High-impact breaks are named by:
+
+- `test_round4_compile_cache_routes_to_writable_output_with_read_only_source` and
+  `test_round4_container_compile_and_ruff_cache_policy_is_exact`: real `py_compile`/`compileall`
+  no longer attempt writes below the read-only source bind; `PYTHONPYCACHEPREFIX` is exactly
+  `/workspace/output/pycache`, its source/gate mirrors are writable by UID 65532, and Ruff uses
+  `--no-cache` with its cache path confined to output.
+- `test_round4_git_replacement_refs_are_rejected_before_object_reads`: every Git command carries
+  both `--no-replace-objects` and `GIT_NO_REPLACE_OBJECTS=1`, while preflight rejects a populated
+  `refs/replace` namespace.
+- `test_round4_docker_capability_revalidates_bytes_before_bounded_spawn` and the three containment
+  cases: production Docker is an explicit canonical absolute external capability recording file
+  identity, size, and streamed SHA-256; it is revalidated before each `_bounded_process` call.
+  Injected Docker-shaped tests remain a separate non-production path.
+- `test_round4_windows_environment_canonicalizes_names_and_rejects_conflicts`: Windows accepts
+  case-insensitive input but emits only canonical names and rejects conflicting variants; POSIX
+  continues to accept exact names only.
+- `test_round4_credential_path_policy_checks_every_component`: credential-like names in any path
+  component are rejected, with only final `.env.example` and `.env.template` names exempted.
+- `test_round4_unsafe_local_entry_owns_lock_and_excludes_runtime` and
+  `test_round4_source_lock_rejects_hardlink_without_touching_target`: unsafe-local cannot bypass
+  the source lock/runtime boundary, and a hardlinked lock is rejected without changing its target.
+- `test_import_is_lazy_and_never_reads_key_or_execution_modules`: the regression now runs in a
+  fresh subprocess and remains independent of module state created by earlier tests.
+
+### Exact TDD and verification output
+
+Initial round-four focused RED:
+
+```text
+12 failed, 1 passed, 176 deselected, 2 warnings in 6.10s
+```
+
+Focused GREEN after implementing the full round-four contract:
+
+```text
+18 passed, 174 deselected, 1 warning in 8.34s
+```
+
+The final cache-permission self-review regression also passed:
+
+```text
+2 passed, 190 deselected, 1 warning in 3.56s
+```
+
+Final full and static verification after the last implementation change:
+
+```text
+python -m pytest -q tests/test_agent_loop.py
+186 passed, 6 skipped, 10 warnings in 147.10s (0:02:27)
+
+python -m ruff check agent_loop.py tests/test_agent_loop.py
+All checks passed!
+
+python -m compileall -q agent_loop.py tests/test_agent_loop.py
+exit 0, no output
+
+git diff --check
+exit 0; only host core.autocrlf LF-to-CRLF advisories
+```
+
+The six skips are four POSIX-only cases (executable-mode behavior, process-group leader reaping,
+and the two parent-success/timeout process-group cases) plus two Windows symlink cases skipped
+because this account lacks symlink privilege. The Windows junction and Job Object cases ran. The
+ten warnings are existing SQLite resource/deprecation warnings plus the workspace pytest-cache
+permission warning; none changed a gate result.
+
+### Security evidence, self-review, and limitations
+
+The approved Docker executable is no longer a mutable path string. Production construction needs
+an operator-supplied capability outside source, controller, and permanent-runtime roots; every
+engine invocation rechecks non-reparse ancestry, file identity, size, and SHA-256. The simulated
+runner API accepts only an explicit absolute Docker-shaped endpoint and cannot yield production
+attestation. Git object reads are replacement-disabled even if a ref appears after preflight.
+
+Worker source, gate, and approved data remain read-only. Controller setup creates only the exact
+output-side pycache directory mirrors required for the fixed `/workspace/src` and
+`/workspace/gate` paths, leaving candidate bytes immutable. No `.alc-*` or `.controller-tmp`
+directory remained after verification.
+
+Per coordination, Docker Desktop was not invoked, and no image was pulled, built, or run. Real
+daemon/image provenance therefore remains unverified in this round. Provider-safe results still
+intentionally omit raw worker stdout/stderr and arbitrary sentinel/metric content. Before Task 3
+can form useful model feedback, it must derive bounded controller-owned diagnostic facts and
+finite normalized metrics/threshold outcomes without exposing worker streams; that is a Task 3
+prerequisite, not a reason to weaken this boundary.
