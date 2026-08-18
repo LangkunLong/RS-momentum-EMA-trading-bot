@@ -2335,6 +2335,52 @@ def test_container_config_hash_normalizes_none_network_id_assigned_after_start(
     assert engine.removed and engine.absence_verified
 
 
+def test_container_attestation_accepts_exact_docker_desktop_minimal_network_profile(
+    tmp_path: Path,
+) -> None:
+    """Docker Desktop omits the legacy empty top-level network fields."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+
+    def use_docker_desktop_profile(item: dict[str, Any]) -> None:
+        item["NetworkSettings"] = {
+            "Networks": {
+                "none": {
+                    "Aliases": None,
+                    "DNSNames": None,
+                    "DriverOpts": None,
+                    "EndpointID": "",
+                    "Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "GwPriority": 0,
+                    "IPAMConfig": None,
+                    "IPAddress": "",
+                    "IPPrefixLen": 0,
+                    "IPv6Gateway": "",
+                    "Links": None,
+                    "MacAddress": "",
+                    "NetworkID": "d" * 64 if engine.started else "",
+                }
+            },
+            "Ports": {},
+            "SandboxID": "",
+            "SandboxKey": "",
+        }
+
+    engine.mutate_inspection = use_docker_desktop_profile
+
+    result = run_test_gate(candidate, _faithful_runner(image, engine))
+
+    assert result.gate_observation is True
+    assert result.observed_exit_zero is True
+    assert engine.removed and engine.absence_verified
+
+
 @pytest.mark.parametrize(
     "mutator",
     [

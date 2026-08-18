@@ -2530,11 +2530,14 @@ class SandboxRunner:
         if item.get("Id") != container_id or item.get("Name") != f"/{name}" or item.get("Image") != image_id:
             raise SandboxError("created container image ID differs from the inspected image")
         network = item.get("NetworkSettings")
-        expected_network = {
-            "Bridge": "",
+        expected_network_minimal = {
             "SandboxID": "",
             "SandboxKey": "",
             "Ports": {},
+        }
+        expected_network_full = {
+            **expected_network_minimal,
+            "Bridge": "",
             "HairpinMode": False,
             "LinkLocalIPv6Address": "",
             "LinkLocalIPv6PrefixLen": 0,
@@ -2551,10 +2554,13 @@ class SandboxRunner:
         }
         if (
             not isinstance(network, dict)
-            or set(network) != {*expected_network, "Networks"}
-            or any(
-                type(network[key]) is not type(wanted) or network[key] != wanted
-                for key, wanted in expected_network.items()
+            or not any(
+                set(network) == {*profile, "Networks"}
+                and all(
+                    type(network[key]) is type(wanted) and network[key] == wanted
+                    for key, wanted in profile.items()
+                )
+                for profile in (expected_network_minimal, expected_network_full)
             )
         ):
             raise SandboxError("created container network isolation differs")
