@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from core.notifier import (
+    _is_configured,
     notify_buy_filled,
     notify_cycle_summary,
     notify_entry_submitted,
@@ -21,6 +22,7 @@ from core.notifier import (
 def _cfg(**overrides):
     """Return a settings-like dict used to patch notifier settings."""
     defaults = {
+        "NOTIFY_EMAIL_PROVIDER": "smtp",
         "NOTIFY_EMAIL_FROM": "bot@gmail.com",
         "NOTIFY_EMAIL_TO": "trader@gmail.com",
         "NOTIFY_EMAIL_PASSWORD": "secret",
@@ -107,6 +109,64 @@ class TestSendEmail:
         assert captured["to"] == "trader@gmail.com"
         assert captured["from"] == "bot@gmail.com"
         assert captured["subject"] == "Hello"
+
+    def test_gmail_oauth_is_configured_without_an_smtp_password(self):
+        """Requiring the legacy password would defeat browser-based authorization."""
+        with _patch_settings(
+            NOTIFY_EMAIL_PROVIDER="gmail_oauth",
+            NOTIFY_EMAIL_FROM="langkunlong@gmail.com",
+            NOTIFY_EMAIL_TO="langkunlong@gmail.com",
+            NOTIFY_EMAIL_PASSWORD="",
+        ):
+            with patch("core.notifier.is_gmail_authorized", return_value=True):
+                assert _is_configured() is True
+
+    def test_gmail_oauth_routes_through_gmail_api_without_smtp(self):
+        """The OAuth backend must never expose a path back to SMTP password login."""
+        with _patch_settings(
+            NOTIFY_EMAIL_PROVIDER="gmail_oauth",
+            NOTIFY_EMAIL_FROM="langkunlong@gmail.com",
+            NOTIFY_EMAIL_TO="langkunlong@gmail.com",
+            NOTIFY_EMAIL_PASSWORD="",
+        ):
+            with (
+                patch("core.notifier.is_gmail_authorized", return_value=True),
+                patch("core.notifier.send_gmail_email", return_value="gmail-message-1") as gmail_send,
+                patch("smtplib.SMTP") as smtp,
+            ):
+                result = send_email("OAuth subject", "OAuth body")
+
+        assert result is True
+        assert gmail_send.call_args.kwargs == {
+            "from_email": "langkunlong@gmail.com",
+            "to_email": "langkunlong@gmail.com",
+            "subject": "OAuth subject",
+            "body": "OAuth body",
+        }
+        smtp.assert_not_called()
+
+    def test_gmail_oauth_failure_does_not_fall_back_to_smtp(self):
+        """A revoked OAuth grant must fail visibly rather than use an unrelated legacy secret."""
+        from core.gmail_oauth import GmailOAuthError
+
+        with _patch_settings(
+            NOTIFY_EMAIL_PROVIDER="gmail_oauth",
+            NOTIFY_EMAIL_FROM="langkunlong@gmail.com",
+            NOTIFY_EMAIL_TO="langkunlong@gmail.com",
+            NOTIFY_EMAIL_PASSWORD="legacy-secret",
+        ):
+            with (
+                patch("core.notifier.is_gmail_authorized", return_value=True),
+                patch(
+                    "core.notifier.send_gmail_email",
+                    side_effect=GmailOAuthError("Gmail API send failed"),
+                ),
+                patch("smtplib.SMTP") as smtp,
+            ):
+                result = send_email("OAuth subject", "OAuth body")
+
+        assert result is False
+        smtp.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
