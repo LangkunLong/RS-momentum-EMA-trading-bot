@@ -2800,6 +2800,70 @@ def test_private_tree_cleanup_does_not_follow_hostile_symlink(tmp_path: Path) ->
     assert outside.stat().st_mode == before
 
 
+def test_private_tree_cleanup_makes_owned_parent_writable_before_child_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: readable 0500 directories fail only when cleanup tries to unlink a child."""
+    import agent_loop
+    from agent_loop import _remove_private_tree
+
+    parent = tmp_path / "owned-parent"
+    parent.mkdir()
+    child = parent / "read-only-child.txt"
+    child.write_bytes(b"owned")
+    child.chmod(0o400)
+    parent.chmod(0o500)
+    original_chmod = agent_loop.os.chmod
+    original_unlink = agent_loop.os.unlink
+    parent_writable = False
+
+    def track_chmod(path: Any, mode: int, *, follow_symlinks: bool = True) -> None:
+        nonlocal parent_writable
+        if Path(path) == parent and mode == 0o700 and follow_symlinks is False:
+            parent_writable = True
+        original_chmod(path, mode, follow_symlinks=follow_symlinks)
+
+    def require_writable_parent(path: Any) -> None:
+        if Path(path) == child and not parent_writable:
+            raise PermissionError(13, "parent directory is not writable", str(path))
+        original_unlink(path)
+
+    monkeypatch.setattr(agent_loop.os, "chmod", track_chmod)
+    monkeypatch.setattr(agent_loop.os, "unlink", require_writable_parent)
+    try:
+        _remove_private_tree(parent)
+        assert not parent.exists()
+    finally:
+        if child.exists():
+            original_chmod(child, 0o600, follow_symlinks=False)
+        if parent.exists():
+            original_chmod(parent, 0o700, follow_symlinks=False)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory write permissions")
+def test_private_tree_cleanup_removes_0500_parent_with_0400_child(tmp_path: Path) -> None:
+    """Break caught: POSIX cleanup can scan a read-only tree but cannot unlink its child."""
+    from agent_loop import _remove_private_tree
+
+    parent = tmp_path / "owned-parent"
+    parent.mkdir()
+    child = parent / "read-only-child.txt"
+    child.write_bytes(b"owned")
+    child.chmod(0o400)
+    parent.chmod(0o500)
+    assert stat.S_IMODE(child.stat().st_mode) == 0o400
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o500
+    try:
+        _remove_private_tree(parent)
+        assert not parent.exists()
+    finally:
+        if child.exists():
+            child.chmod(0o600)
+        if parent.exists():
+            parent.chmod(0o700)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junction behavior")
 def test_private_tree_cleanup_does_not_follow_hostile_junction(tmp_path: Path) -> None:
     """Break caught: cleanup chmod/traversal follows a candidate-created junction outside its exact root."""

@@ -1851,6 +1851,7 @@ def _remove_private_tree(root: Path) -> None:
             remove_leaf(path, current, directory=stat.S_ISDIR(current.st_mode))
             return
         if stat.S_ISDIR(current.st_mode):
+            os.chmod(path, 0o700, follow_symlinks=False)
             try:
                 scanner = os.scandir(path)
             except PermissionError:
