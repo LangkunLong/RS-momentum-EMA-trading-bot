@@ -423,3 +423,102 @@ Remaining limitation: Docker is absent on this host, so real daemon provenance r
 `security_attestation=false`; faithful injected Docker-shaped tests cannot become production
 attestation. Controller snapshots/candidates still have caller-owned run-lifetime disposal, which
 Task 3 must close after inert diff/archive export.
+
+## Review fix round 3/5 — explicit capabilities and provider-safe evidence
+
+### Files, APIs, and named breaks
+
+- `agent_loop.py`: added `GitCapability` and `configure_git_executable(Path)`, exact-byte Git
+  revalidation before every spawn, execution-affecting common/worktree-config rejection, lazy-fetch
+  disabling, link-safe `SourceLock`, POSIX leader reaping, executable read-only modes, random
+  container ownership labels/full-ID cleanup, credential-like tracked-path rejection, and
+  provider-safe `GateResult`/`BacktestGateResult` views.
+- `tests/test_agent_loop.py`: added round-three regressions for poisoned Git discovery and gateway
+  construction, local filter/worktree promisor config, canonical environment names, redirected
+  lock files, POSIX descendant cleanup, foreign container collisions, high-entropy ownership,
+  tracked dotenv export, and raw test/backtest-output canaries.
+- `Dockerfile.agent-loop`: unchanged in this round; its fixed UID/GID and digest-pinned build
+  contract remain covered by the prior tests.
+
+High-impact breaks are named by:
+
+- `test_round3_poisoned_path_before_import_never_executes_fake_git`,
+  `test_round3_gateway_key_lookup_never_starts_git`, and
+  `test_round3_repo_contained_git_capability_is_rejected_before_spawn`: no controller Git operation
+  may discover a binary from PATH/current directory or trust a repository-contained executable.
+- `test_round3_preflight_rejects_execution_local_config_before_filter_runs` and
+  `test_round3_worktree_promisor_config_is_rejected_before_object_reads`: filters and partial-clone
+  transport are rejected before status, index, or object reads.
+- `test_round3_posix_bounded_process_kills_live_grandchild` and
+  `test_round3_posix_tree_helper_reaps_leader_before_absence_poll`: process-group termination reaps
+  the leader before proving descendant absence; these are POSIX-only and skipped on Windows.
+- `test_round3_foreign_name_collision_is_never_removed` and
+  `test_round3_owned_container_cleanup_uses_full_id_and_high_entropy_label`: predictable names never
+  authorize deletion; only a unique owner label plus inspected full container ID does.
+- `test_round3_provider_safe_gate_result_never_contains_hostile_stream_canaries` and its backtest
+  counterpart: public results have `provider_safe=true`, closed observation outcomes, hashes, and
+  envelopes, but no raw `.stdout`, `.stderr`, `.process`, parsed sentinel map, or arbitrary metrics.
+- `test_round3_force_tracked_credential_path_is_rejected_before_export`: all tree entries are
+  classified before any blob export, so `.env.production` and credential/key/token filenames never
+  enter a candidate.
+
+### Exact TDD and verification output
+
+Initial round-three RED:
+
+```text
+10 failed, 3 skipped, 161 deselected, 1 warning in 10.15s
+```
+
+Additional provider-safe backtest/worktree-config RED after the interface clarification:
+
+```text
+2 failed, 1 passed, 1 skipped, 173 deselected, 3 warnings in 5.32s
+```
+
+First complete run after implementation, before correcting two stale test-harness assumptions:
+
+```text
+2 failed, 169 passed, 6 skipped, 9 warnings in 168.89s (0:02:48)
+```
+
+Final GREEN and static verification:
+
+```text
+python -m pytest -q tests/test_agent_loop.py
+171 passed, 6 skipped, 9 warnings in 156.55s (0:02:36)
+
+python -m ruff check agent_loop.py tests/test_agent_loop.py
+All checks passed!
+
+python -m compileall -q agent_loop.py tests/test_agent_loop.py
+exit 0, no output
+
+git diff --check
+exit 0; only host core.autocrlf LF-to-CRLF advisories
+```
+
+The six skips are platform capability tests: POSIX executable/process-group cases on Windows and
+link/junction creation cases unavailable without the corresponding host privilege. Windows Job
+Object coverage from round two still ran in the full suite.
+
+### Security evidence, self-review, and limitation
+
+Git now starts only through an explicitly configured canonical absolute `git`/`git.exe` capability.
+The capability records device/inode, size, and streamed SHA-256; every spawn rechecks non-reparse
+ancestors, identity, size, and bytes. Git receives no ambient PATH, provider/broker/cloud/proxy or
+credential state, disables hooks/fsmonitor/external diff/pagers/lazy fetch, and rejects dangerous
+local plus worktree config before reading checkout state. Dotenv discovery is filesystem-only and
+does not start Git.
+
+Container creation carries a fresh 256-bit owner label. A failed create/name collision performs
+only a narrow owner-label query and never removes by name. A successful or transport-ambiguous
+create is cleaned only after exact label, deterministic name, and full 64-hex ID ownership are
+inspected; absence proof is a successful exact ID-plus-label list returning empty. Raw worker
+streams remain ephemeral in controller-local `ProcessResult`/`WorkerObservation`
+(`provider_safe=false`) and only their digests enter the host-sealed envelope.
+
+Docker Desktop is now available on the host, but per coordination this round did not pull, build,
+or run any image/container. Therefore real daemon/image provenance remains deliberately unverified;
+all sandbox contract coverage here uses the faithful injected Docker-shaped backend, which always
+reports `worker_confined=false` and `security_attestation=false`.

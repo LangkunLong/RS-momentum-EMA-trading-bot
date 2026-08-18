@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import importlib
+import base64
 import hashlib
+import importlib
 import json
+import os
+import re
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -630,6 +633,12 @@ def _run_git(path: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, text=True)
 
 
+def _trusted_git_path() -> Path:
+    located = shutil.which("git")
+    assert located is not None
+    return Path(located).resolve()
+
+
 def test_common_dotenv_lookup_is_bound_to_explicit_linked_worktree_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -661,6 +670,9 @@ def test_common_dotenv_lookup_is_bound_to_explicit_linked_worktree_root(
 
 
 def _task2_repo(tmp_path: Path, *, branch: str = "codex/task2") -> Path:
+    import agent_loop
+
+    agent_loop.configure_git_executable(_trusted_git_path())
     repo = tmp_path / "source"
     repo.mkdir()
     _run_git(repo, "init")
@@ -1367,14 +1379,14 @@ def test_execution_mode_has_no_promotion_surface_and_gate_results_are_observatio
     with pytest.raises(TypeError):
         ExecutionMode(promote=True)  # type: ignore[call-arg]
     result = GateResult(
+        provider_safe=True,
         gate_observation=True,
         observed_exit_zero=True,
         worker_confined=False,
         source_modified=False,
         security_attestation=False,
         returncode=0,
-        stdout="spoofable",
-        stderr="",
+        outcome="exit_zero",
         stdout_sha256="a" * 64,
         stderr_sha256="b" * 64,
         completion_envelope=None,
@@ -1425,13 +1437,17 @@ class FaithfulSandboxEngine:
         self.absence_verified = False
         self.malformed_create_output = False
         self.raise_after_create = False
+        self.foreign_name_collision = False
+        self.foreign_deleted = False
         self.cleanup_fails = False
         self.oom_killed = False
         self.mutate_inspection: Any = None
         self.mutate_terminal_state: Any = None
         self.cleanup_inspect_error = False
         self.mutate_data_on_start = False
+        self.start_stdout = "candidate says success\n"
         self.name = ""
+        self.owner_label = ""
         self.inspect_payload: dict[str, object] = {}
 
     @staticmethod
@@ -1465,6 +1481,15 @@ class FaithfulSandboxEngine:
             self.removed = False
             self.absence_verified = False
             self.name = self._option(argv, "--name")
+            if self.foreign_name_collision:
+                self.created = False
+                return _process_result(1, stderr="name is already in use")
+            labels: dict[str, str] = {}
+            for index, value in enumerate(argv):
+                if value == "--label":
+                    key, item = argv[index + 1].split("=", 1)
+                    labels[key] = item
+            self.owner_label = labels.get("agent-loop.owner", "")
             mounts: list[dict[str, object]] = []
             for index, value in enumerate(argv):
                 if value != "--mount":
@@ -1509,6 +1534,7 @@ class FaithfulSandboxEngine:
                     "WorkingDir": "/workspace/src",
                     "Cmd": list(argv[image_index + 1 :]),
                     "Env": [f"{key}={value}" for key, value in sorted(environment.items())],
+                    "Labels": labels,
                 },
                 "HostConfig": {
                     "NetworkMode": "none",
@@ -1578,15 +1604,28 @@ class FaithfulSandboxEngine:
                 data_path.chmod(stat.S_IWRITE)
                 with data_path.open("ab") as stream:
                     stream.write(b"tampered")
-            return _process_result(137 if self.oom_killed else 0, "candidate says success\n")
+            return _process_result(137 if self.oom_killed else 0, self.start_stdout)
         if command == "rm":
             if self.cleanup_fails:
                 return _process_result(1, stderr="cleanup failed")
+            target = argv[-1]
+            if self.foreign_name_collision and target == self.name:
+                self.foreign_deleted = True
+                return _process_result(0)
+            if target not in {self.name, self.container_id}:
+                return _process_result(1, stderr="unknown container")
             self.removed = True
             return _process_result(0)
         if argv[1:3] == ("container", "ls"):
             if self.cleanup_inspect_error:
                 return _process_result(1, stderr="permission denied")
+            filters = [argv[index + 1] for index, value in enumerate(argv) if value == "--filter"]
+            if any(value.startswith("label=agent-loop.owner=") for value in filters):
+                wanted = next(value.split("=", 2)[2] for value in filters if value.startswith("label="))
+                found = self.created and not self.removed and self.owner_label == wanted
+                if any(value.startswith("id=") for value in filters) and not found:
+                    self.absence_verified = self.removed
+                return _process_result(0, self.container_id + "\n" if found else "")
             self.absence_verified = self.removed
             return _process_result(0, "" if self.removed else self.container_id + "\n")
         raise AssertionError(f"unexpected fake engine command: {argv}")
@@ -1635,7 +1674,7 @@ def test_worker_completion_envelope_is_host_sealed_chained_and_observational(tmp
         "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "-q", "-m", "not integration"
     ]
     assert second.completion_envelope.payload["previous_hmac_sha256"] == first.completion_envelope.hmac_sha256
-    assert first.completion_envelope.hmac_sha256 not in first.stdout
+    assert "candidate says success" not in repr(first)
 
 
 def test_worker_mounts_candidate_gate_and_data_read_only_with_narrow_writable_dirs(tmp_path: Path) -> None:
@@ -2152,7 +2191,7 @@ def test_worker_export_preserves_executable_tracked_mode(tmp_path: Path) -> None
     _run_git(source, "commit", "-m", "executable")
     candidate = export_candidate(preflight_source(source, acquire_lock=False))
     mode = run_in_disposable_worker(candidate, lambda layout: stat.S_IMODE((layout.source / "core/tool.py").stat().st_mode))
-    assert mode == 0o755
+    assert mode == 0o555
 
 
 def test_linked_worktree_uses_real_worktree_specific_exclusive_lock(tmp_path: Path) -> None:
@@ -2222,13 +2261,13 @@ def test_git_execution_keeps_resolved_absolute_binary_after_path_poisoning(
 
     source = _task2_repo(tmp_path)
     preflight_source(source, acquire_lock=False)
-    approved = agent_loop._GIT_EXECUTABLE
-    assert approved is not None and approved.is_absolute()
+    approved = agent_loop._GIT_CAPABILITY
+    assert approved is not None and approved.executable.is_absolute()
     monkeypatch.setenv("PATH", str(tmp_path / "hostile-bin"))
 
     state = preflight_source(source, acquire_lock=False)
     assert state.head
-    assert agent_loop._GIT_EXECUTABLE == approved
+    assert agent_loop._GIT_CAPABILITY == approved
 
 
 def test_engine_control_directories_are_never_mounted_to_candidate(tmp_path: Path) -> None:
@@ -2356,3 +2395,339 @@ def test_windows_job_assignment_failure_never_releases_target(
             timeout=2,
         )
     assert not marker.exists()
+
+
+def test_round3_git_requires_explicit_absolute_operator_capability(tmp_path: Path) -> None:
+    """Break caught: first Git use resolves a hostile current-directory/PATH git.exe."""
+    import agent_loop
+
+    assert hasattr(agent_loop, "configure_git_executable")
+    repo = _task2_repo(tmp_path)
+    capability = agent_loop.configure_git_executable(_trusted_git_path())
+    state = agent_loop.preflight_source(repo, git=capability, acquire_lock=False)
+    assert state.head
+
+
+def test_round3_poisoned_path_before_import_never_executes_fake_git(tmp_path: Path) -> None:
+    """Break caught: module import/first preflight uses PATH or cwd to discover Git."""
+    fake = tmp_path / "poison"
+    fake.mkdir()
+    (fake / "git.exe").write_bytes(b"not an approved executable")
+    marker = tmp_path / "fake-git-ran"
+    repo_root = Path(__file__).parents[1]
+    code = (
+        "import pathlib,subprocess; marker=pathlib.Path(" + repr(str(marker)) + "); "
+        "real=subprocess.run; "
+        "subprocess.run=lambda argv,*a,**k: (marker.write_text('ran'),None)[1] "
+        "if pathlib.Path(str(argv[0])).name.lower()=='git.exe' else real(argv,*a,**k); "
+        "import agent_loop; "
+        "\ntry: agent_loop.preflight_source(pathlib.Path('.'),acquire_lock=False)\n"
+        "except Exception: pass\n"
+    )
+    environment = dict(os.environ)
+    environment["PATH"] = str(fake)
+    environment["PYTHONPATH"] = str(repo_root)
+    completed = subprocess.run(
+        [sys.executable, "-c", code], cwd=fake, env=environment,
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
+
+
+def test_round3_gateway_key_lookup_never_starts_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: gateway construction runs literal Git before any trusted capability exists."""
+    import agent_loop
+    from agent_loop import OpenRouterGateway
+
+    marker = tmp_path / "git-ran"
+
+    def forbidden_git(*_args: object, **_kwargs: object) -> object:
+        marker.write_text("ran", encoding="utf-8")
+        raise AssertionError("gateway key lookup must not execute Git")
+
+    monkeypatch.setattr(agent_loop.subprocess, "run", forbidden_git)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "explicit-controller-key")
+    monkeypatch.delenv("OPENROUTER", raising=False)
+    OpenRouterGateway(controller_root=tmp_path)
+    assert not marker.exists()
+
+
+def test_round3_preflight_rejects_execution_local_config_before_filter_runs(tmp_path: Path) -> None:
+    """Break caught: status/hash invokes a repository-local clean/process filter before config audit."""
+    import agent_loop
+    from agent_loop import PreflightError
+
+    assert hasattr(agent_loop, "configure_git_executable")
+    repo = _task2_repo(tmp_path)
+    (repo / ".gitattributes").write_text("*.py filter=evil\n", encoding="utf-8")
+    _run_git(repo, "add", ".gitattributes")
+    _run_git(repo, "commit", "-m", "attributes")
+    marker = tmp_path / "filter-ran"
+    command = f'"{sys.executable}" -c "from pathlib import Path; Path(r\'{marker}\').write_text(\'ran\')"'
+    _run_git(repo, "config", "filter.evil.clean", command)
+    _run_git(repo, "config", "filter.evil.process", command)
+    capability = agent_loop.configure_git_executable(_trusted_git_path())
+
+    with pytest.raises(PreflightError, match="local Git config"):
+        agent_loop.preflight_source(repo, git=capability, acquire_lock=False)
+    assert not marker.exists()
+
+
+def test_round3_canonical_environment_drops_case_variants_and_credentials() -> None:
+    """Break caught: PaTh/OpenRouter case variants survive canonical child-env allowlisting."""
+    import agent_loop
+
+    assert hasattr(agent_loop, "_canonical_environment")
+    source = {
+        "PATH": "/trusted/bin",
+        "PaTh": "/hostile/bin",
+        "SYSTEMROOT": "C:/Windows",
+        "OpenRouter_Api_Key": "secret",
+    }
+    assert agent_loop._canonical_environment(source, {"PATH", "SYSTEMROOT"}) == {
+        "PATH": "/trusted/bin",
+        "SYSTEMROOT": "C:/Windows",
+    }
+
+
+def test_round3_source_lock_rejects_symlink_without_touching_target(tmp_path: Path) -> None:
+    """Break caught: SourceLock opens/writes through a pre-existing redirected lock path."""
+    from agent_loop import PreflightError, SourceLock
+
+    outside = tmp_path / "outside-marker"
+    outside.write_bytes(b"")
+    lock_path = tmp_path / "agent-loop.lock"
+    try:
+        os.symlink(outside, lock_path)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    lock = SourceLock(lock_path)
+    error: BaseException | None = None
+    try:
+        lock.acquire()
+    except PreflightError as exc:
+        error = exc
+    finally:
+        lock.close()
+    assert error is not None
+    assert outside.read_bytes() == b""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group containment")
+def test_round3_posix_tree_helper_reaps_leader_before_absence_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a killed zombie leader keeps killpg(pid, 0) alive until the deadline."""
+    import agent_loop
+
+    assert hasattr(agent_loop, "_terminate_posix_process_tree")
+    events: list[str] = []
+
+    class FakeProcess:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float) -> int:
+            assert timeout == 10
+            events.append("reap")
+            return -9
+
+    checks = 0
+
+    def killpg(_pid: int, signal: int) -> None:
+        nonlocal checks
+        if signal == 9:
+            events.append("kill")
+            return
+        checks += 1
+        events.append("verify")
+        raise ProcessLookupError
+
+    monkeypatch.setattr(agent_loop.os, "killpg", killpg)
+    agent_loop._terminate_posix_process_tree(FakeProcess())
+    assert events == ["kill", "reap", "verify"]
+    assert checks == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group containment")
+@pytest.mark.parametrize("parent_sleep", [False, True])
+def test_round3_posix_bounded_process_kills_live_grandchild(
+    tmp_path: Path,
+    parent_sleep: bool,
+) -> None:
+    """Break caught: POSIX parent success/timeout leaves a pipe-holding descendant or zombie loop."""
+    from agent_loop import _bounded_process
+
+    marker = tmp_path / "posix-heartbeat.txt"
+    result = _bounded_process(
+        (sys.executable, "-c", _pipe_holding_tree_program(marker, parent_sleep=parent_sleep)),
+        timeout=0.75 if parent_sleep else 5,
+    )
+    assert result.timed_out is parent_sleep
+    before = marker.read_bytes()
+    time.sleep(0.25)
+    assert marker.read_bytes() == before
+
+
+def test_round3_foreign_name_collision_is_never_removed(tmp_path: Path) -> None:
+    """Break caught: failed create/name collision triggers rm --force on a predictable foreign name."""
+    from agent_loop import SandboxError, export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    engine.foreign_name_collision = True
+    with pytest.raises(SandboxError):
+        run_test_gate(candidate, _faithful_runner(image, engine))
+    assert not engine.foreign_deleted
+    assert not any(call[1] == "rm" for call in engine.calls)
+
+
+def test_round3_owned_container_cleanup_uses_full_id_and_high_entropy_label(tmp_path: Path) -> None:
+    """Break caught: owned cleanup is authorized by predictable name instead of inspected token+ID."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    run_test_gate(candidate, _faithful_runner(image, engine))
+    create = next(call for call in engine.calls if call[1] == "create")
+    label = create[create.index("--label") + 1]
+    assert re.fullmatch(r"agent-loop\.owner=[0-9a-f]{64}", label)
+    removals = [call for call in engine.calls if call[1] == "rm"]
+    assert removals and all(call[-1] == engine.container_id for call in removals)
+
+
+def test_round3_force_tracked_credential_path_is_rejected_before_export(tmp_path: Path) -> None:
+    """Break caught: force-tracked dotenv/credential bytes enter candidate and provider evidence."""
+    from agent_loop import QuarantineError, export_candidate, preflight_source
+
+    source = _task2_repo(tmp_path)
+    secret = source / ".env.production"
+    secret.write_text("CANARY=force-tracked-secret\n", encoding="utf-8")
+    _run_git(source, "add", "-f", ".env.production")
+    _run_git(source, "commit", "-m", "tracked secret")
+    with pytest.raises(QuarantineError, match="credential"):
+        export_candidate(preflight_source(source, acquire_lock=False))
+
+
+def test_round3_provider_safe_gate_result_never_contains_hostile_stream_canaries(tmp_path: Path) -> None:
+    """Break caught: candidate stdout/stderr or encoded DB bytes enter Task3/provider-facing fields."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    db_canary = b"approved-db-secret-canary"
+    hostile = "candidate:" + base64.b64encode(db_canary).decode() + ":chunked"
+    engine.start_stdout = hostile + "\n"
+    result = run_test_gate(candidate, _faithful_runner(image, engine))
+    assert result.provider_safe is True
+    assert not hasattr(result, "stdout") and not hasattr(result, "stderr")
+    safe_render = repr(result) + json.dumps(dict(result.completion_envelope.payload), sort_keys=True)
+    assert hostile not in safe_render
+    assert db_canary.decode() not in safe_render
+
+
+def test_round3_provider_safe_backtest_result_never_exposes_process_or_sentinel(
+    tmp_path: Path,
+) -> None:
+    """Break caught: backtest public result retains raw process streams or arbitrary sentinel values."""
+    from agent_loop import (
+        BACKTEST_SENTINEL,
+        BacktestThresholds,
+        CompletionEnvelope,
+        ProcessResult,
+        WorkerObservation,
+        export_candidate,
+        preflight_source,
+        run_backtest_gate,
+        validate_historical_data_bundle,
+    )
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    bundle_path = tmp_path / "historical.sqlite3"
+    symbols = "AAPL,SPY"
+    digest = _create_bundle(
+        bundle_path,
+        [
+            (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
+            (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+        ],
+    )
+    bundle = validate_historical_data_bundle(
+        bundle_path, digest, ["AAPL"], "SPY", "2026-01-01", "2026-02-01"
+    )
+    canary = "candidate-runtime-canary-" + base64.b64encode(b"approved-db-canary").decode()
+
+    class HostileSandbox:
+        def run_worker(self, *_args: object, **_kwargs: object) -> WorkerObservation:
+            metrics = {
+                "total_return_pct": 1.0,
+                "annualized_return_pct": 1.0,
+                "sharpe_ratio": 1.0,
+                "max_drawdown_pct": -1.0,
+                "closed_trades": 1,
+            }
+            output = canary + "\n" + BACKTEST_SENTINEL + json.dumps(metrics) + "\n"
+            return WorkerObservation(
+                ProcessResult.ok(output, canary),
+                CompletionEnvelope({"worker_confined": False}, "0" * 64),
+            )
+
+    result = run_backtest_gate(
+        candidate,
+        HostileSandbox(),  # type: ignore[arg-type]
+        bundle,
+        ["AAPL"],
+        "SPY",
+        "2026-01-01",
+        "2026-02-01",
+        BacktestThresholds(0, 0, 0, 100, 0),
+    )
+    assert result.provider_safe is True
+    assert not hasattr(result, "process") and not hasattr(result, "metrics")
+    safe_render = repr(result) + json.dumps(dict(result.completion_envelope.payload), sort_keys=True)
+    assert canary not in safe_render
+    assert "approved-db-canary" not in safe_render
+
+
+def test_round3_repo_contained_git_capability_is_rejected_before_spawn(tmp_path: Path) -> None:
+    """Break caught: an operator capability may point into the untrusted repository itself."""
+    repo_root = Path(__file__).parents[1]
+    code = (
+        "import pathlib,agent_loop; root=pathlib.Path(" + repr(str(tmp_path)) + "); "
+        "repo=root/'repo'; repo.mkdir(); fake=repo/'git.exe'; fake.write_bytes(b'fake'); "
+        "cap=agent_loop.configure_git_executable(fake.resolve()); "
+        "\ntry: agent_loop.preflight_source(repo,git=cap,acquire_lock=False)\n"
+        "except agent_loop.PreflightError: raise SystemExit(0)\n"
+        "raise SystemExit(7)\n"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(repo_root)
+    completed = subprocess.run(
+        [sys.executable, "-c", code], cwd=tmp_path, env=environment,
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_round3_worktree_promisor_config_is_rejected_before_object_reads(tmp_path: Path) -> None:
+    """Break caught: worktree config can enable lazy remote object fetching before export."""
+    from agent_loop import PreflightError, preflight_source
+
+    repo = _task2_repo(tmp_path)
+    _run_git(repo, "config", "extensions.worktreeConfig", "true")
+    _run_git(repo, "config", "--worktree", "remote.origin.promisor", "true")
+    with pytest.raises(PreflightError, match="local Git config"):
+        preflight_source(repo, acquire_lock=False)

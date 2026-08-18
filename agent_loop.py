@@ -639,26 +639,51 @@ def _embedded_status_code(error: object) -> int | None:
     return None
 
 
+def _existing_path_without_links(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode) or bool(
+            getattr(info, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            raise OSError("path contains a link or reparse point")
+    return absolute
+
+
 def _controller_dotenv_values(controller_root: Path) -> dict[str, str]:
-    """Read only accepted key names from the common repository's adjacent ``.env`` file."""
+    """Read accepted keys beside validated Git metadata without starting Git or following links."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=controller_root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    common_dir = Path(result.stdout.strip())
-    if not common_dir.is_absolute():
-        common_dir = controller_root / common_dir
-    dotenv = common_dir.parent / ".env"
-    try:
+        root = _existing_path_without_links(controller_root)
+        marker = root / ".git"
+        marker_info = marker.lstat()
+        if stat.S_ISDIR(marker_info.st_mode):
+            git_dir = _existing_path_without_links(marker)
+        elif stat.S_ISREG(marker_info.st_mode):
+            line = marker.read_text(encoding="utf-8").strip()
+            if "\n" in line or not line.startswith("gitdir: "):
+                return {}
+            raw_git_dir = Path(line.removeprefix("gitdir: "))
+            git_dir = _existing_path_without_links(
+                raw_git_dir if raw_git_dir.is_absolute() else root / raw_git_dir
+            )
+        else:
+            return {}
+        commondir_file = git_dir / "commondir"
+        if commondir_file.exists():
+            _existing_path_without_links(commondir_file)
+            raw_common = Path(commondir_file.read_text(encoding="utf-8").strip())
+            common_dir = _existing_path_without_links(
+                raw_common if raw_common.is_absolute() else git_dir / raw_common
+            )
+        else:
+            common_dir = git_dir
+        dotenv = common_dir.parent / ".env"
+        _existing_path_without_links(dotenv)
         lines = dotenv.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return {}
     values: dict[str, str] = {}
     for line in lines:
@@ -892,9 +917,10 @@ class OpenRouterGateway:
         )
 
 
-_GIT_ENV_KEYS = ("PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP")
+_GIT_ENV_KEYS = frozenset({"SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"})
 _NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
 _GIT_FIXED_ARGS = (
+    "--no-lazy-fetch",
     "-c", f"core.hooksPath={_NULL_DEVICE}",
     "-c", "core.fsmonitor=false",
     "-c", "diff.external=",
@@ -903,56 +929,92 @@ _GIT_FIXED_ARGS = (
 )
 
 
-def _resolve_git_executable() -> Path | None:
-    located = shutil.which("git")
-    if located is None:
-        return None
-    located_path = Path(located)
+@dataclass(frozen=True)
+class GitCapability:
+    executable: Path
+    device: int
+    inode: int
+    size: int
+    sha256: str
+
+
+_GIT_CAPABILITY: GitCapability | None = None
+
+
+def configure_git_executable(executable: Path) -> GitCapability:
+    """Validate and install one explicit operator-approved absolute Git executable."""
+    if not isinstance(executable, Path) or not executable.is_absolute():
+        raise ConfigurationError("Git executable approval requires an absolute path")
     try:
-        located_info = located_path.lstat()
-    except OSError:
-        return None
-    if stat.S_ISLNK(located_info.st_mode) or bool(
-        getattr(located_info, "st_file_attributes", 0)
+        canonical = _existing_path_without_links(executable)
+        info = canonical.lstat()
+    except OSError as exc:
+        raise ConfigurationError("approved Git executable is absent") from exc
+    if canonical != executable or stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
         & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    ):
-        return None
-    executable = located_path.resolve()
-    info = executable.lstat()
+    ) or not stat.S_ISREG(info.st_mode) or canonical.name.casefold() not in {"git", "git.exe"}:
+        raise ConfigurationError("approved Git executable must be canonical, regular, and non-reparse")
+    digest = hashlib.sha256()
+    with canonical.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    capability = GitCapability(canonical, info.st_dev, info.st_ino, info.st_size, digest.hexdigest())
+    global _GIT_CAPABILITY
+    if _GIT_CAPABILITY is not None and _GIT_CAPABILITY != capability:
+        raise ConfigurationError("approved Git executable cannot change during a controller process")
+    _GIT_CAPABILITY = capability
+    return capability
+
+
+def _approved_git_executable(capability: GitCapability | None = None) -> Path:
+    approved = capability or _GIT_CAPABILITY
+    if approved is None:
+        raise PreflightError("an explicit approved Git capability is required")
+    try:
+        canonical = _existing_path_without_links(approved.executable)
+        info = canonical.lstat()
+    except OSError as exc:
+        raise PreflightError("approved Git executable disappeared") from exc
     if (
         not stat.S_ISREG(info.st_mode)
-        or executable.is_symlink()
-        or bool(
-            getattr(info, "st_file_attributes", 0)
-            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-        )
-        or executable.name.casefold() not in {"git", "git.exe"}
+        or stat.S_ISLNK(info.st_mode)
+        or _has_reparse_point(approved.executable)
+        or (info.st_dev, info.st_ino) != (approved.device, approved.inode)
+        or info.st_size != approved.size
     ):
-        return None
-    return executable
+        raise PreflightError("approved Git executable identity changed")
+    digest = hashlib.sha256()
+    try:
+        with approved.executable.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise PreflightError("approved Git executable cannot be revalidated") from exc
+    if digest.hexdigest() != approved.sha256:
+        raise PreflightError("approved Git executable bytes changed")
+    return approved.executable
 
 
-_GIT_EXECUTABLE: Path | None = None
-
-
-def _approved_git_executable() -> Path:
-    global _GIT_EXECUTABLE
-    if _GIT_EXECUTABLE is None:
-        _GIT_EXECUTABLE = _resolve_git_executable()
-    if _GIT_EXECUTABLE is None:
-        raise PreflightError("an approved absolute Git executable is unavailable")
-    return _GIT_EXECUTABLE
+def _canonical_environment(source: Mapping[str, str], allowed: set[str] | frozenset[str]) -> dict[str, str]:
+    """Copy only exact canonical allowlist names; case variants are never normalized into policy."""
+    return {
+        key: value
+        for key, value in source.items()
+        if type(key) is str and type(value) is str and key in allowed
+    }
 
 
 def _git_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """Return a credential-free, config-free environment for every Git child."""
-    environment = {key: os.environ[key] for key in _GIT_ENV_KEYS if key in os.environ}
+    environment = _canonical_environment(os.environ, _GIT_ENV_KEYS)
     environment.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": _NULL_DEVICE,
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_LAZY_FETCH": "1",
             "GIT_PAGER": "cat",
             "PAGER": "cat",
             "LC_ALL": "C",
@@ -960,6 +1022,16 @@ def _git_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
         }
     )
     if extra:
+        allowed_overrides = {
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_AUTHOR_DATE",
+            "GIT_COMMITTER_DATE",
+        }
+        if set(extra) - allowed_overrides or any(type(value) is not str for value in extra.values()):
+            raise PreflightError("Git environment override is outside the deterministic identity policy")
         environment.update(extra)
     return environment
 
@@ -970,9 +1042,10 @@ def _git(
     input_bytes: bytes | None = None,
     timeout: float = 15.0,
     env_overrides: Mapping[str, str] | None = None,
+    git: GitCapability | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one fixed Git operation without a shell."""
-    executable = _approved_git_executable()
+    executable = _approved_git_executable(git)
     environment = _git_environment(env_overrides)
     try:
         return subprocess.run(
@@ -991,10 +1064,78 @@ def _git(
         raise PreflightError(f"Git operation failed: {' '.join(args)}: {detail}") from exc
 
 
+def _audit_local_git_config(root: Path, git: GitCapability) -> None:
+    """Reject local config that can execute or redirect code before reading the worktree."""
+    raw_values: list[bytes] = []
+    for scope in ("--local", "--worktree"):
+        try:
+            raw_values.append(
+                _git(
+                    root,
+                    "config",
+                    scope,
+                    "--null",
+                    "--name-only",
+                    "--no-includes",
+                    "--list",
+                    git=git,
+                ).stdout
+            )
+        except PreflightError:
+            if scope == "--worktree" and b"extensions.worktreeconfig" not in raw_values[0].lower():
+                continue
+            raise
+    raw = b"\0".join(raw_values)
+    try:
+        keys = [item.decode("utf-8").casefold() for item in raw.split(b"\0") if item]
+    except UnicodeDecodeError as exc:
+        raise PreflightError("local Git config names are not UTF-8") from exc
+
+    def unsafe(key: str) -> bool:
+        return (
+            key.startswith(
+                (
+                    "filter.",
+                    "include.",
+                    "includeif.",
+                    "alias.",
+                    "credential.",
+                    "gpg.",
+                    "url.",
+                    "submodule.",
+                    "maintenance.",
+                )
+            )
+            or key in {
+                "core.fsmonitor",
+                "core.hookspath",
+                "core.sshcommand",
+                "core.attributesfile",
+                "diff.external",
+                "credential.helper",
+                "extensions.partialclone",
+                "commit.gpgsign",
+                "tag.gpgsign",
+                "user.signingkey",
+                "core.gitproxy",
+            }
+            or (key.startswith("diff.") and key.endswith((".command", ".textconv")))
+            or (key.startswith("credential.") and key.endswith(".helper"))
+            or (key.startswith("url.") and key.endswith((".insteadof", ".pushinsteadof")))
+            or (key.startswith("merge.") and key.endswith(".driver"))
+            or (key.startswith("remote.") and key.endswith((".promisor", ".partialclonefilter")))
+            or (key.startswith("remote.") and key.endswith((".uploadpack", ".receivepack")))
+        )
+
+    rejected = sorted(key for key in keys if unsafe(key))
+    if rejected:
+        raise PreflightError("repository local Git config contains execution-affecting keys")
+
+
 def _resolved_git_path(root: Path, name: str) -> Path:
     value = _git(root, "rev-parse", "--git-path", name).stdout.decode().strip()
     path = Path(value)
-    return path.resolve() if path.is_absolute() else (root / path).resolve()
+    return Path(os.path.abspath(path if path.is_absolute() else root / path))
 
 
 class SourceLock:
@@ -1005,8 +1146,43 @@ class SourceLock:
         self._stream: BinaryIO | None = None
 
     def acquire(self) -> SourceLock:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        stream = self.path.open("a+b")
+        try:
+            parent_info = self.path.parent.lstat()
+            if (
+                not stat.S_ISDIR(parent_info.st_mode)
+                or stat.S_ISLNK(parent_info.st_mode)
+                or _has_reparse_point(self.path.parent)
+            ):
+                raise PreflightError("source lock parent is not an exact regular directory")
+            try:
+                existing = self.path.lstat()
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and (
+                not stat.S_ISREG(existing.st_mode)
+                or stat.S_ISLNK(existing.st_mode)
+                or _has_reparse_point(self.path)
+            ):
+                raise PreflightError("source lock path is a link, reparse point, or non-file")
+            flags = os.O_RDWR | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(self.path, flags, 0o600)
+            opened = os.fstat(descriptor)
+            current = self.path.lstat()
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or _has_reparse_point(self.path)
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                os.close(descriptor)
+                raise PreflightError("source lock identity changed while opening")
+            stream = os.fdopen(descriptor, "r+b")
+        except PreflightError:
+            raise
+        except OSError as exc:
+            raise PreflightError("source lock cannot be opened without following links") from exc
         try:
             if os.name == "nt":
                 import msvcrt
@@ -1021,6 +1197,15 @@ class SourceLock:
                 import fcntl
 
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = os.fstat(stream.fileno())
+            current = self.path.lstat()
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or _has_reparse_point(self.path)
+                or (locked.st_dev, locked.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise OSError("source lock identity changed after locking")
         except (OSError, BlockingIOError) as exc:
             stream.close()
             raise PreflightError("another agent loop holds the source lock") from exc
@@ -1114,13 +1299,26 @@ def preflight_source(
     permanent_runtime_root: Path | None = None,
     acquire_lock: bool = True,
     controller_temp_parent: Path | None = None,
+    git: GitCapability | None = None,
 ) -> SourceState:
     """Lock first, then capture two identical clean source fingerprints."""
+    capability = git or _GIT_CAPABILITY
+    _approved_git_executable(capability)
     root = repo_root.resolve()
+    assert capability is not None
+    try:
+        capability.executable.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        raise PreflightError("approved Git executable cannot be repository-contained")
     if permanent_runtime_root is not None and root == permanent_runtime_root.resolve():
         raise PreflightError("the permanent paper runtime cannot host the agent loop")
+    _audit_local_git_config(root, capability)  # type: ignore[arg-type]
     try:
-        actual_root = Path(_git(root, "rev-parse", "--show-toplevel").stdout.decode().strip()).resolve()
+        actual_root = Path(
+            _git(root, "rev-parse", "--show-toplevel", git=capability).stdout.decode().strip()
+        ).resolve()
     except UnicodeDecodeError as exc:
         raise PreflightError("Git metadata is not UTF-8") from exc
     if actual_root != root:
@@ -1233,9 +1431,25 @@ def _has_reparse_point(path: Path) -> bool:
     return bool(attributes & reparse_flag)
 
 
+def _credential_like_tracked_path(path: str) -> bool:
+    basename = path.rsplit("/", 1)[-1].casefold()
+    if basename in {".env.example", ".env.template"}:
+        return False
+    if basename == ".env" or basename.startswith(".env."):
+        return True
+    if basename in {"id_rsa", "id_ed25519", "credentials.json"} or basename.endswith(
+        (".pem", ".key", ".p12", ".pfx", ".jks")
+    ):
+        return True
+    return re.search(
+        r"(?:^|[._-])(?:secret|secrets|token|tokens|credential|credentials|private[_-]?key|api[_-]?key)(?:$|[._-])",
+        basename,
+    ) is not None
+
+
 def _write_commit_export(source: Path, commit: str, destination: Path) -> tuple[str, ...]:
     raw = _git(source, "ls-tree", "-rz", "--full-tree", commit).stdout
-    tracked: list[str] = []
+    entries: list[tuple[str, str]] = []
     for entry in raw.split(b"\0"):
         if not entry:
             continue
@@ -1248,6 +1462,11 @@ def _write_commit_export(source: Path, commit: str, destination: Path) -> tuple[
         canonical = canonical_patch_path(relative)
         if kind != "blob" or mode not in {"100644", "100755"}:
             raise QuarantineError(f"unsupported tracked entry: {canonical}")
+        if _credential_like_tracked_path(canonical):
+            raise QuarantineError(f"credential-like tracked path cannot be exported: {canonical}")
+        entries.append((canonical, mode))
+    tracked: list[str] = []
+    for canonical, mode in entries:
         target = destination / canonical
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(_git(source, "show", f"{commit}:{canonical}").stdout)
@@ -1344,7 +1563,7 @@ def build_child_environment(parent: Mapping[str, str], home: Path) -> dict[str, 
     """Construct a minimal worker environment without mutating or copying the parent mapping."""
     worker_home = home.resolve()
     worker_home.mkdir(parents=True, exist_ok=True)
-    env = {name: value for name, value in parent.items() if name.upper() in _CHILD_ENV_ALLOWLIST}
+    env = _canonical_environment(parent, _CHILD_ENV_ALLOWLIST)
     env.update(
         {
             "ALPACA_PAPER": "false",
@@ -1523,7 +1742,11 @@ def _make_inputs_read_only(layout: WorkerLayout) -> None:
         return
     for root in (layout.source, layout.gate, layout.data):
         for path in root.rglob("*"):
-            path.chmod(0o555 if path.is_dir() else 0o444)
+            if path.is_dir():
+                path.chmod(0o555)
+            else:
+                executable = bool(path.stat().st_mode & 0o111)
+                path.chmod(0o555 if executable else 0o444)
         root.chmod(0o555)
     for root in (layout.tmp, layout.home, layout.output):
         root.chmod(0o777)
@@ -1646,6 +1869,7 @@ class ProcessResult:
     stdout_sha256: str
     stderr_sha256: str
     timed_out: bool = False
+    provider_safe: bool = False
 
     @classmethod
     def ok(cls, stdout: str = "", stderr: str = "") -> ProcessResult:
@@ -1755,8 +1979,8 @@ def _bounded_process(
                     raise SandboxError("Windows worker has no owned Job Object")
                 _terminate_windows_job(job_handle)
             else:
-                _terminate_posix_process_group(process.pid)
-            if process.poll() is None:
+                _terminate_posix_process_tree(process)
+            if os.name == "nt" and process.poll() is None:
                 process.wait(timeout=10)
         except BaseException as exc:
             termination_error = exc
@@ -1786,11 +2010,16 @@ def _bounded_process(
     )
 
 
-def _terminate_posix_process_group(pid: int) -> None:
+def _terminate_posix_process_tree(process: subprocess.Popen[bytes]) -> None:
+    pid = process.pid
     try:
         os.killpg(pid, 9)
     except ProcessLookupError:
+        if process.poll() is None:
+            process.wait(timeout=10)
         return
+    if process.poll() is None:
+        process.wait(timeout=10)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         try:
@@ -1915,12 +2144,14 @@ ProcessRunner = Callable[..., ProcessResult]
 class CompletionEnvelope:
     payload: Mapping[str, object]
     hmac_sha256: str
+    provider_safe: bool = True
 
 
 @dataclass(frozen=True)
 class WorkerObservation:
     process: ProcessResult
     completion_envelope: CompletionEnvelope
+    provider_safe: bool = False
 
     @property
     def returncode(self) -> int:
@@ -2006,7 +2237,7 @@ class SandboxRunner:
         for directory in (engine_home, engine_config, engine_temp):
             directory.mkdir(mode=private_mode)
         allowed = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
-        environment = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+        environment = _canonical_environment(os.environ, allowed)
         environment.update(
             {
                 "HOME": str(engine_home.resolve()),
@@ -2082,13 +2313,14 @@ class SandboxRunner:
         self,
         name: str,
         container_id: str,
+        ownership_token: str,
         image_id: str,
         layout: WorkerLayout,
         python_args: tuple[str, ...],
         expected_environment: tuple[str, ...],
         data_bundle: ValidatedDataBundle | None,
     ) -> tuple[dict[str, object], str]:
-        result = self._call("inspect", name, timeout=15)
+        result = self._call("inspect", container_id, timeout=15)
         if result.returncode != 0 or result.timed_out:
             raise SandboxError("created container cannot be inspected")
         try:
@@ -2139,6 +2371,7 @@ class SandboxRunner:
             "Entrypoint": ["python"],
             "WorkingDir": "/workspace/src",
             "Cmd": list(python_args),
+            "Labels": {"agent-loop.owner": ownership_token},
         }
         if any(key not in config or config[key] != wanted for key, wanted in expected_config.items()):
             raise SandboxError("created container user or Python entrypoint differs")
@@ -2244,10 +2477,44 @@ class SandboxRunner:
         expected = hmac.new(self._seal_key, message, hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, envelope.hmac_sha256)
 
-    def _cleanup(self, name: str) -> None:
-        removed = self._call("rm", "--force", name, timeout=30)
+    def _discover_owned_container(self, name: str, ownership_token: str) -> str | None:
         listing = self._call(
-            "container", "ls", "--all", "--quiet", "--filter", f"name=^/{name}$", timeout=15
+            "container", "ls", "--all", "--quiet", "--no-trunc",
+            "--filter", f"label=agent-loop.owner={ownership_token}", timeout=15,
+        )
+        if listing.returncode != 0 or listing.timed_out:
+            raise SandboxError("sandbox ownership discovery failed")
+        identifiers = tuple(line.strip() for line in listing.stdout.splitlines() if line.strip())
+        if not identifiers:
+            return None
+        if len(identifiers) != 1 or re.fullmatch(r"[0-9a-f]{64}", identifiers[0]) is None:
+            raise SandboxError("sandbox ownership discovery was ambiguous")
+        container_id = identifiers[0]
+        inspected = self._call("inspect", container_id, timeout=15)
+        if inspected.returncode != 0 or inspected.timed_out:
+            raise SandboxError("discovered container ownership cannot be inspected")
+        try:
+            values = json.loads(inspected.stdout)
+            item = values[0]
+            labels = item["Config"]["Labels"]
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
+            raise SandboxError("discovered container ownership is malformed") from exc
+        if (
+            item.get("Id") != container_id
+            or item.get("Name") != f"/{name}"
+            or labels != {"agent-loop.owner": ownership_token}
+        ):
+            raise SandboxError("discovered container is not controller-owned")
+        return container_id
+
+    def _cleanup_owned(self, container_id: str, ownership_token: str) -> None:
+        if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+            raise SandboxError("sandbox cleanup requires a full owned container ID")
+        removed = self._call("rm", "--force", container_id, timeout=30)
+        listing = self._call(
+            "container", "ls", "--all", "--quiet", "--no-trunc",
+            "--filter", f"id={container_id}",
+            "--filter", f"label=agent-loop.owner={ownership_token}", timeout=15,
         )
         if (
             removed.returncode != 0
@@ -2283,10 +2550,13 @@ class SandboxRunner:
                 raise SandboxError("worker layout contains an unsafe directory")
         self._counter += 1
         name = f"agent-loop-{self.run_id[:15]}-{self._counter:06d}"
+        ownership_token = secrets.token_hex(32)
         create_args = [
             "create",
             "--name",
             name,
+            "--label",
+            f"agent-loop.owner={ownership_token}",
             "--pull",
             "never",
             "--network",
@@ -2355,20 +2625,24 @@ class SandboxRunner:
         started = time.time_ns()
         deadline = started + int(self.timeout_seconds * 1_000_000_000)
         container_id = ""
+        owned_container_id: str | None = None
         process: ProcessResult | None = None
         config_hash = ""
         oom_killed = False
         try:
             created = self._call(*create_args, timeout=30)
             container_id = created.stdout.strip()
-            if created.returncode != 0 or created.timed_out or not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
+            if created.returncode != 0 or created.timed_out or not re.fullmatch(r"[0-9a-f]{64}", container_id):
                 raise SandboxError("sandbox engine did not create a valid container")
             _item, config_hash = self._inspect_container(
-                name, container_id, image_id, worker, tuple(python_args), expected_environment, data_bundle
+                name, container_id, ownership_token, image_id, worker, tuple(python_args),
+                expected_environment, data_bundle,
             )
-            process = self._call("start", "--attach", name)
+            owned_container_id = container_id
+            process = self._call("start", "--attach", container_id)
             final_item, final_hash = self._inspect_container(
-                name, container_id, image_id, worker, tuple(python_args), expected_environment, data_bundle
+                name, container_id, ownership_token, image_id, worker, tuple(python_args),
+                expected_environment, data_bundle,
             )
             if final_hash != config_hash:
                 raise SandboxError("container configuration changed during execution")
@@ -2387,7 +2661,10 @@ class SandboxRunner:
                 raise SandboxError("container terminal state inspection is incomplete")
             oom_killed = bool(state["OOMKilled"])
         finally:
-            self._cleanup(name)
+            if owned_container_id is None:
+                owned_container_id = self._discover_owned_container(name, ownership_token)
+            if owned_container_id is not None:
+                self._cleanup_owned(owned_container_id, ownership_token)
         if process is None:
             raise SandboxError("sandbox worker produced no observation")
         if data_bundle is not None:
@@ -2811,14 +3088,14 @@ def build_ruff_gate_argv() -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class GateResult:
+    provider_safe: bool
     gate_observation: bool
     observed_exit_zero: bool
     worker_confined: bool
     source_modified: bool
     security_attestation: bool
     returncode: int
-    stdout: str
-    stderr: str
+    outcome: str
     stdout_sha256: str
     stderr_sha256: str
     completion_envelope: CompletionEnvelope | None
@@ -2839,14 +3116,14 @@ def run_test_gate(
     result = run_in_disposable_worker(candidate, execute)
     payload = result.completion_envelope.payload
     return GateResult(
+        True,
         bool(payload["gate_observation"]),
         result.returncode == 0 and not result.timed_out,
         bool(payload["worker_confined"]),
         False,
         False,
         result.returncode,
-        result.stdout,
-        result.stderr,
+        "timed_out" if result.timed_out else ("exit_zero" if result.returncode == 0 else "exit_nonzero"),
         result.stdout_sha256,
         result.stderr_sha256,
         result.completion_envelope,
@@ -2875,14 +3152,14 @@ def run_unsafe_local_test_baseline(
     result = run_source_commit_in_disposable_worker(state, execute)
     source_recheck = recheck_source_unchanged(state)
     return GateResult(
+        True,
         result.returncode == 0 and not result.timed_out,
         result.returncode == 0 and not result.timed_out,
         False,
         source_recheck.source_modified,
         False,
         result.returncode,
-        result.stdout,
-        result.stderr,
+        "timed_out" if result.timed_out else ("exit_zero" if result.returncode == 0 else "exit_nonzero"),
         result.stdout_sha256,
         result.stderr_sha256,
         None,
@@ -3229,14 +3506,14 @@ def parse_backtest_sentinel(output: str) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class BacktestGateResult:
+    provider_safe: bool
     gate_observation: bool
     observed_exit_zero: bool
     worker_confined: bool
     source_modified: bool
     security_attestation: bool
-    metrics: Mapping[str, object]
+    outcome: str
     evaluation: BacktestEvaluation
-    process: ProcessResult
     completion_envelope: CompletionEnvelope
 
 
@@ -3293,22 +3570,29 @@ def run_backtest_gate(
     payload = observation.completion_envelope.payload
     if process.returncode != 0 or process.timed_out:
         evaluation = BacktestEvaluation(False, ("process",))
-        return BacktestGateResult(False, False, bool(payload["worker_confined"]), False, False, MappingProxyType({}), evaluation, process, observation.completion_envelope)
+        return BacktestGateResult(
+            True, False, False, bool(payload["worker_confined"]), False, False,
+            "timed_out" if process.timed_out else "process_exit_nonzero",
+            evaluation, observation.completion_envelope,
+        )
     try:
         metrics = parse_backtest_sentinel(process.stdout)
         evaluation = evaluate_backtest_metrics(metrics, thresholds)
     except GateConfigurationError:
         evaluation = BacktestEvaluation(False, ("sentinel",))
-        return BacktestGateResult(False, True, bool(payload["worker_confined"]), False, False, MappingProxyType({}), evaluation, process, observation.completion_envelope)
+        return BacktestGateResult(
+            True, False, True, bool(payload["worker_confined"]), False, False,
+            "sentinel_invalid", evaluation, observation.completion_envelope,
+        )
     return BacktestGateResult(
+        True,
         evaluation.thresholds_met_observation,
         True,
         bool(payload["worker_confined"]),
         False,
         False,
-        MappingProxyType(dict(metrics)),
+        "thresholds_met" if evaluation.thresholds_met_observation else "thresholds_not_met",
         evaluation,
-        process,
         observation.completion_envelope,
     )
 
