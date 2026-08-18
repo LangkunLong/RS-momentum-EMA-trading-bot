@@ -193,8 +193,10 @@ Commit: `feat: add quarantined gates and safe patch application`
 3. Reasoner receives failure evidence and current selected file text and returns a plan. Coder
    receives that validated plan plus the same current file state and returns one diff.
 4. `--apply` controls quarantine mutation. Without it, record one validated proposal and exit
-   without writing candidate or source files. Invalid API output/unsafe patches skip an iteration;
-   no unchanged infinite loop can exceed the hard limits.
+   without mutating the candidate relative to its baseline or touching source files. The private
+   candidate bootstrap commit is controller-created provenance; no model patch is staged or
+   committed and no source commit occurs. Invalid API output/unsafe patches skip an iteration; no
+   unchanged infinite loop can exceed the hard limits.
 5. Enforce maximum iterations, API calls, total tokens, hard USD cost, per-child/API timeout, and
    total monotonic wall deadline at each transition. A call without a current usable price or
    enough reserved budget is not sent.

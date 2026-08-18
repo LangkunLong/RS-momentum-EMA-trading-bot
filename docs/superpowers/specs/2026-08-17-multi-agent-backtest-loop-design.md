@@ -255,18 +255,20 @@ logs/metrics; worker filesystem changes are discarded. The source branch is alwa
 
 ```text
 PREPARE
-  -> RUN_GATE
-  -> PASS: FINISH_SUCCESS
-  -> FAIL: CALL_ORCHESTRATOR
-  -> ABORT: FINISH_ABORTED
+  -> RUN_PRIMARY_GATE
+     -> PASS: RUN_FINAL_QUALITY
+        -> ALL OBSERVED PASS: FINISH_GATE_OBSERVED
+        -> ANY OBSERVED FAILURE: CALL_ORCHESTRATOR
+     -> FAIL: CALL_ORCHESTRATOR
+  -> ABORT: FINISH_AGENT_ABORTED
   -> REASON: CALL_REASONER
   -> SKIP/INVALID: RECORD_SKIP -> NEXT_ITERATION
   -> CALL_CODER
-  -> INVALID/UNSAFE: RECORD_REJECTION -> NEXT_ITERATION
-  -> DRY RUN: RECORD_PROPOSAL -> FINISH_DRY_RUN
-  -> APPLY_PATCH
-  -> NEXT_ITERATION -> RUN_GATE
-  -> ITERATION/CALL/TOKEN/WALL LIMIT: FINISH_EXHAUSTED
+  -> INVALID/UNSAFE/UNAPPLICABLE: RECORD_REJECTION -> NEXT_ITERATION
+  -> DRY RUN: EXPORT_DIFF -> FINISH_PROPOSAL_EXPORTED
+  -> APPLY_TO_CANDIDATE
+  -> NEXT_ITERATION -> RUN_PRIMARY_GATE
+  -> ITERATION/CALL/TOKEN/USD/WALL LIMIT: FINISH_LIMITS_EXHAUSTED
 ```
 
 `MAX_ITERATIONS` is exactly 10. A CLI value may lower but never increase it. The controller also
@@ -324,7 +326,7 @@ High-value behavior tests cover:
 - API retry classification and call/token/iteration limits;
 - path traversal, Windows path edge cases, structural diff attacks, denylist precedence, and
   size caps;
-- successful apply, exact rollback on postcondition failure, candidate-manifest invariance after
+- successful candidate apply, exact rollback on postcondition failure, candidate-manifest invariance after
   hostile worker writes, and accumulated iterations;
 - deterministic test/backtest pass decisions;
 - source checkout unchanged even when `--apply` mutates the candidate;
