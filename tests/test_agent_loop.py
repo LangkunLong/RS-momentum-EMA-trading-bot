@@ -2007,6 +2007,27 @@ def test_worker_dockerfile_uses_fixed_numeric_identity_without_build_args() -> N
     assert "useradd --uid 65532 --gid 65532" in dockerfile
 
 
+def test_worker_dockerfile_installs_only_the_pinned_git_package_before_user() -> None:
+    """Break caught: the confined worker lacks Git or silently upgrades an unpinned package."""
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile.agent-loop").read_text(encoding="utf-8")
+    install = (
+        "RUN apt-get update \\\n"
+        "    && apt-get install -y --no-install-recommends git=1:2.47.3-0+deb13u1 \\\n"
+        "    && rm -rf /var/lib/apt/lists/*"
+    )
+
+    assert dockerfile.count("apt-get install") == 1
+    assert dockerfile.count("git=") == 1
+    assert install in dockerfile
+    install_index = dockerfile.index(install)
+    user_index = dockerfile.index("USER 65532:65532")
+    assert "USER " not in dockerfile[:install_index]
+    assert install_index < user_index
+    assert "apt-get" not in dockerfile[user_index:]
+    assert "COPY --chown=65532:65532 requirements-lock.txt" in dockerfile
+    assert "pip install --no-cache-dir --requirement /opt/agent-loop/requirements-lock.txt" in dockerfile
+
+
 def test_agent_loop_docker_build_context_is_deny_by_default() -> None:
     """Break caught: Docker could receive ignored credentials or runtime artifacts as build context."""
     ignore_path = Path(__file__).parents[1] / "Dockerfile.agent-loop.dockerignore"
