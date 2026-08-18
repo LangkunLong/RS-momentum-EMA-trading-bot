@@ -653,3 +653,526 @@ def test_common_dotenv_lookup_is_bound_to_explicit_linked_worktree_root(
     monkeypatch.chdir(unrelated)
 
     assert agent_loop._controller_dotenv_values(linked) == {"OPENROUTER": "controller-only"}
+
+
+def _task2_repo(tmp_path: Path, *, branch: str = "codex/task2") -> Path:
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _run_git(repo, "init")
+    _run_git(repo, "config", "user.email", "tests@example.invalid")
+    _run_git(repo, "config", "user.name", "Tests")
+    _run_git(repo, "config", "core.autocrlf", "false")
+    _run_git(repo, "switch", "-c", branch)
+    (repo / "core").mkdir()
+    (repo / "tests").mkdir()
+    (repo / "core" / "backtest_engine.py").write_text("VALUE = 1\n", encoding="utf-8", newline="\n")
+    (repo / "core" / "momentum_analysis.py").write_text("MOMENTUM = 1\n", encoding="utf-8", newline="\n")
+    (repo / "tests" / "test_safe.py").write_text(
+        "def test_safe():\n    assert True\n", encoding="utf-8", newline="\n"
+    )
+    (repo / ".gitignore").write_text(".env\nignored.txt\n", encoding="utf-8", newline="\n")
+    _run_git(repo, "add", ".")
+    _run_git(repo, "commit", "-m", "initial")
+    return repo
+
+
+def _task2_diff(*, path: str = "core/backtest_engine.py", old: str = "VALUE = 1", new: str = "VALUE = 2") -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "index 1111111..2222222 100644\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -1,1 +1,1 @@\n"
+        f"-{old}\n"
+        f"+{new}\n"
+    )
+
+
+@pytest.mark.parametrize("break_kind", ["dirty", "detached", "protected"])
+def test_preflight_rejects_unsafe_source_state(tmp_path: Path, break_kind: str) -> None:
+    """Break caught: an unsafe source state could become the promotion baseline."""
+    from agent_loop import PreflightError, preflight_source
+
+    repo = _task2_repo(tmp_path)
+    if break_kind == "dirty":
+        (repo / "untracked.txt").write_text("dirty", encoding="utf-8")
+    elif break_kind == "detached":
+        _run_git(repo, "checkout", "--detach")
+    else:
+        _run_git(repo, "branch", "-m", "main")
+
+    with pytest.raises(PreflightError):
+        preflight_source(repo, acquire_lock=False)
+
+
+def test_preflight_captures_head_and_uses_worktree_git_lock_path(tmp_path: Path) -> None:
+    """Break caught: linked worktrees could lock the wrong repository path or lose the exact HEAD."""
+    from agent_loop import preflight_source
+
+    repo = _task2_repo(tmp_path)
+    state = preflight_source(repo, acquire_lock=False)
+
+    assert state.head == subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    expected = subprocess.run(
+        ["git", "rev-parse", "--git-path", "agent-loop.lock"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert state.lock_path == (repo / expected).resolve() if not Path(expected).is_absolute() else Path(expected).resolve()
+
+
+def test_preflight_exclusive_lock_and_permanent_runtime_fail_closed(tmp_path: Path) -> None:
+    """Break caught: concurrent loops or the permanent paper checkout could become an execution controller."""
+    from agent_loop import PreflightError, preflight_source
+
+    repo = _task2_repo(tmp_path)
+    with pytest.raises(PreflightError, match="permanent"):
+        preflight_source(repo, permanent_runtime_root=repo)
+
+    first = preflight_source(repo)
+    try:
+        with pytest.raises(PreflightError, match="lock"):
+            preflight_source(repo)
+    finally:
+        first.close()
+
+
+def test_quarantine_exports_only_exact_tracked_commit_and_private_git(tmp_path: Path) -> None:
+    """Break caught: source credentials or ignored files could leak into the candidate export."""
+    from agent_loop import export_candidate, preflight_source
+
+    repo = _task2_repo(tmp_path)
+    (repo / ".env").write_text("OPENROUTER_API_KEY=secret\n", encoding="utf-8")
+    (repo / "ignored.txt").write_text("secret\n", encoding="utf-8")
+    state = preflight_source(repo, acquire_lock=False)
+    candidate = export_candidate(state)
+
+    assert not (candidate.root / ".env").exists()
+    assert not (candidate.root / "ignored.txt").exists()
+    assert (candidate.root / ".git").is_dir()
+    assert candidate.root.resolve() not in repo.resolve().parents
+    assert not candidate.root.resolve().is_relative_to(repo.resolve())
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=candidate.root, check=True, capture_output=True, text=True
+    ).stdout == ""
+
+
+def test_child_environment_is_allowlisted_scrubbed_and_parent_is_unchanged(tmp_path: Path) -> None:
+    """Break caught: a worker could inherit broker/provider/Git credentials or mutate its parent env."""
+    from agent_loop import build_child_environment
+
+    parent = {
+        "PATH": "safe-path",
+        "SYSTEMROOT": "safe-root",
+        "OPENROUTER_API_KEY": "router-secret",
+        "ALPACA_API_KEY": "broker-secret",
+        "FMP_API_KEY": "data-secret",
+        "GIT_ASKPASS": "credential-helper",
+        "HTTPS_PROXY": "http://credential-proxy.invalid",
+        "AWS_SECRET_ACCESS_KEY": "cloud-secret",
+    }
+    original = dict(parent)
+    child = build_child_environment(parent, tmp_path / "child-home")
+
+    assert parent == original
+    assert "OPENROUTER_API_KEY" not in child
+    assert "ALPACA_API_KEY" not in child
+    assert "FMP_API_KEY" not in child
+    assert "GIT_ASKPASS" not in child
+    assert "AWS_SECRET_ACCESS_KEY" not in child
+    assert child["ALPACA_PAPER"] == "false"
+    assert child["FMP_DAILY_REQUEST_BUDGET"] == "0"
+    assert child["PYTHONNOUSERSITE"] == "1"
+    assert child["HTTP_PROXY"] == child["HTTPS_PROXY"] == "http://127.0.0.1:9"
+    assert child["HOME"] == str((tmp_path / "child-home").resolve())
+
+
+def test_unsafe_local_mode_can_never_apply_or_promote() -> None:
+    """Break caught: the development escape hatch could execute model-authored code."""
+    from agent_loop import ConfigurationError, ExecutionMode
+
+    assert ExecutionMode(unsafe_local=True, apply=False, promote=False).status == "unsafe-local-baseline-only"
+    with pytest.raises(ConfigurationError):
+        ExecutionMode(unsafe_local=True, apply=True, promote=False)
+    with pytest.raises(ConfigurationError):
+        ExecutionMode(unsafe_local=True, apply=False, promote=True)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../core/backtest_engine.py",
+        "C:/core/backtest_engine.py",
+        "//server/share/file.py",
+        "core\\backtest_engine.py",
+        "core/file.py:stream",
+        "core/CON.py",
+        "core/trailing.py.",
+        '"core/backtest_engine.py"',
+    ],
+)
+def test_patch_policy_rejects_windows_and_traversal_paths(tmp_path: Path, path: str) -> None:
+    """Break caught: path canonicalization ambiguity could write outside approved regular files."""
+    from agent_loop import PatchPolicyError, validate_unified_diff
+
+    repo = _task2_repo(tmp_path)
+    with pytest.raises(PatchPolicyError):
+        validate_unified_diff(repo, _task2_diff(path=path), [path])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "new file mode 100644\n",
+        "deleted file mode 100644\n",
+        "rename from core/backtest_engine.py\nrename to core/momentum_analysis.py\n",
+        "old mode 100644\nnew mode 100755\n",
+        "GIT binary patch\n",
+        "diff --cc core/backtest_engine.py\n",
+    ],
+)
+def test_patch_policy_rejects_structural_diff_features(tmp_path: Path, mutation: str) -> None:
+    """Break caught: a model could create/delete/rename/re-mode or smuggle a non-text patch."""
+    from agent_loop import PatchPolicyError, validate_unified_diff
+
+    repo = _task2_repo(tmp_path)
+    patch = _task2_diff().replace("index 1111111..2222222 100644\n", mutation)
+    with pytest.raises(PatchPolicyError):
+        validate_unified_diff(repo, patch, ["core/backtest_engine.py"])
+
+
+def test_patch_policy_checks_hunk_counts_declared_files_deny_precedence_and_live_imports(tmp_path: Path) -> None:
+    """Break caught: malformed or scope-expanding content could reach Git apply."""
+    from agent_loop import PatchPolicyError, validate_unified_diff
+
+    repo = _task2_repo(tmp_path)
+    malformed = _task2_diff().replace("@@ -1,1 +1,1 @@", "@@ -1,2 +1,1 @@")
+    with pytest.raises(PatchPolicyError, match="hunk"):
+        validate_unified_diff(repo, malformed, ["core/backtest_engine.py"])
+    with pytest.raises(PatchPolicyError, match="declared"):
+        validate_unified_diff(repo, _task2_diff(), ["core/momentum_analysis.py"])
+    denied = _task2_diff(path="agent_loop.py")
+    with pytest.raises(PatchPolicyError, match="denied"):
+        validate_unified_diff(repo, denied, ["agent_loop.py"], editable_paths=["agent_loop.py"])
+    live_import = _task2_diff(new="from core.order_execution import Broker")
+    with pytest.raises(PatchPolicyError, match="live"):
+        validate_unified_diff(repo, live_import, ["core/backtest_engine.py"])
+
+
+def test_backtest_gate_makes_engine_files_read_only_and_requires_mode_100644(tmp_path: Path) -> None:
+    """Break caught: a metrics patch could rewrite its oracle or target a non-regular tracked mode."""
+    from agent_loop import PatchPolicyError, validate_unified_diff
+
+    repo = _task2_repo(tmp_path)
+    with pytest.raises(PatchPolicyError, match="read-only"):
+        validate_unified_diff(repo, _task2_diff(), ["core/backtest_engine.py"], gate="backtest")
+    _run_git(repo, "update-index", "--chmod=+x", "core/backtest_engine.py")
+    with pytest.raises(PatchPolicyError, match="100644"):
+        validate_unified_diff(repo, _task2_diff(), ["core/backtest_engine.py"])
+
+
+def test_patch_apply_rolls_back_exact_bytes_on_compile_failure(tmp_path: Path) -> None:
+    """Break caught: a failed compile could leave a partially mutated candidate behind."""
+    from agent_loop import CodingProposal, PatchApplicationError, apply_validated_patch
+
+    repo = _task2_repo(tmp_path)
+    before = (repo / "core" / "backtest_engine.py").read_bytes()
+    proposal = CodingProposal("change", ("core/backtest_engine.py",), _task2_diff())
+
+    with pytest.raises(PatchApplicationError, match="compile"):
+        apply_validated_patch(repo, proposal, compile_runner=lambda _root, _paths: False)
+
+    assert (repo / "core" / "backtest_engine.py").read_bytes() == before
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout == ""
+
+
+def test_patch_application_accumulates_valid_iterations_without_rejecting_prior_changes(tmp_path: Path) -> None:
+    """Break caught: the second safe iteration could be rejected merely because the first patch remains."""
+    from agent_loop import CodingProposal, apply_validated_patch
+
+    repo = _task2_repo(tmp_path)
+    first = CodingProposal("first", ("core/backtest_engine.py",), _task2_diff())
+    second_diff = _task2_diff(
+        path="core/momentum_analysis.py",
+        old="MOMENTUM = 1",
+        new="MOMENTUM = 2",
+    )
+    second = CodingProposal("second", ("core/momentum_analysis.py",), second_diff)
+
+    apply_validated_patch(repo, first, compile_runner=lambda _root, _paths: True)
+    apply_validated_patch(repo, second, compile_runner=lambda _root, _paths: True)
+
+    assert (repo / "core" / "backtest_engine.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert (repo / "core" / "momentum_analysis.py").read_text(encoding="utf-8") == "MOMENTUM = 2\n"
+
+
+def test_worker_export_has_no_git_and_hostile_runner_cannot_change_candidate(tmp_path: Path) -> None:
+    """Break caught: candidate execution could mutate its controller-owned Git metadata or manifest."""
+    from agent_loop import CandidateMutationError, run_in_disposable_worker, snapshot_tree
+
+    repo = _task2_repo(tmp_path)
+    before = snapshot_tree(repo)
+
+    def hostile(worker: Path) -> bool:
+        assert not (worker / ".git").exists()
+        (worker / "hostile.txt").write_text("discard me", encoding="utf-8")
+        (repo / "candidate-hostile.txt").write_text("must be detected", encoding="utf-8")
+        return True
+
+    with pytest.raises(CandidateMutationError):
+        run_in_disposable_worker(repo, hostile)
+    assert snapshot_tree(repo) == before
+
+
+def test_sandbox_command_and_inspection_contract_is_fail_closed(tmp_path: Path) -> None:
+    """Break caught: an unattested or weakly configured container could be trusted as a sandbox."""
+    from agent_loop import ProcessResult, SandboxError, SandboxRunner
+
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    calls: list[tuple[str, ...]] = []
+    container_id = "c" * 64
+
+    def fake(argv: tuple[str, ...], **_kwargs: object) -> ProcessResult:
+        calls.append(argv)
+        if argv[1:3] == ("image", "inspect"):
+            return ProcessResult.ok(json.dumps([{"Id": "sha256:" + "b" * 64, "RepoDigests": [image]}]))
+        if argv[1] == "create":
+            return ProcessResult.ok(container_id + "\n")
+        if argv[1:2] == ("inspect",):
+            payload = [{
+                "Image": "sha256:" + "b" * 64,
+                "Config": {"User": "65532:65532", "Entrypoint": ["python"]},
+                "HostConfig": {
+                    "NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
+                    "SecurityOpt": ["no-new-privileges"], "PidsLimit": 64,
+                    "Memory": 1073741824, "NanoCpus": 1000000000,
+                },
+                "Mounts": [{"Source": str(worker.resolve()), "Destination": "/workspace", "RW": True}],
+            }]
+            return ProcessResult.ok(json.dumps(payload))
+        return ProcessResult.ok("passed\n")
+
+    runner = SandboxRunner(engine_path=Path("C:/fake/docker.exe"), image=image, process_runner=fake)
+    fixed_pytest = (
+        "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "-q", "-m", "not integration"
+    )
+    result = runner.run_worker(worker, fixed_pytest, {})
+    create = next(call for call in calls if call[1] == "create")
+    assert result.returncode == 0
+    for flag in ("--network", "--read-only", "--cap-drop", "--security-opt", "--pids-limit", "--memory", "--cpus", "--user", "--entrypoint"):
+        assert flag in create
+    assert "--pull" in create
+    assert "sha256:" + "b" * 64 in create
+    assert calls.index(next(call for call in calls if call[1:2] == ("inspect",))) < calls.index(
+        next(call for call in calls if call[1:3] == ("start", "--attach"))
+    )
+
+    with pytest.raises(SandboxError):
+        SandboxRunner(engine_path=Path("C:/missing/docker.exe"), image=image).run_worker(
+            worker, fixed_pytest, {}
+        )
+
+
+def _create_bundle(path: Path, keys: list[tuple[str, str]]) -> str:
+    import hashlib
+    import sqlite3
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE dataset_cache (cache_key TEXT PRIMARY KEY, cache_kind TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, payload BLOB NOT NULL)"
+        )
+        for cache_key, kind in keys:
+            conn.execute(
+                "INSERT INTO dataset_cache VALUES (?, ?, ?, ?)",
+                (cache_key, kind, "2026-08-17T00:00:00", b"opaque-pickle-never-loaded"),
+            )
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_data_bundle_validates_hash_schema_exact_keys_and_copies_privately(tmp_path: Path) -> None:
+    """Break caught: unapproved, incomplete, or schema-confused pickle caches could enter a worker."""
+    from agent_loop import DataBundleError, copy_validated_data_bundle, validate_historical_data_bundle
+
+    bundle = tmp_path / "historical.sqlite3"
+    symbols = "AAPL,MSFT,SPY"
+    keys = [
+        (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
+        (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+    ]
+    digest = _create_bundle(bundle, keys)
+
+    validated = validate_historical_data_bundle(
+        bundle, digest, ["MSFT", "AAPL"], "SPY", "2026-01-01", "2026-02-01"
+    )
+    copied = copy_validated_data_bundle(validated, tmp_path / "private")
+    assert copied.read_bytes() == bundle.read_bytes()
+    assert copied.resolve() != bundle.resolve()
+    with pytest.raises(DataBundleError, match="SHA-256"):
+        validate_historical_data_bundle(
+            bundle, "0" * 64, ["MSFT", "AAPL"], "SPY", "2026-01-01", "2026-02-01"
+        )
+    with pytest.raises(DataBundleError, match="coverage"):
+        validate_historical_data_bundle(
+            bundle, digest, ["NVDA"], "SPY", "2026-01-01", "2026-02-01"
+        )
+
+
+def test_backtest_gate_copies_approved_bundle_and_fails_closed_on_missing_sentinel(tmp_path: Path) -> None:
+    """Break caught: process success without trusted SimulationResult metrics could pass the gate."""
+    from agent_loop import (
+        BACKTEST_SENTINEL,
+        BacktestThresholds,
+        ProcessResult,
+        run_backtest_gate,
+        validate_historical_data_bundle,
+    )
+
+    repo = _task2_repo(tmp_path)
+    (repo / "agent_loop.py").write_text("# trusted hidden worker\n", encoding="utf-8")
+    _run_git(repo, "add", "agent_loop.py")
+    _run_git(repo, "commit", "-m", "worker")
+    bundle = tmp_path / "historical.sqlite3"
+    symbols = "AAPL,SPY"
+    digest = _create_bundle(
+        bundle,
+        [
+            (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
+            (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+        ],
+    )
+    approved = validate_historical_data_bundle(
+        bundle, digest, ["AAPL"], "SPY", "2026-01-01", "2026-02-01"
+    )
+    metrics = {
+        "total_return_pct": 10.0,
+        "annualized_return_pct": 8.0,
+        "sharpe_ratio": 1.0,
+        "max_drawdown_pct": -5.0,
+        "closed_trades": 3,
+    }
+
+    class FakeSandbox:
+        def __init__(self, output: str) -> None:
+            self.output = output
+            self.argv: tuple[str, ...] | None = None
+
+        def run_worker(self, worker: Path, argv: tuple[str, ...], environment: dict[str, str]) -> ProcessResult:
+            self.argv = argv
+            private = worker / ".agent-loop-data" / "historical_data.sqlite3"
+            assert private.read_bytes() == bundle.read_bytes()
+            assert environment["BACKTEST_DATA_CACHE_DB_PATH"] == "/workspace/.agent-loop-data/historical_data.sqlite3"
+            return ProcessResult.ok(self.output)
+
+    passing = FakeSandbox(BACKTEST_SENTINEL + json.dumps(metrics) + "\n")
+    result = run_backtest_gate(
+        repo,
+        passing,  # type: ignore[arg-type]
+        approved,
+        ["AAPL"],
+        "SPY",
+        "2026-01-01",
+        "2026-02-01",
+        BacktestThresholds(10.0, 8.0, 1.0, 5.0, 3),
+    )
+    assert result.passed
+    assert passing.argv is not None and "--technical-only" in passing.argv
+
+    missing = FakeSandbox("ordinary output only\n")
+    failed = run_backtest_gate(
+        repo,
+        missing,  # type: ignore[arg-type]
+        approved,
+        ["AAPL"],
+        "SPY",
+        "2026-01-01",
+        "2026-02-01",
+        BacktestThresholds(10.0, 8.0, 1.0, 5.0, 3),
+    )
+    assert not failed.passed
+    assert failed.evaluation.failures == ("sentinel",)
+
+
+@pytest.mark.parametrize(
+    ("metrics", "expected"),
+    [
+        ({"total_return_pct": 10.0, "annualized_return_pct": 8.0, "sharpe_ratio": 1.0, "max_drawdown_pct": -5.0, "closed_trades": 3}, True),
+        ({"total_return_pct": 9.999, "annualized_return_pct": 8.0, "sharpe_ratio": 1.0, "max_drawdown_pct": -5.0, "closed_trades": 3}, False),
+        ({"total_return_pct": 10.0, "annualized_return_pct": 8.0, "sharpe_ratio": 1.0, "max_drawdown_pct": -5.001, "closed_trades": 3}, False),
+    ],
+)
+def test_backtest_threshold_boundaries_are_deterministic(metrics: dict[str, float], expected: bool) -> None:
+    """Break caught: an LLM or an off-by-one comparison could decide a metrics gate."""
+    from agent_loop import BacktestThresholds, evaluate_backtest_metrics
+
+    thresholds = BacktestThresholds(10.0, 8.0, 1.0, 5.0, 3)
+    assert evaluate_backtest_metrics(metrics, thresholds).passed is expected
+
+
+def test_backtest_gate_hidden_worker_uses_exact_tickers_and_neutralizes_extra_symbols(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: hidden settings/S&P expansion could widen the operator-approved offline universe."""
+    from agent_loop import BACKTEST_SENTINEL, run_hidden_backtest_worker
+
+    settings = SimpleNamespace(EXTRA_SYMBOLS=["SECRET"], BACKTEST_DATA_CACHE_DB_PATH="wrong")
+    observed: dict[str, object] = {}
+    result = SimpleNamespace(
+        total_return_pct=1.0,
+        annualized_return_pct=2.0,
+        sharpe_ratio=3.0,
+        max_drawdown_pct=-4.0,
+        closed_trades=[object(), object()],
+    )
+
+    def run_cli(argv: list[str]) -> object:
+        observed["argv"] = argv
+        return result
+
+    engine = SimpleNamespace(run_cli=run_cli, get_sp500_tickers=lambda: ["WIDENED"])
+    monkeypatch.setitem(sys.modules, "config", SimpleNamespace(settings=settings))
+    monkeypatch.setitem(sys.modules, "core", SimpleNamespace(backtest_engine=engine))
+    bundle = tmp_path / "private.sqlite3"
+    bundle.write_bytes(b"private")
+
+    assert run_hidden_backtest_worker(
+        tickers=["MSFT", "AAPL", "MSFT"],
+        benchmark="SPY",
+        start_date="2026-01-01",
+        end_date="2026-02-01",
+        bundle_path=bundle,
+    ) == 0
+
+    assert settings.EXTRA_SYMBOLS == []
+    assert settings.BACKTEST_DATA_CACHE_DB_PATH == str(bundle.resolve())
+    assert engine.get_sp500_tickers() == ["MSFT", "AAPL", "SPY"]
+    assert observed["argv"] == [
+        "--tickers", "MSFT", "AAPL", "--start-date", "2026-01-01", "--end-date", "2026-02-01",
+        "--benchmark", "SPY", "--technical-only", "--no-csv",
+    ]
+    sentinel_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith(BACKTEST_SENTINEL)]
+    assert len(sentinel_lines) == 1
+
+
+def test_fixed_test_gate_accepts_only_tracked_tests_selectors(tmp_path: Path) -> None:
+    """Break caught: a selector beginning with an option could inject an arbitrary pytest command."""
+    from agent_loop import GateConfigurationError, build_test_gate_argv
+
+    repo = _task2_repo(tmp_path)
+    assert build_test_gate_argv(repo, ["tests/test_safe.py"]) == (
+        "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "-q", "-m", "not integration", "tests/test_safe.py"
+    )
+    with pytest.raises(GateConfigurationError):
+        build_test_gate_argv(repo, ["--collect-only"])
+    with pytest.raises(GateConfigurationError):
+        build_test_gate_argv(repo, ["tests/not-tracked.py"])
