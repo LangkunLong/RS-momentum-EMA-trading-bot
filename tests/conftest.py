@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from uuid import uuid4
@@ -12,17 +13,32 @@ import pytest
 _TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".artifacts" / "pytest" / "tmp_test_roots"
 
 
+def _configured_test_tmp_root() -> Path:
+    override = os.environ.get("AGENT_LOOP_TEST_TMP_ROOT")
+    if override is None:
+        return _TEST_TMP_ROOT
+    configured = Path(override)
+    if not configured.is_absolute():
+        raise pytest.UsageError("AGENT_LOOP_TEST_TMP_ROOT must be absolute")
+    resolved = configured.resolve()
+    source_root = Path(__file__).resolve().parents[1]
+    if resolved == source_root or resolved.is_relative_to(source_root):
+        raise pytest.UsageError("AGENT_LOOP_TEST_TMP_ROOT must be outside source")
+    return resolved
+
+
 @pytest.fixture()
 def tmp_path() -> Path:
-    """Provide a repo-local temporary directory.
+    """Provide a writable per-test directory outside confined candidate source.
 
     Pytest's built-in ``tmp_path`` has been flaky on this Windows environment
     during session cleanup, causing false-negative test failures unrelated to
-    application logic. This fixture keeps temp I/O inside the repo workspace
-    and performs best-effort cleanup per test.
+    application logic. Local runs retain the repo-local default; the agent-loop
+    controller supplies its isolated writable root to confined workers.
     """
-    _TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    path = _TEST_TMP_ROOT / f"test_{uuid4().hex}"
+    test_tmp_root = _configured_test_tmp_root()
+    test_tmp_root.mkdir(parents=True, exist_ok=True)
+    path = test_tmp_root / f"test_{uuid4().hex}"
     path.mkdir(parents=True, exist_ok=True)
     try:
         yield path

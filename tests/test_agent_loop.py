@@ -19,6 +19,15 @@ from typing import Any
 import pytest
 
 
+def _suite_conftest_module() -> Any:
+    target = Path(__file__).with_name("conftest.py").resolve()
+    for module in tuple(sys.modules.values()):
+        module_file = getattr(module, "__file__", None)
+        if module_file is not None and Path(module_file).resolve() == target:
+            return module
+    raise AssertionError("suite conftest module is not loaded")
+
+
 def _route_json(**overrides: object) -> str:
     payload: dict[str, object] = {
         "action": "reason",
@@ -1323,6 +1332,7 @@ def test_child_environment_is_allowlisted_scrubbed_and_parent_is_unchanged(tmp_p
     parent = {
         "PATH": "safe-path",
         "SYSTEMROOT": "safe-root",
+        "AGENT_LOOP_TEST_TMP_ROOT": "candidate-selected-path",
         "OPENROUTER_API_KEY": "router-secret",
         "ALPACA_API_KEY": "broker-secret",
         "FMP_API_KEY": "data-secret",
@@ -1344,6 +1354,59 @@ def test_child_environment_is_allowlisted_scrubbed_and_parent_is_unchanged(tmp_p
     assert child["PYTHONNOUSERSITE"] == "1"
     assert child["HTTP_PROXY"] == child["HTTPS_PROXY"] == "http://127.0.0.1:9"
     assert child["HOME"] == str((tmp_path / "child-home").resolve())
+    assert child["AGENT_LOOP_TEST_TMP_ROOT"] == str(
+        (tmp_path / "child-home" / "tmp" / "pytest").resolve()
+    )
+
+
+def test_tmp_path_fixture_uses_controller_owned_absolute_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: confined pytest writes its per-test directories below read-only source."""
+    suite_conftest = _suite_conftest_module()
+    controller_root = os.environ.get("AGENT_LOOP_TEST_TMP_ROOT")
+    outside_parent = (
+        Path(controller_root).resolve().parent
+        if controller_root is not None
+        else Path(__file__).resolve().parents[2]
+    )
+    outside = outside_parent / f"agent-loop-conftest-{time.time_ns()}"
+    outside.mkdir(parents=True)
+    override = (outside / "pytest").resolve()
+    monkeypatch.setenv("AGENT_LOOP_TEST_TMP_ROOT", str(override))
+    fixture = suite_conftest.tmp_path.__wrapped__()
+    try:
+        allocated = next(fixture)
+        assert allocated.parent == override
+        assert allocated.is_dir()
+    finally:
+        fixture.close()
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param("relative/pytest", id="relative"),
+        pytest.param(
+            str((Path(__file__).resolve().parents[1] / ".artifacts" / "pytest-override")),
+            id="inside-source",
+        ),
+    ],
+)
+def test_tmp_path_fixture_rejects_invalid_supplied_override_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    override: str,
+) -> None:
+    """Break caught: an invalid supplied temp root silently falls back into candidate source."""
+    suite_conftest = _suite_conftest_module()
+    monkeypatch.setenv("AGENT_LOOP_TEST_TMP_ROOT", override)
+    fixture = suite_conftest.tmp_path.__wrapped__()
+    try:
+        with pytest.raises(pytest.UsageError, match="AGENT_LOOP_TEST_TMP_ROOT"):
+            next(fixture)
+    finally:
+        fixture.close()
 
 
 def test_unsafe_local_mode_can_never_apply_and_has_no_promotion_surface() -> None:
@@ -3604,6 +3667,7 @@ def test_round4_container_compile_and_ruff_cache_policy_is_exact(tmp_path: Path)
     )
     assert environment["PYTHONPYCACHEPREFIX"] == "/workspace/output/pycache"
     assert environment["RUFF_CACHE_DIR"] == "/workspace/output/ruff-cache"
+    assert environment["AGENT_LOOP_TEST_TMP_ROOT"] == "/workspace/tmp/pytest"
     assert build_ruff_gate_argv() == ("-m", "ruff", "check", "--no-cache", ".")
     cache_ready = run_in_disposable_worker(
         candidate,

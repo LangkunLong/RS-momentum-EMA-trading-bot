@@ -1616,6 +1616,7 @@ def build_child_environment(parent: Mapping[str, str], home: Path) -> dict[str, 
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
+            "AGENT_LOOP_TEST_TMP_ROOT": str((worker_home / "tmp" / "pytest").resolve()),
             "HOME": str(worker_home),
             "USERPROFILE": str(worker_home),
             "XDG_CACHE_HOME": str(worker_home / ".cache"),
@@ -2855,6 +2856,7 @@ class SandboxRunner:
             raise SandboxError("historical data path must be the controller-owned private copy")
         container_environment = {
             "ALPACA_PAPER": "false",
+            "AGENT_LOOP_TEST_TMP_ROOT": "/workspace/tmp/pytest",
             "FMP_DAILY_REQUEST_BUDGET": "0",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
