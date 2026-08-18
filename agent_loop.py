@@ -285,6 +285,13 @@ class Usage:
         )
         if any(value is not None and (type(value) is not int or value < 0) for value in token_values):
             raise ProtocolValidationError("usage token fields must be non-negative integers")
+        if (
+            self.total_tokens is not None
+            and self.prompt_tokens is not None
+            and self.completion_tokens is not None
+            and self.total_tokens < self.prompt_tokens + self.completion_tokens
+        ):
+            raise ProtocolValidationError("total_tokens must cover prompt_tokens plus completion_tokens")
         if self.cost_usd is not None and _non_negative_float(self.cost_usd) is None:
             raise ProtocolValidationError("usage cost must be a finite non-negative number")
 
@@ -507,8 +514,10 @@ def _embedded_status_code(error: object) -> int | None:
     for path in (
         ("status_code",),
         ("status",),
+        ("code",),
         ("metadata", "status_code"),
         ("metadata", "status"),
+        ("metadata", "code"),
     ):
         status = _read_field(error, *path)
         if type(status) is int:

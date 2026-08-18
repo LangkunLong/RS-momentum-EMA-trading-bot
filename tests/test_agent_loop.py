@@ -339,6 +339,40 @@ def test_gateway_classifies_nested_embedded_error_status_metadata() -> None:
     assert len(client.completions.calls) == 2
 
 
+@pytest.mark.parametrize(
+    ("code", "should_retry"),
+    [(429, True), (402, False)],
+)
+def test_gateway_classifies_standard_embedded_openrouter_error_code(
+    code: int,
+    should_retry: bool,
+) -> None:
+    """Break caught: documented OpenRouter ``error.code`` was ignored for retry safety."""
+    from agent_loop import BudgetLedger, GatewayError, OpenRouterGateway, Route
+
+    client = FakeClient(
+        [
+            FakeResponse(_route_json(), error={"code": code, "message": "provider error"}),
+            FakeResponse(_route_json()),
+        ]
+    )
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    if should_retry:
+        assert gateway.request("orchestrator", "evidence", Route.from_json).payload.action == "reason"
+        assert len(client.completions.calls) == 2
+        assert "repair" not in client.completions.calls[1]["messages"][2]["content"].lower()
+    else:
+        with pytest.raises(GatewayError) as raised:
+            gateway.request("orchestrator", "evidence", Route.from_json)
+        assert raised.value.status_code == code
+        assert len(client.completions.calls) == 1
+
+
 def test_budget_reserves_before_call_and_keeps_reservation_when_usage_cost_is_missing() -> None:
     """Break caught: a missing provider cost could make later calls exceed the USD cap."""
     from agent_loop import BudgetLedger, OpenRouterGateway, Route
@@ -375,6 +409,27 @@ def test_budget_enforces_exact_call_and_token_reservation_boundaries() -> None:
     token_limited = BudgetLedger(max_usd=1.0, max_calls=2, max_tokens=10)
     with pytest.raises(BudgetExceededError, match="token"):
         token_limited.reserve("abc", 8, pricing)
+
+
+def test_usage_rejects_total_lower_than_reported_prompt_and_completion() -> None:
+    """Break caught: a provider total lower than component totals could undercharge token budget."""
+    from agent_loop import ProtocolValidationError, Usage
+
+    with pytest.raises(ProtocolValidationError, match="total_tokens"):
+        Usage(prompt_tokens=6, completion_tokens=5, total_tokens=1)
+
+
+def test_consistent_usage_reconciles_and_leaves_only_real_token_headroom() -> None:
+    """Break caught: strict validation could reject a consistent provider total or release too much headroom."""
+    from agent_loop import BudgetLedger, Pricing, Usage
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=2, max_tokens=10)
+    reservation = ledger.reserve("abc", 7, Pricing(0.0, 0.0))
+    ledger.reconcile(reservation, Usage(prompt_tokens=3, completion_tokens=4, total_tokens=7))
+
+    assert ledger.total_tokens == 7
+    assert ledger.reserved_tokens == 7
+    ledger.reserve("", 3, Pricing(0.0, 0.0))
 
 
 def test_gateway_reserves_full_static_and_dynamic_message_bytes_before_call() -> None:
