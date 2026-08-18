@@ -419,6 +419,41 @@ def test_usage_rejects_total_lower_than_reported_prompt_and_completion() -> None
         Usage(prompt_tokens=6, completion_tokens=5, total_tokens=1)
 
 
+@pytest.mark.parametrize(
+    ("prompt_tokens", "completion_tokens"),
+    [(3, None), (None, 3)],
+)
+def test_usage_rejects_total_lower_than_a_reported_partial_component(
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+) -> None:
+    """Break caught: a partial provider usage shape could still release token headroom."""
+    from agent_loop import ProtocolValidationError, Usage
+
+    with pytest.raises(ProtocolValidationError, match="total_tokens"):
+        Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=2)
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "completion_tokens", "total_tokens"),
+    [(3, None, 3), (None, 3, 3), (3, None, 4), (None, 3, 4)],
+)
+def test_usage_accepts_consistent_partial_component_totals(
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    total_tokens: int,
+) -> None:
+    """Break caught: hardening could reject valid provider usage shapes with one component omitted."""
+    from agent_loop import Usage
+
+    usage = Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+    assert usage.total_tokens == total_tokens
+
+
 def test_consistent_usage_reconciles_and_leaves_only_real_token_headroom() -> None:
     """Break caught: strict validation could reject a consistent provider total or release too much headroom."""
     from agent_loop import BudgetLedger, Pricing, Usage
