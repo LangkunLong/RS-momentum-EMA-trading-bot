@@ -309,3 +309,117 @@ requested tickers plus benchmark without selecting or unpickling payload bytes.
   production-attested provenance.
 - Controller-owned approved snapshots persist for the caller's run lifetime; Task 3 owns lifecycle
   disposal and inert diff/archive export wiring. No source-checkout apply or promotion API remains.
+
+## Review fix round 2/5 — controller/daemon boundary hardening
+
+### Files and named breaks
+
+- `agent_loop.py`: added stable lock-first source capture, explicit safe controller temp roots,
+  no-follow cleanup, absolute sanitized Git execution, a Windows Job Object/POSIX process-group
+  runner, Docker-only command and inspection attestation, controller-private engine state, exact
+  official image environment validation, approved-DB scratch copying, and hidden-worker import/cache
+  isolation.
+- `tests/test_agent_loop.py`: added deterministic regressions for engine environment leakage;
+  hostile symlink/junction cleanup; temp fallback; relative/alpaca live imports; exact digest argv;
+  verified writable DB scratch and real `DataFetcher`; namespace, port, and terminal-state mutations;
+  authoritative cleanup errors; unstable source capture; captured gate bytes; executable modes; a
+  real linked worktree lock; reproducible candidate commits; snapshot cleanup; absolute Git PATH
+  poisoning; controller-private engine config; and Windows grandchild/assignment containment.
+
+The highest-impact named breaks are:
+
+- `test_bounded_process_kills_pipe_holding_grandchild_on_success_and_timeout` (2 cases) and
+  `test_windows_job_assignment_failure_never_releases_target`: a successful/expired parent could
+  leave descendants and live stream readers; a target could start before containment.
+- `test_private_tree_cleanup_does_not_follow_hostile_symlink`, the Windows junction counterpart,
+  and `test_private_tree_cleanup_propagates_exact_root_removal_failure`: cleanup could chmod an
+  outside target or hide an incomplete removal.
+- `test_engine_cli_receives_only_minimal_controller_owned_environment` and
+  `test_engine_control_directories_are_never_mounted_to_candidate`: Docker inherited controller
+  secrets and its mutable home/config/temp was visible to candidate code.
+- `test_hidden_gate_streams_verified_approved_db_to_writable_scratch_before_import` and
+  `test_real_data_fetcher_opens_verified_writable_scratch_without_network`: the immutable approved
+  bind was opened as a mutable cache rather than copied, rehashed, and isolated before candidate
+  imports.
+- `test_container_attestation_rejects_host_namespaces_cgroups_and_published_ports` (6 cases) and
+  `test_terminal_state_attestation_rejects_nonterminal_or_exit_mismatch` (6 cases): inspection did
+  not prove private namespace/port state or exact terminal flags/exit/OOM shape.
+- `test_git_execution_keeps_resolved_absolute_binary_after_path_poisoning`,
+  `test_preflight_rejects_unstable_double_capture`, and
+  `test_protected_gate_bytes_come_from_captured_commit_not_live_controller_file`: mutable PATH or
+  checkout state could change controller tools, source capture, or protected gate bytes.
+- `test_bundle_snapshot_rejects_temp_parent_inside_git_checkout` and
+  `test_failed_bundle_validation_deletes_controller_snapshot`: poisoned TEMP or late validation
+  failure could place/leak controller data in the checkout.
+- `test_create_transport_failure_still_cleans_deterministic_name`: a post-create transport failure
+  could bypass deterministic named-container cleanup.
+
+### Exact TDD and verification output
+
+Initial round-two focused RED:
+
+```text
+24 failed, 2 passed, 2 skipped, 123 deselected, 1 warning in 37.95s
+```
+
+The separately corrected engine-environment RED was:
+
+```text
+1 failed, 151 deselected, 1 warning in 3.10s
+```
+
+Complete GREEN before the final post-create transport regression was added:
+
+```text
+158 passed, 2 skipped, 2 warnings in 123.39s (0:02:03)
+```
+
+Final verification after all round-two tests:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py
+159 passed, 2 skipped, 2 warnings in 123.22s (0:02:03)
+
+python -m ruff check agent_loop.py tests/test_agent_loop.py
+All checks passed!
+
+python -m compileall -q agent_loop.py tests/test_agent_loop.py
+exit 0, no output
+
+git diff --check
+exit 0; only host core.autocrlf LF-to-CRLF advisories
+```
+
+The two skips are POSIX-only executable-mode behavior and the Windows junction test when junction
+creation is unavailable. The Windows Job Object success, timeout, and assignment-failure tests ran
+and passed on this host.
+
+### Sandbox/data/schema evidence and self-review
+
+The production adapter is explicitly Docker-only. It resolves one canonical absolute `docker`
+binary and gives every CLI child only OS essentials plus unmounted controller-private
+home/config/temp directories. The approved image must expose the exact four-entry official
+`python:3.13.14-slim` environment map (including the public CPython GPG signing key and exact Python
+source SHA). Create uses Docker-supported private IPC/cgroup namespaces; inspection requires empty
+PID/UTS modes (Docker private defaults), no network or ports, exact read-only bind objects (`Mode`
+empty and `RW=false` for `--mount`), non-root user, read-only root, dropped capabilities,
+no-new-privileges, and exact resource/terminal state. Successful forced removal plus an empty,
+successful exact-name `container ls -a` is the locale-independent absence proof.
+
+On Windows, a fixed `python -I -S` launcher waits for one controller byte; the controller assigns
+it to a `KILL_ON_JOB_CLOSE` Job Object before release, then always terminates the job, verifies zero
+active processes, reaps the launcher, joins non-daemon drain threads, and only then seals hashes.
+POSIX uses a new session/process group and verifies group absence. There is no `taskkill` fallback.
+
+The approved SQLite snapshot is a dedicated 0444 bind at
+`/workspace/data/historical_data.sqlite3`. The protected gate exclusively creates
+`/workspace/tmp/backtest-cache/historical_data.sqlite3`, streams under the 8 GiB cap, checks the
+approved SHA during copy and the destination SHA afterward, then prepends only `/workspace/src`,
+sets the cache path, fixes the exact ticker universe, and replaces all three provider download
+functions with cache-miss failures. The controller never unpickles payloads and rehashes the
+approved snapshot after observation.
+
+Remaining limitation: Docker is absent on this host, so real daemon provenance remains untested and
+`security_attestation=false`; faithful injected Docker-shaped tests cannot become production
+attestation. Controller snapshots/candidates still have caller-owned run-lifetime disposal, which
+Task 3 must close after inert diff/archive export.

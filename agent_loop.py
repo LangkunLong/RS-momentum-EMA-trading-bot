@@ -25,6 +25,7 @@ import time
 import secrets
 import urllib.request
 from urllib.parse import quote
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -49,6 +50,14 @@ _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529
 
 AGENT_LOOP_UID_GID = "65532:65532"
 BACKTEST_SENTINEL = "AGENT_LOOP_BACKTEST_RESULT="
+AGENT_LOOP_IMAGE_ENV = MappingProxyType(
+    {
+        "PATH": "/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GPG_KEY": "7169605F62C751356D054A26A821E680E5FA6305",
+        "PYTHON_VERSION": "3.13.14",
+        "PYTHON_SHA256": "639e43243c620a308f968213df9e00f2f8f62332f7adbaa7a7eeb9783057c690",
+    }
+)
 DEFAULT_EDITABLE_PATHS = frozenset(
     {
         "backtest.py",
@@ -894,6 +903,47 @@ _GIT_FIXED_ARGS = (
 )
 
 
+def _resolve_git_executable() -> Path | None:
+    located = shutil.which("git")
+    if located is None:
+        return None
+    located_path = Path(located)
+    try:
+        located_info = located_path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(located_info.st_mode) or bool(
+        getattr(located_info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    ):
+        return None
+    executable = located_path.resolve()
+    info = executable.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or executable.is_symlink()
+        or bool(
+            getattr(info, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+        or executable.name.casefold() not in {"git", "git.exe"}
+    ):
+        return None
+    return executable
+
+
+_GIT_EXECUTABLE: Path | None = None
+
+
+def _approved_git_executable() -> Path:
+    global _GIT_EXECUTABLE
+    if _GIT_EXECUTABLE is None:
+        _GIT_EXECUTABLE = _resolve_git_executable()
+    if _GIT_EXECUTABLE is None:
+        raise PreflightError("an approved absolute Git executable is unavailable")
+    return _GIT_EXECUTABLE
+
+
 def _git_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """Return a credential-free, config-free environment for every Git child."""
     environment = {key: os.environ[key] for key in _GIT_ENV_KEYS if key in os.environ}
@@ -919,12 +969,14 @@ def _git(
     *args: str,
     input_bytes: bytes | None = None,
     timeout: float = 15.0,
+    env_overrides: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one fixed Git operation without a shell."""
-    environment = _git_environment()
+    executable = _approved_git_executable()
+    environment = _git_environment(env_overrides)
     try:
         return subprocess.run(
-            ["git", *_GIT_FIXED_ARGS, *args],
+            [str(executable), *_GIT_FIXED_ARGS, *args],
             cwd=root,
             env=environment,
             input=input_bytes,
@@ -1049,6 +1101,7 @@ class SourceState:
     lock_path: Path
     lock: SourceLock | None = None
     fingerprint: SourceFingerprint | None = None
+    controller_temp_parent: Path | None = None
 
     def close(self) -> None:
         if self.lock is not None:
@@ -1060,29 +1113,46 @@ def preflight_source(
     *,
     permanent_runtime_root: Path | None = None,
     acquire_lock: bool = True,
+    controller_temp_parent: Path | None = None,
 ) -> SourceState:
-    """Capture an exact, clean feature-branch baseline and optionally hold its loop lock."""
+    """Lock first, then capture two identical clean source fingerprints."""
     root = repo_root.resolve()
     if permanent_runtime_root is not None and root == permanent_runtime_root.resolve():
         raise PreflightError("the permanent paper runtime cannot host the agent loop")
     try:
         actual_root = Path(_git(root, "rev-parse", "--show-toplevel").stdout.decode().strip()).resolve()
-        if actual_root != root:
-            raise PreflightError("repository root must be explicit")
-        head = _git(root, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
-        branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.decode().strip()
-        status = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.decode()
     except UnicodeDecodeError as exc:
         raise PreflightError("Git metadata is not UTF-8") from exc
-    if not re.fullmatch(r"[0-9a-f]{40,64}", head):
-        raise PreflightError("HEAD is not an exact commit")
-    if branch in {"main", "master"} or not branch.startswith("codex/"):
-        raise PreflightError("source must be a non-protected codex/* branch")
-    if status:
-        raise PreflightError("source working tree must be clean including untracked files")
+    if actual_root != root:
+        raise PreflightError("repository root must be explicit")
+    forbidden = _controller_forbidden_roots(root)
+    temp_parent = _validate_controller_temp_parent(
+        controller_temp_parent or Path(tempfile.gettempdir()), forbidden
+    )
     lock_path = _resolved_git_path(root, "agent-loop.lock")
     lock = SourceLock(lock_path).acquire() if acquire_lock else None
-    return SourceState(root, head, branch, status, lock_path, lock, source_fingerprint(root))
+    try:
+        first_fingerprint = source_fingerprint(root)
+        first_status = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.decode()
+        second_fingerprint = source_fingerprint(root)
+        second_status = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.decode()
+        if first_fingerprint != second_fingerprint or first_status != second_status:
+            raise PreflightError("source did not remain stable across clean capture")
+        head = second_fingerprint.head
+        branch = second_fingerprint.branch
+        if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+            raise PreflightError("HEAD is not an exact commit")
+        if branch in {"main", "master"} or not branch.startswith("codex/"):
+            raise PreflightError("source must be a non-protected codex/* branch")
+        if second_status:
+            raise PreflightError("source working tree must be clean including untracked files")
+    except Exception:
+        if lock is not None:
+            lock.close()
+        raise
+    return SourceState(
+        root, head, branch, second_status, lock_path, lock, second_fingerprint, temp_parent
+    )
 
 
 @dataclass(frozen=True)
@@ -1110,28 +1180,51 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
-def _new_controller_temp(prefix: str, preferred_parent: Path | None = None) -> Path:
-    """Create a private temp directory, falling back to the controller workspace under ACL sandboxes."""
-    parents = [preferred_parent] if preferred_parent is not None else [Path(tempfile.gettempdir())]
-    parents.append(Path.cwd() / ".controller-tmp")
-    last_error: OSError | None = None
-    for parent in parents:
-        if parent is None:
-            continue
-        root: Path | None = None
+def _controller_forbidden_roots(source_root: Path) -> tuple[Path, ...]:
+    roots = [source_root.resolve()]
+    roots.extend(
+        parent.resolve()
+        for parent in (source_root, *source_root.parents)
+        if (parent / ".env").is_file()
+    )
+    return tuple(dict.fromkeys(roots))
+
+
+def _validate_controller_temp_parent(parent: Path, forbidden_roots: Sequence[Path]) -> Path:
+    try:
+        info = parent.lstat()
+        resolved = parent.resolve(strict=True)
+    except OSError as exc:
+        raise QuarantineError("controller temp parent must already exist") from exc
+    if not stat.S_ISDIR(info.st_mode) or parent.is_symlink() or _has_reparse_point(parent):
+        raise QuarantineError("controller temp parent must be a regular non-reparse directory")
+    if any(_is_relative_to(resolved, forbidden.resolve()) for forbidden in forbidden_roots):
+        raise QuarantineError("controller temp parent must be outside source and dotenv-bearing ancestors")
+    for ancestor in (resolved, *resolved.parents):
         try:
-            parent.mkdir(parents=True, exist_ok=True)
-            root = (parent / f"{prefix}{secrets.token_hex(12)}").resolve()
-            root.mkdir(mode=0o777 if os.name == "nt" else 0o700)
-            probe = root / ".write-probe"
-            probe.write_bytes(b"")
-            probe.unlink()
-            return root
-        except OSError as exc:
-            last_error = exc
-            if root is not None:
-                _remove_private_tree(root)
-    raise QuarantineError("controller cannot create a private temporary directory") from last_error
+            names = {item.name.casefold() for item in ancestor.iterdir()}
+        except OSError:
+            continue
+        if ".git" in names or any(name.startswith(".env") for name in names):
+            raise QuarantineError("controller temp parent must remain outside Git and dotenv ancestors")
+    return resolved
+
+
+def _new_controller_temp(
+    prefix: str,
+    parent: Path,
+    forbidden_roots: Sequence[Path] = (),
+) -> Path:
+    """Create one private child below an explicit, pre-existing controller-owned parent."""
+    approved_parent = _validate_controller_temp_parent(parent, forbidden_roots)
+    root = approved_parent / f"{prefix}{secrets.token_hex(12)}"
+    try:
+        root.mkdir(mode=0o777 if os.name == "nt" else 0o700)
+        return root.resolve(strict=True)
+    except OSError as exc:
+        if root.exists():
+            _remove_private_tree(root)
+        raise QuarantineError("controller cannot create a private temporary directory") from exc
 
 
 def _has_reparse_point(path: Path) -> bool:
@@ -1170,6 +1263,8 @@ class Candidate:
     source_head: str
     tracked_files: tuple[str, ...]
     _controller_capability: object
+    controller_temp_parent: Path
+    forbidden_temp_roots: tuple[Path, ...]
 
 
 _CANDIDATE_CAPABILITIES: dict[Path, object] = {}
@@ -1186,17 +1281,11 @@ def _require_candidate(candidate: Candidate) -> Path:
 
 def export_candidate(state: SourceState, destination_parent: Path | None = None) -> Candidate:
     """Create a tracked-commit-only private Git repository outside dotenv-bearing ancestors."""
-    dotenv_ancestors = [parent for parent in (state.root, *state.root.parents) if (parent / ".env").is_file()]
-    parent = (destination_parent or Path(tempfile.gettempdir())).resolve()
-    if _is_relative_to(parent, state.root):
-        raise QuarantineError("candidate parent must be outside the source repository")
-    for ancestor in dotenv_ancestors:
-        if _is_relative_to(parent, ancestor):
-            raise QuarantineError("candidate parent is below a source ancestor containing .env")
-    root = _new_controller_temp("agent-loop-candidate-", parent)
-    if _is_relative_to(root, state.root):
-        shutil.rmtree(root, ignore_errors=True)
-        raise QuarantineError("candidate temp fallback is inside the source repository")
+    forbidden = _controller_forbidden_roots(state.root)
+    parent = _validate_controller_temp_parent(
+        destination_parent or state.controller_temp_parent or Path(tempfile.gettempdir()), forbidden
+    )
+    root = _new_controller_temp("agent-loop-candidate-", parent, forbidden)
     try:
         tracked = _write_commit_export(state.root, state.head, root)
         _git(root, "-c", "init.templateDir=", "init", "--quiet")
@@ -1231,14 +1320,21 @@ def export_candidate(state: SourceState, destination_parent: Path | None = None)
             "--quiet",
             "-m",
             f"candidate from {state.head}",
-            # Deterministic metadata is supplied through the sanitized Git environment below.
+            env_overrides={
+                "GIT_AUTHOR_NAME": "Agent Loop",
+                "GIT_AUTHOR_EMAIL": "agent-loop@invalid",
+                "GIT_COMMITTER_NAME": "Agent Loop",
+                "GIT_COMMITTER_EMAIL": "agent-loop@invalid",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+            },
         )
     except Exception:
-        shutil.rmtree(root, ignore_errors=True)
+        _remove_private_tree(root)
         raise
     capability = object()
     _CANDIDATE_CAPABILITIES[root] = capability
-    return Candidate(root, state.head, tracked, capability)
+    return Candidate(root, state.head, tracked, capability, parent, forbidden)
 
 
 _CHILD_ENV_ALLOWLIST = frozenset({"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"})
@@ -1367,8 +1463,15 @@ def _tracked_paths(root: Path) -> tuple[str, ...]:
 
 
 def _export_candidate_worker(candidate_root: Path, destination: Path) -> tuple[str, ...]:
-    tracked = _tracked_paths(candidate_root)
-    for relative in tracked:
+    staged = _git(candidate_root, "ls-files", "-s", "-z").stdout
+    tracked: list[str] = []
+    for entry in staged.split(b"\0"):
+        if not entry:
+            continue
+        fields = entry.decode("utf-8").split(None, 3)
+        if len(fields) != 4 or fields[0] not in {"100644", "100755"} or fields[2] != "0":
+            raise QuarantineError("candidate worker export contains an unsupported tracked mode")
+        mode, relative = fields[0], fields[3]
         canonical = canonical_patch_path(relative)
         source = candidate_root / canonical
         if not source.is_file() or source.is_symlink() or _has_reparse_point(source):
@@ -1376,7 +1479,10 @@ def _export_candidate_worker(candidate_root: Path, destination: Path) -> tuple[s
         target = destination / canonical
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
-    return tracked
+        if os.name != "nt":
+            target.chmod(0o755 if mode == "100755" else 0o644)
+        tracked.append(canonical)
+    return tuple(tracked)
 
 
 @dataclass(frozen=True)
@@ -1402,8 +1508,14 @@ def _make_worker_layout(root: Path) -> WorkerLayout:
     )
     for directory in (layout.source, layout.gate, layout.data, layout.tmp, layout.home, layout.output):
         directory.mkdir(parents=True, exist_ok=False)
-    shutil.copyfile(Path(__file__).resolve(), layout.gate / "agent_loop.py")
     return layout
+
+
+def _install_protected_gate(layout: WorkerLayout) -> None:
+    source = layout.source / "agent_loop.py"
+    if not source.is_file() or source.is_symlink() or _has_reparse_point(source):
+        raise QuarantineError("captured commit lacks a regular protected agent_loop.py gate")
+    shutil.copyfile(source, layout.gate / "agent_loop.py")
 
 
 def _make_inputs_read_only(layout: WorkerLayout) -> None:
@@ -1418,16 +1530,63 @@ def _make_inputs_read_only(layout: WorkerLayout) -> None:
 
 
 def _remove_private_tree(root: Path) -> None:
-    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix(), reverse=True):
-        try:
-            path.chmod(0o700 if path.is_dir() else 0o600)
-        except OSError:
-            pass
+    """Remove exactly one controller tree without ever following a link or reparse point."""
+    absolute = root.absolute()
     try:
-        root.chmod(0o700)
-    except OSError:
-        pass
-    shutil.rmtree(root, ignore_errors=True)
+        root_info = absolute.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(root_info.st_mode) or absolute.is_symlink() or _has_reparse_point(absolute):
+        raise QuarantineError("private cleanup root must be an exact regular directory")
+
+    def remove_leaf(path: Path, info: os.stat_result, *, directory: bool) -> None:
+        del info
+        operation = os.rmdir if directory else os.unlink
+        try:
+            operation(path)
+        except PermissionError:
+            current = path.lstat()
+            attributes = getattr(current, "st_file_attributes", 0)
+            reparse = bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+            if stat.S_ISLNK(current.st_mode) or reparse:
+                raise
+            os.chmod(path, 0o700 if directory else 0o600, follow_symlinks=False)
+            operation(path)
+
+    def remove_entry(path: Path, info: os.stat_result | None = None) -> None:
+        current = info or path.lstat()
+        attributes = getattr(current, "st_file_attributes", 0)
+        reparse = bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if stat.S_ISLNK(current.st_mode) or reparse:
+            remove_leaf(path, current, directory=stat.S_ISDIR(current.st_mode))
+            return
+        if stat.S_ISDIR(current.st_mode):
+            try:
+                scanner = os.scandir(path)
+            except PermissionError:
+                refreshed = path.lstat()
+                attributes = getattr(refreshed, "st_file_attributes", 0)
+                reparse_now = bool(
+                    attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                )
+                if stat.S_ISLNK(refreshed.st_mode) or reparse_now:
+                    raise
+                os.chmod(path, 0o700, follow_symlinks=False)
+                scanner = os.scandir(path)
+            with scanner as entries:
+                children = [(Path(entry.path), entry.stat(follow_symlinks=False)) for entry in entries]
+            for child, child_info in children:
+                remove_entry(child, child_info)
+            remove_leaf(path, current, directory=True)
+            return
+        remove_leaf(path, current, directory=False)
+
+    remove_entry(absolute)
+    try:
+        absolute.lstat()
+    except FileNotFoundError:
+        return
+    raise QuarantineError("private cleanup could not prove exact-root removal")
 
 
 def run_in_disposable_worker(candidate: Candidate, runner: Callable[[WorkerLayout], Any]) -> Any:
@@ -1437,12 +1596,15 @@ def run_in_disposable_worker(candidate: Candidate, runner: Callable[[WorkerLayou
     result: Any = None
     worker_error: BaseException | None = None
     try:
-        temporary = _new_controller_temp("agent-loop-worker-")
+        temporary = _new_controller_temp(
+            "agent-loop-worker-", candidate.controller_temp_parent, candidate.forbidden_temp_roots
+        )
         try:
             layout = _make_worker_layout(temporary)
             exported = _export_candidate_worker(candidate_root, layout.source)
             if tuple(exported) != tuple(candidate.tracked_files):
                 raise CandidateMutationError("worker manifest differs from candidate tracked manifest")
+            _install_protected_gate(layout)
             _make_inputs_read_only(layout)
             result = runner(layout)
         finally:
@@ -1463,10 +1625,13 @@ def run_source_commit_in_disposable_worker(
     runner: Callable[[WorkerLayout], Any],
 ) -> Any:
     """Execute a captured commit export; never copy, restore, or mutate the live source checkout."""
-    temporary = _new_controller_temp("agent-loop-baseline-")
+    parent = state.controller_temp_parent or Path(tempfile.gettempdir())
+    forbidden = _controller_forbidden_roots(state.root)
+    temporary = _new_controller_temp("agent-loop-baseline-", parent, forbidden)
     try:
         layout = _make_worker_layout(temporary)
         _write_commit_export(state.root, state.head, layout.source)
+        _install_protected_gate(layout)
         _make_inputs_read_only(layout)
         return runner(layout)
     finally:
@@ -1504,13 +1669,28 @@ def _bounded_process(
     """Capture bounded text plus hashes while enforcing a process-tree deadline."""
     if not math.isfinite(timeout) or timeout <= 0 or output_limit <= 0:
         raise SandboxError("process bounds must be positive and finite")
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    job_handle: int | None = None
+    popen_argv = list(argv)
+    stdin: int | None = subprocess.DEVNULL
+    creationflags = 0
+    if os.name == "nt":
+        # The trusted isolated launcher cannot create the target until the controller has placed
+        # it in a kill-on-close Job Object and releases its one-byte stdin gate.
+        launcher = (
+            "import subprocess,sys; "
+            "gate=sys.stdin.buffer.read(1); "
+            "sys.exit(125) if gate != b'1' else "
+            "sys.exit(subprocess.run(sys.argv[1:],stdin=subprocess.DEVNULL).returncode)"
+        )
+        popen_argv = [sys.executable, "-I", "-S", "-c", launcher, *argv]
+        stdin = subprocess.PIPE
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         process = subprocess.Popen(
-            list(argv),
+            popen_argv,
             cwd=cwd,
             env=dict(env) if env is not None else None,
-            stdin=subprocess.DEVNULL,
+            stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
@@ -1520,46 +1700,82 @@ def _bounded_process(
     except OSError as exc:
         raise SandboxError(f"could not start executable: {argv[0]}") from exc
 
+    if os.name == "nt":
+        try:
+            job_handle = _assign_windows_kill_job(process)
+            assert process.stdin is not None
+            process.stdin.write(b"1")
+            process.stdin.close()
+        except BaseException as exc:
+            try:
+                if job_handle is not None:
+                    _terminate_windows_job(job_handle)
+                elif process.poll() is None:
+                    process.kill()
+                process.wait(timeout=10)
+            finally:
+                if job_handle is not None:
+                    _close_windows_handle(job_handle)
+            raise SandboxError("target could not be contained before release") from exc
+
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     digests = {"stdout": hashlib.sha256(), "stderr": hashlib.sha256()}
 
+    drain_errors: list[BaseException] = []
+
     def drain(name: str, stream: BinaryIO) -> None:
-        while True:
-            chunk = stream.read(64 * 1024)
-            if not chunk:
-                return
-            digests[name].update(chunk)
-            remaining = output_limit - len(buffers[name])
-            if remaining > 0:
-                buffers[name].extend(chunk[:remaining])
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                digests[name].update(chunk)
+                remaining = output_limit - len(buffers[name])
+                if remaining > 0:
+                    buffers[name].extend(chunk[:remaining])
+        except (OSError, ValueError) as exc:
+            drain_errors.append(exc)
 
     threads = [
-        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),  # type: ignore[arg-type]
-        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),  # type: ignore[arg-type]
+        threading.Thread(target=drain, args=("stdout", process.stdout)),  # type: ignore[arg-type]
+        threading.Thread(target=drain, args=("stderr", process.stderr)),  # type: ignore[arg-type]
     ]
     for thread in threads:
         thread.start()
     timed_out = False
+    termination_error: BaseException | None = None
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                timeout=10,
-            )
-        else:
-            try:
-                os.killpg(process.pid, 9)
-            except ProcessLookupError:
-                pass
-        process.kill()
-        process.wait(timeout=10)
+    finally:
+        try:
+            if os.name == "nt":
+                if job_handle is None:
+                    raise SandboxError("Windows worker has no owned Job Object")
+                _terminate_windows_job(job_handle)
+            else:
+                _terminate_posix_process_group(process.pid)
+            if process.poll() is None:
+                process.wait(timeout=10)
+        except BaseException as exc:
+            termination_error = exc
+        finally:
+            if job_handle is not None:
+                _close_windows_handle(job_handle)
     for thread in threads:
         thread.join(timeout=10)
+    if any(thread.is_alive() for thread in threads):
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        for thread in threads:
+            thread.join(timeout=5)
+    for stream in (process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            stream.close()
+    if termination_error is not None or any(thread.is_alive() for thread in threads) or drain_errors:
+        raise SandboxError("process-tree termination or output drain could not be verified") from termination_error
     return ProcessResult(
         process.returncode if not timed_out else -1,
         bytes(buffers["stdout"]).decode("utf-8", errors="replace"),
@@ -1568,6 +1784,128 @@ def _bounded_process(
         digests["stderr"].hexdigest(),
         timed_out,
     )
+
+
+def _terminate_posix_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, 9)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    raise SandboxError("POSIX process group did not terminate")
+
+
+def _windows_job_api() -> tuple[Any, Any, Any]:
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicAccounting(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_longlong),
+            ("TotalKernelTime", ctypes.c_longlong),
+            ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+            ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
+    class BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimit),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    return ctypes, BasicAccounting, ExtendedLimit
+
+
+def _assign_windows_kill_job(process: subprocess.Popen[bytes]) -> int:
+    ctypes, _basic_accounting, extended_limit = _windows_job_api()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        limits = extended_limit()
+        limits.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        process_handle = int(process._handle)  # type: ignore[attr-defined]
+        if not kernel32.AssignProcessToJobObject(handle, process_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(handle)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _terminate_windows_job(handle: int) -> None:
+    ctypes, basic_accounting, _extended_limit = _windows_job_api()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p
+    ]
+    if not kernel32.TerminateJobObject(handle, 1):
+        raise ctypes.WinError(ctypes.get_last_error())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        accounting = basic_accounting()
+        if not kernel32.QueryInformationJobObject(
+            handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if accounting.ActiveProcesses == 0:
+            return
+        time.sleep(0.01)
+    raise SandboxError("Windows Job Object still has active processes")
+
+
+def _close_windows_handle(handle: int) -> None:
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    if not kernel32.CloseHandle(handle):
+        raise SandboxError("Windows Job Object handle could not be closed")
 
 
 ProcessRunner = Callable[..., ProcessResult]
@@ -1656,12 +1994,39 @@ class SandboxRunner:
         self._counter = 0
         self._seal_key = secrets.token_bytes(32)
         self._previous_hmac = "0" * 64
+        self._engine_env: dict[str, str] | None = None
+
+    def _prepare_engine_environment(self, worker: WorkerLayout) -> None:
+        control = worker.root / ".engine-control"
+        private_mode = 0o777 if os.name == "nt" else 0o700
+        control.mkdir(mode=private_mode, exist_ok=False)
+        engine_home = control / "home"
+        engine_config = control / "config"
+        engine_temp = control / "tmp"
+        for directory in (engine_home, engine_config, engine_temp):
+            directory.mkdir(mode=private_mode)
+        allowed = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
+        environment = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+        environment.update(
+            {
+                "HOME": str(engine_home.resolve()),
+                "USERPROFILE": str(engine_home.resolve()),
+                "DOCKER_CONFIG": str(engine_config.resolve()),
+                "XDG_CONFIG_HOME": str(engine_config.resolve()),
+                "TEMP": str(engine_temp.resolve()),
+                "TMP": str(engine_temp.resolve()),
+            }
+        )
+        self._engine_env = environment
 
     def _call(self, *args: str, timeout: float | None = None) -> ProcessResult:
+        if self._engine_env is None:
+            raise SandboxError("sandbox engine environment is not initialized")
         return self._run(
             (str(self.engine_path), *args),
             timeout=timeout or self.timeout_seconds,
             output_limit=self.output_limit,
+            env=self._engine_env,
         )
 
     def _attest_engine_and_image(self) -> tuple[str, tuple[str, ...]]:
@@ -1669,7 +2034,7 @@ class SandboxRunner:
             engine = self.engine_path.resolve()
             if not engine.is_file() or engine.is_symlink() or _has_reparse_point(engine):
                 raise SandboxError("sandbox engine executable is absent or unsafe")
-            if engine.name.lower() not in {"docker", "docker.exe", "podman", "podman.exe"}:
+            if engine.name.lower() not in {"docker", "docker.exe"}:
                 raise SandboxError("unsupported sandbox engine executable")
         version = self._call("version", "--format", "{{json .}}", timeout=15)
         if version.returncode != 0 or version.timed_out:
@@ -1694,12 +2059,11 @@ class SandboxRunner:
         ):
             raise SandboxError("worker image environment inspection is malformed")
         names = [value.split("=", 1)[0] for value in base_environment]
-        if len(names) != len(set(names)) or any(
-            re.search(r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PROXY)", name, re.IGNORECASE)
-            for name in names
-        ):
-            raise SandboxError("worker image inherits a credential-shaped environment")
-        return image_id, tuple(base_environment)
+        if len(names) != len(set(names)) or dict(
+            value.split("=", 1) for value in base_environment
+        ) != dict(AGENT_LOOP_IMAGE_ENV):
+            raise SandboxError("worker image environment differs from the approved image contract")
+        return image_id, tuple(sorted(base_environment))
 
     @staticmethod
     def _expected_mounts(layout: WorkerLayout, data_bundle: ValidatedDataBundle | None) -> tuple[tuple[Path, str, bool], ...]:
@@ -1747,22 +2111,43 @@ class SandboxRunner:
             "Devices": [],
             "DeviceRequests": [],
             "SecurityOpt": ["no-new-privileges"],
+            "IpcMode": "private",
+            "PidMode": "",
+            "UTSMode": "",
+            "CgroupnsMode": "private",
+            "CgroupParent": "",
+            "PortBindings": {},
+            "PublishAllPorts": False,
         }
         if any(key not in host or host[key] != wanted for key, wanted in expected_host.items()):
             raise SandboxError("created container lacks required isolation")
         if item.get("Id") != container_id or item.get("Name") != f"/{name}" or item.get("Image") != image_id:
             raise SandboxError("created container image ID differs from the inspected image")
+        network = item.get("NetworkSettings")
+        if not isinstance(network, dict) or network.get("Ports") != {}:
+            raise SandboxError("created container exposes or publishes a port")
+        actual_environment = config.get("Env")
+        if not isinstance(actual_environment, list) or any(
+            not isinstance(value, str) or "=" not in value for value in actual_environment
+        ):
+            raise SandboxError("created container environment is malformed")
+        actual_names = [value.split("=", 1)[0] for value in actual_environment]
+        if len(actual_names) != len(set(actual_names)):
+            raise SandboxError("created container environment has duplicate names")
         expected_config = {
             "User": AGENT_LOOP_UID_GID,
             "Entrypoint": ["python"],
             "WorkingDir": "/workspace/src",
             "Cmd": list(python_args),
-            "Env": list(expected_environment),
         }
         if any(key not in config or config[key] != wanted for key, wanted in expected_config.items()):
             raise SandboxError("created container user or Python entrypoint differs")
+        if dict(value.split("=", 1) for value in actual_environment) != dict(
+            value.split("=", 1) for value in expected_environment
+        ):
+            raise SandboxError("created container environment differs from the exact policy")
         expected_mounts = {
-            (str(source.resolve()), destination, not readonly, "ro" if readonly else "rw")
+            (str(source.resolve()), destination, not readonly, "")
             for source, destination, readonly in self._expected_mounts(layout, data_bundle)
         }
         if not isinstance(mounts, list) or len(mounts) != len(expected_mounts):
@@ -1776,7 +2161,15 @@ class SandboxRunner:
             actual_mounts.add((str(Path(str(mount["Source"])).resolve()), mount["Destination"], mount["RW"], mount["Mode"]))
         if actual_mounts != expected_mounts:
             raise SandboxError("created container mount differs from controller contract")
-        attested = {"Config": config, "HostConfig": host, "Mounts": mounts, "Image": item["Image"]}
+        normalized_config = dict(config)
+        normalized_config["Env"] = dict(value.split("=", 1) for value in actual_environment)
+        attested = {
+            "Config": normalized_config,
+            "HostConfig": host,
+            "Mounts": mounts,
+            "Image": item["Image"],
+            "NetworkSettings": network,
+        }
         return item, _canonical_json_sha256(attested)
 
     @staticmethod
@@ -1813,15 +2206,17 @@ class SandboxRunner:
             return
         if args in {("-m", "compileall", "-q", "."), ("-m", "ruff", "check", ".")}:
             return
-        if len(args) >= 14 and args[:3] == ("/workspace/gate/agent_loop.py", "--_hidden-backtest", "--tickers"):
+        if len(args) >= 16 and args[:3] == ("/workspace/gate/agent_loop.py", "--_hidden-backtest", "--tickers"):
             try:
                 benchmark_index = args.index("--benchmark", 3)
                 ticker_values = args[3:benchmark_index]
+                digest = args[benchmark_index + 9]
                 expected_tail = (
                     "--benchmark", args[benchmark_index + 1],
                     "--start-date", args[benchmark_index + 3],
                     "--end-date", args[benchmark_index + 5],
                     "--historical-data-bundle", "/workspace/data/historical_data.sqlite3",
+                    "--historical-data-sha256", digest,
                     "--technical-only", "--no-csv",
                 )
                 actual_tail = args[benchmark_index:]
@@ -1830,6 +2225,7 @@ class SandboxRunner:
                     or len(set(ticker_values)) != len(ticker_values)
                     or any(_validate_symbol(value) != value for value in ticker_values)
                     or actual_tail != expected_tail
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
                     or _validate_symbol(args[benchmark_index + 1]) != args[benchmark_index + 1]
                     or date.fromisoformat(args[benchmark_index + 3]) >= date.fromisoformat(args[benchmark_index + 5])
                 ):
@@ -1850,8 +2246,16 @@ class SandboxRunner:
 
     def _cleanup(self, name: str) -> None:
         removed = self._call("rm", "--force", name, timeout=30)
-        absent = self._call("inspect", name, timeout=15)
-        if removed.returncode != 0 or removed.timed_out or absent.returncode == 0 or absent.timed_out:
+        listing = self._call(
+            "container", "ls", "--all", "--quiet", "--filter", f"name=^/{name}$", timeout=15
+        )
+        if (
+            removed.returncode != 0
+            or removed.timed_out
+            or listing.returncode != 0
+            or listing.timed_out
+            or listing.stdout.strip()
+        ):
             raise SandboxError("sandbox container cleanup could not be verified")
 
     def run_worker(
@@ -1865,6 +2269,14 @@ class SandboxRunner:
         if not python_args or any(not isinstance(value, str) or "\x00" in value for value in python_args):
             raise SandboxError("worker Python argv is invalid")
         self._validate_python_args(worker, python_args)
+        hidden = "--_hidden-backtest" in python_args
+        if hidden != (data_bundle is not None):
+            raise SandboxError("hidden backtest and approved data bundle must be supplied together")
+        if data_bundle is not None:
+            digest_index = tuple(python_args).index("--historical-data-sha256") + 1
+            if python_args[digest_index] != data_bundle.sha256:
+                raise SandboxError("hidden backtest digest differs from the approved data bundle")
+        self._prepare_engine_environment(worker)
         image_id, base_environment = self._attest_engine_and_image()
         for path in (worker.root, worker.source, worker.gate, worker.data, worker.tmp, worker.home, worker.output):
             if not path.is_dir() or path.is_symlink() or _has_reparse_point(path):
@@ -1879,6 +2291,10 @@ class SandboxRunner:
             "never",
             "--network",
             "none",
+            "--ipc",
+            "private",
+            "--cgroupns",
+            "private",
             "--read-only",
             "--cap-drop",
             "ALL",
@@ -1899,7 +2315,7 @@ class SandboxRunner:
         ]
         if environment.get("BACKTEST_DATA_CACHE_DB_PATH") not in {
             None,
-            "/workspace/data/historical_data.sqlite3",
+            "/workspace/tmp/backtest-cache/historical_data.sqlite3",
         }:
             raise SandboxError("historical data path must be the controller-owned private copy")
         container_environment = {
@@ -1938,12 +2354,13 @@ class SandboxRunner:
         environment_hash = _canonical_json_sha256({"base": base_environment, "explicit": container_environment})
         started = time.time_ns()
         deadline = started + int(self.timeout_seconds * 1_000_000_000)
-        created = self._call(*create_args, timeout=30)
-        container_id = created.stdout.strip()
+        container_id = ""
         process: ProcessResult | None = None
         config_hash = ""
         oom_killed = False
         try:
+            created = self._call(*create_args, timeout=30)
+            container_id = created.stdout.strip()
             if created.returncode != 0 or created.timed_out or not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
                 raise SandboxError("sandbox engine did not create a valid container")
             _item, config_hash = self._inspect_container(
@@ -1956,11 +2373,19 @@ class SandboxRunner:
             if final_hash != config_hash:
                 raise SandboxError("container configuration changed during execution")
             state = final_item.get("State")
-            if not isinstance(state, dict) or "OOMKilled" not in state or "Status" not in state:
+            expected_state = {
+                "Status": "exited",
+                "Running": False,
+                "Paused": False,
+                "Restarting": False,
+                "Dead": False,
+                "ExitCode": process.returncode,
+            }
+            if not isinstance(state, dict) or any(
+                key not in state or state[key] != wanted for key, wanted in expected_state.items()
+            ) or type(state.get("OOMKilled")) is not bool:
                 raise SandboxError("container terminal state inspection is incomplete")
-            oom_killed = state["OOMKilled"] is True
-            if state["Status"] != "exited":
-                raise SandboxError("container did not reach a terminal state")
+            oom_killed = bool(state["OOMKilled"])
         finally:
             self._cleanup(name)
         if process is None:
@@ -2212,11 +2637,20 @@ def validate_unified_diff(
                 raise PatchPolicyError("added import references a live execution module")
             if isinstance(node, ast.ImportFrom):
                 module = node.module or ""
+                imported = {alias.name for alias in node.names}
                 if (
                     module in live_modules
                     or module in {"core.order_execution", "core.order_manager"}
                     or module.startswith("alpaca.trading")
-                    or (module == "core" and any(alias.name in {"order_execution", "order_manager"} for alias in node.names))
+                    or (module == "core" and bool(imported & {"order_execution", "order_manager"}))
+                    or (module == "alpaca" and "trading" in imported)
+                    or (
+                        node.level > 0
+                        and (
+                            module.split(".")[-1] in {"order_execution", "order_manager"}
+                            or bool(imported & {"order_execution", "order_manager"})
+                        )
+                    )
                 ):
                     raise PatchPolicyError("added import references a live execution module")
     if any(_LIVE_REFERENCE_RE.search(line) for line in parsed.added_lines):
@@ -2225,10 +2659,14 @@ def validate_unified_diff(
 
 
 def _git_patch(root: Path, args: Sequence[str], raw: str) -> subprocess.CompletedProcess[bytes]:
+    try:
+        executable = _approved_git_executable()
+    except PreflightError as exc:
+        raise PatchApplicationError("an approved absolute Git executable is unavailable") from exc
     environment = _git_environment()
     try:
         return subprocess.run(
-            ["git", *_GIT_FIXED_ARGS, *args],
+            [str(executable), *_GIT_FIXED_ARGS, *args],
             cwd=root,
             env=environment,
             input=raw.encode("utf-8"),
@@ -2523,10 +2961,14 @@ def _reject_database_sidecars(path: Path) -> None:
             raise DataBundleError("historical data bundle has an unapproved sidecar")
 
 
-def _snapshot_data_bundle(source: Path, expected_sha256: str) -> tuple[Path, str]:
+def _snapshot_data_bundle(
+    source: Path,
+    expected_sha256: str,
+    controller_temp_parent: Path,
+) -> tuple[Path, str]:
     _reject_database_sidecars(source)
     before = source.stat()
-    root = _new_controller_temp("agent-loop-data-")
+    root = _new_controller_temp("agent-loop-data-", controller_temp_parent)
     destination = root / "historical_data.sqlite3"
     digest = hashlib.sha256()
     total = 0
@@ -2544,10 +2986,10 @@ def _snapshot_data_bundle(source: Path, expected_sha256: str) -> tuple[Path, str
         actual = digest.hexdigest()
         if actual.casefold() != expected_sha256.casefold():
             raise DataBundleError("historical data SHA-256 mismatch")
-        destination.chmod(stat.S_IREAD)
+        destination.chmod(0o444)
         return destination.resolve(), actual
     except Exception:
-        shutil.rmtree(root, ignore_errors=True)
+        _remove_private_tree(root)
         raise
 
 
@@ -2558,12 +3000,32 @@ def validate_historical_data_bundle(
     benchmark: str,
     start_date: str,
     end_date: str,
+    *,
+    controller_temp_parent: Path | None = None,
 ) -> ValidatedDataBundle:
     """Validate SQLite bytes/schema/cache keys without deserializing its opaque pickle payloads."""
     source = _regular_approved_file(bundle_path)
     if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
         raise DataBundleError("historical data SHA-256 must be exact")
-    path, actual = _snapshot_data_bundle(source, expected_sha256)
+    parent = controller_temp_parent or Path(tempfile.gettempdir())
+    path, actual = _snapshot_data_bundle(source, expected_sha256, parent)
+    try:
+        return _validate_historical_data_snapshot(
+            path, actual, tickers, benchmark, start_date, end_date
+        )
+    except Exception:
+        _remove_private_tree(path.parent)
+        raise
+
+
+def _validate_historical_data_snapshot(
+    path: Path,
+    actual: str,
+    tickers: Sequence[str],
+    benchmark: str,
+    start_date: str,
+    end_date: str,
+) -> ValidatedDataBundle:
     with path.open("rb") as stream:
         if stream.read(16) != b"SQLite format 3\x00":
             raise DataBundleError("historical data bundle lacks the SQLite header")
@@ -2587,7 +3049,7 @@ def validate_historical_data_bundle(
     closes_key = f"closes::{period}::{start.isoformat()}::{end.isoformat()}::{suffix}"
     uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro&immutable=1"
     try:
-        with sqlite3.connect(uri, uri=True) as connection:
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
             connection.execute("PRAGMA trusted_schema=OFF")
             connection.execute("PRAGMA query_only=ON")
             objects = connection.execute(
@@ -2633,6 +3095,57 @@ def copy_validated_data_bundle(bundle: ValidatedDataBundle, worker: Path) -> Pat
     if actual != bundle.sha256:
         raise DataBundleError("private historical data snapshot hash mismatch")
     return bundle.path
+
+
+def prepare_backtest_scratch_copy(
+    approved_path: Path,
+    expected_sha256: str,
+    scratch_path: Path,
+) -> Path:
+    """Create one verified writable worker scratch DB from the immutable approved input."""
+    approved = _regular_approved_file(approved_path)
+    _reject_database_sidecars(approved)
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise DataBundleError("approved historical data SHA-256 must be lowercase and exact")
+    before = approved.stat()
+    parent = scratch_path.parent
+    try:
+        parent.mkdir(parents=True, mode=0o777 if os.name == "nt" else 0o700, exist_ok=False)
+    except FileExistsError:
+        raise DataBundleError("backtest scratch parent must be a new protected directory") from None
+    if os.name != "nt":
+        parent.chmod(0o700)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with approved.open("rb") as source, scratch_path.open("xb") as destination:
+            if os.name != "nt":
+                scratch_path.chmod(0o600)
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                total += len(chunk)
+                if total > _MAX_DATA_BUNDLE_BYTES:
+                    raise DataBundleError("historical data bundle exceeds the size limit")
+                digest.update(chunk)
+                destination.write(chunk)
+        after = approved.stat()
+        stable = (before.st_size, before.st_mtime_ns, before.st_ino) == (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ino,
+        )
+        if not stable or digest.hexdigest() != expected_sha256:
+            raise DataBundleError("approved historical data changed or has the wrong SHA-256")
+        copied_digest, copied_size = _stream_sha256(scratch_path)
+        if copied_digest != expected_sha256 or copied_size != total:
+            raise DataBundleError("backtest scratch copy verification failed")
+        return scratch_path.resolve()
+    except Exception:
+        try:
+            if scratch_path.exists() and not scratch_path.is_symlink():
+                scratch_path.unlink()
+        except OSError as cleanup_error:
+            raise DataBundleError("failed to remove rejected backtest scratch copy") from cleanup_error
+        raise
 
 
 @dataclass(frozen=True)
@@ -2754,7 +3267,7 @@ def run_backtest_gate(
 
     def execute(layout: WorkerLayout) -> WorkerObservation:
         env = build_child_environment(os.environ, layout.home)
-        env["BACKTEST_DATA_CACHE_DB_PATH"] = "/workspace/data/historical_data.sqlite3"
+        env["BACKTEST_DATA_CACHE_DB_PATH"] = "/workspace/tmp/backtest-cache/historical_data.sqlite3"
         argv = (
             "/workspace/gate/agent_loop.py",
             "--_hidden-backtest",
@@ -2768,6 +3281,8 @@ def run_backtest_gate(
             end_date,
             "--historical-data-bundle",
             "/workspace/data/historical_data.sqlite3",
+            "--historical-data-sha256",
+            bundle.sha256,
             "--technical-only",
             "--no-csv",
         )
@@ -2805,16 +3320,28 @@ def run_hidden_backtest_worker(
     start_date: str,
     end_date: str,
     bundle_path: Path,
+    expected_sha256: str,
+    scratch_path: Path = Path("/workspace/tmp/backtest-cache/historical_data.sqlite3"),
+    candidate_source_root: Path = Path("/workspace/src"),
 ) -> int:
     """Hidden child-only technical backtest entrypoint; imports engine code only when invoked."""
     requested = tuple(dict.fromkeys(_validate_symbol(value) for value in tickers))
     benchmark_symbol = _validate_symbol(benchmark)
     exact = tuple(dict.fromkeys((*requested, benchmark_symbol)))
+    scratch = prepare_backtest_scratch_copy(bundle_path, expected_sha256, scratch_path)
+    source_root = candidate_source_root.resolve(strict=True)
+    sys.path.insert(0, str(source_root))
     from config import settings
 
     settings.EXTRA_SYMBOLS = []
-    settings.BACKTEST_DATA_CACHE_DB_PATH = str(bundle_path.resolve())
+    settings.BACKTEST_DATA_CACHE_DB_PATH = str(scratch)
     from core import backtest_engine
+
+    def cache_miss(*_args: object, **_kwargs: object) -> object:
+        raise GateConfigurationError("approved historical cache miss; provider access is forbidden")
+
+    for attribute in ("_download_price_data", "_download_bulk_closes", "fetch_bulk_ohlcv"):
+        setattr(backtest_engine, attribute, cache_miss)
 
     backtest_engine.get_sp500_tickers = lambda *_args, **_kwargs: list(exact)
     result = backtest_engine.run_cli(
