@@ -2252,6 +2252,28 @@ def test_worker_mounts_candidate_gate_and_data_read_only_with_narrow_writable_di
         assert "readonly" not in spec
 
 
+def test_container_attestation_normalizes_only_docker_null_capability_lists(
+    tmp_path: Path,
+) -> None:
+    """Docker Desktop reports absent capability/device requests as null, not empty lists."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    engine.mutate_inspection = lambda item: item["HostConfig"].update(
+        CapAdd=None,
+        DeviceRequests=None,
+    )
+
+    result = run_test_gate(candidate, _faithful_runner(image, engine))
+
+    assert result.gate_observation is True
+    assert result.observed_exit_zero is True
+    assert engine.removed and engine.absence_verified
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -4237,3 +4259,439 @@ def test_state_machine_reasoner_skip_never_calls_coder(tmp_path: Path) -> None:
         assert not candidate.root.exists()
     finally:
         external.cleanup()
+
+
+def _normal_cli_argv(tmp_path: Path) -> list[str]:
+    return [
+        "--repo-root",
+        str((tmp_path / "source").resolve()),
+        "--permanent-runtime-root",
+        str((tmp_path / "paper-runtime").resolve()),
+        "--git-executable",
+        str((tmp_path / "bin" / "git.exe").resolve()),
+        "--controller-temp-parent",
+        str((tmp_path / "controller").resolve()),
+        "--artifact-root",
+        str((tmp_path / "audit").resolve()),
+        "--docker-executable",
+        str((tmp_path / "bin" / "docker.exe").resolve()),
+        "--sandbox-image",
+        "example.invalid/agent-loop@sha256:" + ("d" * 64),
+        "--gate",
+        "test",
+        "--max-usd",
+        "0.25",
+        "--max-iterations",
+        "2",
+        "--max-api-calls",
+        "9",
+        "--max-tokens",
+        "65536",
+        "--api-timeout-seconds",
+        "20",
+        "--child-timeout-seconds",
+        "120",
+        "--wall-timeout-seconds",
+        "600",
+        "--output-limit-bytes",
+        "524288",
+        "--apply",
+    ]
+
+
+def _cli_loop_result(
+    tmp_path: Path,
+    run_id: str,
+    terminal_state: Any,
+    status: Any,
+    exit_code: int,
+) -> Any:
+    from agent_loop import BudgetSnapshot, LoopResult, TerminalStatus
+
+    passed = status is TerminalStatus.GATE_OBSERVED_PASS
+    return LoopResult(
+        terminal_state=terminal_state,
+        status=status,
+        exit_code=exit_code,
+        run_id=run_id,
+        iterations_started=0,
+        patches_applied=0,
+        gate_observation=passed,
+        worker_confined=passed,
+        source_modified=False,
+        security_attestation=False,
+        budget=BudgetSnapshot(0, 0, 0, 0, 0, 0.0, 0.0),
+        audit_path=(tmp_path / "audit" / run_id).resolve(),
+        quarantine_path=None,
+        quarantine_retained=False,
+        handoff_artifacts=(),
+        cleanup_complete=True,
+    )
+
+
+def test_cli_help_has_no_controller_or_provider_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: asking for help initializes Git, Docker, audit, or provider state."""
+    import agent_loop
+
+    marker = tmp_path / "controller-started"
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        marker.write_text("started", encoding="utf-8")
+        raise AssertionError("help must not initialize a controller run")
+
+    monkeypatch.setattr(agent_loop, "_execute_cli_run", forbidden, raising=False)
+    with pytest.raises(SystemExit) as raised:
+        agent_loop.main(["--help"])
+
+    assert raised.value.code == 0
+    assert "usage:" in capsys.readouterr().out.lower()
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("state_name", "status_name", "exit_code"),
+    [
+        ("FINISH_GATE_OBSERVED", "GATE_OBSERVED_PASS", 0),
+        ("FINISH_PROPOSAL_EXPORTED", "PROPOSAL_EXPORTED", 10),
+        ("FINISH_AGENT_ABORTED", "AGENT_ABORTED", 20),
+        ("FINISH_LIMITS_EXHAUSTED", "LIMITS_EXHAUSTED", 21),
+        ("FINISH_CONTROLLER_ERROR", "CONTROLLER_ERROR", 22),
+    ],
+)
+def test_cli_prints_one_canonical_summary_and_returns_terminal_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state_name: str,
+    status_name: str,
+    exit_code: int,
+) -> None:
+    """Break caught: CLI status/exit drift or extra output breaks automation consumers."""
+    import agent_loop
+
+    terminal_state = getattr(agent_loop.LoopState, state_name)
+    terminal_status = getattr(agent_loop.TerminalStatus, status_name)
+    captured: dict[str, object] = {}
+
+    def execute(config: object, **kwargs: object) -> object:
+        captured["config"] = config
+        captured.update(kwargs)
+        return _cli_loop_result(
+            tmp_path,
+            str(kwargs["run_id"]),
+            terminal_state,
+            terminal_status,
+            exit_code,
+        )
+
+    monkeypatch.setattr(agent_loop, "_execute_cli_run", execute, raising=False)
+    monkeypatch.setenv("OPENROUTER", "summary-secret-must-not-appear")
+
+    assert agent_loop.main(_normal_cli_argv(tmp_path)) == exit_code
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("AGENT_LOOP_SUMMARY=")
+    assert "summary-secret-must-not-appear" not in lines[0]
+    summary = json.loads(lines[0].split("=", 1)[1])
+    assert summary == {
+        "audit_path": str((tmp_path / "audit" / summary["run_id"]).resolve()),
+        "budget": {
+            "api_calls": 0,
+            "completion_tokens": 0,
+            "prompt_tokens": 0,
+            "reserved_tokens": 0,
+            "reserved_usd": 0.0,
+            "spent_usd": 0.0,
+            "total_tokens": 0,
+        },
+        "cleanup_complete": True,
+        "exit_code": exit_code,
+        "gate_observation": exit_code == 0,
+        "handoff_artifacts": [],
+        "iterations_started": 0,
+        "patches_applied": 0,
+        "quarantine_path": None,
+        "quarantine_retained": False,
+        "run_id": summary["run_id"],
+        "schema_version": 1,
+        "security_attestation": False,
+        "source_modified": False,
+        "status": terminal_status.value,
+        "terminal_state": terminal_state.value,
+        "worker_confined": exit_code == 0,
+    }
+    assert re.fullmatch(r"run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}", summary["run_id"])
+    config = captured["config"]
+    assert config.mode.apply is True  # type: ignore[attr-defined]
+    assert config.limits.max_iterations == 2  # type: ignore[attr-defined]
+    assert captured["docker_executable"] == (tmp_path / "bin" / "docker.exe").resolve()
+
+
+def test_cli_rejects_secret_and_promotion_options_before_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: CLI exposes a credential or real-repository promotion surface."""
+    import agent_loop
+
+    called = False
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError
+
+    monkeypatch.setattr(agent_loop, "_execute_cli_run", forbidden, raising=False)
+    for option in ("--openrouter-api-key", "--promote"):
+        with pytest.raises(SystemExit) as raised:
+            agent_loop.main([*_normal_cli_argv(tmp_path), option, "forbidden"])
+        assert raised.value.code == 2
+    assert called is False
+
+
+def test_hidden_backtest_dispatch_accepts_only_the_protected_exact_grammar(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: hidden dispatch accepts reordered/controller options or emits a run summary."""
+    import agent_loop
+
+    calls: list[dict[str, object]] = []
+
+    def hidden_worker(**kwargs: object) -> int:
+        calls.append(kwargs)
+        return 7
+
+    monkeypatch.setattr(agent_loop, "run_hidden_backtest_worker", hidden_worker)
+    exact = [
+        "--_hidden-backtest",
+        "--tickers",
+        "AAPL",
+        "MSFT",
+        "--benchmark",
+        "SPY",
+        "--start-date",
+        "2024-01-01",
+        "--end-date",
+        "2025-01-01",
+        "--historical-data-bundle",
+        "/workspace/data/historical_data.sqlite3",
+        "--historical-data-sha256",
+        "a" * 64,
+        "--technical-only",
+        "--no-csv",
+    ]
+    assert agent_loop.main(exact) == 7
+    assert capsys.readouterr().out == ""
+    assert calls == [
+        {
+            "tickers": ("AAPL", "MSFT"),
+            "benchmark": "SPY",
+            "start_date": "2024-01-01",
+            "end_date": "2025-01-01",
+            "bundle_path": Path("/workspace/data/historical_data.sqlite3"),
+            "expected_sha256": "a" * 64,
+        }
+    ]
+
+    reordered = [exact[0], "--benchmark", "SPY", "--tickers", *exact[2:4], *exact[6:]]
+    with pytest.raises(SystemExit) as raised:
+        agent_loop.main(reordered)
+    assert raised.value.code == 2
+    assert len(calls) == 1
+
+
+def test_production_cli_assembly_passes_explicit_git_and_docker_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: production wiring passes raw executable paths around capability checks."""
+    import agent_loop
+
+    config = agent_loop.LoopConfig(
+        source_root=(tmp_path / "source").resolve(),
+        permanent_runtime_root=(tmp_path / "runtime").resolve(),
+        git_executable=(tmp_path / "bin" / "git.exe").resolve(),
+        controller_temp_parent=(tmp_path / "controller").resolve(),
+        artifact_root=(tmp_path / "audit").resolve(),
+        mode=agent_loop.ExecutionMode(),
+        gate=agent_loop.TestGateConfig(),
+        models=agent_loop.ModelConfig(),
+        limits=agent_loop.LoopLimits(max_usd=0.25),
+    )
+    git_capability = object()
+    docker_capability = object()
+    state = SimpleNamespace(
+        head="a" * 40,
+        fingerprint=SimpleNamespace(sha256="b" * 64),
+    )
+    candidate = object()
+    audit = SimpleNamespace(
+        artifact_root=config.artifact_root,
+        run_id="run-20260818T010203Z-abcdef123456",
+        run_root=(config.artifact_root / "run-20260818T010203Z-abcdef123456"),
+        write_manifest=lambda *_args, **_kwargs: None,
+    )
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.ledger = agent_loop.BudgetLedger(max_usd=0.25)
+            self.api_key = "controller-only-secret"
+
+        def request(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("provider must not be called by CLI assembly")
+
+    gateway = Gateway()
+
+    monkeypatch.setattr(
+        agent_loop,
+        "configure_git_executable",
+        lambda path: git_capability if path == config.git_executable else None,
+    )
+
+    def preflight(*_args: object, **kwargs: object) -> object:
+        assert kwargs["git"] is git_capability
+        return state
+
+    monkeypatch.setattr(agent_loop, "preflight_source", preflight)
+    monkeypatch.setattr(
+        agent_loop,
+        "export_candidate",
+        lambda value: candidate if value is state else None,
+    )
+
+    def configure_docker(path: Path, **kwargs: object) -> object:
+        assert path == (tmp_path / "bin" / "docker.exe").resolve()
+        assert kwargs == {
+            "source_root": config.source_root,
+            "controller_root": config.controller_temp_parent,
+            "permanent_runtime_root": config.permanent_runtime_root,
+        }
+        return docker_capability
+
+    monkeypatch.setattr(agent_loop, "configure_docker_executable", configure_docker)
+
+    class Sandbox:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["engine"] is docker_capability
+
+    monkeypatch.setattr(agent_loop, "SandboxRunner", Sandbox)
+    monkeypatch.setattr(agent_loop, "OpenRouterGateway", lambda **_kwargs: gateway)
+    monkeypatch.setattr(agent_loop, "AuditTrail", lambda *_args, **_kwargs: audit)
+    expected = _cli_loop_result(
+        tmp_path,
+        audit.run_id,
+        agent_loop.LoopState.FINISH_GATE_OBSERVED,
+        agent_loop.TerminalStatus.GATE_OBSERVED_PASS,
+        0,
+    )
+
+    def run_loop(
+        actual_config: object,
+        actual_state: object,
+        actual_candidate: object,
+        actual_audit: object,
+        services: object,
+    ) -> object:
+        assert (actual_config, actual_state, actual_candidate, actual_audit) == (
+            config,
+            state,
+            candidate,
+            audit,
+        )
+        assert services.gateway is gateway  # type: ignore[attr-defined]
+        return expected
+
+    monkeypatch.setattr(agent_loop, "run_agent_loop", run_loop)
+    result = agent_loop._execute_cli_run(
+        config,
+        docker_executable=(tmp_path / "bin" / "docker.exe").resolve(),
+        sandbox_image="example.invalid/agent-loop@sha256:" + ("d" * 64),
+        run_id=audit.run_id,
+    )
+    assert result is expected
+
+
+def test_production_cli_attempts_all_owned_cleanup_when_bundle_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: one snapshot cleanup error could strand the candidate and source lock."""
+    import agent_loop
+
+    config = agent_loop.LoopConfig(
+        source_root=(tmp_path / "source").resolve(),
+        permanent_runtime_root=(tmp_path / "runtime").resolve(),
+        git_executable=(tmp_path / "bin" / "git.exe").resolve(),
+        controller_temp_parent=(tmp_path / "controller").resolve(),
+        artifact_root=(tmp_path / "audit").resolve(),
+        mode=agent_loop.ExecutionMode(),
+        gate=agent_loop.BacktestGateConfig(
+            tickers=("AAPL",),
+            benchmark="SPY",
+            start_date="2024-01-01",
+            end_date="2025-01-01",
+            historical_data_bundle=(tmp_path / "operator.sqlite3").resolve(),
+            historical_data_sha256="a" * 64,
+            thresholds=agent_loop.BacktestThresholds(0.0, 0.0, 0.0, 100.0, 0),
+        ),
+        models=agent_loop.ModelConfig(),
+        limits=agent_loop.LoopLimits(max_usd=0.25),
+    )
+    cleanup_calls: list[str] = []
+
+    class State:
+        head = "a" * 40
+        fingerprint = SimpleNamespace(sha256="b" * 64)
+
+        def close(self) -> None:
+            cleanup_calls.append("state")
+
+    class Gateway:
+        api_key = "secret"
+        ledger = agent_loop.BudgetLedger(max_usd=0.25)
+
+        def request(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError
+
+    monkeypatch.setattr(agent_loop, "configure_git_executable", lambda _path: object())
+    monkeypatch.setattr(agent_loop, "preflight_source", lambda *_args, **_kwargs: State())
+    monkeypatch.setattr(agent_loop, "export_candidate", lambda _state: object())
+    monkeypatch.setattr(agent_loop, "configure_docker_executable", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(agent_loop, "SandboxRunner", lambda **_kwargs: object())
+    monkeypatch.setattr(agent_loop, "OpenRouterGateway", lambda **_kwargs: Gateway())
+    monkeypatch.setattr(
+        agent_loop,
+        "validate_historical_data_bundle",
+        lambda *_args, **_kwargs: SimpleNamespace(path=(tmp_path / "snapshot" / "data.sqlite3")),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "AuditTrail",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(agent_loop.AuditError("audit")),
+    )
+
+    def fail_bundle_cleanup(_path: Path) -> None:
+        cleanup_calls.append("bundle")
+        raise agent_loop.QuarantineError("bundle cleanup")
+
+    monkeypatch.setattr(agent_loop, "_remove_private_tree", fail_bundle_cleanup)
+    monkeypatch.setattr(
+        agent_loop,
+        "dispose_candidate",
+        lambda _candidate: cleanup_calls.append("candidate"),
+    )
+
+    with pytest.raises(agent_loop.QuarantineError, match="bundle cleanup"):
+        agent_loop._execute_cli_run(
+            config,
+            docker_executable=(tmp_path / "bin" / "docker.exe").resolve(),
+            sandbox_image="example.invalid/agent-loop@sha256:" + ("d" * 64),
+            run_id="run-20260818T010203Z-abcdef123456",
+        )
+
+    assert cleanup_calls == ["bundle", "candidate", "state"]

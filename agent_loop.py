@@ -6,6 +6,7 @@ is imported only when a default gateway first needs to send a request.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import hmac
 import json
@@ -2495,6 +2496,12 @@ class SandboxRunner:
             mounts = item["Mounts"]
         except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
             raise SandboxError("created container inspection is malformed") from exc
+        if not isinstance(host, dict):
+            raise SandboxError("created container inspection is malformed")
+        normalized_host = dict(host)
+        for key in ("CapAdd", "DeviceRequests"):
+            if key in normalized_host and normalized_host[key] is None:
+                normalized_host[key] = []
         expected_host = {
             "NetworkMode": "none",
             "ReadonlyRootfs": True,
@@ -2515,7 +2522,10 @@ class SandboxRunner:
             "PortBindings": {},
             "PublishAllPorts": False,
         }
-        if any(key not in host or host[key] != wanted for key, wanted in expected_host.items()):
+        if any(
+            key not in normalized_host or normalized_host[key] != wanted
+            for key, wanted in expected_host.items()
+        ):
             raise SandboxError("created container lacks required isolation")
         if item.get("Id") != container_id or item.get("Name") != f"/{name}" or item.get("Image") != image_id:
             raise SandboxError("created container image ID differs from the inspected image")
@@ -2562,7 +2572,7 @@ class SandboxRunner:
         normalized_config["Env"] = dict(value.split("=", 1) for value in actual_environment)
         attested = {
             "Config": normalized_config,
-            "HostConfig": host,
+            "HostConfig": normalized_host,
             "Mounts": mounts,
             "Image": item["Image"],
             "NetworkSettings": network,
@@ -5915,3 +5925,601 @@ def run_agent_loop(
         handoff_artifacts=tuple(artifacts),
         cleanup_complete=cleanup.cleanup_complete,
     )
+
+
+def _hidden_backtest_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent_loop.py --_hidden-backtest",
+        add_help=False,
+        allow_abbrev=False,
+    )
+    parser.add_argument("--tickers", nargs="+", required=True)
+    parser.add_argument("--benchmark", required=True)
+    parser.add_argument("--start-date", required=True)
+    parser.add_argument("--end-date", required=True)
+    parser.add_argument("--historical-data-bundle", required=True)
+    parser.add_argument("--historical-data-sha256", required=True)
+    parser.add_argument("--technical-only", action="store_true", required=True)
+    parser.add_argument("--no-csv", action="store_true", required=True)
+    return parser
+
+
+def _dispatch_hidden_backtest(argv: Sequence[str]) -> int:
+    """Dispatch only the controller-built hidden worker grammar, in its exact order."""
+    parser = _hidden_backtest_parser()
+    if not argv or argv[0] != "--_hidden-backtest":
+        parser.error("hidden backtest marker must be the first argument")
+    namespace = parser.parse_args(tuple(argv[1:]))
+    canonical = (
+        "--_hidden-backtest",
+        "--tickers",
+        *namespace.tickers,
+        "--benchmark",
+        namespace.benchmark,
+        "--start-date",
+        namespace.start_date,
+        "--end-date",
+        namespace.end_date,
+        "--historical-data-bundle",
+        namespace.historical_data_bundle,
+        "--historical-data-sha256",
+        namespace.historical_data_sha256,
+        "--technical-only",
+        "--no-csv",
+    )
+    try:
+        start = date.fromisoformat(namespace.start_date)
+        end = date.fromisoformat(namespace.end_date)
+        symbols_are_canonical = all(
+            _validate_symbol(value) == value for value in namespace.tickers
+        )
+        benchmark_is_canonical = (
+            _validate_symbol(namespace.benchmark) == namespace.benchmark
+        )
+    except (DataBundleError, TypeError, ValueError):
+        parser.error("hidden backtest arguments are not canonical")
+    if (
+        tuple(argv) != canonical
+        or not symbols_are_canonical
+        or len(set(namespace.tickers)) != len(namespace.tickers)
+        or not benchmark_is_canonical
+        or namespace.benchmark in namespace.tickers
+        or start >= end
+        or namespace.historical_data_bundle
+        != "/workspace/data/historical_data.sqlite3"
+        or _SHA256_RE.fullmatch(namespace.historical_data_sha256) is None
+    ):
+        parser.error("hidden backtest arguments violate the exact grammar")
+    return run_hidden_backtest_worker(
+        tickers=tuple(namespace.tickers),
+        benchmark=namespace.benchmark,
+        start_date=namespace.start_date,
+        end_date=namespace.end_date,
+        bundle_path=Path(namespace.historical_data_bundle),
+        expected_sha256=namespace.historical_data_sha256,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the side-effect-free production controller CLI parser."""
+    parser = argparse.ArgumentParser(
+        prog="agent_loop.py",
+        description=(
+            "Run the bounded OpenRouter refinement loop in an attested Docker sandbox. "
+            "All generated patches remain in a controller-owned candidate."
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument("--permanent-runtime-root", type=Path, required=True)
+    parser.add_argument("--git-executable", type=Path, required=True)
+    parser.add_argument("--controller-temp-parent", type=Path, required=True)
+    parser.add_argument("--artifact-root", type=Path, required=True)
+    parser.add_argument("--docker-executable", type=Path, required=True)
+    parser.add_argument("--sandbox-image", required=True)
+    parser.add_argument("--gate", choices=("test", "backtest"), required=True)
+    parser.add_argument(
+        "--test-path",
+        action="append",
+        default=[],
+        metavar="tests/.../test_*.py",
+    )
+    parser.add_argument("--tickers", nargs="+")
+    parser.add_argument("--benchmark")
+    parser.add_argument("--start-date")
+    parser.add_argument("--end-date")
+    parser.add_argument("--historical-data-bundle", type=Path)
+    parser.add_argument("--historical-data-sha256")
+    parser.add_argument("--minimum-total-return", type=float)
+    parser.add_argument("--minimum-annualized-return", type=float)
+    parser.add_argument("--minimum-sharpe-ratio", type=float)
+    parser.add_argument("--maximum-drawdown-magnitude", type=float)
+    parser.add_argument("--minimum-closed-trades", type=int)
+    parser.add_argument("--max-usd", type=float, required=True)
+    parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
+    parser.add_argument("--max-api-calls", type=int, default=DEFAULT_MAX_CALLS)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument(
+        "--api-timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS
+    )
+    parser.add_argument("--child-timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--wall-timeout-seconds", type=float, default=3600.0)
+    parser.add_argument("--output-limit-bytes", type=int, default=1024 * 1024)
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply validated patches only to the controller-owned candidate.",
+    )
+    return parser
+
+
+def _absolute_cli_path(value: object, field: str) -> Path:
+    if not isinstance(value, Path) or not value.is_absolute():
+        raise ConfigurationError(f"{field} must be an explicit absolute path")
+    return value.resolve(strict=False)
+
+
+def _build_cli_config(
+    namespace: argparse.Namespace,
+) -> tuple[LoopConfig, Path, str]:
+    docker_executable = _absolute_cli_path(
+        namespace.docker_executable, "docker executable"
+    )
+    sandbox_image = namespace.sandbox_image
+    if (
+        not isinstance(sandbox_image, str)
+        or re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", sandbox_image) is None
+    ):
+        raise ConfigurationError(
+            "sandbox image must be an exact repository@sha256 digest"
+        )
+    backtest_fields = (
+        namespace.tickers,
+        namespace.benchmark,
+        namespace.start_date,
+        namespace.end_date,
+        namespace.historical_data_bundle,
+        namespace.historical_data_sha256,
+        namespace.minimum_total_return,
+        namespace.minimum_annualized_return,
+        namespace.minimum_sharpe_ratio,
+        namespace.maximum_drawdown_magnitude,
+        namespace.minimum_closed_trades,
+    )
+    if namespace.gate == "test":
+        if any(value is not None for value in backtest_fields):
+            raise ConfigurationError(
+                "backtest-only options cannot be supplied to the test gate"
+            )
+        gate: TestGateConfig | BacktestGateConfig = TestGateConfig(
+            tuple(namespace.test_path)
+        )
+    else:
+        if namespace.test_path:
+            raise ConfigurationError(
+                "test paths cannot be supplied to the backtest gate"
+            )
+        if any(value is None for value in backtest_fields):
+            raise ConfigurationError(
+                "the backtest gate requires symbols, dates, data approval, and thresholds"
+            )
+        assert namespace.tickers is not None
+        assert namespace.historical_data_bundle is not None
+        gate = BacktestGateConfig(
+            tickers=tuple(namespace.tickers),
+            benchmark=namespace.benchmark,
+            start_date=namespace.start_date,
+            end_date=namespace.end_date,
+            historical_data_bundle=_absolute_cli_path(
+                namespace.historical_data_bundle, "historical data bundle"
+            ),
+            historical_data_sha256=namespace.historical_data_sha256,
+            thresholds=BacktestThresholds(
+                minimum_total_return=namespace.minimum_total_return,
+                minimum_annualized_return=namespace.minimum_annualized_return,
+                minimum_sharpe_ratio=namespace.minimum_sharpe_ratio,
+                maximum_drawdown_magnitude=namespace.maximum_drawdown_magnitude,
+                minimum_closed_trades=namespace.minimum_closed_trades,
+            ),
+        )
+    config = LoopConfig(
+        source_root=_absolute_cli_path(namespace.repo_root, "repository root"),
+        permanent_runtime_root=_absolute_cli_path(
+            namespace.permanent_runtime_root, "permanent runtime root"
+        ),
+        git_executable=_absolute_cli_path(
+            namespace.git_executable, "Git executable"
+        ),
+        controller_temp_parent=_absolute_cli_path(
+            namespace.controller_temp_parent, "controller temporary parent"
+        ),
+        artifact_root=_absolute_cli_path(namespace.artifact_root, "artifact root"),
+        mode=ExecutionMode(apply=namespace.apply),
+        gate=gate,
+        models=ModelConfig(),
+        limits=LoopLimits(
+            max_usd=namespace.max_usd,
+            max_iterations=namespace.max_iterations,
+            max_api_calls=namespace.max_api_calls,
+            max_tokens=namespace.max_tokens,
+            api_timeout_seconds=namespace.api_timeout_seconds,
+            child_timeout_seconds=namespace.child_timeout_seconds,
+            wall_timeout_seconds=namespace.wall_timeout_seconds,
+            output_limit_bytes=namespace.output_limit_bytes,
+        ),
+    )
+    return config, docker_executable, sandbox_image
+
+
+def _new_run_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"run-{timestamp}-{secrets.token_hex(6)}"
+
+
+def _completion_payload(
+    sandbox: SandboxRunner,
+    envelope: CompletionEnvelope | None,
+) -> tuple[Mapping[str, object], bool]:
+    if not isinstance(envelope, CompletionEnvelope):
+        return MappingProxyType({}), False
+    try:
+        verified = sandbox.verify_completion_envelope(envelope)
+    except Exception:
+        verified = False
+    return envelope.payload, verified
+
+
+def _closed_digest(value: object) -> str:
+    return value if isinstance(value, str) and _SHA256_RE.fullmatch(value) else "0" * 64
+
+
+def _closed_returncode(value: object) -> int:
+    return value if type(value) is int and -255 <= value <= 255 else -1
+
+
+def _test_provider_evidence(
+    candidate: Candidate,
+    sandbox: SandboxRunner,
+    selectors: Sequence[str],
+) -> ProviderGateEvidence:
+    result = run_test_gate(candidate, sandbox, selectors)
+    if result.provider_safe is not True:
+        raise ConfigurationError("test gate did not return provider-safe facts")
+    payload, envelope_verified = _completion_payload(
+        sandbox, result.completion_envelope
+    )
+    payload_consistent = (
+        payload.get("gate_observation") is result.gate_observation
+        and payload.get("worker_confined") is result.worker_confined
+        and payload.get("source_modified") is result.source_modified
+        and payload.get("returncode") == result.returncode
+        and payload.get("stdout_sha256") == result.stdout_sha256
+        and payload.get("stderr_sha256") == result.stderr_sha256
+        and payload.get("cleanup_verified") is True
+    )
+    source_modified = result.source_modified or payload.get("source_modified") is True
+    worker_confined = bool(
+        result.worker_confined
+        and envelope_verified
+        and payload_consistent
+        and not source_modified
+    )
+    observed_exit_zero = bool(result.observed_exit_zero and payload_consistent)
+    gate_observation = bool(
+        result.gate_observation and observed_exit_zero and worker_confined
+    )
+    failures: list[str] = []
+    if source_modified:
+        failures.append("source_modified")
+    if not worker_confined:
+        failures.append("worker_unconfined")
+    if not envelope_verified or not payload_consistent:
+        failures.append("security_unattested")
+    if result.outcome == "timed_out":
+        failures.append("timed_out")
+    elif not result.gate_observation:
+        failures.append("pytest_failed")
+    if source_modified:
+        outcome = "source_modified"
+    elif not worker_confined:
+        outcome = "worker_unconfined"
+    else:
+        outcome = result.outcome
+    return ProviderGateEvidence(
+        gate_kind="test",
+        outcome=outcome,
+        gate_observation=gate_observation,
+        observed_exit_zero=observed_exit_zero,
+        worker_confined=worker_confined,
+        returncode=result.returncode,
+        stdout_sha256=result.stdout_sha256,
+        stderr_sha256=result.stderr_sha256,
+        failure_codes=tuple(dict.fromkeys(failures)),
+    )
+
+
+def _backtest_provider_evidence(
+    candidate: Candidate,
+    sandbox: SandboxRunner,
+    gate: BacktestGateConfig,
+    bundle: ValidatedDataBundle,
+) -> ProviderGateEvidence:
+    result = run_backtest_gate(
+        candidate,
+        sandbox,
+        bundle,
+        gate.tickers,
+        gate.benchmark,
+        gate.start_date,
+        gate.end_date,
+        gate.thresholds,
+    )
+    if result.provider_safe is not True:
+        raise ConfigurationError("backtest gate did not return provider-safe facts")
+    payload, envelope_verified = _completion_payload(
+        sandbox, result.completion_envelope
+    )
+    returncode = _closed_returncode(payload.get("returncode"))
+    stdout_sha256 = _closed_digest(payload.get("stdout_sha256"))
+    stderr_sha256 = _closed_digest(payload.get("stderr_sha256"))
+    payload_consistent = (
+        type(payload.get("gate_observation")) is bool
+        and payload.get("worker_confined") is result.worker_confined
+        and payload.get("source_modified") is False
+        and type(payload.get("timed_out")) is bool
+        and type(payload.get("oom_killed")) is bool
+        and payload.get("cleanup_verified") is True
+        and stdout_sha256 != "0" * 64
+        and stderr_sha256 != "0" * 64
+    )
+    source_modified = result.source_modified or payload.get("source_modified") is True
+    worker_confined = bool(
+        result.worker_confined
+        and envelope_verified
+        and payload_consistent
+        and not source_modified
+    )
+    observed_exit_zero = bool(
+        result.observed_exit_zero
+        and payload_consistent
+        and returncode == 0
+        and payload.get("timed_out") is False
+    )
+    gate_observation = bool(
+        result.gate_observation and observed_exit_zero and worker_confined
+    )
+    failures: list[str] = []
+    if source_modified:
+        failures.append("source_modified")
+    if not worker_confined:
+        failures.append("worker_unconfined")
+    if not envelope_verified or not payload_consistent:
+        failures.append("security_unattested")
+    outcome = {
+        "process_exit_nonzero": "exit_nonzero",
+    }.get(result.outcome, result.outcome)
+    if result.outcome == "timed_out":
+        failures.append("timed_out")
+    elif result.outcome == "process_exit_nonzero":
+        failures.append("process_failed")
+    elif result.outcome == "sentinel_invalid":
+        failures.append("sentinel_invalid")
+    elif result.outcome == "thresholds_not_met":
+        failures.append("thresholds_not_met")
+    if source_modified:
+        outcome = "source_modified"
+    elif not worker_confined:
+        outcome = "worker_unconfined"
+    return ProviderGateEvidence(
+        gate_kind="backtest",
+        outcome=outcome,
+        gate_observation=gate_observation,
+        observed_exit_zero=observed_exit_zero,
+        worker_confined=worker_confined,
+        returncode=returncode,
+        stdout_sha256=stdout_sha256,
+        stderr_sha256=stderr_sha256,
+        failure_codes=tuple(dict.fromkeys(failures)),
+    )
+
+
+def _execute_cli_run(
+    config: LoopConfig,
+    *,
+    docker_executable: Path,
+    sandbox_image: str,
+    run_id: str,
+) -> LoopResult:
+    """Assemble production-only capabilities and execute one initialized controller run."""
+    if not isinstance(config, LoopConfig):
+        raise ConfigurationError("CLI execution requires a validated LoopConfig")
+    if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+        raise ConfigurationError("CLI run ID is not canonical")
+    state: SourceState | None = None
+    candidate: Candidate | None = None
+    bundle: ValidatedDataBundle | None = None
+    loop_returned = False
+    try:
+        git_capability = configure_git_executable(config.git_executable)
+        state = preflight_source(
+            config.source_root,
+            permanent_runtime_root=config.permanent_runtime_root,
+            controller_temp_parent=config.controller_temp_parent,
+            git=git_capability,
+        )
+        candidate = export_candidate(state)
+        docker_capability = configure_docker_executable(
+            docker_executable,
+            source_root=config.source_root,
+            controller_root=config.controller_temp_parent,
+            permanent_runtime_root=config.permanent_runtime_root,
+        )
+        sandbox = SandboxRunner(
+            image=sandbox_image,
+            engine=docker_capability,
+            timeout_seconds=config.limits.child_timeout_seconds,
+            output_limit=config.limits.output_limit_bytes,
+            run_id=run_id,
+        )
+        ledger = BudgetLedger(
+            max_usd=config.limits.max_usd,
+            max_calls=config.limits.max_api_calls,
+            max_tokens=config.limits.max_tokens,
+        )
+        gateway = OpenRouterGateway(
+            run_id=run_id,
+            ledger=ledger,
+            timeout_seconds=config.limits.api_timeout_seconds,
+            controller_root=config.source_root,
+        )
+        known_secrets = (
+            (gateway.api_key,)
+            if isinstance(gateway.api_key, str) and gateway.api_key
+            else ()
+        )
+        if isinstance(config.gate, BacktestGateConfig):
+            bundle = validate_historical_data_bundle(
+                config.gate.historical_data_bundle,
+                config.gate.historical_data_sha256,
+                config.gate.tickers,
+                config.gate.benchmark,
+                config.gate.start_date,
+                config.gate.end_date,
+                controller_temp_parent=config.controller_temp_parent,
+            )
+        audit = AuditTrail(
+            config.artifact_root,
+            run_id,
+            known_secrets=known_secrets,
+        )
+        if state.fingerprint is None:
+            raise ConfigurationError("preflight source fingerprint is absent")
+        audit.write_manifest(
+            config,
+            source_head=state.head,
+            source_fingerprint_sha256=state.fingerprint.sha256,
+        )
+
+        if isinstance(config.gate, TestGateConfig):
+            primary_gate = lambda current, _iteration: _test_provider_evidence(
+                current, sandbox, config.gate.selectors
+            )
+        else:
+            if bundle is None:
+                raise ConfigurationError("validated backtest data bundle is absent")
+            primary_gate = lambda current, _iteration: _backtest_provider_evidence(
+                current, sandbox, config.gate, bundle
+            )
+
+        def snapshots(
+            current: Candidate,
+            paths: tuple[str, ...],
+        ) -> tuple[SourceSnapshot, ...]:
+            return tuple(
+                read_candidate_source_snapshot(
+                    current,
+                    path,
+                    approved_paths=paths,
+                    known_secrets=known_secrets,
+                )
+                for path in paths
+            )
+
+        services = LoopServices(
+            gateway=gateway,
+            run_primary_gate=primary_gate,
+            run_final_quality=lambda current, iteration: run_final_quality(
+                current,
+                sandbox,
+                audit=audit,
+                iteration=iteration,
+            ),
+            read_snapshots=snapshots,
+            compile_runner=sandbox_compile_runner(sandbox),
+            known_secrets=known_secrets,
+            editable_paths=tuple(sorted(DEFAULT_EDITABLE_PATHS)),
+        )
+        result = run_agent_loop(config, state, candidate, audit, services)
+        loop_returned = True
+        return result
+    finally:
+        try:
+            if bundle is not None:
+                _remove_private_tree(bundle.path.parent)
+        finally:
+            if not loop_returned:
+                try:
+                    if candidate is not None:
+                        dispose_candidate(candidate)
+                finally:
+                    if state is not None:
+                        state.close()
+
+
+def _loop_result_summary(result: LoopResult) -> dict[str, object]:
+    if not isinstance(result, LoopResult):
+        raise ConfigurationError("CLI execution did not return a LoopResult")
+    return {
+        "schema_version": 1,
+        "terminal_state": result.terminal_state.value,
+        "status": result.status.value,
+        "exit_code": result.exit_code,
+        "run_id": result.run_id,
+        "iterations_started": result.iterations_started,
+        "patches_applied": result.patches_applied,
+        "gate_observation": result.gate_observation,
+        "worker_confined": result.worker_confined,
+        "source_modified": result.source_modified,
+        "security_attestation": result.security_attestation,
+        "budget": asdict(result.budget),
+        "audit_path": str(result.audit_path),
+        "quarantine_path": (
+            str(result.quarantine_path) if result.quarantine_path is not None else None
+        ),
+        "quarantine_retained": result.quarantine_retained,
+        "handoff_artifacts": [
+            {"path": str(path), "sha256": digest}
+            for path, digest in result.handoff_artifacts
+        ],
+        "cleanup_complete": result.cleanup_complete,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the protected child dispatcher or one production controller invocation."""
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "--_hidden-backtest":
+        return _dispatch_hidden_backtest(arguments)
+    parser = build_parser()
+    namespace = parser.parse_args(arguments)
+    try:
+        config, docker_executable, sandbox_image = _build_cli_config(namespace)
+    except (ConfigurationError, GateConfigurationError) as exc:
+        parser.error(str(exc))
+    run_id = _new_run_id()
+    try:
+        result = _execute_cli_run(
+            config,
+            docker_executable=docker_executable,
+            sandbox_image=sandbox_image,
+            run_id=run_id,
+        )
+        summary = _loop_result_summary(result)
+    except Exception:
+        print("agent loop initialization failed", file=sys.stderr)
+        return 22
+    print(
+        "AGENT_LOOP_SUMMARY="
+        + json.dumps(
+            summary,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    return result.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
