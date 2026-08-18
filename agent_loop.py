@@ -6,6 +6,8 @@ is imported only when a default gateway first needs to send a request.
 
 from __future__ import annotations
 
+import ast
+import hmac
 import json
 import hashlib
 import math
@@ -17,9 +19,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
+import secrets
 import urllib.request
+from urllib.parse import quote
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -39,6 +44,7 @@ _MAX_FILES = 8
 _MAX_LIST_ITEMS = 16
 _MAX_TEXT_BYTES = 16 * 1024
 _MAX_DIFF_BYTES = 256 * 1024
+_MAX_DATA_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529})
 
 AGENT_LOOP_UID_GID = "65532:65532"
@@ -877,6 +883,37 @@ class OpenRouterGateway:
         )
 
 
+_GIT_ENV_KEYS = ("PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP")
+_NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
+_GIT_FIXED_ARGS = (
+    "-c", f"core.hooksPath={_NULL_DEVICE}",
+    "-c", "core.fsmonitor=false",
+    "-c", "diff.external=",
+    "-c", "core.pager=cat",
+    "-c", "pager.status=false",
+)
+
+
+def _git_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return a credential-free, config-free environment for every Git child."""
+    environment = {key: os.environ[key] for key in _GIT_ENV_KEYS if key in os.environ}
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": _NULL_DEVICE,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "LC_ALL": "C",
+            "LANG": "C",
+        }
+    )
+    if extra:
+        environment.update(extra)
+    return environment
+
+
 def _git(
     root: Path,
     *args: str,
@@ -884,18 +921,10 @@ def _git(
     timeout: float = 15.0,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one fixed Git operation without a shell."""
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_OPTIONAL_LOCKS": "0",
-        }
-    )
+    environment = _git_environment()
     try:
         return subprocess.run(
-            ["git", *args],
+            ["git", *_GIT_FIXED_ARGS, *args],
             cwd=root,
             env=environment,
             input=input_bytes,
@@ -971,6 +1000,47 @@ class SourceLock:
 
 
 @dataclass(frozen=True)
+class SourceFingerprint:
+    head: str
+    branch: str
+    index_sha256: str
+    tracked_manifest_sha256: str
+    untracked_names: tuple[str, ...]
+    sha256: str
+
+
+def source_fingerprint(root: Path) -> SourceFingerprint:
+    """Fingerprint source metadata and bytes without changing or cleaning the checkout."""
+    head = _git(root, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
+    branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.decode().strip()
+    index = _git(root, "ls-files", "-s", "-z").stdout
+    tracked_hash = hashlib.sha256()
+    for relative in _tracked_paths(root):
+        canonical = canonical_patch_path(relative)
+        path = root / canonical
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or path.is_symlink() or _has_reparse_point(path):
+            raise PreflightError(f"tracked source path is not a regular file: {canonical}")
+        tracked_hash.update(canonical.encode("utf-8") + b"\0")
+        tracked_hash.update(f"{stat.S_IMODE(info.st_mode):o}".encode("ascii") + b"\0")
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                tracked_hash.update(chunk)
+        tracked_hash.update(b"\0")
+    untracked_raw = _git(root, "ls-files", "--others", "--exclude-standard", "-z").stdout
+    untracked = tuple(sorted(value.decode("utf-8") for value in untracked_raw.split(b"\0") if value))
+    payload = {
+        "head": head,
+        "branch": branch,
+        "index_sha256": hashlib.sha256(index).hexdigest(),
+        "tracked_manifest_sha256": tracked_hash.hexdigest(),
+        "untracked_names": list(untracked),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return SourceFingerprint(head, branch, payload["index_sha256"], payload["tracked_manifest_sha256"], untracked, digest)
+
+
+@dataclass(frozen=True)
 class SourceState:
     root: Path
     head: str
@@ -978,6 +1048,7 @@ class SourceState:
     status: str
     lock_path: Path
     lock: SourceLock | None = None
+    fingerprint: SourceFingerprint | None = None
 
     def close(self) -> None:
         if self.lock is not None:
@@ -1011,7 +1082,24 @@ def preflight_source(
         raise PreflightError("source working tree must be clean including untracked files")
     lock_path = _resolved_git_path(root, "agent-loop.lock")
     lock = SourceLock(lock_path).acquire() if acquire_lock else None
-    return SourceState(root, head, branch, status, lock_path, lock)
+    return SourceState(root, head, branch, status, lock_path, lock, source_fingerprint(root))
+
+
+@dataclass(frozen=True)
+class SourceRecheck:
+    source_modified: bool
+    before_sha256: str
+    after_sha256: str
+
+
+def recheck_source_unchanged(state: SourceState) -> SourceRecheck:
+    """Report a source mismatch; deliberately never restore, reset, or clean source."""
+    before = state.fingerprint.sha256 if state.fingerprint is not None else ""
+    try:
+        current = source_fingerprint(state.root).sha256
+    except (PreflightError, OSError, UnicodeError):
+        current = hashlib.sha256(b"source-fingerprint-unreadable").hexdigest()
+    return SourceRecheck(current != before, before, current)
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -1020,6 +1108,30 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _new_controller_temp(prefix: str, preferred_parent: Path | None = None) -> Path:
+    """Create a private temp directory, falling back to the controller workspace under ACL sandboxes."""
+    parents = [preferred_parent] if preferred_parent is not None else [Path(tempfile.gettempdir())]
+    parents.append(Path.cwd() / ".controller-tmp")
+    last_error: OSError | None = None
+    for parent in parents:
+        if parent is None:
+            continue
+        root: Path | None = None
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            root = (parent / f"{prefix}{secrets.token_hex(12)}").resolve()
+            root.mkdir(mode=0o777 if os.name == "nt" else 0o700)
+            probe = root / ".write-probe"
+            probe.write_bytes(b"")
+            probe.unlink()
+            return root
+        except OSError as exc:
+            last_error = exc
+            if root is not None:
+                _remove_private_tree(root)
+    raise QuarantineError("controller cannot create a private temporary directory") from last_error
 
 
 def _has_reparse_point(path: Path) -> bool:
@@ -1057,6 +1169,19 @@ class Candidate:
     root: Path
     source_head: str
     tracked_files: tuple[str, ...]
+    _controller_capability: object
+
+
+_CANDIDATE_CAPABILITIES: dict[Path, object] = {}
+
+
+def _require_candidate(candidate: Candidate) -> Path:
+    if not isinstance(candidate, Candidate):
+        raise ConfigurationError("operation requires a controller-owned candidate")
+    root = candidate.root.resolve()
+    if _CANDIDATE_CAPABILITIES.get(root) is not candidate._controller_capability:
+        raise ConfigurationError("candidate capability is absent or no longer owned by this controller")
+    return root
 
 
 def export_candidate(state: SourceState, destination_parent: Path | None = None) -> Candidate:
@@ -1068,35 +1193,52 @@ def export_candidate(state: SourceState, destination_parent: Path | None = None)
     for ancestor in dotenv_ancestors:
         if _is_relative_to(parent, ancestor):
             raise QuarantineError("candidate parent is below a source ancestor containing .env")
-    root = Path(tempfile.mkdtemp(prefix="agent-loop-candidate-", dir=parent)).resolve()
+    root = _new_controller_temp("agent-loop-candidate-", parent)
+    if _is_relative_to(root, state.root):
+        shutil.rmtree(root, ignore_errors=True)
+        raise QuarantineError("candidate temp fallback is inside the source repository")
     try:
         tracked = _write_commit_export(state.root, state.head, root)
         _git(root, "-c", "init.templateDir=", "init", "--quiet")
         _git(root, "config", "user.email", "agent-loop@invalid")
         _git(root, "config", "user.name", "Agent Loop")
-        _git(root, "add", "--all")
-        env = dict(os.environ)
-        env.update(
-            {
-                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
-                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_TERMINAL_PROMPT": "0",
-            }
-        )
-        subprocess.run(
-            ["git", "commit", "--quiet", "-m", f"candidate from {state.head}"],
-            cwd=root,
-            env=env,
-            check=True,
-            capture_output=True,
-            timeout=15,
+        for offset in range(0, len(tracked), 128):
+            _git(root, "add", "-f", "--", *tracked[offset : offset + 128])
+        tree = _git(state.root, "ls-tree", "-rz", "--full-tree", state.head).stdout
+        expected_modes: dict[str, str] = {}
+        for entry in tree.split(b"\0"):
+            if not entry:
+                continue
+            metadata, raw_path = entry.split(b"\t", 1)
+            mode = metadata.split(b" ", 1)[0].decode("ascii")
+            relative = raw_path.decode("utf-8")
+            expected_modes[relative] = mode
+            if mode == "100755":
+                _git(root, "update-index", "--chmod=+x", "--", relative)
+        if tuple(sorted(_tracked_paths(root))) != tuple(sorted(tracked)):
+            raise QuarantineError("candidate tracked manifest differs from captured commit")
+        staged = _git(root, "ls-files", "-s", "-z").stdout
+        actual_modes: dict[str, str] = {}
+        for entry in staged.split(b"\0"):
+            if entry:
+                fields = entry.decode("utf-8").split(None, 3)
+                actual_modes[fields[3]] = fields[0]
+        if actual_modes != expected_modes:
+            raise QuarantineError("candidate tracked modes differ from captured commit")
+        _git(
+            root,
+            "commit",
+            "--quiet",
+            "-m",
+            f"candidate from {state.head}",
+            # Deterministic metadata is supplied through the sanitized Git environment below.
         )
     except Exception:
         shutil.rmtree(root, ignore_errors=True)
         raise
-    return Candidate(root, state.head, tracked)
+    capability = object()
+    _CANDIDATE_CAPABILITIES[root] = capability
+    return Candidate(root, state.head, tracked, capability)
 
 
 _CHILD_ENV_ALLOWLIST = frozenset({"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"})
@@ -1135,17 +1277,14 @@ def build_child_environment(parent: Mapping[str, str], home: Path) -> dict[str, 
 class ExecutionMode:
     unsafe_local: bool = False
     apply: bool = False
-    promote: bool = False
 
     def __post_init__(self) -> None:
-        if self.promote and not self.apply:
-            raise ConfigurationError("promotion requires apply")
-        if self.unsafe_local and (self.apply or self.promote):
+        if self.unsafe_local and self.apply:
             raise ConfigurationError("unsafe local execution is baseline/dry-proposal only")
 
     @property
     def status(self) -> str:
-        return "unsafe-local-baseline-only" if self.unsafe_local else "attested-sandbox"
+        return "unsafe-local-baseline-only" if self.unsafe_local else "candidate-observation"
 
 
 @dataclass(frozen=True)
@@ -1240,16 +1379,74 @@ def _export_candidate_worker(candidate_root: Path, destination: Path) -> tuple[s
     return tracked
 
 
-def run_in_disposable_worker(candidate_root: Path, runner: Callable[[Path], Any]) -> Any:
-    """Run only a fresh no-Git export, then prove and restore candidate invariance."""
+@dataclass(frozen=True)
+class WorkerLayout:
+    root: Path
+    source: Path
+    gate: Path
+    data: Path
+    tmp: Path
+    home: Path
+    output: Path
+
+
+def _make_worker_layout(root: Path) -> WorkerLayout:
+    layout = WorkerLayout(
+        root,
+        root / "source",
+        root / "gate",
+        root / "data",
+        root / "tmp",
+        root / "home",
+        root / "output",
+    )
+    for directory in (layout.source, layout.gate, layout.data, layout.tmp, layout.home, layout.output):
+        directory.mkdir(parents=True, exist_ok=False)
+    shutil.copyfile(Path(__file__).resolve(), layout.gate / "agent_loop.py")
+    return layout
+
+
+def _make_inputs_read_only(layout: WorkerLayout) -> None:
+    if os.name == "nt":
+        return
+    for root in (layout.source, layout.gate, layout.data):
+        for path in root.rglob("*"):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        root.chmod(0o555)
+    for root in (layout.tmp, layout.home, layout.output):
+        root.chmod(0o777)
+
+
+def _remove_private_tree(root: Path) -> None:
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix(), reverse=True):
+        try:
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        except OSError:
+            pass
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def run_in_disposable_worker(candidate: Candidate, runner: Callable[[WorkerLayout], Any]) -> Any:
+    """Run a fresh no-Git candidate export while retaining candidate-only rollback authority."""
+    candidate_root = _require_candidate(candidate)
     before = snapshot_tree(candidate_root)
     result: Any = None
     worker_error: BaseException | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix="agent-loop-worker-") as temporary:
-            worker = Path(temporary)
-            _export_candidate_worker(candidate_root, worker)
-            result = runner(worker)
+        temporary = _new_controller_temp("agent-loop-worker-")
+        try:
+            layout = _make_worker_layout(temporary)
+            exported = _export_candidate_worker(candidate_root, layout.source)
+            if tuple(exported) != tuple(candidate.tracked_files):
+                raise CandidateMutationError("worker manifest differs from candidate tracked manifest")
+            _make_inputs_read_only(layout)
+            result = runner(layout)
+        finally:
+            _remove_private_tree(temporary)
     except BaseException as exc:
         worker_error = exc
     after = snapshot_tree(candidate_root)
@@ -1259,6 +1456,21 @@ def run_in_disposable_worker(candidate_root: Path, runner: Callable[[Path], Any]
     if worker_error is not None:
         raise worker_error
     return result
+
+
+def run_source_commit_in_disposable_worker(
+    state: SourceState,
+    runner: Callable[[WorkerLayout], Any],
+) -> Any:
+    """Execute a captured commit export; never copy, restore, or mutate the live source checkout."""
+    temporary = _new_controller_temp("agent-loop-baseline-")
+    try:
+        layout = _make_worker_layout(temporary)
+        _write_commit_export(state.root, state.head, layout.source)
+        _make_inputs_read_only(layout)
+        return runner(layout)
+    finally:
+        _remove_private_tree(temporary)
 
 
 @dataclass(frozen=True)
@@ -1361,8 +1573,65 @@ def _bounded_process(
 ProcessRunner = Callable[..., ProcessResult]
 
 
+@dataclass(frozen=True)
+class CompletionEnvelope:
+    payload: Mapping[str, object]
+    hmac_sha256: str
+
+
+@dataclass(frozen=True)
+class WorkerObservation:
+    process: ProcessResult
+    completion_envelope: CompletionEnvelope
+
+    @property
+    def returncode(self) -> int:
+        return self.process.returncode
+
+    @property
+    def stdout(self) -> str:
+        return self.process.stdout
+
+    @property
+    def stderr(self) -> str:
+        return self.process.stderr
+
+    @property
+    def stdout_sha256(self) -> str:
+        return self.process.stdout_sha256
+
+    @property
+    def stderr_sha256(self) -> str:
+        return self.process.stderr_sha256
+
+    @property
+    def timed_out(self) -> bool:
+        return self.process.timed_out
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _manifest_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        if path.is_symlink() or _has_reparse_point(path):
+            raise SandboxError("worker input manifest contains a link or reparse point")
+        kind = "d" if path.is_dir() else "f"
+        digest.update(f"{kind}\0{relative}\0{stat.S_IMODE(info.st_mode):o}\0".encode())
+        if path.is_file():
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 class SandboxRunner:
-    """Digest-pinned Docker/Podman runner whose container is inspected before start."""
+    """Digest-pinned observational runner with an exact inspected confinement contract."""
 
     def __init__(
         self,
@@ -1372,14 +1641,21 @@ class SandboxRunner:
         process_runner: ProcessRunner = _bounded_process,
         timeout_seconds: float = 300.0,
         output_limit: int = 1024 * 1024,
+        run_id: str | None = None,
     ) -> None:
         if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
             raise SandboxError("worker image must be repository-digest pinned")
-        self.engine_path = engine_path
+        self.engine_path = engine_path.resolve()
         self.image = image
         self._run = process_runner
         self.timeout_seconds = timeout_seconds
         self.output_limit = output_limit
+        self.run_id = run_id or secrets.token_hex(16)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", self.run_id):
+            raise SandboxError("controller run ID is invalid")
+        self._counter = 0
+        self._seal_key = secrets.token_bytes(32)
+        self._previous_hmac = "0" * 64
 
     def _call(self, *args: str, timeout: float | None = None) -> ProcessResult:
         return self._run(
@@ -1388,7 +1664,7 @@ class SandboxRunner:
             output_limit=self.output_limit,
         )
 
-    def _attest_engine_and_image(self) -> str:
+    def _attest_engine_and_image(self) -> tuple[str, tuple[str, ...]]:
         if self._run is _bounded_process:
             engine = self.engine_path.resolve()
             if not engine.is_file() or engine.is_symlink() or _has_reparse_point(engine):
@@ -1406,16 +1682,51 @@ class SandboxRunner:
             image = value[0]
             image_id = image["Id"]
             repo_digests = image["RepoDigests"]
+            base_environment = image["Config"]["Env"]
         except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
             raise SandboxError("worker image inspection is malformed") from exc
         if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
             raise SandboxError("worker image has no immutable image ID")
         if not isinstance(repo_digests, list) or self.image not in repo_digests:
             raise SandboxError("resolved image repository digest does not match approval")
-        return image_id
+        if not isinstance(base_environment, list) or any(
+            not isinstance(value, str) or "=" not in value for value in base_environment
+        ):
+            raise SandboxError("worker image environment inspection is malformed")
+        names = [value.split("=", 1)[0] for value in base_environment]
+        if len(names) != len(set(names)) or any(
+            re.search(r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PROXY)", name, re.IGNORECASE)
+            for name in names
+        ):
+            raise SandboxError("worker image inherits a credential-shaped environment")
+        return image_id, tuple(base_environment)
 
-    def _inspect_container(self, container_id: str, worker: Path, image_id: str) -> None:
-        result = self._call("inspect", container_id, timeout=15)
+    @staticmethod
+    def _expected_mounts(layout: WorkerLayout, data_bundle: ValidatedDataBundle | None) -> tuple[tuple[Path, str, bool], ...]:
+        data_source = data_bundle.path if data_bundle is not None else layout.data
+        data_destination = "/workspace/data/historical_data.sqlite3" if data_bundle is not None else "/workspace/data"
+        return (
+            (layout.source, "/workspace/src", True),
+            (layout.gate, "/workspace/gate", True),
+            (data_source, data_destination, True),
+            (layout.tmp, "/workspace/tmp", False),
+            (layout.home, "/workspace/home", False),
+            (layout.output, "/workspace/output", False),
+        )
+
+    def _inspect_container(
+        self,
+        name: str,
+        container_id: str,
+        image_id: str,
+        layout: WorkerLayout,
+        python_args: tuple[str, ...],
+        expected_environment: tuple[str, ...],
+        data_bundle: ValidatedDataBundle | None,
+    ) -> tuple[dict[str, object], str]:
+        result = self._call("inspect", name, timeout=15)
+        if result.returncode != 0 or result.timed_out:
+            raise SandboxError("created container cannot be inspected")
         try:
             value = json.loads(result.stdout)
             item = value[0]
@@ -1424,35 +1735,53 @@ class SandboxRunner:
             mounts = item["Mounts"]
         except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
             raise SandboxError("created container inspection is malformed") from exc
-        expected = {
+        expected_host = {
             "NetworkMode": "none",
             "ReadonlyRootfs": True,
             "PidsLimit": 64,
             "Memory": 1024 * 1024 * 1024,
             "NanoCpus": 1_000_000_000,
+            "Privileged": False,
+            "CapDrop": ["ALL"],
+            "CapAdd": [],
+            "Devices": [],
+            "DeviceRequests": [],
+            "SecurityOpt": ["no-new-privileges"],
         }
-        if result.returncode != 0 or result.timed_out or any(host.get(key) != wanted for key, wanted in expected.items()):
+        if any(key not in host or host[key] != wanted for key, wanted in expected_host.items()):
             raise SandboxError("created container lacks required isolation")
-        if item.get("Image") != image_id:
+        if item.get("Id") != container_id or item.get("Name") != f"/{name}" or item.get("Image") != image_id:
             raise SandboxError("created container image ID differs from the inspected image")
-        if {str(value).upper() for value in host.get("CapDrop", [])} != {"ALL"}:
-            raise SandboxError("created container did not drop all capabilities")
-        if "no-new-privileges" not in {str(value).lower() for value in host.get("SecurityOpt", [])}:
-            raise SandboxError("created container permits privilege escalation")
-        if config.get("User") != AGENT_LOOP_UID_GID or config.get("Entrypoint") not in (["python"], ["python3"]):
+        expected_config = {
+            "User": AGENT_LOOP_UID_GID,
+            "Entrypoint": ["python"],
+            "WorkingDir": "/workspace/src",
+            "Cmd": list(python_args),
+            "Env": list(expected_environment),
+        }
+        if any(key not in config or config[key] != wanted for key, wanted in expected_config.items()):
             raise SandboxError("created container user or Python entrypoint differs")
-        if not isinstance(mounts, list) or len(mounts) != 1:
-            raise SandboxError("created container must have exactly one mount")
-        mount = mounts[0]
-        try:
-            source = Path(mount["Source"]).resolve()
-        except (KeyError, TypeError) as exc:
-            raise SandboxError("created container mount is malformed") from exc
-        if source != worker.resolve() or mount.get("Destination") != "/workspace" or mount.get("RW") is not True:
-            raise SandboxError("created container mount differs from disposable worker")
+        expected_mounts = {
+            (str(source.resolve()), destination, not readonly, "ro" if readonly else "rw")
+            for source, destination, readonly in self._expected_mounts(layout, data_bundle)
+        }
+        if not isinstance(mounts, list) or len(mounts) != len(expected_mounts):
+            raise SandboxError("created container mount count differs from controller contract")
+        actual_mounts: set[tuple[str, str, bool, str]] = set()
+        for mount in mounts:
+            if not isinstance(mount, dict) or set(("Type", "Source", "Destination", "RW", "Mode", "Propagation")) - set(mount):
+                raise SandboxError("created container mount is malformed")
+            if mount["Type"] != "bind" or mount["Propagation"] != "rprivate":
+                raise SandboxError("created container mount type or propagation differs")
+            actual_mounts.add((str(Path(str(mount["Source"])).resolve()), mount["Destination"], mount["RW"], mount["Mode"]))
+        if actual_mounts != expected_mounts:
+            raise SandboxError("created container mount differs from controller contract")
+        attested = {"Config": config, "HostConfig": host, "Mounts": mounts, "Image": item["Image"]}
+        return item, _canonical_json_sha256(attested)
 
     @staticmethod
-    def _validate_python_args(worker: Path, python_args: Sequence[str]) -> None:
+    def _validate_python_args(worker: Path | WorkerLayout, python_args: Sequence[str]) -> None:
+        source = worker.source if isinstance(worker, WorkerLayout) else worker
         args = tuple(python_args)
         pytest_prefix = (
             "-m",
@@ -1470,7 +1799,7 @@ class SandboxRunner:
                     path = canonical_patch_path(selector)
                 except PatchPolicyError as exc:
                     raise SandboxError("pytest selector escaped the fixed gate") from exc
-                if not path.startswith("tests/") or not (worker / path).is_file():
+                if not path.startswith("tests/") or not (source / path).is_file():
                     raise SandboxError("pytest selector is outside tracked tests")
             return
         if args[:2] == ("-m", "py_compile") and len(args) > 2:
@@ -1479,48 +1808,69 @@ class SandboxRunner:
                     path = canonical_patch_path(value)
                 except PatchPolicyError as exc:
                     raise SandboxError("compile path escaped the worker") from exc
-                if not path.endswith(".py") or not (worker / path).is_file():
+                if not path.endswith(".py") or not (source / path).is_file():
                     raise SandboxError("compile path is not a worker Python file")
             return
-        if args[:2] == ("agent_loop.py", "--_hidden-backtest"):
-            allowed_options = {
-                "--_hidden-backtest",
-                "--tickers",
-                "--benchmark",
-                "--start-date",
-                "--end-date",
-                "--historical-data-bundle",
-                "--technical-only",
-                "--no-csv",
-            }
-            if not (worker / "agent_loop.py").is_file() or any(
-                value.startswith("--") and value not in allowed_options for value in args[1:]
-            ):
-                raise SandboxError("hidden backtest argv contains an unknown option")
+        if args in {("-m", "compileall", "-q", "."), ("-m", "ruff", "check", ".")}:
             return
+        if len(args) >= 14 and args[:3] == ("/workspace/gate/agent_loop.py", "--_hidden-backtest", "--tickers"):
+            try:
+                benchmark_index = args.index("--benchmark", 3)
+                ticker_values = args[3:benchmark_index]
+                expected_tail = (
+                    "--benchmark", args[benchmark_index + 1],
+                    "--start-date", args[benchmark_index + 3],
+                    "--end-date", args[benchmark_index + 5],
+                    "--historical-data-bundle", "/workspace/data/historical_data.sqlite3",
+                    "--technical-only", "--no-csv",
+                )
+                actual_tail = args[benchmark_index:]
+                if (
+                    not ticker_values
+                    or len(set(ticker_values)) != len(ticker_values)
+                    or any(_validate_symbol(value) != value for value in ticker_values)
+                    or actual_tail != expected_tail
+                    or _validate_symbol(args[benchmark_index + 1]) != args[benchmark_index + 1]
+                    or date.fromisoformat(args[benchmark_index + 3]) >= date.fromisoformat(args[benchmark_index + 5])
+                ):
+                    raise ValueError
+            except (ValueError, IndexError, DataBundleError):
+                raise SandboxError("hidden backtest argv violates the exact grammar") from None
+            return
+        if "--_hidden-backtest" in args:
+            raise SandboxError("hidden backtest argv violates the exact grammar")
         raise SandboxError("arbitrary worker Python commands are forbidden")
+
+    def verify_completion_envelope(self, envelope: CompletionEnvelope | None) -> bool:
+        if not isinstance(envelope, CompletionEnvelope):
+            return False
+        message = json.dumps(dict(envelope.payload), sort_keys=True, separators=(",", ":")).encode()
+        expected = hmac.new(self._seal_key, message, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, envelope.hmac_sha256)
+
+    def _cleanup(self, name: str) -> None:
+        removed = self._call("rm", "--force", name, timeout=30)
+        absent = self._call("inspect", name, timeout=15)
+        if removed.returncode != 0 or removed.timed_out or absent.returncode == 0 or absent.timed_out:
+            raise SandboxError("sandbox container cleanup could not be verified")
 
     def run_worker(
         self,
-        worker: Path,
+        worker: WorkerLayout,
         python_args: Sequence[str],
         environment: Mapping[str, str],
-    ) -> ProcessResult:
-        """Run a controller-built Python argv after immutable image and container attestation."""
+        data_bundle: ValidatedDataBundle | None = None,
+    ) -> WorkerObservation:
+        """Return a host-sealed untrusted observation after cleanup and post-run hashing."""
         if not python_args or any(not isinstance(value, str) or "\x00" in value for value in python_args):
             raise SandboxError("worker Python argv is invalid")
         self._validate_python_args(worker, python_args)
-        image_id = self._attest_engine_and_image()
-        if not worker.is_dir() or worker.is_symlink() or _has_reparse_point(worker):
-            raise SandboxError("worker mount must be a regular disposable directory")
-        worker_entries = tuple(worker.rglob("*"))
-        if any(path.is_symlink() or _has_reparse_point(path) for path in worker_entries):
-            raise SandboxError("worker mount contains a symlink or reparse point")
-        if os.name != "nt":
-            for directory in (worker, *(path for path in worker_entries if path.is_dir())):
-                directory.chmod(0o777)
-        name = f"agent-loop-{os.getpid()}-{time.monotonic_ns()}"
-        mount = f"type=bind,src={worker.resolve()},dst=/workspace,rw"
+        image_id, base_environment = self._attest_engine_and_image()
+        for path in (worker.root, worker.source, worker.gate, worker.data, worker.tmp, worker.home, worker.output):
+            if not path.is_dir() or path.is_symlink() or _has_reparse_point(path):
+                raise SandboxError("worker layout contains an unsafe directory")
+        self._counter += 1
+        name = f"agent-loop-{self.run_id[:15]}-{self._counter:06d}"
         create_args = [
             "create",
             "--name",
@@ -1544,14 +1894,12 @@ class SandboxRunner:
             AGENT_LOOP_UID_GID,
             "--entrypoint",
             "python",
-            "--mount",
-            mount,
             "--workdir",
-            "/workspace",
+            "/workspace/src",
         ]
         if environment.get("BACKTEST_DATA_CACHE_DB_PATH") not in {
             None,
-            "/workspace/.agent-loop-data/historical_data.sqlite3",
+            "/workspace/data/historical_data.sqlite3",
         }:
             raise SandboxError("historical data path must be the controller-owned private copy")
         container_environment = {
@@ -1560,12 +1908,12 @@ class SandboxRunner:
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
-            "HOME": "/workspace/.home",
-            "USERPROFILE": "/workspace/.home",
-            "XDG_CACHE_HOME": "/workspace/.home/.cache",
-            "PIP_CACHE_DIR": "/workspace/.home/.cache/pip",
-            "TEMP": "/workspace/.home/tmp",
-            "TMP": "/workspace/.home/tmp",
+            "HOME": "/workspace/home",
+            "USERPROFILE": "/workspace/home",
+            "XDG_CACHE_HOME": "/workspace/home/.cache",
+            "PIP_CACHE_DIR": "/workspace/home/.cache/pip",
+            "TEMP": "/workspace/tmp",
+            "TMP": "/workspace/tmp",
             "HTTP_PROXY": "http://127.0.0.1:9",
             "HTTPS_PROXY": "http://127.0.0.1:9",
             "ALL_PROXY": "http://127.0.0.1:9",
@@ -1576,38 +1924,86 @@ class SandboxRunner:
             container_environment["BACKTEST_DATA_CACHE_DB_PATH"] = environment[
                 "BACKTEST_DATA_CACHE_DB_PATH"
             ]
+        for source, destination, readonly in self._expected_mounts(worker, data_bundle):
+            specification = f"type=bind,src={source.resolve()},dst={destination}"
+            specification += ",readonly" if readonly else ""
+            create_args.extend(("--mount", specification))
         for key, value in sorted(container_environment.items()):
-            if key not in {
-                "ALPACA_PAPER",
-                "FMP_DAILY_REQUEST_BUDGET",
-                "PYTHONNOUSERSITE",
-                "PYTHONDONTWRITEBYTECODE",
-                "PYTHONHASHSEED",
-                "HOME",
-                "USERPROFILE",
-                "XDG_CACHE_HOME",
-                "PIP_CACHE_DIR",
-                "TEMP",
-                "TMP",
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "ALL_PROXY",
-                "NO_PROXY",
-                "GIT_TERMINAL_PROMPT",
-                "BACKTEST_DATA_CACHE_DB_PATH",
-            }:
-                continue
             create_args.extend(("--env", f"{key}={value}"))
         create_args.extend((image_id, *python_args))
+        expected_environment = tuple(sorted((*base_environment, *(f"{key}={value}" for key, value in container_environment.items()))))
+        candidate_hash = _manifest_sha256(worker.source)
+        gate_hash = _manifest_sha256(worker.gate)
+        data_hash = data_bundle.sha256 if data_bundle is not None else _manifest_sha256(worker.data)
+        environment_hash = _canonical_json_sha256({"base": base_environment, "explicit": container_environment})
+        started = time.time_ns()
+        deadline = started + int(self.timeout_seconds * 1_000_000_000)
         created = self._call(*create_args, timeout=30)
         container_id = created.stdout.strip()
-        if created.returncode != 0 or created.timed_out or not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
-            raise SandboxError("sandbox engine did not create a valid container")
+        process: ProcessResult | None = None
+        config_hash = ""
+        oom_killed = False
         try:
-            self._inspect_container(container_id, worker, image_id)
-            return self._call("start", "--attach", container_id)
+            if created.returncode != 0 or created.timed_out or not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
+                raise SandboxError("sandbox engine did not create a valid container")
+            _item, config_hash = self._inspect_container(
+                name, container_id, image_id, worker, tuple(python_args), expected_environment, data_bundle
+            )
+            process = self._call("start", "--attach", name)
+            final_item, final_hash = self._inspect_container(
+                name, container_id, image_id, worker, tuple(python_args), expected_environment, data_bundle
+            )
+            if final_hash != config_hash:
+                raise SandboxError("container configuration changed during execution")
+            state = final_item.get("State")
+            if not isinstance(state, dict) or "OOMKilled" not in state or "Status" not in state:
+                raise SandboxError("container terminal state inspection is incomplete")
+            oom_killed = state["OOMKilled"] is True
+            if state["Status"] != "exited":
+                raise SandboxError("container did not reach a terminal state")
         finally:
-            self._call("rm", "--force", container_id, timeout=30)
+            self._cleanup(name)
+        if process is None:
+            raise SandboxError("sandbox worker produced no observation")
+        if data_bundle is not None:
+            _reject_database_sidecars(data_bundle.path)
+            post_hash, _ = _stream_sha256(data_bundle.path)
+            if post_hash != data_bundle.sha256:
+                raise SandboxError("approved historical data changed during worker execution")
+        ended = time.time_ns()
+        payload: dict[str, object] = {
+            "nonce": secrets.token_hex(16),
+            "run_id": self.run_id,
+            "image_repository_digest": self.image,
+            "image_id": image_id,
+            "container_id": container_id,
+            "container_config_sha256": config_hash,
+            "candidate_manifest_sha256": candidate_hash,
+            "gate_manifest_sha256": gate_hash,
+            "data_sha256": data_hash,
+            "environment_policy_sha256": environment_hash,
+            "argv": list(python_args),
+            "started_at_ns": started,
+            "deadline_ns": deadline,
+            "ended_at_ns": ended,
+            "returncode": process.returncode,
+            "timed_out": process.timed_out,
+            "oom_killed": oom_killed,
+            "stdout_sha256": process.stdout_sha256,
+            "stderr_sha256": process.stderr_sha256,
+            "cleanup_verified": True,
+            "gate_observation": process.returncode == 0 and not process.timed_out and not oom_killed,
+            "worker_confined": self._run is _bounded_process,
+            "source_modified": False,
+            "security_attestation": False,
+            "previous_hmac_sha256": self._previous_hmac,
+            "daemon_tcb": True,
+        }
+        message = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        signature = hmac.new(self._seal_key, message, hashlib.sha256).hexdigest()
+        self._previous_hmac = signature
+        envelope = CompletionEnvelope(MappingProxyType(payload), signature)
+        return WorkerObservation(process, envelope)
 
 
 def canonical_patch_path(value: str) -> str:
@@ -1796,24 +2192,43 @@ def validate_unified_diff(
         target = candidate_root / path
         if not target.is_file() or target.is_symlink() or _has_reparse_point(target):
             raise PatchPolicyError(f"target must be a regular non-reparse file: {path}")
+    added_source = textwrap.dedent("\n".join(parsed.added_lines))
+    try:
+        tree = ast.parse(added_source)
+    except SyntaxError:
+        try:
+            tree = ast.parse("def _added_patch_lines():\n" + textwrap.indent(added_source, "    "))
+        except SyntaxError:
+            tree = None
+    live_modules = {"auto_trader", "fill_monitor", "paper_trading_console", "scheduler", "task_scheduler", "alpaca.trading"}
+    if tree is not None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(
+                alias.name in live_modules
+                or alias.name in {"core.order_execution", "core.order_manager"}
+                or alias.name.startswith("alpaca.trading.")
+                for alias in node.names
+            ):
+                raise PatchPolicyError("added import references a live execution module")
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if (
+                    module in live_modules
+                    or module in {"core.order_execution", "core.order_manager"}
+                    or module.startswith("alpaca.trading")
+                    or (module == "core" and any(alias.name in {"order_execution", "order_manager"} for alias in node.names))
+                ):
+                    raise PatchPolicyError("added import references a live execution module")
     if any(_LIVE_REFERENCE_RE.search(line) for line in parsed.added_lines):
         raise PatchPolicyError("added line references a live execution module")
     return parsed
 
 
 def _git_patch(root: Path, args: Sequence[str], raw: str) -> subprocess.CompletedProcess[bytes]:
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_OPTIONAL_LOCKS": "0",
-        }
-    )
+    environment = _git_environment()
     try:
         return subprocess.run(
-            ["git", *args],
+            ["git", *_GIT_FIXED_ARGS, *args],
             cwd=root,
             env=environment,
             input=raw.encode("utf-8"),
@@ -1826,15 +2241,16 @@ def _git_patch(root: Path, args: Sequence[str], raw: str) -> subprocess.Complete
         raise PatchApplicationError(f"git {' '.join(args)} failed: {detail}") from exc
 
 
-def apply_validated_patch(
-    candidate_root: Path,
+def apply_candidate_patch(
+    candidate: Candidate,
     proposal: CodingProposal,
     *,
     gate: str = "test",
     editable_paths: Sequence[str] = (),
-    compile_runner: Callable[[Path, tuple[str, ...]], bool] | None = None,
+    compile_runner: Callable[[WorkerLayout, tuple[str, ...]], bool] | None = None,
 ) -> ParsedPatch:
-    """Check, apply, post-validate and compile a patch transaction with exact rollback."""
+    """Apply one validated transaction using a controller-issued candidate capability."""
+    candidate_root = _require_candidate(candidate)
     if compile_runner is None:
         raise ConfigurationError("patch application requires an attested sandbox compile runner")
     parsed = validate_unified_diff(
@@ -1879,15 +2295,16 @@ def apply_validated_patch(
         _git_patch(candidate_root, ("apply", "--check", "--whitespace=error-all", "-"), parsed.raw)
         _git_patch(candidate_root, ("apply", "--whitespace=error-all", "-"), parsed.raw)
         changed_paths = modified_paths()
-        if changed_paths != prior_paths | set(parsed.files):
+        required_prior = prior_paths - set(parsed.files)
+        if not required_prior <= changed_paths or not changed_paths <= prior_paths | set(parsed.files):
             raise PatchApplicationError("patch changed files outside its declared scope")
         diff_check = _git(candidate_root, "diff", "--check")
         if diff_check.stdout or diff_check.stderr:
             raise PatchApplicationError("git diff --check reported whitespace errors")
         python_paths = tuple(path for path in parsed.files if path.endswith(".py"))
         compiled = run_in_disposable_worker(
-            candidate_root,
-            lambda worker: compile_runner(worker, python_paths),
+            candidate,
+            lambda layout: compile_runner(layout, python_paths),  # type: ignore[arg-type]
         )
         if compiled is not True:
             raise PatchApplicationError("compile gate failed")
@@ -1899,14 +2316,14 @@ def apply_validated_patch(
     return parsed
 
 
-def sandbox_compile_runner(sandbox: SandboxRunner) -> Callable[[Path, tuple[str, ...]], bool]:
+def sandbox_compile_runner(sandbox: SandboxRunner) -> Callable[[WorkerLayout, tuple[str, ...]], bool]:
     """Bind patch compilation to the production sandbox; never execute candidate code locally."""
-    def compile_in_sandbox(worker: Path, python_paths: tuple[str, ...]) -> bool:
+    def compile_in_sandbox(layout: WorkerLayout, python_paths: tuple[str, ...]) -> bool:
         if not python_paths:
             return True
-        environment = build_child_environment(os.environ, worker / ".home")
-        result = sandbox.run_worker(worker, ("-m", "py_compile", *python_paths), environment)
-        return result.returncode == 0 and not result.timed_out
+        environment = build_child_environment(os.environ, layout.home)
+        observation = sandbox.run_worker(layout, ("-m", "py_compile", *python_paths), environment)
+        return observation.returncode == 0 and not observation.timed_out
 
     return compile_in_sandbox
 
@@ -1944,35 +2361,57 @@ def build_test_gate_argv(candidate_root: Path, selectors: Sequence[str] = ()) ->
     )
 
 
+def build_compileall_gate_argv() -> tuple[str, ...]:
+    """Return the only whole-candidate compileall command admitted by the sandbox."""
+    return ("-m", "compileall", "-q", ".")
+
+
+def build_ruff_gate_argv() -> tuple[str, ...]:
+    """Return the only whole-candidate Ruff command admitted by the sandbox."""
+    return ("-m", "ruff", "check", ".")
+
+
 @dataclass(frozen=True)
 class GateResult:
-    passed: bool
+    gate_observation: bool
+    observed_exit_zero: bool
+    worker_confined: bool
+    source_modified: bool
+    security_attestation: bool
     returncode: int
     stdout: str
     stderr: str
     stdout_sha256: str
     stderr_sha256: str
+    completion_envelope: CompletionEnvelope | None
 
 
 def run_test_gate(
-    candidate_root: Path,
+    candidate: Candidate,
     sandbox: SandboxRunner,
     selectors: Sequence[str] = (),
 ) -> GateResult:
+    candidate_root = _require_candidate(candidate)
     argv = build_test_gate_argv(candidate_root, selectors)
 
-    def execute(worker: Path) -> ProcessResult:
-        env = build_child_environment(os.environ, worker / ".home")
-        return sandbox.run_worker(worker, argv, env)
+    def execute(layout: WorkerLayout) -> WorkerObservation:
+        env = build_child_environment(os.environ, layout.home)
+        return sandbox.run_worker(layout, argv, env)
 
-    result = run_in_disposable_worker(candidate_root, execute)
+    result = run_in_disposable_worker(candidate, execute)
+    payload = result.completion_envelope.payload
     return GateResult(
+        bool(payload["gate_observation"]),
         result.returncode == 0 and not result.timed_out,
+        bool(payload["worker_confined"]),
+        False,
+        False,
         result.returncode,
         result.stdout,
         result.stderr,
         result.stdout_sha256,
         result.stderr_sha256,
+        result.completion_envelope,
     )
 
 
@@ -1982,28 +2421,33 @@ def run_unsafe_local_test_baseline(
     selectors: Sequence[str] = (),
 ) -> GateResult:
     """Explicit development escape hatch for the unchanged baseline only; never candidate apply."""
-    if not mode.unsafe_local or mode.apply or mode.promote:
+    if not mode.unsafe_local or mode.apply:
         raise ConfigurationError("local execution requires unsafe baseline-only mode")
-    preflight_source(source_root, acquire_lock=False)
-    argv = build_test_gate_argv(source_root, selectors)
-
-    def execute(worker: Path) -> ProcessResult:
-        environment = build_child_environment(os.environ, worker / ".home")
+    state = preflight_source(source_root, acquire_lock=False)
+    def execute(layout: WorkerLayout) -> ProcessResult:
+        argv = build_test_gate_argv(layout.source, selectors)
+        environment = build_child_environment(os.environ, layout.home)
         return _bounded_process(
             (sys.executable, *argv),
-            cwd=worker,
+            cwd=layout.source,
             env=environment,
             timeout=300,
         )
 
-    result = run_in_disposable_worker(source_root, execute)
+    result = run_source_commit_in_disposable_worker(state, execute)
+    source_recheck = recheck_source_unchanged(state)
     return GateResult(
         result.returncode == 0 and not result.timed_out,
+        result.returncode == 0 and not result.timed_out,
+        False,
+        source_recheck.source_modified,
+        False,
         result.returncode,
         result.stdout,
         result.stderr,
         result.stdout_sha256,
         result.stderr_sha256,
+        None,
     )
 
 
@@ -2059,6 +2503,54 @@ class ValidatedDataBundle:
     end_date: str
 
 
+def _stream_sha256(path: Path, maximum: int = _MAX_DATA_BUNDLE_BYTES) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            total += len(chunk)
+            if total > maximum:
+                raise DataBundleError("historical data bundle exceeds the size limit")
+            digest.update(chunk)
+    return digest.hexdigest(), total
+
+
+def _reject_database_sidecars(path: Path) -> None:
+    if any(path.name.endswith(suffix) for suffix in ("-wal", "-shm", "-journal")):
+        raise DataBundleError("historical data sidecar cannot be approved as the bundle")
+    for suffix in ("-wal", "-shm", "-journal"):
+        if Path(str(path) + suffix).exists():
+            raise DataBundleError("historical data bundle has an unapproved sidecar")
+
+
+def _snapshot_data_bundle(source: Path, expected_sha256: str) -> tuple[Path, str]:
+    _reject_database_sidecars(source)
+    before = source.stat()
+    root = _new_controller_temp("agent-loop-data-")
+    destination = root / "historical_data.sqlite3"
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with source.open("rb") as source_stream, destination.open("xb") as target:
+            for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                total += len(chunk)
+                if total > _MAX_DATA_BUNDLE_BYTES:
+                    raise DataBundleError("historical data bundle exceeds the size limit")
+                digest.update(chunk)
+                target.write(chunk)
+        after = source.stat()
+        if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+            raise DataBundleError("historical data bundle changed while being captured")
+        actual = digest.hexdigest()
+        if actual.casefold() != expected_sha256.casefold():
+            raise DataBundleError("historical data SHA-256 mismatch")
+        destination.chmod(stat.S_IREAD)
+        return destination.resolve(), actual
+    except Exception:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+
+
 def validate_historical_data_bundle(
     bundle_path: Path,
     expected_sha256: str,
@@ -2068,12 +2560,10 @@ def validate_historical_data_bundle(
     end_date: str,
 ) -> ValidatedDataBundle:
     """Validate SQLite bytes/schema/cache keys without deserializing its opaque pickle payloads."""
-    path = _regular_approved_file(bundle_path)
+    source = _regular_approved_file(bundle_path)
     if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
         raise DataBundleError("historical data SHA-256 must be exact")
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual.casefold() != expected_sha256.casefold():
-        raise DataBundleError("historical data SHA-256 mismatch")
+    path, actual = _snapshot_data_bundle(source, expected_sha256)
     with path.open("rb") as stream:
         if stream.read(16) != b"SQLite format 3\x00":
             raise DataBundleError("historical data bundle lacks the SQLite header")
@@ -2095,7 +2585,7 @@ def validate_historical_data_bundle(
     period = _period_for_dates(start, end)
     price_key = f"price::{period}::{start.isoformat()}::{end.isoformat()}::{suffix}"
     closes_key = f"closes::{period}::{start.isoformat()}::{end.isoformat()}::{suffix}"
-    uri = f"file:{path.as_posix()}?mode=ro&immutable=1"
+    uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro&immutable=1"
     try:
         with sqlite3.connect(uri, uri=True) as connection:
             connection.execute("PRAGMA trusted_schema=OFF")
@@ -2137,17 +2627,12 @@ def validate_historical_data_bundle(
 
 
 def copy_validated_data_bundle(bundle: ValidatedDataBundle, worker: Path) -> Path:
-    """Make a private non-link cache copy and verify its approved digest again."""
-    worker.mkdir(parents=True, exist_ok=True)
-    destination = worker / "historical_data.sqlite3"
-    if destination.exists():
-        raise DataBundleError("private historical data destination already exists")
-    with bundle.path.open("rb") as source, destination.open("xb") as target:
-        shutil.copyfileobj(source, target, length=1024 * 1024)
-    if hashlib.sha256(destination.read_bytes()).hexdigest() != bundle.sha256:
-        destination.unlink(missing_ok=True)
-        raise DataBundleError("private historical data copy hash mismatch")
-    return destination
+    """Return the already-private approved snapshot; no second mutable copy is made."""
+    del worker
+    actual, _ = _stream_sha256(bundle.path)
+    if actual != bundle.sha256:
+        raise DataBundleError("private historical data snapshot hash mismatch")
+    return bundle.path
 
 
 @dataclass(frozen=True)
@@ -2175,7 +2660,7 @@ class BacktestThresholds:
 
 @dataclass(frozen=True)
 class BacktestEvaluation:
-    passed: bool
+    thresholds_met_observation: bool
     failures: tuple[str, ...]
 
 
@@ -2231,14 +2716,19 @@ def parse_backtest_sentinel(output: str) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class BacktestGateResult:
-    passed: bool
+    gate_observation: bool
+    observed_exit_zero: bool
+    worker_confined: bool
+    source_modified: bool
+    security_attestation: bool
     metrics: Mapping[str, object]
     evaluation: BacktestEvaluation
     process: ProcessResult
+    completion_envelope: CompletionEnvelope
 
 
 def run_backtest_gate(
-    candidate_root: Path,
+    candidate: Candidate,
     sandbox: SandboxRunner,
     bundle: ValidatedDataBundle,
     tickers: Sequence[str],
@@ -2248,8 +2738,12 @@ def run_backtest_gate(
     thresholds: BacktestThresholds,
 ) -> BacktestGateResult:
     """Run the fixed hidden technical-only worker against one private approved cache copy."""
-    requested = tuple(dict.fromkeys(_validate_symbol(value) for value in tickers))
     benchmark_symbol = _validate_symbol(benchmark)
+    requested = tuple(
+        value
+        for value in dict.fromkeys(_validate_symbol(value) for value in tickers)
+        if value != benchmark_symbol
+    )
     if (
         tuple(sorted({*requested, benchmark_symbol})) != bundle.symbols
         or benchmark_symbol != bundle.benchmark
@@ -2258,14 +2752,11 @@ def run_backtest_gate(
     ):
         raise GateConfigurationError("backtest invocation differs from the validated data approval")
 
-    def execute(worker: Path) -> ProcessResult:
-        private = copy_validated_data_bundle(bundle, worker / ".agent-loop-data")
-        if private.parent.parent != worker:
-            raise CandidateMutationError("private data bundle escaped its disposable worker")
-        env = build_child_environment(os.environ, worker / ".home")
-        env["BACKTEST_DATA_CACHE_DB_PATH"] = "/workspace/.agent-loop-data/historical_data.sqlite3"
+    def execute(layout: WorkerLayout) -> WorkerObservation:
+        env = build_child_environment(os.environ, layout.home)
+        env["BACKTEST_DATA_CACHE_DB_PATH"] = "/workspace/data/historical_data.sqlite3"
         argv = (
-            "agent_loop.py",
+            "/workspace/gate/agent_loop.py",
             "--_hidden-backtest",
             "--tickers",
             *requested,
@@ -2276,23 +2767,35 @@ def run_backtest_gate(
             "--end-date",
             end_date,
             "--historical-data-bundle",
-            "/workspace/.agent-loop-data/historical_data.sqlite3",
+            "/workspace/data/historical_data.sqlite3",
             "--technical-only",
             "--no-csv",
         )
-        return sandbox.run_worker(worker, argv, env)
+        return sandbox.run_worker(layout, argv, env, data_bundle=bundle)
 
-    process = run_in_disposable_worker(candidate_root, execute)
+    observation = run_in_disposable_worker(candidate, execute)
+    process = observation.process
+    payload = observation.completion_envelope.payload
     if process.returncode != 0 or process.timed_out:
         evaluation = BacktestEvaluation(False, ("process",))
-        return BacktestGateResult(False, MappingProxyType({}), evaluation, process)
+        return BacktestGateResult(False, False, bool(payload["worker_confined"]), False, False, MappingProxyType({}), evaluation, process, observation.completion_envelope)
     try:
         metrics = parse_backtest_sentinel(process.stdout)
         evaluation = evaluate_backtest_metrics(metrics, thresholds)
     except GateConfigurationError:
         evaluation = BacktestEvaluation(False, ("sentinel",))
-        return BacktestGateResult(False, MappingProxyType({}), evaluation, process)
-    return BacktestGateResult(evaluation.passed, MappingProxyType(dict(metrics)), evaluation, process)
+        return BacktestGateResult(False, True, bool(payload["worker_confined"]), False, False, MappingProxyType({}), evaluation, process, observation.completion_envelope)
+    return BacktestGateResult(
+        evaluation.thresholds_met_observation,
+        True,
+        bool(payload["worker_confined"]),
+        False,
+        False,
+        MappingProxyType(dict(metrics)),
+        evaluation,
+        process,
+        observation.completion_envelope,
+    )
 
 
 def run_hidden_backtest_worker(
