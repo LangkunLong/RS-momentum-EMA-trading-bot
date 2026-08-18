@@ -22,6 +22,8 @@ ORCHESTRATOR_MODEL = "qwen/qwen-2.5-7b-instruct"
 REASONER_MODEL = "deepseek/deepseek-r1"
 CODER_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAX_CALLS = 30
+DEFAULT_MAX_TOKENS = 131_072
 
 _MAX_FILES = 8
 _MAX_LIST_ITEMS = 16
@@ -301,6 +303,8 @@ class AgentCompletion(Generic[PayloadT]):
 
     def __post_init__(self) -> None:
         """Ensure every completion is the accepted complete text shape."""
+        if not isinstance(self.usage, Usage):
+            raise ProtocolValidationError("usage must be a Usage instance")
         if self.finish_reason != "stop":
             raise ProtocolValidationError("finish_reason must be stop")
         if self.model is not None and (not isinstance(self.model, str) or not self.model.strip()):
@@ -336,19 +340,32 @@ class BudgetReservation:
     amount_usd: float
     prompt_bytes: int
     completion_allowance: int
+    token_upper_bound: int
 
 
 class BudgetLedger:
     """Tracks API calls, tokens, and conservative USD reservations."""
 
-    def __init__(self, max_usd: float) -> None:
-        if not math.isfinite(max_usd) or max_usd <= 0:
+    def __init__(
+        self,
+        max_usd: float,
+        max_calls: int = DEFAULT_MAX_CALLS,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> None:
+        if type(max_usd) not in {int, float} or not math.isfinite(max_usd) or max_usd <= 0:
             raise ConfigurationError("max_usd must be a finite positive value")
+        if type(max_calls) is not int or max_calls < 1:
+            raise ConfigurationError("max_calls must be a positive integer")
+        if type(max_tokens) is not int or max_tokens < 1:
+            raise ConfigurationError("max_tokens must be a positive integer")
         self.max_usd = max_usd
+        self.max_calls = max_calls
+        self.max_tokens = max_tokens
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
+        self.reserved_tokens = 0
         self.reserved_usd = 0.0
         self.spent_usd = 0.0
 
@@ -362,6 +379,11 @@ class BudgetLedger:
         if completion_allowance <= 0:
             raise ConfigurationError("completion allowance must be positive")
         prompt_bytes = len(prompt.encode("utf-8"))
+        token_upper_bound = prompt_bytes + completion_allowance
+        if self.calls >= self.max_calls:
+            raise BudgetExceededError("call budget cannot reserve another provider call")
+        if self.reserved_tokens + token_upper_bound > self.max_tokens:
+            raise BudgetExceededError("token budget cannot reserve this provider call")
         amount = (
             (prompt_bytes * pricing.prompt_per_million)
             + (completion_allowance * pricing.completion_per_million)
@@ -369,8 +391,9 @@ class BudgetLedger:
         if self.reserved_usd + amount > self.max_usd:
             raise BudgetExceededError("USD budget cannot reserve this provider call")
         self.reserved_usd += amount
+        self.reserved_tokens += token_upper_bound
         self.calls += 1
-        return BudgetReservation(amount, prompt_bytes, completion_allowance)
+        return BudgetReservation(amount, prompt_bytes, completion_allowance, token_upper_bound)
 
     def reconcile(self, reservation: BudgetReservation, usage: Usage) -> None:
         """Replace a reservation with authoritative cost, retaining it when the cost is missing."""
@@ -384,10 +407,17 @@ class BudgetLedger:
         self.spent_usd += charged
         if self.reserved_usd > self.max_usd:
             raise BudgetExceededError("provider reported cost exceeds the hard USD budget")
+        reported_tokens = usage.total_tokens
+        if reported_tokens is None and usage.prompt_tokens is not None and usage.completion_tokens is not None:
+            reported_tokens = usage.prompt_tokens + usage.completion_tokens
+        charged_tokens = reservation.token_upper_bound if reported_tokens is None else reported_tokens
+        self.reserved_tokens += charged_tokens - reservation.token_upper_bound
+        if self.reserved_tokens > self.max_tokens:
+            raise BudgetExceededError("provider reported tokens exceed the hard token budget")
+        self.total_tokens += charged_tokens
         for attribute, value in (
             ("prompt_tokens", usage.prompt_tokens),
             ("completion_tokens", usage.completion_tokens),
-            ("total_tokens", usage.total_tokens),
         ):
             if value is not None:
                 setattr(self, attribute, getattr(self, attribute) + value)
@@ -453,15 +483,45 @@ def _status_code(error: BaseException) -> int | None:
     return value if type(value) is int else None
 
 
+def _is_openai_transport_error(error: BaseException) -> bool:
+    """Recognize 2.54 transport exception shapes without importing the SDK at module load."""
+    error_type = type(error)
+    return (
+        error_type.__name__ in {"APIConnectionError", "APITimeoutError"}
+        and error_type.__module__.startswith("openai")
+        and hasattr(error, "request")
+        and hasattr(error, "body")
+    )
+
+
 def _is_retryable(error: BaseException) -> bool:
-    return isinstance(error, (ConnectionError, TimeoutError)) or _status_code(error) in _RETRYABLE_STATUS_CODES
+    return (
+        isinstance(error, (ConnectionError, TimeoutError))
+        or _is_openai_transport_error(error)
+        or _status_code(error) in _RETRYABLE_STATUS_CODES
+    )
 
 
-def _controller_dotenv_values() -> dict[str, str]:
+def _embedded_status_code(error: object) -> int | None:
+    """Extract only numeric status metadata from the supported embedded-error shapes."""
+    for path in (
+        ("status_code",),
+        ("status",),
+        ("metadata", "status_code"),
+        ("metadata", "status"),
+    ):
+        status = _read_field(error, *path)
+        if type(status) is int:
+            return status
+    return None
+
+
+def _controller_dotenv_values(controller_root: Path) -> dict[str, str]:
     """Read only accepted key names from the common repository's adjacent ``.env`` file."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--git-common-dir"],
+            cwd=controller_root,
             check=True,
             capture_output=True,
             text=True,
@@ -471,7 +531,7 @@ def _controller_dotenv_values() -> dict[str, str]:
         return {}
     common_dir = Path(result.stdout.strip())
     if not common_dir.is_absolute():
-        common_dir = Path.cwd() / common_dir
+        common_dir = controller_root / common_dir
     dotenv = common_dir.parent / ".env"
     try:
         lines = dotenv.read_text(encoding="utf-8").splitlines()
@@ -486,12 +546,6 @@ def _controller_dotenv_values() -> dict[str, str]:
         if name in {"OPENROUTER_API_KEY", "OPENROUTER"}:
             values[name] = value.strip().strip('"').strip("'")
     return values
-
-
-def _select_api_key(primary: str | None, alias: str | None) -> str | None:
-    if primary and alias and primary != alias:
-        raise ConfigurationError("OPENROUTER_API_KEY and OPENROUTER differ")
-    return primary or alias
 
 
 def _load_current_pricing(model: str) -> Mapping[str, float]:
@@ -561,13 +615,22 @@ class OpenRouterGateway:
         app_name: str | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_attempts: int = 2,
+        controller_root: Path | None = None,
     ) -> None:
-        if not run_id.strip() or max_attempts < 1 or timeout_seconds <= 0:
+        if (
+            not run_id.strip()
+            or type(timeout_seconds) not in {int, float}
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+            or type(max_attempts) is not int
+            or max_attempts not in {1, 2}
+        ):
             raise ConfigurationError("gateway run_id, timeout, and attempts must be valid")
         self._client = client
         self.api_key = api_key
+        self.controller_root = (controller_root or Path(__file__).resolve().parent).resolve()
         if client is None and api_key is None:
-            dotenv_values = _controller_dotenv_values()
+            dotenv_values = _controller_dotenv_values(self.controller_root)
             values = {
                 os.getenv("OPENROUTER_API_KEY"),
                 os.getenv("OPENROUTER"),
@@ -637,31 +700,36 @@ class OpenRouterGateway:
     ) -> AgentCompletion[PayloadT]:
         model = self._MODELS[role]
         for attempt in range(self.max_attempts):
+            messages = [
+                {"role": "system", "content": self.SYSTEM_PROMPTS[role]},
+                {"role": "system", "content": self.STATIC_CONTEXT},
+                {"role": "user", "content": dynamic},
+            ]
             pricing = Pricing.from_value(self.pricing_loader(model))
-            reservation = self.ledger.reserve(dynamic, self._TOKEN_CAPS[role], pricing)
+            prompt_for_reservation = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+            reservation = self.ledger.reserve(prompt_for_reservation, self._TOKEN_CAPS[role], pricing)
             try:
                 response = self._get_client().chat.completions.create(
                     model=model,
-                    messages=[
-                        {"role": "system", "content": self.SYSTEM_PROMPTS[role]},
-                        {"role": "system", "content": self.STATIC_CONTEXT},
-                        {"role": "user", "content": dynamic},
-                    ],
+                    messages=messages,
                     response_format={"type": "json_object"},
                     stream=False,
                     max_tokens=self._TOKEN_CAPS[role],
                     timeout=self.timeout_seconds,
                     extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
+                    extra_body={"provider": {"require_parameters": True}},
                 )
+                completion = self._validate_response(response, parser)
             except Exception as exc:
                 usage = Usage()
                 self.ledger.reconcile(reservation, usage)
+                if isinstance(exc, ResponseValidationError):
+                    raise
                 if attempt + 1 < self.max_attempts and _is_retryable(exc):
                     continue
                 if isinstance(exc, GatewayError):
                     raise
                 raise GatewayError("OpenRouter request failed", status_code=_status_code(exc)) from exc
-            completion = self._validate_response(response, parser)
             self.ledger.reconcile(reservation, completion.usage)
             return completion
         raise AssertionError("retry loop exhausted")
@@ -671,8 +739,12 @@ class OpenRouterGateway:
         response: object,
         parser: Callable[[str], PayloadT],
     ) -> AgentCompletion[PayloadT]:
-        if _read_field(response, "error") is not None:
-            raise ResponseValidationError("OpenRouter response embeds an error")
+        embedded_error = _read_field(response, "error")
+        if embedded_error is not None:
+            raise GatewayError(
+                "OpenRouter response embeds an error",
+                status_code=_embedded_status_code(embedded_error),
+            )
         choices = _read_field(response, "choices")
         if not isinstance(choices, (list, tuple)) or len(choices) != 1:
             raise ResponseValidationError("response must contain exactly one choice")

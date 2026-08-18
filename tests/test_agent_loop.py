@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib
 import json
+import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -162,6 +164,8 @@ def test_usage_and_completion_reject_invalid_direct_values() -> None:
         Usage(prompt_tokens=-1)
     with pytest.raises(ProtocolValidationError, match="finish_reason"):
         AgentCompletion(payload="route", usage=Usage(), finish_reason="length", model=None)
+    with pytest.raises(ProtocolValidationError, match="Usage"):
+        AgentCompletion(payload="route", usage=object(), finish_reason="stop", model=None)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("max_usd", [0.0, -1.0, float("nan"), float("inf")])
@@ -203,6 +207,7 @@ def test_gateway_uses_immutable_three_message_prefix_and_reasoner_cap() -> None:
     assert call["max_tokens"] == 4096
     assert call["response_format"] == {"type": "json_object"}
     assert call["stream"] is False
+    assert call["extra_body"] == {"provider": {"require_parameters": True}}
     assert call["extra_headers"]["X-Session-Id"] == "run-123:reasoner"
     assert [message["content"] for message in call["messages"][:2]] == [
         gateway.SYSTEM_PROMPTS["reasoner"],
@@ -266,6 +271,74 @@ def test_gateway_never_retries_non_transient_statuses(status: int) -> None:
     assert len(client.completions.calls) == 1
 
 
+def test_gateway_classifies_lazy_openai_connection_and_timeout_shapes() -> None:
+    """Break caught: SDK transport failures would be treated as permanent without eager imports."""
+    from agent_loop import _is_retryable
+
+    connection_type = type("APIConnectionError", (Exception,), {"__module__": "openai._exceptions"})
+    timeout_type = type("APITimeoutError", (connection_type,), {"__module__": "openai._exceptions"})
+
+    connection = connection_type()
+    connection.request = object()  # type: ignore[attr-defined]
+    connection.body = None  # type: ignore[attr-defined]
+    timeout = timeout_type()
+    timeout.request = object()  # type: ignore[attr-defined]
+    timeout.body = None  # type: ignore[attr-defined]
+
+    assert _is_retryable(connection)
+    assert _is_retryable(timeout)
+
+
+def test_gateway_embedded_permanent_error_never_retries_or_repairs() -> None:
+    """Break caught: an embedded 400 error was incorrectly sent through the repair loop."""
+    from agent_loop import BudgetLedger, GatewayError, OpenRouterGateway, Route
+
+    client = FakeClient([FakeResponse(_route_json(), error={"status": 400}), FakeResponse(_route_json())])
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    with pytest.raises(GatewayError) as raised:
+        gateway.request("orchestrator", "evidence", Route.from_json)
+    assert raised.value.status_code == 400
+    assert len(client.completions.calls) == 1
+
+
+def test_gateway_retries_embedded_transient_error_without_repair_prompt() -> None:
+    """Break caught: an embedded 429 error was not classified by the bounded retry policy."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, Route
+
+    client = FakeClient([FakeResponse(_route_json(), error={"status_code": 429}), FakeResponse(_route_json())])
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    assert gateway.request("orchestrator", "evidence", Route.from_json).payload.action == "reason"
+    assert len(client.completions.calls) == 2
+    assert "repair" not in client.completions.calls[1]["messages"][2]["content"].lower()
+
+
+def test_gateway_classifies_nested_embedded_error_status_metadata() -> None:
+    """Break caught: provider metadata status was discarded and skipped retry classification."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, Route
+
+    client = FakeClient(
+        [FakeResponse(_route_json(), error={"metadata": {"status": 503}}), FakeResponse(_route_json())]
+    )
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    assert gateway.request("orchestrator", "evidence", Route.from_json).payload.action == "reason"
+    assert len(client.completions.calls) == 2
+
+
 def test_budget_reserves_before_call_and_keeps_reservation_when_usage_cost_is_missing() -> None:
     """Break caught: a missing provider cost could make later calls exceed the USD cap."""
     from agent_loop import BudgetLedger, OpenRouterGateway, Route
@@ -285,6 +358,48 @@ def test_budget_reserves_before_call_and_keeps_reservation_when_usage_cost_is_mi
     assert ledger.completion_tokens == 7
     assert ledger.reserved_usd > 0
     assert ledger.spent_usd == ledger.reserved_usd
+
+
+def test_budget_enforces_exact_call_and_token_reservation_boundaries() -> None:
+    """Break caught: call/token limits allowed one extra provider call or over-budget token use."""
+    from agent_loop import BudgetExceededError, BudgetLedger, Pricing, Usage
+
+    pricing = Pricing(prompt_per_million=0.0, completion_per_million=0.0)
+    ledger = BudgetLedger(max_usd=1.0, max_calls=1, max_tokens=10)
+    reservation = ledger.reserve("abc", 7, pricing)
+    ledger.reconcile(reservation, Usage())
+    assert ledger.total_tokens == 10
+    with pytest.raises(BudgetExceededError, match="call"):
+        ledger.reserve("", 1, pricing)
+
+    token_limited = BudgetLedger(max_usd=1.0, max_calls=2, max_tokens=10)
+    with pytest.raises(BudgetExceededError, match="token"):
+        token_limited.reserve("abc", 8, pricing)
+
+
+def test_gateway_reserves_full_static_and_dynamic_message_bytes_before_call() -> None:
+    """Break caught: reservations omitted immutable system/static messages from the prompt bound."""
+    from agent_loop import BudgetExceededError, BudgetLedger, OpenRouterGateway, Route
+
+    client = FakeClient([FakeResponse(_route_json())])
+    dynamic = "evidence"
+    expected_messages = [
+        {"role": "system", "content": OpenRouterGateway.SYSTEM_PROMPTS["orchestrator"]},
+        {"role": "system", "content": OpenRouterGateway.STATIC_CONTEXT},
+        {"role": "user", "content": "<dynamic-input>\nevidence\n</dynamic-input>"},
+    ]
+    full_prompt_upper_bound = len(
+        json.dumps(expected_messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ) + 2048
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 0.0, "completion": 0.0},
+        ledger=BudgetLedger(max_usd=1.0, max_calls=1, max_tokens=full_prompt_upper_bound - 1),
+    )
+
+    with pytest.raises(BudgetExceededError, match="token"):
+        gateway.request("orchestrator", dynamic, Route.from_json)
+    assert client.completions.calls == []
 
 
 def test_budget_reconciles_an_explicit_zero_usage_cost() -> None:
@@ -344,7 +459,7 @@ def test_default_gateway_accepts_aliases_fails_closed_and_lazily_configures_sdk(
     import agent_loop
     from agent_loop import ConfigurationError, OpenRouterGateway
 
-    monkeypatch.setattr(agent_loop, "_controller_dotenv_values", lambda: {})
+    monkeypatch.setattr(agent_loop, "_controller_dotenv_values", lambda _root: {})
     monkeypatch.setenv("OPENROUTER", "alias-key")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     gateway = OpenRouterGateway()
@@ -383,7 +498,68 @@ def test_default_gateway_fails_closed_when_environment_and_common_dotenv_disagre
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "environment-key")
     monkeypatch.delenv("OPENROUTER", raising=False)
-    monkeypatch.setattr(agent_loop, "_controller_dotenv_values", lambda: {"OPENROUTER": "dotenv-key"})
+    monkeypatch.setattr(agent_loop, "_controller_dotenv_values", lambda _root: {"OPENROUTER": "dotenv-key"})
 
     with pytest.raises(ConfigurationError, match="differ"):
         OpenRouterGateway()
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "max_attempts"),
+    [
+        (float("nan"), 2),
+        (float("inf"), 2),
+        (0.0, 2),
+        (30.0, 0),
+        (30.0, 3),
+        (30.0, 1000),
+    ],
+)
+def test_gateway_rejects_unbounded_timeout_or_attempt_configuration(
+    timeout_seconds: float,
+    max_attempts: int,
+) -> None:
+    """Break caught: unbounded retries/timeouts could exceed the controller's hard wall budget."""
+    from agent_loop import BudgetLedger, ConfigurationError, OpenRouterGateway
+
+    with pytest.raises(ConfigurationError):
+        OpenRouterGateway(
+            client=FakeClient([]),
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            ledger=BudgetLedger(max_usd=1.0),
+        )
+
+
+def _run_git(path: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, text=True)
+
+
+def test_common_dotenv_lookup_is_bound_to_explicit_linked_worktree_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: ambient cwd could select an unrelated repository's dotenv credential."""
+    import agent_loop
+
+    controller = tmp_path / "controller"
+    controller.mkdir()
+    _run_git(controller, "init")
+    _run_git(controller, "config", "user.email", "tests@example.invalid")
+    _run_git(controller, "config", "user.name", "Tests")
+    (controller / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    (controller / ".env").write_text(
+        "OPENROUTER=controller-only\nIGNORED_SECRET=must-not-be-read\n",
+        encoding="utf-8",
+    )
+    _run_git(controller, "add", "tracked.txt")
+    _run_git(controller, "commit", "-m", "initial")
+    linked = tmp_path / "linked"
+    _run_git(controller, "worktree", "add", "-b", "codex/test-dotenv", str(linked))
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    (unrelated / ".env").write_text("OPENROUTER=ambient-wrong\n", encoding="utf-8")
+    monkeypatch.chdir(unrelated)
+
+    assert agent_loop._controller_dotenv_values(linked) == {"OPENROUTER": "controller-only"}
