@@ -3526,3 +3526,228 @@ def test_round4_source_lock_rejects_hardlink_without_touching_target(tmp_path: P
     with pytest.raises(PreflightError, match="hardlink"):
         SourceLock(lock_path).acquire()
     assert outside.read_bytes() == b"outside"
+
+
+class _FinalQualitySandbox:
+    """Host-sealed test double for the controller-only final-quality coordinator."""
+
+    def __init__(
+        self,
+        failures: set[str] | None = None,
+        *,
+        confined: bool = True,
+        envelope_valid: bool = True,
+        stdout: str | None = None,
+        raises: set[str] | None = None,
+    ) -> None:
+        self.failures = failures or set()
+        self.confined = confined
+        self.envelope_valid = envelope_valid
+        self.stdout = stdout
+        self.raises = raises or set()
+        self.calls: list[tuple[str, ...]] = []
+        self.worker_roots: list[Path] = []
+
+    @staticmethod
+    def _gate_name(argv: tuple[str, ...]) -> str:
+        if "pytest" in argv:
+            return "pytest"
+        if "ruff" in argv:
+            return "ruff"
+        if "compileall" in argv:
+            return "compile"
+        raise AssertionError(f"unexpected final-quality command: {argv}")
+
+    def run_worker(
+        self,
+        _layout: Any,
+        python_args: tuple[str, ...],
+        _environment: dict[str, str],
+        data_bundle: Any = None,
+    ) -> Any:
+        from agent_loop import CompletionEnvelope, ProcessResult, WorkerObservation
+
+        assert data_bundle is None
+        self.worker_roots.append(_layout.root)
+        argv = tuple(python_args)
+        self.calls.append(argv)
+        gate = self._gate_name(argv)
+        if gate in self.raises:
+            from agent_loop import SandboxError
+
+            raise SandboxError("injected sandbox failure")
+        failed = gate in self.failures
+        stdout = self.stdout if self.stdout is not None else f"{gate} stdout"
+        process = ProcessResult(
+            1 if failed else 0,
+            stdout,
+            f"{gate} stderr" if failed else "",
+            hashlib.sha256(stdout.encode()).hexdigest(),
+            hashlib.sha256((f"{gate} stderr" if failed else "").encode()).hexdigest(),
+            False,
+        )
+        payload = {
+            "gate_observation": not failed,
+            "worker_confined": self.confined,
+            "source_modified": False,
+            "returncode": process.returncode,
+            "timed_out": process.timed_out,
+            "oom_killed": False,
+            "stdout_sha256": process.stdout_sha256,
+            "stderr_sha256": process.stderr_sha256,
+            "cleanup_verified": True,
+        }
+        return WorkerObservation(process, CompletionEnvelope(payload, "sealed-for-test"))
+
+    def verify_completion_envelope(self, envelope: Any) -> bool:
+        return (
+            self.envelope_valid
+            and envelope is not None
+            and envelope.hmac_sha256 == "sealed-for-test"
+        )
+
+
+def _final_quality_candidate(tmp_path: Path) -> tuple[Any, Any]:
+    from agent_loop import export_candidate, preflight_source
+
+    source = _task2_repo(tmp_path)
+    state = preflight_source(source, acquire_lock=False)
+    return export_candidate(state), state
+
+
+def test_final_quality_runs_all_isolated_gates_and_passes(tmp_path: Path) -> None:
+    from agent_loop import dispose_candidate, run_final_quality
+
+    candidate, _state = _final_quality_candidate(tmp_path)
+    sandbox = _FinalQualitySandbox()
+    try:
+        result = run_final_quality(candidate, sandbox)
+    finally:
+        dispose_candidate(candidate)
+
+    assert result.provider_safe is True
+    assert result.passed is True
+    assert result.failure_codes == ()
+    assert [sandbox._gate_name(argv) for argv in sandbox.calls] == [
+        "pytest",
+        "ruff",
+        "compile",
+    ]
+    assert len(set(sandbox.worker_roots)) == 3
+
+
+@pytest.mark.parametrize(
+    ("failed_gate", "expected_code"),
+    (
+        ("pytest", "pytest_failed"),
+        ("ruff", "ruff_failed"),
+        ("compile", "compile_failed"),
+    ),
+)
+def test_final_quality_collects_each_worker_failure_without_short_circuiting(
+    tmp_path: Path,
+    failed_gate: str,
+    expected_code: str,
+) -> None:
+    from agent_loop import dispose_candidate, run_final_quality
+
+    candidate, _state = _final_quality_candidate(tmp_path)
+    sandbox = _FinalQualitySandbox({failed_gate})
+    try:
+        result = run_final_quality(candidate, sandbox)
+    finally:
+        dispose_candidate(candidate)
+
+    assert result.passed is False
+    assert result.failure_codes == (expected_code,)
+    assert len(sandbox.calls) == 3
+
+
+def test_final_quality_fails_closed_on_unconfined_worker_but_runs_every_gate(
+    tmp_path: Path,
+) -> None:
+    from agent_loop import dispose_candidate, run_final_quality
+
+    candidate, _state = _final_quality_candidate(tmp_path)
+    sandbox = _FinalQualitySandbox(confined=False)
+    try:
+        result = run_final_quality(candidate, sandbox)
+    finally:
+        dispose_candidate(candidate)
+
+    assert result.passed is False
+    assert result.failure_codes == ("worker_unconfined",)
+    assert len(sandbox.calls) == 3
+
+
+def test_final_quality_rejects_unverified_completion_envelopes(tmp_path: Path) -> None:
+    from agent_loop import dispose_candidate, run_final_quality
+
+    candidate, _state = _final_quality_candidate(tmp_path)
+    sandbox = _FinalQualitySandbox(envelope_valid=False)
+    try:
+        result = run_final_quality(candidate, sandbox)
+    finally:
+        dispose_candidate(candidate)
+
+    assert result.passed is False
+    assert result.failure_codes == ("security_unattested",)
+    assert len(sandbox.calls) == 3
+
+
+def test_final_quality_classifies_sandbox_failure_as_unattested_and_continues(
+    tmp_path: Path,
+) -> None:
+    from agent_loop import dispose_candidate, run_final_quality
+
+    candidate, _state = _final_quality_candidate(tmp_path)
+    sandbox = _FinalQualitySandbox(raises={"ruff"})
+    try:
+        result = run_final_quality(candidate, sandbox)
+    finally:
+        dispose_candidate(candidate)
+
+    assert result.passed is False
+    assert result.failure_codes == ("security_unattested",)
+    assert len(sandbox.calls) == 3
+
+
+def test_final_quality_audit_redacts_worker_output_before_persisting(
+    tmp_path: Path,
+) -> None:
+    from agent_loop import AuditTrail, dispose_candidate, run_final_quality
+
+    candidate, _state = _final_quality_candidate(tmp_path)
+    secret = "sk-openrouter-secret-value"
+    sandbox = _FinalQualitySandbox(stdout=f"credential={secret}")
+    audit = AuditTrail((tmp_path / "audit").resolve(), "run-final-quality", known_secrets=(secret,))
+    try:
+        result = run_final_quality(candidate, sandbox, audit=audit, iteration=3)
+    finally:
+        dispose_candidate(candidate)
+
+    assert result.passed is True
+    persisted = (audit.run_root / "log-final-quality-03-pytest-stdout.json").read_text(
+        encoding="utf-8"
+    )
+    assert secret not in persisted
+    assert "[REDACTED]" in persisted
+
+
+def test_final_quality_reports_git_diff_check_failure_after_all_workers(
+    tmp_path: Path,
+) -> None:
+    from agent_loop import dispose_candidate, run_final_quality
+
+    candidate, _state = _final_quality_candidate(tmp_path)
+    target = candidate.root / "core" / "backtest_engine.py"
+    target.write_text("VALUE = 1   \n", encoding="utf-8", newline="\n")
+    sandbox = _FinalQualitySandbox()
+    try:
+        result = run_final_quality(candidate, sandbox)
+    finally:
+        dispose_candidate(candidate)
+
+    assert result.passed is False
+    assert result.failure_codes == ("diff_check_failed",)
+    assert len(sandbox.calls) == 3

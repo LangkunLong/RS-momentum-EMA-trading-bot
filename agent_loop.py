@@ -4196,6 +4196,129 @@ class QualityObservation:
         ):
             raise ConfigurationError("quality failure code is not allowed")
 
+    @property
+    def passed(self) -> bool:
+        return (
+            self.test_gate_passed
+            and self.ruff_passed
+            and self.compile_passed
+            and self.diff_check_passed
+            and not self.failure_codes
+        )
+
+
+def run_final_quality(
+    candidate: Candidate,
+    sandbox: SandboxRunner,
+    *,
+    audit: AuditTrail | None = None,
+    iteration: int = 0,
+) -> QualityObservation:
+    """Observe all release gates in fresh sandboxes and return only closed provider-safe facts."""
+    if type(iteration) is not int or not 0 <= iteration <= MAX_ITERATIONS:
+        raise ConfigurationError("final-quality iteration is outside the controller limit")
+    if audit is not None and not isinstance(audit, AuditTrail):
+        raise ConfigurationError("final-quality audit must be an AuditTrail")
+    root = _require_candidate(candidate)
+    before = _candidate_tracked_manifest_sha256(candidate)
+    failures: list[str] = []
+    worker_unconfined = False
+    security_unattested = False
+
+    def record_failure(code: str) -> None:
+        if code not in failures:
+            failures.append(code)
+
+    def observe(label: str, argv: tuple[str, ...], failure_code: str) -> bool:
+        nonlocal worker_unconfined, security_unattested
+
+        def execute(layout: WorkerLayout) -> WorkerObservation:
+            environment = build_child_environment(os.environ, layout.home)
+            return sandbox.run_worker(layout, argv, environment)
+
+        try:
+            observation = run_in_disposable_worker(candidate, execute)
+        except CandidateMutationError:
+            raise
+        except Exception:
+            security_unattested = True
+            return False
+        if audit is not None:
+            prefix = f"final-quality-{iteration:02d}-{label}"
+            audit.write_redacted_log(f"{prefix}-stdout", observation.stdout)
+            audit.write_redacted_log(f"{prefix}-stderr", observation.stderr)
+        try:
+            envelope_valid = sandbox.verify_completion_envelope(
+                observation.completion_envelope
+            )
+        except Exception:
+            envelope_valid = False
+        payload = observation.completion_envelope.payload
+        payload_consistent = (
+            type(payload.get("gate_observation")) is bool
+            and type(payload.get("worker_confined")) is bool
+            and type(payload.get("source_modified")) is bool
+            and type(payload.get("returncode")) is int
+            and type(payload.get("timed_out")) is bool
+            and type(payload.get("oom_killed")) is bool
+            and payload.get("returncode") == observation.returncode
+            and payload.get("timed_out") is observation.timed_out
+            and payload.get("oom_killed") is False
+            and payload.get("stdout_sha256") == observation.stdout_sha256
+            and payload.get("stderr_sha256") == observation.stderr_sha256
+            and payload.get("cleanup_verified") is True
+            and payload.get("source_modified") is False
+        )
+        confined = payload_consistent and payload.get("worker_confined") is True
+        if not confined:
+            worker_unconfined = True
+        if not envelope_valid or not payload_consistent:
+            security_unattested = True
+        functional_pass = (
+            observation.returncode == 0
+            and not observation.timed_out
+            and payload_consistent
+            and payload.get("gate_observation") is True
+        )
+        accepted = functional_pass and confined and envelope_valid
+        if not functional_pass:
+            record_failure(failure_code)
+        return accepted
+
+    test_passed = observe("pytest", build_test_gate_argv(root), "pytest_failed")
+    ruff_passed = observe("ruff", build_ruff_gate_argv(), "ruff_failed")
+    compile_passed = observe(
+        "compileall", build_compileall_gate_argv(), "compile_failed"
+    )
+    try:
+        diff = _git(
+            root,
+            "diff",
+            "--check",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        )
+        diff_check_passed = not diff.stdout and not diff.stderr
+    except PreflightError:
+        diff_check_passed = False
+    if not diff_check_passed:
+        record_failure("diff_check_failed")
+    after = _candidate_tracked_manifest_sha256(candidate)
+    if after != before:
+        raise CandidateMutationError("candidate changed during final-quality observation")
+    if worker_unconfined:
+        record_failure("worker_unconfined")
+    if security_unattested:
+        record_failure("security_unattested")
+    return QualityObservation(
+        test_gate_passed=test_passed,
+        ruff_passed=ruff_passed,
+        compile_passed=compile_passed,
+        diff_check_passed=diff_check_passed,
+        failure_codes=tuple(failures),
+    )
+
 
 @dataclass(frozen=True)
 class BudgetSnapshot:
