@@ -10,8 +10,8 @@ offline tests or technical-only backtests in quarantine, never touching the pape
 **Architecture:** `agent_loop.py` is the trusted state machine. It exports tracked files into a
 credential-free controller-owned candidate repository, executes each gate in a fresh no-`.git`,
 network-denied sandbox worker, obtains strict JSON from an orchestrator/reasoner/coder, validates
-one unified diff, and applies it only to the candidate repository. Optional promotion uses a
-clean-HEAD compare-and-swap and never stages or commits.
+one unified diff, and applies it only to the candidate repository. It exports an inert reviewed
+diff/archive but has no source-checkout application, staging, commit, or promotion path.
 
 **Tech stack:** Python 3.11+, stdlib, Git CLI, pytest, official `openai==2.54.0` SDK against
 OpenRouter Chat Completions.
@@ -34,15 +34,14 @@ OpenRouter Chat Completions.
 - Local child commands are fixed argv lists with `shell=False`; the OpenRouter key and all broker
   credentials are absent from the child environment.
 - Production candidate execution requires an attested Docker/Podman-compatible `--network none`
-  sandbox. Unsafe local execution is explicit, cannot promote, and cannot report production-safe
-  success.
+  sandbox. Unsafe local execution is explicit and cannot report production-safe success.
 - Unsafe local execution is mutually exclusive with `--apply`; it may run only trusted baseline
   code and obtain a dry proposal.
 - The candidate Git repository is controller-only. Every child sees a disposable no-`.git` export,
   and the controller verifies its complete manifest before and after each child.
 - Default editable scope excludes tests and permanently denies every live/paper execution surface.
-- Shared strategy modules that paper trading imports may be edited only in quarantine and exported
-  as proposals; automatic promotion is limited to backtest-only files.
+- Every candidate change is quarantine-only and exported as a proposal; the loop has no automatic
+  source application or promotion API.
 - Metrics-based backtest runs additionally make the backtest engine/CLI read-only so candidates
   cannot pass by falsifying accounting or serialized metrics.
 - Only existing tracked `100644` files can change. V1 rejects creates, deletes, renames, copies,
@@ -128,7 +127,7 @@ Commit: `feat: add multi-agent protocols and OpenRouter gateway`
    read-only root, all capabilities dropped, no-new-privileges, bounded PID/memory/CPU, one writable
    worker mount, repository-digest verification, and post-create inspection. Add bounded
    output/hash/timeouts. Local backend requires `--unsafe-local-execution`, is mutually exclusive
-   with `--apply`, has explicit unsafe status, and can never promote.
+   with `--apply` and has explicit unsafe status.
 5. Add `Dockerfile.agent-loop` as the reproducible worker-image recipe using
    `python:3.13.14-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6`,
    exact `requirements-lock.txt`, fixed non-root UID/GID, no key/config copy, and Python entrypoint.
@@ -177,7 +176,7 @@ python -m ruff check agent_loop.py tests/test_agent_loop.py
 
 Commit: `feat: add quarantined gates and safe patch application`
 
-## Task 3: State machine, audit trail, CLI, and compare-and-swap promotion
+## Task 3: State machine, audit trail, CLI, and inert candidate handoff
 
 **Files:**
 
@@ -202,16 +201,15 @@ Commit: `feat: add quarantined gates and safe patch application`
 6. Write atomic sanitized artifacts to `.artifacts/agent_loop/<run-id>/`: manifest, hash-chained
    JSONL events, redacted gate logs, validated role payloads, diffs, validation reports, usage, and
    final summary. Never store raw API objects, raw reasoning, keys, or environment values.
-7. `--promote` requires `--apply`, the attested sandbox, and a passing final gate. Recheck source
-   HEAD/status against preflight, revalidate final diff, snapshot bytes/modes/index, compute
-   expected patched hashes, `git apply --check`, apply, and verify only declared files changed.
-   Never stage or commit. Pre-apply races leave source untouched; post-apply failures restore only
-   targets still equal to expected patched hashes and preserve concurrent mismatches.
-   Reject promotion unless every changed file is one of `backtest.py`, `backtest_pnl.py`, or
-   `core/backtest_engine.py`; quarantine-tested shared strategy diffs remain proposal-only.
-8. Before promotion, run the full offline pytest command, Ruff, compileall, and `git diff --check`
-   against the final candidate through the sandbox/controller-safe boundary. A backtest threshold
-   pass alone never permits promotion; any one quality-gate failure blocks it.
+7. Remove every source-application/promotion path. `--apply` mutates only the candidate. Export a
+   canonical sanitized diff and optional inert source archive with base/tree/diff hashes; never
+   execute the exported artifact. Recheck that source HEAD/index/tracked/untracked state remains
+   unchanged at completion, but never clean or overwrite external changes.
+8. Before recording a terminal pass observation, run the full offline pytest command, Ruff,
+   compileall, and `git diff --check` through the sandbox/controller-safe boundary. A backtest
+   threshold pass alone is insufficient; any one quality-gate failure prevents terminal pass.
+   Record `gate_observation`, `worker_confined`, `source_modified=false`, and
+   `security_attestation=false` rather than claiming correctness.
 9. Add `build_parser()`, `main(argv: Sequence[str] | None = None) -> int`, and
    `raise SystemExit(main())`. Validate dates, tickers, thresholds, model names, budgets, and path
    overrides before any API call. Do not expose the key as a CLI option.
@@ -228,12 +226,11 @@ gate scripts. Observe RED for:
 - abort, malformed skip, unsafe patch rejection, dry proposal, two-iteration repair, and hard stop;
 - call/token/wall limits at exact boundaries;
 - redaction and event hash-chain verification;
-- source unchanged without promotion;
-- promotion success leaving unstaged allowed files only;
-- changed HEAD, dirty source, or pre-apply race refusing promotion with exact source bytes intact;
-- post-apply failure conditionally rolling back without overwriting a concurrent edit;
-- each of pytest, Ruff, compileall, and diff-check independently blocking runtime promotion;
-- a passing shared-strategy patch remaining proposal-only because paper automation imports it;
+- source unchanged both with and without candidate `--apply`;
+- absence of `--promote` and source-apply APIs;
+- exported diff/archive hashes matching the candidate while remaining inert;
+- each of pytest, Ruff, compileall, and diff-check independently blocking terminal pass;
+- a passing shared-strategy patch remaining proposal-only;
 - parser help causing no side effects and absent key failing before a billable call.
 
 Then run:
@@ -258,7 +255,7 @@ Commit: `feat: complete audited multi-agent refinement loop`
 
 1. Document architecture, exact models, both accepted key names, install command, sandbox image,
    safe dry proposal command,
-   quarantine apply command, optional promotion command, test/backtest gate examples, audit paths,
+   quarantine apply command, manual inert-diff handoff, test/backtest gate examples, audit paths,
    budgets, and exit statuses.
 2. State prominently that the loop is separate from paper trading, does not run in the scheduler,
    strips broker/provider credentials from children, and cannot claim OS confinement without an

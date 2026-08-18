@@ -55,7 +55,7 @@ writable. The image reference must include an operator-approved `@sha256:` diges
 verifies the real executable, daemon, resolved repository digest, and created container
 configuration before trusting its result. An explicit `--unsafe-local-execution` development
 escape hatch may run only the trusted baseline and produce a dry proposal. It is mutually exclusive
-with `--apply` and `--promote`, so model-authored code is never executed locally. Applying model
+with `--apply`, so model-authored code is never executed locally. Applying model
 patches requires both `--apply` and the attested sandbox.
 
 ## Branch and source preconditions
@@ -67,7 +67,7 @@ Before any model call, the controller must:
 3. Reject detached HEAD, `main`, `master`, and branches without the `codex/` prefix.
 4. Reject the permanent paper runtime path and any source tree containing a running loop
    lock.
-5. Record the source commit and status for later compare-and-swap promotion.
+5. Record the source commit and status as immutable candidate provenance.
 
 The controller resolves the lock with `git rev-parse --git-path agent-loop.lock`, which works for
 normal and linked worktrees, and acquires a nonblocking OS file lock. A second loop must fail
@@ -213,14 +213,11 @@ Tests are readable when needed but are not editable, preventing an agent from ma
 pass by weakening assertions. The operator may add another tracked non-denied path with an
 explicit CLI option; the model cannot expand its own scope.
 
-Candidate-editable and automatically promotable scopes are intentionally different. Shared
-strategy modules (`core/canslim/*`, `core/momentum_analysis.py`, and `core/pivot_detector.py`) are
-transitively imported by the paper scanner, so any candidate diff containing them is proposal-only:
-it may be tested in quarantine and exported for human review, but `--promote` must reject it.
-Automatic promotion is limited to the backtest-only compatibility/engine files (`backtest.py`,
-`backtest_pnl.py`, and `core/backtest_engine.py`) after all other gates pass. A trusted future
-change may create a backtest-only strategy boundary; static import scanning cannot safely turn
-shared production strategy code into an automatically promotable surface.
+All candidate edits are proposal-only. Shared strategy modules are transitively imported by paper
+trading, and arbitrary candidate Python can forge its own in-process test/backtest evidence.
+Therefore the loop has no source-application or automatic-promotion path, even for backtest-only
+files. It may test candidate changes in quarantine and export a sanitized diff/inert archive for
+human review. Applying that diff to a real repository is an explicitly manual, out-of-band action.
 
 Permanently denied paths include `agent_loop.py`, `.env*`, `.git`, `.github`, dependency
 manifests, task/scheduler files, `auto_trader.py`, `fill_monitor.py`,
@@ -252,8 +249,7 @@ restores the exact pre-patch bytes and records a rejected proposal.
 Valid patches remain in the controller-owned candidate repository across iterations. Before and
 after every worker execution the controller verifies the candidate Git tree/index/refs/config and
 full tracked/untracked manifest are unchanged. Worker results are copied back only as sanitized
-logs/metrics; worker filesystem changes are discarded. The source branch is unchanged until
-optional promotion.
+logs/metrics; worker filesystem changes are discarded. The source branch is always unchanged.
 
 ## State machine
 
@@ -298,29 +294,23 @@ Sanitized run artifacts are written atomically under
 - validated route, plan, proposal summary, and diff;
 - patch validation result and changed-file hashes;
 - API finish reason, provider/model IDs, token/cache/reasoning usage, and cost when supplied;
-- final result and optional promotion result.
+- final observational result and exported candidate artifact hashes.
 
 The key, raw environment, raw chain-of-thought, unredacted logs, and full API response are never
 persisted. Redaction covers exact known secret values and credential-shaped tokens before any
 model prompt, terminal output, or artifact write.
 
-## Promotion
+## Source immutability and manual handoff
 
-Promotion is off by default. `--promote` requires `--apply`, an attested sandbox (never the unsafe
-local backend), and a passing gate.
-It also requires every changed file to be on the separate backtest-only promotion allowlist;
-shared paper-reachable strategy changes remain proposal-only regardless of test results.
-The controller recomputes source status and `HEAD`; both must exactly match the recorded clean
-base. It validates the final quarantine diff again against the same policy, snapshots exact source
-bytes/modes/index state and expected patched hashes, runs `git apply --check` in the source
-checkout, applies it, and verifies only the declared files changed. It does not stage or commit.
-On post-apply failure it restores a target only when its current hash still equals the expected
-patched hash; a concurrent mismatch is preserved and reported for manual recovery rather than
-overwritten.
+`--apply` means apply to the controller-owned candidate repository only. `agent_loop.py` contains
+no `--promote` option and no source-checkout apply function. The source `HEAD`, index, tracked bytes,
+and untracked set are rechecked at the end and must equal preflight; a mismatch is reported as an
+external concurrent change, never cleaned or overwritten.
 
-Any pre-apply compare-and-swap failure leaves the source untouched. Any post-apply verification
-failure performs the conditional exact rollback above and preserves a recovery manifest plus the
-candidate diff for manual review.
+The loop exports a canonical sanitized unified diff and optional inert source archive with hashes,
+but never executes either artifact after export. A human may inspect and apply the diff manually in
+a separate workflow. A worker gate pass is recorded as an observed deterministic result, not proof
+of correctness, a security attestation, or merge approval.
 
 ## Verification strategy
 
@@ -337,14 +327,15 @@ High-value behavior tests cover:
 - successful apply, exact rollback on postcondition failure, candidate-manifest invariance after
   hostile worker writes, and accumulated iterations;
 - deterministic test/backtest pass decisions;
-- source checkout unchanged by default;
-- compare-and-swap promotion refusal after concurrent source change;
+- source checkout unchanged even when `--apply` mutates the candidate;
+- no parser option or callable API that applies a candidate diff to the source;
 - import safety proving no live execution modules load merely by importing `agent_loop`.
 
 The full existing offline suite, Ruff, compileall, and `git diff --check` remain the final gate.
-Every future candidate must pass those same four runtime quality checks before promotion. A metrics
-backtest passing its thresholds is necessary but not sufficient; any one quality-gate failure
-blocks promotion. No unit test may contact OpenRouter, Alpaca, FMP, or any other provider.
+Every final candidate must run those same four runtime quality checks before the controller records
+a terminal pass observation. A metrics backtest passing its thresholds is necessary but not
+sufficient. Worker output and exit status remain untrusted observations and cannot authorize source
+mutation. No unit test may contact OpenRouter, Alpaca, FMP, or any other provider.
 
 ## Operational invocation
 
@@ -354,7 +345,7 @@ The documented safe progression is:
 2. Set `OPENROUTER_API_KEY` or `OPENROUTER` in the controller shell/private `.env` only.
 3. Run without `--apply` to obtain and audit one proposal.
 4. Run with `--apply` to refine inside quarantine.
-5. Add `--promote` only after reviewing the audit artifacts and using the attested sandbox.
+5. Review the exported diff manually; any real-repository application is out of band.
 
 The command must always print the quarantine/audit path and a final machine-readable summary.
 Absence of both accepted key names is an immediate configuration error before any billable call.
