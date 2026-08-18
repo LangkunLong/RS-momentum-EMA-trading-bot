@@ -2731,7 +2731,7 @@ def test_data_bundle_rejects_sidecars_size_overflow_and_post_run_tampering(
     engine = FaithfulSandboxEngine(image)
     engine.mutate_data_on_start = True
 
-    with pytest.raises(SandboxError, match="data"):
+    with pytest.raises(SandboxError) as raised:
         run_backtest_gate(
             candidate,
             _faithful_runner(image, engine),
@@ -2742,6 +2742,78 @@ def test_data_bundle_rejects_sidecars_size_overflow_and_post_run_tampering(
             "2026-02-01",
             BacktestThresholds(0.0, 0.0, 0.0, 100.0, 0),
         )
+    expected = (
+        "approved historical data changed during worker execution"
+        if os.access(approved.path, os.R_OK)
+        else "approved historical data post-run revalidation failed"
+    )
+    assert str(raised.value) == expected
+
+
+@pytest.mark.parametrize("failure_kind", ["hash-oserror", "sidecar-data-error"])
+def test_post_run_data_revalidation_wraps_errors_with_static_sandbox_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    """Break caught: post-run data proof leaks a raw filesystem or bundle-validation error."""
+    import agent_loop
+    from agent_loop import (
+        BacktestThresholds,
+        DataBundleError,
+        SandboxError,
+        export_candidate,
+        preflight_source,
+        run_backtest_gate,
+        validate_historical_data_bundle,
+    )
+
+    source = _task2_repo(tmp_path)
+    (source / "agent_loop.py").write_text("# hidden gate\n", encoding="utf-8", newline="\n")
+    _run_git(source, "add", "agent_loop.py")
+    _run_git(source, "commit", "-m", "gate")
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    bundle = tmp_path / "operator.sqlite3"
+    symbols = "AAPL,SPY"
+    digest = _create_bundle(
+        bundle,
+        [
+            (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
+            (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+        ],
+    )
+    approved = validate_historical_data_bundle(
+        bundle, digest, ["AAPL"], "SPY", "2026-01-01", "2026-02-01"
+    )
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+
+    if failure_kind == "hash-oserror":
+        def deny_hash(_path: Path, _maximum: int = 0) -> tuple[str, int]:
+            raise PermissionError(13, "runtime-canary", "private/operator.sqlite3")
+
+        monkeypatch.setattr(agent_loop, "_stream_sha256", deny_hash)
+    else:
+        def reject_sidecars(_path: Path) -> None:
+            raise DataBundleError("runtime-canary")
+
+        monkeypatch.setattr(agent_loop, "_reject_database_sidecars", reject_sidecars)
+
+    with pytest.raises(SandboxError) as raised:
+        run_backtest_gate(
+            candidate,
+            _faithful_runner(image, engine),
+            approved,
+            ["AAPL"],
+            "SPY",
+            "2026-01-01",
+            "2026-02-01",
+            BacktestThresholds(0.0, 0.0, 0.0, 100.0, 0),
+        )
+
+    assert str(raised.value) == "approved historical data post-run revalidation failed"
+    assert "runtime-canary" not in str(raised.value)
+    assert engine.removed and engine.absence_verified
 
 
 def test_engine_cli_receives_only_minimal_controller_owned_environment(

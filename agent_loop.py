@@ -2938,8 +2938,13 @@ class SandboxRunner:
         if process is None:
             raise SandboxError("sandbox worker produced no observation")
         if data_bundle is not None:
-            _reject_database_sidecars(data_bundle.path)
-            post_hash, _ = _stream_sha256(data_bundle.path)
+            try:
+                _reject_database_sidecars(data_bundle.path)
+                post_hash, _ = _stream_sha256(data_bundle.path)
+            except (OSError, DataBundleError) as exc:
+                raise SandboxError(
+                    "approved historical data post-run revalidation failed"
+                ) from exc
             if post_hash != data_bundle.sha256:
                 raise SandboxError("approved historical data changed during worker execution")
         ended = time.time_ns()
