@@ -1106,6 +1106,9 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     assert "omit the annotation" in coder_prompt
     assert "first hunk body line" in coder_prompt
     assert "cumulative prior hunk line-count delta" in coder_prompt
+    assert "zero-context hunk" in coder_prompt
+    assert "final diff line must end with one LF" in coder_prompt
+    assert "change the guard predicate" in coder_prompt
 
 
 def test_coder_snapshot_annotations_are_complete_bounded_and_exact() -> None:
@@ -1728,11 +1731,11 @@ def test_reconcile_records_authoritative_overages_before_failing_closed() -> Non
     assert token_ledger.completion_tokens == 100
 
 
-def test_provider_call_audit_is_exact_chained_and_contains_no_content(
+def test_provider_call_audit_binds_validated_payload_and_contains_no_content(
     tmp_path: Path,
 ) -> None:
-    """Break caught: paid-call evidence omitted accounting or retained prompts/raw model output."""
-    from agent_loop import AuditTrail, ProviderCallRecord, verify_audit_chain
+    """Break caught: the event chain could not authenticate the saved accepted payload."""
+    from agent_loop import AuditTrail, ProviderCallRecord, Route, verify_audit_chain
 
     secret = "provider-secret-canary"
     raw_canary = "raw-response-canary"
@@ -1761,7 +1764,17 @@ def test_provider_call_audit_is_exact_chained_and_contains_no_content(
         cost_usd=0.01,
     )
 
-    path, digest = audit.write_provider_call(record)
+    payload_path = audit.write_validated_payload(
+        "orchestrator-001",
+        Route(
+            action="reason",
+            failure_summary="A bounded test failed.",
+            relevant_files=("core/backtest_engine.py",),
+            reasoning_focus="Diagnose the exact failure.",
+        ),
+    )
+    payload_digest = hashlib.sha256(payload_path.read_bytes()).hexdigest()
+    path, digest = audit.write_provider_call(record, payload_sha256=payload_digest)
     payload = json.loads(path.read_text(encoding="utf-8"))
     serialized = path.read_text(encoding="utf-8") + audit.events_path.read_text(encoding="utf-8")
 
@@ -1772,8 +1785,64 @@ def test_provider_call_audit_is_exact_chained_and_contains_no_content(
         "artifact_sha256": digest,
         "call_index": 1,
         "outcome": "accepted",
+        "payload_sha256": payload_digest,
         "role": "orchestrator",
     }
+    payload_path.write_text("{}\n", encoding="utf-8")
+    assert hashlib.sha256(payload_path.read_bytes()).hexdigest() != event["details"][
+        "payload_sha256"
+    ]
+
+
+def test_accepted_provider_call_audit_requires_validated_payload_digest(tmp_path: Path) -> None:
+    """Break caught: an accepted paid call could be chained without its model payload."""
+    from agent_loop import AuditError, AuditTrail, ProviderCallRecord
+
+    audit = AuditTrail(tmp_path.resolve(), "run-20260819T010203Z-abcdef123456")
+    record = ProviderCallRecord(
+        schema_version=1,
+        call_index=1,
+        iteration=1,
+        role="orchestrator",
+        api_backend="openrouter",
+        requested_model="qwen/qwen-2.5-7b-instruct",
+        returned_model="qwen/qwen-2.5-7b-instruct",
+        outcome="accepted",
+        finish_reason="stop",
+        response_schema_valid=True,
+        accounting_complete=True,
+        prompt_tokens=11,
+        cached_tokens=None,
+        completion_tokens=7,
+        reasoning_tokens=None,
+        total_tokens=18,
+        cost_usd=0.01,
+    )
+
+    with pytest.raises(AuditError, match="payload digest"):
+        audit.write_provider_call(record)
+
+    rejected = ProviderCallRecord(
+        schema_version=1,
+        call_index=2,
+        iteration=1,
+        role="reasoner",
+        api_backend="openrouter",
+        requested_model="deepseek/deepseek-r1",
+        returned_model="deepseek/deepseek-r1",
+        outcome="protocol_invalid",
+        finish_reason="non_stop",
+        response_schema_valid=False,
+        accounting_complete=True,
+        prompt_tokens=13,
+        cached_tokens=None,
+        completion_tokens=5,
+        reasoning_tokens=5,
+        total_tokens=18,
+        cost_usd=0.02,
+    )
+    with pytest.raises(AuditError, match="cannot bind"):
+        audit.write_provider_call(rejected, payload_sha256="a" * 64)
 
 
 @pytest.mark.parametrize("max_usd", [0.0, -1.0, float("nan"), float("inf")])
@@ -2365,6 +2434,78 @@ def test_inert_model_proposal_requires_read_only_patch_applicability(
             assert (repo / "core" / "backtest_engine.py").read_bytes() == source_before
         finally:
             dispose_candidate(candidate)
+
+
+def test_inert_model_proposal_accepts_exact_partial_file_zero_context_hunk(
+    tmp_path: Path,
+) -> None:
+    """Break caught: the safe minimal hunk protocol could not patch a line inside a larger file."""
+    from agent_loop import (
+        AuditTrail,
+        CodingProposal,
+        dispose_candidate,
+        export_candidate,
+        export_inert_proposal,
+        preflight_source,
+    )
+
+    repo = _task2_repo(tmp_path)
+    target = repo / "core" / "backtest_engine.py"
+    target.write_text("FIRST = 0\nVALUE = 1\nLAST = 2\n", encoding="utf-8", newline="\n")
+    _run_git(repo, "add", "core/backtest_engine.py")
+    _run_git(repo, "commit", "-m", "multiline source")
+    with tempfile.TemporaryDirectory(prefix="agent-loop-zero-context-") as controller_name:
+        controller = Path(controller_name)
+        state = preflight_source(repo, acquire_lock=False, controller_temp_parent=controller)
+        candidate = export_candidate(state)
+        audit = AuditTrail((tmp_path / "audit-zero-context").resolve(), "run-12345678")
+        proposal = CodingProposal(
+            summary="Replace the exact middle line.",
+            files=("core/backtest_engine.py",),
+            unified_diff=_task2_diff().replace("@@ -1,1 +1,1 @@", "@@ -2,1 +2,1 @@"),
+        )
+        try:
+            handoff = export_inert_proposal(candidate, audit, proposal, gate="test")
+            assert handoff.files == ("core/backtest_engine.py",)
+            assert handoff.diff_path.read_text(encoding="utf-8") == proposal.unified_diff
+            assert target.read_text(encoding="utf-8") == "FIRST = 0\nVALUE = 1\nLAST = 2\n"
+        finally:
+            dispose_candidate(candidate)
+
+
+def test_patch_application_rejects_offset_hunk_before_mutation(tmp_path: Path) -> None:
+    """Break caught: apply mode let Git relocate a wrong-coordinate model hunk by offset."""
+    from agent_loop import (
+        CodingProposal,
+        PatchPolicyError,
+        apply_candidate_patch,
+        dispose_candidate,
+        export_candidate,
+        preflight_source,
+    )
+
+    repo = _task2_repo(tmp_path)
+    target = repo / "core" / "backtest_engine.py"
+    target.write_text("FIRST = 0\nVALUE = 1\nLAST = 2\n", encoding="utf-8", newline="\n")
+    _run_git(repo, "add", "core/backtest_engine.py")
+    _run_git(repo, "commit", "-m", "multiline source")
+    candidate = export_candidate(preflight_source(repo, acquire_lock=False))
+    before = (candidate.root / "core" / "backtest_engine.py").read_bytes()
+    wrong_offset = _task2_diff().replace("@@ -1,1 +1,1 @@", "@@ -3,1 +3,1 @@")
+    try:
+        with pytest.raises(PatchPolicyError, match="exact source coordinates"):
+            apply_candidate_patch(
+                candidate,
+                CodingProposal(
+                    summary="Attempt a relocated hunk.",
+                    files=("core/backtest_engine.py",),
+                    unified_diff=wrong_offset,
+                ),
+                compile_runner=lambda _layout, _paths: True,
+            )
+        assert (candidate.root / "core" / "backtest_engine.py").read_bytes() == before
+    finally:
+        dispose_candidate(candidate)
 
 
 @pytest.mark.parametrize("break_kind", ["dirty", "detached", "protected"])
@@ -5837,6 +5978,7 @@ def _run_proposal_batch_fixture(
     *,
     samples: int,
     outcomes: list[object],
+    clock: Any = None,
 ) -> tuple[Any, _StrictBatchGateway, Any, Any]:
     from agent_loop import (
         AuditTrail,
@@ -5869,6 +6011,7 @@ def _run_proposal_batch_fixture(
         canary_max_usd=0.5,
         max_calls=samples * 3,
         max_tokens=2_000_000,
+        wall_timeout_seconds=1.0 if clock is not None else 3600.0,
     )
     config = LoopConfig(
         source_root=source.resolve(),
@@ -5945,6 +6088,7 @@ def _run_proposal_batch_fixture(
             gateway=gateway,
             run_primary_gate=lambda _candidate: evidence,
             read_snapshots=snapshots,
+            monotonic=clock or time.monotonic,
             editable_paths=("core/momentum_analysis.py", "core/pivot_detector.py"),
         ),
         batch_limits,
@@ -6123,6 +6267,64 @@ def test_proposal_batch_hash_binds_sanitized_evidence_to_unbacktested_proposal(
         metadata = json.loads(result.samples[0].metadata_path.read_text(encoding="utf-8"))
         assert metadata["provider_evidence_sha256"] == evidence_sha256
         assert metadata["verification_status"] == "not_backtested"
+        accepted = [event for event in events if event["event"] == "provider_call_accepted"]
+        assert [event["details"]["role"] for event in accepted] == [
+            "orchestrator",
+            "reasoner",
+            "coder",
+        ]
+        for event in accepted:
+            role = event["details"]["role"]
+            payload_path = result.audit_path / f"payload-{role}-001.json"
+            assert hashlib.sha256(payload_path.read_bytes()).hexdigest() == event["details"][
+                "payload_sha256"
+            ]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_audits_accepted_call_before_enforcing_crossed_deadline(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a paid accepted call crossing the wall deadline vanished from the chain."""
+    from agent_loop import Route, verify_audit_chain
+
+    class CrossingClock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self) -> float:
+            self.calls += 1
+            return 0.0 if self.calls <= 4 else 2.0
+
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        outcomes=[
+            Route(
+                action="reason",
+                failure_summary="The sealed threshold was not met.",
+                relevant_files=("core/momentum_analysis.py",),
+                reasoning_focus="Diagnose the bounded source.",
+            )
+        ],
+        clock=CrossingClock(),
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "budget_exceeded"
+        assert result.completed_samples == 0
+        assert result.budget.api_calls == 1
+        assert gateway.roles == ["orchestrator"]
+        assert len(result.provider_call_artifacts) == 1
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        accepted = [event for event in events if event["event"] == "provider_call_accepted"]
+        assert len(accepted) == 1
+        payload_path = result.audit_path / "payload-orchestrator-001.json"
+        assert hashlib.sha256(payload_path.read_bytes()).hexdigest() == accepted[0]["details"][
+            "payload_sha256"
+        ]
         assert not candidate.root.exists()
     finally:
         external.cleanup()

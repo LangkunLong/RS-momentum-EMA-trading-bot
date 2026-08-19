@@ -1156,6 +1156,11 @@ class OpenRouterGateway:
                 "diff body, and make the old header start match the first hunk body line. The new "
                 "start is the corresponding post-change line: for later hunks, adjust N by the "
                 "cumulative prior hunk line-count delta instead of blindly copying N. "
+                "Prefer a zero-context hunk containing only the exact deleted and added lines; "
+                "for a one-line replacement at annotated line N use '@@ -N,1 +N,1 @@'. When the "
+                "plan changes a threshold or guard, change the guard predicate or expression and "
+                "preserve its branch body, return type, and downstream flow unless explicitly told "
+                "otherwise. The unified_diff final diff line must end with one LF newline. "
                 "The hunk header counts must exactly match the hunk body. Do not use Markdown "
                 "fences, issue commands, add keys, or include prose."
             ),
@@ -4151,6 +4156,7 @@ def apply_candidate_patch(
         editable_paths=editable_paths,
         gate=gate,
     )
+    _validate_exact_patch_anchors(candidate_root, parsed)
     before = snapshot_tree(candidate_root)
 
     def modified_paths() -> set[str]:
@@ -4183,8 +4189,16 @@ def apply_candidate_patch(
         ):
             raise PatchApplicationError("candidate already contains an out-of-policy modification")
     try:
-        _git_patch(candidate_root, ("apply", "--check", "--whitespace=error-all", "-"), parsed.raw)
-        _git_patch(candidate_root, ("apply", "--whitespace=error-all", "-"), parsed.raw)
+        _git_patch(
+            candidate_root,
+            ("apply", "--check", "--unidiff-zero", "--whitespace=error-all", "-"),
+            parsed.raw,
+        )
+        _git_patch(
+            candidate_root,
+            ("apply", "--unidiff-zero", "--whitespace=error-all", "-"),
+            parsed.raw,
+        )
         changed_paths = modified_paths()
         required_prior = prior_paths - set(parsed.files)
         if not required_prior <= changed_paths or not changed_paths <= prior_paths | set(parsed.files):
@@ -6324,10 +6338,20 @@ class AuditTrail:
             {"role": role, "payload": asdict(payload)},
         )
 
-    def write_provider_call(self, record: ProviderCallRecord) -> tuple[Path, str]:
+    def write_provider_call(
+        self,
+        record: ProviderCallRecord,
+        *,
+        payload_sha256: str | None = None,
+    ) -> tuple[Path, str]:
         """Persist one exact paid-call record without any provider content or headers."""
         if not isinstance(record, ProviderCallRecord):
             raise AuditError("provider call audit requires a validated record")
+        if record.outcome == "accepted":
+            if payload_sha256 is None or _SHA256_RE.fullmatch(payload_sha256) is None:
+                raise AuditError("accepted provider call requires a validated payload digest")
+        elif payload_sha256 is not None:
+            raise AuditError("rejected provider call cannot bind a validated payload digest")
         path = self.run_root / f"provider-call-{record.call_index:04d}.json"
         self._write_json(path, asdict(record))
         digest = _file_sha256(path)
@@ -6336,15 +6360,18 @@ class AuditTrail:
             "reasoner": LoopState.CALL_REASONER,
             "coder": LoopState.CALL_CODER,
         }[record.role]
+        details: dict[str, object] = {
+            "call_index": record.call_index,
+            "role": record.role,
+            "outcome": record.outcome,
+            "artifact_sha256": digest,
+        }
+        if payload_sha256 is not None:
+            details["payload_sha256"] = payload_sha256
         self.append_event(
             state,
             "provider_call_accepted" if record.outcome == "accepted" else "provider_call_rejected",
-            {
-                "call_index": record.call_index,
-                "role": record.role,
-                "outcome": record.outcome,
-                "artifact_sha256": digest,
-            },
+            details,
         )
         return path, digest
 
@@ -6928,7 +6955,11 @@ def export_inert_proposal(
     )
     _validate_exact_patch_anchors(root, parsed)
     try:
-        _git_patch(root, ("apply", "--check", "--whitespace=error-all", "-"), parsed.raw)
+        _git_patch(
+            root,
+            ("apply", "--check", "--unidiff-zero", "--whitespace=error-all", "-"),
+            parsed.raw,
+        )
     except PatchApplicationError as exc:
         raise PatchPolicyError("proposal patch does not apply to the candidate") from exc
     after = _candidate_tracked_manifest_sha256(candidate)
@@ -7144,7 +7175,6 @@ def run_proposal_batch(
                 },
             )
             raise
-        check_wall()
         if not isinstance(completion, AgentCompletion) or not isinstance(
             completion.payload, expected_type
         ):
@@ -7158,6 +7188,10 @@ def run_proposal_batch(
             or usage.cost_usd is None
         ):
             raise AccountingValidationError("strict gateway omitted complete accepted-call accounting")
+        payload_path = audit.write_validated_payload(
+            f"{role}-{sample:03d}", completion.payload
+        )
+        payload_sha256 = _file_sha256(payload_path)
         record = ProviderCallRecord(
             schema_version=1,
             call_index=ledger.calls,
@@ -7178,11 +7212,14 @@ def run_proposal_batch(
             cost_usd=usage.cost_usd,
             accounting_source=usage.accounting_source,
         )
-        call_artifact = audit.write_provider_call(record)
+        call_artifact = audit.write_provider_call(
+            record,
+            payload_sha256=payload_sha256,
+        )
         provider_call_artifacts.append(
             (record.call_index, record.outcome, call_artifact[0], call_artifact[1])
         )
-        audit.write_validated_payload(f"{role}-{sample:03d}", completion.payload)
+        check_wall()
         return completion.payload, call_artifact
 
     cleanup: CleanupObservation | None = None
