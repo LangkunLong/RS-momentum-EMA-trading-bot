@@ -2119,6 +2119,77 @@ def test_coder_request_requires_valid_replacement_hunks_at_provider_boundary() -
     assert "hunk header counts must exactly match the hunk body" in messages[0]["content"]
 
 
+def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> None:
+    """The reasoner prompt makes the strict seven-field schema mechanically checkable."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, ReasoningPlan
+
+    model = "deepseek/deepseek-r1"
+    plan = json.dumps(
+        {
+            "diagnosis": "The measured return misses the configured threshold.",
+            "root_cause": "The sealed evidence supports one bounded filter adjustment.",
+            "invariants": ["Preserve the downstream confirmation flow."],
+            "files_to_change": ["core/pivot_detector.py"],
+            "steps": ["Adjust only the supported guard expression."],
+            "skip": False,
+            "skip_reason": "",
+        }
+    )
+    client = FakeClient([FakeResponse(plan, cost=0.01, model=model)])
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    gateway.request_once("reasoner", "sealed evidence and source", ReasoningPlan.from_json)
+
+    system_prompt = client.completions.calls[0]["messages"][0]["content"]
+    assert "diagnosis, root_cause, and skip_reason must be JSON strings" in system_prompt
+    assert "invariants, files_to_change, and steps must be JSON arrays of strings" in system_prompt
+    assert "skip must be the JSON boolean true or false" in system_prompt
+    assert 'when skip is false, skip_reason must be exactly ""' in system_prompt
+    assert "when skip is true, skip_reason must be a nonblank JSON string" in system_prompt
+
+
+def test_reasoner_rejects_nonempty_skip_reason_when_skip_is_false() -> None:
+    """The reasoner parser and prompt enforce the same exact skip contract."""
+    from agent_loop import (
+        AccountedResponseValidationError,
+        BudgetLedger,
+        OpenRouterGateway,
+        ProtocolFailureCode,
+        ReasoningPlan,
+    )
+
+    model = "deepseek/deepseek-r1"
+    planted = "provider-nonempty-skip-reason-canary"
+    plan = json.dumps(
+        {
+            "diagnosis": "A bounded diagnosis.",
+            "root_cause": "A bounded cause.",
+            "invariants": ["Preserve behavior outside the approved edit."],
+            "files_to_change": ["core/pivot_detector.py"],
+            "steps": ["Change the approved expression."],
+            "skip": False,
+            "skip_reason": planted,
+        }
+    )
+    gateway = OpenRouterGateway(
+        client=FakeClient([FakeResponse(plan, cost=0.012, model=model)]),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0, max_calls=1, max_tokens=10_000),
+    )
+
+    with pytest.raises(AccountedResponseValidationError) as raised:
+        gateway.request_once("reasoner", "sealed evidence and source", ReasoningPlan.from_json)
+
+    facts = raised.value.facts
+    assert facts.protocol_failure_code is ProtocolFailureCode.PAYLOAD_FIELD_INVALID
+    assert facts.usage.cost_usd == pytest.approx(0.012)
+    assert planted not in json.dumps(asdict(facts), sort_keys=True)
+
+
 def test_strict_protocol_failure_retains_complete_authoritative_accounting() -> None:
     """Break caught: malformed paid output discarded exact provider tokens and cost."""
     from agent_loop import (
@@ -2152,7 +2223,30 @@ def test_strict_protocol_failure_retains_complete_authoritative_accounting() -> 
     ("raw_content", "expected_code"),
     (
         ("", "content_shape_invalid"),
-        ("{not-json-provider-canary", "payload_schema_invalid"),
+        ("{not-json-provider-canary", "payload_json_invalid"),
+        (
+            json.dumps(
+                {
+                    "action": "reason",
+                    "failure_summary": "failure",
+                    "relevant_files": [],
+                    "reasoning_focus": "focus",
+                    "unexpected": "provider-canary",
+                }
+            ),
+            "payload_keys_invalid",
+        ),
+        (
+            json.dumps(
+                {
+                    "action": "write",
+                    "failure_summary": "failure",
+                    "relevant_files": [],
+                    "reasoning_focus": "focus",
+                }
+            ),
+            "payload_field_invalid",
+        ),
     ),
 )
 def test_accounted_protocol_rejection_has_closed_content_free_stage(

@@ -139,6 +139,18 @@ class ProtocolValidationError(ValueError):
     """Raised when untrusted model JSON does not satisfy a role protocol."""
 
 
+class PayloadJsonValidationError(ProtocolValidationError):
+    """Raised when a model payload is not syntactically valid JSON."""
+
+
+class PayloadKeysValidationError(ProtocolValidationError):
+    """Raised when a model payload is not the exact required object shape."""
+
+
+class PayloadFieldValidationError(ProtocolValidationError):
+    """Raised when a model payload field has an invalid value or type."""
+
+
 class ResponseValidationError(ValueError):
     """Raised when a provider response is incomplete or not a valid protocol object."""
 
@@ -150,6 +162,9 @@ class ProtocolFailureCode(str, Enum):
     REFUSAL = "refusal"
     CONTENT_SHAPE_INVALID = "content_shape_invalid"
     PAYLOAD_SCHEMA_INVALID = "payload_schema_invalid"
+    PAYLOAD_JSON_INVALID = "payload_json_invalid"
+    PAYLOAD_KEYS_INVALID = "payload_keys_invalid"
+    PAYLOAD_FIELD_INVALID = "payload_field_invalid"
     MODEL_MISMATCH = "model_mismatch"
     VALIDATOR_BOUNDARY_INVALID = "validator_boundary_invalid"
 
@@ -377,44 +392,44 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ProtocolValidationError(f"duplicate JSON key: {key}")
+            raise PayloadKeysValidationError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
 
 
 def _parse_json_object(raw: str, allowed: set[str]) -> dict[str, Any]:
     if not isinstance(raw, str):
-        raise ProtocolValidationError("JSON response must be a string")
+        raise PayloadJsonValidationError("JSON response must be a string")
     try:
         value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
-        raise ProtocolValidationError("malformed JSON response") from exc
+        raise PayloadJsonValidationError("malformed JSON response") from exc
     if not isinstance(value, dict):
-        raise ProtocolValidationError("JSON response must be an object")
+        raise PayloadKeysValidationError("JSON response must be an object")
     unknown = set(value) - allowed
     missing = allowed - set(value)
     if unknown:
-        raise ProtocolValidationError(f"unknown JSON keys: {', '.join(sorted(unknown))}")
+        raise PayloadKeysValidationError(f"unknown JSON keys: {', '.join(sorted(unknown))}")
     if missing:
-        raise ProtocolValidationError(f"missing JSON keys: {', '.join(sorted(missing))}")
+        raise PayloadKeysValidationError(f"missing JSON keys: {', '.join(sorted(missing))}")
     return value
 
 
 def _required_text(value: Any, field: str, *, max_bytes: int = _MAX_TEXT_BYTES) -> str:
     if not isinstance(value, str):
-        raise ProtocolValidationError(f"{field} must be a string")
+        raise PayloadFieldValidationError(f"{field} must be a string")
     if not value.strip():
-        raise ProtocolValidationError(f"{field} must not be blank")
+        raise PayloadFieldValidationError(f"{field} must not be blank")
     if len(value.encode("utf-8")) > max_bytes:
-        raise ProtocolValidationError(f"{field} is too long")
+        raise PayloadFieldValidationError(f"{field} is too long")
     return value
 
 
 def _optional_text(value: Any, field: str, *, max_bytes: int = _MAX_TEXT_BYTES) -> str:
     if not isinstance(value, str):
-        raise ProtocolValidationError(f"{field} must be a string")
+        raise PayloadFieldValidationError(f"{field} must be a string")
     if len(value.encode("utf-8")) > max_bytes:
-        raise ProtocolValidationError(f"{field} is too long")
+        raise PayloadFieldValidationError(f"{field} is too long")
     return value
 
 
@@ -428,39 +443,39 @@ def _relative_path(value: Any, field: str) -> str:
         or path.endswith((".", " "))
         or any(part in {"", ".", ".."} for part in path.split("/"))
     ):
-        raise ProtocolValidationError(f"{field} must be a safe relative path")
+        raise PayloadFieldValidationError(f"{field} must be a safe relative path")
     return path
 
 
 def _path_list(value: Any, field: str, *, maximum: int = _MAX_FILES) -> tuple[str, ...]:
     if not isinstance(value, list):
-        raise ProtocolValidationError(f"{field} must be a list")
+        raise PayloadFieldValidationError(f"{field} must be a list")
     if len(value) > maximum:
-        raise ProtocolValidationError(f"{field} has too many entries")
+        raise PayloadFieldValidationError(f"{field} has too many entries")
     return tuple(_relative_path(item, field) for item in value)
 
 
 def _text_list(value: Any, field: str, *, maximum: int = _MAX_LIST_ITEMS) -> tuple[str, ...]:
     if not isinstance(value, list):
-        raise ProtocolValidationError(f"{field} must be a list")
+        raise PayloadFieldValidationError(f"{field} must be a list")
     if len(value) > maximum:
-        raise ProtocolValidationError(f"{field} has too many entries")
+        raise PayloadFieldValidationError(f"{field} has too many entries")
     return tuple(_required_text(item, field) for item in value)
 
 
 def _path_tuple(value: Any, field: str, *, maximum: int = _MAX_FILES) -> tuple[str, ...]:
     if not isinstance(value, tuple):
-        raise ProtocolValidationError(f"{field} must be an immutable tuple")
+        raise PayloadFieldValidationError(f"{field} must be an immutable tuple")
     if len(value) > maximum:
-        raise ProtocolValidationError(f"{field} has too many entries")
+        raise PayloadFieldValidationError(f"{field} has too many entries")
     return tuple(_relative_path(item, field) for item in value)
 
 
 def _text_tuple(value: Any, field: str, *, maximum: int = _MAX_LIST_ITEMS) -> tuple[str, ...]:
     if not isinstance(value, tuple):
-        raise ProtocolValidationError(f"{field} must be an immutable tuple")
+        raise PayloadFieldValidationError(f"{field} must be an immutable tuple")
     if len(value) > maximum:
-        raise ProtocolValidationError(f"{field} has too many entries")
+        raise PayloadFieldValidationError(f"{field} has too many entries")
     return tuple(_required_text(item, field) for item in value)
 
 
@@ -476,7 +491,7 @@ class Route:
     def __post_init__(self) -> None:
         """Validate direct construction as strictly as parsed model input."""
         if _required_text(self.action, "action") not in {"reason", "abort"}:
-            raise ProtocolValidationError("action must be reason or abort")
+            raise PayloadFieldValidationError("action must be reason or abort")
         _required_text(self.failure_summary, "failure_summary")
         _path_tuple(self.relevant_files, "relevant_files")
         _required_text(self.reasoning_focus, "reasoning_focus")
@@ -490,7 +505,7 @@ class Route:
         )
         action = _required_text(value["action"], "action")
         if action not in {"reason", "abort"}:
-            raise ProtocolValidationError("action must be reason or abort")
+            raise PayloadFieldValidationError("action must be reason or abort")
         return cls(
             action=action,
             failure_summary=_required_text(value["failure_summary"], "failure_summary"),
@@ -519,10 +534,12 @@ class ReasoningPlan:
         _path_tuple(self.files_to_change, "files_to_change")
         _text_tuple(self.steps, "steps")
         if type(self.skip) is not bool:
-            raise ProtocolValidationError("skip must be a boolean")
+            raise PayloadFieldValidationError("skip must be a boolean")
         _optional_text(self.skip_reason, "skip_reason")
         if self.skip and not self.skip_reason.strip():
-            raise ProtocolValidationError("skip_reason must not be blank when skip is true")
+            raise PayloadFieldValidationError("skip_reason must not be blank when skip is true")
+        if not self.skip and self.skip_reason != "":
+            raise PayloadFieldValidationError("skip_reason must be empty when skip is false")
 
     @classmethod
     def from_json(cls, raw: str) -> ReasoningPlan:
@@ -540,10 +557,12 @@ class ReasoningPlan:
             },
         )
         if type(value["skip"]) is not bool:
-            raise ProtocolValidationError("skip must be a boolean")
+            raise PayloadFieldValidationError("skip must be a boolean")
         skip_reason = _optional_text(value["skip_reason"], "skip_reason")
         if value["skip"] and not skip_reason.strip():
-            raise ProtocolValidationError("skip_reason must not be blank when skip is true")
+            raise PayloadFieldValidationError("skip_reason must not be blank when skip is true")
+        if not value["skip"] and skip_reason != "":
+            raise PayloadFieldValidationError("skip_reason must be empty when skip is false")
         return cls(
             diagnosis=_required_text(value["diagnosis"], "diagnosis"),
             root_cause=_required_text(value["root_cause"], "root_cause"),
@@ -1429,7 +1448,10 @@ class OpenRouterGateway:
                 "only from the provided source snapshots. Use the closed numeric diagnostics and all "
                 "supplied source snapshots to establish a specific causal edit. Set skip to true when "
                 "that evidence is insufficient; otherwise set skip to false and skip_reason to an empty "
-                "string for a repairable issue. Never invent a patch merely to satisfy a target. Do not "
+                "string for a repairable issue. diagnosis, root_cause, and skip_reason must be JSON strings; "
+                "invariants, files_to_change, and steps must be JSON arrays of strings; skip must be the JSON "
+                'boolean true or false; when skip is false, skip_reason must be exactly ""; when skip is true, '
+                "skip_reason must be a nonblank JSON string. Never invent a patch merely to satisfy a target. Do not "
                 "reveal chain of thought, issue commands, add keys, or include prose."
             ),
             "coder": (
@@ -2054,6 +2076,21 @@ class OpenRouterGateway:
             )
         try:
             payload = parser(content)
+        except PayloadJsonValidationError as exc:
+            raise ClosedResponseValidationError(
+                "response JSON validation failed",
+                ProtocolFailureCode.PAYLOAD_JSON_INVALID,
+            ) from exc
+        except PayloadKeysValidationError as exc:
+            raise ClosedResponseValidationError(
+                "response key validation failed",
+                ProtocolFailureCode.PAYLOAD_KEYS_INVALID,
+            ) from exc
+        except PayloadFieldValidationError as exc:
+            raise ClosedResponseValidationError(
+                "response field validation failed",
+                ProtocolFailureCode.PAYLOAD_FIELD_INVALID,
+            ) from exc
         except ProtocolValidationError as exc:
             raise ClosedResponseValidationError(
                 "response protocol validation failed",
