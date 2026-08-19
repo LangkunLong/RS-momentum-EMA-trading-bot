@@ -55,10 +55,44 @@ FMP_DAILY_REQUEST_BUDGET=198
 EXECUTION_STORE_DB_PATH
 NOTIFY_EMAIL_FROM
 NOTIFY_EMAIL_TO
-NOTIFY_EMAIL_PASSWORD
+NOTIFY_EMAIL_PROVIDER=gmail_oauth
 ```
 
 Keep `ALPACA_PAPER=true`. Every execution entry point rejects a false value before constructing an Alpaca trading client or fill stream; `auto_trader.py --enable-orders` enables paper-account orders only. Notification credentials are optional; when absent, email delivery is skipped without blocking execution.
+
+### Gmail notifications without a password
+
+Gmail notifications use Google's installed-app OAuth flow and the narrow `gmail.send`
+permission. The reusable authorization is stored in Windows Credential Manager through
+`keyring`; neither a Gmail password nor an OAuth refresh token belongs in `.env`.
+
+1. In Google Cloud, enable the Gmail API, configure the OAuth consent screen, and create an
+   OAuth client of type **Desktop app**.
+2. Download its client JSON to an ignored local path such as
+   `.artifacts/secrets/gmail-oauth-client.json`. Do not commit or paste this file into chat.
+3. Set only the provider and addresses in `.env`:
+
+   ```text
+   NOTIFY_EMAIL_PROVIDER=gmail_oauth
+   NOTIFY_EMAIL_FROM=langkunlong@gmail.com
+   NOTIFY_EMAIL_TO=langkunlong@gmail.com
+   ```
+
+4. Authorize the exact account in the browser and send a test message:
+
+   ```powershell
+   python paper_trading_console.py email-auth --client-secrets .artifacts/secrets/gmail-oauth-client.json
+   python paper_trading_console.py email-test
+   ```
+
+Google shows the requested account and permission in the browser; select
+`langkunlong@gmail.com` and confirm. Revoke both the Google grant and the local vault entry with
+`python paper_trading_console.py email-revoke`. If the OAuth consent screen remains in Google's
+**Testing** publishing status, refresh tokens for external users generally expire after seven
+days, so publish the app for durable unattended notifications or reauthorize when prompted.
+
+`NOTIFY_EMAIL_PASSWORD` remains supported only for the legacy SMTP backend. OAuth delivery never
+falls back to SMTP after an authorization or Gmail API failure.
 
 Never commit credentials, generated scan results, execution databases, `.claude/settings.local.json`, or recovery artifacts. A previously exposed FMP key must be rotated at FMP even if the generated CSV is deleted locally; deletion does not revoke a key or remove it from Git history.
 

@@ -25,7 +25,15 @@ import pandas as pd
 from auto_trader import _rank_entry_candidates, run_auto_trader
 from config import settings
 from core.execution_store import get_execution_store
+from core.gmail_oauth import (
+    GmailOAuthError,
+    authorize_gmail,
+    revoke_gmail_authorization,
+)
+from core.notifier import _configured_backend as notify_configured_backend
 from core.notifier import _is_configured as notify_configured
+from core.notifier import notification_configuration_error
+from core.notifier import send_email
 from core.order_execution import (
     _get_trading_client,
     _is_paper_mode,
@@ -380,8 +388,18 @@ def _check_scan_results_dir() -> CheckResult:
 
 
 def _check_email_configuration() -> CheckResult:
+    configuration_error = notification_configuration_error()
+    if configuration_error is not None:
+        return CheckResult("Email notifications", False, configuration_error, severity="fail")
     if notify_configured():
         return CheckResult("Email notifications", True, "configured")
+    if str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() == "gmail_oauth":
+        return CheckResult(
+            "Email notifications",
+            False,
+            "Gmail OAuth is selected but unavailable; run `email-auth` again",
+            severity="fail",
+        )
     return CheckResult(
         "Email notifications",
         True,
@@ -485,6 +503,53 @@ def run_now(*, dry_run: bool) -> int:
     return 0
 
 
+def _notification_email(email: str | None) -> str:
+    value = str(email or settings.NOTIFY_EMAIL_FROM or "").strip()
+    if not value:
+        raise GmailOAuthError(
+            "Gmail address is required; set NOTIFY_EMAIL_FROM or pass --email"
+        )
+    return value
+
+
+def run_email_auth(*, client_secrets: Path, email: str | None) -> int:
+    """Open Google's desktop consent flow and store the grant in the OS credential vault."""
+    try:
+        result = authorize_gmail(_notification_email(email), client_secrets)
+    except GmailOAuthError as exc:
+        print(f"Gmail authorization failed: {exc}")
+        return 1
+    print(f"Gmail OAuth authorized for {result.email}; credential stored in Windows Credential Manager.")
+    return 0
+
+
+def run_email_test() -> int:
+    """Send one notification through the same backend used by trading workflows."""
+    if notify_configured_backend() != "gmail_oauth":
+        print("Gmail OAuth test requires NOTIFY_EMAIL_PROVIDER=gmail_oauth with authorization.")
+        return 1
+    sent = send_email(
+        "[CANSLIM] Gmail OAuth notification test",
+        "This test was sent through the browser-authorized Gmail API notification backend.",
+    )
+    if sent:
+        print("Gmail OAuth test notification sent successfully.")
+        return 0
+    print("Gmail OAuth test notification failed; review notification configuration and logs.")
+    return 1
+
+
+def run_email_revoke(*, email: str | None) -> int:
+    """Revoke the Google grant and remove its local Windows credential."""
+    try:
+        result = revoke_gmail_authorization(_notification_email(email))
+    except GmailOAuthError as exc:
+        print(f"Gmail authorization revocation failed: {exc}")
+        return 1
+    print(f"Gmail OAuth authorization revoked for {result.email}.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Paper trading deployment and observation console")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -526,6 +591,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("task-status", help="Show Windows task scheduler status")
 
+    email_auth_parser = subparsers.add_parser(
+        "email-auth",
+        help="Authorize Gmail notifications in a browser and store the grant in Windows Credential Manager",
+    )
+    email_auth_parser.add_argument(
+        "--client-secrets",
+        type=Path,
+        required=True,
+        help="Google Desktop OAuth client JSON downloaded from Google Cloud",
+    )
+    email_auth_parser.add_argument(
+        "--email",
+        help="Gmail account to authorize (defaults to NOTIFY_EMAIL_FROM)",
+    )
+    subparsers.add_parser(
+        "email-test",
+        help="Send one test through the configured notification backend",
+    )
+    email_revoke_parser = subparsers.add_parser(
+        "email-revoke",
+        help="Revoke Gmail OAuth and remove the local Windows credential",
+    )
+    email_revoke_parser.add_argument(
+        "--email",
+        help="Gmail account to revoke (defaults to NOTIFY_EMAIL_FROM)",
+    )
+
     return parser
 
 
@@ -550,6 +642,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         return register_task(dry_run=not args.enable_orders)
     if args.command == "task-status":
         return show_status()
+    if args.command == "email-auth":
+        return run_email_auth(client_secrets=args.client_secrets, email=args.email)
+    if args.command == "email-test":
+        return run_email_test()
+    if args.command == "email-revoke":
+        return run_email_revoke(email=args.email)
 
     parser.error(f"Unsupported command: {args.command}")
     return 2

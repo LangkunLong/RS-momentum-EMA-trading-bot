@@ -22,11 +22,13 @@ FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 # ALPACA_PAPER is read directly from os.environ in order_execution.py
 # (default: "true" — paper trading). Any false value is rejected at runtime.
 
-# Email notifications (Gmail SMTP with App Password)
+# Email notifications (Gmail API OAuth preferred; SMTP App Password remains supported)
+# NOTIFY_EMAIL_PROVIDER: auto, gmail_oauth, or smtp. ``auto`` prefers an authorized
+#   Gmail OAuth credential in Windows Credential Manager, then falls back to SMTP.
 # NOTIFY_EMAIL_FROM: your Gmail address (sender)
 # NOTIFY_EMAIL_TO: recipient address (can be the same Gmail)
-# NOTIFY_EMAIL_PASSWORD: Gmail App Password (not your login password).
-#   Generate at: https://myaccount.google.com/apppasswords
+# NOTIFY_EMAIL_PASSWORD: legacy SMTP App Password; unused by gmail_oauth.
+NOTIFY_EMAIL_PROVIDER = os.environ.get("NOTIFY_EMAIL_PROVIDER", "auto").strip().lower()
 NOTIFY_EMAIL_FROM = os.environ.get("NOTIFY_EMAIL_FROM", "")
 NOTIFY_EMAIL_TO = os.environ.get("NOTIFY_EMAIL_TO", "")
 NOTIFY_EMAIL_PASSWORD = os.environ.get("NOTIFY_EMAIL_PASSWORD", "")

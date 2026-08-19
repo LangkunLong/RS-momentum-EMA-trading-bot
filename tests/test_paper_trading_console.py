@@ -274,3 +274,128 @@ def test_main_checklist_delegates_to_checklist_runner() -> None:
 
     assert rc == 0
     mock_checklist.assert_called_once_with(limit=7)
+
+
+def test_email_auth_opens_consent_for_configured_sender_without_printing_credentials(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """The operator flow must expose only the authorized address, never returned credentials."""
+    client_secrets = tmp_path / "gmail-oauth-client.json"
+    client_secrets.write_text('{"installed": {}}', encoding="utf-8")
+    with (
+        patch.object(console.settings, "NOTIFY_EMAIL_FROM", "langkunlong@gmail.com"),
+        patch(
+            "paper_trading_console.authorize_gmail",
+            return_value=SimpleNamespace(
+                email="langkunlong@gmail.com",
+                refresh_token_stored=True,
+            ),
+        ) as authorize,
+    ):
+        rc = console.run_email_auth(client_secrets=client_secrets, email=None)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "langkunlong@gmail.com" in output
+    assert "refresh_token" not in output
+    authorize.assert_called_once_with("langkunlong@gmail.com", client_secrets)
+
+
+def test_main_email_auth_has_no_password_or_token_cli_option(tmp_path: Path) -> None:
+    """Adding a secret-valued CLI flag would leak it into shell history and process listings."""
+    client_secrets = tmp_path / "gmail-oauth-client.json"
+    client_secrets.write_text('{"installed": {}}', encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc_info:
+        console.main(
+            [
+                "email-auth",
+                "--client-secrets",
+                str(client_secrets),
+                "--password",
+                "must-not-be-accepted",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_email_test_sends_through_configured_notifier(capsys) -> None:
+    """The smoke command must exercise the same notifier used by trading workflows."""
+    with (
+        patch("paper_trading_console.notify_configured_backend", return_value="gmail_oauth"),
+        patch("paper_trading_console.send_email", return_value=True) as send,
+    ):
+        rc = console.run_email_test()
+
+    assert rc == 0
+    subject, body = send.call_args.args
+    assert subject == "[CANSLIM] Gmail OAuth notification test"
+    assert "browser-authorized Gmail API" in body
+    assert "sent successfully" in capsys.readouterr().out
+
+
+def test_email_test_refuses_a_non_oauth_backend_even_when_delivery_would_succeed(capsys) -> None:
+    """SMTP and auto fallback cannot be reported as a Gmail OAuth smoke-test success."""
+    with (
+        patch("paper_trading_console.notify_configured_backend", return_value="smtp"),
+        patch("paper_trading_console.send_email", return_value=True) as send,
+    ):
+        rc = console.run_email_test()
+
+    assert rc == 1
+    send.assert_not_called()
+    assert "requires NOTIFY_EMAIL_PROVIDER=gmail_oauth with authorization" in capsys.readouterr().out
+
+
+def test_explicit_unavailable_gmail_oauth_is_a_failed_deployment_check() -> None:
+    """A deliberately selected but unauthorized OAuth backend must block doctor and checklist."""
+    with (
+        patch.object(console.settings, "NOTIFY_EMAIL_PROVIDER", "gmail_oauth"),
+        patch("paper_trading_console.notify_configured", return_value=False),
+    ):
+        result = console._check_email_configuration()
+
+    assert result.ok is False
+    assert result.severity == "fail"
+    assert result.detail == "Gmail OAuth is selected but unavailable; run `email-auth` again"
+
+
+def test_unsupported_notification_provider_is_a_failed_deployment_check() -> None:
+    """A misspelled provider must not be downgraded to a warning that disables notifications."""
+    with patch.object(console.settings, "NOTIFY_EMAIL_PROVIDER", "gmial_oauth"):
+        result = console._check_email_configuration()
+
+    assert result.ok is False
+    assert result.severity == "fail"
+    assert result.detail == "Unsupported NOTIFY_EMAIL_PROVIDER: gmial_oauth"
+
+
+def test_invalid_notification_recipient_is_a_failed_deployment_check() -> None:
+    """A malformed recipient must block preflight before notification delivery is attempted."""
+    with patch.object(console.settings, "NOTIFY_EMAIL_TO", "not-an-email"):
+        result = console._check_email_configuration()
+
+    assert result.ok is False
+    assert result.severity == "fail"
+    assert result.detail == "NOTIFY_EMAIL_TO must be a valid email address"
+
+
+def test_email_revoke_removes_the_configured_sender_grant(capsys) -> None:
+    """The console revoke path must target only the configured Gmail identity."""
+    with (
+        patch.object(console.settings, "NOTIFY_EMAIL_FROM", "langkunlong@gmail.com"),
+        patch(
+            "paper_trading_console.revoke_gmail_authorization",
+            return_value=SimpleNamespace(
+                email="langkunlong@gmail.com",
+                remote_revoked=True,
+            ),
+        ) as revoke,
+    ):
+        rc = console.run_email_revoke(email=None)
+
+    assert rc == 0
+    assert "revoked" in capsys.readouterr().out.lower()
+    revoke.assert_called_once_with("langkunlong@gmail.com")

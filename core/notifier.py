@@ -1,14 +1,15 @@
 """Email notifications for CANSLIM order fills and exits.
 
-Sends via Gmail SMTP (TLS on port 587).  Requires three environment variables:
+Gmail API OAuth is preferred and stores refresh credentials in the OS credential vault.
+Legacy Gmail SMTP (TLS on port 587) remains available with three environment variables:
 
+    NOTIFY_EMAIL_PROVIDER — gmail_oauth (preferred), smtp, or auto
     NOTIFY_EMAIL_FROM     — your Gmail address (the sending account)
     NOTIFY_EMAIL_TO       — recipient address (can be the same Gmail)
-    NOTIFY_EMAIL_PASSWORD — Gmail App Password (not your login password).
-                            Generate at https://myaccount.google.com/apppasswords
+    NOTIFY_EMAIL_PASSWORD — legacy SMTP App Password; unused by Gmail OAuth
 
-If any of the three variables is empty, notification calls are silently skipped
-so the rest of the trading workflow is never blocked by a misconfigured mailer.
+If the selected backend is incomplete, notification calls do not block the trading workflow.
+An explicitly selected but unavailable Gmail OAuth backend emits a safe diagnostic instead.
 """
 
 from __future__ import annotations
@@ -18,9 +19,11 @@ from collections.abc import Sequence
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parseaddr
 from zoneinfo import ZoneInfo
 
 from config import settings
+from core.gmail_oauth import is_gmail_authorized, send_gmail_email
 from core.order_execution import require_paper_mode
 
 _ET = ZoneInfo("America/New_York")
@@ -35,16 +38,56 @@ def _paper_mode_label(paper: bool) -> str:
 
 
 def _is_configured() -> bool:
-    """Return True when all three email env vars are present."""
-    return bool(
-        settings.NOTIFY_EMAIL_FROM
-        and settings.NOTIFY_EMAIL_TO
-        and settings.NOTIFY_EMAIL_PASSWORD
-    )
+    """Return whether the selected notification backend has complete credentials."""
+    return _configured_backend() is not None
+
+
+def _is_valid_email_address(value: str) -> bool:
+    display_name, address = parseaddr(value)
+    if display_name or address != value or value.count("@") != 1:
+        return False
+    local_part, domain = value.split("@", maxsplit=1)
+    return bool(local_part and domain) and not any(character.isspace() for character in value)
+
+
+def notification_configuration_error() -> str | None:
+    """Return a safe static validation error for an invalid notification configuration."""
+    provider = str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() or "auto"
+    if provider not in {"auto", "gmail_oauth", "smtp"}:
+        return f"Unsupported NOTIFY_EMAIL_PROVIDER: {provider}"
+
+    sender = str(settings.NOTIFY_EMAIL_FROM or "").strip()
+    recipient = str(settings.NOTIFY_EMAIL_TO or "").strip()
+    if sender and not _is_valid_email_address(sender):
+        return "NOTIFY_EMAIL_FROM must be a valid email address"
+    if recipient and not _is_valid_email_address(recipient):
+        return "NOTIFY_EMAIL_TO must be a valid email address"
+    return None
+
+
+def _configured_backend() -> str | None:
+    if notification_configuration_error() is not None:
+        return None
+    sender = str(settings.NOTIFY_EMAIL_FROM or "").strip()
+    recipient = str(settings.NOTIFY_EMAIL_TO or "").strip()
+    if not sender or not recipient:
+        return None
+    provider = str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() or "auto"
+    if provider in {"auto", "gmail_oauth"} and is_gmail_authorized(sender):
+        return "gmail_oauth"
+    if provider == "gmail_oauth":
+        return None
+    if settings.NOTIFY_EMAIL_PASSWORD:
+        return "smtp"
+    return None
+
+
+def _gmail_oauth_selected() -> bool:
+    return str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() == "gmail_oauth"
 
 
 def send_email(subject: str, body: str) -> bool:
-    """Send a plain-text email via Gmail SMTP.
+    """Send a plain-text email through the configured Gmail backend.
 
     Args:
         subject: Email subject line.
@@ -54,8 +97,25 @@ def send_email(subject: str, body: str) -> bool:
         True when the message was accepted by Gmail; False otherwise (including
         when email is not configured).
     """
-    if not _is_configured():
+    backend = _configured_backend()
+    if backend is None:
+        if _gmail_oauth_selected():
+            print("[NOTIFY ERROR] Gmail OAuth notifications are unavailable; run `email-auth` again")
         return False
+
+    if backend == "gmail_oauth":
+        try:
+            send_gmail_email(
+                from_email=settings.NOTIFY_EMAIL_FROM,
+                to_email=settings.NOTIFY_EMAIL_TO,
+                subject=subject,
+                body=body,
+            )
+            print(f"[NOTIFY] Email sent: {subject}")
+            return True
+        except Exception:
+            print("[NOTIFY ERROR] Gmail OAuth delivery failed; run `email-auth` again")
+            return False
 
     msg = MIMEMultipart()
     msg["From"] = settings.NOTIFY_EMAIL_FROM
