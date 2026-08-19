@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parseaddr
 from zoneinfo import ZoneInfo
 
 from config import settings
@@ -41,14 +42,37 @@ def _is_configured() -> bool:
     return _configured_backend() is not None
 
 
+def _is_valid_email_address(value: str) -> bool:
+    display_name, address = parseaddr(value)
+    if display_name or address != value or value.count("@") != 1:
+        return False
+    local_part, domain = value.split("@", maxsplit=1)
+    return bool(local_part and domain) and not any(character.isspace() for character in value)
+
+
+def notification_configuration_error() -> str | None:
+    """Return a safe static validation error for an invalid notification configuration."""
+    provider = str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() or "auto"
+    if provider not in {"auto", "gmail_oauth", "smtp"}:
+        return f"Unsupported NOTIFY_EMAIL_PROVIDER: {provider}"
+
+    sender = str(settings.NOTIFY_EMAIL_FROM or "").strip()
+    recipient = str(settings.NOTIFY_EMAIL_TO or "").strip()
+    if sender and not _is_valid_email_address(sender):
+        return "NOTIFY_EMAIL_FROM must be a valid email address"
+    if recipient and not _is_valid_email_address(recipient):
+        return "NOTIFY_EMAIL_TO must be a valid email address"
+    return None
+
+
 def _configured_backend() -> str | None:
+    if notification_configuration_error() is not None:
+        return None
     sender = str(settings.NOTIFY_EMAIL_FROM or "").strip()
     recipient = str(settings.NOTIFY_EMAIL_TO or "").strip()
     if not sender or not recipient:
         return None
-    provider = str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower()
-    if provider not in {"auto", "gmail_oauth", "smtp"}:
-        return None
+    provider = str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() or "auto"
     if provider in {"auto", "gmail_oauth"} and is_gmail_authorized(sender):
         return "gmail_oauth"
     if provider == "gmail_oauth":

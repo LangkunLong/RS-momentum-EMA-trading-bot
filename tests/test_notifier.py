@@ -188,6 +188,29 @@ class TestSendEmail:
         )
         smtp.assert_not_called()
 
+    def test_invalid_recipient_is_not_configured_and_never_reaches_smtp(self):
+        """A malformed recipient must fail before an SMTP connection is attempted."""
+        with _patch_settings(NOTIFY_EMAIL_TO="not-an-email"):
+            with patch("smtplib.SMTP") as smtp:
+                result = send_email("subject", "body")
+                configured = _is_configured()
+
+        assert configured is False
+        assert result is False
+        smtp.assert_not_called()
+
+    def test_invalid_sender_is_not_configured(self):
+        """A malformed sender must be rejected before either backend is selected."""
+        with _patch_settings(NOTIFY_EMAIL_FROM="not-an-email"):
+            assert _is_configured() is False
+
+    def test_notification_configuration_error_accepts_valid_addresses(self):
+        """Valid addresses must not be misclassified as an operator configuration error."""
+        from core import notifier
+
+        with _patch_settings():
+            assert notifier.notification_configuration_error() is None
+
 
 # ---------------------------------------------------------------------------
 # notify_buy_filled

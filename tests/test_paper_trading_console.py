@@ -362,6 +362,26 @@ def test_explicit_unavailable_gmail_oauth_is_a_failed_deployment_check() -> None
     assert result.detail == "Gmail OAuth is selected but unavailable; run `email-auth` again"
 
 
+def test_unsupported_notification_provider_is_a_failed_deployment_check() -> None:
+    """A misspelled provider must not be downgraded to a warning that disables notifications."""
+    with patch.object(console.settings, "NOTIFY_EMAIL_PROVIDER", "gmial_oauth"):
+        result = console._check_email_configuration()
+
+    assert result.ok is False
+    assert result.severity == "fail"
+    assert result.detail == "Unsupported NOTIFY_EMAIL_PROVIDER: gmial_oauth"
+
+
+def test_invalid_notification_recipient_is_a_failed_deployment_check() -> None:
+    """A malformed recipient must block preflight before notification delivery is attempted."""
+    with patch.object(console.settings, "NOTIFY_EMAIL_TO", "not-an-email"):
+        result = console._check_email_configuration()
+
+    assert result.ok is False
+    assert result.severity == "fail"
+    assert result.detail == "NOTIFY_EMAIL_TO must be a valid email address"
+
+
 def test_email_revoke_removes_the_configured_sender_grant(capsys) -> None:
     """The console revoke path must target only the configured Gmail identity."""
     with (

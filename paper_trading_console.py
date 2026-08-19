@@ -32,6 +32,7 @@ from core.gmail_oauth import (
 )
 from core.notifier import _configured_backend as notify_configured_backend
 from core.notifier import _is_configured as notify_configured
+from core.notifier import notification_configuration_error
 from core.notifier import send_email
 from core.order_execution import (
     _get_trading_client,
@@ -387,6 +388,9 @@ def _check_scan_results_dir() -> CheckResult:
 
 
 def _check_email_configuration() -> CheckResult:
+    configuration_error = notification_configuration_error()
+    if configuration_error is not None:
+        return CheckResult("Email notifications", False, configuration_error, severity="fail")
     if notify_configured():
         return CheckResult("Email notifications", True, "configured")
     if str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() == "gmail_oauth":
