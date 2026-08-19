@@ -762,6 +762,7 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
         assert all(f'"{key}"' in prompt for key in keys)
     coder_prompt = OpenRouterGateway.SYSTEM_PROMPTS["coder"]
     assert "diff --git a/<path> b/<path>" in coder_prompt
+    assert "index 1111111..2222222 100644" in coder_prompt
     assert "--- a/<path>" in coder_prompt
     assert "+++ b/<path>" in coder_prompt
 

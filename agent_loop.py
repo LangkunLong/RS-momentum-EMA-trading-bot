@@ -1144,8 +1144,10 @@ class OpenRouterGateway:
                 '"summary", "files", "unified_diff". Set files to the exact JSON array of paths changed '
                 "by unified_diff, limited to the approved plan and source snapshots. unified_diff must be "
                 "a complete git-style unified diff. For every changed file, include "
-                '"diff --git a/<path> b/<path>", "--- a/<path>", and "+++ b/<path>" before the '
-                "@@ hunk. Do not use Markdown fences, issue commands, add keys, or include prose."
+                '"diff --git a/<path> b/<path>", "index 1111111..2222222 100644", '
+                '"--- a/<path>", and "+++ b/<path>" in that order before the @@ hunk. '
+                "Use that exact index line for every file. Do not use Markdown fences, issue "
+                "commands, add keys, or include prose."
             ),
         }
     )
