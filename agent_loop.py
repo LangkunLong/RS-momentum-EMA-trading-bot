@@ -6582,6 +6582,14 @@ def export_inert_proposal(
     )
 
 
+def _proposal_batch_editable_paths() -> tuple[str, ...]:
+    """Expose only writable strategy paths, never the protected backtest oracle."""
+    editable = tuple(sorted(DEFAULT_EDITABLE_PATHS - BACKTEST_READ_ONLY_PATHS))
+    if not editable:
+        raise ConfigurationError("proposal batch has no writable strategy paths")
+    return editable
+
+
 def run_proposal_batch(
     config: LoopConfig,
     state: SourceState,
@@ -8081,7 +8089,7 @@ def _execute_cli_run(
                     ),
                     read_snapshots=snapshots,
                     known_secrets=known_secrets,
-                    editable_paths=tuple(sorted(DEFAULT_EDITABLE_PATHS)),
+                    editable_paths=_proposal_batch_editable_paths(),
                 ),
                 batch_limits,
             )

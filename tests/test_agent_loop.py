@@ -6060,6 +6060,19 @@ def test_cli_builds_only_the_exact_non_applying_canary_first_batch(tmp_path: Pat
         agent_loop._build_proposal_batch_limits(namespace, config)
 
 
+def test_production_proposal_scope_excludes_read_only_backtest_oracles() -> None:
+    """The model cannot be invited to patch a path the backtest policy must reject."""
+    import agent_loop
+
+    editable = agent_loop._proposal_batch_editable_paths()
+
+    assert editable == (
+        "core/momentum_analysis.py",
+        "core/pivot_detector.py",
+    )
+    assert not set(editable) & agent_loop.BACKTEST_READ_ONLY_PATHS
+
+
 def test_cli_routes_batch_to_dedicated_runner_and_prints_closed_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
