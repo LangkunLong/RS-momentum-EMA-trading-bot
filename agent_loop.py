@@ -25,6 +25,7 @@ import threading
 import time
 import secrets
 import unicodedata
+import urllib.error
 import urllib.request
 from urllib.parse import quote
 from contextlib import closing
@@ -46,13 +47,17 @@ DEFAULT_MAX_TOKENS = 131_072
 MAX_PROPOSAL_SAMPLES = 50
 MAX_BATCH_CALLS = 150
 MAX_BATCH_TOKENS = 2_000_000
+GENERATION_ACCOUNTING_ATTEMPTS = 3
+GENERATION_ACCOUNTING_DELAY_SECONDS = 0.25
 
 _MAX_FILES = 8
 _MAX_LIST_ITEMS = 16
 _MAX_TEXT_BYTES = 16 * 1024
 _MAX_DIFF_BYTES = 256 * 1024
 _MAX_DATA_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_GENERATION_ACCOUNTING_BYTES = 64 * 1024
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529})
+_GENERATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
 AGENT_LOOP_UID_GID = "65532:65532"
 BACKTEST_SENTINEL = "AGENT_LOOP_BACKTEST_RESULT="
@@ -403,6 +408,7 @@ class Usage:
     cached_tokens: int | None = None
     reasoning_tokens: int | None = None
     cost_usd: float | None = None
+    accounting_source: str = "inline"
 
     def __post_init__(self) -> None:
         """Reject invalid provider metadata even when constructed outside response parsing."""
@@ -434,6 +440,8 @@ class Usage:
             raise ProtocolValidationError("reasoning_tokens cannot exceed completion_tokens")
         if self.cost_usd is not None and _non_negative_float(self.cost_usd) is None:
             raise ProtocolValidationError("usage cost must be a finite non-negative number")
+        if self.accounting_source not in {"inline", "generation_endpoint"}:
+            raise ProtocolValidationError("usage accounting source is invalid")
 
 
 PayloadT = TypeVar("PayloadT")
@@ -539,6 +547,7 @@ class ProviderCallRecord:
     reasoning_tokens: int | None
     total_tokens: int
     cost_usd: float
+    accounting_source: str = "inline"
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -559,6 +568,8 @@ class ProviderCallRecord:
             raise ConfigurationError("provider call finish reason is invalid")
         if self.accounting_complete is not True or type(self.response_schema_valid) is not bool:
             raise ConfigurationError("provider call must have complete validated accounting")
+        if self.accounting_source not in {"inline", "generation_endpoint"}:
+            raise ConfigurationError("provider call accounting source is invalid")
         if _MODEL_SLUG_RE.fullmatch(self.requested_model) is None:
             raise ConfigurationError("provider call requested model is invalid")
         if self.returned_model != "unknown" and _MODEL_SLUG_RE.fullmatch(
@@ -887,6 +898,86 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
         raise AccountingValidationError("provider accounting relationships are invalid") from exc
 
 
+def _safe_generation_id(response: object) -> str:
+    """Return one locally hardened OpenRouter generation identifier."""
+    value = _read_field(response, "id")
+    if not isinstance(value, str) or _GENERATION_ID_RE.fullmatch(value) is None:
+        raise AccountingValidationError(
+            "response has no safe generation accounting identifier"
+        )
+    return value
+
+
+def _generation_token_pair(data: Mapping[str, object]) -> tuple[int, int]:
+    """Prefer the complete native pair, falling back atomically to normalized tokens."""
+    native_prompt = _present_field(data, "native_tokens_prompt")
+    native_completion = _present_field(data, "native_tokens_completion")
+    if native_prompt is not _MISSING_FIELD or native_completion is not _MISSING_FIELD:
+        if native_prompt is not None and native_completion is not None:
+            prompt = _non_negative_int(native_prompt)
+            completion = _non_negative_int(native_completion)
+            if prompt is None or completion is None:
+                raise AccountingValidationError(
+                    "generation native token accounting is invalid"
+                )
+            return prompt, completion
+        if not (
+            (native_prompt is _MISSING_FIELD or native_prompt is None)
+            and (native_completion is _MISSING_FIELD or native_completion is None)
+        ):
+            raise AccountingValidationError(
+                "generation native token accounting is incomplete"
+            )
+    prompt = _non_negative_int(_present_field(data, "tokens_prompt"))
+    completion = _non_negative_int(_present_field(data, "tokens_completion"))
+    if prompt is None or completion is None:
+        raise AccountingValidationError("generation token accounting is incomplete")
+    return prompt, completion
+
+
+def _usage_from_generation_record(
+    payload: object,
+    *,
+    generation_id: str,
+    expected_model: str,
+) -> Usage:
+    """Validate one complete authoritative record from OpenRouter's generation endpoint."""
+    if not isinstance(payload, Mapping):
+        raise AccountingValidationError("generation accounting response is invalid")
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise AccountingValidationError("generation accounting data is invalid")
+    if data.get("id") != generation_id:
+        raise AccountingValidationError("generation accounting identity does not match")
+    if data.get("api_type") != "completions":
+        raise AccountingValidationError("generation accounting API type is invalid")
+    if data.get("model") != expected_model:
+        raise AccountingValidationError("generation accounting model does not match")
+    if data.get("finish_reason") != "stop" or data.get("cancelled") is not False:
+        raise AccountingValidationError("generation accounting completion is not final")
+    total_cost = _usage_cost(data.get("total_cost", _MISSING_FIELD), "generation total")
+    usage_cost = _usage_cost(data.get("usage", _MISSING_FIELD), "generation usage")
+    if total_cost is None or usage_cost is None or total_cost != usage_cost:
+        raise AccountingValidationError("generation cost accounting is incomplete or conflicting")
+    prompt_tokens, completion_tokens = _generation_token_pair(data)
+    cached_tokens = _usage_int(data, "native_tokens_cached")
+    reasoning_tokens = _usage_int(data, "native_tokens_reasoning")
+    try:
+        return Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            cached_tokens=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
+            cost_usd=total_cost,
+            accounting_source="generation_endpoint",
+        )
+    except ProtocolValidationError as exc:
+        raise AccountingValidationError(
+            "generation accounting relationships are invalid"
+        ) from exc
+
+
 def _status_code(error: BaseException) -> int | None:
     value = getattr(error, "status_code", None)
     if type(value) is int:
@@ -1069,6 +1160,8 @@ class OpenRouterGateway:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_attempts: int = 2,
         controller_root: Path | None = None,
+        generation_loader: Callable[[str], object] | None = None,
+        generation_sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if (
             not run_id.strip()
@@ -1105,6 +1198,12 @@ class OpenRouterGateway:
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
         self._pricing_cache: dict[str, Pricing] = {}
+        self._generation_loader = (
+            generation_loader
+            if generation_loader is not None
+            else (self._load_generation_accounting if client is None else None)
+        )
+        self._generation_sleeper = generation_sleeper
 
     def _get_client(self) -> Any:
         """Construct the SDK client lazily, only after configuration has succeeded."""
@@ -1189,6 +1288,64 @@ class OpenRouterGateway:
             self._pricing_cache[model] = pricing
         return pricing
 
+    def _load_generation_accounting(self, generation_id: str) -> object:
+        """Fetch one bounded generation record from the fixed OpenRouter endpoint."""
+        query_id = quote(generation_id, safe="")
+        request = urllib.request.Request(
+            f"{OPENROUTER_BASE_URL}/generation?id={query_id}",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(  # noqa: S310
+                request,
+                timeout=min(self.timeout_seconds, 5.0),
+            ) as response:
+                body = response.read(_MAX_GENERATION_ACCOUNTING_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            raise GatewayError(
+                "OpenRouter generation accounting request failed",
+                status_code=exc.code,
+            ) from exc
+        except OSError as exc:
+            raise GatewayError("OpenRouter generation accounting request failed") from exc
+        if len(body) > _MAX_GENERATION_ACCOUNTING_BYTES:
+            raise AccountingValidationError("generation accounting response is too large")
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AccountingValidationError("generation accounting response is invalid") from exc
+
+    def _recover_generation_usage(self, response: object, expected_model: str) -> Usage:
+        """Recover strict accounting without issuing another paid chat completion."""
+        generation_id = _safe_generation_id(response)
+        if self._generation_loader is None:
+            raise AccountingValidationError("generation accounting recovery is unavailable")
+        for attempt in range(GENERATION_ACCOUNTING_ATTEMPTS):
+            try:
+                payload = self._generation_loader(generation_id)
+            except GatewayError as exc:
+                if (
+                    attempt + 1 < GENERATION_ACCOUNTING_ATTEMPTS
+                    and exc.status_code in {404, 408, 429, 500, 502, 503, 504, 524, 529}
+                ):
+                    self._generation_sleeper(
+                        GENERATION_ACCOUNTING_DELAY_SECONDS * (attempt + 1)
+                    )
+                    continue
+                raise AccountingValidationError(
+                    "generation accounting recovery failed"
+                ) from exc
+            return _usage_from_generation_record(
+                payload,
+                generation_id=generation_id,
+                expected_model=expected_model,
+            )
+        raise AssertionError("generation accounting retry loop exhausted")
+
     def _request_with_retries(
         self,
         role: str,
@@ -1267,6 +1424,15 @@ class OpenRouterGateway:
                 response,
                 require_complete=require_complete_accounting,
             )
+        except AccountingValidationError:
+            if not require_complete_accounting:
+                self.ledger.reconcile(reservation, Usage(), window=budget_window)
+                raise
+            try:
+                usage = self._recover_generation_usage(response, model)
+            except Exception:
+                self.ledger.reconcile(reservation, Usage(), window=budget_window)
+                raise
         except Exception:
             self.ledger.reconcile(reservation, Usage(), window=budget_window)
             raise
@@ -6532,6 +6698,7 @@ def run_proposal_batch(
                 reasoning_tokens=usage.reasoning_tokens,
                 total_tokens=usage.total_tokens,
                 cost_usd=usage.cost_usd,
+                accounting_source=usage.accounting_source,
             )
             path, digest = audit.write_provider_call(record)
             provider_call_artifacts.append((record.call_index, outcome, path, digest))
@@ -6595,6 +6762,7 @@ def run_proposal_batch(
             reasoning_tokens=usage.reasoning_tokens,
             total_tokens=usage.total_tokens,
             cost_usd=usage.cost_usd,
+            accounting_source=usage.accounting_source,
         )
         call_artifact = audit.write_provider_call(record)
         provider_call_artifacts.append(

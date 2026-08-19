@@ -62,6 +62,7 @@ class FakeResponse:
     cost: float | None = None
     error: object | None = None
     model: str | None = None
+    id: str = "gen-test12345678"
 
     @property
     def choices(self) -> list[SimpleNamespace]:
@@ -101,6 +102,27 @@ class FakeClient:
     def __init__(self, outcomes: list[object]) -> None:
         self.completions = FakeCompletions(outcomes)
         self.chat = SimpleNamespace(completions=self.completions)
+
+
+def _generation_accounting(
+    generation_id: str,
+    model: str,
+    *,
+    cost: float = 0.012,
+) -> dict[str, object]:
+    return {
+        "data": {
+            "id": generation_id,
+            "api_type": "completions",
+            "model": model,
+            "finish_reason": "stop",
+            "cancelled": False,
+            "tokens_prompt": 11,
+            "tokens_completion": 7,
+            "total_cost": cost,
+            "usage": cost,
+        }
+    }
 
 
 def test_import_is_lazy_and_never_reads_key_or_execution_modules(tmp_path: Path) -> None:
@@ -845,6 +867,192 @@ def test_gateway_strict_request_stops_after_first_unaccounted_call() -> None:
     with pytest.raises(ResponseValidationError, match="accounting"):
         gateway.request_once("orchestrator", "evidence", Route.from_json)
     assert len(client.completions.calls) == 1
+
+
+def test_strict_request_recovers_authoritative_generation_accounting_once() -> None:
+    """A paid response may recover only from its exact immutable generation record."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, Route
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    generation_id = "gen-recovery123456"
+    client = FakeClient(
+        [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
+    )
+    polls: list[str] = []
+
+    def load_generation(value: str) -> object:
+        polls.append(value)
+        return _generation_accounting(value, model)
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000)
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=load_generation,
+        ledger=ledger,
+    )
+
+    completion = gateway.request_once("orchestrator", "evidence", Route.from_json)
+
+    assert completion.payload.action == "reason"
+    assert completion.usage.accounting_source == "generation_endpoint"
+    assert completion.usage.cost_usd == pytest.approx(0.012)
+    assert completion.usage.total_tokens == 18
+    assert polls == [generation_id]
+    assert len(client.completions.calls) == 1
+    assert ledger.calls == 1
+    assert ledger.spent_usd == pytest.approx(0.012)
+    assert ledger.total_tokens == 18
+
+
+@pytest.mark.parametrize(
+    "generation_id",
+    ("", "../escape", "gen-bad?query", "gen-bad%2Fescape", "gen-" + "a" * 129),
+)
+def test_generation_accounting_rejects_unsafe_response_ids_without_polling(
+    generation_id: str,
+) -> None:
+    """Untrusted response IDs cannot control the accounting endpoint or trigger a second chat."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, ResponseValidationError, Route
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    client = FakeClient(
+        [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
+    )
+    polls: list[str] = []
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=lambda value: polls.append(value),
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    with pytest.raises(ResponseValidationError, match="accounting"):
+        gateway.request_once("orchestrator", "evidence", Route.from_json)
+    assert polls == []
+    assert len(client.completions.calls) == 1
+
+
+def test_generation_accounting_polling_is_bounded_and_reconciles_once() -> None:
+    """Transient metadata failures cannot retry the paid role or escape the fixed poll bound."""
+    from agent_loop import BudgetLedger, GatewayError, OpenRouterGateway, ResponseValidationError, Route
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    client = FakeClient([FakeResponse(_route_json(), cost=None, model=model)])
+    polls: list[str] = []
+    sleeps: list[float] = []
+
+    def unavailable(value: str) -> object:
+        polls.append(value)
+        raise GatewayError("not visible yet", status_code=404)
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000)
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=unavailable,
+        generation_sleeper=sleeps.append,
+        ledger=ledger,
+    )
+
+    with pytest.raises(ResponseValidationError, match="accounting"):
+        gateway.request_once("orchestrator", "evidence", Route.from_json)
+    assert polls == ["gen-test12345678"] * 3
+    assert sleeps == [0.25, 0.5]
+    assert len(client.completions.calls) == 1
+    assert ledger.calls == 1
+    assert ledger.total_tokens > 18
+
+
+def test_generation_accounting_malformed_success_is_not_retried() -> None:
+    """A malformed successful metadata response is definitive, not eventual consistency."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, ResponseValidationError, Route
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    polls: list[str] = []
+
+    def malformed(value: str) -> object:
+        polls.append(value)
+        return {"data": {"id": value, "api_type": "completions", "model": model}}
+
+    gateway = OpenRouterGateway(
+        client=FakeClient([FakeResponse(_route_json(), cost=None, model=model)]),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=malformed,
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    with pytest.raises(ResponseValidationError, match="accounting"):
+        gateway.request_once("orchestrator", "evidence", Route.from_json)
+    assert polls == ["gen-test12345678"]
+
+
+def test_generation_accounting_prefers_complete_native_token_pair() -> None:
+    """The immutable record uses provider-native tokens without mixing coordinate systems."""
+    from agent_loop import _usage_from_generation_record
+
+    generation_id = "chatcmpl-native123"
+    model = "deepseek/deepseek-r1"
+    payload = _generation_accounting(generation_id, model)
+    data = payload["data"]
+    assert isinstance(data, dict)
+    data.update(
+        {
+            "native_tokens_prompt": 13,
+            "native_tokens_completion": 9,
+            "native_tokens_cached": 4,
+            "native_tokens_reasoning": 6,
+            "tokens_prompt": 999,
+            "tokens_completion": 999,
+        }
+    )
+
+    usage = _usage_from_generation_record(
+        payload,
+        generation_id=generation_id,
+        expected_model=model,
+    )
+    assert usage.prompt_tokens == 13
+    assert usage.completion_tokens == 9
+    assert usage.total_tokens == 22
+    assert usage.cached_tokens == 4
+    assert usage.reasoning_tokens == 6
+    assert usage.accounting_source == "generation_endpoint"
+
+
+def test_recovered_generation_overage_commits_before_failing_closed() -> None:
+    """Recovered authoritative cost must be committed even when it exceeds the canary window."""
+    from agent_loop import (
+        AccountedBudgetExceededError,
+        BudgetLedger,
+        BudgetWindow,
+        OpenRouterGateway,
+        Route,
+    )
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    generation_id = "gen-overage1234567"
+    ledger = BudgetLedger(max_usd=2.0, max_calls=3, max_tokens=10_000)
+    gateway = OpenRouterGateway(
+        client=FakeClient(
+            [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
+        ),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=lambda value: _generation_accounting(value, model, cost=0.60),
+        ledger=ledger,
+    )
+
+    with pytest.raises(AccountedBudgetExceededError) as raised:
+        gateway.request_once(
+            "orchestrator",
+            "evidence",
+            Route.from_json,
+            budget_window=BudgetWindow(0, 0.0, 3, 0.50),
+        )
+    assert raised.value.facts.usage.accounting_source == "generation_endpoint"
+    assert raised.value.facts.usage.cost_usd == pytest.approx(0.60)
+    assert ledger.calls == 1
+    assert ledger.spent_usd == pytest.approx(0.60)
 
 
 def test_gateway_strict_request_is_one_shot_and_caches_pricing_per_model() -> None:
