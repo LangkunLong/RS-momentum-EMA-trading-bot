@@ -183,7 +183,7 @@ def test_task3_models_and_limits_validate_exact_boundaries() -> None:
 
     models = ModelConfig()
     assert models.orchestrator == "qwen/qwen3-next-80b-a3b-instruct"
-    assert models.reasoner == "qwen/qwen3-next-80b-a3b-instruct"
+    assert models.reasoner == "deepseek/deepseek-r1"
     assert models.coder == "deepseek/deepseek-chat"
     with pytest.raises(ConfigurationError, match="model slug"):
         ModelConfig(coder="bad model")
@@ -2106,7 +2106,10 @@ def test_generation_accounting_prefers_complete_native_token_pair() -> None:
         ("normalized_tokens_invalid", "normalized_token_pair_invalid"),
         ("optional_token_invalid", "optional_token_invalid"),
         ("cached_exceeds_prompt", "cached_exceeds_prompt"),
-        ("reasoning_exceeds_completion", "reasoning_exceeds_completion"),
+        (
+            "reasoning_exceeds_completion_without_normalized_pair",
+            "normalized_token_pair_invalid",
+        ),
     ),
 )
 def test_generation_accounting_uses_closed_content_free_usage_subcodes(
@@ -2140,10 +2143,11 @@ def test_generation_accounting_uses_closed_content_free_usage_subcodes(
         data["native_tokens_prompt"] = 11
         data["native_tokens_completion"] = 7
         data["native_tokens_cached"] = 12
-    elif case == "reasoning_exceeds_completion":
+    elif case == "reasoning_exceeds_completion_without_normalized_pair":
         data["native_tokens_prompt"] = 11
         data["native_tokens_completion"] = 7
         data["native_tokens_reasoning"] = 8
+        data["tokens_completion"] = "provider-secret-tokens"
     else:  # pragma: no cover - parameter table is closed above
         raise AssertionError(case)
 
@@ -2180,12 +2184,11 @@ def test_generation_accounting_never_mixes_native_details_with_normalized_pair()
     assert usage.reasoning_tokens is None
 
 
-def test_generation_accounting_four_misses_then_invalid_record_is_fail_closed() -> None:
-    """The observed 404x4 -> invalid-record timeline stops one paid call exactly."""
+def test_generation_accounting_four_misses_then_uses_normalized_reasoning_fallback() -> None:
+    """The observed native reasoning drift falls back to the complete normalized pair."""
     from agent_loop import (
         BudgetLedger,
         GatewayError,
-        IncompleteAccountingError,
         OpenRouterGateway,
         Route,
     )
@@ -2239,23 +2242,21 @@ def test_generation_accounting_four_misses_then_invalid_record_is_fail_closed() 
         ledger=ledger,
     )
 
-    with pytest.raises(IncompleteAccountingError) as raised:
-        gateway.request_once("reasoner", "sealed evidence", Route.from_json)
+    completion = gateway.request_once("reasoner", "sealed evidence", Route.from_json)
 
-    facts = raised.value.facts
-    assert facts.inline_failure_code.value == "inline_reasoning_exceeds_completion"
-    assert facts.recovery_failure_code.value == "recovery_usage_invalid"
-    assert facts.recovery_usage_diagnostic.value == "reasoning_exceeds_completion"
-    assert facts.generation_attempts == 5
-    assert facts.response_id_safe is True
+    assert completion.usage.prompt_tokens == 11
+    assert completion.usage.completion_tokens == 7
+    assert completion.usage.total_tokens == 18
+    assert completion.usage.cached_tokens is None
+    assert completion.usage.reasoning_tokens is None
+    assert completion.usage.accounting_source == "generation_endpoint"
     assert polls == [generation_id] * 5
     assert sleeps == [1.0, 2.0, 4.0, 8.0]
     assert len(client.completions.calls) == 1
     assert ledger.calls == 1
-    assert ledger.incomplete_accounting_calls == 1
-    assert facts.retained_reservation_tokens == ledger.retained_reservation_tokens
-    assert facts.retained_reservation_usd == pytest.approx(ledger.retained_reservation_usd)
-    assert "provider" not in json.dumps(asdict(facts))
+    assert ledger.incomplete_accounting_calls == 0
+    assert ledger.total_tokens == 18
+    assert ledger.spent_usd == pytest.approx(0.012)
 
 
 def test_generation_accounting_fetch_rejects_redirect_without_forwarding_key(
@@ -2397,7 +2398,7 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
         ),
         (
             "reasoner",
-            "qwen/qwen3-next-80b-a3b-instruct",
+            "deepseek/deepseek-r1",
             _plan_json(),
             ReasoningPlan.from_json,
             4096,
@@ -2545,7 +2546,7 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
     """The reasoner prompt makes the strict seven-field schema mechanically checkable."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ReasoningPlan
 
-    model = "qwen/qwen3-next-80b-a3b-instruct"
+    model = "deepseek/deepseek-r1"
     plan = json.dumps(
         {
             "diagnosis": "The measured return misses the configured threshold.",
@@ -2917,7 +2918,7 @@ def test_gateway_uses_immutable_three_message_prefix_and_reasoner_cap() -> None:
     call = client.completions.calls[0]
 
     assert completion.payload.diagnosis == "A boundary is wrong."
-    assert call["model"] == "qwen/qwen3-next-80b-a3b-instruct"
+    assert call["model"] == "deepseek/deepseek-r1"
     assert call["max_tokens"] == 4096
     assert call["response_format"] == {"type": "json_object"}
     assert call["stream"] is False
@@ -7128,7 +7129,7 @@ class _StrictBatchGateway:
         self.ledger.reconcile(reservation, usage, window=budget_window)
         model = {
             "orchestrator": "qwen/qwen3-next-80b-a3b-instruct",
-            "reasoner": "qwen/qwen3-next-80b-a3b-instruct",
+            "reasoner": "deepseek/deepseek-r1",
             "coder": "deepseek/deepseek-chat",
         }[role]
         return AgentCompletion(outcome, usage, "stop", model)
@@ -7487,8 +7488,8 @@ def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
     facts = ProviderCallFacts(
         call_index=2,
         role="reasoner",
-        requested_model="qwen/qwen3-next-80b-a3b-instruct",
-        returned_model="qwen/qwen3-next-80b-a3b-instruct",
+        requested_model="deepseek/deepseek-r1",
+        returned_model="deepseek/deepseek-r1",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=10,
