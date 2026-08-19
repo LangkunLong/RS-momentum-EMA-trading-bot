@@ -1103,6 +1103,21 @@ def _load_current_pricing(model: str) -> Mapping[str, float]:
     raise ConfigurationError(f"OpenRouter did not return pricing for {model}")
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Make all generation-accounting redirects terminal before headers can be copied."""
+
+    def redirect_request(
+        self,
+        req: object,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> None:
+        return None
+
+
 class OpenRouterGateway:
     """Injectable, non-streaming OpenRouter chat-completions gateway."""
 
@@ -1300,7 +1315,8 @@ class OpenRouterGateway:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(  # noqa: S310
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            with opener.open(  # noqa: S310
                 request,
                 timeout=min(self.timeout_seconds, 5.0),
             ) as response:

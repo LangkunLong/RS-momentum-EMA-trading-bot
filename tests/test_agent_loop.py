@@ -1020,6 +1020,47 @@ def test_generation_accounting_prefers_complete_native_token_pair() -> None:
     assert usage.accounting_source == "generation_endpoint"
 
 
+def test_generation_accounting_fetch_rejects_redirect_without_forwarding_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bearer credential must never follow provider/proxy redirects."""
+    import urllib.error
+    from agent_loop import BudgetLedger, GatewayError, OpenRouterGateway, _NoRedirectHandler
+
+    secret = "openrouter-secret-canary"
+    opens: list[object] = []
+    handlers: list[object] = []
+
+    class RedirectingOpener:
+        def open(self, request: Any, *, timeout: float) -> object:
+            opens.append((request, timeout))
+            raise urllib.error.HTTPError(
+                request.full_url,
+                302,
+                "redirect",
+                {"Location": "https://attacker.invalid/steal"},
+                None,
+            )
+
+    def build_opener(*values: object) -> RedirectingOpener:
+        handlers.extend(values)
+        return RedirectingOpener()
+
+    monkeypatch.setattr("agent_loop.urllib.request.build_opener", build_opener)
+    gateway = OpenRouterGateway(
+        api_key=secret,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    with pytest.raises(GatewayError) as raised:
+        gateway._load_generation_accounting("gen-safe123")
+    assert len(opens) == 1
+    assert len(handlers) == 1 and isinstance(handlers[0], _NoRedirectHandler)
+    assert secret not in str(raised.value)
+    assert "attacker" not in str(raised.value)
+
+
 def test_recovered_generation_overage_commits_before_failing_closed() -> None:
     """Recovered authoritative cost must be committed even when it exceeds the canary window."""
     from agent_loop import (
