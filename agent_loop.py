@@ -143,6 +143,27 @@ class ResponseValidationError(ValueError):
     """Raised when a provider response is incomplete or not a valid protocol object."""
 
 
+class ProtocolFailureCode(str, Enum):
+    """Closed, content-free stage for an authoritatively accounted rejection."""
+
+    RESPONSE_SEMANTICS_INVALID = "response_semantics_invalid"
+    REFUSAL = "refusal"
+    CONTENT_SHAPE_INVALID = "content_shape_invalid"
+    PAYLOAD_SCHEMA_INVALID = "payload_schema_invalid"
+    MODEL_MISMATCH = "model_mismatch"
+    VALIDATOR_BOUNDARY_INVALID = "validator_boundary_invalid"
+
+
+class ClosedResponseValidationError(ResponseValidationError):
+    """A response rejection carrying only a controller-owned closed stage code."""
+
+    def __init__(self, message: str, code: ProtocolFailureCode) -> None:
+        if not isinstance(code, ProtocolFailureCode):
+            raise ConfigurationError("protocol failure code is invalid")
+        super().__init__(message)
+        self.code = code
+
+
 class AccountingFailureCode(str, Enum):
     """Closed, content-free reason codes for strict accounting failures."""
 
@@ -619,6 +640,7 @@ class ProviderCallFacts:
     finish_reason: str
     usage: Usage
     response_schema_valid: bool
+    protocol_failure_code: ProtocolFailureCode | None = None
 
     def __post_init__(self) -> None:
         if type(self.call_index) is not int or self.call_index < 1:
@@ -650,6 +672,11 @@ class ProviderCallFacts:
             raise ConfigurationError("provider call fact token total is inconsistent")
         if type(self.response_schema_valid) is not bool:
             raise ConfigurationError("provider response schema fact must be boolean")
+        if self.response_schema_valid:
+            if self.protocol_failure_code is not None:
+                raise ConfigurationError("validated provider response cannot have a failure code")
+        elif not isinstance(self.protocol_failure_code, ProtocolFailureCode):
+            raise ConfigurationError("rejected provider response requires a closed failure code")
 
 
 class AccountedCallError(Exception):
@@ -709,6 +736,7 @@ class ProviderCallRecord:
     total_tokens: int
     cost_usd: float
     accounting_source: str = "inline"
+    protocol_failure_code: ProtocolFailureCode | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -744,6 +772,11 @@ class ProviderCallRecord:
             raise ConfigurationError("accepted provider call must have a validated response")
         if self.outcome == "protocol_invalid" and self.response_schema_valid is not False:
             raise ConfigurationError("protocol-invalid provider call cannot be schema-valid")
+        if self.response_schema_valid:
+            if self.protocol_failure_code is not None:
+                raise ConfigurationError("validated provider call cannot have a failure code")
+        elif not isinstance(self.protocol_failure_code, ProtocolFailureCode):
+            raise ConfigurationError("rejected provider call requires a closed failure code")
         Usage(
             prompt_tokens=self.prompt_tokens,
             completion_tokens=self.completion_tokens,
@@ -1881,21 +1914,11 @@ class OpenRouterGateway:
         except Exception:
             self.ledger.reconcile(reservation, Usage(), window=budget_window)
             raise
-        facts = (
-            self._provider_call_facts(
-                role,
-                model,
-                response,
-                usage,
-                response_schema_valid=False,
-            )
-            if require_complete_accounting
-            else None
-        )
         try:
             if not recovered_semantics_valid:
-                raise ResponseValidationError(
-                    "generation response semantics are not acceptable"
+                raise ClosedResponseValidationError(
+                    "generation response semantics are not acceptable",
+                    ProtocolFailureCode.RESPONSE_SEMANTICS_INVALID,
                 )
             completion = self._validate_response(
                 response,
@@ -1905,30 +1928,46 @@ class OpenRouterGateway:
                 usage=usage,
             )
         except Exception as exc:
+            protocol_failure_code = (
+                exc.code
+                if isinstance(exc, ClosedResponseValidationError)
+                else ProtocolFailureCode.VALIDATOR_BOUNDARY_INVALID
+            )
+            rejected_facts = (
+                self._provider_call_facts(
+                    role,
+                    model,
+                    response,
+                    usage,
+                    response_schema_valid=False,
+                    protocol_failure_code=protocol_failure_code,
+                )
+                if require_complete_accounting
+                else None
+            )
             try:
                 self.ledger.reconcile(reservation, usage, window=budget_window)
             except BudgetExceededError as budget_exc:
-                if facts is None:
+                if rejected_facts is None:
                     raise
                 raise AccountedBudgetExceededError(
-                    "provider accounting exceeded a rollout limit", facts
+                    "provider accounting exceeded a rollout limit", rejected_facts
                 ) from budget_exc
-            if facts is None:
+            if rejected_facts is None:
                 raise
             raise AccountedResponseValidationError(
-                "provider response failed strict protocol validation", facts
+                "provider response failed strict protocol validation", rejected_facts
             ) from exc
         accepted_facts = (
-            ProviderCallFacts(
-                call_index=facts.call_index,
-                role=facts.role,
-                requested_model=facts.requested_model,
-                returned_model=facts.returned_model,
-                finish_reason=facts.finish_reason,
-                usage=facts.usage,
+            self._provider_call_facts(
+                role,
+                model,
+                response,
+                usage,
                 response_schema_valid=True,
+                protocol_failure_code=None,
             )
-            if facts is not None
+            if require_complete_accounting
             else None
         )
         try:
@@ -1949,6 +1988,7 @@ class OpenRouterGateway:
         usage: Usage,
         *,
         response_schema_valid: bool,
+        protocol_failure_code: ProtocolFailureCode | None,
     ) -> ProviderCallFacts:
         choices = _read_field(response, "choices")
         if isinstance(choices, (list, tuple)) and len(choices) == 1:
@@ -1970,6 +2010,7 @@ class OpenRouterGateway:
             finish_reason=finish_reason,
             usage=usage,
             response_schema_valid=response_schema_valid,
+            protocol_failure_code=protocol_failure_code,
         )
 
     def _validate_response(
@@ -1989,26 +2030,44 @@ class OpenRouterGateway:
             )
         choices = _read_field(response, "choices")
         if not isinstance(choices, (list, tuple)) or len(choices) != 1:
-            raise ResponseValidationError("response must contain exactly one choice")
+            raise ClosedResponseValidationError(
+                "response must contain exactly one choice",
+                ProtocolFailureCode.RESPONSE_SEMANTICS_INVALID,
+            )
         choice = choices[0]
         if _read_field(choice, "finish_reason") != "stop":
-            raise ResponseValidationError("response finish_reason must be stop")
+            raise ClosedResponseValidationError(
+                "response finish_reason must be stop",
+                ProtocolFailureCode.RESPONSE_SEMANTICS_INVALID,
+            )
         message = _read_field(choice, "message")
         if _read_field(message, "refusal") is not None:
-            raise ResponseValidationError("response contains a refusal")
+            raise ClosedResponseValidationError(
+                "response contains a refusal",
+                ProtocolFailureCode.REFUSAL,
+            )
         content = _read_field(message, "content")
         if not isinstance(content, str) or not content.strip():
-            raise ResponseValidationError("response must contain nonblank text content")
+            raise ClosedResponseValidationError(
+                "response must contain nonblank text content",
+                ProtocolFailureCode.CONTENT_SHAPE_INVALID,
+            )
         try:
             payload = parser(content)
         except ProtocolValidationError as exc:
-            raise ResponseValidationError("response protocol validation failed") from exc
+            raise ClosedResponseValidationError(
+                "response protocol validation failed",
+                ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
+            ) from exc
         normalized_usage = usage or _usage_from_response(
             response, require_complete=require_complete_accounting
         )
         returned_model = _read_field(response, "model")
         if require_complete_accounting and returned_model != expected_model:
-            raise ResponseValidationError("response model does not match the requested model")
+            raise ClosedResponseValidationError(
+                "response model does not match the requested model",
+                ProtocolFailureCode.MODEL_MISMATCH,
+            )
         return AgentCompletion(
             payload=payload,
             usage=normalized_usage,
@@ -6795,6 +6854,8 @@ class AuditTrail:
             "outcome": record.outcome,
             "artifact_sha256": digest,
         }
+        if record.protocol_failure_code is not None:
+            details["protocol_failure_code"] = record.protocol_failure_code.value
         if payload_sha256 is not None:
             details["payload_sha256"] = payload_sha256
         self.append_event(
@@ -7579,6 +7640,19 @@ def run_proposal_batch(
         check_wall()
         if ordinal != {"orchestrator": 1, "reasoner": 2, "coder": 3}.get(role):
             raise ConfigurationError("proposal batch role order is invalid")
+        ledger_before = (
+            ledger.calls,
+            ledger.prompt_tokens,
+            ledger.completion_tokens,
+            ledger.total_tokens,
+            ledger.spent_usd,
+            ledger.authoritative_usd,
+            ledger.reserved_usd,
+            ledger.reserved_tokens,
+            ledger.incomplete_accounting_calls,
+            ledger.retained_reservation_tokens,
+            ledger.retained_reservation_usd,
+        )
         try:
             completion = services.gateway.request_once(
                 role,
@@ -7600,6 +7674,59 @@ def run_proposal_batch(
             assert usage.completion_tokens is not None
             assert usage.total_tokens is not None
             assert usage.cost_usd is not None
+            (
+                calls_before,
+                prompt_before,
+                completion_before,
+                total_before,
+                spent_usd_before,
+                authoritative_usd_before,
+                reserved_usd_before,
+                reserved_tokens_before,
+                incomplete_before,
+                retained_tokens_before,
+                retained_usd_before,
+            ) = ledger_before
+            if (
+                facts.call_index != ledger.calls
+                or ledger.calls != calls_before + 1
+                or facts.role != role
+                or facts.requested_model != role_models[role]
+                or ledger.prompt_tokens - prompt_before != usage.prompt_tokens
+                or ledger.completion_tokens - completion_before != usage.completion_tokens
+                or ledger.total_tokens - total_before != usage.total_tokens
+                or not math.isclose(
+                    ledger.spent_usd - spent_usd_before,
+                    usage.cost_usd,
+                    rel_tol=1e-12,
+                    abs_tol=1e-15,
+                )
+                or not math.isclose(
+                    ledger.authoritative_usd - authoritative_usd_before,
+                    usage.cost_usd,
+                    rel_tol=1e-12,
+                    abs_tol=1e-15,
+                )
+                or not math.isclose(
+                    ledger.reserved_usd - reserved_usd_before,
+                    usage.cost_usd,
+                    rel_tol=1e-12,
+                    abs_tol=1e-15,
+                )
+                or ledger.reserved_tokens - reserved_tokens_before
+                != usage.total_tokens
+                or ledger.incomplete_accounting_calls != incomplete_before
+                or ledger.retained_reservation_tokens != retained_tokens_before
+                or not math.isclose(
+                    ledger.retained_reservation_usd,
+                    retained_usd_before,
+                    rel_tol=1e-12,
+                    abs_tol=1e-15,
+                )
+            ):
+                raise ConfigurationError(
+                    "accounted provider diagnostic does not match the active paid call"
+                ) from exc
             record = ProviderCallRecord(
                 schema_version=1,
                 call_index=facts.call_index,
@@ -7619,6 +7746,7 @@ def run_proposal_batch(
                 total_tokens=usage.total_tokens,
                 cost_usd=usage.cost_usd,
                 accounting_source=usage.accounting_source,
+                protocol_failure_code=facts.protocol_failure_code,
             )
             path, digest = audit.write_provider_call(record)
             provider_call_artifacts.append((record.call_index, outcome, path, digest))

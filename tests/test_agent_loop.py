@@ -2148,6 +2148,43 @@ def test_strict_protocol_failure_retains_complete_authoritative_accounting() -> 
     assert ledger.completion_tokens == 7
 
 
+@pytest.mark.parametrize(
+    ("raw_content", "expected_code"),
+    (
+        ("", "content_shape_invalid"),
+        ("{not-json-provider-canary", "payload_schema_invalid"),
+    ),
+)
+def test_accounted_protocol_rejection_has_closed_content_free_stage(
+    raw_content: str,
+    expected_code: str,
+) -> None:
+    """A rejected paid response exposes only its closed validation stage."""
+    from agent_loop import (
+        AccountedResponseValidationError,
+        BudgetLedger,
+        OpenRouterGateway,
+        Route,
+    )
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    gateway = OpenRouterGateway(
+        client=FakeClient([FakeResponse(raw_content, cost=0.012, model=model)]),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0, max_calls=1, max_tokens=10_000),
+    )
+
+    with pytest.raises(AccountedResponseValidationError) as raised:
+        gateway.request_once("orchestrator", "sealed evidence", Route.from_json)
+
+    facts = raised.value.facts
+    assert facts.protocol_failure_code == expected_code
+    assert facts.response_schema_valid is False
+    assert facts.usage.cost_usd == pytest.approx(0.012)
+    if raw_content:
+        assert raw_content not in json.dumps(asdict(facts), sort_keys=True)
+
+
 def test_budget_window_caps_canary_calls_and_reserved_usd() -> None:
     """Break caught: the canary could consume rollout budget before it was accepted."""
     from agent_loop import BudgetExceededError, BudgetLedger, BudgetWindow, Pricing, Usage
@@ -2261,7 +2298,13 @@ def test_provider_call_audit_binds_validated_payload_and_contains_no_content(
 
 def test_accepted_provider_call_audit_requires_validated_payload_digest(tmp_path: Path) -> None:
     """Break caught: an accepted paid call could be chained without its model payload."""
-    from agent_loop import AuditError, AuditTrail, ProviderCallRecord
+    from agent_loop import (
+        AuditError,
+        AuditTrail,
+        ProtocolFailureCode,
+        ProviderCallRecord,
+        verify_audit_chain,
+    )
 
     audit = AuditTrail(tmp_path.resolve(), "run-20260819T010203Z-abcdef123456")
     record = ProviderCallRecord(
@@ -2305,9 +2348,22 @@ def test_accepted_provider_call_audit_requires_validated_payload_digest(tmp_path
         reasoning_tokens=5,
         total_tokens=18,
         cost_usd=0.02,
+        protocol_failure_code=ProtocolFailureCode.RESPONSE_SEMANTICS_INVALID,
     )
     with pytest.raises(AuditError, match="cannot bind"):
         audit.write_provider_call(rejected, payload_sha256="a" * 64)
+
+    rejected_path, rejected_digest = audit.write_provider_call(rejected)
+    rejected_payload = json.loads(rejected_path.read_text(encoding="utf-8"))
+    assert rejected_payload["protocol_failure_code"] == "response_semantics_invalid"
+    rejected_event = verify_audit_chain(audit.events_path)[0]
+    assert rejected_event["details"] == {
+        "artifact_sha256": rejected_digest,
+        "call_index": 2,
+        "outcome": "protocol_invalid",
+        "protocol_failure_code": "response_semantics_invalid",
+        "role": "reasoner",
+    }
 
 
 @pytest.mark.parametrize("max_usd", [0.0, -1.0, float("nan"), float("inf")])
@@ -6344,6 +6400,7 @@ class _StrictBatchGateway:
         monotonic: Any = None,
     ) -> Any:
         from agent_loop import (
+            AccountedCallError,
             AccountedBudgetExceededError,
             AgentCompletion,
             BudgetExceededError,
@@ -6355,6 +6412,18 @@ class _StrictBatchGateway:
         self.dynamic_inputs.append((role, dynamic_input))
         reservation = self.ledger.reserve("x", 10, Pricing(0.0, 0.0), window=budget_window)
         outcome = self.outcomes.pop(0)
+        if isinstance(outcome, _CorruptCommittedAccountedOutcome):
+            self.roles.append(role)
+            self.ledger.reconcile(
+                reservation, outcome.error.facts.usage, window=budget_window
+            )
+            self.ledger.reserved_usd = 0.0
+            self.ledger.reserved_tokens = 0
+            raise outcome.error
+        if isinstance(outcome, AccountedCallError):
+            self.roles.append(role)
+            self.ledger.reconcile(reservation, outcome.facts.usage, window=budget_window)
+            raise outcome
         if isinstance(outcome, ProviderCallFacts):
             self.roles.append(role)
             try:
@@ -6383,6 +6452,11 @@ class _StrictBatchGateway:
             "coder": "deepseek/deepseek-chat",
         }[role]
         return AgentCompletion(outcome, usage, "stop", model)
+
+
+@dataclass(frozen=True)
+class _CorruptCommittedAccountedOutcome:
+    error: Any
 
 
 def _gate_evidence(passed: bool) -> Any:
@@ -6663,6 +6737,112 @@ def test_proposal_batch_failure_stops_before_the_next_role_or_sample(tmp_path: P
         assert result.completed_samples == 0
         assert result.budget.api_calls == 1
         assert gateway.roles == ["orchestrator"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_rejects_accounted_facts_not_bound_to_active_call(
+    tmp_path: Path,
+) -> None:
+    """A faulty strict gateway cannot chain another role's closed-looking facts."""
+    from agent_loop import (
+        AccountedResponseValidationError,
+        ProtocolFailureCode,
+        ProviderCallFacts,
+        Usage,
+        verify_audit_chain,
+    )
+
+    fabricated = ProviderCallFacts(
+        call_index=99,
+        role="coder",
+        requested_model="deepseek/deepseek-chat",
+        returned_model="deepseek/deepseek-chat",
+        finish_reason="stop",
+        usage=Usage(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            cached_tokens=0,
+            reasoning_tokens=0,
+            cost_usd=0.001,
+        ),
+        response_schema_valid=False,
+        protocol_failure_code=ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[
+            _loop_route(),
+            AccountedResponseValidationError("provider-canary", fabricated),
+            _loop_proposal(),
+        ],
+    )
+    try:
+        assert result.failure_code == "controller_boundary_error"
+        assert gateway.roles == ["orchestrator", "reasoner"]
+        assert len(result.provider_call_artifacts) == 1
+        assert not (result.audit_path / "provider-call-0099.json").exists()
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        assert not any(
+            event["event"] == "provider_call_rejected"
+            and event["details"].get("call_index") == 99
+            for event in events
+        )
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
+    tmp_path: Path,
+) -> None:
+    """A strict gateway cannot understate committed spend/tokens after reconciliation."""
+    from agent_loop import (
+        AccountedResponseValidationError,
+        ProtocolFailureCode,
+        ProviderCallFacts,
+        Usage,
+        verify_audit_chain,
+    )
+
+    facts = ProviderCallFacts(
+        call_index=2,
+        role="reasoner",
+        requested_model="deepseek/deepseek-r1",
+        returned_model="deepseek/deepseek-r1",
+        finish_reason="stop",
+        usage=Usage(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            cached_tokens=0,
+            reasoning_tokens=0,
+            cost_usd=0.001,
+        ),
+        response_schema_valid=False,
+        protocol_failure_code=ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[
+            _loop_route(),
+            _CorruptCommittedAccountedOutcome(
+                AccountedResponseValidationError("provider-canary", facts)
+            ),
+            _loop_proposal(),
+        ],
+    )
+    try:
+        assert result.failure_code == "controller_boundary_error"
+        assert gateway.roles == ["orchestrator", "reasoner"]
+        assert len(result.provider_call_artifacts) == 1
+        assert not (result.audit_path / "provider-call-0002.json").exists()
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        assert not any(event["event"] == "provider_call_rejected" for event in events)
         assert not candidate.root.exists()
     finally:
         external.cleanup()
