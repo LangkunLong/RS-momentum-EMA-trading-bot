@@ -39,7 +39,7 @@ from typing import Any, BinaryIO, Callable, Generic, Mapping, Protocol, Sequence
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
-REASONER_MODEL = "deepseek/deepseek-r1"
+REASONER_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
 CODER_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
@@ -1490,11 +1490,10 @@ def _usage_from_generation_record(
                 RecoveryUsageDiagnosticCode.OPTIONAL_TOKEN_INVALID
             ),
         ) from exc
-    if (
-        token_basis is _GenerationTokenBasis.NATIVE
-        and cached_tokens is not None
-        and cached_tokens > prompt_tokens
-    ):
+    if token_basis is _GenerationTokenBasis.NORMALIZED:
+        cached_tokens = None
+        reasoning_tokens = None
+    elif cached_tokens is not None and cached_tokens > prompt_tokens:
         raise AccountingValidationError(
             "generation cached token accounting is inconsistent",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
@@ -1502,29 +1501,14 @@ def _usage_from_generation_record(
                 RecoveryUsageDiagnosticCode.CACHED_EXCEEDS_PROMPT
             ),
         )
-    if (
-        token_basis is _GenerationTokenBasis.NATIVE
-        and reasoning_tokens is not None
-        and reasoning_tokens > completion_tokens
-    ):
-        normalized_prompt = _non_negative_int(_present_field(data, "tokens_prompt"))
-        normalized_completion = _non_negative_int(
-            _present_field(data, "tokens_completion")
+    elif reasoning_tokens is not None and reasoning_tokens > completion_tokens:
+        raise AccountingValidationError(
+            "generation reasoning token accounting is inconsistent",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=(
+                RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
+            ),
         )
-        if normalized_prompt is None or normalized_completion is None:
-            raise AccountingValidationError(
-                "generation normalized token accounting is incomplete",
-                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-                recovery_usage_diagnostic=(
-                    RecoveryUsageDiagnosticCode.NORMALIZED_TOKEN_PAIR_INVALID
-                ),
-            )
-        prompt_tokens = normalized_prompt
-        completion_tokens = normalized_completion
-        token_basis = _GenerationTokenBasis.NORMALIZED
-    if token_basis is _GenerationTokenBasis.NORMALIZED:
-        cached_tokens = None
-        reasoning_tokens = None
     return Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
