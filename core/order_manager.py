@@ -85,6 +85,15 @@ class EntrySubmissionOutcome:
     error: str = ""
 
 
+class PendingExitSafetyError(RuntimeError):
+    """Signal an unresolved exit that must remain unhealthy until convergence."""
+
+    def __init__(self, message: str, *, symbol: str, workflow_id: str) -> None:
+        super().__init__(message)
+        self.symbol = symbol.strip().upper()
+        self.workflow_id = workflow_id
+
+
 class OrderManager:
     """Own the end-to-end execution lifecycle for orders."""
 
@@ -2317,6 +2326,15 @@ class OrderManager:
         if protection.action == "pending_exit":
             return protection
         if not protection.success:
+            if protection.action == "exit_outcome_unresolved":
+                raise PendingExitSafetyError(
+                    (
+                        f"Safety remains unproven for {normalized_symbol}: "
+                        f"{protection.error or protection.action}"
+                    ),
+                    symbol=normalized_symbol,
+                    workflow_id=workflow.workflow_id,
+                )
             raise RuntimeError(
                 f"Safety remains unproven for {normalized_symbol}: "
                 f"{protection.error or protection.action}"

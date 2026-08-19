@@ -7,6 +7,7 @@ the OrderManager so workflow transitions stay centralized and auditable.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from typing import Any
@@ -14,8 +15,10 @@ from typing import Any
 from alpaca.trading.stream import TradingStream
 
 from config import settings
+from core.execution_store import get_execution_store
+from core.execution_workflow import build_stop_client_order_id
 from core.order_execution import require_paper_mode
-from core.order_manager import OrderManager
+from core.order_manager import OrderManager, PendingExitSafetyError
 
 
 _STOP_JOIN_TIMEOUT_SECS = 5.0
@@ -36,12 +39,24 @@ class FillMonitor:
         self._thread: threading.Thread | None = None
         self._running = False
         self._handler_fault = False
+        self._pending_exit_faults: set[tuple[str, str]] = set()
+        self._health_lock = threading.Lock()
 
         async def _on_trade_update(data: Any) -> None:  # noqa: ANN401
             try:
                 await asyncio.to_thread(self._dispatch, data)
+                self._clear_converged_exit_fault(data)
+            except PendingExitSafetyError as exc:
+                if self._is_expected_stop_cancel(data, exc):
+                    with self._health_lock:
+                        self._pending_exit_faults.add((exc.symbol, exc.workflow_id))
+                else:
+                    with self._health_lock:
+                        self._handler_fault = True
+                print(f"[FILL MONITOR] Trade update handler error: {exc}")
             except Exception as exc:  # noqa: BLE001
-                self._handler_fault = True
+                with self._health_lock:
+                    self._handler_fault = True
                 print(f"[FILL MONITOR] Trade update handler error: {exc}")
 
         self._stream.subscribe_trade_updates(_on_trade_update)
@@ -110,12 +125,67 @@ class FillMonitor:
 
     def is_connected(self) -> bool:
         """Return True only while the wrapper and SDK stream are healthy."""
+        with self._health_lock:
+            handler_healthy = not self._handler_fault and not self._pending_exit_faults
         return (
             self._running
             and self.is_running()
             and bool(getattr(self._stream, "_running", False))
-            and not self._handler_fault
+            and handler_healthy
         )
+
+    @staticmethod
+    def _is_expected_stop_cancel(
+        data: Any,
+        error: PendingExitSafetyError,
+    ) -> bool:
+        """Classify the exact zero-fill stop cancellation for one pending exit."""
+        if _normalize_enum_like(getattr(data, "event", "")) != "canceled":
+            return False
+        order = getattr(data, "order", None)
+        if order is None:
+            return False
+        try:
+            filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        stop_client_order_id = str(getattr(order, "client_order_id", "") or "")
+        stop_base = build_stop_client_order_id(error.workflow_id)
+        return bool(
+            str(getattr(order, "symbol", "")).strip().upper() == error.symbol
+            and _normalize_enum_like(getattr(order, "side", "")) == "sell"
+            and _normalize_enum_like(getattr(order, "type", ""))
+            in {"stop", "stop_limit"}
+            and math.isfinite(filled_qty)
+            and filled_qty == 0.0
+            and (
+                stop_client_order_id == stop_base
+                or stop_client_order_id.startswith(f"{stop_base}-")
+            )
+        )
+
+    def _clear_converged_exit_fault(self, data: Any) -> None:
+        """Clear only obligations whose successful sell fill resolved durable state."""
+        if _normalize_enum_like(getattr(data, "event", "")) != "fill":
+            return
+        order = getattr(data, "order", None)
+        if order is None or _normalize_enum_like(getattr(order, "side", "")) != "sell":
+            return
+        symbol = str(getattr(order, "symbol", "")).strip().upper()
+        with self._health_lock:
+            candidates = {
+                item for item in self._pending_exit_faults if item[0] == symbol
+            }
+        if not candidates:
+            return
+        pending = get_execution_store().load_pending_submission_intents(symbol=symbol)
+        unresolved_workflow_ids = {
+            str(intent.get("workflow_id", "") or "") for intent in pending
+        }
+        with self._health_lock:
+            self._pending_exit_faults.difference_update(
+                item for item in candidates if item[1] not in unresolved_workflow_ids
+            )
 
     def _run_stream(self) -> None:
         """Entry point for the daemon thread — runs the asyncio event loop."""

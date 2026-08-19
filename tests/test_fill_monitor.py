@@ -51,6 +51,56 @@ def _make_event(event: str, order: SimpleNamespace) -> SimpleNamespace:
     return SimpleNamespace(event=event, order=order)
 
 
+def _persist_pending_exit():
+    """Create the durable one-share exit saga used by stream-health tests."""
+    from core.execution_workflow import (
+        EntryExecutionPlan,
+        create_entry_workflow,
+        reset_workflow_state,
+    )
+
+    reset_workflow_state()
+    plan = EntryExecutionPlan(
+        symbol="NVDA",
+        entry_price=500.0,
+        price_source="test",
+        stop_price=465.0,
+        stop_loss_pct=0.07,
+        position_value=500.0,
+        risk_amount=35.0,
+        risk_per_share=35.0,
+        qty=1.0,
+        canslim_score=80.0,
+        rs_score=90.0,
+        is_breakout=True,
+        has_volume_surge=True,
+    )
+    workflow = create_entry_workflow(plan, signal_payload={"symbol": "NVDA"})
+    workflow.mark_buy_fill(
+        qty=1.0,
+        fill_price=500.0,
+        broker_order_id="entry-filled",
+    )
+    stop_client_order_id = f"{workflow.workflow_id}-sl-live"
+    workflow.mark_protective_stop(
+        success=True,
+        stop_order_id="protective-stop",
+        stop_price=465.0,
+        action="submitted",
+        stop_client_order_id=stop_client_order_id,
+    )
+    exit_client_order_id = f"{workflow.workflow_id}-exit"
+    workflow.mark_exit_submission_intent(
+        exit_reason="supervised verification cleanup",
+        client_order_id=exit_client_order_id,
+    )
+    workflow.mark_exit_order_submitted(
+        exit_reason="supervised verification cleanup",
+        broker_order_id="market-exit",
+    )
+    return workflow, stop_client_order_id, exit_client_order_id
+
+
 def _build_monitor_with_mock_stream():
     """Construct a FillMonitor where TradingStream is replaced by a mock."""
     registered_handlers: dict[str, list] = {"trade_updates": []}
@@ -135,6 +185,22 @@ class TestHandlerRegistration:
         assert "first dispatch failed" in capsys.readouterr().out
         assert monitor.is_connected() is False
 
+    def test_post_dispatch_health_reconciliation_error_is_contained(self, capsys):
+        monitor, mock_stream, handlers = _build_monitor_with_mock_stream()
+        monitor._running = True
+        monitor._thread = MagicMock()
+        monitor._thread.is_alive.return_value = True
+        mock_stream._running = True
+        monitor._dispatch = MagicMock()
+        monitor._clear_converged_exit_fault = MagicMock(
+            side_effect=RuntimeError("health reconciliation failed")
+        )
+
+        asyncio.run(handlers["trade_updates"][0](SimpleNamespace(sequence=1)))
+
+        assert "health reconciliation failed" in capsys.readouterr().out
+        assert monitor.is_connected() is False
+
     def test_fill_monitor_constructed_with_paper_true(self):
         with patch("fill_monitor.TradingStream") as mock_cls, \
              patch("fill_monitor.require_paper_mode"):
@@ -144,6 +210,233 @@ class TestHandlerRegistration:
         mock_cls.assert_called_once()
         _, kwargs = mock_cls.call_args
         assert kwargs.get("paper") is True or mock_cls.call_args[0][2] is True
+
+    def test_pending_exit_fault_clears_after_exact_sell_fill(self, tmp_path):
+        from core.execution_store import get_execution_store
+        from core.order_execution import ProtectiveStopResult
+        from core.order_manager import OrderManager
+
+        db_path = tmp_path / "pending-exit-stream.sqlite3"
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            workflow, stop_client_order_id, exit_client_order_id = (
+                _persist_pending_exit()
+            )
+            monitor, mock_stream, handlers = _build_monitor_with_mock_stream()
+            monitor._order_manager = OrderManager(paper=True)
+            monitor._running = True
+            monitor._thread = MagicMock()
+            monitor._thread.is_alive.return_value = True
+            mock_stream._running = True
+            lagged_exit = ProtectiveStopResult(
+                success=False,
+                order_id="",
+                symbol="NVDA",
+                qty=1.0,
+                stop_price=465.0,
+                action="exit_outcome_unresolved",
+                error="exact exit is not visible yet",
+            )
+            stop_cancel = _make_event(
+                "canceled",
+                _make_order(
+                    broker_order_id="protective-stop",
+                    side="sell",
+                    filled_qty="0",
+                    filled_avg_price="0",
+                    type="stop",
+                    client_order_id=stop_client_order_id,
+                ),
+            )
+            exit_fill = _make_event(
+                "fill",
+                _make_order(
+                    broker_order_id="market-exit",
+                    side="sell",
+                    filled_qty="1",
+                    filled_avg_price="499",
+                    type="market",
+                    client_order_id=exit_client_order_id,
+                ),
+            )
+            handler = handlers["trade_updates"][0]
+
+            with (
+                patch(
+                    "core.order_manager.ensure_protective_stop",
+                    return_value=lagged_exit,
+                ),
+                patch(
+                    "core.order_manager._sample_stable_symbol_state",
+                    return_value=(None, []),
+                ),
+                patch("core.order_manager.notify_sell_filled", return_value=False),
+            ):
+                asyncio.run(handler(stop_cancel))
+                assert monitor.is_connected() is False
+                asyncio.run(handler(exit_fill))
+
+            store = get_execution_store()
+            snapshot = store.load_workflow(workflow.workflow_id)
+
+        assert monitor.is_connected() is True
+        assert store.load_active_position("NVDA") is None
+        assert store.load_pending_submission_intents(symbol="NVDA") == []
+        assert snapshot is not None
+        assert "sell_fill_received" in {
+            item["event"] for item in snapshot["transitions"]
+        }
+
+    def test_sell_fill_does_not_clear_fault_while_exit_intent_remains(self, tmp_path):
+        db_path = tmp_path / "still-pending-exit-stream.sqlite3"
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            workflow, _, exit_client_order_id = _persist_pending_exit()
+            monitor, mock_stream, handlers = _build_monitor_with_mock_stream()
+            monitor._running = True
+            monitor._thread = MagicMock()
+            monitor._thread.is_alive.return_value = True
+            mock_stream._running = True
+            monitor._pending_exit_faults.add(("NVDA", workflow.workflow_id))
+            monitor._dispatch = MagicMock()
+            exit_fill = _make_event(
+                "fill",
+                _make_order(
+                    broker_order_id="market-exit",
+                    side="sell",
+                    filled_qty="1",
+                    filled_avg_price="499",
+                    type="market",
+                    client_order_id=exit_client_order_id,
+                ),
+            )
+
+            asyncio.run(handlers["trade_updates"][0](exit_fill))
+
+        assert monitor.is_connected() is False
+
+    def test_stop_cancel_without_pending_exit_remains_permanently_faulted(
+        self,
+        tmp_path,
+    ):
+        from core.order_execution import ProtectiveStopResult
+        from core.order_manager import OrderManager
+
+        db_path = tmp_path / "stop-cancel-without-exit.sqlite3"
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            workflow, stop_client_order_id, exit_client_order_id = (
+                _persist_pending_exit()
+            )
+            workflow.mark_submission_intent_resolved(
+                role="exit",
+                client_order_id=exit_client_order_id,
+                outcome="definitive_failure",
+            )
+            monitor, mock_stream, handlers = _build_monitor_with_mock_stream()
+            monitor._order_manager = OrderManager(paper=True)
+            monitor._running = True
+            monitor._thread = MagicMock()
+            monitor._thread.is_alive.return_value = True
+            mock_stream._running = True
+            unproven_stop = ProtectiveStopResult(
+                success=False,
+                order_id="",
+                symbol="NVDA",
+                qty=1.0,
+                stop_price=465.0,
+                action="position_not_visible",
+                error="position proof is unavailable",
+            )
+            stop_cancel = _make_event(
+                "canceled",
+                _make_order(
+                    broker_order_id="protective-stop",
+                    side="sell",
+                    filled_qty="0",
+                    filled_avg_price="0",
+                    type="stop",
+                    client_order_id=stop_client_order_id,
+                ),
+            )
+
+            with patch(
+                "core.order_manager.ensure_protective_stop",
+                return_value=unproven_stop,
+            ):
+                asyncio.run(handlers["trade_updates"][0](stop_cancel))
+
+        assert monitor.is_connected() is False
+        assert monitor._handler_fault is True
+
+    def test_canceled_market_exit_fault_remains_latched_after_late_fill(self, tmp_path):
+        from core.execution_store import get_execution_store
+        from core.order_execution import ProtectiveStopResult
+        from core.order_manager import OrderManager
+
+        db_path = tmp_path / "canceled-market-exit-stream.sqlite3"
+        with patch("core.execution_store.settings.EXECUTION_STORE_DB_PATH", str(db_path)):
+            workflow, _, exit_client_order_id = _persist_pending_exit()
+            monitor, mock_stream, handlers = _build_monitor_with_mock_stream()
+            monitor._order_manager = OrderManager(paper=True)
+            monitor._running = True
+            monitor._thread = MagicMock()
+            monitor._thread.is_alive.return_value = True
+            mock_stream._running = True
+            unproven_exit = ProtectiveStopResult(
+                success=False,
+                order_id="",
+                symbol="NVDA",
+                qty=1.0,
+                stop_price=465.0,
+                action="exit_outcome_unresolved",
+                error="exact exit is not visible yet",
+            )
+            market_cancel = _make_event(
+                "canceled",
+                _make_order(
+                    broker_order_id="market-exit",
+                    side="sell",
+                    filled_qty="0",
+                    filled_avg_price="0",
+                    type="market",
+                    client_order_id=exit_client_order_id,
+                ),
+            )
+            late_fill = _make_event(
+                "fill",
+                _make_order(
+                    broker_order_id="market-exit",
+                    side="sell",
+                    filled_qty="1",
+                    filled_avg_price="499",
+                    type="market",
+                    client_order_id=exit_client_order_id,
+                ),
+            )
+            handler = handlers["trade_updates"][0]
+
+            with (
+                patch(
+                    "core.order_manager.ensure_protective_stop",
+                    return_value=unproven_exit,
+                ),
+                patch(
+                    "core.order_manager._sample_stable_symbol_state",
+                    return_value=(None, []),
+                ),
+                patch("core.order_manager.notify_sell_filled", return_value=False),
+            ):
+                asyncio.run(handler(market_cancel))
+                asyncio.run(handler(late_fill))
+
+            store = get_execution_store()
+            snapshot = store.load_workflow(workflow.workflow_id)
+
+        assert monitor.is_connected() is False
+        assert store.load_active_position("NVDA") is None
+        assert store.load_pending_submission_intents(symbol="NVDA") == []
+        assert snapshot is not None
+        assert "sell_fill_received" in {
+            item["event"] for item in snapshot["transitions"]
+        }
 
 # ---------------------------------------------------------------------------
 # Fill event → notify_buy_filled
