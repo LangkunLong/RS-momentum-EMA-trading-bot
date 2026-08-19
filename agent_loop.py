@@ -47,8 +47,8 @@ DEFAULT_MAX_TOKENS = 131_072
 MAX_PROPOSAL_SAMPLES = 50
 MAX_BATCH_CALLS = 150
 MAX_BATCH_TOKENS = 2_000_000
-GENERATION_ACCOUNTING_ATTEMPTS = 3
-GENERATION_ACCOUNTING_DELAY_SECONDS = 0.25
+GENERATION_ACCOUNTING_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0)
+GENERATION_ACCOUNTING_ATTEMPTS = len(GENERATION_ACCOUNTING_DELAYS_SECONDS) + 1
 
 _MAX_FILES = 8
 _MAX_LIST_ITEMS = 16
@@ -58,6 +58,9 @@ _MAX_DATA_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
 _MAX_GENERATION_ACCOUNTING_BYTES = 64 * 1024
 _MAX_PROVIDER_EVIDENCE_BYTES = 2 * 1024
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529})
+_GENERATION_ACCOUNTING_RETRYABLE_STATUS_CODES = frozenset(
+    {404, 408, 429, 500, 502, 503, 504, 524, 529}
+)
 _GENERATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
 AGENT_LOOP_UID_GID = "65532:65532"
@@ -145,13 +148,17 @@ class AccountingFailureCode(str, Enum):
 
     INLINE_USAGE_MISSING = "inline_usage_missing"
     INLINE_USAGE_INVALID = "inline_usage_invalid"
-    INLINE_USAGE_INCONSISTENT = "inline_usage_inconsistent"
+    INLINE_COST_CONFLICT = "inline_cost_conflict"
+    INLINE_TOTAL_MISMATCH = "inline_total_mismatch"
+    INLINE_CACHED_EXCEEDS_PROMPT = "inline_cached_exceeds_prompt"
+    INLINE_REASONING_EXCEEDS_COMPLETION = "inline_reasoning_exceeds_completion"
     RECOVERY_ID_MISSING = "recovery_id_missing"
     RECOVERY_ID_UNSAFE = "recovery_id_unsafe"
     RECOVERY_UNAVAILABLE = "recovery_unavailable"
     RECOVERY_TRANSPORT_FAILED = "recovery_transport_failed"
     RECOVERY_HTTP_RETRY_EXHAUSTED = "recovery_http_retry_exhausted"
     RECOVERY_HTTP_TERMINAL = "recovery_http_terminal"
+    RECOVERY_DEADLINE_EXHAUSTED = "recovery_deadline_exhausted"
     RECOVERY_PAYLOAD_INVALID = "recovery_payload_invalid"
     RECOVERY_IDENTITY_INVALID = "recovery_identity_invalid"
     RECOVERY_USAGE_INVALID = "recovery_usage_invalid"
@@ -195,7 +202,10 @@ _INLINE_ACCOUNTING_CODES = frozenset(
     {
         AccountingFailureCode.INLINE_USAGE_MISSING,
         AccountingFailureCode.INLINE_USAGE_INVALID,
-        AccountingFailureCode.INLINE_USAGE_INCONSISTENT,
+        AccountingFailureCode.INLINE_COST_CONFLICT,
+        AccountingFailureCode.INLINE_TOTAL_MISMATCH,
+        AccountingFailureCode.INLINE_CACHED_EXCEEDS_PROMPT,
+        AccountingFailureCode.INLINE_REASONING_EXCEEDS_COMPLETION,
     }
 )
 _RECOVERY_ACCOUNTING_CODES = frozenset(set(AccountingFailureCode) - _INLINE_ACCOUNTING_CODES)
@@ -238,10 +248,27 @@ class IncompleteAccountingFacts:
             AccountingFailureCode.RECOVERY_ID_UNSAFE,
             AccountingFailureCode.RECOVERY_UNAVAILABLE,
         }
-        if (self.recovery_failure_code in no_attempt_codes) != (
-            self.generation_attempts == 0
-        ):
+        if self.recovery_failure_code in no_attempt_codes and self.generation_attempts != 0:
             raise ConfigurationError("recovery failure code and attempt count are inconsistent")
+        if (
+            self.recovery_failure_code not in no_attempt_codes
+            and self.recovery_failure_code
+            is not AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED
+            and self.generation_attempts == 0
+        ):
+            raise ConfigurationError("recovery failure code requires at least one attempt")
+        if (
+            self.recovery_failure_code
+            is AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED
+            and self.generation_attempts != GENERATION_ACCOUNTING_ATTEMPTS
+        ):
+            raise ConfigurationError("retry exhaustion requires the full attempt bound")
+        if (
+            self.recovery_failure_code
+            is AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED
+            and self.generation_attempts >= GENERATION_ACCOUNTING_ATTEMPTS
+        ):
+            raise ConfigurationError("deadline exhaustion must precede the final poll")
         expected_response_id_safe = (
             self.recovery_failure_code
             not in {
@@ -962,6 +989,17 @@ def _non_negative_float(value: object) -> float | None:
     return normalized
 
 
+def _remaining_wall_seconds(
+    wall_deadline: float,
+    monotonic: Callable[[], float],
+) -> float:
+    """Return validated remaining controller wall time for one bounded operation."""
+    current = monotonic()
+    if type(current) not in {int, float} or not math.isfinite(current):
+        raise ConfigurationError("gateway monotonic clock is invalid")
+    return float(wall_deadline) - float(current)
+
+
 _MISSING_FIELD = object()
 
 
@@ -1025,7 +1063,7 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
     if usage_cost is not None and response_cost is not None and usage_cost != response_cost:
         raise AccountingValidationError(
             "response contains conflicting provider cost accounting",
-            code=AccountingFailureCode.INLINE_USAGE_INCONSISTENT,
+            code=AccountingFailureCode.INLINE_COST_CONFLICT,
         )
     cost = usage_cost if usage_cost is not None else response_cost
     if require_complete and cost is None:
@@ -1048,7 +1086,25 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
     ):
         raise AccountingValidationError(
             "usage total_tokens must equal prompt_tokens plus completion_tokens",
-            code=AccountingFailureCode.INLINE_USAGE_INCONSISTENT,
+            code=AccountingFailureCode.INLINE_TOTAL_MISMATCH,
+        )
+    if (
+        cached_tokens is not None
+        and prompt_tokens is not None
+        and cached_tokens > prompt_tokens
+    ):
+        raise AccountingValidationError(
+            "cached_tokens cannot exceed prompt_tokens",
+            code=AccountingFailureCode.INLINE_CACHED_EXCEEDS_PROMPT,
+        )
+    if (
+        reasoning_tokens is not None
+        and completion_tokens is not None
+        and reasoning_tokens > completion_tokens
+    ):
+        raise AccountingValidationError(
+            "reasoning_tokens cannot exceed completion_tokens",
+            code=AccountingFailureCode.INLINE_REASONING_EXCEEDS_COMPLETION,
         )
     try:
         return Usage(
@@ -1061,8 +1117,8 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
         )
     except ProtocolValidationError as exc:
         raise AccountingValidationError(
-            "provider accounting relationships are invalid",
-            code=AccountingFailureCode.INLINE_USAGE_INCONSISTENT,
+            "provider accounting is invalid",
+            code=AccountingFailureCode.INLINE_USAGE_INVALID,
         ) from exc
 
 
@@ -1433,11 +1489,8 @@ class OpenRouterGateway:
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
         self._pricing_cache: dict[str, Pricing] = {}
-        self._generation_loader = (
-            generation_loader
-            if generation_loader is not None
-            else (self._load_generation_accounting if client is None else None)
-        )
+        self._generation_loader_is_builtin = generation_loader is None and client is None
+        self._generation_loader = generation_loader
         self._generation_sleeper = generation_sleeper
 
     def _get_client(self) -> Any:
@@ -1489,12 +1542,23 @@ class OpenRouterGateway:
         parser: Callable[[str], PayloadT],
         *,
         budget_window: BudgetWindow | None = None,
+        wall_deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> AgentCompletion[PayloadT]:
         """Make exactly one fail-closed request with complete authoritative accounting."""
         if role not in self._MODELS:
             raise ConfigurationError(f"unknown gateway role: {role}")
         if not isinstance(dynamic_input, str):
             raise ConfigurationError("dynamic input must be a string")
+        if wall_deadline is not None:
+            if (
+                type(wall_deadline) not in {int, float}
+                or not math.isfinite(wall_deadline)
+                or not callable(monotonic)
+            ):
+                raise ConfigurationError("gateway wall deadline is invalid")
+            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+                raise BudgetExceededError("proposal batch wall deadline reached")
         dynamic = f"<dynamic-input>\n{dynamic_input}\n</dynamic-input>"
         try:
             return self._request_attempt(
@@ -1503,6 +1567,8 @@ class OpenRouterGateway:
                 parser,
                 require_complete_accounting=True,
                 budget_window=budget_window,
+                wall_deadline=None if wall_deadline is None else float(wall_deadline),
+                monotonic=monotonic,
             )
         except (ResponseValidationError, BudgetExceededError, GatewayError):
             raise
@@ -1523,7 +1589,12 @@ class OpenRouterGateway:
             self._pricing_cache[model] = pricing
         return pricing
 
-    def _load_generation_accounting(self, generation_id: str) -> object:
+    def _load_generation_accounting(
+        self,
+        generation_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> object:
         """Fetch one bounded generation record from the fixed OpenRouter endpoint."""
         query_id = quote(generation_id, safe="")
         request = urllib.request.Request(
@@ -1534,11 +1605,20 @@ class OpenRouterGateway:
             },
             method="GET",
         )
+        request_timeout = min(self.timeout_seconds, 5.0)
+        if timeout_seconds is not None:
+            if (
+                type(timeout_seconds) not in {int, float}
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds <= 0
+            ):
+                raise ConfigurationError("generation accounting timeout is invalid")
+            request_timeout = min(request_timeout, float(timeout_seconds))
         try:
             opener = urllib.request.build_opener(_NoRedirectHandler())
             with opener.open(  # noqa: S310
                 request,
-                timeout=min(self.timeout_seconds, 5.0),
+                timeout=request_timeout,
             ) as response:
                 body = response.read(_MAX_GENERATION_ACCOUNTING_BYTES + 1)
         except urllib.error.HTTPError as exc:
@@ -1565,33 +1645,61 @@ class OpenRouterGateway:
         self,
         response: object,
         expected_model: str,
+        *,
+        wall_deadline: float | None,
+        monotonic: Callable[[], float],
     ) -> tuple[Usage, bool]:
         """Recover strict accounting without issuing another paid chat completion."""
         generation_id = _safe_generation_id(response)
-        if self._generation_loader is None:
+        if self._generation_loader is None and not self._generation_loader_is_builtin:
             raise AccountingValidationError(
                 "generation accounting recovery is unavailable",
                 code=AccountingFailureCode.RECOVERY_UNAVAILABLE,
             )
         for attempt in range(GENERATION_ACCOUNTING_ATTEMPTS):
+            remaining = (
+                None
+                if wall_deadline is None
+                else _remaining_wall_seconds(wall_deadline, monotonic)
+            )
+            if remaining is not None and remaining <= 0:
+                raise AccountingValidationError(
+                    "generation accounting recovery reached the wall deadline",
+                    code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
+                    generation_attempts=attempt,
+                )
             try:
-                payload = self._generation_loader(generation_id)
+                payload = (
+                    self._load_generation_accounting(
+                        generation_id,
+                        timeout_seconds=remaining,
+                    )
+                    if self._generation_loader_is_builtin
+                    else self._generation_loader(generation_id)  # type: ignore[misc]
+                )
             except GatewayError as exc:
                 if (
                     attempt + 1 < GENERATION_ACCOUNTING_ATTEMPTS
-                    and exc.status_code in {404, 408, 429, 500, 502, 503, 504, 524, 529}
+                    and exc.status_code
+                    in _GENERATION_ACCOUNTING_RETRYABLE_STATUS_CODES
                 ):
-                    self._generation_sleeper(
-                        GENERATION_ACCOUNTING_DELAY_SECONDS * (attempt + 1)
-                    )
+                    delay = GENERATION_ACCOUNTING_DELAYS_SECONDS[attempt]
+                    if wall_deadline is not None:
+                        remaining = _remaining_wall_seconds(wall_deadline, monotonic)
+                        if remaining <= delay:
+                            raise AccountingValidationError(
+                                "generation accounting recovery reached the wall deadline",
+                                code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
+                                generation_attempts=attempt + 1,
+                            ) from exc
+                    self._generation_sleeper(delay)
                     continue
                 status_code = exc.status_code
                 raise AccountingValidationError(
                     "generation accounting recovery failed",
                     code=(
                         AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED
-                        if status_code
-                        in {404, 408, 429, 500, 502, 503, 504, 524, 529}
+                        if status_code in _GENERATION_ACCOUNTING_RETRYABLE_STATUS_CODES
                         else AccountingFailureCode.RECOVERY_HTTP_TERMINAL
                         if type(status_code) is int
                         else AccountingFailureCode.RECOVERY_TRANSPORT_FAILED
@@ -1649,6 +1757,8 @@ class OpenRouterGateway:
                     parser,
                     require_complete_accounting=False,
                     budget_window=None,
+                    wall_deadline=None,
+                    monotonic=time.monotonic,
                 )
             except Exception as exc:
                 if isinstance(exc, BudgetExceededError):
@@ -1670,6 +1780,8 @@ class OpenRouterGateway:
         *,
         require_complete_accounting: bool,
         budget_window: BudgetWindow | None,
+        wall_deadline: float | None,
+        monotonic: Callable[[], float],
     ) -> AgentCompletion[PayloadT]:
         model = self._MODELS[role]
         messages = [
@@ -1679,6 +1791,12 @@ class OpenRouterGateway:
         ]
         pricing = self._pricing_for_model(model)
         prompt_for_reservation = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+        request_timeout = self.timeout_seconds
+        if wall_deadline is not None:
+            remaining = _remaining_wall_seconds(wall_deadline, monotonic)
+            if remaining <= 0:
+                raise BudgetExceededError("proposal batch wall deadline reached")
+            request_timeout = min(request_timeout, remaining)
         reservation = self.ledger.reserve(
             prompt_for_reservation,
             self._TOKEN_CAPS[role],
@@ -1697,7 +1815,7 @@ class OpenRouterGateway:
                 response_format={"type": "json_object"},
                 stream=False,
                 max_tokens=self._TOKEN_CAPS[role],
-                timeout=self.timeout_seconds,
+                timeout=request_timeout,
                 extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
                 extra_body=extra_body,
             )
@@ -1724,7 +1842,12 @@ class OpenRouterGateway:
                 self.ledger.reconcile(reservation, Usage(), window=budget_window)
                 raise
             try:
-                usage, recovered_semantics_valid = self._recover_generation_usage(response, model)
+                usage, recovered_semantics_valid = self._recover_generation_usage(
+                    response,
+                    model,
+                    wall_deadline=wall_deadline,
+                    monotonic=monotonic,
+                )
             except AccountingValidationError as recovery_exc:
                 self.ledger.reconcile(reservation, Usage(), window=budget_window)
                 inline_code = (
@@ -7177,6 +7300,8 @@ class StrictAgentGatewayProtocol(Protocol):
         parser: Callable[[str], Any],
         *,
         budget_window: BudgetWindow | None = None,
+        wall_deadline: float | None = None,
+        monotonic: Callable[[], float] = ...,
     ) -> AgentCompletion[Any]: ...
 
 
@@ -7460,6 +7585,8 @@ def run_proposal_batch(
                 _provider_dynamic_payload(dynamic, services.known_secrets),
                 parser,
                 budget_window=window,
+                wall_deadline=deadline,
+                monotonic=services.monotonic,
             )
         except AccountedCallError as exc:
             outcome = (

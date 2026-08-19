@@ -1216,6 +1216,71 @@ def test_usage_parser_rejects_cached_and_reasoning_subset_violations(
 
 
 @pytest.mark.parametrize(
+    ("response", "expected_code"),
+    (
+        (
+            {
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                    "cost": 0.01,
+                },
+                "cost": 0.02,
+            },
+            "inline_cost_conflict",
+        ),
+        (
+            {
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 4,
+                    "cost": 0.01,
+                }
+            },
+            "inline_total_mismatch",
+        ),
+        (
+            {
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                    "cost": 0.01,
+                }
+            },
+            "inline_cached_exceeds_prompt",
+        ),
+        (
+            {
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                    "completion_tokens_details": {"reasoning_tokens": 2},
+                    "cost": 0.01,
+                }
+            },
+            "inline_reasoning_exceeds_completion",
+        ),
+    ),
+)
+def test_usage_parser_classifies_inconsistency_without_exposing_values(
+    response: dict[str, object],
+    expected_code: str,
+) -> None:
+    """Each inline inconsistency has one closed content-free diagnostic."""
+    from agent_loop import AccountingValidationError, _usage_from_response
+
+    with pytest.raises(AccountingValidationError) as raised:
+        _usage_from_response(response, require_complete=True)
+
+    assert raised.value.code.value == expected_code
+
+
+@pytest.mark.parametrize(
     ("field", "invalid"),
     [
         ("prompt_tokens", "11"),
@@ -1432,11 +1497,133 @@ def test_generation_accounting_polling_is_bounded_and_reconciles_once() -> None:
 
     with pytest.raises(ResponseValidationError, match="accounting"):
         gateway.request_once("orchestrator", "evidence", Route.from_json)
-    assert polls == ["gen-test12345678"] * 3
-    assert sleeps == [0.25, 0.5]
+    assert polls == ["gen-test12345678"] * 6
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0]
     assert len(client.completions.calls) == 1
     assert ledger.calls == 1
     assert ledger.total_tokens > 18
+
+
+def test_generation_accounting_recovers_after_bounded_eventual_consistency_delay() -> None:
+    """Five retryable metadata misses can recover without retrying the paid chat."""
+    from agent_loop import BudgetLedger, GatewayError, OpenRouterGateway, Route
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    generation_id = "gen-delayed-accounting123"
+    client = FakeClient(
+        [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
+    )
+    polls: list[str] = []
+    sleeps: list[float] = []
+
+    def delayed(value: str) -> object:
+        polls.append(value)
+        if len(polls) < 6:
+            raise GatewayError("generation record is not visible", status_code=404)
+        return _generation_accounting(value, model)
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000)
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=delayed,
+        generation_sleeper=sleeps.append,
+        ledger=ledger,
+    )
+
+    completion = gateway.request_once("orchestrator", "evidence", Route.from_json)
+
+    assert completion.usage.accounting_source == "generation_endpoint"
+    assert polls == [generation_id] * 6
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0]
+    assert len(client.completions.calls) == 1
+    assert ledger.calls == 1
+    assert ledger.incomplete_accounting_calls == 0
+
+
+def test_generation_accounting_recovery_obeys_shared_wall_deadline() -> None:
+    """Metadata polling cannot sleep or wait past the controller's shared wall deadline."""
+    from agent_loop import (
+        BudgetLedger,
+        GatewayError,
+        IncompleteAccountingError,
+        OpenRouterGateway,
+        Route,
+    )
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    generation_id = "gen-deadline-accounting123"
+    client = FakeClient(
+        [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
+    )
+    current = [0.0]
+    polls: list[str] = []
+    poll_timeouts: list[float] = []
+    sleeps: list[float] = []
+
+    gateway = OpenRouterGateway(
+        client=None,
+        api_key="test-key-not-a-secret",
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_sleeper=lambda delay: (sleeps.append(delay), current.__setitem__(0, current[0] + delay)),
+        ledger=BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000),
+    )
+    gateway._client = client
+
+    def delayed_builtin(value: str, *, timeout_seconds: float | None = None) -> object:
+        polls.append(value)
+        assert timeout_seconds is not None
+        poll_timeouts.append(timeout_seconds)
+        current[0] += 0.4
+        raise GatewayError("generation record is not visible", status_code=404)
+
+    gateway._load_generation_accounting = delayed_builtin  # type: ignore[method-assign]
+
+    with pytest.raises(IncompleteAccountingError) as raised:
+        gateway.request_once(
+            "orchestrator",
+            "evidence",
+            Route.from_json,
+            wall_deadline=2.5,
+            monotonic=lambda: current[0],
+        )
+
+    assert polls == [generation_id, generation_id]
+    assert poll_timeouts == pytest.approx([2.5, 1.1])
+    assert sleeps == [1.0]
+    assert current[0] == pytest.approx(1.8)
+    assert client.completions.calls[0]["timeout"] == pytest.approx(2.5)
+    assert raised.value.facts.recovery_failure_code.value == "recovery_deadline_exhausted"
+    assert raised.value.facts.generation_attempts == 2
+    assert len(client.completions.calls) == 1
+
+
+def test_gateway_deadline_expiring_during_pricing_starts_no_paid_call() -> None:
+    """A deadline crossed before reservation cannot be recorded as an attempted provider call."""
+    from agent_loop import BudgetExceededError, BudgetLedger, OpenRouterGateway, Route
+
+    current = [0.0]
+    client = FakeClient([FakeResponse(_route_json(), cost=0.01)])
+
+    def pricing(_model: str) -> dict[str, float]:
+        current[0] = 2.0
+        return {"prompt": 1.0, "completion": 1.0}
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000)
+    gateway = OpenRouterGateway(client=client, pricing_loader=pricing, ledger=ledger)
+
+    with pytest.raises(BudgetExceededError):
+        gateway.request_once(
+            "orchestrator",
+            "evidence",
+            Route.from_json,
+            wall_deadline=1.0,
+            monotonic=lambda: current[0],
+        )
+
+    assert client.completions.calls == []
+    assert ledger.calls == 0
+    assert ledger.incomplete_accounting_calls == 0
 
 
 def test_generation_accounting_malformed_success_is_not_retried() -> None:
@@ -1583,8 +1770,8 @@ def test_generation_accounting_transient_exhaustion_records_attempt_bound() -> N
 
     facts = raised.value.facts
     assert facts.recovery_failure_code.value == "recovery_http_retry_exhausted"
-    assert facts.generation_attempts == 3
-    assert len(polls) == 3
+    assert facts.generation_attempts == 6
+    assert len(polls) == 6
     assert secret not in json.dumps(asdict(facts))
 
 
@@ -1689,6 +1876,54 @@ def test_incomplete_accounting_facts_reject_open_or_inconsistent_values(
     values.update(overrides)
     with pytest.raises(ConfigurationError):
         IncompleteAccountingFacts(**values)  # type: ignore[arg-type]
+
+
+def test_incomplete_accounting_retry_exhaustion_requires_the_full_attempt_bound() -> None:
+    """The closed audit cannot claim retry exhaustion before all bounded polls ran."""
+    from agent_loop import (
+        AccountingFailureCode,
+        ConfigurationError,
+        IncompleteAccountingFacts,
+    )
+
+    with pytest.raises(ConfigurationError):
+        IncompleteAccountingFacts(
+            schema_version=1,
+            call_index=1,
+            role="orchestrator",
+            inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
+            recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
+            generation_attempts=1,
+            response_id_safe=True,
+            accounting_complete=False,
+            budget_charge_basis="full_reservation",
+            retained_reservation_tokens=10,
+            retained_reservation_usd=0.01,
+        )
+
+
+def test_incomplete_accounting_deadline_exhaustion_must_precede_final_poll() -> None:
+    """Deadline telemetry cannot claim an impossible post-final-poll attempt count."""
+    from agent_loop import (
+        AccountingFailureCode,
+        ConfigurationError,
+        IncompleteAccountingFacts,
+    )
+
+    with pytest.raises(ConfigurationError):
+        IncompleteAccountingFacts(
+            schema_version=1,
+            call_index=1,
+            role="orchestrator",
+            inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
+            recovery_failure_code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
+            generation_attempts=6,
+            response_id_safe=True,
+            accounting_complete=False,
+            budget_charge_basis="full_reservation",
+            retained_reservation_tokens=10,
+            retained_reservation_usd=0.01,
+        )
 
 
 def test_generation_accounting_prefers_complete_native_token_pair() -> None:
@@ -6105,6 +6340,8 @@ class _StrictBatchGateway:
         _parser: Any,
         *,
         budget_window: Any = None,
+        wall_deadline: float | None = None,
+        monotonic: Any = None,
     ) -> Any:
         from agent_loop import (
             AccountedBudgetExceededError,
@@ -6620,9 +6857,9 @@ def test_proposal_batch_persists_closed_incomplete_accounting_diagnostic(
         schema_version=1,
         call_index=2,
         role="reasoner",
-        inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
-        recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
-        generation_attempts=3,
+            inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
+            recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
+            generation_attempts=6,
         response_id_safe=True,
         accounting_complete=False,
         budget_charge_basis="full_reservation",
@@ -6700,9 +6937,9 @@ def test_proposal_batch_rejects_incomplete_facts_that_do_not_match_ledger(
         schema_version=1,
         call_index=2,
         role="reasoner",
-        inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
-        recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
-        generation_attempts=3,
+            inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
+            recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
+            generation_attempts=6,
         response_id_safe=True,
         accounting_complete=False,
         budget_charge_basis="full_reservation",
