@@ -2981,10 +2981,8 @@ class SandboxRunner:
         ):
             raise SandboxError("created container OOM-kill policy differs")
         normalized_host["OomKillDisable"] = False
-        if "Init" not in normalized_host or (
-            normalized_host["Init"] is not False
-            and normalized_host["Init"] is not None
-        ):
+        init_policy = normalized_host.get("Init")
+        if init_policy is not False and init_policy is not None:
             raise SandboxError("created container init policy differs")
         normalized_host["Init"] = False
         expected_host = {

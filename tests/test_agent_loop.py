@@ -2908,17 +2908,25 @@ def test_container_config_hash_normalizes_oom_kill_disable_null_after_start(
     assert engine.removed and engine.absence_verified
 
 
-def test_container_attestation_normalizes_only_disabled_init_false_or_null(
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda item: item["HostConfig"].update(Init=None),
+        lambda item: item["HostConfig"].pop("Init"),
+    ],
+)
+def test_container_attestation_normalizes_only_disabled_init_forms(
     tmp_path: Path,
+    mutator: Any,
 ) -> None:
-    """Docker Desktop reports an omitted --init policy as null rather than false."""
+    """Docker Desktop reports an omitted --init policy as null or no field."""
     from agent_loop import export_candidate, preflight_source, run_test_gate
 
     source = _task2_repo(tmp_path)
     candidate = export_candidate(preflight_source(source, acquire_lock=False))
     image = "registry.invalid/agent-loop@sha256:" + "a" * 64
     engine = FaithfulSandboxEngine(image)
-    engine.mutate_inspection = lambda item: item["HostConfig"].update(Init=None)
+    engine.mutate_inspection = mutator
 
     result = run_test_gate(candidate, _faithful_runner(image, engine))
 
@@ -3662,7 +3670,6 @@ def test_real_data_fetcher_opens_verified_writable_scratch_without_network(tmp_p
         lambda item: item["HostConfig"].update(Init=True),
         lambda item: item["HostConfig"].update(Init=1),
         lambda item: item["HostConfig"].update(Init="true"),
-        lambda item: item["HostConfig"].pop("Init"),
         lambda item: item["HostConfig"].update(ReadonlyRootfs=1),
         lambda item: item["HostConfig"].update(PidsLimit=64.0),
         lambda item: item["HostConfig"].update(PortBindings={"80/tcp": [{"HostPort": "8080"}]}),
