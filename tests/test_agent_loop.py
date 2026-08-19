@@ -755,6 +755,15 @@ def test_task3_source_snapshot_reads_only_approved_candidate_text(tmp_path: Path
                 approved_paths=("core/backtest_engine.py",),
             )
 
+        target.write_text("x" * 64 + "\n", encoding="utf-8", newline="\n")
+        with pytest.raises(ConfigurationError, match="complete source line"):
+            read_candidate_source_snapshot(
+                candidate,
+                "core/backtest_engine.py",
+                approved_paths=("core/backtest_engine.py",),
+                max_bytes=32,
+            )
+
 
 def test_task3_audit_is_atomic_redacted_and_hash_chained(tmp_path: Path) -> None:
     """Break caught: run artifacts could leak model/log secrets or lose event provenance."""
@@ -1093,6 +1102,74 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     assert "set skip to true" in reasoner_prompt.lower()
     assert "Never invent" in reasoner_prompt
     assert "sealed gate evidence" in coder_prompt
+    assert "exact numbered source annotation" in coder_prompt
+    assert "omit the annotation" in coder_prompt
+    assert "first hunk body line" in coder_prompt
+    assert "cumulative prior hunk line-count delta" in coder_prompt
+
+
+def test_coder_snapshot_annotations_are_complete_bounded_and_exact() -> None:
+    """Break caught: line prefixes could overflow JSON or number synthetic truncation text."""
+    import agent_loop
+    from agent_loop import SourceSnapshot
+
+    many_lines = "x\n" * 16_384
+    snapshot = SourceSnapshot(
+        path="core/momentum_analysis.py",
+        sha256="c" * 64,
+        byte_count=len(many_lines.encode("utf-8")),
+        line_count=16_384,
+        selected_start_line=1,
+        selected_end_line=16_384,
+        truncated=False,
+        sanitized_text=many_lines,
+    )
+    payload = agent_loop._coder_snapshot_payload(snapshot)
+    annotated = payload["sanitized_text"]
+    assert isinstance(annotated, str)
+    assert len(annotated.encode("utf-8")) <= 32 * 1024
+    assert "[TRUNCATED]" not in annotated
+    rendered_lines = annotated.splitlines()
+    assert rendered_lines[0] == "1: x"
+    assert rendered_lines[-1] == f"{len(rendered_lines)}: x"
+    assert payload["selected_end_line"] == len(rendered_lines)
+    assert payload["truncated"] is True
+
+    excerpt = SourceSnapshot(
+        path="core/pivot_detector.py",
+        sha256="d" * 64,
+        byte_count=10,
+        line_count=20,
+        selected_start_line=10,
+        selected_end_line=11,
+        truncated=False,
+        sanitized_text="alpha\nbeta",
+    )
+    excerpt_payload = agent_loop._coder_snapshot_payload(excerpt)
+    assert excerpt_payload["sanitized_text"] == "10: alpha\n11: beta"
+    assert excerpt_payload["selected_end_line"] == 11
+    assert excerpt_payload["truncated"] is False
+
+
+def test_provider_dynamic_payload_rejects_truncated_json() -> None:
+    """Break caught: a large annotated payload was silently truncated into malformed JSON."""
+    import agent_loop
+    from agent_loop import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="provider dynamic payload exceeds"):
+        agent_loop._provider_dynamic_payload({"payload": "x" * (300 * 1024)}, ())
+
+
+def test_provider_dynamic_payload_rejects_redaction_that_could_break_json() -> None:
+    """Break caught: serialized untrusted text redaction consumed a JSON closing quote."""
+    import agent_loop
+    from agent_loop import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="secret-shaped"):
+        agent_loop._provider_dynamic_payload(
+            {"plan": {"diagnosis": "API_KEY=abcdefgh"}},
+            (),
+        )
 
 
 def test_usage_and_completion_reject_invalid_direct_values() -> None:
@@ -2245,6 +2322,49 @@ def _task2_diff(*, path: str = "core/backtest_engine.py", old: str = "VALUE = 1"
         f"-{old}\n"
         f"+{new}\n"
     )
+
+
+@pytest.mark.parametrize("failure_kind", ("wrong_start", "wrong_old_text"))
+def test_inert_model_proposal_requires_read_only_patch_applicability(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    """Break caught: a grammar-valid wrong-line or wrong-text proposal counted as a canary."""
+    from agent_loop import (
+        AuditTrail,
+        CodingProposal,
+        PatchPolicyError,
+        dispose_candidate,
+        export_candidate,
+        export_inert_proposal,
+        preflight_source,
+    )
+
+    if failure_kind == "wrong_start":
+        unified_diff = _task2_diff().replace("@@ -1,1 +1,1 @@", "@@ -2,1 +2,1 @@")
+    else:
+        unified_diff = _task2_diff(old="VALUE = 999")
+    repo = _task2_repo(tmp_path)
+    source_before = (repo / "core" / "backtest_engine.py").read_bytes()
+    with tempfile.TemporaryDirectory(prefix="agent-loop-applicability-") as controller_name:
+        controller = Path(controller_name)
+        state = preflight_source(repo, acquire_lock=False, controller_temp_parent=controller)
+        candidate = export_candidate(state)
+        audit = AuditTrail((tmp_path / "audit-applicability").resolve(), "run-12345678")
+        proposal = CodingProposal(
+            summary="Attempt an inapplicable replacement.",
+            files=("core/backtest_engine.py",),
+            unified_diff=unified_diff,
+        )
+        try:
+            with pytest.raises(PatchPolicyError, match="does not apply"):
+                export_inert_proposal(candidate, audit, proposal, gate="test")
+            assert not tuple(audit.run_root.glob("*.diff"))
+            assert not tuple(audit.run_root.glob("*.metadata.json"))
+            assert (candidate.root / "core" / "backtest_engine.py").read_bytes() == source_before
+            assert (repo / "core" / "backtest_engine.py").read_bytes() == source_before
+        finally:
+            dispose_candidate(candidate)
 
 
 @pytest.mark.parametrize("break_kind", ["dirty", "detached", "protected"])
@@ -5578,14 +5698,16 @@ class _StateMachineGateway:
         )
         self.outcomes = list(outcomes)
         self.roles: list[str] = []
+        self.dynamic_inputs: list[tuple[str, str]] = []
 
-    def request(self, role: str, _dynamic_input: str, _parser: Any) -> Any:
+    def request(self, role: str, dynamic_input: str, _parser: Any) -> Any:
         from agent_loop import AgentCompletion, BudgetExceededError, Usage
 
         if self.ledger.calls >= self.ledger.max_calls:
             raise BudgetExceededError("fake gateway call limit")
         self.ledger.calls += 1
         self.roles.append(role)
+        self.dynamic_inputs.append((role, dynamic_input))
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -5898,6 +6020,8 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
         assert coder_role == "coder"
         coder_payload = json.loads(coder_dynamic)
         assert coder_payload["evidence"] == reasoner_payload["evidence"]
+        assert coder_payload["source_snapshots"][0]["line_numbers_are_annotations"] is True
+        assert coder_payload["source_snapshots"][0]["sanitized_text"] == "1: MOMENTUM = 1\n"
         assert gateway.pricing_preloads == [("orchestrator", "reasoner", "coder")]
         assert len(result.samples) == 50
         assert all(len(sample.provider_call_paths) == 3 for sample in result.samples)
@@ -6287,6 +6411,11 @@ def test_state_machine_dry_run_exports_exact_proposal_without_mutating_candidate
         assert result.iterations_started == 1
         assert result.patches_applied == 0
         assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        coder_role, coder_dynamic = gateway.dynamic_inputs[2]
+        assert coder_role == "coder"
+        coder_payload = json.loads(coder_dynamic)
+        assert coder_payload["source_snapshots"][0]["line_numbers_are_annotations"] is True
+        assert coder_payload["source_snapshots"][0]["sanitized_text"] == "1: VALUE = 1\n"
         assert candidate.root.exists()
         assert (candidate.root / "core" / "backtest_engine.py").read_text() == "VALUE = 1\n"
         assert Path(result.handoff_artifacts[0][0]).read_text(encoding="utf-8") == _task2_diff()

@@ -1151,6 +1151,11 @@ class OpenRouterGateway:
                 "Use that exact index line for every file. Express every replacement with "
                 "paired '-old' and '+new' lines; never leave the old line as context and append "
                 "a duplicate. Use the sealed gate evidence to verify the plan's numeric premise. "
+                "Each sanitized_text line begins with an exact numbered source annotation 'N: '. "
+                "Use N as the unified-diff hunk's old starting line, omit the annotation from the "
+                "diff body, and make the old header start match the first hunk body line. The new "
+                "start is the corresponding post-change line: for later hunks, adjust N by the "
+                "cumulative prior hunk line-count delta instead of blindly copying N. "
                 "The hunk header counts must exactly match the hunk body. Do not use Markdown "
                 "fences, issue commands, add keys, or include prose."
             ),
@@ -4059,6 +4064,53 @@ def validate_unified_diff(
     return parsed
 
 
+def _validate_exact_patch_anchors(candidate_root: Path, parsed: ParsedPatch) -> None:
+    """Require every old-side hunk body to match its declared source coordinates exactly."""
+    lines = parsed.raw.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        fields = lines[index][:-1].split(" ")
+        path = fields[2][2:]
+        try:
+            decoded = (candidate_root / path).read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PatchPolicyError("proposal target cannot be checked as UTF-8 source") from exc
+        source_lines = decoded.replace("\r\n", "\n").replace("\r", "\n").splitlines(
+            keepends=True
+        )
+        index += 4
+        while index < len(lines) and not lines[index].startswith("diff --git "):
+            match = _HUNK_RE.fullmatch(lines[index][:-1])
+            if match is None:
+                raise PatchPolicyError("proposal hunk cannot be checked at exact coordinates")
+            old_start = int(match.group(1))
+            old_count = int(match.group(2) or "1")
+            expected_old: list[str] = []
+            index += 1
+            while index < len(lines) and not lines[index].startswith(("diff --git ", "@@ ")):
+                body = lines[index]
+                if body.startswith((" ", "-")):
+                    expected_old.append(body[1:].removesuffix("\n"))
+                index += 1
+            start_index = old_start if old_count == 0 else old_start - 1
+            if (
+                start_index < 0
+                or start_index + old_count > len(source_lines)
+                or len(expected_old) != old_count
+            ):
+                raise PatchPolicyError(
+                    "proposal patch does not apply at its exact source coordinates"
+                )
+            actual_old = [
+                value.removesuffix("\n")
+                for value in source_lines[start_index : start_index + old_count]
+            ]
+            if actual_old != expected_old:
+                raise PatchPolicyError(
+                    "proposal patch does not apply at its exact source coordinates"
+                )
+
+
 def _git_patch(root: Path, args: Sequence[str], raw: str) -> subprocess.CompletedProcess[bytes]:
     try:
         executable = _approved_git_executable()
@@ -5375,6 +5427,33 @@ class SourceSnapshot:
         object.__setattr__(self, "path", path)
 
 
+def _coder_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, object]:
+    """Add controller-owned line annotations to one provider-safe coder snapshot."""
+    if not isinstance(snapshot, SourceSnapshot):
+        raise ConfigurationError("coder snapshot must be provider-safe source evidence")
+    lines = snapshot.sanitized_text.splitlines(keepends=True)
+    expected_lines = snapshot.selected_end_line - snapshot.selected_start_line + 1
+    if len(lines) != expected_lines:
+        raise ConfigurationError("coder snapshot requires exact complete source lines")
+    annotated: list[str] = []
+    annotated_size = 0
+    for number, line in enumerate(lines, start=snapshot.selected_start_line):
+        rendered = f"{number}: {line}"
+        rendered_size = len(rendered.encode("utf-8"))
+        if annotated_size + rendered_size > _SOURCE_SNAPSHOT_LIMIT:
+            break
+        annotated.append(rendered)
+        annotated_size += rendered_size
+    if not annotated:
+        raise ConfigurationError("coder snapshot requires a complete source line within the limit")
+    payload: dict[str, object] = asdict(snapshot)
+    payload["sanitized_text"] = "".join(annotated)
+    payload["selected_end_line"] = snapshot.selected_start_line + len(annotated) - 1
+    payload["truncated"] = snapshot.truncated or len(annotated) < len(lines)
+    payload["line_numbers_are_annotations"] = True
+    return payload
+
+
 @dataclass(frozen=True)
 class QualityObservation:
     """Provider-safe final-quality facts without process output or candidate-authored text."""
@@ -5869,20 +5948,22 @@ def read_candidate_source_snapshot(
         raise ConfigurationError("source snapshot line range is outside the file")
     selected: list[str] = []
     selected_size = 0
-    last_line = start_line
+    last_line = start_line - 1
     for number in range(start_line, selected_end + 1):
         line = lines[number - 1]
         line_size = len(line.encode("utf-8"))
-        if selected and selected_size + line_size > max_bytes:
+        if selected_size + line_size > max_bytes:
             break
         selected.append(line)
         selected_size += line_size
         last_line = number
-        if selected_size > max_bytes:
-            break
+    if not selected:
+        raise ConfigurationError("source snapshot requires a complete source line within the limit")
     sanitized = sanitize_untrusted_text(
         "".join(selected), known_secrets=known_secrets, max_bytes=max_bytes
     )
+    if sanitized.truncated:
+        raise ConfigurationError("source snapshot sanitization cannot preserve complete source lines")
     return SourceSnapshot(
         path=canonical,
         sha256=hashlib.sha256(raw).hexdigest(),
@@ -6783,12 +6864,32 @@ def _budget_snapshot(ledger: BudgetLedger) -> BudgetSnapshot:
 
 
 def _provider_dynamic_payload(value: Mapping[str, object], secrets: Sequence[str]) -> str:
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return sanitize_untrusted_text(
+    try:
+        raw = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError("provider dynamic payload is not canonical JSON") from exc
+    sanitized = sanitize_untrusted_text(
         raw,
         known_secrets=secrets,
         max_bytes=_MAX_DIFF_BYTES,
-    ).text
+    )
+    if sanitized.truncated:
+        raise ConfigurationError("provider dynamic payload exceeds the bounded JSON limit")
+    if sanitized.redaction_count:
+        raise ConfigurationError("provider dynamic payload contains secret-shaped text")
+    try:
+        decoded = json.loads(sanitized.text, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, ProtocolValidationError) as exc:
+        raise ConfigurationError("provider dynamic payload is not valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ConfigurationError("provider dynamic payload must remain one JSON object")
+    return sanitized.text
 
 
 def _file_sha256(path: Path) -> str:
@@ -6825,6 +6926,11 @@ def export_inert_proposal(
         editable_paths=editable_paths,
         gate=gate,
     )
+    _validate_exact_patch_anchors(root, parsed)
+    try:
+        _git_patch(root, ("apply", "--check", "--whitespace=error-all", "-"), parsed.raw)
+    except PatchApplicationError as exc:
+        raise PatchPolicyError("proposal patch does not apply to the candidate") from exc
     after = _candidate_tracked_manifest_sha256(candidate)
     if after != before:
         raise CandidateMutationError("candidate changed while proposal handoff was validated")
@@ -7171,7 +7277,9 @@ def run_proposal_batch(
                         "batch_sample": sample,
                         "evidence": evidence_payload,
                         "plan": asdict(plan),
-                        "source_snapshots": [asdict(value) for value in snapshots],
+                        "source_snapshots": [
+                            _coder_snapshot_payload(value) for value in snapshots
+                        ],
                     },
                     CodingProposal.from_json,
                     CodingProposal,
@@ -7579,7 +7687,9 @@ def run_agent_loop(
                 "coder",
                 {
                     "plan": asdict(plan),
-                    "source_snapshots": [asdict(value) for value in snapshots],
+                    "source_snapshots": [
+                        _coder_snapshot_payload(value) for value in snapshots
+                    ],
                 },
                 CodingProposal.from_json,
                 CodingProposal,
