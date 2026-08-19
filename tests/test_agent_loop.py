@@ -6604,9 +6604,9 @@ def test_round4_container_compile_and_ruff_cache_policy_is_exact(tmp_path: Path)
     environment = dict(
         item.split("=", 1) for item in engine.inspect_payload["Config"]["Env"]  # type: ignore[index]
     )
-    assert environment["PYTHONPYCACHEPREFIX"] == "/workspace/output/pycache"
+    assert environment["PYTHONPYCACHEPREFIX"] == "/dev/shm/agent-loop/pycache"
     assert environment["RUFF_CACHE_DIR"] == "/workspace/output/ruff-cache"
-    assert environment["AGENT_LOOP_TEST_TMP_ROOT"] == "/workspace/tmp/pytest"
+    assert environment["AGENT_LOOP_TEST_TMP_ROOT"] == "/dev/shm/agent-loop/pytest"
     assert environment["OPENBLAS_NUM_THREADS"] == "1"
     assert environment["OMP_NUM_THREADS"] == "1"
     assert environment["MKL_NUM_THREADS"] == "1"

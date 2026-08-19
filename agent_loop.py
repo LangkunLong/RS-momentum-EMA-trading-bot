@@ -4331,11 +4331,11 @@ class SandboxRunner:
         container_environment = {
             "ALPACA_PAPER": "false",
             "AGENT_LOOP_SANDBOX_WATCHDOG": "1",
-            "AGENT_LOOP_TEST_TMP_ROOT": "/workspace/tmp/pytest",
+            "AGENT_LOOP_TEST_TMP_ROOT": "/dev/shm/agent-loop/pytest",
             "FMP_DAILY_REQUEST_BUDGET": "0",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPYCACHEPREFIX": "/workspace/output/pycache",
+            "PYTHONPYCACHEPREFIX": "/dev/shm/agent-loop/pycache",
             "PYTHONHASHSEED": "0",
             "OPENBLAS_NUM_THREADS": "1",
             "OMP_NUM_THREADS": "1",
