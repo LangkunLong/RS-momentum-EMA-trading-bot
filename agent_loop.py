@@ -1037,8 +1037,9 @@ class OpenRouterGateway:
                 "You are the Coder. Return exactly one JSON object with exactly these keys: "
                 '"summary", "files", "unified_diff". Set files to the exact JSON array of paths changed '
                 "by unified_diff, limited to the approved plan and source snapshots. unified_diff must be "
-                "a valid unified diff string. Do not use Markdown fences, issue commands, add keys, or "
-                "include prose."
+                "a complete git-style unified diff. For every changed file, include "
+                '"diff --git a/<path> b/<path>", "--- a/<path>", and "+++ b/<path>" before the '
+                "@@ hunk. Do not use Markdown fences, issue commands, add keys, or include prose."
             ),
         }
     )

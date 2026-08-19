@@ -738,6 +738,10 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
         prompt = OpenRouterGateway.SYSTEM_PROMPTS[role]
         assert "exactly these keys" in prompt
         assert all(f'"{key}"' in prompt for key in keys)
+    coder_prompt = OpenRouterGateway.SYSTEM_PROMPTS["coder"]
+    assert "diff --git a/<path> b/<path>" in coder_prompt
+    assert "--- a/<path>" in coder_prompt
+    assert "+++ b/<path>" in coder_prompt
 
 
 def test_usage_and_completion_reject_invalid_direct_values() -> None:
