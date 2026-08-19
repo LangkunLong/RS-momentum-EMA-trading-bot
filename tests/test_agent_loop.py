@@ -907,6 +907,71 @@ def test_strict_request_recovers_authoritative_generation_accounting_once() -> N
 
 
 @pytest.mark.parametrize(
+    ("response_finish_reason", "generation_overrides"),
+    (
+        ("length", {"finish_reason": "length"}),
+        ("stop", {"cancelled": True}),
+        ("stop", {"model": "deepseek/deepseek-r1-provider-variant"}),
+    ),
+)
+def test_generation_semantic_failure_is_accounted_before_protocol_rejection(
+    response_finish_reason: str,
+    generation_overrides: dict[str, object],
+) -> None:
+    """Non-acceptable generation semantics cannot discard authoritative spend."""
+    from agent_loop import (
+        AccountedResponseValidationError,
+        BudgetLedger,
+        OpenRouterGateway,
+        Route,
+    )
+
+    model = "deepseek/deepseek-r1"
+    generation_id = "gen-accounted-nonstop123"
+    client = FakeClient(
+        [
+            FakeResponse(
+                _route_json(),
+                cost=None,
+                model=model,
+                id=generation_id,
+                finish_reason=response_finish_reason,
+            )
+        ]
+    )
+    polls: list[str] = []
+
+    def load_generation(value: str) -> object:
+        polls.append(value)
+        payload = _generation_accounting(value, model)
+        data = payload["data"]
+        assert isinstance(data, dict)
+        data.update(generation_overrides)
+        return payload
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000)
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=load_generation,
+        ledger=ledger,
+    )
+
+    with pytest.raises(AccountedResponseValidationError) as raised:
+        gateway.request_once("reasoner", "evidence", Route.from_json)
+
+    assert raised.value.facts.usage.accounting_source == "generation_endpoint"
+    assert raised.value.facts.usage.cost_usd == pytest.approx(0.012)
+    assert raised.value.facts.usage.total_tokens == 18
+    assert raised.value.facts.response_schema_valid is False
+    assert polls == [generation_id]
+    assert len(client.completions.calls) == 1
+    assert ledger.calls == 1
+    assert ledger.spent_usd == pytest.approx(0.012)
+    assert ledger.total_tokens == 18
+
+
+@pytest.mark.parametrize(
     "generation_id",
     ("", "../escape", "gen-bad?query", "gen-bad%2Fescape", "gen-" + "a" * 129),
 )
@@ -1011,7 +1076,6 @@ def test_generation_accounting_prefers_complete_native_token_pair() -> None:
     usage = _usage_from_generation_record(
         payload,
         generation_id=generation_id,
-        expected_model=model,
     )
     assert usage.prompt_tokens == 13
     assert usage.completion_tokens == 9

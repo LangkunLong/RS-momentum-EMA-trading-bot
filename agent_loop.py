@@ -939,7 +939,6 @@ def _usage_from_generation_record(
     payload: object,
     *,
     generation_id: str,
-    expected_model: str,
 ) -> Usage:
     """Validate one complete authoritative record from OpenRouter's generation endpoint."""
     if not isinstance(payload, Mapping):
@@ -951,10 +950,6 @@ def _usage_from_generation_record(
         raise AccountingValidationError("generation accounting identity does not match")
     if data.get("api_type") != "completions":
         raise AccountingValidationError("generation accounting API type is invalid")
-    if data.get("model") != expected_model:
-        raise AccountingValidationError("generation accounting model does not match")
-    if data.get("finish_reason") != "stop" or data.get("cancelled") is not False:
-        raise AccountingValidationError("generation accounting completion is not final")
     total_cost = _usage_cost(data.get("total_cost", _MISSING_FIELD), "generation total")
     usage_cost = _usage_cost(data.get("usage", _MISSING_FIELD), "generation usage")
     if total_cost is None or usage_cost is None or total_cost != usage_cost:
@@ -1337,7 +1332,11 @@ class OpenRouterGateway:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AccountingValidationError("generation accounting response is invalid") from exc
 
-    def _recover_generation_usage(self, response: object, expected_model: str) -> Usage:
+    def _recover_generation_usage(
+        self,
+        response: object,
+        expected_model: str,
+    ) -> tuple[Usage, bool]:
         """Recover strict accounting without issuing another paid chat completion."""
         generation_id = _safe_generation_id(response)
         if self._generation_loader is None:
@@ -1357,11 +1356,18 @@ class OpenRouterGateway:
                 raise AccountingValidationError(
                     "generation accounting recovery failed"
                 ) from exc
-            return _usage_from_generation_record(
+            usage = _usage_from_generation_record(
                 payload,
                 generation_id=generation_id,
-                expected_model=expected_model,
             )
+            data = payload["data"]
+            assert isinstance(data, Mapping)
+            semantics_valid = (
+                data.get("model") == expected_model
+                and data.get("finish_reason") == "stop"
+                and data.get("cancelled") is False
+            )
+            return usage, semantics_valid
         raise AssertionError("generation accounting retry loop exhausted")
 
     def _request_with_retries(
@@ -1442,6 +1448,7 @@ class OpenRouterGateway:
                 expected_model=model if require_complete_accounting else None,
             )
             raise AssertionError("embedded provider error was not rejected")
+        recovered_semantics_valid = True
         try:
             usage = _usage_from_response(
                 response,
@@ -1452,7 +1459,7 @@ class OpenRouterGateway:
                 self.ledger.reconcile(reservation, Usage(), window=budget_window)
                 raise
             try:
-                usage = self._recover_generation_usage(response, model)
+                usage, recovered_semantics_valid = self._recover_generation_usage(response, model)
             except Exception:
                 self.ledger.reconcile(reservation, Usage(), window=budget_window)
                 raise
@@ -1471,6 +1478,10 @@ class OpenRouterGateway:
             else None
         )
         try:
+            if not recovered_semantics_valid:
+                raise ResponseValidationError(
+                    "generation response semantics are not acceptable"
+                )
             completion = self._validate_response(
                 response,
                 parser,
