@@ -2539,7 +2539,11 @@ class SandboxRunner:
             "Init": True,
             "LogConfig": {
                 "Type": "local",
-                "Config": {"max-size": "4m", "max-file": "1"},
+                "Config": {
+                    "max-size": "4m",
+                    "max-file": "1",
+                    "compress": "false",
+                },
             },
         }
         if any(
@@ -2853,6 +2857,8 @@ class SandboxRunner:
             "max-size=4m",
             "--log-opt",
             "max-file=1",
+            "--log-opt",
+            "compress=false",
             "--init",
             "--cap-drop",
             "ALL",

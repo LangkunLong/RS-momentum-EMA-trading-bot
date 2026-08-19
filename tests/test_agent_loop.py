@@ -2508,6 +2508,7 @@ def test_worker_uses_detached_start_bounded_logs_and_polled_deadline(
     assert [create[index + 1] for index, value in enumerate(create) if value == "--log-opt"] == [
         "max-size=4m",
         "max-file=1",
+        "compress=false",
     ]
     assert any(call[1] == "logs" for call in engine.calls)
     assert engine.removed and engine.absence_verified
