@@ -183,7 +183,7 @@ def test_task3_models_and_limits_validate_exact_boundaries() -> None:
 
     models = ModelConfig()
     assert models.orchestrator == "qwen/qwen3-next-80b-a3b-instruct"
-    assert models.reasoner == "deepseek/deepseek-r1"
+    assert models.reasoner == "qwen/qwen3-next-80b-a3b-instruct"
     assert models.coder == "deepseek/deepseek-chat"
     with pytest.raises(ConfigurationError, match="model slug"):
         ModelConfig(coder="bad model")
@@ -2397,7 +2397,7 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
         ),
         (
             "reasoner",
-            "deepseek/deepseek-r1",
+            "qwen/qwen3-next-80b-a3b-instruct",
             _plan_json(),
             ReasoningPlan.from_json,
             4096,
@@ -2545,7 +2545,7 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
     """The reasoner prompt makes the strict seven-field schema mechanically checkable."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ReasoningPlan
 
-    model = "deepseek/deepseek-r1"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     plan = json.dumps(
         {
             "diagnosis": "The measured return misses the configured threshold.",
@@ -2917,7 +2917,7 @@ def test_gateway_uses_immutable_three_message_prefix_and_reasoner_cap() -> None:
     call = client.completions.calls[0]
 
     assert completion.payload.diagnosis == "A boundary is wrong."
-    assert call["model"] == "deepseek/deepseek-r1"
+    assert call["model"] == "qwen/qwen3-next-80b-a3b-instruct"
     assert call["max_tokens"] == 4096
     assert call["response_format"] == {"type": "json_object"}
     assert call["stream"] is False
@@ -7128,7 +7128,7 @@ class _StrictBatchGateway:
         self.ledger.reconcile(reservation, usage, window=budget_window)
         model = {
             "orchestrator": "qwen/qwen3-next-80b-a3b-instruct",
-            "reasoner": "deepseek/deepseek-r1",
+            "reasoner": "qwen/qwen3-next-80b-a3b-instruct",
             "coder": "deepseek/deepseek-chat",
         }[role]
         return AgentCompletion(outcome, usage, "stop", model)
@@ -7487,8 +7487,8 @@ def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
     facts = ProviderCallFacts(
         call_index=2,
         role="reasoner",
-        requested_model="deepseek/deepseek-r1",
-        returned_model="deepseek/deepseek-r1",
+        requested_model="qwen/qwen3-next-80b-a3b-instruct",
+        returned_model="qwen/qwen3-next-80b-a3b-instruct",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=10,
