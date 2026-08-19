@@ -2635,6 +2635,38 @@ def test_container_config_hash_normalizes_none_network_id_assigned_after_start(
     assert engine.removed and engine.absence_verified
 
 
+def test_container_config_hash_normalizes_exact_running_none_network_identity(
+    tmp_path: Path,
+) -> None:
+    """Docker Desktop assigns a private sandbox and endpoint only while running."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    engine.never_exits = True
+    sandbox_id = "a" * 64
+
+    def assign_running_network_identity(item: dict[str, Any]) -> None:
+        if engine.started:
+            network = item["NetworkSettings"]
+            network["SandboxID"] = sandbox_id
+            network["SandboxKey"] = f"/var/run/docker/netns/{sandbox_id[:12]}"
+            network["Networks"]["none"]["NetworkID"] = "b" * 64
+            network["Networks"]["none"]["EndpointID"] = "c" * 64
+
+    engine.mutate_inspection = assign_running_network_identity
+
+    result = run_test_gate(
+        candidate,
+        _faithful_runner(image, engine, timeout_seconds=0.05),
+    )
+
+    assert result.outcome == "timed_out"
+    assert engine.removed and engine.absence_verified
+
+
 def test_container_attestation_accepts_exact_docker_desktop_minimal_network_profile(
     tmp_path: Path,
 ) -> None:
@@ -2692,6 +2724,8 @@ def test_container_attestation_accepts_exact_docker_desktop_minimal_network_prof
         lambda network: network["Networks"]["none"].update(IPAddress="172.17.0.2"),
         lambda network: network["Networks"]["none"].update(IPPrefixLen=16),
         lambda network: network["Networks"]["none"].update(NetworkID="D" * 64),
+        lambda network: network["Networks"]["none"].update(EndpointID="C" * 64),
+        lambda network: network.update(SandboxID="a" * 64, SandboxKey="wrong"),
         lambda network: network["Networks"]["none"].update(Unexpected=""),
         lambda network: network.update(IPAddress="172.17.0.2"),
         lambda network: network.update(Unexpected=""),

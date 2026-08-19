@@ -2557,8 +2557,6 @@ class SandboxRunner:
             raise SandboxError("created container image ID differs from the inspected image")
         network = item.get("NetworkSettings")
         expected_network_minimal = {
-            "SandboxID": "",
-            "SandboxKey": "",
             "Ports": {},
         }
         expected_network_full = {
@@ -2581,7 +2579,7 @@ class SandboxRunner:
         if (
             not isinstance(network, dict)
             or not any(
-                set(network) == {*profile, "Networks"}
+                set(network) == {*profile, "Networks", "SandboxID", "SandboxKey"}
                 and all(
                     type(network[key]) is type(wanted) and network[key] == wanted
                     for key, wanted in profile.items()
@@ -2590,6 +2588,20 @@ class SandboxRunner:
             )
         ):
             raise SandboxError("created container network isolation differs")
+        runtime_state = item.get("State")
+        running = isinstance(runtime_state, dict) and runtime_state.get("Running") is True
+        sandbox_id = network["SandboxID"]
+        sandbox_key = network["SandboxKey"]
+        if not (
+            (sandbox_id == "" and sandbox_key == "")
+            or (
+                running
+                and isinstance(sandbox_id, str)
+                and _SHA256_RE.fullmatch(sandbox_id) is not None
+                and sandbox_key == f"/var/run/docker/netns/{sandbox_id[:12]}"
+            )
+        ):
+            raise SandboxError("created container sandbox namespace identity differs")
         networks = network["Networks"]
         if not isinstance(networks, dict) or set(networks) != {"none"}:
             raise SandboxError("created container must have only the none network")
@@ -2601,7 +2613,6 @@ class SandboxRunner:
             "MacAddress": "",
             "DriverOpts": None,
             "GwPriority": 0,
-            "EndpointID": "",
             "Gateway": "",
             "IPAddress": "",
             "IPPrefixLen": 0,
@@ -2612,7 +2623,7 @@ class SandboxRunner:
         }
         if (
             not isinstance(none_network, dict)
-            or set(none_network) != {*expected_none_network, "NetworkID"}
+            or set(none_network) != {*expected_none_network, "NetworkID", "EndpointID"}
             or any(
                 type(none_network[key]) is not type(wanted)
                 or none_network[key] != wanted
@@ -2625,9 +2636,17 @@ class SandboxRunner:
             network_id and _SHA256_RE.fullmatch(network_id) is None
         ):
             raise SandboxError("created container none-network ID is malformed")
+        endpoint_id = none_network["EndpointID"]
+        if not isinstance(endpoint_id, str) or (
+            endpoint_id and (not running or _SHA256_RE.fullmatch(endpoint_id) is None)
+        ):
+            raise SandboxError("created container none-network endpoint ID is malformed")
         normalized_none_network = dict(none_network)
         normalized_none_network["NetworkID"] = ""
+        normalized_none_network["EndpointID"] = ""
         normalized_network = dict(network)
+        normalized_network["SandboxID"] = ""
+        normalized_network["SandboxKey"] = ""
         normalized_network["Networks"] = {"none": normalized_none_network}
         actual_environment = config.get("Env")
         if not isinstance(actual_environment, list) or any(
