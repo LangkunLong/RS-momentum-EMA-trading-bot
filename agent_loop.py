@@ -55,6 +55,7 @@ _MAX_LIST_ITEMS = 16
 _MAX_TEXT_BYTES = 16 * 1024
 _MAX_DIFF_BYTES = 256 * 1024
 _MAX_DATA_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
+_CONTAINER_SHM_SIZE_BYTES = 64 * 1024 * 1024
 _MAX_GENERATION_ACCOUNTING_BYTES = 64 * 1024
 _MAX_PROVIDER_EVIDENCE_BYTES = 2 * 1024
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529})
@@ -3934,6 +3935,8 @@ class SandboxRunner:
         for key in ("CapAdd", "DeviceRequests"):
             if key in normalized_host and normalized_host[key] is None:
                 normalized_host[key] = []
+        if "Tmpfs" in normalized_host and normalized_host["Tmpfs"] is None:
+            normalized_host["Tmpfs"] = {}
         if "OomKillDisable" not in normalized_host or (
             normalized_host["OomKillDisable"] is not False
             and normalized_host["OomKillDisable"] is not None
@@ -3958,6 +3961,8 @@ class SandboxRunner:
             "DeviceRequests": [],
             "SecurityOpt": ["no-new-privileges"],
             "IpcMode": "private",
+            "ShmSize": _CONTAINER_SHM_SIZE_BYTES,
+            "Tmpfs": {},
             "PidMode": "",
             "UTSMode": "",
             "CgroupnsMode": "private",
@@ -4295,6 +4300,8 @@ class SandboxRunner:
             "none",
             "--ipc",
             "private",
+            "--shm-size",
+            "64m",
             "--cgroupns",
             "private",
             "--read-only",

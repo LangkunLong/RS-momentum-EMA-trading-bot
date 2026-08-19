@@ -4740,6 +4740,10 @@ class FaithfulSandboxEngine:
                     "Devices": [],
                     "DeviceRequests": [],
                     "IpcMode": "private",
+                    "ShmSize": 67108864
+                    if "--shm-size" in argv and self._option(argv, "--shm-size") == "64m"
+                    else 0,
+                    "Tmpfs": {},
                     "PidMode": "",
                     "UTSMode": "",
                     "CgroupnsMode": "private",
@@ -5069,10 +5073,10 @@ def test_timed_out_running_container_is_killed_before_logs_are_collected(tmp_pat
     assert commands.index("kill") < commands.index("logs")
 
 
-def test_container_attestation_normalizes_only_docker_null_capability_lists(
+def test_container_attestation_normalizes_only_docker_null_empty_collections(
     tmp_path: Path,
 ) -> None:
-    """Docker Desktop reports absent capability/device requests as null, not empty lists."""
+    """Docker Desktop may report absent capability, device, and tmpfs maps as null."""
     from agent_loop import export_candidate, preflight_source, run_test_gate
 
     source = _task2_repo(tmp_path)
@@ -5082,6 +5086,7 @@ def test_container_attestation_normalizes_only_docker_null_capability_lists(
     engine.mutate_inspection = lambda item: item["HostConfig"].update(
         CapAdd=None,
         DeviceRequests=None,
+        Tmpfs=None,
     )
 
     result = run_test_gate(candidate, _faithful_runner(image, engine))
@@ -5871,6 +5876,12 @@ def test_real_data_fetcher_opens_verified_writable_scratch_without_network(tmp_p
     "mutator",
     [
         lambda item: item["HostConfig"].update(IpcMode="host"),
+        lambda item: item["HostConfig"].pop("ShmSize"),
+        lambda item: item["HostConfig"].update(ShmSize=67108863),
+        lambda item: item["HostConfig"].update(ShmSize=67108864.0),
+        lambda item: item["HostConfig"].pop("Tmpfs"),
+        lambda item: item["HostConfig"].update(Tmpfs={"/workspace": "rw"}),
+        lambda item: item["HostConfig"].update(Tmpfs=[]),
         lambda item: item["HostConfig"].update(PidMode="host"),
         lambda item: item["HostConfig"].update(UTSMode="host"),
         lambda item: item["HostConfig"].update(CgroupnsMode="host"),
@@ -6618,8 +6629,13 @@ def test_round4_container_compile_and_ruff_cache_policy_is_exact(tmp_path: Path)
     assert environment["MKL_NUM_THREADS"] == "1"
     assert environment["NUMEXPR_NUM_THREADS"] == "1"
     assert engine.inspect_payload["HostConfig"]["Init"] is False  # type: ignore[index]
+    assert engine.inspect_payload["HostConfig"]["ShmSize"] == 64 * 1024 * 1024  # type: ignore[index]
+    assert engine.inspect_payload["HostConfig"]["Tmpfs"] == {}  # type: ignore[index]
     create = next(call for call in engine.calls if call[1] == "create")
     assert create.count("--init") == 0
+    assert create.count("--shm-size") == 1
+    shm_index = create.index("--shm-size")
+    assert create[shm_index + 1] == "64m"
     assert build_ruff_gate_argv() == ("-m", "ruff", "check", "--no-cache", ".")
     cache_ready = run_in_disposable_worker(
         candidate,
