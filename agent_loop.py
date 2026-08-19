@@ -1018,15 +1018,27 @@ class OpenRouterGateway:
     SYSTEM_PROMPTS = MappingProxyType(
         {
             "orchestrator": (
-                "You are the Orchestrator. Return one JSON route object only. Do not issue commands, "
-                "select unapproved scope, or include prose."
+                "You are the Orchestrator. Return exactly one JSON object with exactly these keys: "
+                '"action", "failure_summary", "relevant_files", "reasoning_focus". '
+                'Set "action" to "reason" or "abort"; use "reason" for a repairable failed gate. '
+                'Set "relevant_files" to a JSON array of one to four paths chosen only from the '
+                'provided "editable_paths". All text fields must be nonblank. Do not issue commands, '
+                "select unapproved scope, add keys, or include prose."
             ),
             "reasoner": (
-                "You are the Reasoner. Return one concise JSON plan only. Do not reveal chain of thought, "
-                "issue commands, or include prose."
+                "You are the Reasoner. Return exactly one concise JSON object with exactly these keys: "
+                '"diagnosis", "root_cause", "invariants", "files_to_change", "steps", "skip", '
+                '"skip_reason". Use JSON arrays for invariants, files_to_change, and steps; choose files '
+                "only from the provided source snapshots. Set skip to false and skip_reason to an empty "
+                "string for a repairable issue. Do not reveal chain of thought, issue commands, add keys, "
+                "or include prose."
             ),
             "coder": (
-                "You are the Coder. Return one JSON coding proposal only. Do not issue commands or include prose."
+                "You are the Coder. Return exactly one JSON object with exactly these keys: "
+                '"summary", "files", "unified_diff". Set files to the exact JSON array of paths changed '
+                "by unified_diff, limited to the approved plan and source snapshots. unified_diff must be "
+                "a valid unified diff string. Do not use Markdown fences, issue commands, add keys, or "
+                "include prose."
             ),
         }
     )
@@ -6635,7 +6647,11 @@ def run_proposal_batch(
                     sample,
                     1,
                     "orchestrator",
-                    {"batch_sample": sample, "evidence": evidence_payload},
+                    {
+                        "batch_sample": sample,
+                        "editable_paths": list(services.editable_paths),
+                        "evidence": evidence_payload,
+                    },
                     Route.from_json,
                     Route,
                     window,

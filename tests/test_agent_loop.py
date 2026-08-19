@@ -711,6 +711,35 @@ def test_reasoning_plan_and_coding_proposal_are_frozen_and_validate_limits() -> 
         )
 
 
+def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
+    """Break caught: JSON mode alone does not tell a model the controller's required keys."""
+    from agent_loop import OpenRouterGateway
+
+    required_keys = {
+        "orchestrator": (
+            "action",
+            "failure_summary",
+            "relevant_files",
+            "reasoning_focus",
+        ),
+        "reasoner": (
+            "diagnosis",
+            "root_cause",
+            "invariants",
+            "files_to_change",
+            "steps",
+            "skip",
+            "skip_reason",
+        ),
+        "coder": ("summary", "files", "unified_diff"),
+    }
+
+    for role, keys in required_keys.items():
+        prompt = OpenRouterGateway.SYSTEM_PROMPTS[role]
+        assert "exactly these keys" in prompt
+        assert all(f'"{key}"' in prompt for key in keys)
+
+
 def test_usage_and_completion_reject_invalid_direct_values() -> None:
     """Break caught: malformed provider metadata could poison the shared budget ledger."""
     from agent_loop import AgentCompletion, ProtocolValidationError, Usage
@@ -4833,6 +4862,7 @@ class _StrictBatchGateway:
         self.ledger = BudgetLedger(limits.max_usd, limits.max_calls, limits.max_tokens)
         self.outcomes = list(outcomes)
         self.roles: list[str] = []
+        self.dynamic_inputs: list[tuple[str, str]] = []
         self.pricing_preloads: list[tuple[str, ...]] = []
 
     def preload_pricing(self, roles: tuple[str, ...]) -> None:
@@ -4841,7 +4871,7 @@ class _StrictBatchGateway:
     def request_once(
         self,
         role: str,
-        _dynamic_input: str,
+        dynamic_input: str,
         _parser: Any,
         *,
         budget_window: Any = None,
@@ -4855,6 +4885,7 @@ class _StrictBatchGateway:
             Usage,
         )
 
+        self.dynamic_inputs.append((role, dynamic_input))
         reservation = self.ledger.reserve("x", 10, Pricing(0.0, 0.0), window=budget_window)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, ProviderCallFacts):
@@ -5083,6 +5114,12 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
         assert result.budget.api_calls == 150
         assert result.budget.spent_usd == pytest.approx(0.15)
         assert gateway.roles == ["orchestrator", "reasoner", "coder"] * 50
+        first_role, first_dynamic = gateway.dynamic_inputs[0]
+        assert first_role == "orchestrator"
+        assert json.loads(first_dynamic)["editable_paths"] == [
+            "core/backtest_engine.py",
+            "core/momentum_analysis.py",
+        ]
         assert gateway.pricing_preloads == [("orchestrator", "reasoner", "coder")]
         assert len(result.samples) == 50
         assert all(len(sample.provider_call_paths) == 3 for sample in result.samples)
