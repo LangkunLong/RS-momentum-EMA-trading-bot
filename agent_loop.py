@@ -1141,8 +1141,10 @@ class OpenRouterGateway:
                 "a complete git-style unified diff. For every changed file, include "
                 '"diff --git a/<path> b/<path>", "index 1111111..2222222 100644", '
                 '"--- a/<path>", and "+++ b/<path>" in that order before the @@ hunk. '
-                "Use that exact index line for every file. Do not use Markdown fences, issue "
-                "commands, add keys, or include prose."
+                "Use that exact index line for every file. Express every replacement with "
+                "paired '-old' and '+new' lines; never leave the old line as context and append "
+                "a duplicate. The hunk header counts must exactly match the hunk body. Do not use "
+                "Markdown fences, issue commands, add keys, or include prose."
             ),
         }
     )

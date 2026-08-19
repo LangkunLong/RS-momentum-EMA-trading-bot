@@ -1212,6 +1212,40 @@ def test_strict_gateway_enables_single_call_json_response_healing() -> None:
     }
 
 
+def test_coder_request_requires_valid_replacement_hunks_at_provider_boundary() -> None:
+    """A replacement request cannot invite add-only duplicate assignments or bad counts."""
+    from agent_loop import BudgetLedger, CodingProposal, OpenRouterGateway
+
+    model = "deepseek/deepseek-chat"
+    proposal = json.dumps(
+        {
+            "summary": "Replace one assignment.",
+            "files": ["core/momentum_analysis.py"],
+            "unified_diff": (
+                "diff --git a/core/momentum_analysis.py b/core/momentum_analysis.py\n"
+                "index 1111111..2222222 100644\n"
+                "--- a/core/momentum_analysis.py\n"
+                "+++ b/core/momentum_analysis.py\n"
+                "@@ -167,1 +167,1 @@\n"
+                "-        wp = calculate_weighted_performance(clean)\n"
+                "+        wp = calculate_weighted_performance(clean, q1_weight=0.4)\n"
+            ),
+        }
+    )
+    client = FakeClient([FakeResponse(proposal, cost=0.01, model=model)])
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    gateway.request_once("coder", "approved plan and snapshots", CodingProposal.from_json)
+
+    messages = client.completions.calls[0]["messages"]
+    assert "paired '-old' and '+new' lines" in messages[0]["content"]
+    assert "hunk header counts must exactly match the hunk body" in messages[0]["content"]
+
+
 def test_strict_protocol_failure_retains_complete_authoritative_accounting() -> None:
     """Break caught: malformed paid output discarded exact provider tokens and cost."""
     from agent_loop import (
