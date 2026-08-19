@@ -140,8 +140,43 @@ class ResponseValidationError(ValueError):
     """Raised when a provider response is incomplete or not a valid protocol object."""
 
 
+class AccountingFailureCode(str, Enum):
+    """Closed, content-free reason codes for strict accounting failures."""
+
+    INLINE_USAGE_MISSING = "inline_usage_missing"
+    INLINE_USAGE_INVALID = "inline_usage_invalid"
+    INLINE_USAGE_INCONSISTENT = "inline_usage_inconsistent"
+    RECOVERY_ID_MISSING = "recovery_id_missing"
+    RECOVERY_ID_UNSAFE = "recovery_id_unsafe"
+    RECOVERY_UNAVAILABLE = "recovery_unavailable"
+    RECOVERY_TRANSPORT_FAILED = "recovery_transport_failed"
+    RECOVERY_HTTP_RETRY_EXHAUSTED = "recovery_http_retry_exhausted"
+    RECOVERY_HTTP_TERMINAL = "recovery_http_terminal"
+    RECOVERY_PAYLOAD_INVALID = "recovery_payload_invalid"
+    RECOVERY_IDENTITY_INVALID = "recovery_identity_invalid"
+    RECOVERY_USAGE_INVALID = "recovery_usage_invalid"
+
+
 class AccountingValidationError(ResponseValidationError):
     """Raised when provider usage/cost accounting is missing, malformed, or inconsistent."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: AccountingFailureCode = AccountingFailureCode.INLINE_USAGE_INVALID,
+        generation_attempts: int = 0,
+    ) -> None:
+        if not isinstance(code, AccountingFailureCode):
+            raise ConfigurationError("accounting failure code is invalid")
+        if (
+            type(generation_attempts) is not int
+            or not 0 <= generation_attempts <= GENERATION_ACCOUNTING_ATTEMPTS
+        ):
+            raise ConfigurationError("generation accounting attempt count is invalid")
+        super().__init__(message)
+        self.code = code
+        self.generation_attempts = generation_attempts
 
 
 class BudgetExceededError(RuntimeError):
@@ -154,6 +189,100 @@ class GatewayError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+_INLINE_ACCOUNTING_CODES = frozenset(
+    {
+        AccountingFailureCode.INLINE_USAGE_MISSING,
+        AccountingFailureCode.INLINE_USAGE_INVALID,
+        AccountingFailureCode.INLINE_USAGE_INCONSISTENT,
+    }
+)
+_RECOVERY_ACCOUNTING_CODES = frozenset(set(AccountingFailureCode) - _INLINE_ACCOUNTING_CODES)
+
+
+@dataclass(frozen=True)
+class IncompleteAccountingFacts:
+    """Closed facts for one paid call whose exact provider accounting is unavailable."""
+
+    schema_version: int
+    call_index: int
+    role: str
+    inline_failure_code: AccountingFailureCode
+    recovery_failure_code: AccountingFailureCode
+    generation_attempts: int
+    response_id_safe: bool
+    accounting_complete: bool
+    budget_charge_basis: str
+    retained_reservation_tokens: int
+    retained_reservation_usd: float
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ConfigurationError("incomplete accounting schema version must be 1")
+        if type(self.call_index) is not int or self.call_index < 1:
+            raise ConfigurationError("incomplete accounting call index must be positive")
+        if self.role not in {"orchestrator", "reasoner", "coder"}:
+            raise ConfigurationError("incomplete accounting role is invalid")
+        if self.inline_failure_code not in _INLINE_ACCOUNTING_CODES:
+            raise ConfigurationError("inline accounting failure code is invalid")
+        if self.recovery_failure_code not in _RECOVERY_ACCOUNTING_CODES:
+            raise ConfigurationError("recovery accounting failure code is invalid")
+        if (
+            type(self.generation_attempts) is not int
+            or not 0 <= self.generation_attempts <= GENERATION_ACCOUNTING_ATTEMPTS
+        ):
+            raise ConfigurationError("generation accounting attempt count is invalid")
+        no_attempt_codes = {
+            AccountingFailureCode.RECOVERY_ID_MISSING,
+            AccountingFailureCode.RECOVERY_ID_UNSAFE,
+            AccountingFailureCode.RECOVERY_UNAVAILABLE,
+        }
+        if (self.recovery_failure_code in no_attempt_codes) != (
+            self.generation_attempts == 0
+        ):
+            raise ConfigurationError("recovery failure code and attempt count are inconsistent")
+        expected_response_id_safe = (
+            self.recovery_failure_code
+            not in {
+                AccountingFailureCode.RECOVERY_ID_MISSING,
+                AccountingFailureCode.RECOVERY_ID_UNSAFE,
+            }
+        )
+        if (
+            type(self.response_id_safe) is not bool
+            or self.response_id_safe is not expected_response_id_safe
+        ):
+            raise ConfigurationError("response identifier safety fact is inconsistent")
+        if self.accounting_complete is not False:
+            raise ConfigurationError("incomplete accounting cannot claim complete accounting")
+        if self.budget_charge_basis != "full_reservation":
+            raise ConfigurationError("incomplete accounting charge basis is invalid")
+        if (
+            type(self.retained_reservation_tokens) is not int
+            or self.retained_reservation_tokens < 1
+        ):
+            raise ConfigurationError("retained reservation tokens must be positive")
+        if (
+            type(self.retained_reservation_usd) not in {int, float}
+            or not math.isfinite(self.retained_reservation_usd)
+            or self.retained_reservation_usd < 0
+        ):
+            raise ConfigurationError("retained reservation USD must be finite and nonnegative")
+
+
+class IncompleteAccountingError(AccountingValidationError):
+    """A paid call retained its full reservation because accounting recovery failed."""
+
+    def __init__(self, facts: IncompleteAccountingFacts) -> None:
+        if not isinstance(facts, IncompleteAccountingFacts):
+            raise ConfigurationError("incomplete accounting error requires closed facts")
+        super().__init__(
+            "provider accounting remained incomplete after bounded recovery",
+            code=facts.recovery_failure_code,
+            generation_attempts=facts.generation_attempts,
+        )
+        self.facts = facts
 
 
 class PreflightError(RuntimeError):
@@ -685,6 +814,10 @@ class BudgetLedger:
         self.reserved_tokens = 0
         self.reserved_usd = 0.0
         self.spent_usd = 0.0
+        self.authoritative_usd = 0.0
+        self.retained_reservation_usd = 0.0
+        self.retained_reservation_tokens = 0
+        self.incomplete_accounting_calls = 0
 
     @property
     def committed_usd(self) -> float:
@@ -770,6 +903,14 @@ class BudgetLedger:
         self.spent_usd += charged
         self.reserved_tokens = prospective_tokens
         self.total_tokens += charged_tokens
+        if usage.cost_usd is None:
+            self.retained_reservation_usd += charged
+        else:
+            self.authoritative_usd += charged
+        if reported_tokens is None:
+            self.retained_reservation_tokens += charged_tokens
+        if usage.cost_usd is None or reported_tokens is None:
+            self.incomplete_accounting_calls += 1
         for attribute, value in (
             ("prompt_tokens", usage.prompt_tokens),
             ("completion_tokens", usage.completion_tokens),
@@ -836,7 +977,10 @@ def _usage_int(usage: object, name: str) -> int | None:
         return None
     normalized = _non_negative_int(value)
     if normalized is None:
-        raise AccountingValidationError(f"usage {name} must be a non-negative integer")
+        raise AccountingValidationError(
+            f"usage {name} must be a non-negative integer",
+            code=AccountingFailureCode.INLINE_USAGE_INVALID,
+        )
     return normalized
 
 
@@ -845,7 +989,10 @@ def _usage_cost(value: object, location: str) -> float | None:
         return None
     normalized = _non_negative_float(value)
     if normalized is None:
-        raise AccountingValidationError(f"{location} cost must be a finite non-negative number")
+        raise AccountingValidationError(
+            f"{location} cost must be a finite non-negative number",
+            code=AccountingFailureCode.INLINE_USAGE_INVALID,
+        )
     return normalized
 
 
@@ -853,7 +1000,10 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
     usage = _read_field(response, "usage")
     if usage is None:
         if require_complete:
-            raise AccountingValidationError("response is missing authoritative usage accounting")
+            raise AccountingValidationError(
+                "response is missing authoritative usage accounting",
+                code=AccountingFailureCode.INLINE_USAGE_MISSING,
+            )
         usage = {}
     prompt_tokens = _usage_int(usage, "prompt_tokens")
     completion_tokens = _usage_int(usage, "completion_tokens")
@@ -873,14 +1023,23 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
     usage_cost = _usage_cost(_present_field(usage, "cost"), "usage")
     response_cost = _usage_cost(_present_field(response, "cost"), "response")
     if usage_cost is not None and response_cost is not None and usage_cost != response_cost:
-        raise AccountingValidationError("response contains conflicting provider cost accounting")
+        raise AccountingValidationError(
+            "response contains conflicting provider cost accounting",
+            code=AccountingFailureCode.INLINE_USAGE_INCONSISTENT,
+        )
     cost = usage_cost if usage_cost is not None else response_cost
     if require_complete and cost is None:
-        raise AccountingValidationError("response is missing authoritative provider cost accounting")
+        raise AccountingValidationError(
+            "response is missing authoritative provider cost accounting",
+            code=AccountingFailureCode.INLINE_USAGE_MISSING,
+        )
     if require_complete and (
         prompt_tokens is None or completion_tokens is None or total_tokens is None
     ):
-        raise AccountingValidationError("response is missing complete authoritative usage accounting")
+        raise AccountingValidationError(
+            "response is missing complete authoritative usage accounting",
+            code=AccountingFailureCode.INLINE_USAGE_MISSING,
+        )
     if (
         require_complete
         and prompt_tokens is not None
@@ -888,7 +1047,8 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
         and total_tokens != prompt_tokens + completion_tokens
     ):
         raise AccountingValidationError(
-            "usage total_tokens must equal prompt_tokens plus completion_tokens"
+            "usage total_tokens must equal prompt_tokens plus completion_tokens",
+            code=AccountingFailureCode.INLINE_USAGE_INCONSISTENT,
         )
     try:
         return Usage(
@@ -900,15 +1060,24 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
             cost_usd=cost,
         )
     except ProtocolValidationError as exc:
-        raise AccountingValidationError("provider accounting relationships are invalid") from exc
+        raise AccountingValidationError(
+            "provider accounting relationships are invalid",
+            code=AccountingFailureCode.INLINE_USAGE_INCONSISTENT,
+        ) from exc
 
 
 def _safe_generation_id(response: object) -> str:
     """Return one locally hardened OpenRouter generation identifier."""
     value = _read_field(response, "id")
+    if value is None:
+        raise AccountingValidationError(
+            "response is missing a generation accounting identifier",
+            code=AccountingFailureCode.RECOVERY_ID_MISSING,
+        )
     if not isinstance(value, str) or _GENERATION_ID_RE.fullmatch(value) is None:
         raise AccountingValidationError(
-            "response has no safe generation accounting identifier"
+            "response has an unsafe generation accounting identifier",
+            code=AccountingFailureCode.RECOVERY_ID_UNSAFE,
         )
     return value
 
@@ -923,7 +1092,8 @@ def _generation_token_pair(data: Mapping[str, object]) -> tuple[int, int]:
             completion = _non_negative_int(native_completion)
             if prompt is None or completion is None:
                 raise AccountingValidationError(
-                    "generation native token accounting is invalid"
+                    "generation native token accounting is invalid",
+                    code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
                 )
             return prompt, completion
         if not (
@@ -931,12 +1101,16 @@ def _generation_token_pair(data: Mapping[str, object]) -> tuple[int, int]:
             and (native_completion is _MISSING_FIELD or native_completion is None)
         ):
             raise AccountingValidationError(
-                "generation native token accounting is incomplete"
+                "generation native token accounting is incomplete",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
             )
     prompt = _non_negative_int(_present_field(data, "tokens_prompt"))
     completion = _non_negative_int(_present_field(data, "tokens_completion"))
     if prompt is None or completion is None:
-        raise AccountingValidationError("generation token accounting is incomplete")
+        raise AccountingValidationError(
+            "generation token accounting is incomplete",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+        )
     return prompt, completion
 
 
@@ -947,21 +1121,48 @@ def _usage_from_generation_record(
 ) -> Usage:
     """Validate one complete authoritative record from OpenRouter's generation endpoint."""
     if not isinstance(payload, Mapping):
-        raise AccountingValidationError("generation accounting response is invalid")
+        raise AccountingValidationError(
+            "generation accounting response is invalid",
+            code=AccountingFailureCode.RECOVERY_PAYLOAD_INVALID,
+        )
     data = payload.get("data")
     if not isinstance(data, Mapping):
-        raise AccountingValidationError("generation accounting data is invalid")
+        raise AccountingValidationError(
+            "generation accounting data is invalid",
+            code=AccountingFailureCode.RECOVERY_PAYLOAD_INVALID,
+        )
     if data.get("id") != generation_id:
-        raise AccountingValidationError("generation accounting identity does not match")
+        raise AccountingValidationError(
+            "generation accounting identity does not match",
+            code=AccountingFailureCode.RECOVERY_IDENTITY_INVALID,
+        )
     if data.get("api_type") != "completions":
-        raise AccountingValidationError("generation accounting API type is invalid")
-    total_cost = _usage_cost(data.get("total_cost", _MISSING_FIELD), "generation total")
-    usage_cost = _usage_cost(data.get("usage", _MISSING_FIELD), "generation usage")
+        raise AccountingValidationError(
+            "generation accounting API type is invalid",
+            code=AccountingFailureCode.RECOVERY_PAYLOAD_INVALID,
+        )
+    try:
+        total_cost = _usage_cost(data.get("total_cost", _MISSING_FIELD), "generation total")
+        usage_cost = _usage_cost(data.get("usage", _MISSING_FIELD), "generation usage")
+    except AccountingValidationError as exc:
+        raise AccountingValidationError(
+            "generation cost accounting is invalid",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+        ) from exc
     if total_cost is None or usage_cost is None or total_cost != usage_cost:
-        raise AccountingValidationError("generation cost accounting is incomplete or conflicting")
+        raise AccountingValidationError(
+            "generation cost accounting is incomplete or conflicting",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+        )
     prompt_tokens, completion_tokens = _generation_token_pair(data)
-    cached_tokens = _usage_int(data, "native_tokens_cached")
-    reasoning_tokens = _usage_int(data, "native_tokens_reasoning")
+    try:
+        cached_tokens = _usage_int(data, "native_tokens_cached")
+        reasoning_tokens = _usage_int(data, "native_tokens_reasoning")
+    except AccountingValidationError as exc:
+        raise AccountingValidationError(
+            "generation optional token accounting is invalid",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+        ) from exc
     try:
         return Usage(
             prompt_tokens=prompt_tokens,
@@ -974,7 +1175,8 @@ def _usage_from_generation_record(
         )
     except ProtocolValidationError as exc:
         raise AccountingValidationError(
-            "generation accounting relationships are invalid"
+            "generation accounting relationships are invalid",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
         ) from exc
 
 
@@ -1347,11 +1549,17 @@ class OpenRouterGateway:
         except OSError as exc:
             raise GatewayError("OpenRouter generation accounting request failed") from exc
         if len(body) > _MAX_GENERATION_ACCOUNTING_BYTES:
-            raise AccountingValidationError("generation accounting response is too large")
+            raise AccountingValidationError(
+                "generation accounting response is too large",
+                code=AccountingFailureCode.RECOVERY_PAYLOAD_INVALID,
+            )
         try:
             return json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AccountingValidationError("generation accounting response is invalid") from exc
+            raise AccountingValidationError(
+                "generation accounting response is invalid",
+                code=AccountingFailureCode.RECOVERY_PAYLOAD_INVALID,
+            ) from exc
 
     def _recover_generation_usage(
         self,
@@ -1361,7 +1569,10 @@ class OpenRouterGateway:
         """Recover strict accounting without issuing another paid chat completion."""
         generation_id = _safe_generation_id(response)
         if self._generation_loader is None:
-            raise AccountingValidationError("generation accounting recovery is unavailable")
+            raise AccountingValidationError(
+                "generation accounting recovery is unavailable",
+                code=AccountingFailureCode.RECOVERY_UNAVAILABLE,
+            )
         for attempt in range(GENERATION_ACCOUNTING_ATTEMPTS):
             try:
                 payload = self._generation_loader(generation_id)
@@ -1374,13 +1585,46 @@ class OpenRouterGateway:
                         GENERATION_ACCOUNTING_DELAY_SECONDS * (attempt + 1)
                     )
                     continue
+                status_code = exc.status_code
                 raise AccountingValidationError(
-                    "generation accounting recovery failed"
+                    "generation accounting recovery failed",
+                    code=(
+                        AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED
+                        if status_code
+                        in {404, 408, 429, 500, 502, 503, 504, 524, 529}
+                        else AccountingFailureCode.RECOVERY_HTTP_TERMINAL
+                        if type(status_code) is int
+                        else AccountingFailureCode.RECOVERY_TRANSPORT_FAILED
+                    ),
+                    generation_attempts=attempt + 1,
                 ) from exc
-            usage = _usage_from_generation_record(
-                payload,
-                generation_id=generation_id,
-            )
+            except AccountingValidationError as exc:
+                loader_validation_codes = {
+                    AccountingFailureCode.RECOVERY_PAYLOAD_INVALID,
+                    AccountingFailureCode.RECOVERY_IDENTITY_INVALID,
+                    AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                }
+                recovery_code = (
+                    exc.code
+                    if exc.code in loader_validation_codes
+                    else AccountingFailureCode.RECOVERY_PAYLOAD_INVALID
+                )
+                raise AccountingValidationError(
+                    "generation accounting loader failed validation",
+                    code=recovery_code,
+                    generation_attempts=attempt + 1,
+                ) from exc
+            try:
+                usage = _usage_from_generation_record(
+                    payload,
+                    generation_id=generation_id,
+                )
+            except AccountingValidationError as exc:
+                raise AccountingValidationError(
+                    "generation accounting record failed validation",
+                    code=exc.code,
+                    generation_attempts=attempt + 1,
+                ) from exc
             data = payload["data"]
             assert isinstance(data, Mapping)
             semantics_valid = (
@@ -1475,12 +1719,39 @@ class OpenRouterGateway:
                 response,
                 require_complete=require_complete_accounting,
             )
-        except AccountingValidationError:
+        except AccountingValidationError as inline_exc:
             if not require_complete_accounting:
                 self.ledger.reconcile(reservation, Usage(), window=budget_window)
                 raise
             try:
                 usage, recovered_semantics_valid = self._recover_generation_usage(response, model)
+            except AccountingValidationError as recovery_exc:
+                self.ledger.reconcile(reservation, Usage(), window=budget_window)
+                inline_code = (
+                    inline_exc.code
+                    if inline_exc.code in _INLINE_ACCOUNTING_CODES
+                    else AccountingFailureCode.INLINE_USAGE_INVALID
+                )
+                facts = IncompleteAccountingFacts(
+                    schema_version=1,
+                    call_index=self.ledger.calls,
+                    role=role,
+                    inline_failure_code=inline_code,
+                    recovery_failure_code=recovery_exc.code,
+                    generation_attempts=recovery_exc.generation_attempts,
+                    response_id_safe=(
+                        recovery_exc.code
+                        not in {
+                            AccountingFailureCode.RECOVERY_ID_MISSING,
+                            AccountingFailureCode.RECOVERY_ID_UNSAFE,
+                        }
+                    ),
+                    accounting_complete=False,
+                    budget_charge_basis="full_reservation",
+                    retained_reservation_tokens=reservation.token_upper_bound,
+                    retained_reservation_usd=reservation.amount_usd,
+                )
+                raise IncompleteAccountingError(facts) from recovery_exc
             except Exception:
                 self.ledger.reconcile(reservation, Usage(), window=budget_window)
                 raise
@@ -5633,6 +5904,11 @@ class BudgetSnapshot:
     reserved_tokens: int
     reserved_usd: float
     spent_usd: float
+    authoritative_usd: float
+    retained_reservation_usd: float
+    retained_reservation_tokens: int
+    incomplete_accounting_calls: int
+    accounting_basis: str
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -5641,14 +5917,43 @@ class BudgetSnapshot:
             ("completion_tokens", self.completion_tokens),
             ("total_tokens", self.total_tokens),
             ("reserved_tokens", self.reserved_tokens),
+            ("retained_reservation_tokens", self.retained_reservation_tokens),
+            ("incomplete_accounting_calls", self.incomplete_accounting_calls),
         ):
             if type(value) is not int or value < 0:
                 raise ConfigurationError(f"{field} must be a nonnegative integer")
         if self.total_tokens < self.prompt_tokens + self.completion_tokens:
             raise ConfigurationError("total_tokens must cover prompt plus completion tokens")
-        for field, value in (("reserved_usd", self.reserved_usd), ("spent_usd", self.spent_usd)):
+        if self.incomplete_accounting_calls > self.api_calls:
+            raise ConfigurationError("incomplete accounting calls cannot exceed API calls")
+        for field, value in (
+            ("reserved_usd", self.reserved_usd),
+            ("spent_usd", self.spent_usd),
+            ("authoritative_usd", self.authoritative_usd),
+            ("retained_reservation_usd", self.retained_reservation_usd),
+        ):
             if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
                 raise ConfigurationError(f"{field} must be finite and nonnegative")
+        expected_basis = (
+            "authoritative"
+            if self.incomplete_accounting_calls == 0
+            else "authoritative_plus_retained_reservations"
+        )
+        if self.accounting_basis != expected_basis:
+            raise ConfigurationError("budget accounting basis is inconsistent")
+        if self.incomplete_accounting_calls == 0 and (
+            self.retained_reservation_tokens != 0 or self.retained_reservation_usd != 0
+        ):
+            raise ConfigurationError(
+                "authoritative budget cannot contain retained reservation components"
+            )
+        if not math.isclose(
+            self.spent_usd,
+            self.authoritative_usd + self.retained_reservation_usd,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        ):
+            raise ConfigurationError("budget USD components do not equal conservative spend")
 
 
 @dataclass(frozen=True)
@@ -6593,6 +6898,7 @@ class ProposalBatchResult:
     provider_call_artifacts: tuple[tuple[Path, str], ...]
     source_modified: bool
     cleanup_complete: bool
+    accounting_failure: IncompleteAccountingFacts | None = None
 
     def __post_init__(self) -> None:
         allowed = {
@@ -6628,6 +6934,36 @@ class ProposalBatchResult:
                 raise ConfigurationError("provider call artifact digest is invalid")
         if type(self.source_modified) is not bool or type(self.cleanup_complete) is not bool:
             raise ConfigurationError("proposal batch cleanup facts must be boolean")
+        has_accounting_failure = isinstance(
+            self.accounting_failure, IncompleteAccountingFacts
+        )
+        if self.failure_code == "accounting_invalid" and not has_accounting_failure:
+            raise ConfigurationError(
+                "proposal batch accounting diagnostic must match its terminal failure"
+            )
+        if has_accounting_failure and self.failure_code not in {
+            "accounting_invalid",
+            "source_modified",
+            "cleanup_incomplete",
+        }:
+            raise ConfigurationError(
+                "proposal batch accounting diagnostic is unrelated to its terminal failure"
+            )
+        if self.accounting_failure is not None and (
+            self.budget.incomplete_accounting_calls != 1
+            or self.accounting_failure.call_index != self.budget.api_calls
+            or self.accounting_failure.retained_reservation_tokens
+            != self.budget.retained_reservation_tokens
+            or not math.isclose(
+                self.accounting_failure.retained_reservation_usd,
+                self.budget.retained_reservation_usd,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+        ):
+            raise ConfigurationError(
+                "proposal batch accounting diagnostic does not match its budget"
+            )
 
 
 def export_inert_handoff(
@@ -6888,6 +7224,15 @@ def _budget_snapshot(ledger: BudgetLedger) -> BudgetSnapshot:
         reserved_tokens=ledger.reserved_tokens,
         reserved_usd=ledger.reserved_usd,
         spent_usd=ledger.spent_usd,
+        authoritative_usd=ledger.authoritative_usd,
+        retained_reservation_usd=ledger.retained_reservation_usd,
+        retained_reservation_tokens=ledger.retained_reservation_tokens,
+        incomplete_accounting_calls=ledger.incomplete_accounting_calls,
+        accounting_basis=(
+            "authoritative"
+            if ledger.incomplete_accounting_calls == 0
+            else "authoritative_plus_retained_reservations"
+        ),
     )
 
 
@@ -7059,6 +7404,7 @@ def run_proposal_batch(
     provider_call_artifacts: list[tuple[int, str, Path, str]] = []
     failure_code = "none"
     status = "batch_failed"
+    accounting_failure: IncompleteAccountingFacts | None = None
 
     def check_wall() -> None:
         current = services.monotonic()
@@ -7104,6 +7450,7 @@ def run_proposal_batch(
         expected_type: type[object],
         window: BudgetWindow,
     ) -> tuple[object, tuple[Path, str]]:
+        nonlocal accounting_failure
         check_wall()
         if ordinal != {"orchestrator": 1, "reasoner": 2, "coder": 3}.get(role):
             raise ConfigurationError("proposal batch role order is invalid")
@@ -7149,7 +7496,26 @@ def run_proposal_batch(
             path, digest = audit.write_provider_call(record)
             provider_call_artifacts.append((record.call_index, outcome, path, digest))
             raise
-        except AccountingValidationError:
+        except IncompleteAccountingError as exc:
+            facts = exc.facts
+            if (
+                facts.role != role
+                or facts.call_index != ledger.calls
+                or accounting_failure is not None
+                or ledger.incomplete_accounting_calls != 1
+                or facts.retained_reservation_tokens
+                != ledger.retained_reservation_tokens
+                or not math.isclose(
+                    facts.retained_reservation_usd,
+                    ledger.retained_reservation_usd,
+                    rel_tol=1e-12,
+                    abs_tol=1e-15,
+                )
+            ):
+                raise ConfigurationError(
+                    "incomplete accounting diagnostic does not match the active paid call"
+                ) from exc
+            accounting_failure = facts
             audit.append_event(
                 {
                     "orchestrator": LoopState.CALL_ORCHESTRATOR,
@@ -7157,9 +7523,30 @@ def run_proposal_batch(
                     "coder": LoopState.CALL_CODER,
                 }[role],
                 "provider_call_rejected",
-                {"call_index": ledger.calls, "role": role, "code": "accounting_invalid"},
+                {
+                    "code": "accounting_invalid",
+                    "accounting_failure": asdict(facts),
+                },
             )
             raise
+        except AccountingValidationError as exc:
+            audit.append_event(
+                {
+                    "orchestrator": LoopState.CALL_ORCHESTRATOR,
+                    "reasoner": LoopState.CALL_REASONER,
+                    "coder": LoopState.CALL_CODER,
+                }[role],
+                "provider_call_rejected",
+                {
+                    "accounting_complete": False,
+                    "call_index": ledger.calls,
+                    "role": role,
+                    "code": "strict_gateway_contract_invalid",
+                },
+            )
+            raise ConfigurationError(
+                "strict gateway raised accounting failure without closed facts"
+            ) from exc
         except GatewayError:
             audit.append_event(
                 {
@@ -7188,7 +7575,7 @@ def run_proposal_batch(
             or usage.total_tokens is None
             or usage.cost_usd is None
         ):
-            raise AccountingValidationError("strict gateway omitted complete accepted-call accounting")
+            raise ConfigurationError("strict gateway omitted complete accepted-call accounting")
         payload_path = audit.write_validated_payload(
             f"{role}-{sample:03d}", completion.payload
         )
@@ -7402,6 +7789,9 @@ def run_proposal_batch(
             "failure_code": failure_code,
             "cleanup_complete": cleanup.cleanup_complete,
             "source_modified": cleanup.source_modified,
+            "accounting_failure": (
+                asdict(accounting_failure) if accounting_failure is not None else None
+            ),
         },
     )
     summary = {
@@ -7413,6 +7803,9 @@ def run_proposal_batch(
         "budget": asdict(_budget_snapshot(ledger)),
         "cleanup_complete": cleanup.cleanup_complete,
         "source_modified": cleanup.source_modified,
+        "accounting_failure": (
+            asdict(accounting_failure) if accounting_failure is not None else None
+        ),
         "proposal_artifacts": [
             {
                 "sample": value.sample,
@@ -7442,6 +7835,7 @@ def run_proposal_batch(
         ),
         source_modified=cleanup.source_modified,
         cleanup_complete=cleanup.cleanup_complete,
+        accounting_failure=accounting_failure,
     )
 
 
@@ -8616,6 +9010,11 @@ def _proposal_batch_summary(result: ProposalBatchResult) -> dict[str, object]:
         "requested_samples": result.requested_samples,
         "completed_samples": result.completed_samples,
         "failure_code": result.failure_code,
+        "accounting_failure": (
+            asdict(result.accounting_failure)
+            if result.accounting_failure is not None
+            else None
+        ),
         "budget": asdict(result.budget),
         "audit_path": str(result.audit_path),
         "proposal_artifacts": [

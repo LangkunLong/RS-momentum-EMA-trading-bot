@@ -658,7 +658,7 @@ def test_task3_loop_config_and_result_enforce_terminal_contract(tmp_path: Path) 
             gate=TestGateConfig(), models=ModelConfig(), limits=LoopLimits(max_usd=0.25),
         )
 
-    budget = BudgetSnapshot(0, 0, 0, 0, 0, 0.0, 0.0)
+    budget = BudgetSnapshot(0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0, "authoritative")
     result = LoopResult(
         terminal_state=LoopState.FINISH_GATE_OBSERVED,
         status=TerminalStatus.GATE_OBSERVED_PASS, exit_code=0,
@@ -1460,6 +1460,235 @@ def test_generation_accounting_malformed_success_is_not_retried() -> None:
     with pytest.raises(ResponseValidationError, match="accounting"):
         gateway.request_once("orchestrator", "evidence", Route.from_json)
     assert polls == ["gen-test12345678"]
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_code",
+        "expected_attempts",
+        "response_id_safe",
+    ),
+    (
+        ("missing_id", "recovery_id_missing", 0, False),
+        ("unsafe_id", "recovery_id_unsafe", 0, False),
+        ("unavailable", "recovery_unavailable", 0, True),
+        ("transport", "recovery_transport_failed", 1, True),
+        ("http_status", "recovery_http_terminal", 1, True),
+        ("payload", "recovery_payload_invalid", 1, True),
+        ("identity", "recovery_identity_invalid", 1, True),
+        ("usage", "recovery_usage_invalid", 1, True),
+    ),
+)
+def test_strict_accounting_failure_exposes_only_closed_recovery_facts(
+    case: str,
+    expected_code: str,
+    expected_attempts: int,
+    response_id_safe: bool,
+) -> None:
+    """Every incomplete paid call has useful bounded facts without provider content."""
+    from agent_loop import (
+        BudgetLedger,
+        GatewayError,
+        IncompleteAccountingError,
+        OpenRouterGateway,
+        Route,
+    )
+
+    secret = "sk-or-v1-do-not-persist-accounting-canary"
+    response_id = (
+        None
+        if case == "missing_id"
+        else "../" + secret
+        if case == "unsafe_id"
+        else "gen-closed-facts123"
+    )
+    model = "qwen/qwen-2.5-7b-instruct"
+    polls: list[str] = []
+
+    def load_generation(value: str) -> object:
+        polls.append(value)
+        if case == "transport":
+            raise GatewayError(f"connection leaked {secret}")
+        if case == "http_status":
+            raise GatewayError(f"provider leaked {secret}", status_code=401)
+        if case == "payload":
+            return {"untrusted": secret}
+        payload = _generation_accounting(value, model)
+        data = payload["data"]
+        assert isinstance(data, dict)
+        if case == "identity":
+            data["id"] = "gen-other-identity"
+        elif case == "usage":
+            data["tokens_completion"] = secret
+        return payload
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=100_000)
+    gateway = OpenRouterGateway(
+        client=FakeClient(
+            [FakeResponse(_route_json(), cost=None, model=model, id=response_id)]  # type: ignore[arg-type]
+        ),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=None if case == "unavailable" else load_generation,
+        ledger=ledger,
+    )
+
+    with pytest.raises(IncompleteAccountingError) as raised:
+        gateway.request_once("orchestrator", "evidence", Route.from_json)
+
+    facts = raised.value.facts
+    assert facts.inline_failure_code.value == "inline_usage_missing"
+    assert facts.recovery_failure_code.value == expected_code
+    assert facts.generation_attempts == expected_attempts
+    assert facts.response_id_safe is response_id_safe
+    assert facts.accounting_complete is False
+    assert facts.budget_charge_basis == "full_reservation"
+    assert facts.retained_reservation_tokens == ledger.retained_reservation_tokens
+    assert facts.retained_reservation_usd == pytest.approx(ledger.retained_reservation_usd)
+    assert ledger.incomplete_accounting_calls == 1
+    assert ledger.authoritative_usd == 0.0
+    assert secret not in json.dumps(asdict(facts))
+    assert polls == (
+        [] if case in {"missing_id", "unsafe_id", "unavailable"} else [response_id]
+    )
+
+
+def test_generation_accounting_transient_exhaustion_records_attempt_bound() -> None:
+    """Bounded metadata retries are visible without exposing statuses, IDs, or exceptions."""
+    from agent_loop import (
+        BudgetLedger,
+        GatewayError,
+        IncompleteAccountingError,
+        OpenRouterGateway,
+        Route,
+    )
+
+    secret = "sk-or-v1-transient-accounting-canary"
+    polls: list[str] = []
+
+    def unavailable(value: str) -> object:
+        polls.append(value)
+        raise GatewayError(f"404 {secret} {value}", status_code=404)
+
+    gateway = OpenRouterGateway(
+        client=FakeClient([FakeResponse(_route_json(), cost=None)]),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=unavailable,
+        generation_sleeper=lambda _delay: None,
+        ledger=BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=100_000),
+    )
+
+    with pytest.raises(IncompleteAccountingError) as raised:
+        gateway.request_once("orchestrator", "evidence", Route.from_json)
+
+    facts = raised.value.facts
+    assert facts.recovery_failure_code.value == "recovery_http_retry_exhausted"
+    assert facts.generation_attempts == 3
+    assert len(polls) == 3
+    assert secret not in json.dumps(asdict(facts))
+
+
+def test_generation_loader_accounting_error_is_stamped_with_attempt_count() -> None:
+    """Built-in body/JSON validation failures remain closed accounting diagnostics."""
+    from agent_loop import (
+        AccountingFailureCode,
+        AccountingValidationError,
+        BudgetLedger,
+        IncompleteAccountingError,
+        OpenRouterGateway,
+        Route,
+    )
+
+    secret = "sk-or-v1-loader-body-canary"
+
+    def invalid_body(_value: str) -> object:
+        try:
+            raise ValueError(secret)
+        except ValueError as exc:
+            raise AccountingValidationError(
+                "generation body is invalid",
+                code=AccountingFailureCode.RECOVERY_PAYLOAD_INVALID,
+            ) from exc
+
+    gateway = OpenRouterGateway(
+        client=FakeClient([FakeResponse(_route_json(), cost=None)]),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=invalid_body,
+        ledger=BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=100_000),
+    )
+
+    with pytest.raises(IncompleteAccountingError) as raised:
+        gateway.request_once("orchestrator", "evidence", Route.from_json)
+
+    facts = raised.value.facts
+    assert facts.recovery_failure_code is AccountingFailureCode.RECOVERY_PAYLOAD_INVALID
+    assert facts.generation_attempts == 1
+    assert secret not in json.dumps(asdict(facts))
+
+
+def test_budget_snapshot_separates_authoritative_spend_from_retained_reservations() -> None:
+    """Unknown provider spend is never mislabeled as authoritative in terminal summaries."""
+    from agent_loop import BudgetLedger, Pricing, Usage, _budget_snapshot
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=100_000)
+    accepted = ledger.reserve("known", 10, Pricing(100.0, 100.0))
+    ledger.reconcile(
+        accepted,
+        Usage(prompt_tokens=5, completion_tokens=3, total_tokens=8, cost_usd=0.01),
+    )
+    unknown = ledger.reserve("unknown", 10, Pricing(100.0, 100.0))
+    ledger.reconcile(unknown, Usage())
+
+    snapshot = _budget_snapshot(ledger)
+    assert snapshot.authoritative_usd == pytest.approx(0.01)
+    assert snapshot.retained_reservation_usd == pytest.approx(unknown.amount_usd)
+    assert snapshot.retained_reservation_tokens == unknown.token_upper_bound
+    assert snapshot.incomplete_accounting_calls == 1
+    assert snapshot.accounting_basis == "authoritative_plus_retained_reservations"
+    assert snapshot.spent_usd == pytest.approx(
+        snapshot.authoritative_usd + snapshot.retained_reservation_usd
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"inline_failure_code": "recovery_id_invalid"},
+        {"recovery_failure_code": "inline_usage_missing"},
+        {"generation_attempts": 0},
+        {"response_id_safe": False},
+        {"accounting_complete": True},
+        {"budget_charge_basis": "provider_cost"},
+        {"retained_reservation_tokens": 0},
+        {"retained_reservation_usd": float("nan")},
+    ),
+)
+def test_incomplete_accounting_facts_reject_open_or_inconsistent_values(
+    overrides: dict[str, object],
+) -> None:
+    """The rejection audit schema cannot accept dynamic labels or contradictory facts."""
+    from agent_loop import (
+        AccountingFailureCode,
+        ConfigurationError,
+        IncompleteAccountingFacts,
+    )
+
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "call_index": 1,
+        "role": "orchestrator",
+        "inline_failure_code": AccountingFailureCode.INLINE_USAGE_MISSING,
+        "recovery_failure_code": AccountingFailureCode.RECOVERY_TRANSPORT_FAILED,
+        "generation_attempts": 1,
+        "response_id_safe": True,
+        "accounting_complete": False,
+        "budget_charge_basis": "full_reservation",
+        "retained_reservation_tokens": 10,
+        "retained_reservation_usd": 0.01,
+    }
+    values.update(overrides)
+    with pytest.raises(ConfigurationError):
+        IncompleteAccountingFacts(**values)  # type: ignore[arg-type]
 
 
 def test_generation_accounting_prefers_complete_native_token_pair() -> None:
@@ -6368,6 +6597,140 @@ def test_proposal_batch_records_closed_transport_failure_and_stops(
         external.cleanup()
 
 
+def test_proposal_batch_persists_closed_incomplete_accounting_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """An unaccounted paid call is traceable everywhere without retaining provider content."""
+    from agent_loop import (
+        AccountingFailureCode,
+        IncompleteAccountingError,
+        IncompleteAccountingFacts,
+        Route,
+        verify_audit_chain,
+    )
+
+    secret = "sk-or-v1-never-write-this-accounting-cause"
+    route = Route(
+        action="reason",
+        failure_summary="The deterministic threshold was not met.",
+        relevant_files=("core/momentum_analysis.py",),
+        reasoning_focus="Diagnose the sealed arithmetic.",
+    )
+    facts = IncompleteAccountingFacts(
+        schema_version=1,
+        call_index=2,
+        role="reasoner",
+        inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
+        recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
+        generation_attempts=3,
+        response_id_safe=True,
+        accounting_complete=False,
+        budget_charge_basis="full_reservation",
+        retained_reservation_tokens=11,
+        retained_reservation_usd=0.0,
+    )
+    failure = IncompleteAccountingError(facts)
+    failure.__cause__ = RuntimeError(secret)
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[route, failure],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "accounting_invalid"
+        assert result.completed_samples == 0
+        assert result.accounting_failure == facts
+        assert result.budget.api_calls == 2
+        assert result.budget.incomplete_accounting_calls == 1
+        assert result.budget.accounting_basis == "authoritative_plus_retained_reservations"
+        assert gateway.roles == ["orchestrator"]
+        assert len(result.provider_call_artifacts) == 1
+        assert not (result.audit_path / "payload-reasoner-001.json").exists()
+        assert not (result.audit_path / "provider-call-0002.json").exists()
+
+        expected = asdict(facts)
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        rejected = [event for event in events if event["event"] == "provider_call_rejected"]
+        assert rejected[-1]["details"] == {
+            "code": "accounting_invalid",
+            "accounting_failure": expected,
+        }
+        terminal = events[-1]
+        assert terminal["details"]["accounting_failure"] == expected
+        summary = json.loads(
+            (result.audit_path / "batch-summary.json").read_text(encoding="utf-8")
+        )
+        assert summary["accounting_failure"] == expected
+        assert summary["budget"]["accounting_basis"] == (
+            "authoritative_plus_retained_reservations"
+        )
+        serialized = json.dumps(
+            {
+                "events": events,
+                "summary": summary,
+                "cli": __import__("agent_loop")._proposal_batch_summary(result),
+            }
+        )
+        assert secret not in serialized
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_rejects_incomplete_facts_that_do_not_match_ledger(
+    tmp_path: Path,
+) -> None:
+    """Closed-looking reservation claims cannot be persisted unless the ledger proves them."""
+    from agent_loop import (
+        AccountingFailureCode,
+        IncompleteAccountingError,
+        IncompleteAccountingFacts,
+        Route,
+        verify_audit_chain,
+    )
+
+    route = Route(
+        action="reason",
+        failure_summary="The deterministic threshold was not met.",
+        relevant_files=("core/momentum_analysis.py",),
+        reasoning_focus="Diagnose the sealed arithmetic.",
+    )
+    fabricated = IncompleteAccountingFacts(
+        schema_version=1,
+        call_index=2,
+        role="reasoner",
+        inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
+        recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
+        generation_attempts=3,
+        response_id_safe=True,
+        accounting_complete=False,
+        budget_charge_basis="full_reservation",
+        retained_reservation_tokens=12,
+        retained_reservation_usd=0.01,
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[route, IncompleteAccountingError(fabricated)],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "controller_boundary_error"
+        assert result.accounting_failure is None
+        assert result.budget.incomplete_accounting_calls == 1
+        assert gateway.roles == ["orchestrator"]
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        assert not any(event["event"] == "provider_call_rejected" for event in events)
+        summary = json.loads(
+            (result.audit_path / "batch-summary.json").read_text(encoding="utf-8")
+        )
+        assert summary["accounting_failure"] is None
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
 def test_proposal_batch_audits_the_paid_canary_overage_and_stops(
     tmp_path: Path,
 ) -> None:
@@ -7021,7 +7384,9 @@ def test_cli_routes_batch_to_dedicated_runner_and_prints_closed_summary(
             requested_samples=limits.samples,
             completed_samples=0,
             failure_code="provider_failed",
-            budget=agent_loop.BudgetSnapshot(1, 10, 5, 15, 15, 0.01, 0.01),
+            budget=agent_loop.BudgetSnapshot(
+                1, 10, 5, 15, 15, 0.01, 0.01, 0.01, 0.0, 0, 0, "authoritative"
+            ),
             audit_path=(tmp_path / "audit" / str(kwargs["run_id"])).resolve(),
             samples=(),
             provider_call_artifacts=(),
@@ -7063,7 +7428,9 @@ def _cli_loop_result(
         worker_confined=passed,
         source_modified=False,
         security_attestation=False,
-        budget=BudgetSnapshot(0, 0, 0, 0, 0, 0.0, 0.0),
+        budget=BudgetSnapshot(
+            0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0, "authoritative"
+        ),
         audit_path=(tmp_path / "audit" / run_id).resolve(),
         quarantine_path=None,
         quarantine_retained=False,
@@ -7143,9 +7510,14 @@ def test_cli_prints_one_canonical_summary_and_returns_terminal_exit(
     assert summary == {
         "audit_path": str((tmp_path / "audit" / summary["run_id"]).resolve()),
         "budget": {
+            "accounting_basis": "authoritative",
             "api_calls": 0,
+            "authoritative_usd": 0.0,
             "completion_tokens": 0,
+            "incomplete_accounting_calls": 0,
             "prompt_tokens": 0,
+            "retained_reservation_tokens": 0,
+            "retained_reservation_usd": 0.0,
             "reserved_tokens": 0,
             "reserved_usd": 0.0,
             "spent_usd": 0.0,
