@@ -39,7 +39,7 @@ from typing import Any, BinaryIO, Callable, Generic, Mapping, Protocol, Sequence
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
-REASONER_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
+REASONER_MODEL = "deepseek/deepseek-r1"
 CODER_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
@@ -3935,7 +3935,7 @@ class SandboxRunner:
         for key in ("CapAdd", "DeviceRequests"):
             if key in normalized_host and normalized_host[key] is None:
                 normalized_host[key] = []
-        if "Tmpfs" in normalized_host and normalized_host["Tmpfs"] is None:
+        if normalized_host.get("Tmpfs") is None:
             normalized_host["Tmpfs"] = {}
         if "OomKillDisable" not in normalized_host or (
             normalized_host["OomKillDisable"] is not False

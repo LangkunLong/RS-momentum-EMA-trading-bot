@@ -183,7 +183,7 @@ def test_task3_models_and_limits_validate_exact_boundaries() -> None:
 
     models = ModelConfig()
     assert models.orchestrator == "qwen/qwen3-next-80b-a3b-instruct"
-    assert models.reasoner == "qwen/qwen3-next-80b-a3b-instruct"
+    assert models.reasoner == "deepseek/deepseek-r1"
     assert models.coder == "deepseek/deepseek-chat"
     with pytest.raises(ConfigurationError, match="model slug"):
         ModelConfig(coder="bad model")
@@ -2397,7 +2397,7 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
         ),
         (
             "reasoner",
-            "qwen/qwen3-next-80b-a3b-instruct",
+            "deepseek/deepseek-r1",
             _plan_json(),
             ReasoningPlan.from_json,
             4096,
@@ -2545,7 +2545,7 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
     """The reasoner prompt makes the strict seven-field schema mechanically checkable."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ReasoningPlan
 
-    model = "qwen/qwen3-next-80b-a3b-instruct"
+    model = "deepseek/deepseek-r1"
     plan = json.dumps(
         {
             "diagnosis": "The measured return misses the configured threshold.",
@@ -2917,7 +2917,7 @@ def test_gateway_uses_immutable_three_message_prefix_and_reasoner_cap() -> None:
     call = client.completions.calls[0]
 
     assert completion.payload.diagnosis == "A boundary is wrong."
-    assert call["model"] == "qwen/qwen3-next-80b-a3b-instruct"
+    assert call["model"] == "deepseek/deepseek-r1"
     assert call["max_tokens"] == 4096
     assert call["response_format"] == {"type": "json_object"}
     assert call["stream"] is False
@@ -5073,21 +5073,27 @@ def test_timed_out_running_container_is_killed_before_logs_are_collected(tmp_pat
     assert commands.index("kill") < commands.index("logs")
 
 
-def test_container_attestation_normalizes_only_docker_null_empty_collections(
+@pytest.mark.parametrize("tmpfs_shape", ["null", "missing"])
+def test_container_attestation_normalizes_only_docker_empty_collections(
     tmp_path: Path,
+    tmpfs_shape: str,
 ) -> None:
-    """Docker Desktop may report absent capability, device, and tmpfs maps as null."""
+    """Docker Desktop reports empty collections as null or omits the tmpfs map."""
     from agent_loop import export_candidate, preflight_source, run_test_gate
 
     source = _task2_repo(tmp_path)
     candidate = export_candidate(preflight_source(source, acquire_lock=False))
     image = "registry.invalid/agent-loop@sha256:" + "a" * 64
     engine = FaithfulSandboxEngine(image)
-    engine.mutate_inspection = lambda item: item["HostConfig"].update(
-        CapAdd=None,
-        DeviceRequests=None,
-        Tmpfs=None,
-    )
+
+    def use_docker_empty_collection_shapes(item: dict[str, Any]) -> None:
+        item["HostConfig"].update(CapAdd=None, DeviceRequests=None)
+        if tmpfs_shape == "null":
+            item["HostConfig"]["Tmpfs"] = None
+        else:
+            item["HostConfig"].pop("Tmpfs")
+
+    engine.mutate_inspection = use_docker_empty_collection_shapes
 
     result = run_test_gate(candidate, _faithful_runner(image, engine))
 
@@ -5879,7 +5885,6 @@ def test_real_data_fetcher_opens_verified_writable_scratch_without_network(tmp_p
         lambda item: item["HostConfig"].pop("ShmSize"),
         lambda item: item["HostConfig"].update(ShmSize=67108863),
         lambda item: item["HostConfig"].update(ShmSize=67108864.0),
-        lambda item: item["HostConfig"].pop("Tmpfs"),
         lambda item: item["HostConfig"].update(Tmpfs={"/workspace": "rw"}),
         lambda item: item["HostConfig"].update(Tmpfs=[]),
         lambda item: item["HostConfig"].update(PidMode="host"),
@@ -7123,7 +7128,7 @@ class _StrictBatchGateway:
         self.ledger.reconcile(reservation, usage, window=budget_window)
         model = {
             "orchestrator": "qwen/qwen3-next-80b-a3b-instruct",
-            "reasoner": "qwen/qwen3-next-80b-a3b-instruct",
+            "reasoner": "deepseek/deepseek-r1",
             "coder": "deepseek/deepseek-chat",
         }[role]
         return AgentCompletion(outcome, usage, "stop", model)
@@ -7482,8 +7487,8 @@ def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
     facts = ProviderCallFacts(
         call_index=2,
         role="reasoner",
-        requested_model="qwen/qwen3-next-80b-a3b-instruct",
-        returned_model="qwen/qwen3-next-80b-a3b-instruct",
+        requested_model="deepseek/deepseek-r1",
+        returned_model="deepseek/deepseek-r1",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=10,
