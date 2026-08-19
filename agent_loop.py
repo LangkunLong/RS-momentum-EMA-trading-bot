@@ -56,6 +56,7 @@ _MAX_TEXT_BYTES = 16 * 1024
 _MAX_DIFF_BYTES = 256 * 1024
 _MAX_DATA_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
 _MAX_GENERATION_ACCOUNTING_BYTES = 64 * 1024
+_MAX_PROVIDER_EVIDENCE_BYTES = 2 * 1024
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529})
 _GENERATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
@@ -181,6 +182,10 @@ class PatchApplicationError(RuntimeError):
 
 class CandidateMutationError(RuntimeError):
     """Controller-owned candidate state changed during a disposable worker run."""
+
+
+class InsufficientEvidenceError(RuntimeError):
+    """A provider-safe role declined to invent a change from inadequate facts."""
 
 
 class DataBundleError(ValueError):
@@ -1130,9 +1135,11 @@ class OpenRouterGateway:
                 "You are the Reasoner. Return exactly one concise JSON object with exactly these keys: "
                 '"diagnosis", "root_cause", "invariants", "files_to_change", "steps", "skip", '
                 '"skip_reason". Use JSON arrays for invariants, files_to_change, and steps; choose files '
-                "only from the provided source snapshots. Set skip to false and skip_reason to an empty "
-                "string for a repairable issue. Do not reveal chain of thought, issue commands, add keys, "
-                "or include prose."
+                "only from the provided source snapshots. Use the closed numeric diagnostics and all "
+                "supplied source snapshots to establish a specific causal edit. Set skip to true when "
+                "that evidence is insufficient; otherwise set skip to false and skip_reason to an empty "
+                "string for a repairable issue. Never invent a patch merely to satisfy a target. Do not "
+                "reveal chain of thought, issue commands, add keys, or include prose."
             ),
             "coder": (
                 "You are the Coder. Return exactly one JSON object with exactly these keys: "
@@ -1143,8 +1150,9 @@ class OpenRouterGateway:
                 '"--- a/<path>", and "+++ b/<path>" in that order before the @@ hunk. '
                 "Use that exact index line for every file. Express every replacement with "
                 "paired '-old' and '+new' lines; never leave the old line as context and append "
-                "a duplicate. The hunk header counts must exactly match the hunk body. Do not use "
-                "Markdown fences, issue commands, add keys, or include prose."
+                "a duplicate. Use the sealed gate evidence to verify the plan's numeric premise. "
+                "The hunk header counts must exactly match the hunk body. Do not use Markdown "
+                "fences, issue commands, add keys, or include prose."
             ),
         }
     )
@@ -4570,10 +4578,15 @@ class BacktestThresholds:
         )
         if any(type(value) not in {int, float} or not math.isfinite(value) for value in numeric):
             raise GateConfigurationError("backtest thresholds must be finite")
+        if any(abs(float(value)) > 1_000_000.0 for value in numeric):
+            raise GateConfigurationError("backtest thresholds must be bounded")
         if self.maximum_drawdown_magnitude < 0:
             raise GateConfigurationError("maximum drawdown magnitude must be nonnegative")
-        if type(self.minimum_closed_trades) is not int or self.minimum_closed_trades < 0:
-            raise GateConfigurationError("minimum closed trades must be a nonnegative integer")
+        if (
+            type(self.minimum_closed_trades) is not int
+            or not 0 <= self.minimum_closed_trades <= 1_000_000
+        ):
+            raise GateConfigurationError("minimum closed trades must be a bounded nonnegative integer")
 
 
 @dataclass(frozen=True)
@@ -4643,6 +4656,7 @@ class BacktestGateResult:
     outcome: str
     evaluation: BacktestEvaluation
     completion_envelope: CompletionEnvelope
+    backtest_diagnostics: BacktestDiagnosticEvidence | None = None
 
 
 def run_backtest_gate(
@@ -4712,6 +4726,20 @@ def run_backtest_gate(
             True, False, True, bool(payload["worker_confined"]), False, False,
             "sentinel_invalid", evaluation, observation.completion_envelope,
         )
+    if any(failure not in _BACKTEST_METRIC_NAMES for failure in evaluation.failures):
+        evaluation = BacktestEvaluation(False, ("sentinel",))
+        return BacktestGateResult(
+            True, False, True, bool(payload["worker_confined"]), False, False,
+            "sentinel_invalid", evaluation, observation.completion_envelope,
+        )
+    diagnostics = BacktestDiagnosticEvidence.from_metrics(
+        metrics,
+        thresholds,
+        evaluation,
+        ticker_count=len(requested),
+        start_date=start_date,
+        end_date=end_date,
+    )
     return BacktestGateResult(
         True,
         evaluation.thresholds_met_observation,
@@ -4722,6 +4750,7 @@ def run_backtest_gate(
         "thresholds_met" if evaluation.thresholds_met_observation else "thresholds_not_met",
         evaluation,
         observation.completion_envelope,
+        diagnostics,
     )
 
 
@@ -5037,6 +5066,174 @@ class BacktestGateConfig:
         object.__setattr__(self, "historical_data_bundle", bundle)
 
 
+_BACKTEST_METRIC_NAMES = (
+    "total_return_pct",
+    "annualized_return_pct",
+    "sharpe_ratio",
+    "max_drawdown_pct",
+    "closed_trades",
+)
+_BACKTEST_DIAGNOSTIC_ABS_LIMIT = 1_000_000.0
+_BACKTEST_DIAGNOSTIC_MARGIN_LIMIT = 2_000_000.0
+
+
+@dataclass(frozen=True)
+class BacktestDiagnosticEvidence:
+    """Exact, closed-schema backtest facts safe for provider diagnosis."""
+
+    total_return_pct: float
+    annualized_return_pct: float
+    sharpe_ratio: float
+    max_drawdown_pct: float
+    closed_trades: int
+    minimum_total_return: float
+    minimum_annualized_return: float
+    minimum_sharpe_ratio: float
+    maximum_drawdown_magnitude: float
+    minimum_closed_trades: int
+    total_return_margin: float
+    annualized_return_margin: float
+    sharpe_margin: float
+    drawdown_headroom: float
+    closed_trades_margin: int
+    failed_metrics: tuple[str, ...]
+    ticker_count: int
+    calendar_days: int
+    provider_safe: bool = True
+
+    def __post_init__(self) -> None:
+        operands = (
+            self.total_return_pct,
+            self.annualized_return_pct,
+            self.sharpe_ratio,
+            self.max_drawdown_pct,
+            self.minimum_total_return,
+            self.minimum_annualized_return,
+            self.minimum_sharpe_ratio,
+            self.maximum_drawdown_magnitude,
+        )
+        margins = (
+            self.total_return_margin,
+            self.annualized_return_margin,
+            self.sharpe_margin,
+            self.drawdown_headroom,
+        )
+        if any(
+            type(value) not in {int, float}
+            or not math.isfinite(value)
+            or abs(float(value)) > _BACKTEST_DIAGNOSTIC_ABS_LIMIT
+            for value in operands
+        ) or any(
+            type(value) not in {int, float}
+            or not math.isfinite(value)
+            or abs(float(value)) > _BACKTEST_DIAGNOSTIC_MARGIN_LIMIT
+            for value in margins
+        ):
+            raise ConfigurationError("backtest diagnostic values must be finite and bounded")
+        if self.maximum_drawdown_magnitude < 0:
+            raise ConfigurationError("backtest diagnostic drawdown threshold must be nonnegative")
+        for name, value, minimum, maximum in (
+            ("closed_trades", self.closed_trades, 0, 1_000_000),
+            ("minimum_closed_trades", self.minimum_closed_trades, 0, 1_000_000),
+            ("ticker_count", self.ticker_count, 1, 128),
+            ("calendar_days", self.calendar_days, 1, 36525),
+        ):
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ConfigurationError(f"backtest diagnostic {name} is outside its bound")
+        if (
+            type(self.closed_trades_margin) is not int
+            or not -1_000_000 <= self.closed_trades_margin <= 1_000_000
+        ):
+            raise ConfigurationError("backtest diagnostic closed_trades_margin is outside its bound")
+        if self.provider_safe is not True:
+            raise ConfigurationError("backtest diagnostics must be provider-safe")
+
+        observed = {
+            "total_return_pct": self.total_return_pct,
+            "annualized_return_pct": self.annualized_return_pct,
+            "sharpe_ratio": self.sharpe_ratio,
+            "max_drawdown_pct": self.max_drawdown_pct,
+            "closed_trades": self.closed_trades,
+        }
+        expected_failures: list[str] = []
+        if observed["total_return_pct"] < self.minimum_total_return:
+            expected_failures.append("total_return_pct")
+        if observed["annualized_return_pct"] < self.minimum_annualized_return:
+            expected_failures.append("annualized_return_pct")
+        if observed["sharpe_ratio"] < self.minimum_sharpe_ratio:
+            expected_failures.append("sharpe_ratio")
+        drawdown_magnitude = abs(min(float(observed["max_drawdown_pct"]), 0.0))
+        if drawdown_magnitude > self.maximum_drawdown_magnitude:
+            expected_failures.append("max_drawdown_pct")
+        if observed["closed_trades"] < self.minimum_closed_trades:
+            expected_failures.append("closed_trades")
+        if self.failed_metrics != tuple(expected_failures):
+            raise ConfigurationError("backtest diagnostic failed metrics are inconsistent")
+
+        expected_margins = (
+            self.total_return_pct - self.minimum_total_return,
+            self.annualized_return_pct - self.minimum_annualized_return,
+            self.sharpe_ratio - self.minimum_sharpe_ratio,
+            self.maximum_drawdown_magnitude - drawdown_magnitude,
+            self.closed_trades - self.minimum_closed_trades,
+        )
+        actual_margins = (
+            self.total_return_margin,
+            self.annualized_return_margin,
+            self.sharpe_margin,
+            self.drawdown_headroom,
+            self.closed_trades_margin,
+        )
+        if any(
+            float(actual) != float(expected)
+            for actual, expected in zip(actual_margins, expected_margins, strict=True)
+        ):
+            raise ConfigurationError("backtest diagnostic threshold margins are inconsistent")
+
+    @classmethod
+    def from_metrics(
+        cls,
+        metrics: Mapping[str, object],
+        thresholds: BacktestThresholds,
+        evaluation: BacktestEvaluation,
+        *,
+        ticker_count: int,
+        start_date: str,
+        end_date: str,
+    ) -> BacktestDiagnosticEvidence:
+        """Build one quantized diagnostic from already validated controller facts."""
+        total_return = float(metrics["total_return_pct"])
+        annualized_return = float(metrics["annualized_return_pct"])
+        sharpe = float(metrics["sharpe_ratio"])
+        drawdown = float(metrics["max_drawdown_pct"])
+        minimum_total = float(thresholds.minimum_total_return)
+        minimum_annualized = float(thresholds.minimum_annualized_return)
+        minimum_sharpe = float(thresholds.minimum_sharpe_ratio)
+        maximum_drawdown = float(thresholds.maximum_drawdown_magnitude)
+        closed_trades = int(metrics["closed_trades"])
+        drawdown_magnitude = abs(min(drawdown, 0.0))
+        return cls(
+            total_return_pct=total_return,
+            annualized_return_pct=annualized_return,
+            sharpe_ratio=sharpe,
+            max_drawdown_pct=drawdown,
+            closed_trades=closed_trades,
+            minimum_total_return=minimum_total,
+            minimum_annualized_return=minimum_annualized,
+            minimum_sharpe_ratio=minimum_sharpe,
+            maximum_drawdown_magnitude=maximum_drawdown,
+            minimum_closed_trades=thresholds.minimum_closed_trades,
+            total_return_margin=total_return - minimum_total,
+            annualized_return_margin=annualized_return - minimum_annualized,
+            sharpe_margin=sharpe - minimum_sharpe,
+            drawdown_headroom=maximum_drawdown - drawdown_magnitude,
+            closed_trades_margin=closed_trades - thresholds.minimum_closed_trades,
+            failed_metrics=evaluation.failures,
+            ticker_count=ticker_count,
+            calendar_days=(date.fromisoformat(end_date) - date.fromisoformat(start_date)).days,
+        )
+
+
 @dataclass(frozen=True)
 class ProviderGateEvidence:
     """Closed provider-safe gate facts; worker output and exception strings are never present."""
@@ -5050,6 +5247,7 @@ class ProviderGateEvidence:
     stdout_sha256: str
     stderr_sha256: str
     failure_codes: tuple[str, ...] = ()
+    backtest_diagnostics: BacktestDiagnosticEvidence | None = None
     provider_safe: bool = True
 
     def __post_init__(self) -> None:
@@ -5083,6 +5281,47 @@ class ProviderGateEvidence:
             raise ConfigurationError("failure codes must be unique and bounded")
         if any(value not in _PROVIDER_FAILURE_CODES for value in self.failure_codes):
             raise ConfigurationError("failure code is not allowed")
+        threshold_backtest = self.gate_kind == "backtest" and self.outcome in {
+            "thresholds_met",
+            "thresholds_not_met",
+        }
+        evaluated_backtest = (
+            threshold_backtest
+            and self.observed_exit_zero
+            and self.worker_confined
+            and self.returncode == 0
+        )
+        if self.gate_kind != "backtest" and self.backtest_diagnostics is not None:
+            raise ConfigurationError("test gate cannot carry backtest diagnostics")
+        if threshold_backtest and not evaluated_backtest:
+            raise ConfigurationError(
+                "backtest diagnostics require exact confined exit-zero threshold evidence"
+            )
+        if (self.backtest_diagnostics is not None) != threshold_backtest:
+            raise ConfigurationError(
+                "backtest diagnostics require exact confined exit-zero threshold evidence"
+            )
+        if self.backtest_diagnostics is not None and not isinstance(
+            self.backtest_diagnostics, BacktestDiagnosticEvidence
+        ):
+            raise ConfigurationError("backtest diagnostics have the wrong type")
+        if threshold_backtest:
+            expected_observation = self.outcome == "thresholds_met"
+            expected_failures = () if expected_observation else ("thresholds_not_met",)
+            if (
+                self.gate_observation is not expected_observation
+                or self.failure_codes != expected_failures
+            ):
+                raise ConfigurationError("backtest threshold evidence is inconsistent")
+            assert self.backtest_diagnostics is not None
+            if (
+                self.outcome == "thresholds_met"
+                and self.backtest_diagnostics.failed_metrics
+            ) or (
+                self.outcome == "thresholds_not_met"
+                and not self.backtest_diagnostics.failed_metrics
+            ):
+                raise ConfigurationError("backtest diagnostics disagree with gate outcome")
         if self.gate_observation and not (self.observed_exit_zero and self.worker_confined):
             raise ConfigurationError(
                 "successful gate observation requires exit zero and a confined worker"
@@ -6028,6 +6267,18 @@ class AuditTrail:
         )
         return path, digest
 
+    def write_provider_evidence(
+        self, evidence: ProviderGateEvidence
+    ) -> tuple[Path, str]:
+        """Persist the exact closed facts disclosed to model roles for this run."""
+        if not isinstance(evidence, ProviderGateEvidence) or evidence.provider_safe is not True:
+            raise AuditError("provider evidence audit requires validated closed evidence")
+        payload = asdict(evidence)
+        if len(_canonical_json_bytes(payload)) > _MAX_PROVIDER_EVIDENCE_BYTES:
+            raise AuditError("provider evidence exceeds the closed byte limit")
+        path = self._write_json(self.run_root / "provider-evidence.json", payload)
+        return path, _file_sha256(path)
+
     def write_inert_diff(self, raw: str, *, name: str = "candidate") -> tuple[Path, str]:
         """Persist one exact sanitized diff as inert bytes; never execute or apply the export."""
         if not isinstance(raw, str) or not raw:
@@ -6556,10 +6807,15 @@ def export_inert_proposal(
     gate: str,
     editable_paths: Sequence[str] = (),
     artifact_name: str = "candidate",
+    provider_evidence_sha256: str | None = None,
 ) -> HandoffArtifact:
     """Export one validated model proposal as inert bytes without mutating quarantine."""
     if not isinstance(proposal, CodingProposal) or not isinstance(audit, AuditTrail):
         raise ConfigurationError("proposal handoff requires validated proposal and audit")
+    if provider_evidence_sha256 is not None and _SHA256_RE.fullmatch(
+        provider_evidence_sha256
+    ) is None:
+        raise ConfigurationError("proposal evidence digest must be lowercase SHA-256")
     root = _require_candidate(candidate)
     before = _candidate_tracked_manifest_sha256(candidate)
     parsed = validate_unified_diff(
@@ -6576,8 +6832,7 @@ def export_inert_proposal(
         proposal.unified_diff,
         name=artifact_name,
     )
-    metadata_path = audit.write_handoff_metadata(
-        {
+    metadata: dict[str, object] = {
             "schema_version": 1,
             "kind": "inert_model_proposal",
             "base_head": candidate.source_head,
@@ -6587,7 +6842,16 @@ def export_inert_proposal(
             "files": parsed.files,
             "gate": gate,
             "security_attestation": False,
-        },
+        }
+    if provider_evidence_sha256 is not None:
+        metadata.update(
+            {
+                "provider_evidence_sha256": provider_evidence_sha256,
+                "verification_status": "not_backtested",
+            }
+        )
+    metadata_path = audit.write_handoff_metadata(
+        metadata,
         name="handoff" if artifact_name == "candidate" else artifact_name,
     )
     return HandoffArtifact(
@@ -6822,6 +7086,7 @@ def run_proposal_batch(
         evidence = services.run_primary_gate(candidate)
         if not isinstance(evidence, ProviderGateEvidence) or evidence.gate_kind != "backtest":
             raise ConfigurationError("proposal batch gate returned invalid provider-safe evidence")
+        _evidence_path, evidence_sha256 = audit.write_provider_evidence(evidence)
         audit.append_event(
             LoopState.RUN_PRIMARY_GATE,
             "proposal_batch_gate_observed",
@@ -6829,6 +7094,7 @@ def run_proposal_batch(
                 "outcome": evidence.outcome,
                 "gate_observation": evidence.gate_observation,
                 "worker_confined": evidence.worker_confined,
+                "provider_evidence_sha256": evidence_sha256,
             },
         )
         if evidence.gate_observation:
@@ -6873,7 +7139,7 @@ def run_proposal_batch(
                 assert isinstance(route, Route)
                 if route.action != "reason":
                     raise ProtocolValidationError("proposal batch orchestrator aborted")
-                snapshots = load_snapshots(route.relevant_files)
+                snapshots = load_snapshots(services.editable_paths)
                 plan, artifact = call_role(
                     sample,
                     2,
@@ -6891,7 +7157,11 @@ def run_proposal_batch(
                 calls.append(artifact)
                 assert isinstance(plan, ReasoningPlan)
                 readable = {value.path for value in snapshots}
-                if plan.skip or not set(plan.files_to_change).issubset(readable):
+                if plan.skip:
+                    raise InsufficientEvidenceError(
+                        "proposal batch reasoner reported insufficient evidence"
+                    )
+                if not set(plan.files_to_change).issubset(readable):
                     raise ProtocolValidationError("proposal batch reasoner skipped or expanded scope")
                 proposal, artifact = call_role(
                     sample,
@@ -6899,6 +7169,7 @@ def run_proposal_batch(
                     "coder",
                     {
                         "batch_sample": sample,
+                        "evidence": evidence_payload,
                         "plan": asdict(plan),
                         "source_snapshots": [asdict(value) for value in snapshots],
                     },
@@ -6917,6 +7188,7 @@ def run_proposal_batch(
                     gate="backtest",
                     editable_paths=services.editable_paths,
                     artifact_name=f"proposal-{sample:03d}",
+                    provider_evidence_sha256=evidence_sha256,
                 )
                 if ledger.calls - calls_before != 3:
                     raise BudgetExceededError("proposal sample did not consume exactly three calls")
@@ -6944,6 +7216,8 @@ def run_proposal_batch(
         failure_code = "budget_exceeded"
     except GatewayError:
         failure_code = "provider_failed"
+    except InsufficientEvidenceError:
+        failure_code = "insufficient_evidence"
     except (ResponseValidationError, ProtocolValidationError):
         failure_code = "protocol_invalid"
     except (PatchPolicyError, PreflightError):
@@ -7976,6 +8250,16 @@ def _backtest_provider_evidence(
         outcome = "source_modified"
     elif not worker_confined:
         outcome = "worker_unconfined"
+    diagnostics = (
+        result.backtest_diagnostics
+        if outcome in {"thresholds_met", "thresholds_not_met"}
+        and observed_exit_zero
+        and worker_confined
+        and envelope_verified
+        and payload_consistent
+        and not source_modified
+        else None
+    )
     return ProviderGateEvidence(
         gate_kind="backtest",
         outcome=outcome,
@@ -7986,6 +8270,7 @@ def _backtest_provider_evidence(
         stdout_sha256=stdout_sha256,
         stderr_sha256=stderr_sha256,
         failure_codes=tuple(dict.fromkeys(failures)),
+        backtest_diagnostics=diagnostics,
     )
 
 

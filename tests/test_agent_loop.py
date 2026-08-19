@@ -286,6 +286,328 @@ def test_task3_provider_evidence_and_snapshots_are_closed_and_bounded() -> None:
     assert not hasattr(quality, "stdout")
 
 
+def test_backtest_provider_evidence_exposes_only_bounded_diagnostics() -> None:
+    """Break caught: a model saw only a threshold-failure boolean or arbitrary worker text."""
+    from agent_loop import (
+        BacktestDiagnosticEvidence,
+        ConfigurationError,
+        ProviderGateEvidence,
+    )
+
+    diagnostics = BacktestDiagnosticEvidence(
+        total_return_pct=1.5172,
+        annualized_return_pct=0.5041,
+        sharpe_ratio=0.563,
+        max_drawdown_pct=-1.1056,
+        closed_trades=1,
+        minimum_total_return=5.0,
+        minimum_annualized_return=1.5,
+        minimum_sharpe_ratio=0.75,
+        maximum_drawdown_magnitude=10.0,
+        minimum_closed_trades=5,
+        total_return_margin=1.5172 - 5.0,
+        annualized_return_margin=0.5041 - 1.5,
+        sharpe_margin=0.563 - 0.75,
+        drawdown_headroom=10.0 - 1.1056,
+        closed_trades_margin=-4,
+        failed_metrics=(
+            "total_return_pct",
+            "annualized_return_pct",
+            "sharpe_ratio",
+            "closed_trades",
+        ),
+        ticker_count=11,
+        calendar_days=1096,
+    )
+    evidence = ProviderGateEvidence(
+        gate_kind="backtest",
+        outcome="thresholds_not_met",
+        gate_observation=False,
+        observed_exit_zero=True,
+        worker_confined=True,
+        returncode=0,
+        stdout_sha256="a" * 64,
+        stderr_sha256="b" * 64,
+        failure_codes=("thresholds_not_met",),
+        backtest_diagnostics=diagnostics,
+    )
+
+    assert asdict(evidence)["backtest_diagnostics"] == {
+        "total_return_pct": 1.5172,
+        "annualized_return_pct": 0.5041,
+        "sharpe_ratio": 0.563,
+        "max_drawdown_pct": -1.1056,
+        "closed_trades": 1,
+        "minimum_total_return": 5.0,
+        "minimum_annualized_return": 1.5,
+        "minimum_sharpe_ratio": 0.75,
+        "maximum_drawdown_magnitude": 10.0,
+        "minimum_closed_trades": 5,
+        "total_return_margin": 1.5172 - 5.0,
+        "annualized_return_margin": 0.5041 - 1.5,
+        "sharpe_margin": 0.563 - 0.75,
+        "drawdown_headroom": 10.0 - 1.1056,
+        "closed_trades_margin": -4,
+        "failed_metrics": (
+            "total_return_pct",
+            "annualized_return_pct",
+            "sharpe_ratio",
+            "closed_trades",
+        ),
+        "ticker_count": 11,
+        "calendar_days": 1096,
+        "provider_safe": True,
+    }
+    assert not hasattr(evidence, "stdout") and not hasattr(evidence, "metrics")
+
+    with pytest.raises(ConfigurationError, match="finite"):
+        BacktestDiagnosticEvidence(
+            **{**asdict(diagnostics), "total_return_pct": float("nan")}
+        )
+    with pytest.raises(ConfigurationError, match="test gate"):
+        ProviderGateEvidence(
+            gate_kind="test",
+            outcome="exit_nonzero",
+            gate_observation=False,
+            observed_exit_zero=False,
+            worker_confined=True,
+            returncode=1,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            failure_codes=("pytest_failed",),
+            backtest_diagnostics=diagnostics,
+        )
+    with pytest.raises(ConfigurationError, match="diagnostics"):
+        ProviderGateEvidence(
+            gate_kind="backtest",
+            outcome="thresholds_not_met",
+            gate_observation=False,
+            observed_exit_zero=True,
+            worker_confined=True,
+            returncode=0,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            failure_codes=("thresholds_not_met",),
+        )
+    with pytest.raises(ConfigurationError, match="inconsistent"):
+        ProviderGateEvidence(
+            gate_kind="backtest",
+            outcome="thresholds_not_met",
+            gate_observation=True,
+            observed_exit_zero=True,
+            worker_confined=True,
+            returncode=0,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            failure_codes=("thresholds_not_met",),
+            backtest_diagnostics=diagnostics,
+        )
+
+
+def test_backtest_diagnostics_reject_rounded_inconsistent_and_unbounded_values() -> None:
+    """Break caught: rounded or oversized performance facts could misstate a gate boundary."""
+    from agent_loop import (
+        BacktestDiagnosticEvidence,
+        BacktestThresholds,
+        ConfigurationError,
+        GateConfigurationError,
+    )
+
+    diagnostic = BacktestDiagnosticEvidence(
+        total_return_pct=1.0 - 1e-13,
+        annualized_return_pct=0.5,
+        sharpe_ratio=0.25,
+        max_drawdown_pct=-2.0,
+        closed_trades=1,
+        minimum_total_return=1.0,
+        minimum_annualized_return=0.5,
+        minimum_sharpe_ratio=0.25,
+        maximum_drawdown_magnitude=2.0,
+        minimum_closed_trades=1,
+        total_return_margin=(1.0 - 1e-13) - 1.0,
+        annualized_return_margin=0.0,
+        sharpe_margin=0.0,
+        drawdown_headroom=0.0,
+        closed_trades_margin=0,
+        failed_metrics=("total_return_pct",),
+        ticker_count=1,
+        calendar_days=1,
+    )
+    values = asdict(diagnostic)
+
+    with pytest.raises(ConfigurationError, match="margins"):
+        BacktestDiagnosticEvidence(**{**values, "total_return_margin": 0.0})
+    with pytest.raises(ConfigurationError, match="finite"):
+        BacktestDiagnosticEvidence(**{**values, "sharpe_ratio": True})
+    with pytest.raises(ConfigurationError, match="finite"):
+        BacktestDiagnosticEvidence(**{**values, "sharpe_ratio": float("inf")})
+    with pytest.raises(ConfigurationError, match="finite"):
+        BacktestDiagnosticEvidence(**{**values, "minimum_total_return": 1_000_001.0})
+    with pytest.raises(ConfigurationError, match="failed metrics"):
+        BacktestDiagnosticEvidence(**{**values, "failed_metrics": ()})
+    with pytest.raises(ConfigurationError, match="closed_trades"):
+        BacktestDiagnosticEvidence(**{**values, "closed_trades": 1_000_001})
+
+    with pytest.raises(GateConfigurationError, match="bounded"):
+        BacktestThresholds(1_000_001.0, 0.0, 0.0, 1.0, 1)
+    with pytest.raises(GateConfigurationError, match="bounded"):
+        BacktestThresholds(1.0, 0.0, 0.0, 1.0, 1_000_001)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "observed_exit_zero", "worker_confined", "returncode"),
+    [
+        ("exit_nonzero", False, True, 1),
+        ("timed_out", False, True, -1),
+        ("sentinel_invalid", True, True, 0),
+        ("worker_unconfined", True, False, 0),
+        ("source_modified", True, True, 0),
+    ],
+)
+def test_backtest_diagnostics_require_exact_confined_exit_zero_threshold_evidence(
+    outcome: str,
+    observed_exit_zero: bool,
+    worker_confined: bool,
+    returncode: int | None,
+) -> None:
+    """Break caught: inconsistent injected gate facts could disclose metrics to a provider."""
+    from agent_loop import BacktestDiagnosticEvidence, ConfigurationError, ProviderGateEvidence
+
+    diagnostics = BacktestDiagnosticEvidence(
+        total_return_pct=0.0,
+        annualized_return_pct=0.0,
+        sharpe_ratio=0.0,
+        max_drawdown_pct=0.0,
+        closed_trades=0,
+        minimum_total_return=1.0,
+        minimum_annualized_return=0.0,
+        minimum_sharpe_ratio=0.0,
+        maximum_drawdown_magnitude=1.0,
+        minimum_closed_trades=0,
+        total_return_margin=-1.0,
+        annualized_return_margin=0.0,
+        sharpe_margin=0.0,
+        drawdown_headroom=1.0,
+        closed_trades_margin=0,
+        failed_metrics=("total_return_pct",),
+        ticker_count=1,
+        calendar_days=1,
+    )
+    with pytest.raises(ConfigurationError, match="diagnostics"):
+        ProviderGateEvidence(
+            gate_kind="backtest",
+            outcome=outcome,
+            gate_observation=False,
+            observed_exit_zero=observed_exit_zero,
+            worker_confined=worker_confined,
+            returncode=returncode,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            failure_codes=("thresholds_not_met",),
+            backtest_diagnostics=diagnostics,
+        )
+
+
+def test_backtest_adapter_attaches_diagnostics_only_after_attested_exit_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: validated metrics were dropped, or unconfined metrics reached a provider."""
+    import agent_loop
+    from agent_loop import (
+        BacktestDiagnosticEvidence,
+        BacktestEvaluation,
+        BacktestGateResult,
+        CompletionEnvelope,
+    )
+
+    diagnostics = BacktestDiagnosticEvidence(
+        total_return_pct=1.0,
+        annualized_return_pct=0.5,
+        sharpe_ratio=0.4,
+        max_drawdown_pct=-2.0,
+        closed_trades=1,
+        minimum_total_return=2.0,
+        minimum_annualized_return=1.0,
+        minimum_sharpe_ratio=0.5,
+        maximum_drawdown_magnitude=5.0,
+        minimum_closed_trades=2,
+        total_return_margin=-1.0,
+        annualized_return_margin=-0.5,
+        sharpe_margin=0.4 - 0.5,
+        drawdown_headroom=3.0,
+        closed_trades_margin=-1,
+        failed_metrics=(
+            "total_return_pct",
+            "annualized_return_pct",
+            "sharpe_ratio",
+            "closed_trades",
+        ),
+        ticker_count=2,
+        calendar_days=365,
+    )
+    payload = {
+        "gate_observation": False,
+        "worker_confined": True,
+        "source_modified": False,
+        "timed_out": False,
+        "oom_killed": False,
+        "cleanup_verified": True,
+        "returncode": 0,
+        "stdout_sha256": "a" * 64,
+        "stderr_sha256": "b" * 64,
+    }
+    result = BacktestGateResult(
+        provider_safe=True,
+        gate_observation=False,
+        observed_exit_zero=True,
+        worker_confined=True,
+        source_modified=False,
+        security_attestation=False,
+        outcome="thresholds_not_met",
+        evaluation=BacktestEvaluation(False, diagnostics.failed_metrics),
+        completion_envelope=CompletionEnvelope(payload, "c" * 64),
+        backtest_diagnostics=diagnostics,
+    )
+    monkeypatch.setattr(agent_loop, "run_backtest_gate", lambda *_args, **_kwargs: result)
+
+    class Sandbox:
+        @staticmethod
+        def verify_completion_envelope(_envelope: object) -> bool:
+            return True
+
+    gate = SimpleNamespace(
+        tickers=("AAPL", "MSFT"),
+        benchmark="SPY",
+        start_date="2024-01-01",
+        end_date="2024-12-31",
+        thresholds=object(),
+    )
+    evidence = agent_loop._backtest_provider_evidence(
+        object(), Sandbox(), gate, object()
+    )
+    assert evidence.backtest_diagnostics == diagnostics
+
+    payload["worker_confined"] = False
+    unconfined = BacktestGateResult(
+        provider_safe=True,
+        gate_observation=False,
+        observed_exit_zero=True,
+        worker_confined=False,
+        source_modified=False,
+        security_attestation=False,
+        outcome="thresholds_not_met",
+        evaluation=BacktestEvaluation(False, diagnostics.failed_metrics),
+        completion_envelope=CompletionEnvelope(payload, "d" * 64),
+        backtest_diagnostics=diagnostics,
+    )
+    monkeypatch.setattr(
+        agent_loop, "run_backtest_gate", lambda *_args, **_kwargs: unconfined
+    )
+    rejected = agent_loop._backtest_provider_evidence(
+        object(), Sandbox(), gate, object()
+    )
+    assert rejected.outcome == "worker_unconfined"
+    assert rejected.backtest_diagnostics is None
 def test_task3_loop_config_and_result_enforce_terminal_contract(tmp_path: Path) -> None:
     """Break caught: incompatible configuration or mismatched status/exit pairs could be reported."""
     from agent_loop import (
@@ -765,6 +1087,12 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     assert "index 1111111..2222222 100644" in coder_prompt
     assert "--- a/<path>" in coder_prompt
     assert "+++ b/<path>" in coder_prompt
+    reasoner_prompt = OpenRouterGateway.SYSTEM_PROMPTS["reasoner"]
+    assert "closed numeric diagnostics" in reasoner_prompt
+    assert "all supplied source snapshots" in reasoner_prompt
+    assert "set skip to true" in reasoner_prompt.lower()
+    assert "Never invent" in reasoner_prompt
+    assert "sealed gate evidence" in coder_prompt
 
 
 def test_usage_and_completion_reject_invalid_direct_values() -> None:
@@ -1896,6 +2224,7 @@ def _task2_repo(tmp_path: Path, *, branch: str = "codex/task2") -> Path:
     (repo / "tests").mkdir()
     (repo / "core" / "backtest_engine.py").write_text("VALUE = 1\n", encoding="utf-8", newline="\n")
     (repo / "core" / "momentum_analysis.py").write_text("MOMENTUM = 1\n", encoding="utf-8", newline="\n")
+    (repo / "core" / "pivot_detector.py").write_text("PIVOT = 1\n", encoding="utf-8", newline="\n")
     (repo / "tests" / "test_safe.py").write_text(
         "def test_safe():\n    assert True\n", encoding="utf-8", newline="\n"
     )
@@ -2424,6 +2753,27 @@ def test_backtest_gate_copies_approved_bundle_and_fails_closed_on_missing_sentin
     )
     assert result.gate_observation
     assert passing.argv is not None and "--technical-only" in passing.argv
+    assert asdict(result.backtest_diagnostics) == {
+        "total_return_pct": 10.0,
+        "annualized_return_pct": 8.0,
+        "sharpe_ratio": 1.0,
+        "max_drawdown_pct": -5.0,
+        "closed_trades": 3,
+        "minimum_total_return": 10.0,
+        "minimum_annualized_return": 8.0,
+        "minimum_sharpe_ratio": 1.0,
+        "maximum_drawdown_magnitude": 5.0,
+        "minimum_closed_trades": 3,
+        "total_return_margin": 0.0,
+        "annualized_return_margin": 0.0,
+        "sharpe_margin": 0.0,
+        "drawdown_headroom": 0.0,
+        "closed_trades_margin": 0,
+        "failed_metrics": (),
+        "ticker_count": 1,
+        "calendar_days": 31,
+        "provider_safe": True,
+    }
 
     missing = FakeSandbox("ordinary output only\n")
     failed = run_backtest_gate(
@@ -2438,6 +2788,20 @@ def test_backtest_gate_copies_approved_bundle_and_fails_closed_on_missing_sentin
     )
     assert not failed.gate_observation
     assert failed.evaluation.failures == ("sentinel",)
+
+    invalid_metrics = {**metrics, "closed_trades": True}
+    invalid = run_backtest_gate(
+        candidate,
+        FakeSandbox(BACKTEST_SENTINEL + json.dumps(invalid_metrics) + "\n"),  # type: ignore[arg-type]
+        approved,
+        ["AAPL"],
+        "SPY",
+        "2026-01-01",
+        "2026-02-01",
+        BacktestThresholds(10.0, 8.0, 1.0, 5.0, 3),
+    )
+    assert invalid.outcome == "sentinel_invalid"
+    assert invalid.backtest_diagnostics is None
 
 
 @pytest.mark.parametrize(
@@ -5307,26 +5671,26 @@ def _gate_evidence(passed: bool) -> Any:
     )
 
 
-def _loop_route() -> Any:
+def _loop_route(*, path: str = "core/backtest_engine.py") -> Any:
     from agent_loop import Route
 
     return Route(
         action="reason",
         failure_summary="The deterministic test gate failed.",
-        relevant_files=("core/backtest_engine.py",),
+        relevant_files=(path,),
         reasoning_focus="Repair the isolated arithmetic defect.",
     )
 
 
-def _loop_plan() -> Any:
+def _loop_plan(*, path: str = "core/backtest_engine.py") -> Any:
     from agent_loop import ReasoningPlan
 
     return ReasoningPlan(
         diagnosis="The constant is incorrect.",
         root_cause="The implementation retained the old value.",
         invariants=("Keep the public interface unchanged.",),
-        files_to_change=("core/backtest_engine.py",),
-        steps=("Change the constant from one to two.",),
+        files_to_change=(path,),
+        steps=("Change the isolated constant from one to two.",),
         skip=False,
         skip_reason="",
     )
@@ -5338,7 +5702,11 @@ def _loop_proposal(*, path: str = "core/backtest_engine.py") -> Any:
     return CodingProposal(
         summary="Correct the isolated constant.",
         files=(path,),
-        unified_diff=_task2_diff(path=path),
+        unified_diff=_task2_diff(
+            path=path,
+            old="MOMENTUM = 1" if path == "core/momentum_analysis.py" else "VALUE = 1",
+            new="MOMENTUM = 2" if path == "core/momentum_analysis.py" else "VALUE = 2",
+        ),
     )
 
 
@@ -5350,6 +5718,7 @@ def _run_proposal_batch_fixture(
 ) -> tuple[Any, _StrictBatchGateway, Any, Any]:
     from agent_loop import (
         AuditTrail,
+        BacktestDiagnosticEvidence,
         BacktestGateConfig,
         BacktestThresholds,
         ExecutionMode,
@@ -5393,7 +5762,7 @@ def _run_proposal_batch_fixture(
             end_date="2025-01-01",
             historical_data_bundle=(root / "bundle.sqlite3").resolve(),
             historical_data_sha256="a" * 64,
-            thresholds=BacktestThresholds(0.0, 0.0, 0.0, 100.0, 0),
+            thresholds=BacktestThresholds(1.0, 0.0, 0.0, 100.0, 0),
         ),
         models=ModelConfig(),
         limits=LoopLimits(
@@ -5417,6 +5786,26 @@ def _run_proposal_batch_fixture(
         stdout_sha256="a" * 64,
         stderr_sha256="b" * 64,
         failure_codes=("thresholds_not_met",),
+        backtest_diagnostics=BacktestDiagnosticEvidence(
+            total_return_pct=0.0,
+            annualized_return_pct=0.0,
+            sharpe_ratio=0.0,
+            max_drawdown_pct=0.0,
+            closed_trades=0,
+            minimum_total_return=1.0,
+            minimum_annualized_return=0.0,
+            minimum_sharpe_ratio=0.0,
+            maximum_drawdown_magnitude=100.0,
+            minimum_closed_trades=0,
+            total_return_margin=-1.0,
+            annualized_return_margin=0.0,
+            sharpe_margin=0.0,
+            drawdown_headroom=100.0,
+            closed_trades_margin=0,
+            failed_metrics=("total_return_pct",),
+            ticker_count=1,
+            calendar_days=366,
+        ),
     )
 
     def snapshots(current: Any, paths: tuple[str, ...]) -> tuple[Any, ...]:
@@ -5434,7 +5823,7 @@ def _run_proposal_batch_fixture(
             gateway=gateway,
             run_primary_gate=lambda _candidate: evidence,
             read_snapshots=snapshots,
-            editable_paths=("core/backtest_engine.py", "core/momentum_analysis.py"),
+            editable_paths=("core/momentum_analysis.py", "core/pivot_detector.py"),
         ),
         batch_limits,
     )
@@ -5490,9 +5879,25 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
         first_role, first_dynamic = gateway.dynamic_inputs[0]
         assert first_role == "orchestrator"
         assert json.loads(first_dynamic)["editable_paths"] == [
-            "core/backtest_engine.py",
             "core/momentum_analysis.py",
+            "core/pivot_detector.py",
         ]
+        reasoner_role, reasoner_dynamic = gateway.dynamic_inputs[1]
+        assert reasoner_role == "reasoner"
+        reasoner_payload = json.loads(reasoner_dynamic)
+        assert [
+            snapshot["path"] for snapshot in reasoner_payload["source_snapshots"]
+        ] == [
+            "core/momentum_analysis.py",
+            "core/pivot_detector.py",
+        ]
+        assert reasoner_payload["evidence"]["primary"][
+            "backtest_diagnostics"
+        ]["total_return_margin"] == -1.0
+        coder_role, coder_dynamic = gateway.dynamic_inputs[2]
+        assert coder_role == "coder"
+        coder_payload = json.loads(coder_dynamic)
+        assert coder_payload["evidence"] == reasoner_payload["evidence"]
         assert gateway.pricing_preloads == [("orchestrator", "reasoner", "coder")]
         assert len(result.samples) == 50
         assert all(len(sample.provider_call_paths) == 3 for sample in result.samples)
@@ -5523,6 +5928,77 @@ def test_proposal_batch_failure_stops_before_the_next_role_or_sample(tmp_path: P
         assert result.completed_samples == 0
         assert result.budget.api_calls == 1
         assert gateway.roles == ["orchestrator"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_classifies_a_reasoner_skip_as_insufficient_evidence(
+    tmp_path: Path,
+) -> None:
+    """Break caught: an evidence-grounded safety skip was mislabeled as invalid JSON."""
+    from agent_loop import ReasoningPlan
+
+    skip = ReasoningPlan(
+        diagnosis="The bounded facts do not establish a causal defect.",
+        root_cause="The selected source cannot explain the observed metric gap.",
+        invariants=("Do not invent a strategy change without causal evidence.",),
+        files_to_change=(),
+        steps=(),
+        skip=True,
+        skip_reason="Insufficient causal evidence for a safe patch.",
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[_loop_route(), skip, _loop_proposal()],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "insufficient_evidence"
+        assert result.completed_samples == 0
+        assert result.budget.api_calls == 2
+        assert gateway.roles == ["orchestrator", "reasoner"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_hash_binds_sanitized_evidence_to_unbacktested_proposal(
+    tmp_path: Path,
+) -> None:
+    """Break caught: an inert proposal could not be traced to the metrics disclosed to models."""
+    result, _gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
+    )
+    try:
+        assert result.status == "batch_complete", result.failure_code
+        evidence_path = result.audit_path / "provider-evidence.json"
+        evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        assert evidence["gate_kind"] == "backtest"
+        assert evidence["backtest_diagnostics"]["total_return_margin"] == -1.0
+
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        gate_event = next(
+            event for event in events if event["event"] == "proposal_batch_gate_observed"
+        )
+        assert gate_event["details"]["provider_evidence_sha256"] == evidence_sha256
+
+        metadata = json.loads(result.samples[0].metadata_path.read_text(encoding="utf-8"))
+        assert metadata["provider_evidence_sha256"] == evidence_sha256
+        assert metadata["verification_status"] == "not_backtested"
         assert not candidate.root.exists()
     finally:
         external.cleanup()
