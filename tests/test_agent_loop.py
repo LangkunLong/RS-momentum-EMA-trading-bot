@@ -1780,7 +1780,8 @@ def test_fixed_test_gate_accepts_only_tracked_tests_selectors(tmp_path: Path) ->
 
     repo = _task2_repo(tmp_path)
     assert build_test_gate_argv(repo, ["tests/test_safe.py"]) == (
-        "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "-q", "-m", "not integration", "tests/test_safe.py"
+        "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "--capture=sys",
+        "-q", "-m", "not integration", "tests/test_safe.py",
     )
     with pytest.raises(GateConfigurationError):
         build_test_gate_argv(repo, ["--collect-only"])
@@ -2347,7 +2348,8 @@ def test_worker_completion_envelope_is_host_sealed_chained_and_observational(tmp
     ):
         assert key in payload
     assert payload["argv"] == [
-        "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "-q", "-m", "not integration"
+        "-m", "pytest", "-p", "no:cacheprovider", "--no-cov", "--capture=sys",
+        "-q", "-m", "not integration",
     ]
     assert second.completion_envelope.payload["previous_hmac_sha256"] == first.completion_envelope.hmac_sha256
     assert "candidate says success" not in repr(first)
