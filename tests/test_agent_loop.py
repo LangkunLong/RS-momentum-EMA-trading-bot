@@ -2908,6 +2908,25 @@ def test_container_config_hash_normalizes_oom_kill_disable_null_after_start(
     assert engine.removed and engine.absence_verified
 
 
+def test_container_attestation_normalizes_only_disabled_init_false_or_null(
+    tmp_path: Path,
+) -> None:
+    """Docker Desktop reports an omitted --init policy as null rather than false."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    engine.mutate_inspection = lambda item: item["HostConfig"].update(Init=None)
+
+    result = run_test_gate(candidate, _faithful_runner(image, engine))
+
+    assert result.gate_observation is True
+    assert result.observed_exit_zero is True
+    assert engine.removed and engine.absence_verified
+
+
 def test_container_config_hash_canonicalizes_mount_order_after_exact_validation(
     tmp_path: Path,
 ) -> None:
