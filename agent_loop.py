@@ -39,7 +39,7 @@ from typing import Any, BinaryIO, Callable, Generic, Mapping, Protocol, Sequence
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
-REASONER_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
+REASONER_MODEL = "deepseek/deepseek-r1"
 CODER_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
