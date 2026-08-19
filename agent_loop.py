@@ -43,6 +43,9 @@ CODER_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
 DEFAULT_MAX_TOKENS = 131_072
+MAX_PROPOSAL_SAMPLES = 50
+MAX_BATCH_CALLS = 150
+MAX_BATCH_TOKENS = 2_000_000
 
 _MAX_FILES = 8
 _MAX_LIST_ITEMS = 16
@@ -129,6 +132,10 @@ class ProtocolValidationError(ValueError):
 
 class ResponseValidationError(ValueError):
     """Raised when a provider response is incomplete or not a valid protocol object."""
+
+
+class AccountingValidationError(ResponseValidationError):
+    """Raised when provider usage/cost accounting is missing, malformed, or inconsistent."""
 
 
 class BudgetExceededError(RuntimeError):
@@ -413,11 +420,83 @@ class Usage:
         )
         if self.total_tokens is not None and self.total_tokens < component_total:
             raise ProtocolValidationError("total_tokens must cover prompt_tokens plus completion_tokens")
+        if (
+            self.cached_tokens is not None
+            and self.prompt_tokens is not None
+            and self.cached_tokens > self.prompt_tokens
+        ):
+            raise ProtocolValidationError("cached_tokens cannot exceed prompt_tokens")
+        if (
+            self.reasoning_tokens is not None
+            and self.completion_tokens is not None
+            and self.reasoning_tokens > self.completion_tokens
+        ):
+            raise ProtocolValidationError("reasoning_tokens cannot exceed completion_tokens")
         if self.cost_usd is not None and _non_negative_float(self.cost_usd) is None:
             raise ProtocolValidationError("usage cost must be a finite non-negative number")
 
 
 PayloadT = TypeVar("PayloadT")
+
+
+@dataclass(frozen=True)
+class ProviderCallFacts:
+    """Sanitized complete accounting for one paid response, without provider content."""
+
+    call_index: int
+    role: str
+    requested_model: str
+    returned_model: str
+    finish_reason: str
+    usage: Usage
+    response_schema_valid: bool
+
+    def __post_init__(self) -> None:
+        if type(self.call_index) is not int or self.call_index < 1:
+            raise ConfigurationError("provider call fact index must be positive")
+        if self.role not in {"orchestrator", "reasoner", "coder"}:
+            raise ConfigurationError("provider call fact role is invalid")
+        if _MODEL_SLUG_RE.fullmatch(self.requested_model) is None:
+            raise ConfigurationError("requested provider model is invalid")
+        if self.returned_model != "unknown" and _MODEL_SLUG_RE.fullmatch(
+            self.returned_model
+        ) is None:
+            raise ConfigurationError("returned provider model is invalid")
+        if self.finish_reason not in {"stop", "non_stop", "unknown"}:
+            raise ConfigurationError("provider finish reason fact is invalid")
+        if not isinstance(self.usage, Usage) or any(
+            value is None
+            for value in (
+                self.usage.prompt_tokens,
+                self.usage.completion_tokens,
+                self.usage.total_tokens,
+                self.usage.cost_usd,
+            )
+        ):
+            raise ConfigurationError("provider call facts require complete accounting")
+        assert self.usage.prompt_tokens is not None
+        assert self.usage.completion_tokens is not None
+        assert self.usage.total_tokens is not None
+        if self.usage.total_tokens != self.usage.prompt_tokens + self.usage.completion_tokens:
+            raise ConfigurationError("provider call fact token total is inconsistent")
+        if type(self.response_schema_valid) is not bool:
+            raise ConfigurationError("provider response schema fact must be boolean")
+
+
+class AccountedCallError(Exception):
+    """Base for a rejected provider response whose exact usage was already reconciled."""
+
+    def __init__(self, message: str, facts: ProviderCallFacts) -> None:
+        super().__init__(message)
+        self.facts = facts
+
+
+class AccountedResponseValidationError(AccountedCallError, ResponseValidationError):
+    """A protocol/model-invalid response with complete authoritative accounting."""
+
+
+class AccountedBudgetExceededError(AccountedCallError, BudgetExceededError):
+    """A complete paid response whose authoritative accounting crossed a hard limit."""
 
 
 @dataclass(frozen=True)
@@ -437,6 +516,72 @@ class AgentCompletion(Generic[PayloadT]):
             raise ProtocolValidationError("finish_reason must be stop")
         if self.model is not None and (not isinstance(self.model, str) or not self.model.strip()):
             raise ProtocolValidationError("model must be a nonblank string or None")
+
+
+@dataclass(frozen=True)
+class ProviderCallRecord:
+    """Closed paid-call accounting; prompts and response content are intentionally absent."""
+
+    schema_version: int
+    call_index: int
+    iteration: int
+    role: str
+    api_backend: str
+    requested_model: str
+    returned_model: str
+    outcome: str
+    finish_reason: str
+    response_schema_valid: bool
+    accounting_complete: bool
+    prompt_tokens: int
+    cached_tokens: int | None
+    completion_tokens: int
+    reasoning_tokens: int | None
+    total_tokens: int
+    cost_usd: float
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ConfigurationError("provider call schema version must be 1")
+        if type(self.call_index) is not int or self.call_index < 1:
+            raise ConfigurationError("provider call index must be positive")
+        if type(self.iteration) is not int or self.iteration < 1:
+            raise ConfigurationError("provider call iteration must be positive")
+        if self.role not in {"orchestrator", "reasoner", "coder"}:
+            raise ConfigurationError("provider call role is invalid")
+        if self.api_backend != "openrouter" or self.outcome not in {
+            "accepted",
+            "protocol_invalid",
+            "budget_exceeded",
+        }:
+            raise ConfigurationError("provider call backend/outcome is invalid")
+        if self.finish_reason not in {"stop", "non_stop", "unknown"}:
+            raise ConfigurationError("provider call finish reason is invalid")
+        if self.accounting_complete is not True or type(self.response_schema_valid) is not bool:
+            raise ConfigurationError("provider call must have complete validated accounting")
+        if _MODEL_SLUG_RE.fullmatch(self.requested_model) is None:
+            raise ConfigurationError("provider call requested model is invalid")
+        if self.returned_model != "unknown" and _MODEL_SLUG_RE.fullmatch(
+            self.returned_model
+        ) is None:
+            raise ConfigurationError("provider call returned model is invalid")
+        if self.outcome in {"accepted", "budget_exceeded"} and self.response_schema_valid:
+            if self.finish_reason != "stop" or self.requested_model != self.returned_model:
+                raise ConfigurationError("validated provider call identity is inconsistent")
+        if self.outcome == "accepted" and self.response_schema_valid is not True:
+            raise ConfigurationError("accepted provider call must have a validated response")
+        if self.outcome == "protocol_invalid" and self.response_schema_valid is not False:
+            raise ConfigurationError("protocol-invalid provider call cannot be schema-valid")
+        Usage(
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            total_tokens=self.total_tokens,
+            cached_tokens=self.cached_tokens,
+            reasoning_tokens=self.reasoning_tokens,
+            cost_usd=self.cost_usd,
+        )
+        if self.total_tokens != self.prompt_tokens + self.completion_tokens:
+            raise ConfigurationError("provider call token total is inconsistent")
 
 
 @dataclass(frozen=True)
@@ -471,6 +616,34 @@ class BudgetReservation:
     token_upper_bound: int
 
 
+@dataclass(frozen=True)
+class BudgetWindow:
+    """A monotonic sub-budget measured from one trusted ledger baseline."""
+
+    baseline_calls: int
+    baseline_committed_usd: float
+    max_increment_calls: int
+    max_increment_usd: float | None
+
+    def __post_init__(self) -> None:
+        if type(self.baseline_calls) is not int or self.baseline_calls < 0:
+            raise ConfigurationError("budget window call baseline must be non-negative")
+        if (
+            type(self.baseline_committed_usd) not in {int, float}
+            or not math.isfinite(self.baseline_committed_usd)
+            or self.baseline_committed_usd < 0
+        ):
+            raise ConfigurationError("budget window USD baseline must be finite and non-negative")
+        if type(self.max_increment_calls) is not int or self.max_increment_calls < 1:
+            raise ConfigurationError("budget window call increment must be positive")
+        if self.max_increment_usd is not None and (
+            type(self.max_increment_usd) not in {int, float}
+            or not math.isfinite(self.max_increment_usd)
+            or self.max_increment_usd <= 0
+        ):
+            raise ConfigurationError("budget window USD increment must be finite and positive")
+
+
 class BudgetLedger:
     """Tracks API calls, tokens, and conservative USD reservations."""
 
@@ -502,7 +675,33 @@ class BudgetLedger:
         """Return the conservative amount unavailable for subsequent calls."""
         return self.reserved_usd
 
-    def reserve(self, prompt: str, completion_allowance: int, pricing: Pricing) -> BudgetReservation:
+    def _check_window(
+        self,
+        window: BudgetWindow | None,
+        *,
+        prospective_calls: int,
+        prospective_usd: float,
+    ) -> None:
+        if window is None:
+            return
+        if self.calls < window.baseline_calls or self.committed_usd < window.baseline_committed_usd:
+            raise BudgetExceededError("budget window baseline is no longer monotonic")
+        if prospective_calls - window.baseline_calls > window.max_increment_calls:
+            raise BudgetExceededError("budget window call limit cannot reserve another provider call")
+        if (
+            window.max_increment_usd is not None
+            and prospective_usd - window.baseline_committed_usd > window.max_increment_usd
+        ):
+            raise BudgetExceededError("budget window USD limit cannot reserve this provider call")
+
+    def reserve(
+        self,
+        prompt: str,
+        completion_allowance: int,
+        pricing: Pricing,
+        *,
+        window: BudgetWindow | None = None,
+    ) -> BudgetReservation:
         """Reserve the UTF-8 byte token upper bound plus full completion allowance."""
         if completion_allowance <= 0:
             raise ConfigurationError("completion allowance must be positive")
@@ -518,12 +717,23 @@ class BudgetLedger:
         ) / 1_000_000
         if self.reserved_usd + amount > self.max_usd:
             raise BudgetExceededError("USD budget cannot reserve this provider call")
+        self._check_window(
+            window,
+            prospective_calls=self.calls + 1,
+            prospective_usd=self.reserved_usd + amount,
+        )
         self.reserved_usd += amount
         self.reserved_tokens += token_upper_bound
         self.calls += 1
         return BudgetReservation(amount, prompt_bytes, completion_allowance, token_upper_bound)
 
-    def reconcile(self, reservation: BudgetReservation, usage: Usage) -> None:
+    def reconcile(
+        self,
+        reservation: BudgetReservation,
+        usage: Usage,
+        *,
+        window: BudgetWindow | None = None,
+    ) -> None:
         """Replace a reservation with authoritative cost, retaining it when the cost is missing."""
         if usage.cost_usd is None:
             charged = reservation.amount_usd
@@ -531,17 +741,18 @@ class BudgetLedger:
             charged = usage.cost_usd
             if not math.isfinite(charged) or charged < 0:
                 raise ResponseValidationError("provider cost must be finite and non-negative")
-        self.reserved_usd += charged - reservation.amount_usd
-        self.spent_usd += charged
-        if self.reserved_usd > self.max_usd:
-            raise BudgetExceededError("provider reported cost exceeds the hard USD budget")
+        prospective_usd = self.reserved_usd + charged - reservation.amount_usd
         reported_tokens = usage.total_tokens
         if reported_tokens is None and usage.prompt_tokens is not None and usage.completion_tokens is not None:
             reported_tokens = usage.prompt_tokens + usage.completion_tokens
         charged_tokens = reservation.token_upper_bound if reported_tokens is None else reported_tokens
-        self.reserved_tokens += charged_tokens - reservation.token_upper_bound
-        if self.reserved_tokens > self.max_tokens:
-            raise BudgetExceededError("provider reported tokens exceed the hard token budget")
+        prospective_tokens = self.reserved_tokens + charged_tokens - reservation.token_upper_bound
+
+        # The provider call has already happened. Commit its authoritative accounting before
+        # reporting a limit breach so the ledger never understates actual spend or token use.
+        self.reserved_usd = prospective_usd
+        self.spent_usd += charged
+        self.reserved_tokens = prospective_tokens
         self.total_tokens += charged_tokens
         for attribute, value in (
             ("prompt_tokens", usage.prompt_tokens),
@@ -549,6 +760,15 @@ class BudgetLedger:
         ):
             if value is not None:
                 setattr(self, attribute, getattr(self, attribute) + value)
+        self._check_window(
+            window,
+            prospective_calls=self.calls,
+            prospective_usd=self.reserved_usd,
+        )
+        if self.reserved_usd > self.max_usd:
+            raise BudgetExceededError("provider reported cost exceeds the hard USD budget")
+        if self.reserved_tokens > self.max_tokens:
+            raise BudgetExceededError("provider reported tokens exceed the hard token budget")
 
 
 class ResponseParser(Protocol[PayloadT]):
@@ -585,21 +805,86 @@ def _non_negative_float(value: object) -> float | None:
     return normalized
 
 
-def _usage_from_response(response: object) -> Usage:
+_MISSING_FIELD = object()
+
+
+def _present_field(value: object, name: str) -> object:
+    if isinstance(value, Mapping):
+        return value[name] if name in value else _MISSING_FIELD
+    return getattr(value, name, _MISSING_FIELD)
+
+
+def _usage_int(usage: object, name: str) -> int | None:
+    value = _present_field(usage, name)
+    if value is _MISSING_FIELD or value is None:
+        return None
+    normalized = _non_negative_int(value)
+    if normalized is None:
+        raise AccountingValidationError(f"usage {name} must be a non-negative integer")
+    return normalized
+
+
+def _usage_cost(value: object, location: str) -> float | None:
+    if value is _MISSING_FIELD or value is None:
+        return None
+    normalized = _non_negative_float(value)
+    if normalized is None:
+        raise AccountingValidationError(f"{location} cost must be a finite non-negative number")
+    return normalized
+
+
+def _usage_from_response(response: object, *, require_complete: bool = False) -> Usage:
     usage = _read_field(response, "usage")
-    cost = _non_negative_float(_read_field(usage, "cost"))
-    if cost is None:
-        cost = _non_negative_float(_read_field(response, "cost"))
-    return Usage(
-        prompt_tokens=_non_negative_int(_read_field(usage, "prompt_tokens")),
-        completion_tokens=_non_negative_int(_read_field(usage, "completion_tokens")),
-        total_tokens=_non_negative_int(_read_field(usage, "total_tokens")),
-        cached_tokens=_non_negative_int(_read_field(usage, "prompt_tokens_details", "cached_tokens")),
-        reasoning_tokens=_non_negative_int(
-            _read_field(usage, "completion_tokens_details", "reasoning_tokens")
-        ),
-        cost_usd=cost,
+    if usage is None:
+        if require_complete:
+            raise AccountingValidationError("response is missing authoritative usage accounting")
+        usage = {}
+    prompt_tokens = _usage_int(usage, "prompt_tokens")
+    completion_tokens = _usage_int(usage, "completion_tokens")
+    total_tokens = _usage_int(usage, "total_tokens")
+    prompt_details = _present_field(usage, "prompt_tokens_details")
+    completion_details = _present_field(usage, "completion_tokens_details")
+    cached_tokens = (
+        None
+        if prompt_details is _MISSING_FIELD or prompt_details is None
+        else _usage_int(prompt_details, "cached_tokens")
     )
+    reasoning_tokens = (
+        None
+        if completion_details is _MISSING_FIELD or completion_details is None
+        else _usage_int(completion_details, "reasoning_tokens")
+    )
+    usage_cost = _usage_cost(_present_field(usage, "cost"), "usage")
+    response_cost = _usage_cost(_present_field(response, "cost"), "response")
+    if usage_cost is not None and response_cost is not None and usage_cost != response_cost:
+        raise AccountingValidationError("response contains conflicting provider cost accounting")
+    cost = usage_cost if usage_cost is not None else response_cost
+    if require_complete and cost is None:
+        raise AccountingValidationError("response is missing authoritative provider cost accounting")
+    if require_complete and (
+        prompt_tokens is None or completion_tokens is None or total_tokens is None
+    ):
+        raise AccountingValidationError("response is missing complete authoritative usage accounting")
+    if (
+        require_complete
+        and prompt_tokens is not None
+        and completion_tokens is not None
+        and total_tokens != prompt_tokens + completion_tokens
+    ):
+        raise AccountingValidationError(
+            "usage total_tokens must equal prompt_tokens plus completion_tokens"
+        )
+    try:
+        return Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cached_tokens=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
+            cost_usd=cost,
+        )
+    except ProtocolValidationError as exc:
+        raise AccountingValidationError("provider accounting relationships are invalid") from exc
 
 
 def _status_code(error: BaseException) -> int | None:
@@ -806,6 +1091,7 @@ class OpenRouterGateway:
         self.app_name = app_name
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
+        self._pricing_cache: dict[str, Pricing] = {}
 
     def _get_client(self) -> Any:
         """Construct the SDK client lazily, only after configuration has succeeded."""
@@ -842,10 +1128,53 @@ class OpenRouterGateway:
             dynamic = f"<dynamic-input>\n{dynamic_input}{suffix}\n</dynamic-input>"
             try:
                 return self._request_with_retries(role, dynamic, parser)
+            except AccountingValidationError:
+                raise
             except ResponseValidationError:
                 if repair == 1:
                     raise
         raise AssertionError("unreachable")
+
+    def request_once(
+        self,
+        role: str,
+        dynamic_input: str,
+        parser: Callable[[str], PayloadT],
+        *,
+        budget_window: BudgetWindow | None = None,
+    ) -> AgentCompletion[PayloadT]:
+        """Make exactly one fail-closed request with complete authoritative accounting."""
+        if role not in self._MODELS:
+            raise ConfigurationError(f"unknown gateway role: {role}")
+        if not isinstance(dynamic_input, str):
+            raise ConfigurationError("dynamic input must be a string")
+        dynamic = f"<dynamic-input>\n{dynamic_input}\n</dynamic-input>"
+        try:
+            return self._request_attempt(
+                role,
+                dynamic,
+                parser,
+                require_complete_accounting=True,
+                budget_window=budget_window,
+            )
+        except (ResponseValidationError, BudgetExceededError, GatewayError):
+            raise
+        except Exception as exc:
+            raise GatewayError("OpenRouter request failed", status_code=_status_code(exc)) from exc
+
+    def preload_pricing(self, roles: Sequence[str] = ("orchestrator", "reasoner", "coder")) -> None:
+        """Load and freeze one price record per selected role model before paid calls."""
+        for role in roles:
+            if role not in self._MODELS:
+                raise ConfigurationError(f"unknown gateway role: {role}")
+            self._pricing_for_model(self._MODELS[role])
+
+    def _pricing_for_model(self, model: str) -> Pricing:
+        pricing = self._pricing_cache.get(model)
+        if pricing is None:
+            pricing = Pricing.from_value(self.pricing_loader(model))
+            self._pricing_cache[model] = pricing
+        return pricing
 
     def _request_with_retries(
         self,
@@ -853,31 +1182,18 @@ class OpenRouterGateway:
         dynamic: str,
         parser: Callable[[str], PayloadT],
     ) -> AgentCompletion[PayloadT]:
-        model = self._MODELS[role]
         for attempt in range(self.max_attempts):
-            messages = [
-                {"role": "system", "content": self.SYSTEM_PROMPTS[role]},
-                {"role": "system", "content": self.STATIC_CONTEXT},
-                {"role": "user", "content": dynamic},
-            ]
-            pricing = Pricing.from_value(self.pricing_loader(model))
-            prompt_for_reservation = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
-            reservation = self.ledger.reserve(prompt_for_reservation, self._TOKEN_CAPS[role], pricing)
             try:
-                response = self._get_client().chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    stream=False,
-                    max_tokens=self._TOKEN_CAPS[role],
-                    timeout=self.timeout_seconds,
-                    extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
-                    extra_body={"provider": {"require_parameters": True}},
+                return self._request_attempt(
+                    role,
+                    dynamic,
+                    parser,
+                    require_complete_accounting=False,
+                    budget_window=None,
                 )
-                completion = self._validate_response(response, parser)
             except Exception as exc:
-                usage = Usage()
-                self.ledger.reconcile(reservation, usage)
+                if isinstance(exc, BudgetExceededError):
+                    raise
                 if isinstance(exc, ResponseValidationError):
                     raise
                 if attempt + 1 < self.max_attempts and _is_retryable(exc):
@@ -885,14 +1201,157 @@ class OpenRouterGateway:
                 if isinstance(exc, GatewayError):
                     raise
                 raise GatewayError("OpenRouter request failed", status_code=_status_code(exc)) from exc
-            self.ledger.reconcile(reservation, completion.usage)
-            return completion
         raise AssertionError("retry loop exhausted")
+
+    def _request_attempt(
+        self,
+        role: str,
+        dynamic: str,
+        parser: Callable[[str], PayloadT],
+        *,
+        require_complete_accounting: bool,
+        budget_window: BudgetWindow | None,
+    ) -> AgentCompletion[PayloadT]:
+        model = self._MODELS[role]
+        messages = [
+            {"role": "system", "content": self.SYSTEM_PROMPTS[role]},
+            {"role": "system", "content": self.STATIC_CONTEXT},
+            {"role": "user", "content": dynamic},
+        ]
+        pricing = self._pricing_for_model(model)
+        prompt_for_reservation = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+        reservation = self.ledger.reserve(
+            prompt_for_reservation,
+            self._TOKEN_CAPS[role],
+            pricing,
+            window=budget_window,
+        )
+        try:
+            response = self._get_client().chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                stream=False,
+                max_tokens=self._TOKEN_CAPS[role],
+                timeout=self.timeout_seconds,
+                extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
+                extra_body={"provider": {"require_parameters": True}},
+            )
+        except Exception:
+            self.ledger.reconcile(reservation, Usage(), window=budget_window)
+            raise
+        if _read_field(response, "error") is not None:
+            self.ledger.reconcile(reservation, Usage(), window=budget_window)
+            self._validate_response(
+                response,
+                parser,
+                require_complete_accounting=require_complete_accounting,
+                expected_model=model if require_complete_accounting else None,
+            )
+            raise AssertionError("embedded provider error was not rejected")
+        try:
+            usage = _usage_from_response(
+                response,
+                require_complete=require_complete_accounting,
+            )
+        except Exception:
+            self.ledger.reconcile(reservation, Usage(), window=budget_window)
+            raise
+        facts = (
+            self._provider_call_facts(
+                role,
+                model,
+                response,
+                usage,
+                response_schema_valid=False,
+            )
+            if require_complete_accounting
+            else None
+        )
+        try:
+            completion = self._validate_response(
+                response,
+                parser,
+                require_complete_accounting=require_complete_accounting,
+                expected_model=model if require_complete_accounting else None,
+                usage=usage,
+            )
+        except Exception as exc:
+            try:
+                self.ledger.reconcile(reservation, usage, window=budget_window)
+            except BudgetExceededError as budget_exc:
+                if facts is None:
+                    raise
+                raise AccountedBudgetExceededError(
+                    "provider accounting exceeded a rollout limit", facts
+                ) from budget_exc
+            if facts is None:
+                raise
+            raise AccountedResponseValidationError(
+                "provider response failed strict protocol validation", facts
+            ) from exc
+        accepted_facts = (
+            ProviderCallFacts(
+                call_index=facts.call_index,
+                role=facts.role,
+                requested_model=facts.requested_model,
+                returned_model=facts.returned_model,
+                finish_reason=facts.finish_reason,
+                usage=facts.usage,
+                response_schema_valid=True,
+            )
+            if facts is not None
+            else None
+        )
+        try:
+            self.ledger.reconcile(reservation, completion.usage, window=budget_window)
+        except BudgetExceededError as exc:
+            if accepted_facts is None:
+                raise
+            raise AccountedBudgetExceededError(
+                "provider accounting exceeded a rollout limit", accepted_facts
+            ) from exc
+        return completion
+
+    def _provider_call_facts(
+        self,
+        role: str,
+        requested_model: str,
+        response: object,
+        usage: Usage,
+        *,
+        response_schema_valid: bool,
+    ) -> ProviderCallFacts:
+        choices = _read_field(response, "choices")
+        if isinstance(choices, (list, tuple)) and len(choices) == 1:
+            raw_finish = _read_field(choices[0], "finish_reason")
+            finish_reason = "stop" if raw_finish == "stop" else "non_stop"
+        else:
+            finish_reason = "unknown"
+        raw_model = _read_field(response, "model")
+        returned_model = (
+            raw_model
+            if isinstance(raw_model, str) and _MODEL_SLUG_RE.fullmatch(raw_model) is not None
+            else "unknown"
+        )
+        return ProviderCallFacts(
+            call_index=self.ledger.calls,
+            role=role,
+            requested_model=requested_model,
+            returned_model=returned_model,
+            finish_reason=finish_reason,
+            usage=usage,
+            response_schema_valid=response_schema_valid,
+        )
 
     def _validate_response(
         self,
         response: object,
         parser: Callable[[str], PayloadT],
+        *,
+        require_complete_accounting: bool = False,
+        expected_model: str | None = None,
+        usage: Usage | None = None,
     ) -> AgentCompletion[PayloadT]:
         embedded_error = _read_field(response, "error")
         if embedded_error is not None:
@@ -916,11 +1375,17 @@ class OpenRouterGateway:
             payload = parser(content)
         except ProtocolValidationError as exc:
             raise ResponseValidationError("response protocol validation failed") from exc
+        normalized_usage = usage or _usage_from_response(
+            response, require_complete=require_complete_accounting
+        )
+        returned_model = _read_field(response, "model")
+        if require_complete_accounting and returned_model != expected_model:
+            raise ResponseValidationError("response model does not match the requested model")
         return AgentCompletion(
             payload=payload,
-            usage=_usage_from_response(response),
+            usage=normalized_usage,
             finish_reason="stop",
-            model=_read_field(response, "model") if isinstance(_read_field(response, "model"), str) else None,
+            model=returned_model if isinstance(returned_model, str) else None,
         )
 
 
@@ -2536,7 +3001,7 @@ class SandboxRunner:
             "CgroupParent": "",
             "PortBindings": {},
             "PublishAllPorts": False,
-            "Init": True,
+            "Init": False,
             "LogConfig": {
                 "Type": "local",
                 "Config": {
@@ -2878,7 +3343,6 @@ class SandboxRunner:
             "max-file=1",
             "--log-opt",
             "compress=false",
-            "--init",
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -2903,6 +3367,7 @@ class SandboxRunner:
             raise SandboxError("historical data path must be the controller-owned private copy")
         container_environment = {
             "ALPACA_PAPER": "false",
+            "AGENT_LOOP_SANDBOX_WATCHDOG": "1",
             "AGENT_LOOP_TEST_TMP_ROOT": "/workspace/tmp/pytest",
             "FMP_DAILY_REQUEST_BUDGET": "0",
             "PYTHONNOUSERSITE": "1",
@@ -2936,7 +3401,15 @@ class SandboxRunner:
             create_args.extend(("--mount", specification))
         for key, value in sorted(container_environment.items()):
             create_args.extend(("--env", f"{key}={value}"))
-        create_args.extend((image_id, *python_args))
+        watchdog_args = (
+            "/workspace/gate/agent_loop.py",
+            "--_hidden-watchdog",
+            "--timeout-seconds",
+            str(math.ceil(self.timeout_seconds)),
+            "--",
+            *python_args,
+        )
+        create_args.extend((image_id, *watchdog_args))
         expected_environment = tuple(sorted((*base_environment, *(f"{key}={value}" for key, value in container_environment.items()))))
         candidate_hash = _manifest_sha256(worker.source)
         gate_hash = _manifest_sha256(worker.gate)
@@ -2955,10 +3428,11 @@ class SandboxRunner:
             if created.returncode != 0 or created.timed_out or not re.fullmatch(r"[0-9a-f]{64}", container_id):
                 raise SandboxError("sandbox engine did not create a valid container")
             _item, config_hash = self._inspect_container(
-                name, container_id, ownership_token, image_id, worker, tuple(python_args),
+                name, container_id, ownership_token, image_id, worker, watchdog_args,
                 expected_environment, data_bundle,
             )
             owned_container_id = container_id
+            monotonic_deadline = time.monotonic() + self.timeout_seconds
             started_container = self._call("start", container_id, timeout=30)
             if (
                 started_container.returncode != 0
@@ -2966,8 +3440,8 @@ class SandboxRunner:
                 or started_container.stdout.strip() != container_id
             ):
                 raise SandboxError("sandbox engine did not start the owned container")
-            monotonic_deadline = time.monotonic() + self.timeout_seconds
             timed_out = False
+            running_at_timeout = False
             exit_code: int | None = None
             while True:
                 final_item, final_hash = self._inspect_container(
@@ -2976,10 +3450,11 @@ class SandboxRunner:
                     ownership_token,
                     image_id,
                     worker,
-                    tuple(python_args),
+                    watchdog_args,
                     expected_environment,
                     data_bundle,
                 )
+                observed_at = time.monotonic()
                 if final_hash != config_hash:
                     raise SandboxError("container configuration changed during execution")
                 state = final_item.get("State")
@@ -3001,8 +3476,11 @@ class SandboxRunner:
                     candidate_exit = state.get("ExitCode")
                     if type(candidate_exit) is not int or not 0 <= candidate_exit <= 255:
                         raise SandboxError("container exit code is malformed")
-                    exit_code = candidate_exit
                     oom_killed = bool(state["OOMKilled"])
+                    if observed_at >= monotonic_deadline:
+                        timed_out = True
+                    else:
+                        exit_code = candidate_exit
                     break
                 if (
                     state.get("Status") != "running"
@@ -3011,11 +3489,31 @@ class SandboxRunner:
                     or state["OOMKilled"] is not False
                 ):
                     raise SandboxError("container runtime state inspection is incomplete")
-                remaining = monotonic_deadline - time.monotonic()
+                remaining = monotonic_deadline - observed_at
                 if remaining <= 0:
                     timed_out = True
+                    running_at_timeout = True
                     break
                 time.sleep(min(1.0, remaining))
+            if timed_out and running_at_timeout:
+                killed = self._call("kill", "--signal", "KILL", container_id, timeout=15)
+                if (
+                    killed.returncode != 0
+                    or killed.timed_out
+                    or killed.stdout.strip() != container_id
+                ):
+                    raise SandboxError("timed-out sandbox container could not be killed")
+                waited = self._call("wait", container_id, timeout=15)
+                try:
+                    killed_exit = int(waited.stdout.strip())
+                except ValueError as exc:
+                    raise SandboxError("timed-out sandbox exit code is malformed") from exc
+                if (
+                    waited.returncode != 0
+                    or waited.timed_out
+                    or not 0 <= killed_exit <= 255
+                ):
+                    raise SandboxError("timed-out sandbox termination could not be verified")
             logs = self._call("logs", container_id, timeout=30)
             if logs.returncode != 0 or logs.timed_out:
                 raise SandboxError("sandbox engine could not collect bounded worker logs")
@@ -4214,9 +4712,9 @@ class LoopLimits:
     def __post_init__(self) -> None:
         if type(self.max_iterations) is not int or not 0 <= self.max_iterations <= MAX_ITERATIONS:
             raise ConfigurationError(f"max iterations must be between 0 and {MAX_ITERATIONS}")
-        if type(self.max_api_calls) is not int or not 1 <= self.max_api_calls <= DEFAULT_MAX_CALLS:
+        if type(self.max_api_calls) is not int or not 1 <= self.max_api_calls <= MAX_BATCH_CALLS:
             raise ConfigurationError("max_api_calls is outside the hard controller limit")
-        if type(self.max_tokens) is not int or not 1 <= self.max_tokens <= DEFAULT_MAX_TOKENS:
+        if type(self.max_tokens) is not int or not 1 <= self.max_tokens <= MAX_BATCH_TOKENS:
             raise ConfigurationError("max_tokens is outside the hard controller limit")
         _finite_positive(self.max_usd, "max_usd")
         _finite_positive(self.api_timeout_seconds, "API timeout")
@@ -4227,6 +4725,31 @@ class LoopLimits:
             or not 1 <= self.output_limit_bytes <= 4 * 1024 * 1024
         ):
             raise ConfigurationError("output_limit_bytes is outside the hard controller limit")
+
+
+@dataclass(frozen=True)
+class ProposalBatchLimits:
+    """Hard canary-first limits for independent proposal samples against one sealed gate."""
+
+    samples: int
+    max_usd: float
+    canary_max_usd: float
+    max_calls: int
+    max_tokens: int
+    wall_timeout_seconds: float = 3600.0
+
+    def __post_init__(self) -> None:
+        if type(self.samples) is not int or not 1 <= self.samples <= MAX_PROPOSAL_SAMPLES:
+            raise ConfigurationError("proposal samples must be between 1 and 50")
+        if self.max_calls != self.samples * 3 or self.max_calls > MAX_BATCH_CALLS:
+            raise ConfigurationError("proposal batch requires exactly three calls per sample")
+        if type(self.max_tokens) is not int or not 1 <= self.max_tokens <= MAX_BATCH_TOKENS:
+            raise ConfigurationError("proposal batch token limit is invalid")
+        max_usd = _finite_positive(self.max_usd, "proposal batch max_usd")
+        canary = _finite_positive(self.canary_max_usd, "proposal canary max_usd")
+        if max_usd > 2.0 or canary > 0.50 or canary > max_usd:
+            raise ConfigurationError("proposal batch USD limits exceed the hard rollout ceiling")
+        _finite_positive(self.wall_timeout_seconds, "proposal batch wall timeout")
 
 
 @dataclass(frozen=True)
@@ -4569,8 +5092,8 @@ class BudgetSnapshot:
         ):
             if type(value) is not int or value < 0:
                 raise ConfigurationError(f"{field} must be a nonnegative integer")
-        if self.total_tokens != self.prompt_tokens + self.completion_tokens:
-            raise ConfigurationError("total_tokens must equal prompt plus completion tokens")
+        if self.total_tokens < self.prompt_tokens + self.completion_tokens:
+            raise ConfigurationError("total_tokens must cover prompt plus completion tokens")
         for field, value in (("reserved_usd", self.reserved_usd), ("spent_usd", self.spent_usd)):
             if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
                 raise ConfigurationError(f"{field} must be finite and nonnegative")
@@ -5262,7 +5785,31 @@ class AuditTrail:
             {"role": role, "payload": asdict(payload)},
         )
 
-    def write_inert_diff(self, raw: str) -> tuple[Path, str]:
+    def write_provider_call(self, record: ProviderCallRecord) -> tuple[Path, str]:
+        """Persist one exact paid-call record without any provider content or headers."""
+        if not isinstance(record, ProviderCallRecord):
+            raise AuditError("provider call audit requires a validated record")
+        path = self.run_root / f"provider-call-{record.call_index:04d}.json"
+        self._write_json(path, asdict(record))
+        digest = _file_sha256(path)
+        state = {
+            "orchestrator": LoopState.CALL_ORCHESTRATOR,
+            "reasoner": LoopState.CALL_REASONER,
+            "coder": LoopState.CALL_CODER,
+        }[record.role]
+        self.append_event(
+            state,
+            "provider_call_accepted" if record.outcome == "accepted" else "provider_call_rejected",
+            {
+                "call_index": record.call_index,
+                "role": record.role,
+                "outcome": record.outcome,
+                "artifact_sha256": digest,
+            },
+        )
+        return path, digest
+
+    def write_inert_diff(self, raw: str, *, name: str = "candidate") -> tuple[Path, str]:
         """Persist one exact sanitized diff as inert bytes; never execute or apply the export."""
         if not isinstance(raw, str) or not raw:
             raise AuditError("inert candidate diff must be nonblank text")
@@ -5279,12 +5826,24 @@ class AuditTrail:
         ):
             raise AuditError("candidate diff requires credential redaction or normalization")
         payload = normalized.encode("utf-8")
-        path = self.run_root / "candidate.diff"
+        if _AUDIT_NAME_RE.fullmatch(name) is None:
+            raise AuditError("inert diff name is not canonical")
+        path = self.run_root / f"{name}.diff"
         _atomic_write_audit(path, payload)
         return path, hashlib.sha256(payload).hexdigest()
 
-    def write_handoff_metadata(self, value: Mapping[str, object]) -> Path:
-        return self._write_json(self.run_root / "handoff.json", value)
+    def write_handoff_metadata(
+        self,
+        value: Mapping[str, object],
+        *,
+        name: str = "handoff",
+    ) -> Path:
+        if _AUDIT_NAME_RE.fullmatch(name) is None:
+            raise AuditError("handoff metadata name is not canonical")
+        return self._write_json(self.run_root / f"{name}.json", value)
+
+    def write_batch_summary(self, value: Mapping[str, object]) -> Path:
+        return self._write_json(self.run_root / "batch-summary.json", value)
 
 
 def verify_audit_chain(path: Path) -> tuple[dict[str, object], ...]:
@@ -5414,6 +5973,82 @@ class HandoffArtifact:
             _configuration_relative_path(value, "handoff file")
         if self.provider_safe is not True:
             raise ConfigurationError("handoff observation must be provider-safe")
+
+
+@dataclass(frozen=True)
+class ProposalSampleResult:
+    sample: int
+    provider_call_paths: tuple[tuple[Path, str], ...]
+    diff_path: Path
+    diff_sha256: str
+    metadata_path: Path
+    metadata_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.sample) is not int or not 1 <= self.sample <= MAX_PROPOSAL_SAMPLES:
+            raise ConfigurationError("proposal sample index is invalid")
+        if len(self.provider_call_paths) != 3:
+            raise ConfigurationError("proposal sample must contain exactly three provider calls")
+        for path, digest in self.provider_call_paths:
+            _absolute_configuration_path(path, "provider call artifact")
+            if _SHA256_RE.fullmatch(digest) is None:
+                raise ConfigurationError("provider call artifact digest is invalid")
+        for path in (self.diff_path, self.metadata_path):
+            _absolute_configuration_path(path, "proposal artifact")
+        for digest in (self.diff_sha256, self.metadata_sha256):
+            if _SHA256_RE.fullmatch(digest) is None:
+                raise ConfigurationError("proposal artifact digest is invalid")
+
+
+@dataclass(frozen=True)
+class ProposalBatchResult:
+    status: str
+    exit_code: int
+    run_id: str
+    requested_samples: int
+    completed_samples: int
+    failure_code: str
+    budget: BudgetSnapshot
+    audit_path: Path
+    samples: tuple[ProposalSampleResult, ...]
+    provider_call_artifacts: tuple[tuple[Path, str], ...]
+    source_modified: bool
+    cleanup_complete: bool
+
+    def __post_init__(self) -> None:
+        allowed = {
+            "batch_complete": 10,
+            "gate_observed_pass": 0,
+            "batch_failed": 22,
+        }
+        if self.status not in allowed or self.exit_code != allowed[self.status]:
+            raise ConfigurationError("proposal batch terminal contract is invalid")
+        if _RUN_ID_RE.fullmatch(self.run_id) is None:
+            raise ConfigurationError("proposal batch run id is invalid")
+        if (
+            type(self.requested_samples) is not int
+            or type(self.completed_samples) is not int
+            or not 0 <= self.completed_samples <= self.requested_samples <= MAX_PROPOSAL_SAMPLES
+        ):
+            raise ConfigurationError("proposal batch sample counters are invalid")
+        if not isinstance(self.failure_code, str) or not self.failure_code:
+            raise ConfigurationError("proposal batch failure code is invalid")
+        if not isinstance(self.budget, BudgetSnapshot):
+            raise ConfigurationError("proposal batch budget is invalid")
+        _absolute_configuration_path(self.audit_path, "proposal batch audit path")
+        if len(self.samples) != self.completed_samples:
+            raise ConfigurationError("proposal batch results do not match completed samples")
+        if len(self.provider_call_artifacts) > self.budget.api_calls or (
+            self.status == "batch_complete"
+            and len(self.provider_call_artifacts) != self.budget.api_calls
+        ):
+            raise ConfigurationError("proposal batch provider-call audit coverage is inconsistent")
+        for path, digest in self.provider_call_artifacts:
+            _absolute_configuration_path(path, "provider call artifact")
+            if _SHA256_RE.fullmatch(digest) is None:
+                raise ConfigurationError("provider call artifact digest is invalid")
+        if type(self.source_modified) is not bool or type(self.cleanup_complete) is not bool:
+            raise ConfigurationError("proposal batch cleanup facts must be boolean")
 
 
 def export_inert_handoff(
@@ -5615,6 +6250,52 @@ class LoopServices:
         object.__setattr__(self, "editable_paths", editable)
 
 
+class StrictAgentGatewayProtocol(Protocol):
+    ledger: BudgetLedger
+
+    def preload_pricing(self, roles: Sequence[str] = ...) -> None: ...
+
+    def request_once(
+        self,
+        role: str,
+        dynamic_input: str,
+        parser: Callable[[str], Any],
+        *,
+        budget_window: BudgetWindow | None = None,
+    ) -> AgentCompletion[Any]: ...
+
+
+@dataclass(frozen=True)
+class ProposalBatchServices:
+    gateway: StrictAgentGatewayProtocol
+    run_primary_gate: Callable[[Candidate], ProviderGateEvidence]
+    read_snapshots: Callable[[Candidate, tuple[str, ...]], tuple[SourceSnapshot, ...]]
+    monotonic: Callable[[], float] = time.monotonic
+    known_secrets: tuple[str, ...] = ()
+    editable_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not all(callable(value) for value in (
+            self.run_primary_gate,
+            self.read_snapshots,
+            self.monotonic,
+        )):
+            raise ConfigurationError("proposal batch service boundary must be callable")
+        if not hasattr(self.gateway, "request_once") or not hasattr(self.gateway, "preload_pricing"):
+            raise ConfigurationError("proposal batch requires a strict gateway")
+        if not isinstance(getattr(self.gateway, "ledger", None), BudgetLedger):
+            raise ConfigurationError("proposal batch gateway must expose BudgetLedger")
+        if not isinstance(self.known_secrets, tuple) or any(
+            not isinstance(value, str) for value in self.known_secrets
+        ):
+            raise ConfigurationError("proposal batch secrets must be immutable strings")
+        try:
+            editable = tuple(canonical_patch_path(value) for value in self.editable_paths)
+        except PatchPolicyError as exc:
+            raise ConfigurationError("proposal batch editable path is invalid") from exc
+        object.__setattr__(self, "editable_paths", editable)
+
+
 class _LoopLimitReached(RuntimeError):
     pass
 
@@ -5624,7 +6305,7 @@ def _budget_snapshot(ledger: BudgetLedger) -> BudgetSnapshot:
         api_calls=ledger.calls,
         prompt_tokens=ledger.prompt_tokens,
         completion_tokens=ledger.completion_tokens,
-        total_tokens=ledger.prompt_tokens + ledger.completion_tokens,
+        total_tokens=ledger.total_tokens,
         reserved_tokens=ledger.reserved_tokens,
         reserved_usd=ledger.reserved_usd,
         spent_usd=ledger.spent_usd,
@@ -5655,6 +6336,7 @@ def export_inert_proposal(
     *,
     gate: str,
     editable_paths: Sequence[str] = (),
+    artifact_name: str = "candidate",
 ) -> HandoffArtifact:
     """Export one validated model proposal as inert bytes without mutating quarantine."""
     if not isinstance(proposal, CodingProposal) or not isinstance(audit, AuditTrail):
@@ -5671,7 +6353,10 @@ def export_inert_proposal(
     after = _candidate_tracked_manifest_sha256(candidate)
     if after != before:
         raise CandidateMutationError("candidate changed while proposal handoff was validated")
-    diff_path, diff_sha256 = audit.write_inert_diff(proposal.unified_diff)
+    diff_path, diff_sha256 = audit.write_inert_diff(
+        proposal.unified_diff,
+        name=artifact_name,
+    )
     metadata_path = audit.write_handoff_metadata(
         {
             "schema_version": 1,
@@ -5683,7 +6368,8 @@ def export_inert_proposal(
             "files": parsed.files,
             "gate": gate,
             "security_attestation": False,
-        }
+        },
+        name="handoff" if artifact_name == "candidate" else artifact_name,
     )
     return HandoffArtifact(
         diff_path=diff_path,
@@ -5692,6 +6378,417 @@ def export_inert_proposal(
         candidate_manifest_sha256=after,
         diff_sha256=diff_sha256,
         files=parsed.files,
+    )
+
+
+def run_proposal_batch(
+    config: LoopConfig,
+    state: SourceState,
+    candidate: Candidate,
+    audit: AuditTrail,
+    services: ProposalBatchServices,
+    limits: ProposalBatchLimits,
+) -> ProposalBatchResult:
+    """Sample independent inert proposals against one immutable failed backtest observation."""
+    if (
+        not isinstance(config, LoopConfig)
+        or not isinstance(config.gate, BacktestGateConfig)
+        or config.mode.apply
+        or config.limits.max_iterations != 1
+    ):
+        raise ConfigurationError("proposal batch requires a non-applying one-iteration backtest config")
+    if not isinstance(state, SourceState) or not isinstance(audit, AuditTrail):
+        raise ConfigurationError("proposal batch requires validated source and audit state")
+    if not isinstance(services, ProposalBatchServices) or not isinstance(limits, ProposalBatchLimits):
+        raise ConfigurationError("proposal batch requires validated services and limits")
+    candidate_root = _require_candidate(candidate)
+    if (
+        state.root.resolve() != config.source_root
+        or state.head != candidate.source_head
+        or state.fingerprint is None
+        or state.lock is None
+        or state.lock._stream is None
+        or candidate_root.parent != config.controller_temp_parent
+        or audit.artifact_root != config.artifact_root
+    ):
+        raise ConfigurationError("proposal batch ownership does not match validated configuration")
+    ledger = services.gateway.ledger
+    if (
+        ledger.max_calls != limits.max_calls
+        or ledger.max_tokens != limits.max_tokens
+        or ledger.max_usd != limits.max_usd
+        or config.limits.max_api_calls != limits.max_calls
+        or config.limits.max_tokens != limits.max_tokens
+        or config.limits.max_usd != limits.max_usd
+    ):
+        raise ConfigurationError("proposal batch gateway/config budgets must match exact limits")
+    started = services.monotonic()
+    if type(started) not in {int, float} or not math.isfinite(started):
+        raise ConfigurationError("proposal batch monotonic clock is invalid")
+    deadline = float(started) + limits.wall_timeout_seconds
+    sample_results: list[ProposalSampleResult] = []
+    provider_call_artifacts: list[tuple[int, str, Path, str]] = []
+    failure_code = "none"
+    status = "batch_failed"
+
+    def check_wall() -> None:
+        current = services.monotonic()
+        if type(current) not in {int, float} or not math.isfinite(current):
+            raise ConfigurationError("proposal batch monotonic clock is invalid")
+        if float(current) >= deadline:
+            raise BudgetExceededError("proposal batch wall deadline reached")
+
+    def load_snapshots(paths: tuple[str, ...]) -> tuple[SourceSnapshot, ...]:
+        approved = tuple(
+            dict.fromkeys(
+                path
+                for path in paths
+                if _is_provider_readable_path(path, services.editable_paths)
+            )
+        )
+        values = services.read_snapshots(candidate, approved)
+        if not isinstance(values, tuple) or len(values) > _MAX_FILES:
+            raise ConfigurationError("proposal batch snapshot collection is invalid")
+        seen: set[str] = set()
+        for value in values:
+            if (
+                not isinstance(value, SourceSnapshot)
+                or value.path not in approved
+                or value.path in seen
+            ):
+                raise ConfigurationError("proposal batch snapshot scope expanded or duplicated")
+            seen.add(value.path)
+        return values
+
+    role_models = {
+        "orchestrator": config.models.orchestrator,
+        "reasoner": config.models.reasoner,
+        "coder": config.models.coder,
+    }
+
+    def call_role(
+        sample: int,
+        ordinal: int,
+        role: str,
+        dynamic: Mapping[str, object],
+        parser: Callable[[str], Any],
+        expected_type: type[object],
+        window: BudgetWindow,
+    ) -> tuple[object, tuple[Path, str]]:
+        check_wall()
+        if ordinal != {"orchestrator": 1, "reasoner": 2, "coder": 3}.get(role):
+            raise ConfigurationError("proposal batch role order is invalid")
+        try:
+            completion = services.gateway.request_once(
+                role,
+                _provider_dynamic_payload(dynamic, services.known_secrets),
+                parser,
+                budget_window=window,
+            )
+        except AccountedCallError as exc:
+            outcome = (
+                "budget_exceeded"
+                if isinstance(exc, AccountedBudgetExceededError)
+                else "protocol_invalid"
+            )
+            facts = exc.facts
+            usage = facts.usage
+            assert usage.prompt_tokens is not None
+            assert usage.completion_tokens is not None
+            assert usage.total_tokens is not None
+            assert usage.cost_usd is not None
+            record = ProviderCallRecord(
+                schema_version=1,
+                call_index=facts.call_index,
+                iteration=sample,
+                role=role,
+                api_backend="openrouter",
+                requested_model=facts.requested_model,
+                returned_model=facts.returned_model,
+                outcome=outcome,
+                finish_reason=facts.finish_reason,
+                response_schema_valid=facts.response_schema_valid,
+                accounting_complete=True,
+                prompt_tokens=usage.prompt_tokens,
+                cached_tokens=usage.cached_tokens,
+                completion_tokens=usage.completion_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+                total_tokens=usage.total_tokens,
+                cost_usd=usage.cost_usd,
+            )
+            path, digest = audit.write_provider_call(record)
+            provider_call_artifacts.append((record.call_index, outcome, path, digest))
+            raise
+        except AccountingValidationError:
+            audit.append_event(
+                {
+                    "orchestrator": LoopState.CALL_ORCHESTRATOR,
+                    "reasoner": LoopState.CALL_REASONER,
+                    "coder": LoopState.CALL_CODER,
+                }[role],
+                "provider_call_rejected",
+                {"call_index": ledger.calls, "role": role, "code": "accounting_invalid"},
+            )
+            raise
+        except GatewayError:
+            audit.append_event(
+                {
+                    "orchestrator": LoopState.CALL_ORCHESTRATOR,
+                    "reasoner": LoopState.CALL_REASONER,
+                    "coder": LoopState.CALL_CODER,
+                }[role],
+                "provider_call_rejected",
+                {
+                    "accounting_complete": False,
+                    "call_index": ledger.calls,
+                    "role": role,
+                    "code": "provider_failed",
+                },
+            )
+            raise
+        check_wall()
+        if not isinstance(completion, AgentCompletion) or not isinstance(
+            completion.payload, expected_type
+        ):
+            raise ResponseValidationError("strict gateway returned the wrong payload type")
+        usage = completion.usage
+        if (
+            completion.model != role_models[role]
+            or usage.prompt_tokens is None
+            or usage.completion_tokens is None
+            or usage.total_tokens is None
+            or usage.cost_usd is None
+        ):
+            raise AccountingValidationError("strict gateway omitted complete accepted-call accounting")
+        record = ProviderCallRecord(
+            schema_version=1,
+            call_index=ledger.calls,
+            iteration=sample,
+            role=role,
+            api_backend="openrouter",
+            requested_model=role_models[role],
+            returned_model=completion.model,
+            outcome="accepted",
+            finish_reason=completion.finish_reason,
+            response_schema_valid=True,
+            accounting_complete=True,
+            prompt_tokens=usage.prompt_tokens,
+            cached_tokens=usage.cached_tokens,
+            completion_tokens=usage.completion_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            total_tokens=usage.total_tokens,
+            cost_usd=usage.cost_usd,
+        )
+        call_artifact = audit.write_provider_call(record)
+        provider_call_artifacts.append(
+            (record.call_index, record.outcome, call_artifact[0], call_artifact[1])
+        )
+        audit.write_validated_payload(f"{role}-{sample:03d}", completion.payload)
+        return completion.payload, call_artifact
+
+    cleanup: CleanupObservation | None = None
+    try:
+        audit.append_event(LoopState.PREPARE, "proposal_batch_prepared", {"samples": limits.samples})
+        check_wall()
+        evidence = services.run_primary_gate(candidate)
+        if not isinstance(evidence, ProviderGateEvidence) or evidence.gate_kind != "backtest":
+            raise ConfigurationError("proposal batch gate returned invalid provider-safe evidence")
+        audit.append_event(
+            LoopState.RUN_PRIMARY_GATE,
+            "proposal_batch_gate_observed",
+            {
+                "outcome": evidence.outcome,
+                "gate_observation": evidence.gate_observation,
+                "worker_confined": evidence.worker_confined,
+            },
+        )
+        if evidence.gate_observation:
+            if not evidence.worker_confined or not evidence.observed_exit_zero:
+                raise SandboxError("passing proposal batch gate is not confined and exit-zero")
+            status = "gate_observed_pass"
+        elif (
+            not evidence.worker_confined
+            or not evidence.observed_exit_zero
+            or evidence.outcome != "thresholds_not_met"
+            or "thresholds_not_met" not in evidence.failure_codes
+        ):
+            failure_code = "primary_gate_failed"
+        else:
+            services.gateway.preload_pricing(("orchestrator", "reasoner", "coder"))
+            sealed_manifest = _candidate_tracked_manifest_sha256(candidate)
+            evidence_payload = {"primary": asdict(evidence)}
+            for sample in range(1, limits.samples + 1):
+                check_wall()
+                calls_before = ledger.calls
+                window = BudgetWindow(
+                    baseline_calls=calls_before,
+                    baseline_committed_usd=ledger.committed_usd,
+                    max_increment_calls=3,
+                    max_increment_usd=limits.canary_max_usd if sample == 1 else None,
+                )
+                calls: list[tuple[Path, str]] = []
+                route, artifact = call_role(
+                    sample,
+                    1,
+                    "orchestrator",
+                    {"batch_sample": sample, "evidence": evidence_payload},
+                    Route.from_json,
+                    Route,
+                    window,
+                )
+                calls.append(artifact)
+                assert isinstance(route, Route)
+                if route.action != "reason":
+                    raise ProtocolValidationError("proposal batch orchestrator aborted")
+                snapshots = load_snapshots(route.relevant_files)
+                plan, artifact = call_role(
+                    sample,
+                    2,
+                    "reasoner",
+                    {
+                        "batch_sample": sample,
+                        "evidence": evidence_payload,
+                        "route": asdict(route),
+                        "source_snapshots": [asdict(value) for value in snapshots],
+                    },
+                    ReasoningPlan.from_json,
+                    ReasoningPlan,
+                    window,
+                )
+                calls.append(artifact)
+                assert isinstance(plan, ReasoningPlan)
+                readable = {value.path for value in snapshots}
+                if plan.skip or not set(plan.files_to_change).issubset(readable):
+                    raise ProtocolValidationError("proposal batch reasoner skipped or expanded scope")
+                proposal, artifact = call_role(
+                    sample,
+                    3,
+                    "coder",
+                    {
+                        "batch_sample": sample,
+                        "plan": asdict(plan),
+                        "source_snapshots": [asdict(value) for value in snapshots],
+                    },
+                    CodingProposal.from_json,
+                    CodingProposal,
+                    window,
+                )
+                calls.append(artifact)
+                assert isinstance(proposal, CodingProposal)
+                if not set(proposal.files).issubset(set(plan.files_to_change)):
+                    raise PatchPolicyError("proposal batch coder expanded approved scope")
+                handoff = export_inert_proposal(
+                    candidate,
+                    audit,
+                    proposal,
+                    gate="backtest",
+                    editable_paths=services.editable_paths,
+                    artifact_name=f"proposal-{sample:03d}",
+                )
+                if ledger.calls - calls_before != 3:
+                    raise BudgetExceededError("proposal sample did not consume exactly three calls")
+                if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
+                    raise CandidateMutationError("candidate changed during proposal batch")
+                sample_results.append(
+                    ProposalSampleResult(
+                        sample=sample,
+                        provider_call_paths=tuple(calls),
+                        diff_path=handoff.diff_path,
+                        diff_sha256=handoff.diff_sha256,
+                        metadata_path=handoff.metadata_path,
+                        metadata_sha256=_file_sha256(handoff.metadata_path),
+                    )
+                )
+                audit.append_event(
+                    LoopState.EXPORT_DIFF,
+                    "proposal_sample_exported",
+                    {"sample": sample, "diff_sha256": handoff.diff_sha256},
+                )
+            status = "batch_complete"
+    except AccountingValidationError:
+        failure_code = "accounting_invalid"
+    except BudgetExceededError:
+        failure_code = "budget_exceeded"
+    except GatewayError:
+        failure_code = "provider_failed"
+    except (ResponseValidationError, ProtocolValidationError):
+        failure_code = "protocol_invalid"
+    except (PatchPolicyError, PreflightError):
+        failure_code = "patch_rejected"
+    except CandidateMutationError:
+        failure_code = "candidate_mutation"
+    except (ConfigurationError, QuarantineError, AuditError, SandboxError):
+        failure_code = "controller_boundary_error"
+    except Exception:
+        failure_code = "unexpected_controller_error"
+    finally:
+        cleanup = cleanup_run_resources(state, candidate, retain_candidate=False)
+    assert cleanup is not None
+    if cleanup.source_modified:
+        failure_code = "source_modified"
+        status = "batch_failed"
+    elif not cleanup.cleanup_complete:
+        failure_code = "cleanup_incomplete"
+        status = "batch_failed"
+    if status == "batch_failed" and failure_code == "none":
+        failure_code = "batch_incomplete"
+    terminal_state = (
+        LoopState.FINISH_GATE_OBSERVED
+        if status == "gate_observed_pass"
+        else LoopState.FINISH_PROPOSAL_EXPORTED
+        if status == "batch_complete"
+        else LoopState.FINISH_CONTROLLER_ERROR
+    )
+    audit.append_event(
+        terminal_state,
+        "proposal_batch_terminal",
+        {
+            "status": status,
+            "requested_samples": limits.samples,
+            "completed_samples": len(sample_results),
+            "failure_code": failure_code,
+            "cleanup_complete": cleanup.cleanup_complete,
+            "source_modified": cleanup.source_modified,
+        },
+    )
+    summary = {
+        "schema_version": 1,
+        "status": status,
+        "requested_samples": limits.samples,
+        "completed_samples": len(sample_results),
+        "failure_code": failure_code,
+        "budget": asdict(_budget_snapshot(ledger)),
+        "cleanup_complete": cleanup.cleanup_complete,
+        "source_modified": cleanup.source_modified,
+        "proposal_artifacts": [
+            {
+                "sample": value.sample,
+                "diff_sha256": value.diff_sha256,
+                "metadata_sha256": value.metadata_sha256,
+            }
+            for value in sample_results
+        ],
+        "provider_call_artifacts": [
+            {"call_index": index, "outcome": outcome, "sha256": digest}
+            for index, outcome, _path, digest in provider_call_artifacts
+        ],
+    }
+    audit.write_batch_summary(summary)
+    return ProposalBatchResult(
+        status=status,
+        exit_code={"batch_complete": 10, "gate_observed_pass": 0, "batch_failed": 22}[status],
+        run_id=audit.run_id,
+        requested_samples=limits.samples,
+        completed_samples=len(sample_results),
+        failure_code=failure_code,
+        budget=_budget_snapshot(ledger),
+        audit_path=audit.run_root,
+        samples=tuple(sample_results),
+        provider_call_artifacts=tuple(
+            (path, digest) for _index, _outcome, path, digest in provider_call_artifacts
+        ),
+        source_modified=cleanup.source_modified,
+        cleanup_complete=cleanup.cleanup_complete,
     )
 
 
@@ -5819,6 +6916,10 @@ def run_agent_loop(
             return call_role(role, dynamic, parser, expected)
         except BudgetExceededError:
             raise _LoopLimitReached("provider budget reached") from None
+        except AccountingValidationError:
+            controller_failure_code = "provider_accounting_invalid"
+            terminal_state = LoopState.FINISH_CONTROLLER_ERROR
+            return None
         except GatewayError as exc:
             if exc.status_code in {400, 401, 402, 403, 422}:
                 controller_failure_code = "provider_fatal_error"
@@ -6126,6 +7227,107 @@ def run_agent_loop(
     )
 
 
+def _watchdog_requires_pid_one() -> bool:
+    """Return whether this runtime must provide the container PID-1 supervisor invariant."""
+    return os.name != "nt"
+
+
+def run_hidden_sandbox_watchdog(
+    *,
+    python_args: tuple[str, ...],
+    timeout_seconds: int,
+    source_root: Path = Path("/workspace/src"),
+    process_runner: Callable[..., ProcessResult] = _bounded_process,
+) -> int:
+    """Run one controller-approved Python child under an in-container hard deadline."""
+    if os.environ.get("AGENT_LOOP_SANDBOX_WATCHDOG") != "1":
+        raise SandboxError("sandbox watchdog is not running in the controller-owned environment")
+    if _watchdog_requires_pid_one() and os.getpid() != 1:
+        raise SandboxError("sandbox watchdog must be the trusted container PID 1")
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 3600:
+        raise SandboxError("sandbox watchdog timeout is invalid")
+    if not isinstance(source_root, Path) or not source_root.is_absolute():
+        raise SandboxError("sandbox watchdog source root is invalid")
+    try:
+        source = source_root.resolve(strict=True)
+    except OSError as exc:
+        raise SandboxError("sandbox watchdog source root is unavailable") from exc
+    SandboxRunner._validate_python_args(source, python_args)
+    allowed_names = {
+        *AGENT_LOOP_IMAGE_ENV,
+        "AGENT_LOOP_SANDBOX_WATCHDOG",
+        "AGENT_LOOP_TEST_TMP_ROOT",
+        "ALPACA_PAPER",
+        "FMP_DAILY_REQUEST_BUDGET",
+        "PYTHONNOUSERSITE",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONHASHSEED",
+        "OPENBLAS_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "HOME",
+        "USERPROFILE",
+        "XDG_CACHE_HOME",
+        "PIP_CACHE_DIR",
+        "RUFF_CACHE_DIR",
+        "TEMP",
+        "TMP",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "GIT_TERMINAL_PROMPT",
+        "BACKTEST_DATA_CACHE_DB_PATH",
+    }
+    child_environment = {
+        key: value for key, value in os.environ.items() if key in allowed_names
+    }
+    result = process_runner(
+        (sys.executable, *python_args),
+        cwd=source,
+        env=child_environment,
+        timeout=float(timeout_seconds),
+        output_limit=1024 * 1024,
+    )
+    if not isinstance(result, ProcessResult):
+        raise SandboxError("sandbox watchdog process boundary returned invalid evidence")
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    if result.timed_out:
+        return 124
+    return result.returncode
+
+
+def _dispatch_hidden_watchdog(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agent_loop.py --_hidden-watchdog",
+        add_help=False,
+        allow_abbrev=False,
+    )
+    if (
+        len(argv) < 6
+        or argv[0] != "--_hidden-watchdog"
+        or argv[1] != "--timeout-seconds"
+        or re.fullmatch(r"[1-9][0-9]{0,3}", argv[2]) is None
+        or argv[3] != "--"
+    ):
+        parser.error("hidden watchdog arguments violate the exact grammar")
+    timeout_seconds = int(argv[2])
+    if timeout_seconds > 3600:
+        parser.error("hidden watchdog timeout exceeds the hard limit")
+    python_args = tuple(argv[4:])
+    try:
+        SandboxRunner._validate_python_args(Path("/workspace/src"), python_args)
+    except (SandboxError, OSError):
+        parser.error("hidden watchdog Python argv violates the exact grammar")
+    return run_hidden_sandbox_watchdog(
+        python_args=python_args,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def _hidden_backtest_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent_loop.py --_hidden-backtest",
@@ -6239,6 +7441,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-api-calls", type=int, default=DEFAULT_MAX_CALLS)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument(
+        "--proposal-samples",
+        type=int,
+        help="Run 1-50 independent inert proposal samples after one sealed backtest.",
+    )
+    parser.add_argument("--canary-max-usd", type=float)
+    parser.add_argument(
         "--api-timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS
     )
     parser.add_argument("--child-timeout-seconds", type=float, default=300.0)
@@ -6348,6 +7556,32 @@ def _build_cli_config(
         ),
     )
     return config, docker_executable, sandbox_image
+
+
+def _build_proposal_batch_limits(
+    namespace: argparse.Namespace,
+    config: LoopConfig,
+) -> ProposalBatchLimits | None:
+    samples = namespace.proposal_samples
+    canary = namespace.canary_max_usd
+    if samples is None and canary is None:
+        return None
+    if samples is None or canary is None:
+        raise ConfigurationError("proposal batch requires samples and a canary USD limit")
+    if namespace.apply or config.mode.apply:
+        raise ConfigurationError("proposal batch cannot apply generated patches")
+    if not isinstance(config.gate, BacktestGateConfig):
+        raise ConfigurationError("proposal batch requires the backtest gate")
+    if config.limits.max_iterations != 1:
+        raise ConfigurationError("proposal batch requires max_iterations=1")
+    return ProposalBatchLimits(
+        samples=samples,
+        max_usd=config.limits.max_usd,
+        canary_max_usd=canary,
+        max_calls=config.limits.max_api_calls,
+        max_tokens=config.limits.max_tokens,
+        wall_timeout_seconds=config.limits.wall_timeout_seconds,
+    )
 
 
 def _new_run_id() -> str:
@@ -6528,7 +7762,8 @@ def _execute_cli_run(
     docker_executable: Path,
     sandbox_image: str,
     run_id: str,
-) -> LoopResult:
+    batch_limits: ProposalBatchLimits | None = None,
+) -> LoopResult | ProposalBatchResult:
     """Assemble production-only capabilities and execute one initialized controller run."""
     if not isinstance(config, LoopConfig):
         raise ConfigurationError("CLI execution requires a validated LoopConfig")
@@ -6624,21 +7859,41 @@ def _execute_cli_run(
                 for path in paths
             )
 
-        services = LoopServices(
-            gateway=gateway,
-            run_primary_gate=primary_gate,
-            run_final_quality=lambda current, iteration: run_final_quality(
-                current,
-                sandbox,
-                audit=audit,
-                iteration=iteration,
-            ),
-            read_snapshots=snapshots,
-            compile_runner=sandbox_compile_runner(sandbox),
-            known_secrets=known_secrets,
-            editable_paths=tuple(sorted(DEFAULT_EDITABLE_PATHS)),
-        )
-        result = run_agent_loop(config, state, candidate, audit, services)
+        if batch_limits is not None:
+            if not isinstance(config.gate, BacktestGateConfig) or bundle is None:
+                raise ConfigurationError("proposal batch backtest inputs are absent")
+            result: LoopResult | ProposalBatchResult = run_proposal_batch(
+                config,
+                state,
+                candidate,
+                audit,
+                ProposalBatchServices(
+                    gateway=gateway,
+                    run_primary_gate=lambda current: _backtest_provider_evidence(
+                        current, sandbox, config.gate, bundle
+                    ),
+                    read_snapshots=snapshots,
+                    known_secrets=known_secrets,
+                    editable_paths=tuple(sorted(DEFAULT_EDITABLE_PATHS)),
+                ),
+                batch_limits,
+            )
+        else:
+            services = LoopServices(
+                gateway=gateway,
+                run_primary_gate=primary_gate,
+                run_final_quality=lambda current, iteration: run_final_quality(
+                    current,
+                    sandbox,
+                    audit=audit,
+                    iteration=iteration,
+                ),
+                read_snapshots=snapshots,
+                compile_runner=sandbox_compile_runner(sandbox),
+                known_secrets=known_secrets,
+                editable_paths=tuple(sorted(DEFAULT_EDITABLE_PATHS)),
+            )
+            result = run_agent_loop(config, state, candidate, audit, services)
         loop_returned = True
         return result
     finally:
@@ -6684,15 +7939,55 @@ def _loop_result_summary(result: LoopResult) -> dict[str, object]:
     }
 
 
+def _proposal_batch_summary(result: ProposalBatchResult) -> dict[str, object]:
+    if not isinstance(result, ProposalBatchResult):
+        raise ConfigurationError("CLI execution did not return a ProposalBatchResult")
+    return {
+        "schema_version": 1,
+        "status": result.status,
+        "exit_code": result.exit_code,
+        "run_id": result.run_id,
+        "requested_samples": result.requested_samples,
+        "completed_samples": result.completed_samples,
+        "failure_code": result.failure_code,
+        "budget": asdict(result.budget),
+        "audit_path": str(result.audit_path),
+        "proposal_artifacts": [
+            {
+                "sample": sample.sample,
+                "diff_path": str(sample.diff_path),
+                "diff_sha256": sample.diff_sha256,
+                "metadata_path": str(sample.metadata_path),
+                "metadata_sha256": sample.metadata_sha256,
+                "provider_call_artifacts": [
+                    {"path": str(path), "sha256": digest}
+                    for path, digest in sample.provider_call_paths
+                ],
+            }
+            for sample in result.samples
+        ],
+        "provider_call_artifacts": [
+            {"path": str(path), "sha256": digest}
+            for path, digest in result.provider_call_artifacts
+        ],
+        "patches_applied": 0,
+        "source_modified": result.source_modified,
+        "cleanup_complete": result.cleanup_complete,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the protected child dispatcher or one production controller invocation."""
     arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "--_hidden-watchdog":
+        return _dispatch_hidden_watchdog(arguments)
     if arguments and arguments[0] == "--_hidden-backtest":
         return _dispatch_hidden_backtest(arguments)
     parser = build_parser()
     namespace = parser.parse_args(arguments)
     try:
         config, docker_executable, sandbox_image = _build_cli_config(namespace)
+        batch_limits = _build_proposal_batch_limits(namespace, config)
     except (ConfigurationError, GateConfigurationError) as exc:
         parser.error(str(exc))
     run_id = _new_run_id()
@@ -6702,8 +7997,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             docker_executable=docker_executable,
             sandbox_image=sandbox_image,
             run_id=run_id,
+            batch_limits=batch_limits,
         )
-        summary = _loop_result_summary(result)
+        summary = (
+            _proposal_batch_summary(result)
+            if isinstance(result, ProposalBatchResult)
+            else _loop_result_summary(result)
+        )
     except Exception:
         print("agent loop initialization failed", file=sys.stderr)
         return 22

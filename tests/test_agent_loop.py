@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -61,6 +61,7 @@ class FakeResponse:
     finish_reason: str = "stop"
     cost: float | None = None
     error: object | None = None
+    model: str | None = None
 
     @property
     def choices(self) -> list[SimpleNamespace]:
@@ -722,6 +723,252 @@ def test_usage_and_completion_reject_invalid_direct_values() -> None:
         AgentCompletion(payload="route", usage=object(), finish_reason="stop", model=None)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "usage",
+    [
+        pytest.param(
+            {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3,
+             "prompt_tokens_details": {"cached_tokens": 3},
+             "completion_tokens_details": {"reasoning_tokens": 1}, "cost": 0.01},
+            id="cached-exceeds-prompt",
+        ),
+        pytest.param(
+            {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3,
+             "prompt_tokens_details": {"cached_tokens": 2},
+             "completion_tokens_details": {"reasoning_tokens": 2}, "cost": 0.01},
+            id="reasoning-exceeds-completion",
+        ),
+    ],
+)
+def test_usage_parser_rejects_cached_and_reasoning_subset_violations(
+    usage: dict[str, object],
+) -> None:
+    """Break caught: cache/reasoning subsets could exceed their authoritative parent totals."""
+    from agent_loop import AccountingValidationError, _usage_from_response
+
+    with pytest.raises(AccountingValidationError):
+        _usage_from_response({"usage": usage}, require_complete=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("prompt_tokens", "11"),
+        ("completion_tokens", 7.5),
+        ("total_tokens", -1),
+        ("cost", float("nan")),
+    ],
+)
+def test_usage_parser_rejects_present_invalid_accounting(
+    field: str,
+    invalid: object,
+) -> None:
+    """Break caught: present-invalid accounting was silently treated as absent."""
+    from agent_loop import ResponseValidationError, _usage_from_response
+
+    usage: dict[str, object] = {
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "total_tokens": 18,
+        "prompt_tokens_details": {"cached_tokens": 3},
+        "completion_tokens_details": {"reasoning_tokens": 5},
+        "cost": 0.01,
+    }
+    usage[field] = invalid
+    with pytest.raises(ResponseValidationError, match=field):
+        _usage_from_response({"usage": usage}, require_complete=True)
+
+
+def test_usage_parser_rejects_missing_or_conflicting_authoritative_cost() -> None:
+    """Break caught: a canary could continue without exact provider cost accounting."""
+    from agent_loop import ResponseValidationError, _usage_from_response
+
+    usage = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    with pytest.raises(ResponseValidationError, match="cost"):
+        _usage_from_response({"usage": usage}, require_complete=True)
+    with pytest.raises(ResponseValidationError, match="conflicting"):
+        _usage_from_response(
+            {"usage": {**usage, "cost": 0.01}, "cost": 0.02},
+            require_complete=True,
+        )
+    with pytest.raises(ResponseValidationError, match="must equal"):
+        _usage_from_response(
+            {"usage": {**usage, "total_tokens": 19, "cost": 0.01}},
+            require_complete=True,
+        )
+
+
+def test_gateway_strict_request_stops_after_first_unaccounted_call() -> None:
+    """Break caught: batch mode retried or advanced after a response omitted authoritative cost."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, ResponseValidationError, Route
+
+    client = FakeClient([FakeResponse(_route_json(), cost=None), FakeResponse(_route_json(), cost=0.01)])
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    with pytest.raises(ResponseValidationError, match="accounting"):
+        gateway.request_once("orchestrator", "evidence", Route.from_json)
+    assert len(client.completions.calls) == 1
+
+
+def test_gateway_strict_request_is_one_shot_and_caches_pricing_per_model() -> None:
+    """Break caught: fifty proposal samples could reload prices or repair malformed output."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, Route
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    client = FakeClient(
+        [
+            FakeResponse(_route_json(), cost=0.01, model=model),
+            FakeResponse(_route_json(), cost=0.01, model=model),
+        ]
+    )
+    loads: list[str] = []
+
+    def pricing(value: str) -> dict[str, float]:
+        loads.append(value)
+        return {"prompt": 1.0, "completion": 1.0}
+
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=pricing,
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+    first = gateway.request_once("orchestrator", "sample 1", Route.from_json)
+    second = gateway.request_once("orchestrator", "sample 2", Route.from_json)
+
+    assert first.model == second.model == model
+    assert loads == [model]
+    assert len(client.completions.calls) == 2
+
+
+def test_strict_protocol_failure_retains_complete_authoritative_accounting() -> None:
+    """Break caught: malformed paid output discarded exact provider tokens and cost."""
+    from agent_loop import (
+        AccountedResponseValidationError,
+        BudgetLedger,
+        OpenRouterGateway,
+        Route,
+    )
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000)
+    gateway = OpenRouterGateway(
+        client=FakeClient([FakeResponse("{not-json", cost=0.012, model=model)]),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=ledger,
+    )
+
+    with pytest.raises(AccountedResponseValidationError) as raised:
+        gateway.request_once("orchestrator", "sealed evidence", Route.from_json)
+    assert raised.value.facts.usage.cost_usd == pytest.approx(0.012)
+    assert raised.value.facts.usage.total_tokens == 18
+    assert raised.value.facts.response_schema_valid is False
+    assert ledger.calls == 1
+    assert ledger.spent_usd == pytest.approx(0.012)
+    assert ledger.total_tokens == 18
+    assert ledger.prompt_tokens == 11
+    assert ledger.completion_tokens == 7
+
+
+def test_budget_window_caps_canary_calls_and_reserved_usd() -> None:
+    """Break caught: the canary could consume rollout budget before it was accepted."""
+    from agent_loop import BudgetExceededError, BudgetLedger, BudgetWindow, Pricing, Usage
+
+    ledger = BudgetLedger(max_usd=2.0, max_calls=150, max_tokens=2_000_000)
+    window = BudgetWindow(0, 0.0, 3, 0.50)
+    pricing = Pricing(0.0, 100.0)
+    reservations = [ledger.reserve("", 1000, pricing, window=window) for _ in range(3)]
+    for reservation in reservations:
+        ledger.reconcile(reservation, Usage(cost_usd=0.1), window=window)
+    with pytest.raises(BudgetExceededError, match="window"):
+        ledger.reserve("", 1, pricing, window=window)
+
+    expensive = BudgetWindow(ledger.calls, ledger.committed_usd, 1, 0.01)
+    with pytest.raises(BudgetExceededError, match="window"):
+        ledger.reserve("", 1000, Pricing(0.0, 100.0), window=expensive)
+
+
+def test_reconcile_records_authoritative_overages_before_failing_closed() -> None:
+    """Break caught: a paid overage was raised but omitted from the durable ledger totals."""
+    from agent_loop import BudgetExceededError, BudgetLedger, BudgetWindow, Pricing, Usage
+
+    cost_ledger = BudgetLedger(max_usd=2.0, max_calls=3, max_tokens=1000)
+    window = BudgetWindow(0, 0.0, 1, 0.50)
+    cost_reservation = cost_ledger.reserve("", 10, Pricing(0.0, 10_000.0), window=window)
+    with pytest.raises(BudgetExceededError, match="window"):
+        cost_ledger.reconcile(
+            cost_reservation,
+            Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2, cost_usd=0.60),
+            window=window,
+        )
+    assert cost_ledger.spent_usd == pytest.approx(0.60)
+    assert cost_ledger.reserved_usd == pytest.approx(0.60)
+    assert cost_ledger.total_tokens == 2
+
+    token_ledger = BudgetLedger(max_usd=1.0, max_calls=1, max_tokens=100)
+    token_reservation = token_ledger.reserve("", 10, Pricing(0.0, 0.0))
+    with pytest.raises(BudgetExceededError, match="token"):
+        token_ledger.reconcile(
+            token_reservation,
+            Usage(prompt_tokens=100, completion_tokens=100, total_tokens=200, cost_usd=0.0),
+        )
+    assert token_ledger.reserved_tokens == 200
+    assert token_ledger.total_tokens == 200
+    assert token_ledger.prompt_tokens == 100
+    assert token_ledger.completion_tokens == 100
+
+
+def test_provider_call_audit_is_exact_chained_and_contains_no_content(
+    tmp_path: Path,
+) -> None:
+    """Break caught: paid-call evidence omitted accounting or retained prompts/raw model output."""
+    from agent_loop import AuditTrail, ProviderCallRecord, verify_audit_chain
+
+    secret = "provider-secret-canary"
+    raw_canary = "raw-response-canary"
+    audit = AuditTrail(
+        tmp_path.resolve(),
+        "run-20260819T010203Z-abcdef123456",
+        known_secrets=(secret,),
+    )
+    record = ProviderCallRecord(
+        schema_version=1,
+        call_index=1,
+        iteration=1,
+        role="orchestrator",
+        api_backend="openrouter",
+        requested_model="qwen/qwen-2.5-7b-instruct",
+        returned_model="qwen/qwen-2.5-7b-instruct",
+        outcome="accepted",
+        finish_reason="stop",
+        response_schema_valid=True,
+        accounting_complete=True,
+        prompt_tokens=11,
+        cached_tokens=3,
+        completion_tokens=7,
+        reasoning_tokens=5,
+        total_tokens=18,
+        cost_usd=0.01,
+    )
+
+    path, digest = audit.write_provider_call(record)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    serialized = path.read_text(encoding="utf-8") + audit.events_path.read_text(encoding="utf-8")
+
+    assert payload == asdict(record)
+    assert secret not in serialized and raw_canary not in serialized
+    event = verify_audit_chain(audit.events_path)[0]
+    assert event["details"] == {
+        "artifact_sha256": digest,
+        "call_index": 1,
+        "outcome": "accepted",
+        "role": "orchestrator",
+    }
+
+
 @pytest.mark.parametrize("max_usd", [0.0, -1.0, float("nan"), float("inf")])
 def test_budget_rejects_non_finite_or_non_positive_hard_caps(max_usd: float) -> None:
     """Break caught: NaN/Infinity budgets could bypass the controller's USD limit."""
@@ -1019,6 +1266,23 @@ def test_consistent_usage_reconciles_and_leaves_only_real_token_headroom() -> No
     assert ledger.total_tokens == 7
     assert ledger.reserved_tokens == 7
     ledger.reserve("", 3, Pricing(0.0, 0.0))
+
+
+def test_budget_snapshot_uses_authoritative_ledger_total() -> None:
+    """Break caught: summaries recomputed a lower total than the ledger actually charged."""
+    from agent_loop import BudgetLedger, Pricing, Usage, _budget_snapshot
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=2, max_tokens=20)
+    reservation = ledger.reserve("abc", 7, Pricing(0.0, 0.0))
+    ledger.reconcile(
+        reservation,
+        Usage(prompt_tokens=3, completion_tokens=None, total_tokens=9, cost_usd=0.0),
+    )
+
+    assert ledger.total_tokens == 9
+    assert ledger.prompt_tokens == 3
+    assert ledger.completion_tokens == 0
+    assert _budget_snapshot(ledger).total_tokens == 9
 
 
 def test_gateway_reserves_full_static_and_dynamic_message_bytes_before_call() -> None:
@@ -2162,6 +2426,9 @@ class FaithfulSandboxEngine:
         self.mutate_data_on_start = False
         self.start_stdout = "candidate says success\n"
         self.never_exits = False
+        self.start_delay = 0.0
+        self.inspect_delay = 0.0
+        self.killed = False
         self.name = ""
         self.owner_label = ""
         self.inspect_payload: dict[str, object] = {}
@@ -2338,6 +2605,8 @@ class FaithfulSandboxEngine:
                 raise OSError("injected create transport failure")
             return _process_result(0, output)
         if command == "inspect":
+            if self.inspect_delay:
+                time.sleep(self.inspect_delay)
             if self.removed:
                 if self.cleanup_inspect_error:
                     return _process_result(1, stderr="permission denied")
@@ -2360,6 +2629,8 @@ class FaithfulSandboxEngine:
                 self.mutate_terminal_state(payload["State"])
             return _process_result(0, json.dumps([payload]))
         if command == "start":
+            if self.start_delay:
+                time.sleep(self.start_delay)
             self.started = True
             if self.mutate_data_on_start:
                 data_mount = next(
@@ -2370,6 +2641,10 @@ class FaithfulSandboxEngine:
                 data_path.chmod(stat.S_IWRITE)
                 with data_path.open("ab") as stream:
                     stream.write(b"tampered")
+            return _process_result(0, self.container_id + "\n")
+        if command == "kill":
+            self.killed = True
+            self.never_exits = False
             return _process_result(0, self.container_id + "\n")
         if command == "logs":
             return _process_result(0, self.start_stdout)
@@ -2479,6 +2754,37 @@ def test_worker_mounts_candidate_gate_and_data_read_only_with_narrow_writable_di
         assert "readonly" not in spec
 
 
+def test_worker_uses_trusted_in_container_deadline_wrapper(tmp_path: Path) -> None:
+    """Break caught: abrupt controller death left a detached candidate running indefinitely."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    run_test_gate(candidate, _faithful_runner(image, engine, timeout_seconds=12.1))
+    create = next(call for call in engine.calls if call[1] == "create")
+    image_index = create.index(engine.image_id)
+
+    assert create[image_index + 1 :] == (
+        "/workspace/gate/agent_loop.py",
+        "--_hidden-watchdog",
+        "--timeout-seconds",
+        "13",
+        "--",
+        "-m",
+        "pytest",
+        "-p",
+        "no:cacheprovider",
+        "--no-cov",
+        "--capture=sys",
+        "-q",
+        "-m",
+        "not integration",
+    )
+    assert create.count("AGENT_LOOP_SANDBOX_WATCHDOG=1") == 1
+
+
 def test_worker_uses_detached_start_bounded_logs_and_polled_deadline(
     tmp_path: Path,
 ) -> None:
@@ -2512,6 +2818,48 @@ def test_worker_uses_detached_start_bounded_logs_and_polled_deadline(
     ]
     assert any(call[1] == "logs" for call in engine.calls)
     assert engine.removed and engine.absence_verified
+
+
+@pytest.mark.parametrize("delay_phase", ["start", "inspect"])
+def test_worker_deadline_includes_start_and_rejects_exit_observed_after_deadline(
+    tmp_path: Path,
+    delay_phase: str,
+) -> None:
+    """Break caught: a late detached exit was accepted because start/inspect time was excluded."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    if delay_phase == "start":
+        engine.start_delay = 0.08
+    else:
+        engine.inspect_delay = 0.08
+
+    result = run_test_gate(candidate, _faithful_runner(image, engine, timeout_seconds=0.05))
+
+    assert result.outcome == "timed_out"
+    assert result.returncode == -1
+    assert engine.removed and engine.absence_verified
+
+
+def test_timed_out_running_container_is_killed_before_logs_are_collected(tmp_path: Path) -> None:
+    """Break caught: a timed-out worker kept running during the controller's log collection."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    engine.never_exits = True
+
+    result = run_test_gate(candidate, _faithful_runner(image, engine, timeout_seconds=0.05))
+
+    assert result.outcome == "timed_out"
+    commands = [call[1] for call in engine.calls]
+    assert engine.killed
+    assert commands.index("kill") < commands.index("logs")
 
 
 def test_container_attestation_normalizes_only_docker_null_capability_lists(
@@ -3292,7 +3640,7 @@ def test_real_data_fetcher_opens_verified_writable_scratch_without_network(tmp_p
         lambda item: item["HostConfig"].update(PidMode="host"),
         lambda item: item["HostConfig"].update(UTSMode="host"),
         lambda item: item["HostConfig"].update(CgroupnsMode="host"),
-        lambda item: item["HostConfig"].update(Init=False),
+        lambda item: item["HostConfig"].update(Init=True),
         lambda item: item["HostConfig"].update(Init=1),
         lambda item: item["HostConfig"].update(Init="true"),
         lambda item: item["HostConfig"].pop("Init"),
@@ -4036,9 +4384,9 @@ def test_round4_container_compile_and_ruff_cache_policy_is_exact(tmp_path: Path)
     assert environment["OMP_NUM_THREADS"] == "1"
     assert environment["MKL_NUM_THREADS"] == "1"
     assert environment["NUMEXPR_NUM_THREADS"] == "1"
-    assert engine.inspect_payload["HostConfig"]["Init"] is True  # type: ignore[index]
+    assert engine.inspect_payload["HostConfig"]["Init"] is False  # type: ignore[index]
     create = next(call for call in engine.calls if call[1] == "create")
-    assert create.count("--init") == 1
+    assert create.count("--init") == 0
     assert build_ruff_gate_argv() == ("-m", "ruff", "check", "--no-cache", ".")
     cache_ready = run_in_disposable_worker(
         candidate,
@@ -4452,6 +4800,67 @@ class _StateMachineGateway:
         return AgentCompletion(outcome, Usage(), "stop", None)
 
 
+class _StrictBatchGateway:
+    def __init__(self, limits: Any, outcomes: list[object]) -> None:
+        from agent_loop import BudgetLedger
+
+        self.ledger = BudgetLedger(limits.max_usd, limits.max_calls, limits.max_tokens)
+        self.outcomes = list(outcomes)
+        self.roles: list[str] = []
+        self.pricing_preloads: list[tuple[str, ...]] = []
+
+    def preload_pricing(self, roles: tuple[str, ...]) -> None:
+        self.pricing_preloads.append(roles)
+
+    def request_once(
+        self,
+        role: str,
+        _dynamic_input: str,
+        _parser: Any,
+        *,
+        budget_window: Any = None,
+    ) -> Any:
+        from agent_loop import (
+            AccountedBudgetExceededError,
+            AgentCompletion,
+            BudgetExceededError,
+            Pricing,
+            ProviderCallFacts,
+            Usage,
+        )
+
+        reservation = self.ledger.reserve("x", 10, Pricing(0.0, 0.0), window=budget_window)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, ProviderCallFacts):
+            self.roles.append(role)
+            try:
+                self.ledger.reconcile(reservation, outcome.usage, window=budget_window)
+            except BudgetExceededError as exc:
+                raise AccountedBudgetExceededError(
+                    "provider accounting exceeded a rollout limit", outcome
+                ) from exc
+            raise AssertionError("accounted failure fixture did not exceed its limit")
+        if isinstance(outcome, BaseException):
+            self.ledger.reconcile(reservation, Usage(), window=budget_window)
+            raise outcome
+        self.roles.append(role)
+        usage = Usage(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            cached_tokens=2,
+            reasoning_tokens=3,
+            cost_usd=0.001,
+        )
+        self.ledger.reconcile(reservation, usage, window=budget_window)
+        model = {
+            "orchestrator": "qwen/qwen-2.5-7b-instruct",
+            "reasoner": "deepseek/deepseek-r1",
+            "coder": "deepseek/deepseek-chat",
+        }[role]
+        return AgentCompletion(outcome, usage, "stop", model)
+
+
 def _gate_evidence(passed: bool) -> Any:
     from agent_loop import ProviderGateEvidence
 
@@ -4501,6 +4910,342 @@ def _loop_proposal(*, path: str = "core/backtest_engine.py") -> Any:
         files=(path,),
         unified_diff=_task2_diff(path=path),
     )
+
+
+def _run_proposal_batch_fixture(
+    tmp_path: Path,
+    *,
+    samples: int,
+    outcomes: list[object],
+) -> tuple[Any, _StrictBatchGateway, Any, Any]:
+    from agent_loop import (
+        AuditTrail,
+        BacktestGateConfig,
+        BacktestThresholds,
+        ExecutionMode,
+        LoopConfig,
+        LoopLimits,
+        ModelConfig,
+        ProposalBatchLimits,
+        ProposalBatchServices,
+        ProviderGateEvidence,
+        export_candidate,
+        preflight_source,
+        read_candidate_source_snapshot,
+        run_proposal_batch,
+    )
+
+    source = _task2_repo(tmp_path)
+    external = tempfile.TemporaryDirectory(prefix="agent-loop-proposal-batch-")
+    root = Path(external.name).resolve()
+    controller = root / "controller"
+    controller.mkdir()
+    runtime = root / "runtime"
+    audit_root = root / "audit"
+    batch_limits = ProposalBatchLimits(
+        samples=samples,
+        max_usd=2.0,
+        canary_max_usd=0.5,
+        max_calls=samples * 3,
+        max_tokens=2_000_000,
+    )
+    config = LoopConfig(
+        source_root=source.resolve(),
+        permanent_runtime_root=runtime.resolve(),
+        git_executable=_trusted_git_path(),
+        controller_temp_parent=controller,
+        artifact_root=audit_root,
+        mode=ExecutionMode(apply=False),
+        gate=BacktestGateConfig(
+            tickers=("AAPL",),
+            benchmark="SPY",
+            start_date="2024-01-01",
+            end_date="2025-01-01",
+            historical_data_bundle=(root / "bundle.sqlite3").resolve(),
+            historical_data_sha256="a" * 64,
+            thresholds=BacktestThresholds(0.0, 0.0, 0.0, 100.0, 0),
+        ),
+        models=ModelConfig(),
+        limits=LoopLimits(
+            max_usd=2.0,
+            max_iterations=1,
+            max_api_calls=samples * 3,
+            max_tokens=2_000_000,
+        ),
+    )
+    state = preflight_source(source, controller_temp_parent=controller)
+    candidate = export_candidate(state)
+    gateway = _StrictBatchGateway(batch_limits, outcomes)
+    audit = AuditTrail(audit_root, "run-20260819T010203Z-abcdef123456")
+    evidence = ProviderGateEvidence(
+        gate_kind="backtest",
+        outcome="thresholds_not_met",
+        gate_observation=False,
+        observed_exit_zero=True,
+        worker_confined=True,
+        returncode=0,
+        stdout_sha256="a" * 64,
+        stderr_sha256="b" * 64,
+        failure_codes=("thresholds_not_met",),
+    )
+
+    def snapshots(current: Any, paths: tuple[str, ...]) -> tuple[Any, ...]:
+        return tuple(
+            read_candidate_source_snapshot(current, path, approved_paths=paths)
+            for path in paths
+        )
+
+    result = run_proposal_batch(
+        config,
+        state,
+        candidate,
+        audit,
+        ProposalBatchServices(
+            gateway=gateway,
+            run_primary_gate=lambda _candidate: evidence,
+            read_snapshots=snapshots,
+            editable_paths=("core/backtest_engine.py", "core/momentum_analysis.py"),
+        ),
+        batch_limits,
+    )
+    return result, gateway, candidate, external
+
+
+def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a fifty-sample rollout retried, applied, retained, or exceeded three calls/sample."""
+    from agent_loop import CodingProposal, ReasoningPlan, Route
+
+    route = Route(
+        action="reason",
+        failure_summary="The deterministic backtest thresholds were not met.",
+        relevant_files=("core/momentum_analysis.py",),
+        reasoning_focus="Repair the isolated momentum arithmetic.",
+    )
+    plan = ReasoningPlan(
+        diagnosis="The momentum constant is incorrect.",
+        root_cause="The prior value was retained.",
+        invariants=("Keep the public interface unchanged.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change the momentum constant from one to two.",),
+        skip=False,
+        skip_reason="",
+    )
+    proposal = CodingProposal(
+        summary="Correct the isolated momentum constant.",
+        files=("core/momentum_analysis.py",),
+        unified_diff=_task2_diff(
+            path="core/momentum_analysis.py",
+            old="MOMENTUM = 1",
+            new="MOMENTUM = 2",
+        ),
+    )
+    outcomes = [
+        item
+        for _sample in range(50)
+        for item in (route, plan, proposal)
+    ]
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=50,
+        outcomes=outcomes,
+    )
+    try:
+        assert result.status == "batch_complete", (result.failure_code, result.completed_samples)
+        assert result.completed_samples == 50
+        assert result.budget.api_calls == 150
+        assert result.budget.spent_usd == pytest.approx(0.15)
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"] * 50
+        assert gateway.pricing_preloads == [("orchestrator", "reasoner", "coder")]
+        assert len(result.samples) == 50
+        assert all(len(sample.provider_call_paths) == 3 for sample in result.samples)
+        assert not candidate.root.exists()
+        assert result.cleanup_complete and not result.source_modified
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_failure_stops_before_the_next_role_or_sample(tmp_path: Path) -> None:
+    """Break caught: an abort or invalid canary still allowed paid rollout calls."""
+    from agent_loop import Route
+
+    abort = Route(
+        action="abort",
+        failure_summary="The sealed evidence should not be changed.",
+        relevant_files=(),
+        reasoning_focus="Stop the batch.",
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[abort, _loop_plan(), _loop_proposal()],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "protocol_invalid"
+        assert result.completed_samples == 0
+        assert result.budget.api_calls == 1
+        assert gateway.roles == ["orchestrator"]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_records_closed_transport_failure_and_stops(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a paid provider attempt had no closed rejection event in the audit."""
+    from agent_loop import GatewayError
+
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[GatewayError("untrusted provider canary")],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "provider_failed"
+        assert result.completed_samples == 0
+        assert result.budget.api_calls == 1
+        assert result.provider_call_artifacts == ()
+        assert gateway.roles == []
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        rejected = [event for event in events if event["event"] == "provider_call_rejected"]
+        assert [event["details"] for event in rejected] == [
+            {
+                "accounting_complete": False,
+                "call_index": 1,
+                "code": "provider_failed",
+                "role": "orchestrator",
+            }
+        ]
+        assert "untrusted provider canary" not in json.dumps(events)
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_audits_the_paid_canary_overage_and_stops(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a stopping paid overage was absent from the batch audit and summary."""
+    from agent_loop import ProviderCallFacts, Usage, verify_audit_chain
+
+    facts = ProviderCallFacts(
+        call_index=1,
+        role="orchestrator",
+        requested_model="qwen/qwen-2.5-7b-instruct",
+        returned_model="qwen/qwen-2.5-7b-instruct",
+        finish_reason="stop",
+        usage=Usage(
+            prompt_tokens=11,
+            completion_tokens=7,
+            total_tokens=18,
+            cached_tokens=3,
+            reasoning_tokens=5,
+            cost_usd=0.60,
+        ),
+        response_schema_valid=True,
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[facts, _loop_plan(), _loop_proposal()],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "budget_exceeded"
+        assert result.completed_samples == 0
+        assert result.budget.api_calls == 1
+        assert result.budget.spent_usd == pytest.approx(0.60)
+        assert result.budget.total_tokens == 18
+        assert gateway.roles == ["orchestrator"]
+        assert len(result.provider_call_artifacts) == 1
+        path, digest = result.provider_call_artifacts[0]
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["outcome"] == "budget_exceeded"
+        assert record["response_schema_valid"] is True
+        assert record["cost_usd"] == pytest.approx(0.60)
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+        assert verify_audit_chain(result.audit_path / "events.jsonl")
+        summary = json.loads((result.audit_path / "batch-summary.json").read_text(encoding="utf-8"))
+        assert summary["provider_call_artifacts"] == [
+            {"call_index": 1, "outcome": "budget_exceeded", "sha256": digest}
+        ]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_audits_a_global_rollout_overage_without_next_call(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a later sample could exceed the shared cap without a terminal call record."""
+    from agent_loop import CodingProposal, ProviderCallFacts, ReasoningPlan, Route, Usage
+
+    facts = ProviderCallFacts(
+        call_index=4,
+        role="orchestrator",
+        requested_model="qwen/qwen-2.5-7b-instruct",
+        returned_model="qwen/qwen-2.5-7b-instruct",
+        finish_reason="stop",
+        usage=Usage(
+            prompt_tokens=11,
+            completion_tokens=7,
+            total_tokens=18,
+            cached_tokens=3,
+            reasoning_tokens=5,
+            cost_usd=2.0,
+        ),
+        response_schema_valid=True,
+    )
+    route = Route(
+        action="reason",
+        failure_summary="The deterministic backtest thresholds were not met.",
+        relevant_files=("core/momentum_analysis.py",),
+        reasoning_focus="Repair the isolated momentum arithmetic.",
+    )
+    plan = ReasoningPlan(
+        diagnosis="The momentum constant is incorrect.",
+        root_cause="The prior value was retained.",
+        invariants=("Keep the public interface unchanged.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change the momentum constant from one to two.",),
+        skip=False,
+        skip_reason="",
+    )
+    proposal = CodingProposal(
+        summary="Correct the isolated momentum constant.",
+        files=("core/momentum_analysis.py",),
+        unified_diff=_task2_diff(
+            path="core/momentum_analysis.py",
+            old="MOMENTUM = 1",
+            new="MOMENTUM = 2",
+        ),
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[route, plan, proposal, facts],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "budget_exceeded"
+        assert result.completed_samples == 1
+        assert result.budget.api_calls == 4
+        assert result.budget.spent_usd == pytest.approx(2.003)
+        assert gateway.roles == ["orchestrator", "reasoner", "coder", "orchestrator"]
+        assert len(result.provider_call_artifacts) == 4
+        record = json.loads(result.provider_call_artifacts[-1][0].read_text(encoding="utf-8"))
+        assert record["outcome"] == "budget_exceeded"
+        assert record["cost_usd"] == pytest.approx(2.0)
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
 
 
 def _run_state_machine_fixture(
@@ -4951,6 +5696,95 @@ def _normal_cli_argv(tmp_path: Path) -> list[str]:
     ]
 
 
+def _batch_cli_argv(tmp_path: Path, *, samples: int = 50) -> list[str]:
+    return [
+        "--repo-root", str((tmp_path / "source").resolve()),
+        "--permanent-runtime-root", str((tmp_path / "paper-runtime").resolve()),
+        "--git-executable", str((tmp_path / "bin" / "git.exe").resolve()),
+        "--controller-temp-parent", str((tmp_path / "controller").resolve()),
+        "--artifact-root", str((tmp_path / "audit").resolve()),
+        "--docker-executable", str((tmp_path / "bin" / "docker.exe").resolve()),
+        "--sandbox-image", "example.invalid/agent-loop@sha256:" + ("d" * 64),
+        "--gate", "backtest",
+        "--tickers", "AAPL",
+        "--benchmark", "SPY",
+        "--start-date", "2024-01-01",
+        "--end-date", "2025-01-01",
+        "--historical-data-bundle", str((tmp_path / "bundle.sqlite3").resolve()),
+        "--historical-data-sha256", "a" * 64,
+        "--minimum-total-return", "0",
+        "--minimum-annualized-return", "0",
+        "--minimum-sharpe-ratio", "0",
+        "--maximum-drawdown-magnitude", "100",
+        "--minimum-closed-trades", "0",
+        "--proposal-samples", str(samples),
+        "--canary-max-usd", "0.50",
+        "--max-usd", "2.00",
+        "--max-iterations", "1",
+        "--max-api-calls", str(samples * 3),
+        "--max-tokens", "2000000",
+    ]
+
+
+def test_cli_builds_only_the_exact_non_applying_canary_first_batch(tmp_path: Path) -> None:
+    """Break caught: CLI batch mode could apply patches or drift from 3 calls/sample and $2."""
+    import agent_loop
+
+    namespace = agent_loop.build_parser().parse_args(_batch_cli_argv(tmp_path))
+    config, _docker, _image = agent_loop._build_cli_config(namespace)
+    limits = agent_loop._build_proposal_batch_limits(namespace, config)
+
+    assert limits == agent_loop.ProposalBatchLimits(50, 2.0, 0.5, 150, 2_000_000)
+    assert config.mode.apply is False
+    assert config.limits.max_iterations == 1
+
+    namespace.apply = True
+    with pytest.raises(agent_loop.ConfigurationError, match="apply"):
+        agent_loop._build_proposal_batch_limits(namespace, config)
+
+
+def test_cli_routes_batch_to_dedicated_runner_and_prints_closed_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: batch options silently invoked the retrying/applying legacy loop."""
+    import agent_loop
+
+    captured: dict[str, object] = {}
+
+    def execute(config: object, **kwargs: object) -> object:
+        captured["config"] = config
+        captured.update(kwargs)
+        limits = kwargs["batch_limits"]
+        return agent_loop.ProposalBatchResult(
+            status="batch_failed",
+            exit_code=22,
+            run_id=str(kwargs["run_id"]),
+            requested_samples=limits.samples,
+            completed_samples=0,
+            failure_code="provider_failed",
+            budget=agent_loop.BudgetSnapshot(1, 10, 5, 15, 15, 0.01, 0.01),
+            audit_path=(tmp_path / "audit" / str(kwargs["run_id"])).resolve(),
+            samples=(),
+            provider_call_artifacts=(),
+            source_modified=False,
+            cleanup_complete=True,
+        )
+
+    monkeypatch.setattr(agent_loop, "_execute_cli_run", execute)
+    assert agent_loop.main(_batch_cli_argv(tmp_path, samples=1)) == 22
+    line = capsys.readouterr().out.strip()
+    summary = json.loads(line.split("=", 1)[1])
+
+    assert captured["batch_limits"] == agent_loop.ProposalBatchLimits(
+        1, 2.0, 0.5, 3, 2_000_000
+    )
+    assert summary["status"] == "batch_failed"
+    assert summary["failure_code"] == "provider_failed"
+    assert summary["patches_applied"] == 0
+
+
 def _cli_loop_result(
     tmp_path: Path,
     run_id: str,
@@ -5155,6 +5989,99 @@ def test_hidden_backtest_dispatch_accepts_only_the_protected_exact_grammar(
         agent_loop.main(reordered)
     assert raised.value.code == 2
     assert len(calls) == 1
+
+
+def test_hidden_watchdog_dispatch_is_exact_and_controller_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: the trusted in-container deadline wrapper accepted arbitrary public grammar."""
+    import agent_loop
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        agent_loop,
+        "run_hidden_sandbox_watchdog",
+        lambda **kwargs: calls.append(kwargs) or 124,
+    )
+    exact = [
+        "--_hidden-watchdog",
+        "--timeout-seconds",
+        "300",
+        "--",
+        "-m",
+        "compileall",
+        "-q",
+        ".",
+    ]
+
+    assert agent_loop.main(exact) == 124
+    assert capsys.readouterr().out == ""
+    assert calls == [{"python_args": ("-m", "compileall", "-q", "."), "timeout_seconds": 300}]
+    for malformed in (
+        [*exact[:2], "0300", *exact[3:]],
+        [exact[0], "--", *exact[4:]],
+        [*exact[:3], "-m", "compileall", "-q", "."],
+    ):
+        with pytest.raises(SystemExit) as raised:
+            agent_loop.main(malformed)
+        assert raised.value.code == 2
+
+
+def test_hidden_watchdog_returns_static_timeout_and_bounded_child_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: watchdog failure leaked exceptions or failed to bound/terminate its child."""
+    import agent_loop
+
+    monkeypatch.setenv("AGENT_LOOP_SANDBOX_WATCHDOG", "1")
+    monkeypatch.setattr(agent_loop, "_watchdog_requires_pid_one", lambda: False)
+    (tmp_path / "placeholder.py").write_text("VALUE = 1\n", encoding="utf-8")
+    observed: list[dict[str, object]] = []
+
+    def runner(argv: tuple[str, ...], **kwargs: object) -> object:
+        observed.append({"argv": argv, **kwargs})
+        return _process_result(124, "partial-out", "partial-err", timed_out=True)
+
+    result = agent_loop.run_hidden_sandbox_watchdog(
+        python_args=("-m", "compileall", "-q", "."),
+        timeout_seconds=3,
+        source_root=tmp_path.resolve(),
+        process_runner=runner,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 124
+    assert captured.out == "partial-out"
+    assert captured.err == "partial-err"
+    assert observed[0]["argv"] == (sys.executable, "-m", "compileall", "-q", ".")
+    assert observed[0]["timeout"] == 3
+
+
+def test_hidden_watchdog_requires_the_trusted_wrapper_to_be_pid_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a same-UID candidate could suspend a non-PID-1 watchdog forever."""
+    import agent_loop
+    from agent_loop import SandboxError
+
+    monkeypatch.setenv("AGENT_LOOP_SANDBOX_WATCHDOG", "1")
+    monkeypatch.setattr(agent_loop, "_watchdog_requires_pid_one", lambda: True)
+    monkeypatch.setattr(agent_loop.os, "getpid", lambda: 2)
+    (tmp_path / "placeholder.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    with pytest.raises(SandboxError, match="PID 1"):
+        agent_loop.run_hidden_sandbox_watchdog(
+            python_args=("-m", "compileall", "-q", "."),
+            timeout_seconds=3,
+            source_root=tmp_path.resolve(),
+            process_runner=lambda *_args, **_kwargs: pytest.fail(
+                "untrusted child started before PID-1 proof"
+            ),
+        )
 
 
 def test_production_cli_assembly_passes_explicit_git_and_docker_capabilities(
