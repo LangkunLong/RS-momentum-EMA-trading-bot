@@ -1106,7 +1106,8 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     assert "omit the annotation" in coder_prompt
     assert "first hunk body line" in coder_prompt
     assert "cumulative prior hunk line-count delta" in coder_prompt
-    assert "zero-context hunk" in coder_prompt
+    assert "Every hunk must be zero-context" in coder_prompt
+    assert "Context lines beginning with a space are forbidden" in coder_prompt
     assert "final diff line must end with one LF" in coder_prompt
     assert "change the guard predicate" in coder_prompt
 
