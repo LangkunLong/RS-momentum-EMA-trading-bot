@@ -1415,6 +1415,11 @@ class OpenRouterGateway:
             window=budget_window,
         )
         try:
+            extra_body: dict[str, object] = {
+                "provider": {"require_parameters": True},
+            }
+            if require_complete_accounting:
+                extra_body["plugins"] = [{"id": "response-healing"}]
             response = self._get_client().chat.completions.create(
                 model=model,
                 messages=messages,
@@ -1423,7 +1428,7 @@ class OpenRouterGateway:
                 max_tokens=self._TOKEN_CAPS[role],
                 timeout=self.timeout_seconds,
                 extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
-                extra_body={"provider": {"require_parameters": True}},
+                extra_body=extra_body,
             )
         except Exception:
             self.ledger.reconcile(reservation, Usage(), window=budget_window)

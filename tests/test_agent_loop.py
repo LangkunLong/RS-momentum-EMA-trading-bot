@@ -1127,6 +1127,27 @@ def test_gateway_strict_request_is_one_shot_and_caches_pricing_per_model() -> No
     assert len(client.completions.calls) == 2
 
 
+def test_strict_gateway_enables_single_call_json_response_healing() -> None:
+    """Batch roles use OpenRouter's same-call JSON repair without adding a retry call."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, Route
+
+    model = "qwen/qwen-2.5-7b-instruct"
+    client = FakeClient([FakeResponse(_route_json(), cost=0.01, model=model)])
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    gateway.request_once("orchestrator", "evidence", Route.from_json)
+
+    assert len(client.completions.calls) == 1
+    assert client.completions.calls[0]["extra_body"] == {
+        "plugins": [{"id": "response-healing"}],
+        "provider": {"require_parameters": True},
+    }
+
+
 def test_strict_protocol_failure_retains_complete_authoritative_accounting() -> None:
     """Break caught: malformed paid output discarded exact provider tokens and cost."""
     from agent_loop import (
