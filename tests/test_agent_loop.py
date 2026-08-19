@@ -1333,6 +1333,10 @@ def test_child_environment_is_allowlisted_scrubbed_and_parent_is_unchanged(tmp_p
         "PATH": "safe-path",
         "SYSTEMROOT": "safe-root",
         "AGENT_LOOP_TEST_TMP_ROOT": "candidate-selected-path",
+        "OPENBLAS_NUM_THREADS": "64",
+        "OMP_NUM_THREADS": "64",
+        "MKL_NUM_THREADS": "64",
+        "NUMEXPR_NUM_THREADS": "64",
         "OPENROUTER_API_KEY": "router-secret",
         "ALPACA_API_KEY": "broker-secret",
         "FMP_API_KEY": "data-secret",
@@ -1357,6 +1361,20 @@ def test_child_environment_is_allowlisted_scrubbed_and_parent_is_unchanged(tmp_p
     assert child["AGENT_LOOP_TEST_TMP_ROOT"] == str(
         (tmp_path / "child-home" / "tmp" / "pytest").resolve()
     )
+    assert {
+        key: child[key]
+        for key in (
+            "OPENBLAS_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        )
+    } == {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
 
 
 def test_tmp_path_fixture_uses_controller_owned_absolute_override(
@@ -2191,6 +2209,7 @@ class FaithfulSandboxEngine:
                     "CgroupParent": "",
                     "PortBindings": {},
                     "PublishAllPorts": False,
+                    "Init": argv.count("--init") == 1,
                 },
                 "Mounts": mounts,
                 "NetworkSettings": {
@@ -3114,6 +3133,12 @@ def test_real_data_fetcher_opens_verified_writable_scratch_without_network(tmp_p
         lambda item: item["HostConfig"].update(PidMode="host"),
         lambda item: item["HostConfig"].update(UTSMode="host"),
         lambda item: item["HostConfig"].update(CgroupnsMode="host"),
+        lambda item: item["HostConfig"].update(Init=False),
+        lambda item: item["HostConfig"].update(Init=1),
+        lambda item: item["HostConfig"].update(Init="true"),
+        lambda item: item["HostConfig"].pop("Init"),
+        lambda item: item["HostConfig"].update(ReadonlyRootfs=1),
+        lambda item: item["HostConfig"].update(PidsLimit=64.0),
         lambda item: item["HostConfig"].update(PortBindings={"80/tcp": [{"HostPort": "8080"}]}),
         lambda item: item.update(NetworkSettings={"Ports": {"80/tcp": [{"HostPort": "8080"}]}}),
     ],
@@ -3767,9 +3792,7 @@ def test_round3_worktree_promisor_config_is_rejected_before_object_reads(tmp_pat
 
 def test_round4_compile_cache_routes_to_writable_output_with_read_only_source(tmp_path: Path) -> None:
     """Break caught: py_compile/compileall try to create __pycache__ below the read-only source bind."""
-    del tmp_path
-    test_parent = Path(__file__).parents[1]
-    root = test_parent / f".alc-{time.time_ns()}"
+    root = tmp_path / f".alc-{time.time_ns()}"
     root.mkdir(mode=0o777)
     try:
         source = root / "src"
@@ -3781,6 +3804,7 @@ def test_round4_compile_cache_routes_to_writable_output_with_read_only_source(tm
         module.chmod(0o444)
         source.chmod(0o555)
         environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONPYCACHEPREFIX"] = (
             "\\\\?\\" + str(output) if os.name == "nt" else str(output)
         )
@@ -3815,12 +3839,14 @@ def test_round4_compile_cache_routes_to_writable_output_with_read_only_source(tm
                 compiled.stdout + compiled.stderr + compileall.stdout + compileall.stderr
             )
             assert not (source / "__pycache__").exists()
-            assert any(output.rglob("module.*.pyc"))
+            assert cache_path.is_file()
         finally:
             source.chmod(0o755)
             module.chmod(0o644)
     finally:
-        shutil.rmtree(root)
+        # Windows may keep the extended-prefix bytecode tree transiently busy;
+        # the owning tmp_path fixture removes its exact private parent afterward.
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_round4_container_compile_and_ruff_cache_policy_is_exact(tmp_path: Path) -> None:
@@ -3844,6 +3870,13 @@ def test_round4_container_compile_and_ruff_cache_policy_is_exact(tmp_path: Path)
     assert environment["PYTHONPYCACHEPREFIX"] == "/workspace/output/pycache"
     assert environment["RUFF_CACHE_DIR"] == "/workspace/output/ruff-cache"
     assert environment["AGENT_LOOP_TEST_TMP_ROOT"] == "/workspace/tmp/pytest"
+    assert environment["OPENBLAS_NUM_THREADS"] == "1"
+    assert environment["OMP_NUM_THREADS"] == "1"
+    assert environment["MKL_NUM_THREADS"] == "1"
+    assert environment["NUMEXPR_NUM_THREADS"] == "1"
+    assert engine.inspect_payload["HostConfig"]["Init"] is True  # type: ignore[index]
+    create = next(call for call in engine.calls if call[1] == "create")
+    assert create.count("--init") == 1
     assert build_ruff_gate_argv() == ("-m", "ruff", "check", "--no-cache", ".")
     cache_ready = run_in_disposable_worker(
         candidate,

@@ -1616,6 +1616,10 @@ def build_child_environment(parent: Mapping[str, str], home: Path) -> dict[str, 
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
             "AGENT_LOOP_TEST_TMP_ROOT": str((worker_home / "tmp" / "pytest").resolve()),
             "HOME": str(worker_home),
             "USERPROFILE": str(worker_home),
@@ -2532,9 +2536,12 @@ class SandboxRunner:
             "CgroupParent": "",
             "PortBindings": {},
             "PublishAllPorts": False,
+            "Init": True,
         }
         if any(
-            key not in normalized_host or normalized_host[key] != wanted
+            key not in normalized_host
+            or type(normalized_host[key]) is not type(wanted)
+            or normalized_host[key] != wanted
             for key, wanted in expected_host.items()
         ):
             raise SandboxError("created container lacks required isolation")
@@ -2836,6 +2843,7 @@ class SandboxRunner:
             "--cgroupns",
             "private",
             "--read-only",
+            "--init",
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -2866,6 +2874,10 @@ class SandboxRunner:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPYCACHEPREFIX": "/workspace/output/pycache",
             "PYTHONHASHSEED": "0",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
             "HOME": "/workspace/home",
             "USERPROFILE": "/workspace/home",
             "XDG_CACHE_HOME": "/workspace/home/.cache",
