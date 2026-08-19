@@ -397,9 +397,16 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _parse_json_object(raw: str, allowed: set[str]) -> dict[str, Any]:
+def _parse_json_object(
+    raw: str,
+    allowed: set[str],
+    *,
+    max_bytes: int | None = None,
+) -> dict[str, Any]:
     if not isinstance(raw, str):
         raise PayloadJsonValidationError("JSON response must be a string")
+    if max_bytes is not None and len(raw.encode("utf-8")) > max_bytes:
+        raise PayloadJsonValidationError("JSON response exceeds the byte limit")
     try:
         value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
@@ -574,9 +581,166 @@ class ReasoningPlan:
         )
 
 
+def _source_line(value: Any, field: str, *, allow_trailing_whitespace: bool) -> str:
+    if not isinstance(value, str):
+        raise PayloadFieldValidationError(f"{field} must be a string")
+    if any(character in value for character in "\r\n\x00"):
+        raise PayloadFieldValidationError(f"{field} must be one logical source line")
+    if any(
+        character != "\t" and unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+        for character in value
+    ):
+        raise PayloadFieldValidationError(f"{field} contains a control character")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise PayloadFieldValidationError(f"{field} is not UTF-8 text") from exc
+    if len(encoded) > _MAX_TEXT_BYTES:
+        raise PayloadFieldValidationError(f"{field} is too long")
+    if not allow_trailing_whitespace and value.endswith((" ", "\t")):
+        raise PayloadFieldValidationError(f"{field} must not add trailing whitespace")
+    return value
+
+
+@dataclass(frozen=True)
+class ExactLineReplacement:
+    """One provider-authored replacement anchored to original candidate line numbers."""
+
+    path: str
+    start_line: int
+    old_lines: tuple[str, ...]
+    new_lines: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        path = _relative_path(self.path, "replacement path")
+        if type(self.start_line) is not int or not 1 <= self.start_line <= 1_000_000:
+            raise PayloadFieldValidationError("replacement start_line must be a positive integer")
+        if (
+            not isinstance(self.old_lines, tuple)
+            or not isinstance(self.new_lines, tuple)
+            or not self.old_lines
+            or not self.new_lines
+            or len(self.old_lines) > 400
+            or len(self.new_lines) > 400
+        ):
+            raise PayloadFieldValidationError("replacement line arrays must be nonempty bounded tuples")
+        old_lines = tuple(
+            _source_line(value, "replacement old_lines", allow_trailing_whitespace=True)
+            for value in self.old_lines
+        )
+        new_lines = tuple(
+            _source_line(value, "replacement new_lines", allow_trailing_whitespace=False)
+            for value in self.new_lines
+        )
+        if old_lines == new_lines:
+            raise PayloadFieldValidationError("replacement must change source text")
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "old_lines", old_lines)
+        object.__setattr__(self, "new_lines", new_lines)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ExactLineReplacement:
+        if not isinstance(value, Mapping):
+            raise PayloadFieldValidationError("replacement must be a JSON object")
+        allowed = {"path", "start_line", "old_lines", "new_lines"}
+        if set(value) != allowed:
+            raise PayloadKeysValidationError("replacement keys must exactly match the protocol")
+        old_lines = value["old_lines"]
+        new_lines = value["new_lines"]
+        if not isinstance(old_lines, list) or not isinstance(new_lines, list):
+            raise PayloadFieldValidationError("replacement lines must be JSON arrays")
+        return cls(
+            path=_relative_path(value["path"], "replacement path"),
+            start_line=value["start_line"],
+            old_lines=tuple(old_lines),
+            new_lines=tuple(new_lines),
+        )
+
+
+@dataclass(frozen=True)
+class TypedCodingProposal:
+    """Provider-facing coder protocol without model-controlled diff grammar."""
+
+    summary: str
+    replacements: tuple[ExactLineReplacement, ...]
+
+    def __post_init__(self) -> None:
+        _required_text(self.summary, "summary")
+        if (
+            not isinstance(self.replacements, tuple)
+            or not 1 <= len(self.replacements) <= 25
+            or any(not isinstance(value, ExactLineReplacement) for value in self.replacements)
+        ):
+            raise PayloadFieldValidationError("replacements must be a nonempty bounded tuple")
+        paths = {value.path for value in self.replacements}
+        folded = {value.casefold() for value in paths}
+        if len(paths) > 4 or len(folded) != len(paths):
+            raise PayloadFieldValidationError("replacement paths exceed or collide within scope")
+        changed_lines = sum(
+            len(value.old_lines) + len(value.new_lines) for value in self.replacements
+        )
+        if changed_lines > 400:
+            raise PayloadFieldValidationError("replacements exceed the changed-line limit")
+        by_path: dict[str, list[ExactLineReplacement]] = {}
+        for value in self.replacements:
+            by_path.setdefault(value.path, []).append(value)
+        for values in by_path.values():
+            ordered = sorted(values, key=lambda item: item.start_line)
+            if values != ordered:
+                raise PayloadFieldValidationError("replacements must be ordered by path and start_line")
+            previous_end = 0
+            for value in ordered:
+                if value.start_line <= previous_end:
+                    raise PayloadFieldValidationError("replacement source ranges overlap")
+                if previous_end and value.start_line == previous_end + 1:
+                    raise PayloadFieldValidationError(
+                        "adjacent replacement ranges must be merged"
+                    )
+                previous_end = value.start_line + len(value.old_lines) - 1
+        if tuple(self.replacements) != tuple(
+            sorted(self.replacements, key=lambda item: (item.path, item.start_line))
+        ):
+            raise PayloadFieldValidationError("replacements must be canonically ordered")
+        canonical_payload = json.dumps(
+            {
+                "summary": self.summary,
+                "replacements": [asdict(value) for value in self.replacements],
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(canonical_payload) > _MAX_DIFF_BYTES:
+            raise PayloadFieldValidationError(
+                "typed proposal exceeds the aggregate byte limit"
+            )
+
+    @property
+    def files(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(value.path for value in self.replacements))
+
+    @classmethod
+    def from_json(cls, raw: str) -> TypedCodingProposal:
+        value = _parse_json_object(
+            raw,
+            {"summary", "replacements"},
+            max_bytes=_MAX_DIFF_BYTES,
+        )
+        replacements = value["replacements"]
+        if not isinstance(replacements, list):
+            raise PayloadFieldValidationError("replacements must be a JSON array")
+        return cls(
+            summary=_required_text(value["summary"], "summary"),
+            replacements=tuple(
+                ExactLineReplacement.from_mapping(item) for item in replacements
+            ),
+        )
+
+
 @dataclass(frozen=True)
 class CodingProposal:
-    """Validated patch proposal from the Coder role before diff-policy inspection."""
+    """Controller-rendered patch proposal before diff-policy inspection."""
 
     summary: str
     files: tuple[str, ...]
@@ -587,17 +751,6 @@ class CodingProposal:
         _required_text(self.summary, "summary")
         _path_tuple(self.files, "files")
         _required_text(self.unified_diff, "unified_diff", max_bytes=_MAX_DIFF_BYTES)
-
-    @classmethod
-    def from_json(cls, raw: str) -> CodingProposal:
-        """Parse a strict coding proposal object from a model response."""
-        value = _parse_json_object(raw, {"summary", "files", "unified_diff"})
-        return cls(
-            summary=_required_text(value["summary"], "summary"),
-            files=_path_list(value["files"], "files"),
-            unified_diff=_required_text(value["unified_diff"], "unified_diff", max_bytes=_MAX_DIFF_BYTES),
-        )
-
 
 @dataclass(frozen=True)
 class Usage:
@@ -1456,27 +1609,20 @@ class OpenRouterGateway:
             ),
             "coder": (
                 "You are the Coder. Return exactly one JSON object with exactly these keys: "
-                '"summary", "files", "unified_diff". Set files to the exact JSON array of paths changed '
-                "by unified_diff, limited to the approved plan and source snapshots. unified_diff must be "
-                "a complete git-style unified diff. For every changed file, include "
-                '"diff --git a/<path> b/<path>", "index 1111111..2222222 100644", '
-                '"--- a/<path>", and "+++ b/<path>" in that order before the @@ hunk. '
-                "Use that exact index line for every file. Express every replacement with "
-                "paired '-old' and '+new' lines; never leave the old line as context and append "
-                "a duplicate. Use the sealed gate evidence to verify the plan's numeric premise. "
-                "Each sanitized_text line begins with an exact numbered source annotation 'N: '. "
-                "Use N as the unified-diff hunk's old starting line, omit the annotation from the "
-                "diff body, and make the old header start match the first hunk body line. The new "
-                "start is the corresponding post-change line: for later hunks, adjust N by the "
-                "cumulative prior hunk line-count delta instead of blindly copying N. "
-                "Every hunk must be zero-context and contain only exact deleted '-' and added '+' "
-                "lines. Context lines beginning with a space are forbidden. For a one-line "
-                "replacement at annotated line N use exactly '@@ -N,1 +N,1 @@'. When the "
-                "plan changes a threshold or guard, change the guard predicate or expression and "
-                "preserve its branch body, return type, and downstream flow unless explicitly told "
-                "otherwise. The unified_diff final diff line must end with one LF newline. "
-                "The hunk header counts must exactly match the hunk body. Do not use Markdown "
-                "fences, issue commands, add keys, or include prose."
+                '"summary", "replacements". replacements must be a nonempty JSON array of objects '
+                "with exactly these keys: path, start_line, old_lines, and new_lines. path must be an "
+                "approved plan and source-snapshot path. Each sanitized_text line begins with an exact "
+                "numbered source annotation 'N: '; start_line must be the positive integer N from the "
+                "first exact annotated source line; old_lines and new_lines must be nonempty JSON "
+                "arrays of source-line strings without newline characters; omit the annotation prefix. "
+                "old_lines must exactly match consecutive visible source lines including indentation. "
+                "Order replacements by path and original start_line, with no duplicate, overlapping, or "
+                "adjacent source ranges; merge adjacent changes into one replacement. Use the sealed gate "
+                "evidence to verify the plan's numeric premise. When "
+                "the plan changes a threshold or guard, change the guard predicate or expression and preserve "
+                "its branch body, return type, and downstream flow unless explicitly told otherwise. "
+                "Do not return unified diff text, diff headers, @@ hunks, +/- prefixes, Markdown fences, "
+                "commands, extra keys, or prose outside the JSON object."
             ),
         }
     )
@@ -5959,6 +6105,105 @@ def _coder_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, object]:
     return payload
 
 
+def render_typed_coding_proposal(
+    candidate: Candidate,
+    proposal: TypedCodingProposal,
+    snapshots: tuple[SourceSnapshot, ...],
+) -> CodingProposal:
+    """Render validated provider edits into the sole canonical zero-context diff dialect."""
+    root = _require_candidate(candidate)
+    if not isinstance(proposal, TypedCodingProposal):
+        raise ConfigurationError("typed coder proposal is invalid")
+    if (
+        not isinstance(snapshots, tuple)
+        or not 1 <= len(snapshots) <= _MAX_FILES
+        or any(not isinstance(value, SourceSnapshot) for value in snapshots)
+    ):
+        raise ConfigurationError("typed coder snapshots are invalid")
+    snapshot_by_path = {value.path: value for value in snapshots}
+    if len(snapshot_by_path) != len(snapshots) or set(proposal.files) - set(snapshot_by_path):
+        raise PatchPolicyError("typed replacement path is outside the visible source snapshots")
+    grouped: dict[str, list[ExactLineReplacement]] = {}
+    for replacement in proposal.replacements:
+        grouped.setdefault(replacement.path, []).append(replacement)
+    sections: list[str] = []
+    for path in proposal.files:
+        snapshot = snapshot_by_path[path]
+        view = _coder_snapshot_payload(snapshot)
+        effective_end = view["selected_end_line"]
+        if type(effective_end) is not int:
+            raise ConfigurationError("coder snapshot view is invalid")
+        visible_count = effective_end - snapshot.selected_start_line + 1
+        visible_lines = tuple(snapshot.sanitized_text.splitlines()[:visible_count])
+        if len(visible_lines) != visible_count:
+            raise ConfigurationError("coder snapshot view does not contain complete source lines")
+        target = root / path
+        try:
+            info = target.lstat()
+            raw = target.read_bytes()
+        except OSError as exc:
+            raise PatchPolicyError("typed replacement target cannot be read") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or _has_reparse_point(target)
+            or info.st_nlink != 1
+            or len(raw) != info.st_size
+            or hashlib.sha256(raw).hexdigest() != snapshot.sha256
+        ):
+            raise PatchPolicyError("typed replacement target changed after its source snapshot")
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise PatchPolicyError("typed replacement target is not UTF-8") from exc
+        if "\r" in decoded or "\x00" in decoded or not decoded.endswith("\n"):
+            raise PatchPolicyError("typed replacement target must be canonical LF text ending in LF")
+        source_lines = decoded[:-1].split("\n")
+        expected_lines = list(source_lines)
+        cumulative_delta = 0
+        section = [
+            f"diff --git a/{path} b/{path}\n",
+            "index 1111111..2222222 100644\n",
+            f"--- a/{path}\n",
+            f"+++ b/{path}\n",
+        ]
+        replacements = grouped[path]
+        for replacement in replacements:
+            old_count = len(replacement.old_lines)
+            new_count = len(replacement.new_lines)
+            old_start = replacement.start_line
+            old_end = old_start + old_count - 1
+            if (
+                old_start < snapshot.selected_start_line
+                or old_end > effective_end
+                or old_end > len(source_lines)
+            ):
+                raise PatchPolicyError("typed replacement range is outside the exact visible source")
+            source_slice = tuple(source_lines[old_start - 1 : old_end])
+            view_offset = old_start - snapshot.selected_start_line
+            visible_slice = visible_lines[view_offset : view_offset + old_count]
+            if source_slice != replacement.old_lines or visible_slice != replacement.old_lines:
+                raise PatchPolicyError("typed replacement old lines do not match exact visible source")
+            new_start = old_start + cumulative_delta
+            section.append(f"@@ -{old_start},{old_count} +{new_start},{new_count} @@\n")
+            section.extend(f"-{line}\n" for line in replacement.old_lines)
+            section.extend(f"+{line}\n" for line in replacement.new_lines)
+            cumulative_delta += new_count - old_count
+        for replacement in reversed(replacements):
+            start = replacement.start_line - 1
+            expected_lines[start : start + len(replacement.old_lines)] = replacement.new_lines
+        if expected_lines == source_lines:
+            raise PatchPolicyError("typed replacements do not change candidate source")
+        sections.extend(section)
+    rendered = CodingProposal(
+        summary=proposal.summary,
+        files=proposal.files,
+        unified_diff="".join(sections),
+    )
+    _parse_unified_diff(rendered.unified_diff)
+    return rendered
+
+
 @dataclass(frozen=True)
 class QualityObservation:
     """Provider-safe final-quality facts without process output or candidate-authored text."""
@@ -6848,12 +7093,12 @@ class AuditTrail:
     def write_validated_payload(
         self,
         name: str,
-        payload: Route | ReasoningPlan | CodingProposal,
+        payload: Route | ReasoningPlan | TypedCodingProposal,
     ) -> Path:
         roles: tuple[tuple[type[object], str], ...] = (
             (Route, "orchestrator"),
             (ReasoningPlan, "reasoner"),
-            (CodingProposal, "coder"),
+            (TypedCodingProposal, "coder"),
         )
         role = next((value for expected, value in roles if isinstance(payload, expected)), None)
         if role is None:
@@ -7505,6 +7750,8 @@ def export_inert_proposal(
     editable_paths: Sequence[str] = (),
     artifact_name: str = "candidate",
     provider_evidence_sha256: str | None = None,
+    proposal_payload_sha256: str | None = None,
+    renderer_contract: str | None = None,
 ) -> HandoffArtifact:
     """Export one validated model proposal as inert bytes without mutating quarantine."""
     if not isinstance(proposal, CodingProposal) or not isinstance(audit, AuditTrail):
@@ -7513,6 +7760,16 @@ def export_inert_proposal(
         provider_evidence_sha256
     ) is None:
         raise ConfigurationError("proposal evidence digest must be lowercase SHA-256")
+    if proposal_payload_sha256 is not None and _SHA256_RE.fullmatch(
+        proposal_payload_sha256
+    ) is None:
+        raise ConfigurationError("proposal payload digest must be lowercase SHA-256")
+    if (proposal_payload_sha256 is None) != (renderer_contract is None):
+        raise ConfigurationError("controller-rendered proposal provenance is incomplete")
+    if renderer_contract not in {None, "coding_exact_replacements_v1"}:
+        raise ConfigurationError("proposal renderer contract is invalid")
+    if provider_evidence_sha256 is not None and proposal_payload_sha256 is None:
+        raise ConfigurationError("evidence-bound proposal requires typed payload provenance")
     root = _require_candidate(candidate)
     before = _candidate_tracked_manifest_sha256(candidate)
     parsed = validate_unified_diff(
@@ -7539,16 +7796,28 @@ def export_inert_proposal(
         name=artifact_name,
     )
     metadata: dict[str, object] = {
-            "schema_version": 1,
-            "kind": "inert_model_proposal",
-            "base_head": candidate.source_head,
-            "candidate_manifest_sha256": after,
-            "diff_sha256": diff_sha256,
-            "diff_byte_count": len(proposal.unified_diff.encode("utf-8")),
-            "files": parsed.files,
-            "gate": gate,
-            "security_attestation": False,
-        }
+        "schema_version": 2 if renderer_contract is not None else 1,
+        "kind": (
+            "inert_controller_rendered_proposal"
+            if renderer_contract is not None
+            else "inert_model_proposal"
+        ),
+        "base_head": candidate.source_head,
+        "candidate_manifest_sha256": after,
+        "diff_sha256": diff_sha256,
+        "diff_byte_count": len(proposal.unified_diff.encode("utf-8")),
+        "files": parsed.files,
+        "gate": gate,
+        "security_attestation": False,
+    }
+    if proposal_payload_sha256 is not None:
+        metadata.update(
+            {
+                "proposal_payload_sha256": proposal_payload_sha256,
+                "renderer_contract": renderer_contract,
+                "verification_status": "not_applied",
+            }
+        )
     if provider_evidence_sha256 is not None:
         metadata.update(
             {
@@ -7672,7 +7941,7 @@ def run_proposal_batch(
         parser: Callable[[str], Any],
         expected_type: type[object],
         window: BudgetWindow,
-    ) -> tuple[object, tuple[Path, str]]:
+    ) -> tuple[object, tuple[Path, str], str]:
         nonlocal accounting_failure
         check_wall()
         if ordinal != {"orchestrator": 1, "reasoner": 2, "coder": 3}.get(role):
@@ -7900,7 +8169,7 @@ def run_proposal_batch(
             (record.call_index, record.outcome, call_artifact[0], call_artifact[1])
         )
         check_wall()
-        return completion.payload, call_artifact
+        return completion.payload, call_artifact, payload_sha256
 
     cleanup: CleanupObservation | None = None
     try:
@@ -7945,7 +8214,7 @@ def run_proposal_batch(
                     max_increment_usd=limits.canary_max_usd if sample == 1 else None,
                 )
                 calls: list[tuple[Path, str]] = []
-                route, artifact = call_role(
+                route, artifact, _route_payload_sha256 = call_role(
                     sample,
                     1,
                     "orchestrator",
@@ -7963,7 +8232,7 @@ def run_proposal_batch(
                 if route.action != "reason":
                     raise ProtocolValidationError("proposal batch orchestrator aborted")
                 snapshots = load_snapshots(services.editable_paths)
-                plan, artifact = call_role(
+                plan, artifact, _plan_payload_sha256 = call_role(
                     sample,
                     2,
                     "reasoner",
@@ -7986,7 +8255,7 @@ def run_proposal_batch(
                     )
                 if not set(plan.files_to_change).issubset(readable):
                     raise ProtocolValidationError("proposal batch reasoner skipped or expanded scope")
-                proposal, artifact = call_role(
+                typed_proposal, artifact, proposal_payload_sha256 = call_role(
                     sample,
                     3,
                     "coder",
@@ -7998,14 +8267,19 @@ def run_proposal_batch(
                             _coder_snapshot_payload(value) for value in snapshots
                         ],
                     },
-                    CodingProposal.from_json,
-                    CodingProposal,
+                    TypedCodingProposal.from_json,
+                    TypedCodingProposal,
                     window,
                 )
                 calls.append(artifact)
-                assert isinstance(proposal, CodingProposal)
-                if not set(proposal.files).issubset(set(plan.files_to_change)):
+                assert isinstance(typed_proposal, TypedCodingProposal)
+                if not set(typed_proposal.files).issubset(set(plan.files_to_change)):
                     raise PatchPolicyError("proposal batch coder expanded approved scope")
+                proposal = render_typed_coding_proposal(
+                    candidate,
+                    typed_proposal,
+                    snapshots,
+                )
                 handoff = export_inert_proposal(
                     candidate,
                     audit,
@@ -8014,6 +8288,8 @@ def run_proposal_batch(
                     editable_paths=services.editable_paths,
                     artifact_name=f"proposal-{sample:03d}",
                     provider_evidence_sha256=evidence_sha256,
+                    proposal_payload_sha256=proposal_payload_sha256,
+                    renderer_contract="coding_exact_replacements_v1",
                 )
                 if ledger.calls - calls_before != 3:
                     raise BudgetExceededError("proposal sample did not consume exactly three calls")
@@ -8032,7 +8308,12 @@ def run_proposal_batch(
                 audit.append_event(
                     LoopState.EXPORT_DIFF,
                     "proposal_sample_exported",
-                    {"sample": sample, "diff_sha256": handoff.diff_sha256},
+                    {
+                        "sample": sample,
+                        "diff_sha256": handoff.diff_sha256,
+                        "metadata_sha256": _file_sha256(handoff.metadata_path),
+                        "proposal_payload_sha256": proposal_payload_sha256,
+                    },
                 )
             status = "batch_complete"
     except AccountingValidationError:
@@ -8407,31 +8688,43 @@ def run_agent_loop(
                 "coder_called",
                 {"iteration": iterations_started, "file_count": len(snapshots)},
             )
-            proposal = call_or_skip(
+            typed_proposal = call_or_skip(
                 "coder",
                 {
+                    "evidence": evidence_payload,
                     "plan": asdict(plan),
                     "source_snapshots": [
                         _coder_snapshot_payload(value) for value in snapshots
                     ],
                 },
-                CodingProposal.from_json,
-                CodingProposal,
+                TypedCodingProposal.from_json,
+                TypedCodingProposal,
             )
             if terminal_state is not None:
                 break
-            if proposal is None:
+            if typed_proposal is None:
                 continue
-            assert isinstance(proposal, CodingProposal)
-            audit.write_validated_payload(f"coder-{iterations_started:02d}", proposal)
+            assert isinstance(typed_proposal, TypedCodingProposal)
+            typed_payload_path = audit.write_validated_payload(
+                f"coder-{iterations_started:02d}", typed_proposal
+            )
+            typed_payload_sha256 = _file_sha256(typed_payload_path)
             emit(
                 LoopState.VALIDATE_PROPOSAL,
                 "proposal_validation_started",
-                {"iteration": iterations_started, "file_count": len(proposal.files)},
+                {
+                    "iteration": iterations_started,
+                    "file_count": len(typed_proposal.files),
+                },
             )
             try:
-                if not set(proposal.files).issubset(set(plan.files_to_change)):
+                if not set(typed_proposal.files).issubset(set(plan.files_to_change)):
                     raise PatchPolicyError("proposal expands the reasoner-approved file set")
+                proposal = render_typed_coding_proposal(
+                    candidate,
+                    typed_proposal,
+                    snapshots,
+                )
                 validate_unified_diff(
                     candidate.root,
                     proposal.unified_diff,
@@ -8463,6 +8756,8 @@ def run_agent_loop(
                     proposal,
                     gate=gate_kind,
                     editable_paths=services.editable_paths,
+                    proposal_payload_sha256=typed_payload_sha256,
+                    renderer_contract="coding_exact_replacements_v1",
                 )
                 terminal_state = LoopState.FINISH_PROPOSAL_EXPORTED
                 break

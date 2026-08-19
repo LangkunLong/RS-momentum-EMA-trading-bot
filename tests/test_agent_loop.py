@@ -1045,22 +1045,111 @@ def test_protocol_rejects_untrusted_route_shapes(payload: str, message: str) -> 
         Route.from_json(payload)
 
 
-def test_reasoning_plan_and_coding_proposal_are_frozen_and_validate_limits() -> None:
+def test_reasoning_plan_and_typed_coding_proposal_are_frozen_and_validate_limits() -> None:
     """Break caught: mutable or oversized role payloads could change after validation."""
-    from agent_loop import CodingProposal, ProtocolValidationError, ReasoningPlan
+    from agent_loop import ProtocolValidationError, ReasoningPlan, TypedCodingProposal
 
     plan = ReasoningPlan.from_json(_plan_json())
     with pytest.raises(AttributeError):
         plan.diagnosis = "mutated"  # type: ignore[misc]
-    with pytest.raises(ProtocolValidationError, match="too long"):
-        CodingProposal.from_json(
+    with pytest.raises(ProtocolValidationError, match="byte limit|too long"):
+        TypedCodingProposal.from_json(
             json.dumps(
                 {
                     "summary": "safe patch",
-                    "files": ["core/backtest_engine.py"],
-                    "unified_diff": "x" * 262145,
+                    "replacements": [
+                        {
+                            "path": "core/backtest_engine.py",
+                            "start_line": 1,
+                            "old_lines": ["VALUE = 1"],
+                            "new_lines": ["x" * 262145],
+                        }
+                    ],
                 }
             )
+        )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        {"path": "core/pivot_detector.py", "start_line": 1, "old_lines": ["x = 1"], "new_lines": ["x = 1"]},
+        {"path": "core/pivot_detector.py", "start_line": True, "old_lines": ["x = 1"], "new_lines": ["x = 2"]},
+        {"path": "core/pivot_detector.py", "start_line": 1, "old_lines": ["x = 1\n"], "new_lines": ["x = 2"]},
+        {"path": "../config/settings.py", "start_line": 1, "old_lines": ["x = 1"], "new_lines": ["x = 2"]},
+    ),
+)
+def test_typed_coding_proposal_rejects_unsafe_or_noop_replacements(
+    replacement: dict[str, object],
+) -> None:
+    """Provider edits cannot carry diff grammar, unsafe paths, invalid lines, or no-ops."""
+    from agent_loop import ProtocolValidationError, TypedCodingProposal
+
+    raw = json.dumps({"summary": "Bounded source edit.", "replacements": [replacement]})
+    with pytest.raises(ProtocolValidationError):
+        TypedCodingProposal.from_json(raw)
+
+
+def test_typed_coding_proposal_rejects_legacy_diff_and_adjacent_ranges() -> None:
+    """The provider cannot regain diff grammar or represent one edit ambiguously."""
+    from agent_loop import ProtocolValidationError, TypedCodingProposal
+
+    with pytest.raises(ProtocolValidationError, match="keys"):
+        TypedCodingProposal.from_json(
+            json.dumps(
+                {
+                    "summary": "Legacy model diff.",
+                    "files": ["core/pivot_detector.py"],
+                    "unified_diff": "diff --git a/x b/x\n",
+                }
+            )
+        )
+    with pytest.raises(ProtocolValidationError, match="adjacent"):
+        TypedCodingProposal.from_json(
+            json.dumps(
+                {
+                    "summary": "Ambiguous adjacent replacements.",
+                    "replacements": [
+                        {
+                            "path": "core/pivot_detector.py",
+                            "start_line": 1,
+                            "old_lines": ["A = 1"],
+                            "new_lines": ["A = 2"],
+                        },
+                        {
+                            "path": "core/pivot_detector.py",
+                            "start_line": 2,
+                            "old_lines": ["B = 1"],
+                            "new_lines": ["B = 2"],
+                        },
+                    ],
+                }
+            )
+        )
+
+
+def test_typed_coding_proposal_enforces_aggregate_payload_byte_cap() -> None:
+    """Many individually bounded lines cannot overflow the atomic audit artifact limit."""
+    from agent_loop import (
+        ExactLineReplacement,
+        ProtocolValidationError,
+        TypedCodingProposal,
+    )
+
+    padding = " " * 15_000
+    old_lines = tuple(f"old_{index}{padding}x" for index in range(9))
+    new_lines = tuple(f"new_{index}{padding}x" for index in range(9))
+    with pytest.raises(ProtocolValidationError, match="aggregate byte limit"):
+        TypedCodingProposal(
+            summary="Oversized but individually bounded source edits.",
+            replacements=(
+                ExactLineReplacement(
+                    path="core/pivot_detector.py",
+                    start_line=1,
+                    old_lines=old_lines,
+                    new_lines=new_lines,
+                ),
+            ),
         )
 
 
@@ -1084,7 +1173,7 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
             "skip",
             "skip_reason",
         ),
-        "coder": ("summary", "files", "unified_diff"),
+        "coder": ("summary", "replacements"),
     }
 
     for role, keys in required_keys.items():
@@ -1092,10 +1181,8 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
         assert "exactly these keys" in prompt
         assert all(f'"{key}"' in prompt for key in keys)
     coder_prompt = OpenRouterGateway.SYSTEM_PROMPTS["coder"]
-    assert "diff --git a/<path> b/<path>" in coder_prompt
-    assert "index 1111111..2222222 100644" in coder_prompt
-    assert "--- a/<path>" in coder_prompt
-    assert "+++ b/<path>" in coder_prompt
+    assert "path, start_line, old_lines, and new_lines" in coder_prompt
+    assert "Do not return unified diff text" in coder_prompt
     reasoner_prompt = OpenRouterGateway.SYSTEM_PROMPTS["reasoner"]
     assert "closed numeric diagnostics" in reasoner_prompt
     assert "all supplied source snapshots" in reasoner_prompt
@@ -1104,11 +1191,7 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     assert "sealed gate evidence" in coder_prompt
     assert "exact numbered source annotation" in coder_prompt
     assert "omit the annotation" in coder_prompt
-    assert "first hunk body line" in coder_prompt
-    assert "cumulative prior hunk line-count delta" in coder_prompt
-    assert "Every hunk must be zero-context" in coder_prompt
-    assert "Context lines beginning with a space are forbidden" in coder_prompt
-    assert "final diff line must end with one LF" in coder_prompt
+    assert "old_lines must exactly match" in coder_prompt
     assert "change the guard predicate" in coder_prompt
 
 
@@ -2085,24 +2168,24 @@ def test_strict_gateway_enables_single_call_json_response_healing() -> None:
     }
 
 
-def test_coder_request_requires_valid_replacement_hunks_at_provider_boundary() -> None:
-    """A replacement request cannot invite add-only duplicate assignments or bad counts."""
-    from agent_loop import BudgetLedger, CodingProposal, OpenRouterGateway
+def test_coder_request_requires_typed_exact_replacements_at_provider_boundary() -> None:
+    """The model never owns diff headers, hunk arithmetic, prefixes, or terminal newlines."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, TypedCodingProposal
 
     model = "deepseek/deepseek-chat"
     proposal = json.dumps(
         {
             "summary": "Replace one assignment.",
-            "files": ["core/momentum_analysis.py"],
-            "unified_diff": (
-                "diff --git a/core/momentum_analysis.py b/core/momentum_analysis.py\n"
-                "index 1111111..2222222 100644\n"
-                "--- a/core/momentum_analysis.py\n"
-                "+++ b/core/momentum_analysis.py\n"
-                "@@ -167,1 +167,1 @@\n"
-                "-        wp = calculate_weighted_performance(clean)\n"
-                "+        wp = calculate_weighted_performance(clean, q1_weight=0.4)\n"
-            ),
+            "replacements": [
+                {
+                    "path": "core/momentum_analysis.py",
+                    "start_line": 167,
+                    "old_lines": ["        wp = calculate_weighted_performance(clean)"],
+                    "new_lines": [
+                        "        wp = calculate_weighted_performance(clean, q1_weight=0.4)"
+                    ],
+                }
+            ],
         }
     )
     client = FakeClient([FakeResponse(proposal, cost=0.01, model=model)])
@@ -2112,11 +2195,55 @@ def test_coder_request_requires_valid_replacement_hunks_at_provider_boundary() -
         ledger=BudgetLedger(max_usd=1.0),
     )
 
-    gateway.request_once("coder", "approved plan and snapshots", CodingProposal.from_json)
+    gateway.request_once(
+        "coder", "approved plan and snapshots", TypedCodingProposal.from_json
+    )
 
     messages = client.completions.calls[0]["messages"]
-    assert "paired '-old' and '+new' lines" in messages[0]["content"]
-    assert "hunk header counts must exactly match the hunk body" in messages[0]["content"]
+    assert "path, start_line, old_lines, and new_lines" in messages[0]["content"]
+    assert "Do not return unified diff text" in messages[0]["content"]
+
+
+def test_oversized_typed_coder_response_is_accounted_protocol_rejection() -> None:
+    """A paid oversized coder response is audited as rejected, never lost during payload write."""
+    from agent_loop import (
+        AccountedResponseValidationError,
+        BudgetLedger,
+        OpenRouterGateway,
+        ProtocolFailureCode,
+        TypedCodingProposal,
+    )
+
+    model = "deepseek/deepseek-chat"
+    padding = " " * 15_000
+    oversized = json.dumps(
+        {
+            "summary": "Oversized typed edits.",
+            "replacements": [
+                {
+                    "path": "core/pivot_detector.py",
+                    "start_line": 1,
+                    "old_lines": [f"old_{index}{padding}x" for index in range(9)],
+                    "new_lines": [f"new_{index}{padding}x" for index in range(9)],
+                }
+            ],
+        }
+    )
+    ledger = BudgetLedger(max_usd=1.0, max_calls=1, max_tokens=10_000)
+    gateway = OpenRouterGateway(
+        client=FakeClient([FakeResponse(oversized, cost=0.012, model=model)]),
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=ledger,
+    )
+
+    with pytest.raises(AccountedResponseValidationError) as raised:
+        gateway.request_once("coder", "sealed evidence", TypedCodingProposal.from_json)
+
+    assert raised.value.facts.protocol_failure_code is ProtocolFailureCode.PAYLOAD_JSON_INVALID
+    assert raised.value.facts.usage.cost_usd == pytest.approx(0.012)
+    assert ledger.calls == 1
+    assert ledger.spent_usd == pytest.approx(0.012)
+    assert oversized not in json.dumps(asdict(raised.value.facts), sort_keys=True)
 
 
 def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> None:
@@ -3006,6 +3133,149 @@ def _task2_diff(*, path: str = "core/backtest_engine.py", old: str = "VALUE = 1"
         f"-{old}\n"
         f"+{new}\n"
     )
+
+
+def test_controller_renders_typed_replacements_as_canonical_exact_diff(
+    tmp_path: Path,
+) -> None:
+    """Provider line edits become a deterministic zero-context diff without source mutation."""
+    from agent_loop import (
+        AuditTrail,
+        ExactLineReplacement,
+        TypedCodingProposal,
+        dispose_candidate,
+        export_candidate,
+        export_inert_proposal,
+        preflight_source,
+        read_candidate_source_snapshot,
+        render_typed_coding_proposal,
+    )
+
+    repo = _task2_repo(tmp_path)
+    target = repo / "core" / "momentum_analysis.py"
+    target.write_text("A = 0\nB = 1\nC = 2\nD = 3\nE = 4\n", encoding="utf-8", newline="\n")
+    _run_git(repo, "add", "core/momentum_analysis.py")
+    _run_git(repo, "commit", "-m", "multiline momentum source")
+    source_before = target.read_bytes()
+    with tempfile.TemporaryDirectory(prefix="agent-loop-typed-render-") as controller_name:
+        controller = Path(controller_name)
+        state = preflight_source(repo, acquire_lock=False, controller_temp_parent=controller)
+        candidate = export_candidate(state)
+        audit = AuditTrail((tmp_path / "audit-typed-render").resolve(), "run-12345678")
+        snapshot = read_candidate_source_snapshot(
+            candidate,
+            "core/momentum_analysis.py",
+            approved_paths=("core/momentum_analysis.py",),
+        )
+        typed = TypedCodingProposal(
+            summary="Make two bounded momentum replacements.",
+            replacements=(
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=2,
+                    old_lines=("B = 1",),
+                    new_lines=("B = 10", "B2 = 11"),
+                ),
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=4,
+                    old_lines=("D = 3",),
+                    new_lines=("D = 30",),
+                ),
+            ),
+        )
+        expected = (
+            "diff --git a/core/momentum_analysis.py b/core/momentum_analysis.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/core/momentum_analysis.py\n"
+            "+++ b/core/momentum_analysis.py\n"
+            "@@ -2,1 +2,2 @@\n"
+            "-B = 1\n"
+            "+B = 10\n"
+            "+B2 = 11\n"
+            "@@ -4,1 +5,1 @@\n"
+            "-D = 3\n"
+            "+D = 30\n"
+        )
+        try:
+            rendered = render_typed_coding_proposal(candidate, typed, (snapshot,))
+            assert rendered.files == ("core/momentum_analysis.py",)
+            assert rendered.unified_diff == expected
+            handoff = export_inert_proposal(candidate, audit, rendered, gate="test")
+            assert handoff.diff_path.read_text(encoding="utf-8") == expected
+            assert (candidate.root / "core" / "momentum_analysis.py").read_bytes() == source_before
+            assert target.read_bytes() == source_before
+        finally:
+            dispose_candidate(candidate)
+
+
+def test_typed_replacement_rejects_stale_or_out_of_view_old_lines(tmp_path: Path) -> None:
+    """The renderer cannot use coordinates or text the provider did not see exactly."""
+    from agent_loop import (
+        ExactLineReplacement,
+        PatchPolicyError,
+        TypedCodingProposal,
+        dispose_candidate,
+        export_candidate,
+        preflight_source,
+        read_candidate_source_snapshot,
+        render_typed_coding_proposal,
+    )
+
+    repo = _task2_repo(tmp_path)
+    target = repo / "core" / "momentum_analysis.py"
+    target.write_text("A = 0\nMOMENTUM = 1\nC = 2\n", encoding="utf-8", newline="\n")
+    _run_git(repo, "add", "core/momentum_analysis.py")
+    _run_git(repo, "commit", "-m", "three-line momentum source")
+    with tempfile.TemporaryDirectory(prefix="agent-loop-typed-stale-") as controller_name:
+        state = preflight_source(
+            repo,
+            acquire_lock=False,
+            controller_temp_parent=Path(controller_name),
+        )
+        candidate = export_candidate(state)
+        snapshot = read_candidate_source_snapshot(
+            candidate,
+            "core/momentum_analysis.py",
+            approved_paths=("core/momentum_analysis.py",),
+            start_line=2,
+            end_line=2,
+        )
+        stale = TypedCodingProposal(
+            summary="Attempt a stale replacement.",
+            replacements=(
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=2,
+                    old_lines=("MOMENTUM = 999",),
+                    new_lines=("MOMENTUM = 2",),
+                ),
+            ),
+        )
+        try:
+            with pytest.raises(PatchPolicyError, match="exact visible source"):
+                render_typed_coding_proposal(candidate, stale, (snapshot,))
+            outside_view = TypedCodingProposal(
+                summary="Attempt an unseen replacement.",
+                replacements=(
+                    ExactLineReplacement(
+                        path="core/momentum_analysis.py",
+                        start_line=1,
+                        old_lines=("A = 0",),
+                        new_lines=("A = 1",),
+                    ),
+                ),
+            )
+            with pytest.raises(PatchPolicyError, match="outside the exact visible source"):
+                render_typed_coding_proposal(candidate, outside_view, (snapshot,))
+            candidate_target = candidate.root / "core" / "momentum_analysis.py"
+            candidate_target.write_text(
+                "A = 0\nMOMENTUM = 3\nC = 2\n", encoding="utf-8", newline="\n"
+            )
+            with pytest.raises(PatchPolicyError, match="changed after its source snapshot"):
+                render_typed_coding_proposal(candidate, stale, (snapshot,))
+        finally:
+            dispose_candidate(candidate)
 
 
 @pytest.mark.parametrize("failure_kind", ("wrong_start", "wrong_old_text"))
@@ -6595,15 +6865,19 @@ def _loop_plan(*, path: str = "core/backtest_engine.py") -> Any:
 
 
 def _loop_proposal(*, path: str = "core/backtest_engine.py") -> Any:
-    from agent_loop import CodingProposal
+    from agent_loop import ExactLineReplacement, TypedCodingProposal
 
-    return CodingProposal(
+    old_line = "MOMENTUM = 1" if path == "core/momentum_analysis.py" else "VALUE = 1"
+    new_line = "MOMENTUM = 2" if path == "core/momentum_analysis.py" else "VALUE = 2"
+    return TypedCodingProposal(
         summary="Correct the isolated constant.",
-        files=(path,),
-        unified_diff=_task2_diff(
-            path=path,
-            old="MOMENTUM = 1" if path == "core/momentum_analysis.py" else "VALUE = 1",
-            new="MOMENTUM = 2" if path == "core/momentum_analysis.py" else "VALUE = 2",
+        replacements=(
+            ExactLineReplacement(
+                path=path,
+                start_line=1,
+                old_lines=(old_line,),
+                new_lines=(new_line,),
+            ),
         ),
     )
 
@@ -6735,7 +7009,7 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
     tmp_path: Path,
 ) -> None:
     """Break caught: a fifty-sample rollout retried, applied, retained, or exceeded three calls/sample."""
-    from agent_loop import CodingProposal, ReasoningPlan, Route
+    from agent_loop import ReasoningPlan, Route
 
     route = Route(
         action="reason",
@@ -6752,15 +7026,7 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
         skip=False,
         skip_reason="",
     )
-    proposal = CodingProposal(
-        summary="Correct the isolated momentum constant.",
-        files=("core/momentum_analysis.py",),
-        unified_diff=_task2_diff(
-            path="core/momentum_analysis.py",
-            old="MOMENTUM = 1",
-            new="MOMENTUM = 2",
-        ),
-    )
+    proposal = _loop_proposal(path="core/momentum_analysis.py")
     outcomes = [
         item
         for _sample in range(50)
@@ -7020,6 +7286,22 @@ def test_proposal_batch_hash_binds_sanitized_evidence_to_unbacktested_proposal(
             assert hashlib.sha256(payload_path.read_bytes()).hexdigest() == event["details"][
                 "payload_sha256"
             ]
+        coder_payload_sha256 = accepted[-1]["details"]["payload_sha256"]
+        assert metadata["schema_version"] == 2
+        assert metadata["kind"] == "inert_controller_rendered_proposal"
+        assert metadata["renderer_contract"] == "coding_exact_replacements_v1"
+        assert metadata["proposal_payload_sha256"] == coder_payload_sha256
+        exported = next(
+            event for event in events if event["event"] == "proposal_sample_exported"
+        )
+        assert exported["details"] == {
+            "diff_sha256": result.samples[0].diff_sha256,
+            "metadata_sha256": hashlib.sha256(
+                result.samples[0].metadata_path.read_bytes()
+            ).hexdigest(),
+            "proposal_payload_sha256": coder_payload_sha256,
+            "sample": 1,
+        }
         assert not candidate.root.exists()
     finally:
         external.cleanup()
@@ -7298,7 +7580,7 @@ def test_proposal_batch_audits_a_global_rollout_overage_without_next_call(
     tmp_path: Path,
 ) -> None:
     """Break caught: a later sample could exceed the shared cap without a terminal call record."""
-    from agent_loop import CodingProposal, ProviderCallFacts, ReasoningPlan, Route, Usage
+    from agent_loop import ProviderCallFacts, ReasoningPlan, Route, Usage
 
     facts = ProviderCallFacts(
         call_index=4,
@@ -7331,15 +7613,7 @@ def test_proposal_batch_audits_a_global_rollout_overage_without_next_call(
         skip=False,
         skip_reason="",
     )
-    proposal = CodingProposal(
-        summary="Correct the isolated momentum constant.",
-        files=("core/momentum_analysis.py",),
-        unified_diff=_task2_diff(
-            path="core/momentum_analysis.py",
-            old="MOMENTUM = 1",
-            new="MOMENTUM = 2",
-        ),
-    )
+    proposal = _loop_proposal(path="core/momentum_analysis.py")
     result, gateway, candidate, external = _run_proposal_batch_fixture(
         tmp_path,
         samples=2,
@@ -7491,6 +7765,8 @@ def test_state_machine_dry_run_exports_exact_proposal_without_mutating_candidate
         coder_role, coder_dynamic = gateway.dynamic_inputs[2]
         assert coder_role == "coder"
         coder_payload = json.loads(coder_dynamic)
+        reasoner_payload = json.loads(gateway.dynamic_inputs[1][1])
+        assert coder_payload["evidence"] == reasoner_payload["evidence"]
         assert coder_payload["source_snapshots"][0]["line_numbers_are_annotations"] is True
         assert coder_payload["source_snapshots"][0]["sanitized_text"] == "1: VALUE = 1\n"
         assert candidate.root.exists()
