@@ -8,8 +8,8 @@ Legacy Gmail SMTP (TLS on port 587) remains available with three environment var
     NOTIFY_EMAIL_TO       — recipient address (can be the same Gmail)
     NOTIFY_EMAIL_PASSWORD — legacy SMTP App Password; unused by Gmail OAuth
 
-If the selected backend is incomplete, notification calls are silently skipped so the rest of
-the trading workflow is never blocked by a misconfigured mailer.
+If the selected backend is incomplete, notification calls do not block the trading workflow.
+An explicitly selected but unavailable Gmail OAuth backend emits a safe diagnostic instead.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 from config import settings
-from core.gmail_oauth import GmailOAuthError, is_gmail_authorized, send_gmail_email
+from core.gmail_oauth import is_gmail_authorized, send_gmail_email
 from core.order_execution import require_paper_mode
 
 _ET = ZoneInfo("America/New_York")
@@ -58,6 +58,10 @@ def _configured_backend() -> str | None:
     return None
 
 
+def _gmail_oauth_selected() -> bool:
+    return str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() == "gmail_oauth"
+
+
 def send_email(subject: str, body: str) -> bool:
     """Send a plain-text email through the configured Gmail backend.
 
@@ -71,6 +75,8 @@ def send_email(subject: str, body: str) -> bool:
     """
     backend = _configured_backend()
     if backend is None:
+        if _gmail_oauth_selected():
+            print("[NOTIFY ERROR] Gmail OAuth notifications are unavailable; run `email-auth` again")
         return False
 
     if backend == "gmail_oauth":
@@ -83,7 +89,7 @@ def send_email(subject: str, body: str) -> bool:
             )
             print(f"[NOTIFY] Email sent: {subject}")
             return True
-        except GmailOAuthError:
+        except Exception:
             print("[NOTIFY ERROR] Gmail OAuth delivery failed; run `email-auth` again")
             return False
 

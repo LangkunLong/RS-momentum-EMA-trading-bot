@@ -323,7 +323,10 @@ def test_main_email_auth_has_no_password_or_token_cli_option(tmp_path: Path) -> 
 
 def test_email_test_sends_through_configured_notifier(capsys) -> None:
     """The smoke command must exercise the same notifier used by trading workflows."""
-    with patch("paper_trading_console.send_email", return_value=True) as send:
+    with (
+        patch("paper_trading_console.notify_configured_backend", return_value="gmail_oauth"),
+        patch("paper_trading_console.send_email", return_value=True) as send,
+    ):
         rc = console.run_email_test()
 
     assert rc == 0
@@ -331,6 +334,32 @@ def test_email_test_sends_through_configured_notifier(capsys) -> None:
     assert subject == "[CANSLIM] Gmail OAuth notification test"
     assert "browser-authorized Gmail API" in body
     assert "sent successfully" in capsys.readouterr().out
+
+
+def test_email_test_refuses_a_non_oauth_backend_even_when_delivery_would_succeed(capsys) -> None:
+    """SMTP and auto fallback cannot be reported as a Gmail OAuth smoke-test success."""
+    with (
+        patch("paper_trading_console.notify_configured_backend", return_value="smtp"),
+        patch("paper_trading_console.send_email", return_value=True) as send,
+    ):
+        rc = console.run_email_test()
+
+    assert rc == 1
+    send.assert_not_called()
+    assert "requires NOTIFY_EMAIL_PROVIDER=gmail_oauth with authorization" in capsys.readouterr().out
+
+
+def test_explicit_unavailable_gmail_oauth_is_a_failed_deployment_check() -> None:
+    """A deliberately selected but unauthorized OAuth backend must block doctor and checklist."""
+    with (
+        patch.object(console.settings, "NOTIFY_EMAIL_PROVIDER", "gmail_oauth"),
+        patch("paper_trading_console.notify_configured", return_value=False),
+    ):
+        result = console._check_email_configuration()
+
+    assert result.ok is False
+    assert result.severity == "fail"
+    assert result.detail == "Gmail OAuth is selected but unavailable; run `email-auth` again"
 
 
 def test_email_revoke_removes_the_configured_sender_grant(capsys) -> None:

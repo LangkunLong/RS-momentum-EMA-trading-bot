@@ -168,6 +168,26 @@ class TestSendEmail:
         assert result is False
         smtp.assert_not_called()
 
+    def test_explicit_unavailable_gmail_oauth_logs_a_safe_static_error(self, capsys):
+        """A selected OAuth backend must diagnose a missing authorization without leaking settings."""
+        with _patch_settings(
+            NOTIFY_EMAIL_PROVIDER="gmail_oauth",
+            NOTIFY_EMAIL_FROM="langkunlong@gmail.com",
+            NOTIFY_EMAIL_TO="langkunlong@gmail.com",
+            NOTIFY_EMAIL_PASSWORD="legacy-secret",
+        ):
+            with (
+                patch("core.notifier.is_gmail_authorized", return_value=False),
+                patch("smtplib.SMTP") as smtp,
+            ):
+                result = send_email("OAuth subject", "OAuth body")
+
+        assert result is False
+        assert capsys.readouterr().out == (
+            "[NOTIFY ERROR] Gmail OAuth notifications are unavailable; run `email-auth` again\n"
+        )
+        smtp.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # notify_buy_filled

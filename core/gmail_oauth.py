@@ -102,7 +102,7 @@ def _default_dependencies() -> GmailOAuthDependencies:
 
         response = requests.post(
             "https://oauth2.googleapis.com/revoke",
-            params={"token": token},
+            data={"token": token},
             headers={"content-type": "application/x-www-form-urlencoded"},
             timeout=20,
         )
@@ -239,7 +239,10 @@ def send_gmail_email(
         if session is not None:
             close = getattr(session, "close", None)
             if callable(close):
-                close()
+                try:
+                    close()
+                except Exception:
+                    pass
 
 
 def revoke_gmail_authorization(

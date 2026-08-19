@@ -274,6 +274,93 @@ def test_send_gmail_email_refreshes_and_posts_an_exact_message() -> None:
     assert json.loads(stored)["token"] == "refreshed-access-token"
 
 
+def test_send_gmail_email_ignores_an_authorized_session_close_failure() -> None:
+    """A cleanup failure after Gmail accepts a message must not turn delivery into a failure."""
+    from core.gmail_oauth import gmail_keyring_service, send_gmail_email
+
+    class ClosingFailureSession(FakeAuthorizedSession):
+        def close(self) -> None:
+            self.closed = True
+            raise RuntimeError("close failed")
+
+    keyring = MemoryKeyring()
+    keyring.set_password(
+        gmail_keyring_service(),
+        "langkunlong@gmail.com",
+        FakeCredentials().to_json(),
+    )
+
+    message_id = send_gmail_email(
+        from_email="langkunlong@gmail.com",
+        to_email="langkunlong@gmail.com",
+        subject="CANSLIM OAuth test",
+        body="OAuth delivery body",
+        dependencies=_dependencies(keyring, session=ClosingFailureSession()),
+    )
+
+    assert message_id == "gmail-message-1"
+
+
+def test_default_dependencies_revoke_posts_form_token_without_query_parameters(monkeypatch) -> None:
+    """OAuth revocation tokens must stay in the POST body instead of URL logs and proxies."""
+    import requests
+
+    from core.gmail_oauth import _default_dependencies
+
+    captured: dict[str, object] = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+    def post(url: str, **kwargs: object) -> Response:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return Response()
+
+    monkeypatch.setattr(requests, "post", post)
+
+    _default_dependencies().revoke_token("test-refresh-token")
+
+    assert captured["url"] == "https://oauth2.googleapis.com/revoke"
+    assert captured["kwargs"] == {
+        "data": {"token": "test-refresh-token"},
+        "headers": {"content-type": "application/x-www-form-urlencoded"},
+        "timeout": 20,
+    }
+    assert "params" not in captured["kwargs"]
+
+
+def test_default_dependencies_use_installed_google_oauth_contract_offline() -> None:
+    """The installed OAuth package wiring must load real credentials without external operations."""
+    from google.oauth2.credentials import Credentials
+
+    from core.gmail_oauth import _GMAIL_SCOPES, _default_dependencies
+
+    dependencies = _default_dependencies()
+    assert callable(dependencies.flow_factory)
+    assert callable(dependencies.credentials_loader)
+    assert callable(dependencies.request_factory)
+    assert callable(dependencies.authorized_session_factory)
+    assert callable(dependencies.id_token_verifier)
+    assert callable(dependencies.revoke_token)
+
+    credentials = dependencies.credentials_loader(
+        {
+            "token": "offline-access-token",
+            "refresh_token": "offline-refresh-token",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "offline-client-id",
+            "client_secret": "offline-client-secret",
+            "scopes": list(_GMAIL_SCOPES),
+        },
+        _GMAIL_SCOPES,
+    )
+
+    assert isinstance(credentials, Credentials)
+    assert credentials.refresh_token == "offline-refresh-token"
+
+
 def test_revoke_gmail_authorization_deletes_only_after_google_accepts() -> None:
     """Local deletion before remote revocation would leave an unrecoverable active grant."""
     from core.gmail_oauth import gmail_keyring_service, revoke_gmail_authorization

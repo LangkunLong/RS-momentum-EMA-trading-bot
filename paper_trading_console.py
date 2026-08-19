@@ -30,6 +30,7 @@ from core.gmail_oauth import (
     authorize_gmail,
     revoke_gmail_authorization,
 )
+from core.notifier import _configured_backend as notify_configured_backend
 from core.notifier import _is_configured as notify_configured
 from core.notifier import send_email
 from core.order_execution import (
@@ -388,6 +389,13 @@ def _check_scan_results_dir() -> CheckResult:
 def _check_email_configuration() -> CheckResult:
     if notify_configured():
         return CheckResult("Email notifications", True, "configured")
+    if str(settings.NOTIFY_EMAIL_PROVIDER or "auto").strip().lower() == "gmail_oauth":
+        return CheckResult(
+            "Email notifications",
+            False,
+            "Gmail OAuth is selected but unavailable; run `email-auth` again",
+            severity="fail",
+        )
     return CheckResult(
         "Email notifications",
         True,
@@ -513,6 +521,9 @@ def run_email_auth(*, client_secrets: Path, email: str | None) -> int:
 
 def run_email_test() -> int:
     """Send one notification through the same backend used by trading workflows."""
+    if notify_configured_backend() != "gmail_oauth":
+        print("Gmail OAuth test requires NOTIFY_EMAIL_PROVIDER=gmail_oauth with authorization.")
+        return 1
     sent = send_email(
         "[CANSLIM] Gmail OAuth notification test",
         "This test was sent through the browser-authorized Gmail API notification backend.",
