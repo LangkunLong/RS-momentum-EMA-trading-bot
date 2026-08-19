@@ -2537,6 +2537,10 @@ class SandboxRunner:
             "PortBindings": {},
             "PublishAllPorts": False,
             "Init": True,
+            "LogConfig": {
+                "Type": "local",
+                "Config": {"max-size": "4m", "max-file": "1"},
+            },
         }
         if any(
             key not in normalized_host
@@ -2843,6 +2847,12 @@ class SandboxRunner:
             "--cgroupns",
             "private",
             "--read-only",
+            "--log-driver",
+            "local",
+            "--log-opt",
+            "max-size=4m",
+            "--log-opt",
+            "max-file=1",
             "--init",
             "--cap-drop",
             "ALL",
@@ -2924,27 +2934,84 @@ class SandboxRunner:
                 expected_environment, data_bundle,
             )
             owned_container_id = container_id
-            process = self._call("start", "--attach", container_id)
-            final_item, final_hash = self._inspect_container(
-                name, container_id, ownership_token, image_id, worker, tuple(python_args),
-                expected_environment, data_bundle,
+            started_container = self._call("start", container_id, timeout=30)
+            if (
+                started_container.returncode != 0
+                or started_container.timed_out
+                or started_container.stdout.strip() != container_id
+            ):
+                raise SandboxError("sandbox engine did not start the owned container")
+            monotonic_deadline = time.monotonic() + self.timeout_seconds
+            timed_out = False
+            exit_code: int | None = None
+            while True:
+                final_item, final_hash = self._inspect_container(
+                    name,
+                    container_id,
+                    ownership_token,
+                    image_id,
+                    worker,
+                    tuple(python_args),
+                    expected_environment,
+                    data_bundle,
+                )
+                if final_hash != config_hash:
+                    raise SandboxError("container configuration changed during execution")
+                state = final_item.get("State")
+                if not isinstance(state, dict) or type(state.get("OOMKilled")) is not bool:
+                    raise SandboxError("container runtime state inspection is incomplete")
+                common_state = {
+                    "Paused": False,
+                    "Restarting": False,
+                    "Dead": False,
+                }
+                if any(
+                    key not in state
+                    or type(state[key]) is not type(wanted)
+                    or state[key] != wanted
+                    for key, wanted in common_state.items()
+                ):
+                    raise SandboxError("container runtime state inspection is incomplete")
+                if state.get("Status") == "exited" and state.get("Running") is False:
+                    candidate_exit = state.get("ExitCode")
+                    if type(candidate_exit) is not int or not 0 <= candidate_exit <= 255:
+                        raise SandboxError("container exit code is malformed")
+                    exit_code = candidate_exit
+                    oom_killed = bool(state["OOMKilled"])
+                    break
+                if (
+                    state.get("Status") != "running"
+                    or state.get("Running") is not True
+                    or state.get("ExitCode") != 0
+                    or state["OOMKilled"] is not False
+                ):
+                    raise SandboxError("container runtime state inspection is incomplete")
+                remaining = monotonic_deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                time.sleep(min(1.0, remaining))
+            logs = self._call("logs", container_id, timeout=30)
+            if logs.returncode != 0 or logs.timed_out:
+                raise SandboxError("sandbox engine could not collect bounded worker logs")
+            if not timed_out and exit_code is None:
+                raise SandboxError("container terminal exit code is absent")
+            if not timed_out:
+                waited = self._call("wait", container_id, timeout=15)
+                if (
+                    waited.returncode != 0
+                    or waited.timed_out
+                    or waited.stdout.strip() != str(exit_code)
+                ):
+                    raise SandboxError("container exit code differs from Docker wait")
+            process = ProcessResult(
+                -1 if timed_out else exit_code,
+                logs.stdout,
+                logs.stderr,
+                logs.stdout_sha256,
+                logs.stderr_sha256,
+                timed_out,
             )
-            if final_hash != config_hash:
-                raise SandboxError("container configuration changed during execution")
-            state = final_item.get("State")
-            expected_state = {
-                "Status": "exited",
-                "Running": False,
-                "Paused": False,
-                "Restarting": False,
-                "Dead": False,
-                "ExitCode": process.returncode,
-            }
-            if not isinstance(state, dict) or any(
-                key not in state or state[key] != wanted for key, wanted in expected_state.items()
-            ) or type(state.get("OOMKilled")) is not bool:
-                raise SandboxError("container terminal state inspection is incomplete")
-            oom_killed = bool(state["OOMKilled"])
         finally:
             if owned_container_id is None:
                 owned_container_id = self._discover_owned_container(name, ownership_token)

@@ -2161,6 +2161,7 @@ class FaithfulSandboxEngine:
         self.cleanup_inspect_error = False
         self.mutate_data_on_start = False
         self.start_stdout = "candidate says success\n"
+        self.never_exits = False
         self.name = ""
         self.owner_label = ""
         self.inspect_payload: dict[str, object] = {}
@@ -2272,6 +2273,16 @@ class FaithfulSandboxEngine:
                     "PortBindings": {},
                     "PublishAllPorts": False,
                     "Init": argv.count("--init") == 1,
+                    "LogConfig": {
+                        "Type": self._option(argv, "--log-driver")
+                        if "--log-driver" in argv
+                        else "",
+                        "Config": {
+                            argv[index + 1].split("=", 1)[0]: argv[index + 1].split("=", 1)[1]
+                            for index, value in enumerate(argv)
+                            if value == "--log-opt"
+                        },
+                    },
                 },
                 "Mounts": mounts,
                 "NetworkSettings": {
@@ -2333,10 +2344,11 @@ class FaithfulSandboxEngine:
                 self.absence_verified = True
                 return _process_result(1, stderr="No such container")
             payload = json.loads(json.dumps(self.inspect_payload))
+            running = self.started and self.never_exits
             payload["State"] = {
                 "OOMKilled": self.oom_killed,
-                "Status": "exited" if self.started else "created",
-                "Running": False,
+                "Status": "running" if running else ("exited" if self.started else "created"),
+                "Running": running,
                 "Paused": False,
                 "Restarting": False,
                 "Dead": False,
@@ -2358,7 +2370,11 @@ class FaithfulSandboxEngine:
                 data_path.chmod(stat.S_IWRITE)
                 with data_path.open("ab") as stream:
                     stream.write(b"tampered")
-            return _process_result(137 if self.oom_killed else 0, self.start_stdout)
+            return _process_result(0, self.container_id + "\n")
+        if command == "logs":
+            return _process_result(0, self.start_stdout)
+        if command == "wait":
+            return _process_result(0, ("137" if self.oom_killed else "0") + "\n")
         if command == "rm":
             if self.cleanup_fails:
                 return _process_result(1, stderr="cleanup failed")
@@ -2385,7 +2401,12 @@ class FaithfulSandboxEngine:
         raise AssertionError(f"unexpected fake engine command: {argv}")
 
 
-def _faithful_runner(image: str, engine: FaithfulSandboxEngine):
+def _faithful_runner(
+    image: str,
+    engine: FaithfulSandboxEngine,
+    *,
+    timeout_seconds: float = 300.0,
+):
     from agent_loop import SandboxRunner
 
     return SandboxRunner(
@@ -2397,6 +2418,7 @@ def _faithful_runner(image: str, engine: FaithfulSandboxEngine):
         image=image,
         process_runner=engine,
         run_id="run-1234567890abcdef",
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -2455,6 +2477,40 @@ def test_worker_mounts_candidate_gate_and_data_read_only_with_narrow_writable_di
     for destination in ("/workspace/tmp", "/workspace/home", "/workspace/output"):
         spec = next(value for value in mount_specs if f"dst={destination}" in value)
         assert "readonly" not in spec
+
+
+def test_worker_uses_detached_start_bounded_logs_and_polled_deadline(
+    tmp_path: Path,
+) -> None:
+    """Docker attach pipes must not defeat the controller's wall deadline."""
+    from agent_loop import export_candidate, preflight_source, run_test_gate
+
+    source = _task2_repo(tmp_path)
+    candidate = export_candidate(preflight_source(source, acquire_lock=False))
+    image = "registry.invalid/agent-loop@sha256:" + "a" * 64
+    engine = FaithfulSandboxEngine(image)
+    engine.never_exits = True
+
+    started = time.monotonic()
+    result = run_test_gate(
+        candidate,
+        _faithful_runner(image, engine, timeout_seconds=0.05),
+    )
+
+    assert time.monotonic() - started < 2
+    assert result.outcome == "timed_out"
+    assert result.returncode == -1
+    start = next(call for call in engine.calls if call[1] == "start")
+    assert "--attach" not in start
+    create = next(call for call in engine.calls if call[1] == "create")
+    assert create.count("--log-driver") == 1
+    assert create[create.index("--log-driver") + 1] == "local"
+    assert [create[index + 1] for index, value in enumerate(create) if value == "--log-opt"] == [
+        "max-size=4m",
+        "max-file=1",
+    ]
+    assert any(call[1] == "logs" for call in engine.calls)
+    assert engine.removed and engine.absence_verified
 
 
 def test_container_attestation_normalizes_only_docker_null_capability_lists(
