@@ -1605,7 +1605,10 @@ def test_data_bundle_validates_hash_schema_exact_keys_and_copies_privately(tmp_p
     symbols = "AAPL,MSFT,SPY"
     keys = [
         (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
-        (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+        (
+            f"closes::6mo::2026-01-01::2026-02-01::{symbols.removesuffix(',SPY')}",
+            "closes",
+        ),
     ]
     digest = _create_bundle(bundle, keys)
 
@@ -1622,6 +1625,59 @@ def test_data_bundle_validates_hash_schema_exact_keys_and_copies_privately(tmp_p
     with pytest.raises(DataBundleError, match="coverage"):
         validate_historical_data_bundle(
             bundle, digest, ["NVDA"], "SPY", "2026-01-01", "2026-02-01"
+        )
+
+
+def test_data_bundle_uses_requested_symbols_for_closes_and_benchmark_for_prices(
+    tmp_path: Path,
+) -> None:
+    """The real cache keeps benchmark prices but excludes it from RS closes."""
+    from agent_loop import DataBundleError, validate_historical_data_bundle
+
+    bundle = tmp_path / "historical.sqlite3"
+    digest = _create_bundle(
+        bundle,
+        [
+            (
+                "price::6mo::2026-01-01::2026-02-01::AAPL,MSFT,SPY",
+                "price",
+            ),
+            (
+                "closes::6mo::2026-01-01::2026-02-01::AAPL,MSFT",
+                "closes",
+            ),
+        ],
+    )
+
+    validated = validate_historical_data_bundle(
+        bundle, digest, ["MSFT", "AAPL"], "SPY", "2026-01-01", "2026-02-01"
+    )
+    assert validated.symbols == ("AAPL", "MSFT", "SPY")
+    assert validated.price_key.endswith("::AAPL,MSFT,SPY")
+    assert validated.closes_key.endswith("::AAPL,MSFT")
+
+    wrong = tmp_path / "wrong.sqlite3"
+    wrong_digest = _create_bundle(
+        wrong,
+        [
+            (
+                "price::6mo::2026-01-01::2026-02-01::AAPL,MSFT,SPY",
+                "price",
+            ),
+            (
+                "closes::6mo::2026-01-01::2026-02-01::AAPL,MSFT,SPY",
+                "closes",
+            ),
+        ],
+    )
+    with pytest.raises(DataBundleError, match="coverage"):
+        validate_historical_data_bundle(
+            wrong,
+            wrong_digest,
+            ["MSFT", "AAPL"],
+            "SPY",
+            "2026-01-01",
+            "2026-02-01",
         )
 
 
@@ -1650,7 +1706,10 @@ def test_backtest_gate_copies_approved_bundle_and_fails_closed_on_missing_sentin
         bundle,
         [
             (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
-            (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+            (
+                f"closes::6mo::2026-01-01::2026-02-01::{symbols.removesuffix(',SPY')}",
+                "closes",
+            ),
         ],
     )
     approved = validate_historical_data_bundle(
@@ -1778,7 +1837,7 @@ def test_backtest_gate_hidden_worker_uses_exact_tickers_and_neutralizes_extra_sy
     assert settings.EXTRA_SYMBOLS == []
     assert settings.BACKTEST_DATA_CACHE_DB_PATH == str(scratch.resolve())
     assert sys.path[0] == str(candidate_source.resolve())
-    assert engine.get_sp500_tickers() == ["MSFT", "AAPL", "SPY"]
+    assert engine.get_sp500_tickers() == ["MSFT", "AAPL"]
     from agent_loop import GateConfigurationError
 
     for attribute in ("_download_price_data", "_download_bulk_closes", "fetch_bulk_ohlcv"):
@@ -1936,7 +1995,10 @@ def test_data_bundle_is_streamed_once_to_immutable_controller_snapshot(
         bundle,
         [
             (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
-            (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+            (
+                f"closes::6mo::2026-01-01::2026-02-01::{symbols.removesuffix(',SPY')}",
+                "closes",
+            ),
         ],
     )
     original_read_bytes = Path.read_bytes
@@ -2732,7 +2794,10 @@ def test_data_bundle_rejects_sidecars_size_overflow_and_post_run_tampering(
     symbols = "AAPL,SPY"
     keys = [
         (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
-        (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+        (
+            f"closes::6mo::2026-01-01::2026-02-01::{symbols.removesuffix(',SPY')}",
+            "closes",
+        ),
     ]
     digest = _create_bundle(bundle, keys)
     sidecar = Path(str(bundle) + "-wal")
@@ -2800,7 +2865,10 @@ def test_post_run_data_revalidation_wraps_errors_with_static_sandbox_message(
         bundle,
         [
             (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
-            (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+            (
+                f"closes::6mo::2026-01-01::2026-02-01::{symbols.removesuffix(',SPY')}",
+                "closes",
+            ),
         ],
     )
     approved = validate_historical_data_bundle(
@@ -3719,7 +3787,10 @@ def test_round3_provider_safe_backtest_result_never_exposes_process_or_sentinel(
         bundle_path,
         [
             (f"price::6mo::2026-01-01::2026-02-01::{symbols}", "price"),
-            (f"closes::6mo::2026-01-01::2026-02-01::{symbols}", "closes"),
+            (
+                f"closes::6mo::2026-01-01::2026-02-01::{symbols.removesuffix(',SPY')}",
+                "closes",
+            ),
         ],
     )
     bundle = validate_historical_data_bundle(

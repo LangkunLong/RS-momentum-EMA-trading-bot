@@ -3636,11 +3636,13 @@ def _validate_historical_data_snapshot(
         raise DataBundleError("backtest dates must be ISO calendar dates") from exc
     if start >= end:
         raise DataBundleError("backtest date range must increase")
-    exact_symbols = tuple(sorted({*requested, benchmark_symbol}))
-    suffix = ",".join(exact_symbols)
+    requested_symbols = tuple(sorted(requested))
+    exact_symbols = tuple(sorted({*requested_symbols, benchmark_symbol}))
+    price_suffix = ",".join(exact_symbols)
+    closes_suffix = ",".join(requested_symbols)
     period = _period_for_dates(start, end)
-    price_key = f"price::{period}::{start.isoformat()}::{end.isoformat()}::{suffix}"
-    closes_key = f"closes::{period}::{start.isoformat()}::{end.isoformat()}::{suffix}"
+    price_key = f"price::{period}::{start.isoformat()}::{end.isoformat()}::{price_suffix}"
+    closes_key = f"closes::{period}::{start.isoformat()}::{end.isoformat()}::{closes_suffix}"
     uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro&immutable=1"
     try:
         with closing(sqlite3.connect(uri, uri=True)) as connection:
@@ -3928,7 +3930,6 @@ def run_hidden_backtest_worker(
     """Hidden child-only technical backtest entrypoint; imports engine code only when invoked."""
     requested = tuple(dict.fromkeys(_validate_symbol(value) for value in tickers))
     benchmark_symbol = _validate_symbol(benchmark)
-    exact = tuple(dict.fromkeys((*requested, benchmark_symbol)))
     scratch = prepare_backtest_scratch_copy(bundle_path, expected_sha256, scratch_path)
     source_root = candidate_source_root.resolve(strict=True)
     sys.path.insert(0, str(source_root))
@@ -3944,7 +3945,7 @@ def run_hidden_backtest_worker(
     for attribute in ("_download_price_data", "_download_bulk_closes", "fetch_bulk_ohlcv"):
         setattr(backtest_engine, attribute, cache_miss)
 
-    backtest_engine.get_sp500_tickers = lambda *_args, **_kwargs: list(exact)
+    backtest_engine.get_sp500_tickers = lambda *_args, **_kwargs: list(requested)
     result = backtest_engine.run_cli(
         [
             "--tickers",
