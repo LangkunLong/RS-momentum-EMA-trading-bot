@@ -2820,10 +2820,12 @@ def test_engine_cli_receives_only_minimal_controller_owned_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Break caught: Docker/Podman inherits provider, broker, cloud, proxy, Git, or credential state."""
+    """Break caught: Windows Docker loses SystemDrive or inherits credentials/candidate state."""
     from agent_loop import export_candidate, preflight_source, run_test_gate
 
     source = _task2_repo(tmp_path)
+    controller_system_drive = "Z:"
+    monkeypatch.setenv("SYSTEMDRIVE", controller_system_drive)
     for name in (
         "OPENROUTER_API_KEY", "ALPACA_API_KEY", "FMP_API_KEY", "AWS_SECRET_ACCESS_KEY",
         "HTTPS_PROXY", "GIT_DIR", "GIT_ASKPASS", "SSH_AUTH_SOCK",
@@ -2845,6 +2847,21 @@ def test_engine_cli_receives_only_minimal_controller_owned_environment(
         } & set(environment)
         assert Path(environment["DOCKER_CONFIG"]).parts[-2:] == (".engine-control", "config")
         assert Path(environment["HOME"]).parts[-2:] == (".engine-control", "home")
+        if os.name == "nt":
+            assert environment["SYSTEMDRIVE"] == controller_system_drive
+            native_cache = Path(f"{environment['SYSTEMDRIVE']}/ProgramData/Microsoft/Windows/Caches")
+            assert native_cache.is_absolute()
+            assert not native_cache.is_relative_to(source.resolve())
+        else:
+            assert "SYSTEMDRIVE" not in environment
+
+    create = next(call for call in engine.calls if call[1] == "create")
+    container_names = {
+        create[index + 1].split("=", 1)[0]
+        for index, value in enumerate(create)
+        if value == "--env"
+    }
+    assert "SYSTEMDRIVE" not in container_names
 
 
 def test_private_tree_cleanup_does_not_follow_hostile_symlink(tmp_path: Path) -> None:

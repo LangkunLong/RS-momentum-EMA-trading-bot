@@ -2399,6 +2399,8 @@ class SandboxRunner:
         for directory in (engine_home, engine_config, engine_temp):
             directory.mkdir(mode=private_mode)
         allowed = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
+        if os.name == "nt":
+            allowed.add("SYSTEMDRIVE")
         environment = _canonical_environment(os.environ, allowed)
         environment.update(
             {
