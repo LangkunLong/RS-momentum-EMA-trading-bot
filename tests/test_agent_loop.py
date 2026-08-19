@@ -182,7 +182,7 @@ def test_task3_models_and_limits_validate_exact_boundaries() -> None:
     from agent_loop import ConfigurationError, LoopLimits, ModelConfig
 
     models = ModelConfig()
-    assert models.orchestrator == "qwen/qwen-2.5-7b-instruct"
+    assert models.orchestrator == "qwen/qwen3-next-80b-a3b-instruct"
     assert models.reasoner == "deepseek/deepseek-r1"
     assert models.coder == "deepseek/deepseek-chat"
     with pytest.raises(ConfigurationError, match="model slug"):
@@ -1431,7 +1431,7 @@ def test_strict_request_recovers_authoritative_generation_accounting_once() -> N
     """A paid response may recover only from its exact immutable generation record."""
     from agent_loop import BudgetLedger, OpenRouterGateway, Route
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     generation_id = "gen-recovery123456"
     client = FakeClient(
         [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
@@ -1538,7 +1538,7 @@ def test_generation_accounting_rejects_unsafe_response_ids_without_polling(
     """Untrusted response IDs cannot control the accounting endpoint or trigger a second chat."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ResponseValidationError, Route
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     client = FakeClient(
         [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
     )
@@ -1560,7 +1560,7 @@ def test_generation_accounting_polling_is_bounded_and_reconciles_once() -> None:
     """Transient metadata failures cannot retry the paid role or escape the fixed poll bound."""
     from agent_loop import BudgetLedger, GatewayError, OpenRouterGateway, ResponseValidationError, Route
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     client = FakeClient([FakeResponse(_route_json(), cost=None, model=model)])
     polls: list[str] = []
     sleeps: list[float] = []
@@ -1591,7 +1591,7 @@ def test_generation_accounting_recovers_after_bounded_eventual_consistency_delay
     """Five retryable metadata misses can recover without retrying the paid chat."""
     from agent_loop import BudgetLedger, GatewayError, OpenRouterGateway, Route
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     generation_id = "gen-delayed-accounting123"
     client = FakeClient(
         [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
@@ -1634,7 +1634,7 @@ def test_generation_accounting_recovery_obeys_shared_wall_deadline() -> None:
         Route,
     )
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     generation_id = "gen-deadline-accounting123"
     client = FakeClient(
         [FakeResponse(_route_json(), cost=None, model=model, id=generation_id)]
@@ -1713,7 +1713,7 @@ def test_generation_accounting_malformed_success_is_not_retried() -> None:
     """A malformed successful metadata response is definitive, not eventual consistency."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ResponseValidationError, Route
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     polls: list[str] = []
 
     def malformed(value: str) -> object:
@@ -1747,7 +1747,12 @@ def test_generation_accounting_malformed_success_is_not_retried() -> None:
         ("http_status", "recovery_http_terminal", 1, True),
         ("payload", "recovery_payload_invalid", 1, True),
         ("identity", "recovery_identity_invalid", 1, True),
-        ("usage", "recovery_usage_invalid", 1, True),
+        (
+            "usage",
+            "recovery_usage_invalid",
+            1,
+            True,
+        ),
     ),
 )
 def test_strict_accounting_failure_exposes_only_closed_recovery_facts(
@@ -1773,7 +1778,7 @@ def test_strict_accounting_failure_exposes_only_closed_recovery_facts(
         if case == "unsafe_id"
         else "gen-closed-facts123"
     )
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     polls: list[str] = []
 
     def load_generation(value: str) -> object:
@@ -1809,6 +1814,13 @@ def test_strict_accounting_failure_exposes_only_closed_recovery_facts(
     facts = raised.value.facts
     assert facts.inline_failure_code.value == "inline_usage_missing"
     assert facts.recovery_failure_code.value == expected_code
+    if case == "usage":
+        assert (
+            facts.recovery_usage_diagnostic.value
+            == "normalized_token_pair_invalid"
+        )
+    else:
+        assert facts.recovery_usage_diagnostic is None
     assert facts.generation_attempts == expected_attempts
     assert facts.response_id_safe is response_id_safe
     assert facts.accounting_complete is False
@@ -1923,8 +1935,10 @@ def test_budget_snapshot_separates_authoritative_spend_from_retained_reservation
 @pytest.mark.parametrize(
     "overrides",
     (
+        {"schema_version": 1},
         {"inline_failure_code": "recovery_id_invalid"},
         {"recovery_failure_code": "inline_usage_missing"},
+        {"recovery_usage_diagnostic": "reasoning_exceeds_completion"},
         {"generation_attempts": 0},
         {"response_id_safe": False},
         {"accounting_complete": True},
@@ -1944,11 +1958,12 @@ def test_incomplete_accounting_facts_reject_open_or_inconsistent_values(
     )
 
     values: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "call_index": 1,
         "role": "orchestrator",
         "inline_failure_code": AccountingFailureCode.INLINE_USAGE_MISSING,
         "recovery_failure_code": AccountingFailureCode.RECOVERY_TRANSPORT_FAILED,
+        "recovery_usage_diagnostic": None,
         "generation_attempts": 1,
         "response_id_safe": True,
         "accounting_complete": False,
@@ -1961,6 +1976,43 @@ def test_incomplete_accounting_facts_reject_open_or_inconsistent_values(
         IncompleteAccountingFacts(**values)  # type: ignore[arg-type]
 
 
+def test_incomplete_accounting_usage_diagnostic_requires_usage_failure() -> None:
+    """Schema v2 cannot attach a closed usage detail to an unrelated recovery outcome."""
+    from agent_loop import (
+        AccountingFailureCode,
+        ConfigurationError,
+        IncompleteAccountingFacts,
+        RecoveryUsageDiagnosticCode,
+    )
+
+    common = {
+        "schema_version": 2,
+        "call_index": 1,
+        "role": "reasoner",
+        "inline_failure_code": AccountingFailureCode.INLINE_USAGE_MISSING,
+        "generation_attempts": 1,
+        "response_id_safe": True,
+        "accounting_complete": False,
+        "budget_charge_basis": "full_reservation",
+        "retained_reservation_tokens": 10,
+        "retained_reservation_usd": 0.01,
+    }
+    with pytest.raises(ConfigurationError, match="diagnostic"):
+        IncompleteAccountingFacts(
+            **common,
+            recovery_failure_code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=None,
+        )
+    with pytest.raises(ConfigurationError, match="diagnostic"):
+        IncompleteAccountingFacts(
+            **common,
+            recovery_failure_code=AccountingFailureCode.RECOVERY_TRANSPORT_FAILED,
+            recovery_usage_diagnostic=(
+                RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
+            ),
+        )
+
+
 def test_incomplete_accounting_retry_exhaustion_requires_the_full_attempt_bound() -> None:
     """The closed audit cannot claim retry exhaustion before all bounded polls ran."""
     from agent_loop import (
@@ -1971,11 +2023,12 @@ def test_incomplete_accounting_retry_exhaustion_requires_the_full_attempt_bound(
 
     with pytest.raises(ConfigurationError):
         IncompleteAccountingFacts(
-            schema_version=1,
+            schema_version=2,
             call_index=1,
             role="orchestrator",
             inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
             recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
+            recovery_usage_diagnostic=None,
             generation_attempts=1,
             response_id_safe=True,
             accounting_complete=False,
@@ -1995,11 +2048,12 @@ def test_incomplete_accounting_deadline_exhaustion_must_precede_final_poll() -> 
 
     with pytest.raises(ConfigurationError):
         IncompleteAccountingFacts(
-            schema_version=1,
+            schema_version=2,
             call_index=1,
             role="orchestrator",
             inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
             recovery_failure_code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
+            recovery_usage_diagnostic=None,
             generation_attempts=6,
             response_id_safe=True,
             accounting_complete=False,
@@ -2039,6 +2093,169 @@ def test_generation_accounting_prefers_complete_native_token_pair() -> None:
     assert usage.cached_tokens == 4
     assert usage.reasoning_tokens == 6
     assert usage.accounting_source == "generation_endpoint"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_diagnostic"),
+    (
+        ("cost_missing", "cost_missing"),
+        ("cost_invalid", "cost_invalid"),
+        ("cost_conflict", "cost_conflict"),
+        ("native_tokens_invalid", "native_token_pair_invalid"),
+        ("native_tokens_incomplete", "native_token_pair_invalid"),
+        ("normalized_tokens_invalid", "normalized_token_pair_invalid"),
+        ("optional_token_invalid", "optional_token_invalid"),
+        ("cached_exceeds_prompt", "cached_exceeds_prompt"),
+        ("reasoning_exceeds_completion", "reasoning_exceeds_completion"),
+    ),
+)
+def test_generation_accounting_uses_closed_content_free_usage_subcodes(
+    case: str,
+    expected_diagnostic: str,
+) -> None:
+    """Each authoritative accounting defect has one bounded content-free category."""
+    from agent_loop import AccountingValidationError, _usage_from_generation_record
+
+    generation_id = "gen-recovery-subcode123"
+    payload = _generation_accounting(generation_id, "deepseek/deepseek-r1")
+    data = payload["data"]
+    assert isinstance(data, dict)
+    if case == "cost_missing":
+        data["usage"] = None
+    elif case == "cost_invalid":
+        data["total_cost"] = "provider-secret-cost"
+    elif case == "cost_conflict":
+        data["usage"] = 0.013
+    elif case == "native_tokens_invalid":
+        data["native_tokens_prompt"] = True
+        data["native_tokens_completion"] = 7
+    elif case == "native_tokens_incomplete":
+        data["native_tokens_prompt"] = 11
+        data["native_tokens_completion"] = None
+    elif case == "normalized_tokens_invalid":
+        data["tokens_completion"] = "provider-secret-tokens"
+    elif case == "optional_token_invalid":
+        data["native_tokens_cached"] = "provider-secret-cached"
+    elif case == "cached_exceeds_prompt":
+        data["native_tokens_prompt"] = 11
+        data["native_tokens_completion"] = 7
+        data["native_tokens_cached"] = 12
+    elif case == "reasoning_exceeds_completion":
+        data["native_tokens_prompt"] = 11
+        data["native_tokens_completion"] = 7
+        data["native_tokens_reasoning"] = 8
+    else:  # pragma: no cover - parameter table is closed above
+        raise AssertionError(case)
+
+    with pytest.raises(AccountingValidationError) as raised:
+        _usage_from_generation_record(payload, generation_id=generation_id)
+
+    assert raised.value.code.value == "recovery_usage_invalid"
+    assert raised.value.recovery_usage_diagnostic.value == expected_diagnostic
+    assert "provider-secret" not in str(raised.value)
+
+
+def test_generation_accounting_never_mixes_native_details_with_normalized_pair() -> None:
+    """Nullable native pair fields cannot make native details comparable to fallback totals."""
+    from agent_loop import _usage_from_generation_record
+
+    generation_id = "gen-normalized-basis123"
+    payload = _generation_accounting(generation_id, "deepseek/deepseek-r1")
+    data = payload["data"]
+    assert isinstance(data, dict)
+    data.update(
+        {
+            "native_tokens_prompt": None,
+            "native_tokens_completion": None,
+            "native_tokens_cached": 999,
+            "native_tokens_reasoning": 999,
+        }
+    )
+
+    usage = _usage_from_generation_record(payload, generation_id=generation_id)
+
+    assert usage.prompt_tokens == 11
+    assert usage.completion_tokens == 7
+    assert usage.cached_tokens is None
+    assert usage.reasoning_tokens is None
+
+
+def test_generation_accounting_four_misses_then_invalid_record_is_fail_closed() -> None:
+    """The observed 404x4 -> invalid-record timeline stops one paid call exactly."""
+    from agent_loop import (
+        BudgetLedger,
+        GatewayError,
+        IncompleteAccountingError,
+        OpenRouterGateway,
+        Route,
+    )
+
+    model = "deepseek/deepseek-r1"
+    generation_id = "gen-observed-invalid-accounting123"
+
+    class InvalidInlineAccountingResponse(FakeResponse):
+        @property
+        def usage(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                prompt_tokens=11,
+                completion_tokens=7,
+                total_tokens=18,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=3),
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=8),
+                cost=self.cost,
+            )
+
+    client = FakeClient(
+        [
+            InvalidInlineAccountingResponse(
+                _route_json(),
+                cost=0.012,
+                model=model,
+                id=generation_id,
+            )
+        ]
+    )
+    polls: list[str] = []
+    sleeps: list[float] = []
+
+    def delayed_invalid(value: str) -> object:
+        polls.append(value)
+        if len(polls) < 5:
+            raise GatewayError("untrusted retryable provider error", status_code=404)
+        payload = _generation_accounting(value, model)
+        data = payload["data"]
+        assert isinstance(data, dict)
+        data["native_tokens_prompt"] = 11
+        data["native_tokens_completion"] = 7
+        data["native_tokens_reasoning"] = 8
+        return payload
+
+    ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=100_000)
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        generation_loader=delayed_invalid,
+        generation_sleeper=sleeps.append,
+        ledger=ledger,
+    )
+
+    with pytest.raises(IncompleteAccountingError) as raised:
+        gateway.request_once("reasoner", "sealed evidence", Route.from_json)
+
+    facts = raised.value.facts
+    assert facts.inline_failure_code.value == "inline_reasoning_exceeds_completion"
+    assert facts.recovery_failure_code.value == "recovery_usage_invalid"
+    assert facts.recovery_usage_diagnostic.value == "reasoning_exceeds_completion"
+    assert facts.generation_attempts == 5
+    assert facts.response_id_safe is True
+    assert polls == [generation_id] * 5
+    assert sleeps == [1.0, 2.0, 4.0, 8.0]
+    assert len(client.completions.calls) == 1
+    assert ledger.calls == 1
+    assert ledger.incomplete_accounting_calls == 1
+    assert facts.retained_reservation_tokens == ledger.retained_reservation_tokens
+    assert facts.retained_reservation_usd == pytest.approx(ledger.retained_reservation_usd)
+    assert "provider" not in json.dumps(asdict(facts))
 
 
 def test_generation_accounting_fetch_rejects_redirect_without_forwarding_key(
@@ -2092,7 +2309,7 @@ def test_recovered_generation_overage_commits_before_failing_closed() -> None:
         Route,
     )
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     generation_id = "gen-overage1234567"
     ledger = BudgetLedger(max_usd=2.0, max_calls=3, max_tokens=10_000)
     gateway = OpenRouterGateway(
@@ -2121,7 +2338,7 @@ def test_gateway_strict_request_is_one_shot_and_caches_pricing_per_model() -> No
     """Break caught: fifty proposal samples could reload prices or repair malformed output."""
     from agent_loop import BudgetLedger, OpenRouterGateway, Route
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     client = FakeClient(
         [
             FakeResponse(_route_json(), cost=0.01, model=model),
@@ -2147,11 +2364,83 @@ def test_gateway_strict_request_is_one_shot_and_caches_pricing_per_model() -> No
     assert len(client.completions.calls) == 2
 
 
+def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
+    """Break caught: the Qwen upgrade was absent or deterministic sampling leaked to other roles."""
+    from agent_loop import (
+        BudgetLedger,
+        OpenRouterGateway,
+        ReasoningPlan,
+        Route,
+        TypedCodingProposal,
+    )
+
+    coder_payload = json.dumps(
+        {
+            "summary": "Replace one assignment.",
+            "replacements": [
+                {
+                    "path": "core/momentum_analysis.py",
+                    "start_line": 167,
+                    "old_lines": ["        value = 1"],
+                    "new_lines": ["        value = 2"],
+                }
+            ],
+        }
+    )
+    cases = (
+        (
+            "orchestrator",
+            "qwen/qwen3-next-80b-a3b-instruct",
+            _route_json(),
+            Route.from_json,
+            2048,
+        ),
+        ("reasoner", "deepseek/deepseek-r1", _plan_json(), ReasoningPlan.from_json, 4096),
+        (
+            "coder",
+            "deepseek/deepseek-chat",
+            coder_payload,
+            TypedCodingProposal.from_json,
+            4096,
+        ),
+    )
+    client = FakeClient(
+        [FakeResponse(payload, cost=0.01, model=model) for _, model, payload, _, _ in cases]
+    )
+    gateway = OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    completions = [
+        gateway.request_once(role, "sealed evidence", parser)
+        for role, _, _, parser, _ in cases
+    ]
+
+    for (role, model, _, _, token_cap), call, completion in zip(
+        cases, client.completions.calls, completions, strict=True
+    ):
+        assert call["model"] == model
+        assert call["max_tokens"] == token_cap
+        assert call["response_format"] == {"type": "json_object"}
+        assert call["extra_body"] == {
+            "plugins": [{"id": "response-healing"}],
+            "provider": {"require_parameters": True},
+        }
+        assert completion.model == model
+        assert completion.usage.cost_usd == pytest.approx(0.01)
+        if role == "orchestrator":
+            assert call["temperature"] == 0
+        else:
+            assert "temperature" not in call
+
+
 def test_strict_gateway_enables_single_call_json_response_healing() -> None:
     """Batch roles use OpenRouter's same-call JSON repair without adding a retry call."""
     from agent_loop import BudgetLedger, OpenRouterGateway, Route
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     client = FakeClient([FakeResponse(_route_json(), cost=0.01, model=model)])
     gateway = OpenRouterGateway(
         client=client,
@@ -2326,7 +2615,7 @@ def test_strict_protocol_failure_retains_complete_authoritative_accounting() -> 
         Route,
     )
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     ledger = BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000)
     gateway = OpenRouterGateway(
         client=FakeClient([FakeResponse("{not-json", cost=0.012, model=model)]),
@@ -2388,7 +2677,7 @@ def test_accounted_protocol_rejection_has_closed_content_free_stage(
         Route,
     )
 
-    model = "qwen/qwen-2.5-7b-instruct"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     gateway = OpenRouterGateway(
         client=FakeClient([FakeResponse(raw_content, cost=0.012, model=model)]),
         pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
@@ -2473,8 +2762,8 @@ def test_provider_call_audit_binds_validated_payload_and_contains_no_content(
         iteration=1,
         role="orchestrator",
         api_backend="openrouter",
-        requested_model="qwen/qwen-2.5-7b-instruct",
-        returned_model="qwen/qwen-2.5-7b-instruct",
+        requested_model="qwen/qwen3-next-80b-a3b-instruct",
+        returned_model="qwen/qwen3-next-80b-a3b-instruct",
         outcome="accepted",
         finish_reason="stop",
         response_schema_valid=True,
@@ -2534,8 +2823,8 @@ def test_accepted_provider_call_audit_requires_validated_payload_digest(tmp_path
         iteration=1,
         role="orchestrator",
         api_backend="openrouter",
-        requested_model="qwen/qwen-2.5-7b-instruct",
-        returned_model="qwen/qwen-2.5-7b-instruct",
+        requested_model="qwen/qwen3-next-80b-a3b-instruct",
+        returned_model="qwen/qwen3-next-80b-a3b-instruct",
         outcome="accepted",
         finish_reason="stop",
         response_schema_valid=True,
@@ -6811,7 +7100,7 @@ class _StrictBatchGateway:
         )
         self.ledger.reconcile(reservation, usage, window=budget_window)
         model = {
-            "orchestrator": "qwen/qwen-2.5-7b-instruct",
+            "orchestrator": "qwen/qwen3-next-80b-a3b-instruct",
             "reasoner": "deepseek/deepseek-r1",
             "coder": "deepseek/deepseek-chat",
         }[role]
@@ -7398,6 +7687,7 @@ def test_proposal_batch_persists_closed_incomplete_accounting_diagnostic(
         AccountingFailureCode,
         IncompleteAccountingError,
         IncompleteAccountingFacts,
+        RecoveryUsageDiagnosticCode,
         Route,
         verify_audit_chain,
     )
@@ -7410,12 +7700,15 @@ def test_proposal_batch_persists_closed_incomplete_accounting_diagnostic(
         reasoning_focus="Diagnose the sealed arithmetic.",
     )
     facts = IncompleteAccountingFacts(
-        schema_version=1,
+        schema_version=2,
         call_index=2,
         role="reasoner",
-            inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
-            recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
-            generation_attempts=6,
+        inline_failure_code=AccountingFailureCode.INLINE_REASONING_EXCEEDS_COMPLETION,
+        recovery_failure_code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+        recovery_usage_diagnostic=(
+            RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
+        ),
+        generation_attempts=5,
         response_id_safe=True,
         accounting_complete=False,
         budget_charge_basis="full_reservation",
@@ -7490,12 +7783,13 @@ def test_proposal_batch_rejects_incomplete_facts_that_do_not_match_ledger(
         reasoning_focus="Diagnose the sealed arithmetic.",
     )
     fabricated = IncompleteAccountingFacts(
-        schema_version=1,
+        schema_version=2,
         call_index=2,
         role="reasoner",
-            inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
-            recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
-            generation_attempts=6,
+        inline_failure_code=AccountingFailureCode.INLINE_USAGE_MISSING,
+        recovery_failure_code=AccountingFailureCode.RECOVERY_HTTP_RETRY_EXHAUSTED,
+        recovery_usage_diagnostic=None,
+        generation_attempts=6,
         response_id_safe=True,
         accounting_complete=False,
         budget_charge_basis="full_reservation",
@@ -7533,8 +7827,8 @@ def test_proposal_batch_audits_the_paid_canary_overage_and_stops(
     facts = ProviderCallFacts(
         call_index=1,
         role="orchestrator",
-        requested_model="qwen/qwen-2.5-7b-instruct",
-        returned_model="qwen/qwen-2.5-7b-instruct",
+        requested_model="qwen/qwen3-next-80b-a3b-instruct",
+        returned_model="qwen/qwen3-next-80b-a3b-instruct",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=11,
@@ -7585,8 +7879,8 @@ def test_proposal_batch_audits_a_global_rollout_overage_without_next_call(
     facts = ProviderCallFacts(
         call_index=4,
         role="orchestrator",
-        requested_model="qwen/qwen-2.5-7b-instruct",
-        returned_model="qwen/qwen-2.5-7b-instruct",
+        requested_model="qwen/qwen3-next-80b-a3b-instruct",
+        returned_model="qwen/qwen3-next-80b-a3b-instruct",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=11,

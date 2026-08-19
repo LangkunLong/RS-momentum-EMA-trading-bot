@@ -38,7 +38,7 @@ from typing import Any, BinaryIO, Callable, Generic, Mapping, Protocol, Sequence
 
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-ORCHESTRATOR_MODEL = "qwen/qwen-2.5-7b-instruct"
+ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
 REASONER_MODEL = "deepseek/deepseek-r1"
 CODER_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -200,6 +200,19 @@ class AccountingFailureCode(str, Enum):
     RECOVERY_USAGE_INVALID = "recovery_usage_invalid"
 
 
+class RecoveryUsageDiagnosticCode(str, Enum):
+    """Closed, value-free detail for an invalid generation-accounting record."""
+
+    COST_MISSING = "cost_missing"
+    COST_INVALID = "cost_invalid"
+    COST_CONFLICT = "cost_conflict"
+    NATIVE_TOKEN_PAIR_INVALID = "native_token_pair_invalid"
+    NORMALIZED_TOKEN_PAIR_INVALID = "normalized_token_pair_invalid"
+    OPTIONAL_TOKEN_INVALID = "optional_token_invalid"
+    CACHED_EXCEEDS_PROMPT = "cached_exceeds_prompt"
+    REASONING_EXCEEDS_COMPLETION = "reasoning_exceeds_completion"
+
+
 class AccountingValidationError(ResponseValidationError):
     """Raised when provider usage/cost accounting is missing, malformed, or inconsistent."""
 
@@ -209,6 +222,7 @@ class AccountingValidationError(ResponseValidationError):
         *,
         code: AccountingFailureCode = AccountingFailureCode.INLINE_USAGE_INVALID,
         generation_attempts: int = 0,
+        recovery_usage_diagnostic: RecoveryUsageDiagnosticCode | None = None,
     ) -> None:
         if not isinstance(code, AccountingFailureCode):
             raise ConfigurationError("accounting failure code is invalid")
@@ -217,9 +231,20 @@ class AccountingValidationError(ResponseValidationError):
             or not 0 <= generation_attempts <= GENERATION_ACCOUNTING_ATTEMPTS
         ):
             raise ConfigurationError("generation accounting attempt count is invalid")
+        if recovery_usage_diagnostic is not None and not isinstance(
+            recovery_usage_diagnostic, RecoveryUsageDiagnosticCode
+        ):
+            raise ConfigurationError("recovery usage diagnostic code is invalid")
+        if (code is AccountingFailureCode.RECOVERY_USAGE_INVALID) != (
+            recovery_usage_diagnostic is not None
+        ):
+            raise ConfigurationError(
+                "recovery usage failure and diagnostic code are inconsistent"
+            )
         super().__init__(message)
         self.code = code
         self.generation_attempts = generation_attempts
+        self.recovery_usage_diagnostic = recovery_usage_diagnostic
 
 
 class BudgetExceededError(RuntimeError):
@@ -256,6 +281,7 @@ class IncompleteAccountingFacts:
     role: str
     inline_failure_code: AccountingFailureCode
     recovery_failure_code: AccountingFailureCode
+    recovery_usage_diagnostic: RecoveryUsageDiagnosticCode | None
     generation_attempts: int
     response_id_safe: bool
     accounting_complete: bool
@@ -264,8 +290,8 @@ class IncompleteAccountingFacts:
     retained_reservation_usd: float
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ConfigurationError("incomplete accounting schema version must be 1")
+        if self.schema_version != 2:
+            raise ConfigurationError("incomplete accounting schema version must be 2")
         if type(self.call_index) is not int or self.call_index < 1:
             raise ConfigurationError("incomplete accounting call index must be positive")
         if self.role not in {"orchestrator", "reasoner", "coder"}:
@@ -274,6 +300,17 @@ class IncompleteAccountingFacts:
             raise ConfigurationError("inline accounting failure code is invalid")
         if self.recovery_failure_code not in _RECOVERY_ACCOUNTING_CODES:
             raise ConfigurationError("recovery accounting failure code is invalid")
+        if self.recovery_usage_diagnostic is not None and not isinstance(
+            self.recovery_usage_diagnostic, RecoveryUsageDiagnosticCode
+        ):
+            raise ConfigurationError("recovery usage diagnostic code is invalid")
+        if (
+            self.recovery_failure_code
+            is AccountingFailureCode.RECOVERY_USAGE_INVALID
+        ) != (self.recovery_usage_diagnostic is not None):
+            raise ConfigurationError(
+                "recovery usage failure and diagnostic code are inconsistent"
+            )
         if (
             type(self.generation_attempts) is not int
             or not 0 <= self.generation_attempts <= GENERATION_ACCOUNTING_ATTEMPTS
@@ -344,6 +381,7 @@ class IncompleteAccountingError(AccountingValidationError):
             "provider accounting remained incomplete after bounded recovery",
             code=facts.recovery_failure_code,
             generation_attempts=facts.generation_attempts,
+            recovery_usage_diagnostic=facts.recovery_usage_diagnostic,
         )
         self.facts = facts
 
@@ -1343,7 +1381,14 @@ def _safe_generation_id(response: object) -> str:
     return value
 
 
-def _generation_token_pair(data: Mapping[str, object]) -> tuple[int, int]:
+class _GenerationTokenBasis(str, Enum):
+    NATIVE = "native"
+    NORMALIZED = "normalized"
+
+
+def _generation_token_pair(
+    data: Mapping[str, object],
+) -> tuple[int, int, _GenerationTokenBasis]:
     """Prefer the complete native pair, falling back atomically to normalized tokens."""
     native_prompt = _present_field(data, "native_tokens_prompt")
     native_completion = _present_field(data, "native_tokens_completion")
@@ -1355,8 +1400,11 @@ def _generation_token_pair(data: Mapping[str, object]) -> tuple[int, int]:
                 raise AccountingValidationError(
                     "generation native token accounting is invalid",
                     code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                    recovery_usage_diagnostic=(
+                        RecoveryUsageDiagnosticCode.NATIVE_TOKEN_PAIR_INVALID
+                    ),
                 )
-            return prompt, completion
+            return prompt, completion, _GenerationTokenBasis.NATIVE
         if not (
             (native_prompt is _MISSING_FIELD or native_prompt is None)
             and (native_completion is _MISSING_FIELD or native_completion is None)
@@ -1364,6 +1412,9 @@ def _generation_token_pair(data: Mapping[str, object]) -> tuple[int, int]:
             raise AccountingValidationError(
                 "generation native token accounting is incomplete",
                 code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=(
+                    RecoveryUsageDiagnosticCode.NATIVE_TOKEN_PAIR_INVALID
+                ),
             )
     prompt = _non_negative_int(_present_field(data, "tokens_prompt"))
     completion = _non_negative_int(_present_field(data, "tokens_completion"))
@@ -1371,8 +1422,11 @@ def _generation_token_pair(data: Mapping[str, object]) -> tuple[int, int]:
         raise AccountingValidationError(
             "generation token accounting is incomplete",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=(
+                RecoveryUsageDiagnosticCode.NORMALIZED_TOKEN_PAIR_INVALID
+            ),
         )
-    return prompt, completion
+    return prompt, completion, _GenerationTokenBasis.NORMALIZED
 
 
 def _usage_from_generation_record(
@@ -1409,13 +1463,21 @@ def _usage_from_generation_record(
         raise AccountingValidationError(
             "generation cost accounting is invalid",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_INVALID,
         ) from exc
-    if total_cost is None or usage_cost is None or total_cost != usage_cost:
+    if total_cost is None or usage_cost is None:
         raise AccountingValidationError(
-            "generation cost accounting is incomplete or conflicting",
+            "generation cost accounting is incomplete",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_MISSING,
         )
-    prompt_tokens, completion_tokens = _generation_token_pair(data)
+    if total_cost != usage_cost:
+        raise AccountingValidationError(
+            "generation cost accounting is conflicting",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_CONFLICT,
+        )
+    prompt_tokens, completion_tokens, token_basis = _generation_token_pair(data)
     try:
         cached_tokens = _usage_int(data, "native_tokens_cached")
         reasoning_tokens = _usage_int(data, "native_tokens_reasoning")
@@ -1423,22 +1485,38 @@ def _usage_from_generation_record(
         raise AccountingValidationError(
             "generation optional token accounting is invalid",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=(
+                RecoveryUsageDiagnosticCode.OPTIONAL_TOKEN_INVALID
+            ),
         ) from exc
-    try:
-        return Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            cached_tokens=cached_tokens,
-            reasoning_tokens=reasoning_tokens,
-            cost_usd=total_cost,
-            accounting_source="generation_endpoint",
-        )
-    except ProtocolValidationError as exc:
+    if token_basis is _GenerationTokenBasis.NORMALIZED:
+        cached_tokens = None
+        reasoning_tokens = None
+    elif cached_tokens is not None and cached_tokens > prompt_tokens:
         raise AccountingValidationError(
-            "generation accounting relationships are invalid",
+            "generation cached token accounting is inconsistent",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-        ) from exc
+            recovery_usage_diagnostic=(
+                RecoveryUsageDiagnosticCode.CACHED_EXCEEDS_PROMPT
+            ),
+        )
+    elif reasoning_tokens is not None and reasoning_tokens > completion_tokens:
+        raise AccountingValidationError(
+            "generation reasoning token accounting is inconsistent",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=(
+                RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
+            ),
+        )
+    return Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cost_usd=total_cost,
+        accounting_source="generation_endpoint",
+    )
 
 
 def _status_code(error: BaseException) -> int | None:
@@ -1918,10 +1996,16 @@ class OpenRouterGateway:
                     if exc.code in loader_validation_codes
                     else AccountingFailureCode.RECOVERY_PAYLOAD_INVALID
                 )
+                recovery_usage_diagnostic = (
+                    exc.recovery_usage_diagnostic
+                    if recovery_code is AccountingFailureCode.RECOVERY_USAGE_INVALID
+                    else None
+                )
                 raise AccountingValidationError(
                     "generation accounting loader failed validation",
                     code=recovery_code,
                     generation_attempts=attempt + 1,
+                    recovery_usage_diagnostic=recovery_usage_diagnostic,
                 ) from exc
             try:
                 usage = _usage_from_generation_record(
@@ -1933,6 +2017,7 @@ class OpenRouterGateway:
                     "generation accounting record failed validation",
                     code=exc.code,
                     generation_attempts=attempt + 1,
+                    recovery_usage_diagnostic=exc.recovery_usage_diagnostic,
                 ) from exc
             data = payload["data"]
             assert isinstance(data, Mapping)
@@ -2019,6 +2104,7 @@ class OpenRouterGateway:
                 timeout=request_timeout,
                 extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
                 extra_body=extra_body,
+                **({"temperature": 0} if role == "orchestrator" else {}),
             )
         except Exception:
             self.ledger.reconcile(reservation, Usage(), window=budget_window)
@@ -2057,11 +2143,14 @@ class OpenRouterGateway:
                     else AccountingFailureCode.INLINE_USAGE_INVALID
                 )
                 facts = IncompleteAccountingFacts(
-                    schema_version=1,
+                    schema_version=2,
                     call_index=self.ledger.calls,
                     role=role,
                     inline_failure_code=inline_code,
                     recovery_failure_code=recovery_exc.code,
+                    recovery_usage_diagnostic=(
+                        recovery_exc.recovery_usage_diagnostic
+                    ),
                     generation_attempts=recovery_exc.generation_attempts,
                     response_id_safe=(
                         recovery_exc.code
