@@ -1193,7 +1193,8 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     coder_prompt = OpenRouterGateway.SYSTEM_PROMPTS["coder"]
     assert "path, start_line, old_lines, and new_lines" in coder_prompt
     assert "Do not return unified diff text" in coder_prompt
-    assert "Preserve every supplied configuration reference" in coder_prompt
+    assert "Preserve every reference from" in coder_prompt
+    assert "read_only_configuration_facts" in coder_prompt
     assert "do not replace it with a hard-coded literal" in coder_prompt
     reasoner_prompt = OpenRouterGateway.SYSTEM_PROMPTS["reasoner"]
     assert "closed numeric diagnostics" in reasoner_prompt
@@ -2752,7 +2753,8 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
     assert '"causal_hypothesis", "source_evidence", "configuration_fact_ids"' in system_prompt
     assert "causal_hypothesis is explicitly unproven and falsifiable" in system_prompt
     assert "source_evidence objects require exactly path, start_line, and lines" in system_prompt
-    assert "cite every supplied configuration fact ID exactly once" in system_prompt
+    assert "read_only_configuration_facts exactly once" in system_prompt
+    assert "never source snapshots or editable paths" in system_prompt
     assert "Never invent baseline values" in system_prompt
     assert "diagnosis, causal_hypothesis, and skip_reason must be JSON strings" in system_prompt
     assert "invariants, files_to_change, and steps must be JSON arrays of strings" in system_prompt
@@ -8467,14 +8469,22 @@ def test_proposal_batch_supplies_and_enforces_grounded_configuration_facts(
         expected_facts = [
             {
                 "fact_id": "settings.RS_Q1_WEIGHT",
-                "line": 1,
-                "path": "config/settings.py",
-                "source_sha256": hashlib.sha256(b"RS_Q1_WEIGHT = 0.40\n").hexdigest(),
+                "read_only": True,
                 "value": 0.4,
             }
         ]
-        assert reasoner_payload["configuration_facts"] == expected_facts
-        assert coder_payload["configuration_facts"] == expected_facts
+        assert reasoner_payload["editable_source_paths"] == [
+            "core/momentum_analysis.py",
+            "core/pivot_detector.py",
+        ]
+        assert coder_payload["editable_source_paths"] == [
+            "core/momentum_analysis.py",
+            "core/pivot_detector.py",
+        ]
+        assert reasoner_payload["read_only_configuration_facts"] == expected_facts
+        assert coder_payload["read_only_configuration_facts"] == expected_facts
+        assert "configuration_facts" not in reasoner_payload
+        assert "configuration_facts" not in coder_payload
         assert result.budget.api_calls == 3
         assert not candidate.root.exists()
     finally:
@@ -9823,6 +9833,12 @@ def test_state_machine_dry_run_exports_exact_proposal_without_mutating_candidate
         coder_payload = json.loads(coder_dynamic)
         reasoner_payload = json.loads(gateway.dynamic_inputs[1][1])
         assert coder_payload["evidence"] == reasoner_payload["evidence"]
+        assert reasoner_payload["editable_source_paths"] == ["core/backtest_engine.py"]
+        assert coder_payload["editable_source_paths"] == ["core/backtest_engine.py"]
+        assert reasoner_payload["read_only_configuration_facts"] == []
+        assert coder_payload["read_only_configuration_facts"] == []
+        assert "configuration_facts" not in reasoner_payload
+        assert "configuration_facts" not in coder_payload
         assert coder_payload["source_snapshots"][0]["line_numbers_are_annotations"] is True
         assert coder_payload["source_snapshots"][0]["sanitized_text"] == "1: VALUE = 1\n"
         assert candidate.root.exists()

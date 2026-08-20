@@ -1843,9 +1843,12 @@ class OpenRouterGateway:
                 "source_evidence objects require exactly path, start_line, and lines; path must be a "
                 "provided source snapshot, start_line must be its immutable original coordinate, and "
                 "lines must exactly reproduce consecutive supplied source lines without annotations. "
-                "For a non-skip plan, anchor every files_to_change path and cite every supplied "
-                "configuration fact ID exactly once in configuration_fact_ids. Never invent baseline "
-                "values or configuration facts. diagnosis must state only observed gate facts; "
+                "For a non-skip plan, every source_evidence and files_to_change path must appear in "
+                "editable_source_paths and source_snapshots. Cite every fact_id from "
+                "read_only_configuration_facts exactly once in configuration_fact_ids. Those facts are "
+                "read-only baselines, never source snapshots or editable paths; do not propose changing "
+                "config/settings.py. Never invent baseline values or configuration facts. diagnosis must "
+                "state only observed gate facts; "
                 "causal_hypothesis is explicitly unproven and falsifiable. Use JSON arrays for "
                 "source_evidence, configuration_fact_ids, invariants, files_to_change, and steps; "
                 "choose files only from the provided source snapshots. Use the closed numeric diagnostics "
@@ -1878,8 +1881,9 @@ class OpenRouterGateway:
                 "old_lines must exactly match consecutive visible source lines including indentation. "
                 "Do not add any new defaulted parameter in a function, method, or lambda, even with a proposed "
                 "caller; make a direct change to already-executed logic and never add dormant optional knobs. "
-                "Preserve every supplied configuration reference that appears in old_lines; do not replace it "
-                "with a hard-coded literal or otherwise bypass the controller-supplied configuration fact. "
+                "Every replacement path must appear in editable_source_paths. Preserve every reference from "
+                "read_only_configuration_facts that appears in old_lines; do not replace it with a hard-coded "
+                "literal or otherwise bypass the controller-supplied read-only configuration fact. "
                 "Order replacements by path and original start_line, with no duplicate, overlapping, or "
                 "adjacent source ranges; merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -6450,6 +6454,24 @@ class ConfigurationFact:
             raise ConfigurationError("configuration fact source hash is invalid")
 
 
+def _read_only_configuration_fact_payload(
+    facts: Sequence[ConfigurationFact],
+) -> list[dict[str, object]]:
+    """Minimize provider facts and make their non-editable status explicit."""
+    if not isinstance(facts, (tuple, list)) or any(
+        not isinstance(fact, ConfigurationFact) for fact in facts
+    ):
+        raise ConfigurationError("provider configuration facts are invalid")
+    return [
+        {
+            "fact_id": fact.fact_id,
+            "read_only": True,
+            "value": fact.value,
+        }
+        for fact in facts
+    ]
+
+
 def _coder_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, object]:
     """Add controller-owned line annotations to one provider-safe coder snapshot."""
     if not isinstance(snapshot, SourceSnapshot):
@@ -9156,9 +9178,10 @@ def run_proposal_batch(
                         "evidence": evidence_payload,
                         "route": asdict(route),
                         "source_snapshots": [asdict(value) for value in snapshots],
-                        "configuration_facts": [
-                            asdict(value) for value in configuration_facts
-                        ],
+                        "editable_source_paths": [value.path for value in snapshots],
+                        "read_only_configuration_facts": (
+                            _read_only_configuration_fact_payload(configuration_facts)
+                        ),
                     },
                     ReasoningPlan.from_json,
                     ReasoningPlan,
@@ -9211,9 +9234,10 @@ def run_proposal_batch(
                         "batch_sample": sample,
                         "evidence": evidence_payload,
                         "plan": asdict(plan),
-                        "configuration_facts": [
-                            asdict(value) for value in configuration_facts
-                        ],
+                        "editable_source_paths": [value.path for value in snapshots],
+                        "read_only_configuration_facts": (
+                            _read_only_configuration_fact_payload(configuration_facts)
+                        ),
                         "source_snapshots": [
                             _coder_snapshot_payload(value) for value in snapshots
                         ],
@@ -9671,9 +9695,10 @@ def run_agent_loop(
                     "evidence": evidence_payload,
                     "route": asdict(route),
                     "source_snapshots": [asdict(value) for value in snapshots],
-                    "configuration_facts": [
-                        asdict(value) for value in configuration_facts
-                    ],
+                    "editable_source_paths": [value.path for value in snapshots],
+                    "read_only_configuration_facts": (
+                        _read_only_configuration_fact_payload(configuration_facts)
+                    ),
                 },
                 ReasoningPlan.from_json,
                 ReasoningPlan,
@@ -9707,9 +9732,10 @@ def run_agent_loop(
                 {
                     "evidence": evidence_payload,
                     "plan": asdict(plan),
-                    "configuration_facts": [
-                        asdict(value) for value in configuration_facts
-                    ],
+                    "editable_source_paths": [value.path for value in snapshots],
+                    "read_only_configuration_facts": (
+                        _read_only_configuration_fact_payload(configuration_facts)
+                    ),
                     "source_snapshots": [
                         _coder_snapshot_payload(value) for value in snapshots
                     ],
