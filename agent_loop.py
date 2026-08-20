@@ -651,21 +651,13 @@ class Route:
 
 @dataclass(frozen=True)
 class ReasoningSourceEvidence:
-    """One provider-cited exact excerpt from a controller-supplied source snapshot."""
+    """One provider-selected approved source path for a reasoning plan."""
 
     path: str
-    lines: tuple[str, ...]
 
     def __post_init__(self) -> None:
         path = _relative_path(self.path, "source evidence path")
-        if not isinstance(self.lines, tuple) or not 1 <= len(self.lines) <= 32:
-            raise PayloadFieldValidationError("source evidence lines must be a nonempty bounded tuple")
-        lines = tuple(
-            _source_line(value, "source evidence lines", allow_trailing_whitespace=True)
-            for value in self.lines
-        )
         object.__setattr__(self, "path", path)
-        object.__setattr__(self, "lines", lines)
 
 
 def _reasoning_source_evidence_list(value: Any) -> tuple[ReasoningSourceEvidence, ...]:
@@ -673,17 +665,13 @@ def _reasoning_source_evidence_list(value: Any) -> tuple[ReasoningSourceEvidence
         raise PayloadFieldValidationError("source_evidence must be a bounded list")
     result: list[ReasoningSourceEvidence] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) != {"path", "lines"}:
+        if not isinstance(item, dict) or set(item) != {"path"}:
             raise PayloadKeysValidationError(
-                "source evidence objects require exactly path and lines"
+                "source evidence objects require exactly path"
             )
-        lines = item["lines"]
-        if not isinstance(lines, list):
-            raise PayloadFieldValidationError("source evidence lines must be a list")
         result.append(
             ReasoningSourceEvidence(
                 path=item["path"],
-                lines=tuple(lines),
             )
         )
     return tuple(result)
@@ -1816,13 +1804,9 @@ class OpenRouterGateway:
                 "You are the Reasoner. Return exactly one concise JSON object with exactly these keys: "
                 '"diagnosis", "causal_hypothesis", "source_evidence", "configuration_fact_ids", '
                 '"invariants", "files_to_change", "steps", "skip", "skip_reason". '
-                "source_evidence objects require exactly path and lines; path must be a provided source "
-                "snapshot. Each visible source snapshot line begins with a controller-rendered N: annotation. "
-                "lines must be a JSON array of 1 to 32 strings, each one physical source line with no N: "
-                "annotation and no newline character. Reproduce consecutive source lines exactly; the controller "
-                "resolves their immutable source coordinate only when they have one exact match. Include the exact "
-                "existing expression the Coder "
-                "should change in source_evidence, not only diagnostic context. "
+                "source_evidence objects require exactly path; path must be a provided source snapshot and "
+                "identifies the approved file supporting the diagnosis. Do not reproduce source lines or "
+                "source coordinates: the controller owns exact source anchoring. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
                 "editable_source_paths and source_snapshots. When a read_only_configuration_facts value informs "
                 "your diagnosis, cite its fact_id in configuration_fact_ids; cite only listed fact_id values. "
@@ -1860,7 +1844,7 @@ class OpenRouterGateway:
                 "must be nonempty JSON "
                 "arrays of source-line strings without newline characters; omit the annotation prefix. "
                 "Return exactly one replacement. It must be a direct executable logic edit within a "
-                "source_evidence span in plan. old_lines must exactly match consecutive visible source lines "
+                "files_to_change path in plan. old_lines must exactly match consecutive visible source lines "
                 "including indentation. "
                 "Do not add any new defaulted parameter in a function, method, or lambda, even with a proposed "
                 "caller; make a direct change to already-executed logic and never add dormant optional knobs. "
@@ -1893,7 +1877,7 @@ class OpenRouterGateway:
     _RESPONSE_SCHEMA_NAMES = MappingProxyType(
         {
             "orchestrator": "agent_loop_orchestrator_v1",
-            "reasoner": "agent_loop_reasoning_plan_v2",
+            "reasoner": "agent_loop_reasoning_plan_v3",
             "coder": "agent_loop_coder_v1",
         }
     )
@@ -1940,13 +1924,9 @@ class OpenRouterGateway:
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["path", "lines"],
+                            "required": ["path"],
                             "properties": {
                                 "path": {"type": "string"},
-                                "lines": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
                             },
                         },
                     },
@@ -6785,7 +6765,6 @@ def render_typed_coding_proposal(
     candidate: Candidate,
     proposal: TypedCodingProposal,
     snapshots: tuple[SourceSnapshot, ...],
-    source_evidence: Sequence[ReasoningSourceEvidence] | None = None,
 ) -> CodingProposal:
     """Render validated provider edits into the sole canonical zero-context diff dialect."""
     root = _require_candidate(candidate)
@@ -6800,25 +6779,6 @@ def render_typed_coding_proposal(
     snapshot_by_path = {value.path: value for value in snapshots}
     if len(snapshot_by_path) != len(snapshots) or set(proposal.files) - set(snapshot_by_path):
         raise PatchPolicyError("typed replacement path is outside the visible source snapshots")
-    if source_evidence is not None and (
-        not isinstance(source_evidence, (tuple, list))
-        or any(not isinstance(value, ReasoningSourceEvidence) for value in source_evidence)
-    ):
-        raise ConfigurationError("typed coder source evidence is invalid")
-    evidence_spans_by_path: dict[str, list[tuple[int, int]]] = {}
-    if source_evidence is not None:
-        for evidence in source_evidence:
-            snapshot = snapshot_by_path.get(evidence.path)
-            if snapshot is None:
-                raise PatchPolicyError("reasoning evidence is outside the visible source snapshots")
-            start = _unique_visible_snapshot_span_start(
-                snapshot,
-                evidence.lines,
-                field="reasoning evidence",
-            )
-            evidence_spans_by_path.setdefault(evidence.path, []).append(
-                (start, start + len(evidence.lines) - 1)
-            )
     grouped: dict[str, list[ExactLineReplacement]] = {}
     for replacement in proposal.replacements:
         grouped.setdefault(replacement.path, []).append(replacement)
@@ -6885,13 +6845,6 @@ def render_typed_coding_proposal(
             visible_slice = visible_lines[view_offset : view_offset + old_count]
             if source_slice != replacement.old_lines or visible_slice != replacement.old_lines:
                 raise PatchPolicyError("typed replacement old lines do not match exact visible source")
-            if source_evidence is not None and not any(
-                old_start >= evidence_start and old_end <= evidence_end
-                for evidence_start, evidence_end in evidence_spans_by_path.get(path, ())
-            ):
-                raise PatchPolicyError(
-                    "typed replacement is outside its exact reasoning evidence span"
-                )
             resolved_replacements.append((old_start, replacement))
         if resolved_replacements != sorted(resolved_replacements, key=lambda item: item[0]):
             raise PatchPolicyError("typed replacements must be ordered by resolved source position")
@@ -7624,14 +7577,8 @@ def _validate_reasoning_plan_grounding(
             raise ConfigurationError("reasoning grounding snapshots are duplicated")
         snapshot_by_path[snapshot.path] = snapshot
     for evidence in plan.source_evidence:
-        snapshot = snapshot_by_path.get(evidence.path)
-        if snapshot is None:
+        if snapshot_by_path.get(evidence.path) is None:
             raise PatchPolicyError("reasoning evidence is outside the exact source snapshots")
-        _unique_visible_snapshot_span_start(
-            snapshot,
-            evidence.lines,
-            field="reasoning evidence",
-        )
     if not set(plan.files_to_change).issubset(
         {evidence.path for evidence in plan.source_evidence}
     ):
@@ -9434,7 +9381,6 @@ def run_proposal_batch(
                         candidate,
                         typed_proposal,
                         snapshots,
-                        plan.source_evidence,
                     )
                     evaluation = services.evaluate_proposal(proposal, sample)
                     if not isinstance(evaluation, ProposalEvaluation):
@@ -9949,7 +9895,6 @@ def run_agent_loop(
                     candidate,
                     typed_proposal,
                     snapshots,
-                    plan.source_evidence,
                 )
                 validate_unified_diff(
                     candidate.root,
