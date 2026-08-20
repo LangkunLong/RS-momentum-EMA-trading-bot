@@ -1816,6 +1816,9 @@ class OpenRouterGateway:
                 "owned configuration boundary: do not propose changing, replacing, or hard-coding its effect. "
                 "Locked configuration source lines are omitted from the provider view; do not recreate them. When "
                 "read_only_configuration_facts is empty, configuration_fact_ids must be an empty JSON array. "
+                "When read_only_execution_facts is supplied, treat it as controller-owned behavioral evidence: "
+                "use it to rule out edits that cannot affect the observed execution path, and never treat it "
+                "as editable source or configuration. "
                 "diagnosis must "
                 "state only observed gate facts; "
                 "causal_hypothesis is explicitly unproven and falsifiable. Use JSON arrays for "
@@ -1859,6 +1862,8 @@ class OpenRouterGateway:
                 "A source line containing settings. is locked and must not appear in old_lines or new_lines. "
                 "Locked configuration source lines are omitted from the provider view and cannot appear in any "
                 "replacement. "
+                "Treat any read_only_execution_facts as immutable behavioral constraints; do not propose an edit "
+                "whose stated mechanism they rule out. "
                 "Order multiple replacements by path; use no duplicate, overlapping, or adjacent source ranges "
                 "and merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -6959,6 +6964,7 @@ def run_final_quality(
     *,
     audit: AuditTrail | None = None,
     iteration: int = 0,
+    test_selectors: Sequence[str] = (),
 ) -> QualityObservation:
     """Observe all release gates in fresh sandboxes and return only closed provider-safe facts."""
     if type(iteration) is not int or not 0 <= iteration <= MAX_ITERATIONS:
@@ -7031,7 +7037,11 @@ def run_final_quality(
             record_failure(failure_code)
         return accepted
 
-    test_passed = observe("pytest", build_test_gate_argv(root), "pytest_failed")
+    test_passed = observe(
+        "pytest",
+        build_test_gate_argv(root, test_selectors),
+        "pytest_failed",
+    )
     ruff_passed = observe("ruff", build_ruff_gate_argv(), "ruff_failed")
     compile_passed = observe(
         "compileall", build_compileall_gate_argv(), "compile_failed"
@@ -8877,6 +8887,28 @@ def _proposal_batch_editable_paths() -> tuple[str, ...]:
     return editable
 
 
+def _proposal_batch_quality_selectors() -> tuple[str, ...]:
+    """Run the direct behavior tests for the sole editable batch surface."""
+    if _proposal_batch_editable_paths() != ("core/pivot_detector.py",):
+        raise ConfigurationError("proposal batch quality scope is not pinned")
+    return ("tests/test_pivot_detector.py",)
+
+
+def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
+    """Return the fixed read-only semantics needed to avoid a no-op pivot experiment."""
+    return (
+        {
+            "fact_id": "pivot_absence_allows_buy_zone",
+            "read_only": True,
+            "value": (
+                "When find_pivot returns no pivot, the backtest sets in_buy_zone to true. "
+                "Making pivot detection more permissive cannot increase entry eligibility; it can only "
+                "preserve or block an existing signal."
+            ),
+        },
+    )
+
+
 def run_proposal_batch(
     config: LoopConfig,
     state: SourceState,
@@ -9323,6 +9355,9 @@ def run_proposal_batch(
                         ],
                         "editable_source_paths": [value.path for value in snapshots],
                         "read_only_configuration_facts": [],
+                        "read_only_execution_facts": list(
+                            _proposal_batch_execution_facts()
+                        ),
                     },
                     ReasoningPlan.from_json,
                     ReasoningPlan,
@@ -9377,6 +9412,9 @@ def run_proposal_batch(
                         "plan": asdict(plan),
                         "editable_source_paths": [value.path for value in snapshots],
                         "read_only_configuration_facts": [],
+                        "read_only_execution_facts": list(
+                            _proposal_batch_execution_facts()
+                        ),
                         "source_snapshots": [
                             _provider_editable_snapshot_payload(value) for value in snapshots
                         ],
@@ -10719,7 +10757,11 @@ def _execute_cli_run(
                     gate="backtest",
                     editable_paths=_proposal_batch_editable_paths(),
                     compile_runner=proposal_compile_runner,
-                    run_quality=lambda current: run_final_quality(current, sandbox),
+                    run_quality=lambda current: run_final_quality(
+                        current,
+                        sandbox,
+                        test_selectors=_proposal_batch_quality_selectors(),
+                    ),
                     run_primary_gate=lambda current: _backtest_provider_evidence(
                         current,
                         sandbox,
