@@ -1814,7 +1814,7 @@ class OpenRouterGateway:
                 "config/settings.py must not appear in files_to_change or steps. Never invent baseline values "
                 "or configuration facts. Any source expression containing settings. is an immutable controller-"
                 "owned configuration boundary: do not propose changing, replacing, or hard-coding its effect. "
-                "A source display marked [LOCKED CONFIGURATION EXPRESSION] is immutable. When "
+                "Locked configuration source lines are omitted from the provider view; do not recreate them. When "
                 "read_only_configuration_facts is empty, configuration_fact_ids must be an empty JSON array. "
                 "diagnosis must "
                 "state only observed gate facts; "
@@ -1857,8 +1857,8 @@ class OpenRouterGateway:
                 "literal or otherwise bypass the controller-supplied read-only configuration fact. Do not edit "
                 "config/settings.py, adjust a settings value, or turn a settings reference into a literal. "
                 "A source line containing settings. is locked and must not appear in old_lines or new_lines. "
-                "A source display marked [LOCKED CONFIGURATION EXPRESSION] is controller-owned and cannot "
-                "appear in any replacement. "
+                "Locked configuration source lines are omitted from the provider view and cannot appear in any "
+                "replacement. "
                 "Order multiple replacements by path; use no duplicate, overlapping, or adjacent source ranges "
                 "and merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -6593,17 +6593,11 @@ def _provider_editable_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, o
     annotated = payload["sanitized_text"]
     if not isinstance(annotated, str):
         raise ConfigurationError("provider snapshot text is invalid")
-    locked: list[str] = []
+    editable: list[str] = []
     for line in annotated.splitlines(keepends=True):
         if "settings." not in line:
-            locked.append(line)
-            continue
-        prefix, separator, _ = line.partition(": ")
-        if not separator:
-            raise ConfigurationError("provider snapshot annotation is invalid")
-        newline = "\n" if line.endswith("\n") else ""
-        locked.append(f"{prefix}: [LOCKED CONFIGURATION EXPRESSION]{newline}")
-    payload["sanitized_text"] = "".join(locked)
+            editable.append(line)
+    payload["sanitized_text"] = "".join(editable)
     return payload
 
 
@@ -8876,10 +8870,10 @@ def export_inert_proposal(
 
 
 def _proposal_batch_editable_paths() -> tuple[str, ...]:
-    """Expose only writable strategy paths, never the protected backtest oracle."""
-    editable = tuple(sorted(DEFAULT_EDITABLE_PATHS - BACKTEST_READ_ONLY_PATHS))
-    if not editable:
-        raise ConfigurationError("proposal batch has no writable strategy paths")
+    """Expose the first directly executable pivot-mechanics experiment surface only."""
+    editable = ("core/pivot_detector.py",)
+    if not set(editable).issubset(DEFAULT_EDITABLE_PATHS - BACKTEST_READ_ONLY_PATHS):
+        raise ConfigurationError("proposal batch pivot surface is not writable")
     return editable
 
 
