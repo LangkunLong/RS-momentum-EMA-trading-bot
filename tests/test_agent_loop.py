@@ -1711,6 +1711,158 @@ def test_gateway_deadline_expiring_during_pricing_starts_no_paid_call() -> None:
     assert ledger.incomplete_accounting_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("remaining", "expected_timeout"),
+    ((2.5, 2.5), (120.0, 30.0)),
+)
+def test_gateway_preload_pricing_caps_builtin_timeout_to_remaining_wall(
+    monkeypatch: pytest.MonkeyPatch,
+    remaining: float,
+    expected_timeout: float,
+) -> None:
+    """Production pricing discovery cannot outlive the shared batch deadline."""
+    from agent_loop import BudgetLedger, OpenRouterGateway
+
+    observed_timeouts: list[float] = []
+
+    class PricingResponse:
+        def __enter__(self) -> "PricingResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "data": [
+                        {
+                            "id": "qwen/qwen3-next-80b-a3b-instruct",
+                            "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def urlopen(_request: object, *, timeout: float) -> PricingResponse:
+        observed_timeouts.append(timeout)
+        return PricingResponse()
+
+    monkeypatch.setattr("agent_loop.urllib.request.urlopen", urlopen)
+    gateway = OpenRouterGateway(
+        client=FakeClient([]),
+        ledger=BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000),
+        timeout_seconds=180.0,
+    )
+
+    gateway.preload_pricing(
+        ("orchestrator",),
+        wall_deadline=10.0 + remaining,
+        monotonic=lambda: 10.0,
+    )
+
+    assert observed_timeouts == pytest.approx([expected_timeout])
+
+
+def test_gateway_preload_pricing_refuses_expired_deadline_before_loader() -> None:
+    """An expired shared wall cannot start even a non-billable pricing lookup."""
+    from agent_loop import BudgetExceededError, BudgetLedger, OpenRouterGateway
+
+    loaded: list[str] = []
+
+    def pricing(model: str) -> dict[str, float]:
+        loaded.append(model)
+        return {"prompt": 1.0, "completion": 1.0}
+
+    gateway = OpenRouterGateway(
+        client=FakeClient([]),
+        pricing_loader=pricing,
+        ledger=BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000),
+    )
+
+    with pytest.raises(BudgetExceededError):
+        gateway.preload_pricing(
+            ("orchestrator",),
+            wall_deadline=1.0,
+            monotonic=lambda: 1.0,
+        )
+
+    assert loaded == []
+
+
+def test_gateway_preload_pricing_crossed_deadline_is_budget_exhaustion() -> None:
+    """A pricing failure at the wall remains a closed deadline stop, not a boundary fault."""
+    from agent_loop import (
+        BudgetExceededError,
+        BudgetLedger,
+        ConfigurationError,
+        OpenRouterGateway,
+    )
+
+    current = [0.0]
+
+    def pricing(_model: str) -> dict[str, float]:
+        current[0] = 1.0
+        raise ConfigurationError("private pricing error canary")
+
+    gateway = OpenRouterGateway(
+        client=FakeClient([]),
+        pricing_loader=pricing,
+        ledger=BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000),
+    )
+
+    with pytest.raises(BudgetExceededError, match="wall deadline"):
+        gateway.preload_pricing(
+            ("orchestrator",),
+            wall_deadline=1.0,
+            monotonic=lambda: current[0],
+        )
+
+    assert gateway.ledger.calls == 0
+
+
+def test_strict_request_caps_builtin_pricing_lookup_to_remaining_wall() -> None:
+    """Direct strict calls bound pricing before reserving or starting the paid chat."""
+    from agent_loop import BudgetLedger, OpenRouterGateway, Route
+
+    observed_timeouts: list[float] = []
+
+    def builtin_pricing(
+        _model: str,
+        *,
+        timeout_seconds: float,
+    ) -> dict[str, float]:
+        observed_timeouts.append(timeout_seconds)
+        return {"prompt": 1.0, "completion": 1.0}
+
+    client = FakeClient(
+        [
+            FakeResponse(
+                _route_json(),
+                cost=0.01,
+                model="qwen/qwen3-next-80b-a3b-instruct",
+            )
+        ]
+    )
+    gateway = OpenRouterGateway(
+        client=client,
+        ledger=BudgetLedger(max_usd=1.0, max_calls=3, max_tokens=10_000),
+        timeout_seconds=180.0,
+    )
+    gateway.pricing_loader = builtin_pricing
+
+    gateway.request_once(
+        "orchestrator",
+        "evidence",
+        Route.from_json,
+        wall_deadline=2.5,
+        monotonic=lambda: 0.0,
+    )
+
+    assert observed_timeouts == pytest.approx([2.5])
+    assert client.completions.calls[0]["timeout"] == pytest.approx(2.5)
+
+
 def test_generation_accounting_malformed_success_is_not_retried() -> None:
     """A malformed successful metadata response is definitive, not eventual consistency."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ResponseValidationError, Route
@@ -3935,6 +4087,27 @@ def test_patch_policy_checks_hunk_counts_declared_files_deny_precedence_and_live
     live_import = _task2_diff(new="from core.order_execution import Broker")
     with pytest.raises(PatchPolicyError, match="live"):
         validate_unified_diff(repo, live_import, ["core/backtest_engine.py"])
+
+
+def test_patch_policy_preserves_git_preflight_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A controller Git failure is never reclassified as model patch policy."""
+    import agent_loop
+
+    repo = _task2_repo(tmp_path)
+
+    def fail_git(*_args: object, **_kwargs: object) -> object:
+        raise agent_loop.PreflightError("private git boundary canary")
+
+    monkeypatch.setattr(agent_loop, "_git", fail_git)
+    with pytest.raises(agent_loop.PreflightError, match="private git boundary canary"):
+        agent_loop.validate_unified_diff(
+            repo,
+            _task2_diff(),
+            ["core/backtest_engine.py"],
+        )
 
 
 def test_backtest_gate_makes_engine_files_read_only_and_requires_mode_100644(tmp_path: Path) -> None:
@@ -7068,7 +7241,13 @@ class _StrictBatchGateway:
         self.dynamic_inputs: list[tuple[str, str]] = []
         self.pricing_preloads: list[tuple[str, ...]] = []
 
-    def preload_pricing(self, roles: tuple[str, ...]) -> None:
+    def preload_pricing(
+        self,
+        roles: tuple[str, ...],
+        *,
+        wall_deadline: float | None = None,
+        monotonic: Any = None,
+    ) -> None:
         self.pricing_preloads.append(roles)
 
     def request_once(
@@ -7435,6 +7614,30 @@ def test_proposal_batch_failure_stops_before_the_next_role_or_sample(tmp_path: P
         external.cleanup()
 
 
+def test_proposal_batch_deadline_before_sample_is_not_counted_as_attempted(
+    tmp_path: Path,
+) -> None:
+    """A sample starts only after its entry wall check succeeds."""
+    moments = iter((0.0, 0.0, 1.0))
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        outcomes=[],
+        clock=lambda: next(moments),
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "budget_exceeded"
+        assert result.attempted_samples == 0
+        assert result.completed_samples == 0
+        assert result.rejected_samples == 0
+        assert result.budget.api_calls == 0
+        assert gateway.roles == []
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
 def test_proposal_batch_rejects_accounted_facts_not_bound_to_active_call(
     tmp_path: Path,
 ) -> None:
@@ -7781,7 +7984,7 @@ def test_proposal_batch_treats_preflight_failure_as_a_controller_boundary(
     def fail_preflight(*_args: object, **_kwargs: object) -> object:
         raise agent_loop.PreflightError("private provider canary")
 
-    monkeypatch.setattr(agent_loop, "export_inert_proposal", fail_preflight)
+    monkeypatch.setattr(agent_loop, "_git_patch", fail_preflight)
     result, gateway, candidate, external = _run_proposal_batch_fixture(
         tmp_path,
         samples=2,
@@ -9288,7 +9491,7 @@ def test_production_cli_attempts_all_owned_cleanup_when_bundle_cleanup_fails(
         lambda _candidate: cleanup_calls.append("candidate"),
     )
 
-    with pytest.raises(agent_loop.QuarantineError, match="bundle cleanup"):
+    with pytest.raises(agent_loop.ControllerInitializationError) as raised:
         agent_loop._execute_cli_run(
             config,
             docker_executable=(tmp_path / "bin" / "docker.exe").resolve(),
@@ -9296,4 +9499,6 @@ def test_production_cli_attempts_all_owned_cleanup_when_bundle_cleanup_fails(
             run_id="run-20260818T010203Z-abcdef123456",
         )
 
+    assert raised.value.stage == "cleanup"
+    assert isinstance(raised.value.__cause__, agent_loop.QuarantineError)
     assert cleanup_calls == ["bundle", "candidate", "state"]

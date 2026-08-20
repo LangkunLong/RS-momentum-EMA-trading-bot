@@ -1687,11 +1687,21 @@ def _controller_dotenv_values(controller_root: Path) -> dict[str, str]:
     return values
 
 
-def _load_current_pricing(model: str) -> Mapping[str, float]:
+def _load_current_pricing(
+    model: str,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Mapping[str, float]:
     """Load current model pricing and normalize OpenRouter's per-token values to per-million."""
+    if (
+        type(timeout_seconds) not in {int, float}
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ConfigurationError("OpenRouter pricing timeout is invalid")
     request = urllib.request.Request(f"{OPENROUTER_BASE_URL}/models", method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:  # noqa: S310
+        with urllib.request.urlopen(request, timeout=float(timeout_seconds)) as response:  # noqa: S310
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ConfigurationError("could not load current OpenRouter pricing") from exc
@@ -1832,6 +1842,7 @@ class OpenRouterGateway:
             if not self.api_key:
                 raise ConfigurationError("OPENROUTER_API_KEY or OPENROUTER is required")
         self.run_id = run_id
+        self._pricing_loader_is_builtin = pricing_loader is None
         self.pricing_loader = pricing_loader or _load_current_pricing
         self.ledger = ledger or BudgetLedger(max_usd=1.0)
         self.app_url = app_url
@@ -1925,17 +1936,66 @@ class OpenRouterGateway:
         except Exception as exc:
             raise GatewayError("OpenRouter request failed", status_code=_status_code(exc)) from exc
 
-    def preload_pricing(self, roles: Sequence[str] = ("orchestrator", "reasoner", "coder")) -> None:
+    def preload_pricing(
+        self,
+        roles: Sequence[str] = ("orchestrator", "reasoner", "coder"),
+        *,
+        wall_deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         """Load and freeze one price record per selected role model before paid calls."""
+        if wall_deadline is not None and (
+            type(wall_deadline) not in {int, float}
+            or not math.isfinite(wall_deadline)
+            or not callable(monotonic)
+        ):
+            raise ConfigurationError("gateway wall deadline is invalid")
         for role in roles:
             if role not in self._MODELS:
                 raise ConfigurationError(f"unknown gateway role: {role}")
-            self._pricing_for_model(self._MODELS[role])
+            remaining = None
+            if wall_deadline is not None:
+                remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
+                if remaining <= 0:
+                    raise BudgetExceededError("proposal batch wall deadline reached")
+            try:
+                self._pricing_for_model(
+                    self._MODELS[role],
+                    timeout_seconds=(
+                        None
+                        if remaining is None
+                        else min(DEFAULT_TIMEOUT_SECONDS, self.timeout_seconds, remaining)
+                    ),
+                )
+            except Exception as exc:
+                if wall_deadline is not None and (
+                    _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0
+                ):
+                    raise BudgetExceededError(
+                        "proposal batch wall deadline reached"
+                    ) from exc
+                raise
+            if wall_deadline is not None and (
+                _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0
+            ):
+                raise BudgetExceededError("proposal batch wall deadline reached")
 
-    def _pricing_for_model(self, model: str) -> Pricing:
+    def _pricing_for_model(
+        self,
+        model: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Pricing:
         pricing = self._pricing_cache.get(model)
         if pricing is None:
-            pricing = Pricing.from_value(self.pricing_loader(model))
+            if self._pricing_loader_is_builtin and timeout_seconds is not None:
+                pricing_value = self.pricing_loader(
+                    model,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                pricing_value = self.pricing_loader(model)
+            pricing = Pricing.from_value(pricing_value)
             self._pricing_cache[model] = pricing
         return pricing
 
@@ -2146,9 +2206,29 @@ class OpenRouterGateway:
             {"role": "system", "content": self.STATIC_CONTEXT},
             {"role": "user", "content": dynamic},
         ]
-        pricing = self._pricing_for_model(model)
-        prompt_for_reservation = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
         request_timeout = self.timeout_seconds
+        pricing_timeout = None
+        if wall_deadline is not None:
+            remaining = _remaining_wall_seconds(wall_deadline, monotonic)
+            if remaining <= 0:
+                raise BudgetExceededError("proposal batch wall deadline reached")
+            pricing_timeout = min(
+                DEFAULT_TIMEOUT_SECONDS,
+                self.timeout_seconds,
+                remaining,
+            )
+        try:
+            pricing = self._pricing_for_model(
+                model,
+                timeout_seconds=pricing_timeout,
+            )
+        except Exception as exc:
+            if wall_deadline is not None and (
+                _remaining_wall_seconds(wall_deadline, monotonic) <= 0
+            ):
+                raise BudgetExceededError("proposal batch wall deadline reached") from exc
+            raise
+        prompt_for_reservation = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
         if wall_deadline is not None:
             remaining = _remaining_wall_seconds(wall_deadline, monotonic)
             if remaining <= 0:
@@ -4821,10 +4901,7 @@ def validate_unified_diff(
             raise PatchPolicyError(f"target is outside editable scope: {path}")
         if gate == "backtest" and path in BACKTEST_READ_ONLY_PATHS:
             raise PatchPolicyError(f"backtest oracle path is read-only: {path}")
-        try:
-            entry = _git(candidate_root, "ls-files", "-s", "--", path).stdout.decode().strip()
-        except PreflightError as exc:
-            raise PatchPolicyError(f"target is not tracked: {path}") from exc
+        entry = _git(candidate_root, "ls-files", "-s", "--", path).stdout.decode().strip()
         fields = entry.split()
         if len(fields) != 4 or fields[0] != "100644" or fields[2] != "0" or fields[3] != path:
             raise PatchPolicyError(f"target must be a tracked 100644 stage-0 file: {path}")
@@ -4920,10 +4997,7 @@ def _validate_exact_patch_anchors(candidate_root: Path, parsed: ParsedPatch) -> 
 
 
 def _git_patch(root: Path, args: Sequence[str], raw: str) -> subprocess.CompletedProcess[bytes]:
-    try:
-        executable = _approved_git_executable()
-    except PreflightError as exc:
-        raise PatchApplicationError("an approved absolute Git executable is unavailable") from exc
+    executable = _approved_git_executable()
     environment = _git_environment()
     try:
         return subprocess.run(
@@ -4935,9 +5009,11 @@ def _git_patch(root: Path, args: Sequence[str], raw: str) -> subprocess.Complete
             capture_output=True,
             timeout=30,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        detail = exc.stderr.decode("utf-8", errors="replace")[:2048] if isinstance(exc, subprocess.CalledProcessError) else ""
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace")[:2048]
         raise PatchApplicationError(f"git {' '.join(args)} failed: {detail}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PreflightError("Git patch operation failed") from exc
 
 
 def apply_candidate_patch(
@@ -5018,7 +5094,7 @@ def apply_candidate_patch(
             raise PatchApplicationError("compile gate failed")
     except Exception as exc:
         _restore_tree(candidate_root, before)
-        if isinstance(exc, (PatchApplicationError, CandidateMutationError)):
+        if isinstance(exc, (PatchApplicationError, CandidateMutationError, PreflightError)):
             raise
         raise PatchApplicationError("patch postcondition failed") from exc
     return parsed
@@ -7815,7 +7891,13 @@ class LoopServices:
 class StrictAgentGatewayProtocol(Protocol):
     ledger: BudgetLedger
 
-    def preload_pricing(self, roles: Sequence[str] = ...) -> None: ...
+    def preload_pricing(
+        self,
+        roles: Sequence[str] = ...,
+        *,
+        wall_deadline: float | None = None,
+        monotonic: Callable[[], float] = ...,
+    ) -> None: ...
 
     def request_once(
         self,
@@ -8413,12 +8495,16 @@ def run_proposal_batch(
         ):
             failure_code = "primary_gate_failed"
         else:
-            services.gateway.preload_pricing(("orchestrator", "reasoner", "coder"))
+            services.gateway.preload_pricing(
+                ("orchestrator", "reasoner", "coder"),
+                wall_deadline=deadline,
+                monotonic=services.monotonic,
+            )
             sealed_manifest = _candidate_tracked_manifest_sha256(candidate)
             evidence_payload = {"primary": asdict(evidence)}
             for sample in range(1, limits.samples + 1):
-                attempted_samples = sample
                 check_wall()
+                attempted_samples = sample
                 calls_before = ledger.calls
                 window = BudgetWindow(
                     baseline_calls=calls_before,
@@ -8527,7 +8613,7 @@ def run_proposal_batch(
                         proposal_payload_sha256=proposal_payload_sha256,
                         renderer_contract="coding_exact_replacements_v1",
                     )
-                except (PatchPolicyError, PreflightError) as exc:
+                except PatchPolicyError as exc:
                     try:
                         record_sample_rejection(
                             sample=sample,
@@ -8580,11 +8666,11 @@ def run_proposal_batch(
         failure_code = "insufficient_evidence"
     except (ResponseValidationError, ProtocolValidationError):
         failure_code = "protocol_invalid"
-    except (PatchPolicyError, PreflightError):
+    except PatchPolicyError:
         failure_code = "patch_rejected"
     except CandidateMutationError:
         failure_code = "candidate_mutation"
-    except (ConfigurationError, QuarantineError, AuditError, SandboxError):
+    except (ConfigurationError, PreflightError, QuarantineError, AuditError, SandboxError):
         failure_code = "controller_boundary_error"
     except Exception:
         failure_code = "unexpected_controller_error"
@@ -8992,7 +9078,7 @@ def run_agent_loop(
                     editable_paths=services.editable_paths,
                     gate=gate_kind,
                 )
-            except (PatchPolicyError, PreflightError):
+            except PatchPolicyError:
                 emit(
                     LoopState.RECORD_REJECTION,
                     "proposal_rejected",
