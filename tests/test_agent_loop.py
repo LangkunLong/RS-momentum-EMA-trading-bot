@@ -7634,10 +7634,20 @@ def test_proposal_batch_records_an_inert_patch_rejection_and_continues(
         external.cleanup()
 
 
-def test_proposal_batch_records_a_closed_coder_field_rejection_and_continues(
+@pytest.mark.parametrize(
+    "failure_code",
+    (
+        "payload_schema_invalid",
+        "payload_json_invalid",
+        "payload_keys_invalid",
+        "payload_field_invalid",
+    ),
+)
+def test_proposal_batch_records_a_closed_coder_payload_rejection_and_continues(
     tmp_path: Path,
+    failure_code: str,
 ) -> None:
-    """A fully accounted bad typed field is safe model-quality evidence."""
+    """Fully accounted parser-level failures are safe model-quality evidence."""
     from agent_loop import (
         AccountedResponseValidationError,
         ProtocolFailureCode,
@@ -7660,7 +7670,7 @@ def test_proposal_batch_records_a_closed_coder_field_rejection_and_continues(
             cost_usd=0.001,
         ),
         response_schema_valid=False,
-        protocol_failure_code=ProtocolFailureCode.PAYLOAD_FIELD_INVALID,
+        protocol_failure_code=ProtocolFailureCode(failure_code),
     )
     result, gateway, candidate, external = _run_proposal_batch_fixture(
         tmp_path,

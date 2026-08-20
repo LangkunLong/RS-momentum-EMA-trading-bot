@@ -170,6 +170,16 @@ class ProtocolFailureCode(str, Enum):
     VALIDATOR_BOUNDARY_INVALID = "validator_boundary_invalid"
 
 
+_ENSEMBLE_SAFE_PAYLOAD_REJECTIONS = frozenset(
+    {
+        ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
+        ProtocolFailureCode.PAYLOAD_JSON_INVALID,
+        ProtocolFailureCode.PAYLOAD_KEYS_INVALID,
+        ProtocolFailureCode.PAYLOAD_FIELD_INVALID,
+    }
+)
+
+
 class ClosedResponseValidationError(ResponseValidationError):
     """A response rejection carrying only a controller-owned closed stage code."""
 
@@ -8067,8 +8077,7 @@ def run_proposal_batch(
     ) -> bool:
         return (
             exc.facts.role == role
-            and exc.facts.protocol_failure_code
-            is ProtocolFailureCode.PAYLOAD_FIELD_INVALID
+            and exc.facts.protocol_failure_code in _ENSEMBLE_SAFE_PAYLOAD_REJECTIONS
         )
 
     role_models = {
