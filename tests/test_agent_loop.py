@@ -2601,7 +2601,42 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
     ):
         assert call["model"] == model
         assert call["max_tokens"] == token_cap
-        assert call["response_format"] == {"type": "json_object"}
+        response_format = call["response_format"]
+        assert response_format["type"] == "json_schema"
+        schema_wrapper = response_format["json_schema"]
+        assert schema_wrapper["strict"] is True
+        schema = schema_wrapper["schema"]
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        assert set(schema["required"]) == set(schema["properties"])
+
+        def assert_provider_subset(value: object) -> None:
+            if isinstance(value, dict):
+                assert not {
+                    "allOf",
+                    "not",
+                    "dependentRequired",
+                    "dependentSchemas",
+                    "if",
+                    "then",
+                    "else",
+                }.intersection(value)
+                for nested in value.values():
+                    assert_provider_subset(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    assert_provider_subset(nested)
+
+        assert_provider_subset(schema)
+        if role == "reasoner":
+            assert schema_wrapper["name"] == "agent_loop_reasoning_plan_v1"
+            assert schema["properties"]["skip"]["type"] == "boolean"
+            assert schema["properties"]["skip_reason"]["type"] == "string"
+            assert schema["properties"]["source_evidence"]["items"][
+                "additionalProperties"
+            ] is False
+        else:
+            assert schema_wrapper["name"] == f"agent_loop_{role}_v1"
         assert call["extra_body"] == {
             "plugins": [{"id": "response-healing"}],
             "provider": {"require_parameters": True},
@@ -3472,7 +3507,9 @@ def test_gateway_uses_immutable_three_message_prefix_and_reasoner_cap() -> None:
     assert completion.payload.diagnosis == "A boundary is wrong."
     assert call["model"] == "qwen/qwen3-next-80b-a3b-instruct"
     assert call["max_tokens"] == 4096
-    assert call["response_format"] == {"type": "json_object"}
+    assert call["response_format"]["type"] == "json_schema"
+    assert call["response_format"]["json_schema"]["name"] == "agent_loop_reasoning_plan_v1"
+    assert call["response_format"]["json_schema"]["strict"] is True
     assert call["stream"] is False
     assert call["extra_body"] == {"provider": {"require_parameters": True}}
     assert call["extra_headers"]["X-Session-Id"] == "run-123:reasoner"

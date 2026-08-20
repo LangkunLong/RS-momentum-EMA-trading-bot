@@ -1906,6 +1906,125 @@ class OpenRouterGateway:
         }
     )
     _TOKEN_CAPS = MappingProxyType({"orchestrator": 2048, "reasoner": 4096, "coder": 4096})
+    _RESPONSE_SCHEMA_NAMES = MappingProxyType(
+        {
+            "orchestrator": "agent_loop_orchestrator_v1",
+            "reasoner": "agent_loop_reasoning_plan_v1",
+            "coder": "agent_loop_coder_v1",
+        }
+    )
+    _RESPONSE_SCHEMAS = MappingProxyType(
+        {
+            "orchestrator": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "action",
+                    "failure_summary",
+                    "relevant_files",
+                    "reasoning_focus",
+                ],
+                "properties": {
+                    "action": {"type": "string", "enum": ["reason", "abort"]},
+                    "failure_summary": {"type": "string"},
+                    "relevant_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "reasoning_focus": {"type": "string"},
+                },
+            },
+            "reasoner": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "diagnosis",
+                    "causal_hypothesis",
+                    "source_evidence",
+                    "configuration_fact_ids",
+                    "invariants",
+                    "files_to_change",
+                    "steps",
+                    "skip",
+                    "skip_reason",
+                ],
+                "properties": {
+                    "diagnosis": {"type": "string"},
+                    "causal_hypothesis": {"type": "string"},
+                    "source_evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["path", "start_line", "lines"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "start_line": {"type": "integer", "minimum": 1},
+                                "lines": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                    "configuration_fact_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "invariants": {"type": "array", "items": {"type": "string"}},
+                    "files_to_change": {"type": "array", "items": {"type": "string"}},
+                    "steps": {"type": "array", "items": {"type": "string"}},
+                    "skip": {"type": "boolean"},
+                    "skip_reason": {"type": "string"},
+                },
+            },
+            "coder": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["summary", "replacements"],
+                "properties": {
+                    "summary": {"type": "string"},
+                    "replacements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["path", "start_line", "old_lines", "new_lines"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "start_line": {"type": "integer", "minimum": 1},
+                                "old_lines": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "new_lines": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+    )
+
+    @classmethod
+    def _response_format_for_role(cls, role: str) -> dict[str, object]:
+        """Return an isolated strict provider schema for one closed role payload."""
+        try:
+            name = cls._RESPONSE_SCHEMA_NAMES[role]
+            schema = cls._RESPONSE_SCHEMAS[role]
+        except KeyError as exc:
+            raise ConfigurationError("unknown gateway role") from exc
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": name,
+                "strict": True,
+                "schema": json.loads(json.dumps(schema, separators=(",", ":"))),
+            },
+        }
 
     def __init__(
         self,
@@ -2358,7 +2477,7 @@ class OpenRouterGateway:
             response = self._get_client().chat.completions.create(
                 model=model,
                 messages=messages,
-                response_format={"type": "json_object"},
+                response_format=self._response_format_for_role(role),
                 stream=False,
                 max_tokens=self._TOKEN_CAPS[role],
                 timeout=request_timeout,
