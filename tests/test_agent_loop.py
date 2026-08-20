@@ -7634,6 +7634,69 @@ def test_proposal_batch_records_an_inert_patch_rejection_and_continues(
         external.cleanup()
 
 
+def test_proposal_batch_records_a_closed_coder_field_rejection_and_continues(
+    tmp_path: Path,
+) -> None:
+    """A fully accounted bad typed field is safe model-quality evidence."""
+    from agent_loop import (
+        AccountedResponseValidationError,
+        ProtocolFailureCode,
+        ProviderCallFacts,
+        Usage,
+    )
+
+    facts = ProviderCallFacts(
+        call_index=3,
+        role="coder",
+        requested_model="deepseek/deepseek-chat",
+        returned_model="deepseek/deepseek-chat",
+        finish_reason="stop",
+        usage=Usage(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            cached_tokens=0,
+            reasoning_tokens=0,
+            cost_usd=0.001,
+        ),
+        response_schema_valid=False,
+        protocol_failure_code=ProtocolFailureCode.PAYLOAD_FIELD_INVALID,
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            AccountedResponseValidationError("closed coder rejection", facts),
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
+    )
+    try:
+        assert result.status == "batch_complete"
+        assert result.attempted_samples == 2
+        assert result.completed_samples == 1
+        assert result.budget.api_calls == 6
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"] * 2
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        rejected = [
+            event for event in events if event["event"] == "proposal_sample_rejected"
+        ]
+        assert [event["details"] for event in rejected] == [
+            {"calls_consumed": 3, "code": "coder_payload_invalid", "sample": 1}
+        ]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
 def test_proposal_batch_hash_binds_sanitized_evidence_to_unbacktested_proposal(
     tmp_path: Path,
 ) -> None:

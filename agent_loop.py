@@ -8036,6 +8036,41 @@ def run_proposal_batch(
             seen.add(value.path)
         return values
 
+    def record_sample_rejection(
+        *,
+        sample: int,
+        code: str,
+        calls_before: int,
+        expected_calls: int,
+        sealed_manifest: str,
+        state: LoopState,
+    ) -> None:
+        if ledger.calls - calls_before != expected_calls:
+            raise BudgetExceededError(
+                "proposal sample did not consume its exact call count"
+            )
+        if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
+            raise CandidateMutationError("candidate changed during proposal batch")
+        audit.append_event(
+            state,
+            "proposal_sample_rejected",
+            {
+                "sample": sample,
+                "code": code,
+                "calls_consumed": expected_calls,
+            },
+        )
+
+    def is_closed_payload_rejection(
+        exc: AccountedResponseValidationError,
+        role: str,
+    ) -> bool:
+        return (
+            exc.facts.role == role
+            and exc.facts.protocol_failure_code
+            is ProtocolFailureCode.PAYLOAD_FIELD_INVALID
+        )
+
     role_models = {
         "orchestrator": config.models.orchestrator,
         "reasoner": config.models.reasoner,
@@ -8324,106 +8359,124 @@ def run_proposal_batch(
                     max_increment_usd=limits.canary_max_usd if sample == 1 else None,
                 )
                 calls: list[tuple[Path, str]] = []
-                route, artifact, _route_payload_sha256 = call_role(
-                    sample,
-                    1,
-                    "orchestrator",
-                    {
-                        "batch_sample": sample,
-                        "editable_paths": list(services.editable_paths),
-                        "evidence": evidence_payload,
-                    },
-                    Route.from_json,
-                    Route,
-                    window,
-                )
+                try:
+                    route, artifact, _route_payload_sha256 = call_role(
+                        sample,
+                        1,
+                        "orchestrator",
+                        {
+                            "batch_sample": sample,
+                            "editable_paths": list(services.editable_paths),
+                            "evidence": evidence_payload,
+                        },
+                        Route.from_json,
+                        Route,
+                        window,
+                    )
+                except AccountedResponseValidationError as exc:
+                    if not is_closed_payload_rejection(exc, "orchestrator"):
+                        raise
+                    record_sample_rejection(
+                        sample=sample,
+                        code="orchestrator_payload_invalid",
+                        calls_before=calls_before,
+                        expected_calls=1,
+                        sealed_manifest=sealed_manifest,
+                        state=LoopState.RECORD_REJECTION,
+                    )
+                    continue
                 calls.append(artifact)
                 assert isinstance(route, Route)
                 if route.action != "reason":
-                    if ledger.calls - calls_before != 1:
-                        raise BudgetExceededError(
-                            "proposal sample did not consume its exact call count"
-                        )
-                    if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
-                        raise CandidateMutationError("candidate changed during proposal batch")
-                    audit.append_event(
-                        LoopState.RECORD_SKIP,
-                        "proposal_sample_rejected",
-                        {
-                            "sample": sample,
-                            "code": "orchestrator_abort",
-                            "calls_consumed": 1,
-                        },
+                    record_sample_rejection(
+                        sample=sample,
+                        code="orchestrator_abort",
+                        calls_before=calls_before,
+                        expected_calls=1,
+                        sealed_manifest=sealed_manifest,
+                        state=LoopState.RECORD_SKIP,
                     )
                     continue
                 snapshots = load_snapshots(services.editable_paths)
-                plan, artifact, _plan_payload_sha256 = call_role(
-                    sample,
-                    2,
-                    "reasoner",
-                    {
-                        "batch_sample": sample,
-                        "evidence": evidence_payload,
-                        "route": asdict(route),
-                        "source_snapshots": [asdict(value) for value in snapshots],
-                    },
-                    ReasoningPlan.from_json,
-                    ReasoningPlan,
-                    window,
-                )
+                try:
+                    plan, artifact, _plan_payload_sha256 = call_role(
+                        sample,
+                        2,
+                        "reasoner",
+                        {
+                            "batch_sample": sample,
+                            "evidence": evidence_payload,
+                            "route": asdict(route),
+                            "source_snapshots": [asdict(value) for value in snapshots],
+                        },
+                        ReasoningPlan.from_json,
+                        ReasoningPlan,
+                        window,
+                    )
+                except AccountedResponseValidationError as exc:
+                    if not is_closed_payload_rejection(exc, "reasoner"):
+                        raise
+                    record_sample_rejection(
+                        sample=sample,
+                        code="reasoner_payload_invalid",
+                        calls_before=calls_before,
+                        expected_calls=2,
+                        sealed_manifest=sealed_manifest,
+                        state=LoopState.RECORD_REJECTION,
+                    )
+                    continue
                 calls.append(artifact)
                 assert isinstance(plan, ReasoningPlan)
                 readable = {value.path for value in snapshots}
                 if plan.skip:
-                    if ledger.calls - calls_before != 2:
-                        raise BudgetExceededError(
-                            "proposal sample did not consume its exact call count"
-                        )
-                    if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
-                        raise CandidateMutationError("candidate changed during proposal batch")
-                    audit.append_event(
-                        LoopState.RECORD_SKIP,
-                        "proposal_sample_rejected",
-                        {
-                            "sample": sample,
-                            "code": "reasoner_skip",
-                            "calls_consumed": 2,
-                        },
+                    record_sample_rejection(
+                        sample=sample,
+                        code="reasoner_skip",
+                        calls_before=calls_before,
+                        expected_calls=2,
+                        sealed_manifest=sealed_manifest,
+                        state=LoopState.RECORD_SKIP,
                     )
                     continue
                 if not set(plan.files_to_change).issubset(readable):
-                    if ledger.calls - calls_before != 2:
-                        raise BudgetExceededError(
-                            "proposal sample did not consume its exact call count"
-                        )
-                    if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
-                        raise CandidateMutationError("candidate changed during proposal batch")
-                    audit.append_event(
-                        LoopState.RECORD_REJECTION,
-                        "proposal_sample_rejected",
-                        {
-                            "sample": sample,
-                            "code": "reasoner_scope_rejected",
-                            "calls_consumed": 2,
-                        },
+                    record_sample_rejection(
+                        sample=sample,
+                        code="reasoner_scope_rejected",
+                        calls_before=calls_before,
+                        expected_calls=2,
+                        sealed_manifest=sealed_manifest,
+                        state=LoopState.RECORD_REJECTION,
                     )
                     continue
-                typed_proposal, artifact, proposal_payload_sha256 = call_role(
-                    sample,
-                    3,
-                    "coder",
-                    {
-                        "batch_sample": sample,
-                        "evidence": evidence_payload,
-                        "plan": asdict(plan),
-                        "source_snapshots": [
-                            _coder_snapshot_payload(value) for value in snapshots
-                        ],
-                    },
-                    TypedCodingProposal.from_json,
-                    TypedCodingProposal,
-                    window,
-                )
+                try:
+                    typed_proposal, artifact, proposal_payload_sha256 = call_role(
+                        sample,
+                        3,
+                        "coder",
+                        {
+                            "batch_sample": sample,
+                            "evidence": evidence_payload,
+                            "plan": asdict(plan),
+                            "source_snapshots": [
+                                _coder_snapshot_payload(value) for value in snapshots
+                            ],
+                        },
+                        TypedCodingProposal.from_json,
+                        TypedCodingProposal,
+                        window,
+                    )
+                except AccountedResponseValidationError as exc:
+                    if not is_closed_payload_rejection(exc, "coder"):
+                        raise
+                    record_sample_rejection(
+                        sample=sample,
+                        code="coder_payload_invalid",
+                        calls_before=calls_before,
+                        expected_calls=3,
+                        sealed_manifest=sealed_manifest,
+                        state=LoopState.RECORD_REJECTION,
+                    )
+                    continue
                 calls.append(artifact)
                 assert isinstance(typed_proposal, TypedCodingProposal)
                 try:
@@ -8446,23 +8499,17 @@ def run_proposal_batch(
                         renderer_contract="coding_exact_replacements_v1",
                     )
                 except (PatchPolicyError, PreflightError) as exc:
-                    if ledger.calls - calls_before != 3:
-                        raise BudgetExceededError(
-                            "proposal sample did not consume its exact call count"
-                        ) from exc
-                    if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
-                        raise CandidateMutationError(
-                            "candidate changed during proposal batch"
-                        ) from exc
-                    audit.append_event(
-                        LoopState.RECORD_REJECTION,
-                        "proposal_sample_rejected",
-                        {
-                            "sample": sample,
-                            "code": "patch_rejected",
-                            "calls_consumed": 3,
-                        },
-                    )
+                    try:
+                        record_sample_rejection(
+                            sample=sample,
+                            code="patch_rejected",
+                            calls_before=calls_before,
+                            expected_calls=3,
+                            sealed_manifest=sealed_manifest,
+                            state=LoopState.RECORD_REJECTION,
+                        )
+                    except (BudgetExceededError, CandidateMutationError) as rejection_exc:
+                        raise rejection_exc from exc
                     continue
                 if ledger.calls - calls_before != 3:
                     raise BudgetExceededError("proposal sample did not consume exactly three calls")
