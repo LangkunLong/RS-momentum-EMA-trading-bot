@@ -2650,6 +2650,8 @@ def test_coder_request_requires_typed_exact_replacements_at_provider_boundary() 
 
     messages = client.completions.calls[0]["messages"]
     assert "path, start_line, old_lines, and new_lines" in messages[0]["content"]
+    assert "original snapshot coordinate" in messages[0]["content"]
+    assert "never add or subtract earlier replacement deltas" in messages[0]["content"]
     assert "Do not return unified diff text" in messages[0]["content"]
 
 
@@ -3723,6 +3725,50 @@ def test_typed_replacement_rejects_stale_or_out_of_view_old_lines(tmp_path: Path
             )
             with pytest.raises(PatchPolicyError, match="changed after its source snapshot"):
                 render_typed_coding_proposal(candidate, stale, (snapshot,))
+        finally:
+            dispose_candidate(candidate)
+
+
+def test_typed_replacement_rejects_invalid_rewritten_python_syntax(tmp_path: Path) -> None:
+    """A Git-applicable inert proposal must still describe a syntactically valid Python file."""
+    from agent_loop import (
+        ExactLineReplacement,
+        PatchPolicyError,
+        TypedCodingProposal,
+        dispose_candidate,
+        export_candidate,
+        preflight_source,
+        read_candidate_source_snapshot,
+        render_typed_coding_proposal,
+    )
+
+    repo = _task2_repo(tmp_path)
+    with tempfile.TemporaryDirectory(prefix="agent-loop-typed-syntax-") as controller_name:
+        state = preflight_source(
+            repo,
+            acquire_lock=False,
+            controller_temp_parent=Path(controller_name),
+        )
+        candidate = export_candidate(state)
+        snapshot = read_candidate_source_snapshot(
+            candidate,
+            "core/momentum_analysis.py",
+            approved_paths=("core/momentum_analysis.py",),
+        )
+        invalid = TypedCodingProposal(
+            summary="Produce an incomplete control-flow block.",
+            replacements=(
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=1,
+                    old_lines=("MOMENTUM = 1",),
+                    new_lines=("try:", "    MOMENTUM = 2"),
+                ),
+            ),
+        )
+        try:
+            with pytest.raises(PatchPolicyError, match="valid Python syntax"):
+                render_typed_coding_proposal(candidate, invalid, (snapshot,))
         finally:
             dispose_candidate(candidate)
 

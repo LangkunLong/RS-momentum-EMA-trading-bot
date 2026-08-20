@@ -1772,7 +1772,9 @@ class OpenRouterGateway:
                 "with exactly these keys: path, start_line, old_lines, and new_lines. path must be an "
                 "approved plan and source-snapshot path. Each sanitized_text line begins with an exact "
                 "numbered source annotation 'N: '; start_line must be the positive integer N from the "
-                "first exact annotated source line; old_lines and new_lines must be nonempty JSON "
+                "first exact annotated source line and is always an immutable original snapshot coordinate. "
+                "For every later replacement, never add or subtract earlier replacement deltas; the controller "
+                "alone calculates new output coordinates. old_lines and new_lines must be nonempty JSON "
                 "arrays of source-line strings without newline characters; omit the annotation prefix. "
                 "old_lines must exactly match consecutive visible source lines including indentation. "
                 "Order replacements by path and original start_line, with no duplicate, overlapping, or "
@@ -6436,6 +6438,13 @@ def render_typed_coding_proposal(
             expected_lines[start : start + len(replacement.old_lines)] = replacement.new_lines
         if expected_lines == source_lines:
             raise PatchPolicyError("typed replacements do not change candidate source")
+        if path.endswith(".py"):
+            try:
+                ast.parse("\n".join(expected_lines) + "\n", filename=path)
+            except SyntaxError:
+                raise PatchPolicyError(
+                    "typed replacements must produce valid Python syntax"
+                ) from None
         sections.extend(section)
     rendered = CodingProposal(
         summary=proposal.summary,
