@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-17
 **Branch:** `codex/multi-agent-backtest-loop`
-**Status:** Approved for implementation from the user's supplied mission
+**Status:** Implemented and hardened; paid rollout remains canary-gated
 
 ## Objective
 
@@ -48,15 +48,15 @@ The OpenRouter API key remains only in the controller process and is never sent 
 child. The quarantine path is never nested below a directory containing `.env`.
 
 Production mode fails closed unless an attested sandbox backend is available. V1 supports a
-fixed Docker/Podman-compatible backend whose controller-built command includes `--network none`,
+fixed Docker backend whose controller-built command includes `--network none`,
 `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges`, PID/memory/CPU limits, a fixed
-non-root UID/GID, an overridden Python entrypoint, and only the disposable worker directory mounted
-writable. The image reference must include an operator-approved `@sha256:` digest. The engine
+non-root UID/GID, a private 64 MiB `/dev/shm`, and an overridden Python entrypoint. It bind-mounts
+source, the sealed gate, and approved historical data read-only; separate disposable tmp, home, and
+output directories are writable. The image reference must include an operator-approved `@sha256:` digest. The engine
 verifies the real executable, daemon, resolved repository digest, and created container
-configuration before trusting its result. An explicit `--unsafe-local-execution` development
-escape hatch may run only the trusted baseline and produce a dry proposal. It is mutually exclusive
-with `--apply`, so model-authored code is never executed locally. Applying model
-patches requires both `--apply` and the attested sandbox.
+configuration before trusting its result. The production CLI has no local-execution escape hatch;
+every gate requires the attested sandbox. `--apply` can mutate only the controller-owned candidate,
+never this source checkout or the permanent paper runtime.
 
 ## Branch and source preconditions
 
@@ -117,8 +117,8 @@ not permission to expose provider credentials.
 
 Default models are exactly:
 
-- Orchestrator: `qwen/qwen-2.5-7b-instruct`
-- Reasoner: `deepseek/deepseek-r1`
+- Orchestrator: `qwen/qwen3-next-80b-a3b-instruct`
+- Reasoner: `qwen/qwen3-next-80b-a3b-instruct`
 - Coder: `deepseek/deepseek-chat`
 
 The controller uses the official OpenAI Python SDK pinned to `openai==2.54.0` and configured
@@ -140,10 +140,10 @@ The prefix never changes order, supporting provider prompt caching. Whole-respon
 not enabled because iteration inputs change. Calls are non-streaming. OpenRouter session IDs
 are stable per run and role.
 
-All roles are instructed to return one JSON object and no prose. The Orchestrator and Reasoner
-must use `response_format={"type": "json_object"}`. The Coder uses the same mode so the unified
-diff is carried as a JSON string. Provider routing requires requested parameters where
-supported. Every response is independently JSON-parsed and schema-validated.
+All roles are instructed to return one JSON object and no prose and use
+`response_format={"type": "json_object"}`. The Coder returns typed exact-line replacements, not
+diff grammar. Provider routing requires requested parameters where supported. Every response is
+independently JSON-parsed and schema-validated.
 
 The Reasoner is limited to `max_tokens=4096`. Raw chain-of-thought is neither requested nor
 persisted; the response contains only a concise diagnosis and action plan. A truncated,
@@ -184,10 +184,21 @@ are rejected.
 ```json
 {
   "summary": "what the patch changes",
-  "files": ["allowed/relative.py"],
-  "unified_diff": "diff --git a/... b/...\n..."
+  "replacements": [
+    {
+      "path": "allowed/relative.py",
+      "start_line": 123,
+      "old_lines": ["exact original source line"],
+      "new_lines": ["replacement source line"]
+    }
+  ]
 }
 ```
+
+`start_line` is always a one-based coordinate in the immutable original snapshot. The model never
+adjusts later coordinates for earlier edits. Both line arrays are nonempty, so insertion/deletion
+uses an unchanged adjacent anchor. Paths, replacement order, overlap, adjacency, line counts,
+aggregate bytes, and exact old text are controller-validated.
 
 ## Context construction
 
@@ -202,7 +213,6 @@ Default editable files are:
 - `core/backtest_engine.py`
 - `core/momentum_analysis.py`
 - `core/pivot_detector.py`
-- Python modules directly below `core/canslim/`
 
 For a metrics-based backtest gate, `core/backtest_engine.py`, `backtest.py`, and
 `backtest_pnl.py` become read-only so a patch cannot make itself pass by changing accounting,
@@ -210,8 +220,9 @@ threshold evaluation, or result serialization. Those files are editable only in 
 where the unchanged offline suite is the deterministic oracle.
 
 Tests are readable when needed but are not editable, preventing an agent from making the gate
-pass by weakening assertions. The operator may add another tracked non-denied path with an
-explicit CLI option; the model cannot expand its own scope.
+pass by weakening assertions. Offline tests may inject another tracked non-denied path at the
+controller service boundary, but the production CLI exposes no editable-path override; the model
+cannot expand its own scope.
 
 All candidate edits are proposal-only. Shared strategy modules are transitively imported by paper
 trading, and arbitrary candidate Python can forge its own in-process test/backtest evidence.
@@ -226,8 +237,15 @@ manifests, task/scheduler files, `auto_trader.py`, `fill_monitor.py`,
 
 ## Patch validation and application
 
-Only a single conventional unified Git diff is accepted. Before calling Git, the controller
-parses the entire patch and rejects:
+Provider output never supplies diff headers, hunk coordinates, prefixes, or structural directives.
+The controller parses the typed replacement object, binds every old span to the visible sealed
+snapshot and current candidate hash, applies replacements in memory using original coordinates,
+and rejects rewritten Python that does not parse. It also rejects every newly introduced defaulted
+parameter in a function, async function, method, nested function, or lambda so proposals cannot
+hide dormant optional controls behind unchanged callers.
+
+The controller then renders the only accepted canonical zero-context unified Git diff. Before
+calling Git, the existing diff-policy boundary reparses the controller-owned bytes and rejects:
 
 - absolute, drive, UNC, backslash, NUL, parent-traversal, ADS, reserved-device, trailing-space,
   trailing-dot, quoted, or case-colliding paths;
@@ -238,8 +256,8 @@ parses the entire patch and rejects:
 - more than 4 files, 25 hunks, 400 changed lines, or 256 KiB;
 - added imports/references to live execution modules or `alpaca.trading`.
 
-Every target must already be a tracked `100644` regular file. The proposal's declared file
-list must exactly equal the diff's file set.
+Every target must already be a tracked `100644` regular file. The typed replacement paths must
+exactly equal the rendered diff's file set.
 
 The controller then runs `git apply --check --whitespace=error-all`, snapshots target bytes and
 hashes, applies the patch, verifies that only allowed tracked files changed, runs
@@ -279,21 +297,22 @@ UTF-8 byte count plus the full completion-token allowance. Reported authoritativ
 the reservation afterward; absent cost retains the reservation. A call that cannot fit within the
 remaining USD budget is never sent.
 
-SDK automatic retries are disabled. The controller retries only connection/timeout, 408, 409,
-429, and selected 5xx failures within its own bounded attempt/deadline budget. It never retries
-400, 401, 402, 403, or 422. A malformed/truncated response receives at most one repair attempt;
-if still invalid, the iteration is skipped. OpenRouter embedded errors and non-`stop`
-`finish_reason` values are treated as failure.
+SDK automatic retries are disabled. The ordinary iterative loop retries only connection/timeout,
+408, 409, 429, and selected 5xx failures within its own bounded attempt/deadline budget and may
+make one explicit JSON-repair request. The proposal-batch path makes exactly one paid completion
+per role, requests same-call provider response healing, and stops or records a closed safe rejection
+without retrying the chat. It never retries 400, 401, 402, 403, or 422. OpenRouter embedded errors,
+non-`stop` finish reasons, model mismatches, incomplete accounting, and invalid schemas fail closed.
 
 ## Audit and redaction
 
-Sanitized run artifacts are written atomically under
-`.artifacts/agent_loop/<UTC-run-id>/`:
+Sanitized run artifacts are written atomically under the explicit
+`--artifact-root/<UTC-run-id>/`:
 
 - manifest and fixed policy/model/config values;
 - hash-chained state events in JSONL;
 - redacted/truncated gate output with full-stream hashes;
-- validated route, plan, proposal summary, and diff;
+- validated route, plan, typed coder payload, controller-rendered diff, and proposal metadata;
 - patch validation result and changed-file hashes;
 - API finish reason, provider/model IDs, token/cache/reasoning usage, and cost when supplied;
 - final observational result and exported candidate artifact hashes.
@@ -333,11 +352,13 @@ High-value behavior tests cover:
 - no parser option or callable API that applies a candidate diff to the source;
 - import safety proving no live execution modules load merely by importing `agent_loop`.
 
-The full existing offline suite, Ruff, compileall, and `git diff --check` remain the final gate.
-Every final candidate must run those same four runtime quality checks before the controller records
-a terminal pass observation. A metrics backtest passing its thresholds is necessary but not
-sufficient. Worker output and exit status remain untrusted observations and cannot authorize source
-mutation. No unit test may contact OpenRouter, Alpaca, FMP, or any other provider.
+The full existing offline suite, Ruff, compileall, and `git diff --check` remain the ordinary
+iterative loop's final gate. Every applied candidate in that mode must run those four runtime
+quality checks before the controller records a terminal pass observation. Proposal-batch mode is
+non-applying: exit `0` means only that its sealed primary backtest already passed, so no proposal
+was needed. A metrics backtest passing its thresholds never authorizes source mutation. Worker
+output and exit status remain untrusted observations. No unit test may contact OpenRouter, Alpaca,
+FMP, or any other provider.
 
 ## Operational invocation
 
@@ -345,12 +366,21 @@ The documented safe progression is:
 
 1. Install the pinned SDK in the feature environment and provision the documented sandbox image.
 2. Set `OPENROUTER_API_KEY` or `OPENROUTER` in the controller shell/private `.env` only.
-3. Run without `--apply` to obtain and audit one proposal.
-4. Run with `--apply` to refine inside quarantine.
-5. Review the exported diff manually; any real-repository application is out of band.
+3. Run one explicitly authorized `--proposal-samples 1` backtest canary with
+   `--max-iterations 1 --max-api-calls 3 --max-usd 0.50 --canary-max-usd 0.50`, omit `--apply`,
+   and audit the complete chain, accounting, cleanup, source immutability, and proposal behavior.
+4. Only after an actionable same-commit canary, separately authorize up to 50 inert attempts with
+   `--max-api-calls 150 --canary-max-usd 0.50`, a $2 ceiling, two million tokens, and no `--apply`.
+   The controller may consume fewer than 150 calls when a sample aborts or skips before the coder.
+5. Review every exported diff manually; any backtest, source application, or promotion is a
+   separate out-of-band workflow.
 
-The command must always print the quarantine/audit path and a final machine-readable summary.
-Absence of both accepted key names is an immediate configuration error before any billable call.
+A fully initialized run prints a final machine-readable `AGENT_LOOP_SUMMARY`. Ordinary-loop
+summaries can include audit and quarantine paths; proposal-batch summaries include the audit path
+and always dispose the candidate. Parser/configuration failures exit `2`, while initialization
+failures return `22` with a closed stderr stage; those early failures may have no summary or audit
+artifact. Absence of both accepted key names is an immediate configuration error before any
+billable call.
 
 ## Primary implementation references
 
@@ -367,4 +397,4 @@ Absence of both accepted key names is an immediate configuration error before an
 - Official OpenAI Python SDK release metadata for the conservative pin:
   <https://pypi.org/pypi/openai/2.54.0/json>
 - Official Python 3.13.14 slim image and index digest used by the worker recipe:
-  <https://hub.docker.com/layers/library/python/3.13.14-slim/images/sha256-69e18bd8d831d88e0ef70239dc7771ab7c28bc296ae78ac75cde71e60aa4434f>
+  <https://hub.docker.com/layers/library/python/3.13.14-slim/images/sha256-9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6>
