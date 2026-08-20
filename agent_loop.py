@@ -1841,8 +1841,9 @@ class OpenRouterGateway:
                 '"diagnosis", "causal_hypothesis", "source_evidence", "configuration_fact_ids", '
                 '"invariants", "files_to_change", "steps", "skip", "skip_reason". '
                 "source_evidence objects require exactly path, start_line, and lines; path must be a "
-                "provided source snapshot, start_line must be its immutable original coordinate, and "
-                "lines must exactly reproduce consecutive supplied source lines without annotations. "
+                "provided source snapshot. Each visible source snapshot line begins with the controller-rendered "
+                "N: annotation: set start_line to that N for the first cited line, and reproduce the consecutive "
+                "source lines exactly without the N: annotation. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
                 "editable_source_paths and source_snapshots. Cite every fact_id from "
                 "read_only_configuration_facts exactly once in configuration_fact_ids. Those facts are "
@@ -9296,7 +9297,9 @@ def run_proposal_batch(
                         "batch_sample": sample,
                         "evidence": evidence_payload,
                         "route": asdict(route),
-                        "source_snapshots": [asdict(value) for value in snapshots],
+                        "source_snapshots": [
+                            _coder_snapshot_payload(value) for value in snapshots
+                        ],
                         "editable_source_paths": [value.path for value in snapshots],
                         "read_only_configuration_facts": (
                             _read_only_configuration_fact_payload(configuration_facts)
@@ -9813,7 +9816,9 @@ def run_agent_loop(
                 {
                     "evidence": evidence_payload,
                     "route": asdict(route),
-                    "source_snapshots": [asdict(value) for value in snapshots],
+                    "source_snapshots": [
+                        _coder_snapshot_payload(value) for value in snapshots
+                    ],
                     "editable_source_paths": [value.path for value in snapshots],
                     "read_only_configuration_facts": (
                         _read_only_configuration_fact_payload(configuration_facts)
