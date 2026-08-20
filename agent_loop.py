@@ -1819,6 +1819,9 @@ class OpenRouterGateway:
                 "When read_only_execution_facts is supplied, treat it as controller-owned behavioral evidence: "
                 "use it to rule out edits that cannot affect the observed execution path, and never treat it "
                 "as editable source or configuration. "
+                "When allowed_edit is supplied, it is the sole controller-approved bounded experiment for this "
+                "batch: for a non-skip plan, use its path and mechanism exactly and do not propose an alternative "
+                "source change. "
                 "diagnosis must "
                 "state only observed gate facts; "
                 "causal_hypothesis is explicitly unproven and falsifiable. Use JSON arrays for "
@@ -1864,6 +1867,8 @@ class OpenRouterGateway:
                 "replacement. "
                 "Treat any read_only_execution_facts as immutable behavioral constraints; do not propose an edit "
                 "whose stated mechanism they rule out. "
+                "When allowed_edit is supplied, return exactly its one path, old_lines, and new_lines; do not "
+                "change comments, docs, imports, configuration, fallback behavior, tests, or any other line. "
                 "Order multiple replacements by path; use no duplicate, overlapping, or adjacent source ranges "
                 "and merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -8909,6 +8914,35 @@ def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
     )
 
 
+def _proposal_batch_allowed_edit_payload() -> dict[str, object]:
+    """Pin the first batch experiment to one executable, non-configuration pivot guard."""
+    return {
+        "id": "pivot_right_lip_confirmation_v1",
+        "path": "core/pivot_detector.py",
+        "old_lines": ["    if right_lip < left_lip * 0.95:"],
+        "new_lines": ["    if right_lip < left_lip * 0.98:"],
+        "intent": (
+            "A bounded counterfactual: require a 98% right-lip recovery before accepting a "
+            "cup pivot, while preserving the existing fallback and buy-zone flow."
+        ),
+    }
+
+
+def _validate_proposal_batch_allowed_edit(proposal: TypedCodingProposal) -> None:
+    """Fail closed unless the first batch proposal is exactly the controller-owned experiment."""
+    if not isinstance(proposal, TypedCodingProposal):
+        raise ConfigurationError("proposal batch allowed-edit input is invalid")
+    if len(proposal.replacements) != 1:
+        raise PatchPolicyError("proposal batch must contain exactly one allowed replacement")
+    replacement = proposal.replacements[0]
+    if (
+        replacement.path != "core/pivot_detector.py"
+        or replacement.old_lines != ("    if right_lip < left_lip * 0.95:",)
+        or replacement.new_lines != ("    if right_lip < left_lip * 0.98:",)
+    ):
+        raise PatchPolicyError("proposal batch replacement is outside the approved experiment")
+
+
 def run_proposal_batch(
     config: LoopConfig,
     state: SourceState,
@@ -9358,6 +9392,7 @@ def run_proposal_batch(
                         "read_only_execution_facts": list(
                             _proposal_batch_execution_facts()
                         ),
+                        "allowed_edit": _proposal_batch_allowed_edit_payload(),
                     },
                     ReasoningPlan.from_json,
                     ReasoningPlan,
@@ -9415,6 +9450,7 @@ def run_proposal_batch(
                         "read_only_execution_facts": list(
                             _proposal_batch_execution_facts()
                         ),
+                        "allowed_edit": _proposal_batch_allowed_edit_payload(),
                         "source_snapshots": [
                             _provider_editable_snapshot_payload(value) for value in snapshots
                         ],
@@ -9432,6 +9468,7 @@ def run_proposal_batch(
                         typed_proposal,
                         configuration_facts,
                     )
+                    _validate_proposal_batch_allowed_edit(typed_proposal)
                     proposal = render_typed_coding_proposal(
                         candidate,
                         typed_proposal,
