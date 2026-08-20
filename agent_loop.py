@@ -1845,8 +1845,9 @@ class OpenRouterGateway:
                 "N: annotation: set start_line to that N for the first cited line, and reproduce the consecutive "
                 "source lines exactly without the N: annotation. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
-                "editable_source_paths and source_snapshots. Cite every fact_id from "
-                "read_only_configuration_facts exactly once in configuration_fact_ids. Those facts are "
+                "editable_source_paths and source_snapshots. Cite in configuration_fact_ids exactly the "
+                "fact_id values from read_only_configuration_facts whose settings references appear in your "
+                "source_evidence lines. Do not cite any other setting. Those facts are "
                 "read-only baselines, never source snapshots or editable paths; do not propose changing "
                 "config/settings.py. Never invent baseline values or configuration facts. diagnosis must "
                 "state only observed gate facts; "
@@ -7558,11 +7559,9 @@ def _validate_reasoning_plan_grounding(
         raise ConfigurationError("reasoning grounding requires configuration facts")
     if plan.skip:
         return
-    required_fact_ids = tuple(fact.fact_id for fact in configuration_facts)
-    if len(required_fact_ids) != len(set(required_fact_ids)):
+    available_fact_ids = tuple(fact.fact_id for fact in configuration_facts)
+    if len(available_fact_ids) != len(set(available_fact_ids)):
         raise ConfigurationError("reasoning grounding configuration facts are duplicated")
-    if set(plan.configuration_fact_ids) != set(required_fact_ids):
-        raise PatchPolicyError("reasoning plan did not cite all supplied configuration facts")
     snapshot_by_path: dict[str, SourceSnapshot] = {}
     for snapshot in snapshots:
         if snapshot.path in snapshot_by_path:
@@ -7585,6 +7584,16 @@ def _validate_reasoning_plan_grounding(
         {evidence.path for evidence in plan.source_evidence}
     ):
         raise PatchPolicyError("reasoning evidence must anchor every changed file")
+    evidence_fact_ids = {
+        f"settings.{match.group(1)}"
+        for evidence in plan.source_evidence
+        for match in re.finditer(
+            r"\bsettings\.([A-Z][A-Z0-9_]{0,127})\b", "\n".join(evidence.lines)
+        )
+    }
+    required_fact_ids = set(available_fact_ids) & evidence_fact_ids
+    if set(plan.configuration_fact_ids) != required_fact_ids:
+        raise PatchPolicyError("reasoning plan cited configuration facts outside exact evidence")
 
 
 def _validate_configuration_preservation(
