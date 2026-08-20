@@ -7357,7 +7357,9 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
     )
     try:
         assert result.status == "batch_complete", (result.failure_code, result.completed_samples)
+        assert result.attempted_samples == 50
         assert result.completed_samples == 50
+        assert result.rejected_samples == 0
         assert result.budget.api_calls == 150
         assert result.budget.spent_usd == pytest.approx(0.15)
         assert gateway.roles == ["orchestrator", "reasoner", "coder"] * 50
@@ -7411,10 +7413,23 @@ def test_proposal_batch_failure_stops_before_the_next_role_or_sample(tmp_path: P
     )
     try:
         assert result.status == "batch_failed"
-        assert result.failure_code == "protocol_invalid"
+        assert result.failure_code == "canary_rejected"
+        assert result.attempted_samples == 1
         assert result.completed_samples == 0
+        assert result.rejected_samples == 1
         assert result.budget.api_calls == 1
         assert gateway.roles == ["orchestrator"]
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert [
+            event["details"]
+            for event in events
+            if event["event"] == "proposal_sample_rejected"
+        ] == [{"calls_consumed": 1, "code": "orchestrator_abort", "sample": 1}]
         assert not candidate.root.exists()
     finally:
         external.cleanup()
@@ -7526,7 +7541,7 @@ def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
         external.cleanup()
 
 
-def test_proposal_batch_records_a_reasoner_skip_and_continues_the_ensemble(
+def test_proposal_batch_continues_after_a_post_canary_reasoner_skip(
     tmp_path: Path,
 ) -> None:
     """One harmless decline must not make a fifty-sample ensemble all-or-nothing."""
@@ -7545,11 +7560,11 @@ def test_proposal_batch_records_a_reasoner_skip_and_continues_the_ensemble(
         tmp_path,
         samples=2,
         outcomes=[
-            _loop_route(),
-            skip,
             _loop_route(path="core/momentum_analysis.py"),
             _loop_plan(path="core/momentum_analysis.py"),
             _loop_proposal(path="core/momentum_analysis.py"),
+            _loop_route(),
+            skip,
         ],
     )
     try:
@@ -7557,13 +7572,14 @@ def test_proposal_batch_records_a_reasoner_skip_and_continues_the_ensemble(
         assert result.failure_code == "none"
         assert result.attempted_samples == 2
         assert result.completed_samples == 1
+        assert result.rejected_samples == 1
         assert result.budget.api_calls == 5
         assert gateway.roles == [
             "orchestrator",
             "reasoner",
+            "coder",
             "orchestrator",
             "reasoner",
-            "coder",
         ]
         events = [
             json.loads(line)
@@ -7575,14 +7591,14 @@ def test_proposal_batch_records_a_reasoner_skip_and_continues_the_ensemble(
             event for event in events if event["event"] == "proposal_sample_rejected"
         ]
         assert [event["details"] for event in rejected] == [
-            {"calls_consumed": 2, "code": "reasoner_skip", "sample": 1}
+            {"calls_consumed": 2, "code": "reasoner_skip", "sample": 2}
         ]
         assert not candidate.root.exists()
     finally:
         external.cleanup()
 
 
-def test_proposal_batch_records_an_inert_patch_rejection_and_continues(
+def test_proposal_batch_continues_after_a_post_canary_inert_patch_rejection(
     tmp_path: Path,
 ) -> None:
     """A rejected inert edit is model-quality evidence, not a controller failure."""
@@ -7605,16 +7621,17 @@ def test_proposal_batch_records_an_inert_patch_rejection_and_continues(
         outcomes=[
             _loop_route(path="core/momentum_analysis.py"),
             _loop_plan(path="core/momentum_analysis.py"),
-            invalid,
+            _loop_proposal(path="core/momentum_analysis.py"),
             _loop_route(path="core/momentum_analysis.py"),
             _loop_plan(path="core/momentum_analysis.py"),
-            _loop_proposal(path="core/momentum_analysis.py"),
+            invalid,
         ],
     )
     try:
         assert result.status == "batch_complete"
         assert result.attempted_samples == 2
         assert result.completed_samples == 1
+        assert result.rejected_samples == 1
         assert result.budget.api_calls == 6
         assert gateway.roles == ["orchestrator", "reasoner", "coder"] * 2
         events = [
@@ -7627,7 +7644,7 @@ def test_proposal_batch_records_an_inert_patch_rejection_and_continues(
             event for event in events if event["event"] == "proposal_sample_rejected"
         ]
         assert [event["details"] for event in rejected] == [
-            {"calls_consumed": 3, "code": "patch_rejected", "sample": 1}
+            {"calls_consumed": 3, "code": "patch_rejected", "sample": 2}
         ]
         assert not candidate.root.exists()
     finally:
@@ -7643,7 +7660,7 @@ def test_proposal_batch_records_an_inert_patch_rejection_and_continues(
         "payload_field_invalid",
     ),
 )
-def test_proposal_batch_records_a_closed_coder_payload_rejection_and_continues(
+def test_proposal_batch_stops_on_an_accounted_coder_payload_rejection(
     tmp_path: Path,
     failure_code: str,
 ) -> None:
@@ -7656,7 +7673,7 @@ def test_proposal_batch_records_a_closed_coder_payload_rejection_and_continues(
     )
 
     facts = ProviderCallFacts(
-        call_index=3,
+        call_index=6,
         role="coder",
         requested_model="deepseek/deepseek-chat",
         returned_model="deepseek/deepseek-chat",
@@ -7678,16 +7695,18 @@ def test_proposal_batch_records_a_closed_coder_payload_rejection_and_continues(
         outcomes=[
             _loop_route(path="core/momentum_analysis.py"),
             _loop_plan(path="core/momentum_analysis.py"),
-            AccountedResponseValidationError("closed coder rejection", facts),
+            _loop_proposal(path="core/momentum_analysis.py"),
             _loop_route(path="core/momentum_analysis.py"),
             _loop_plan(path="core/momentum_analysis.py"),
-            _loop_proposal(path="core/momentum_analysis.py"),
+            AccountedResponseValidationError("closed coder rejection", facts),
         ],
     )
     try:
-        assert result.status == "batch_complete"
+        assert result.status == "batch_failed"
+        assert result.failure_code == "protocol_invalid"
         assert result.attempted_samples == 2
         assert result.completed_samples == 1
+        assert result.rejected_samples == 0
         assert result.budget.api_calls == 6
         assert gateway.roles == ["orchestrator", "reasoner", "coder"] * 2
         events = [
@@ -7699,9 +7718,95 @@ def test_proposal_batch_records_a_closed_coder_payload_rejection_and_continues(
         rejected = [
             event for event in events if event["event"] == "proposal_sample_rejected"
         ]
-        assert [event["details"] for event in rejected] == [
-            {"calls_consumed": 3, "code": "coder_payload_invalid", "sample": 1}
+        assert rejected == []
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_continues_after_a_post_canary_reasoner_scope_rejection(
+    tmp_path: Path,
+) -> None:
+    """A schema-valid scope expansion is rejected without ending the later ensemble."""
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/backtest_engine.py"),
+        ],
+    )
+    try:
+        assert result.status == "batch_complete"
+        assert result.failure_code == "none"
+        assert result.attempted_samples == 2
+        assert result.completed_samples == 1
+        assert result.rejected_samples == 1
+        assert result.budget.api_calls == 5
+        assert gateway.roles == [
+            "orchestrator",
+            "reasoner",
+            "coder",
+            "orchestrator",
+            "reasoner",
         ]
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert [
+            event["details"]
+            for event in events
+            if event["event"] == "proposal_sample_rejected"
+        ] == [
+            {"calls_consumed": 2, "code": "reasoner_scope_rejected", "sample": 2}
+        ]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_treats_preflight_failure_as_a_controller_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An immutable-baseline preflight failure must never become a safe sample rejection."""
+    import agent_loop
+
+    def fail_preflight(*_args: object, **_kwargs: object) -> object:
+        raise agent_loop.PreflightError("private provider canary")
+
+    monkeypatch.setattr(agent_loop, "export_inert_proposal", fail_preflight)
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "controller_boundary_error"
+        assert result.attempted_samples == 1
+        assert result.completed_samples == 0
+        assert result.rejected_samples == 0
+        assert result.budget.api_calls == 3
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert not any(event["event"] == "proposal_sample_rejected" for event in events)
+        assert "private provider canary" not in json.dumps(events)
         assert not candidate.root.exists()
     finally:
         external.cleanup()
@@ -7805,7 +7910,9 @@ def test_proposal_batch_audits_accepted_call_before_enforcing_crossed_deadline(
     try:
         assert result.status == "batch_failed"
         assert result.failure_code == "budget_exceeded"
+        assert result.attempted_samples == 1
         assert result.completed_samples == 0
+        assert result.rejected_samples == 0
         assert result.budget.api_calls == 1
         assert gateway.roles == ["orchestrator"]
         assert len(result.provider_call_artifacts) == 1
@@ -8095,7 +8202,9 @@ def test_proposal_batch_audits_a_global_rollout_overage_without_next_call(
     try:
         assert result.status == "batch_failed"
         assert result.failure_code == "budget_exceeded"
+        assert result.attempted_samples == 2
         assert result.completed_samples == 1
+        assert result.rejected_samples == 0
         assert result.budget.api_calls == 4
         assert result.budget.spent_usd == pytest.approx(2.003)
         assert gateway.roles == ["orchestrator", "reasoner", "coder", "orchestrator"]
@@ -8667,6 +8776,7 @@ def test_cli_routes_batch_to_dedicated_runner_and_prints_closed_summary(
             requested_samples=limits.samples,
             attempted_samples=1,
             completed_samples=0,
+            rejected_samples=0,
             failure_code="provider_failed",
             budget=agent_loop.BudgetSnapshot(
                 1, 10, 5, 15, 15, 0.01, 0.01, 0.01, 0.0, 0, 0, "authoritative"

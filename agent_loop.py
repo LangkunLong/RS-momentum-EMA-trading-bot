@@ -232,16 +232,6 @@ class ProtocolFailureCode(str, Enum):
     VALIDATOR_BOUNDARY_INVALID = "validator_boundary_invalid"
 
 
-_ENSEMBLE_SAFE_PAYLOAD_REJECTIONS = frozenset(
-    {
-        ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
-        ProtocolFailureCode.PAYLOAD_JSON_INVALID,
-        ProtocolFailureCode.PAYLOAD_KEYS_INVALID,
-        ProtocolFailureCode.PAYLOAD_FIELD_INVALID,
-    }
-)
-
-
 class ClosedResponseValidationError(ResponseValidationError):
     """A response rejection carrying only a controller-owned closed stage code."""
 
@@ -489,6 +479,10 @@ class CandidateMutationError(RuntimeError):
 
 class InsufficientEvidenceError(RuntimeError):
     """A provider-safe role declined to invent a change from inadequate facts."""
+
+
+class CanaryRejectedError(RuntimeError):
+    """The first proposal sample did not produce one validated inert handoff."""
 
 
 class DataBundleError(ValueError):
@@ -7530,6 +7524,7 @@ class ProposalBatchResult:
     requested_samples: int
     attempted_samples: int
     completed_samples: int
+    rejected_samples: int
     failure_code: str
     budget: BudgetSnapshot
     audit_path: Path
@@ -7553,8 +7548,10 @@ class ProposalBatchResult:
             type(self.requested_samples) is not int
             or type(self.attempted_samples) is not int
             or type(self.completed_samples) is not int
+            or type(self.rejected_samples) is not int
             or not 0
             <= self.completed_samples
+            <= self.completed_samples + self.rejected_samples
             <= self.attempted_samples
             <= self.requested_samples
             <= MAX_PROPOSAL_SAMPLES
@@ -7562,6 +7559,10 @@ class ProposalBatchResult:
             raise ConfigurationError("proposal batch sample counters are invalid")
         if self.status == "batch_complete" and self.attempted_samples != self.requested_samples:
             raise ConfigurationError("completed proposal batch must attempt every requested sample")
+        if self.status == "batch_complete" and (
+            self.completed_samples + self.rejected_samples != self.attempted_samples
+        ):
+            raise ConfigurationError("completed proposal batch has an unclassified sample")
         if not isinstance(self.failure_code, str) or not self.failure_code:
             raise ConfigurationError("proposal batch failure code is invalid")
         if not isinstance(self.budget, BudgetSnapshot):
@@ -8074,6 +8075,7 @@ def run_proposal_batch(
     deadline = float(started) + limits.wall_timeout_seconds
     sample_results: list[ProposalSampleResult] = []
     attempted_samples = 0
+    rejected_samples = 0
     provider_call_artifacts: list[tuple[int, str, Path, str]] = []
     failure_code = "none"
     status = "batch_failed"
@@ -8117,6 +8119,7 @@ def run_proposal_batch(
         sealed_manifest: str,
         state: LoopState,
     ) -> None:
+        nonlocal rejected_samples
         if ledger.calls - calls_before != expected_calls:
             raise BudgetExceededError(
                 "proposal sample did not consume its exact call count"
@@ -8132,15 +8135,9 @@ def run_proposal_batch(
                 "calls_consumed": expected_calls,
             },
         )
-
-    def is_closed_payload_rejection(
-        exc: AccountedResponseValidationError,
-        role: str,
-    ) -> bool:
-        return (
-            exc.facts.role == role
-            and exc.facts.protocol_failure_code in _ENSEMBLE_SAFE_PAYLOAD_REJECTIONS
-        )
+        rejected_samples += 1
+        if sample == 1:
+            raise CanaryRejectedError("proposal batch canary was rejected")
 
     role_models = {
         "orchestrator": config.models.orchestrator,
@@ -8430,32 +8427,19 @@ def run_proposal_batch(
                     max_increment_usd=limits.canary_max_usd if sample == 1 else None,
                 )
                 calls: list[tuple[Path, str]] = []
-                try:
-                    route, artifact, _route_payload_sha256 = call_role(
-                        sample,
-                        1,
-                        "orchestrator",
-                        {
-                            "batch_sample": sample,
-                            "editable_paths": list(services.editable_paths),
-                            "evidence": evidence_payload,
-                        },
-                        Route.from_json,
-                        Route,
-                        window,
-                    )
-                except AccountedResponseValidationError as exc:
-                    if not is_closed_payload_rejection(exc, "orchestrator"):
-                        raise
-                    record_sample_rejection(
-                        sample=sample,
-                        code="orchestrator_payload_invalid",
-                        calls_before=calls_before,
-                        expected_calls=1,
-                        sealed_manifest=sealed_manifest,
-                        state=LoopState.RECORD_REJECTION,
-                    )
-                    continue
+                route, artifact, _route_payload_sha256 = call_role(
+                    sample,
+                    1,
+                    "orchestrator",
+                    {
+                        "batch_sample": sample,
+                        "editable_paths": list(services.editable_paths),
+                        "evidence": evidence_payload,
+                    },
+                    Route.from_json,
+                    Route,
+                    window,
+                )
                 calls.append(artifact)
                 assert isinstance(route, Route)
                 if route.action != "reason":
@@ -8469,33 +8453,20 @@ def run_proposal_batch(
                     )
                     continue
                 snapshots = load_snapshots(services.editable_paths)
-                try:
-                    plan, artifact, _plan_payload_sha256 = call_role(
-                        sample,
-                        2,
-                        "reasoner",
-                        {
-                            "batch_sample": sample,
-                            "evidence": evidence_payload,
-                            "route": asdict(route),
-                            "source_snapshots": [asdict(value) for value in snapshots],
-                        },
-                        ReasoningPlan.from_json,
-                        ReasoningPlan,
-                        window,
-                    )
-                except AccountedResponseValidationError as exc:
-                    if not is_closed_payload_rejection(exc, "reasoner"):
-                        raise
-                    record_sample_rejection(
-                        sample=sample,
-                        code="reasoner_payload_invalid",
-                        calls_before=calls_before,
-                        expected_calls=2,
-                        sealed_manifest=sealed_manifest,
-                        state=LoopState.RECORD_REJECTION,
-                    )
-                    continue
+                plan, artifact, _plan_payload_sha256 = call_role(
+                    sample,
+                    2,
+                    "reasoner",
+                    {
+                        "batch_sample": sample,
+                        "evidence": evidence_payload,
+                        "route": asdict(route),
+                        "source_snapshots": [asdict(value) for value in snapshots],
+                    },
+                    ReasoningPlan.from_json,
+                    ReasoningPlan,
+                    window,
+                )
                 calls.append(artifact)
                 assert isinstance(plan, ReasoningPlan)
                 readable = {value.path for value in snapshots}
@@ -8519,35 +8490,22 @@ def run_proposal_batch(
                         state=LoopState.RECORD_REJECTION,
                     )
                     continue
-                try:
-                    typed_proposal, artifact, proposal_payload_sha256 = call_role(
-                        sample,
-                        3,
-                        "coder",
-                        {
-                            "batch_sample": sample,
-                            "evidence": evidence_payload,
-                            "plan": asdict(plan),
-                            "source_snapshots": [
-                                _coder_snapshot_payload(value) for value in snapshots
-                            ],
-                        },
-                        TypedCodingProposal.from_json,
-                        TypedCodingProposal,
-                        window,
-                    )
-                except AccountedResponseValidationError as exc:
-                    if not is_closed_payload_rejection(exc, "coder"):
-                        raise
-                    record_sample_rejection(
-                        sample=sample,
-                        code="coder_payload_invalid",
-                        calls_before=calls_before,
-                        expected_calls=3,
-                        sealed_manifest=sealed_manifest,
-                        state=LoopState.RECORD_REJECTION,
-                    )
-                    continue
+                typed_proposal, artifact, proposal_payload_sha256 = call_role(
+                    sample,
+                    3,
+                    "coder",
+                    {
+                        "batch_sample": sample,
+                        "evidence": evidence_payload,
+                        "plan": asdict(plan),
+                        "source_snapshots": [
+                            _coder_snapshot_payload(value) for value in snapshots
+                        ],
+                    },
+                    TypedCodingProposal.from_json,
+                    TypedCodingProposal,
+                    window,
+                )
                 calls.append(artifact)
                 assert isinstance(typed_proposal, TypedCodingProposal)
                 try:
@@ -8616,6 +8574,8 @@ def run_proposal_batch(
         failure_code = "budget_exceeded"
     except GatewayError:
         failure_code = "provider_failed"
+    except CanaryRejectedError:
+        failure_code = "canary_rejected"
     except InsufficientEvidenceError:
         failure_code = "insufficient_evidence"
     except (ResponseValidationError, ProtocolValidationError):
@@ -8654,7 +8614,7 @@ def run_proposal_batch(
             "requested_samples": limits.samples,
             "attempted_samples": attempted_samples,
             "completed_samples": len(sample_results),
-            "rejected_samples": attempted_samples - len(sample_results),
+            "rejected_samples": rejected_samples,
             "failure_code": failure_code,
             "cleanup_complete": cleanup.cleanup_complete,
             "source_modified": cleanup.source_modified,
@@ -8669,7 +8629,7 @@ def run_proposal_batch(
         "requested_samples": limits.samples,
         "attempted_samples": attempted_samples,
         "completed_samples": len(sample_results),
-        "rejected_samples": attempted_samples - len(sample_results),
+        "rejected_samples": rejected_samples,
         "failure_code": failure_code,
         "budget": asdict(_budget_snapshot(ledger)),
         "cleanup_complete": cleanup.cleanup_complete,
@@ -8698,6 +8658,7 @@ def run_proposal_batch(
         requested_samples=limits.samples,
         attempted_samples=attempted_samples,
         completed_samples=len(sample_results),
+        rejected_samples=rejected_samples,
         failure_code=failure_code,
         budget=_budget_snapshot(ledger),
         audit_path=audit.run_root,
@@ -9923,7 +9884,7 @@ def _proposal_batch_summary(result: ProposalBatchResult) -> dict[str, object]:
         "requested_samples": result.requested_samples,
         "attempted_samples": result.attempted_samples,
         "completed_samples": result.completed_samples,
-        "rejected_samples": result.attempted_samples - result.completed_samples,
+        "rejected_samples": result.rejected_samples,
         "failure_code": result.failure_code,
         "accounting_failure": (
             asdict(result.accounting_failure)
