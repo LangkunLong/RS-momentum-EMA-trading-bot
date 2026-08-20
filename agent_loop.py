@@ -136,6 +136,32 @@ class ConfigurationError(ValueError):
     """Raised when the controller's local configuration is not safe to use."""
 
 
+_CONTROLLER_INITIALIZATION_STAGES = frozenset(
+    {
+        "git_capability",
+        "source_preflight",
+        "candidate_export",
+        "docker_capability",
+        "sandbox_init",
+        "gateway_init",
+        "data_bundle",
+        "audit_init",
+        "controller_run",
+        "cleanup",
+    }
+)
+
+
+class ControllerInitializationError(RuntimeError):
+    """Carry only one controller-owned pre-audit failure stage to the CLI."""
+
+    def __init__(self, stage: str) -> None:
+        if stage not in _CONTROLLER_INITIALIZATION_STAGES:
+            raise ConfigurationError("controller initialization stage is invalid")
+        super().__init__(stage)
+        self.stage = stage
+
+
 class ProtocolValidationError(ValueError):
     """Raised when untrusted model JSON does not satisfy a role protocol."""
 
@@ -9657,21 +9683,26 @@ def _execute_cli_run(
     candidate: Candidate | None = None
     bundle: ValidatedDataBundle | None = None
     loop_returned = False
+    stage = "git_capability"
     try:
         git_capability = configure_git_executable(config.git_executable)
+        stage = "source_preflight"
         state = preflight_source(
             config.source_root,
             permanent_runtime_root=config.permanent_runtime_root,
             controller_temp_parent=config.controller_temp_parent,
             git=git_capability,
         )
+        stage = "candidate_export"
         candidate = export_candidate(state)
+        stage = "docker_capability"
         docker_capability = configure_docker_executable(
             docker_executable,
             source_root=config.source_root,
             controller_root=config.controller_temp_parent,
             permanent_runtime_root=config.permanent_runtime_root,
         )
+        stage = "sandbox_init"
         sandbox = SandboxRunner(
             image=sandbox_image,
             engine=docker_capability,
@@ -9679,6 +9710,7 @@ def _execute_cli_run(
             output_limit=config.limits.output_limit_bytes,
             run_id=run_id,
         )
+        stage = "gateway_init"
         ledger = BudgetLedger(
             max_usd=config.limits.max_usd,
             max_calls=config.limits.max_api_calls,
@@ -9696,6 +9728,7 @@ def _execute_cli_run(
             else ()
         )
         if isinstance(config.gate, BacktestGateConfig):
+            stage = "data_bundle"
             bundle = validate_historical_data_bundle(
                 config.gate.historical_data_bundle,
                 config.gate.historical_data_sha256,
@@ -9705,6 +9738,7 @@ def _execute_cli_run(
                 config.gate.end_date,
                 controller_temp_parent=config.controller_temp_parent,
             )
+        stage = "audit_init"
         audit = AuditTrail(
             config.artifact_root,
             run_id,
@@ -9743,6 +9777,7 @@ def _execute_cli_run(
                 for path in paths
             )
 
+        stage = "controller_run"
         if batch_limits is not None:
             if not isinstance(config.gate, BacktestGateConfig) or bundle is None:
                 raise ConfigurationError("proposal batch backtest inputs are absent")
@@ -9780,18 +9815,31 @@ def _execute_cli_run(
             result = run_agent_loop(config, state, candidate, audit, services)
         loop_returned = True
         return result
+    except ControllerInitializationError:
+        raise
+    except Exception as exc:
+        raise ControllerInitializationError(stage) from exc
     finally:
         try:
             if bundle is not None:
-                _remove_private_tree(bundle.path.parent)
+                try:
+                    _remove_private_tree(bundle.path.parent)
+                except Exception as exc:
+                    raise ControllerInitializationError("cleanup") from exc
         finally:
             if not loop_returned:
                 try:
                     if candidate is not None:
-                        dispose_candidate(candidate)
+                        try:
+                            dispose_candidate(candidate)
+                        except Exception as exc:
+                            raise ControllerInitializationError("cleanup") from exc
                 finally:
                     if state is not None:
-                        state.close()
+                        try:
+                            state.close()
+                        except Exception as exc:
+                            raise ControllerInitializationError("cleanup") from exc
 
 
 def _loop_result_summary(result: LoopResult) -> dict[str, object]:
@@ -9895,6 +9943,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(result, ProposalBatchResult)
             else _loop_result_summary(result)
         )
+    except ControllerInitializationError as exc:
+        print(f"agent loop initialization failed: {exc.stage}", file=sys.stderr)
+        return 22
     except Exception:
         print("agent loop initialization failed", file=sys.stderr)
         return 22

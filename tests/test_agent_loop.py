@@ -8610,6 +8610,29 @@ def test_cli_builds_only_the_exact_non_applying_canary_first_batch(tmp_path: Pat
         agent_loop._build_proposal_batch_limits(namespace, config)
 
 
+def test_cli_reports_only_the_closed_pre_audit_failure_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Pre-audit failures must be diagnosable without serializing exception text."""
+    import agent_loop
+
+    canary = "provider-secret-exception-canary"
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise agent_loop.ControllerInitializationError("gateway_init") from RuntimeError(
+            canary
+        )
+
+    monkeypatch.setattr(agent_loop, "_execute_cli_run", fail)
+    assert agent_loop.main(_batch_cli_argv(tmp_path, samples=1)) == 22
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "agent loop initialization failed: gateway_init\n"
+    assert canary not in captured.err
+
+
 def test_production_proposal_scope_excludes_read_only_backtest_oracles() -> None:
     """The model cannot be invited to patch a path the backtest policy must reject."""
     import agent_loop
