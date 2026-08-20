@@ -1818,8 +1818,9 @@ class OpenRouterGateway:
                 '"invariants", "files_to_change", "steps", "skip", "skip_reason". '
                 "source_evidence objects require exactly path and lines; path must be a provided source "
                 "snapshot. Each visible source snapshot line begins with a controller-rendered N: annotation. "
-                "Reproduce consecutive source lines exactly without that annotation; the controller resolves "
-                "their immutable source coordinate only when they have one exact match. Include the exact "
+                "lines must be a JSON array of 1 to 32 strings, each one physical source line with no N: "
+                "annotation and no newline character. Reproduce consecutive source lines exactly; the controller "
+                "resolves their immutable source coordinate only when they have one exact match. Include the exact "
                 "existing expression the Coder "
                 "should change in source_evidence, not only diagnostic context. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
@@ -1841,7 +1842,8 @@ class OpenRouterGateway:
                 "already-executed logic instead. "
                 "Set skip to true only when no such causal experiment is supported; otherwise set skip to "
                 "false and skip_reason to an empty "
-                "string for a repairable issue. A skip plan may use empty source_evidence and "
+                "string for a repairable issue. For skip=false, source_evidence must be nonempty and "
+                "skip_reason must be exactly empty; a skip plan may use empty source_evidence and "
                 "configuration_fact_ids. diagnosis, causal_hypothesis, and skip_reason must be JSON strings; "
                 "invariants, files_to_change, and steps must be JSON arrays of strings; skip must be the JSON "
                 'boolean true or false; when skip is false, skip_reason must be exactly ""; when skip is true, '
@@ -1891,7 +1893,7 @@ class OpenRouterGateway:
     _RESPONSE_SCHEMA_NAMES = MappingProxyType(
         {
             "orchestrator": "agent_loop_orchestrator_v1",
-            "reasoner": "agent_loop_reasoning_plan_v1",
+            "reasoner": "agent_loop_reasoning_plan_v2",
             "coder": "agent_loop_coder_v1",
         }
     )
