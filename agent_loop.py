@@ -1845,11 +1845,11 @@ class OpenRouterGateway:
                 "N: annotation: set start_line to that N for the first cited line, and reproduce the consecutive "
                 "source lines exactly without the N: annotation. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
-                "editable_source_paths and source_snapshots. Cite in configuration_fact_ids exactly the "
-                "fact_id values from read_only_configuration_facts whose settings references appear in your "
-                "source_evidence lines. Do not cite any other setting. Those facts are "
-                "read-only baselines, never source snapshots or editable paths; do not propose changing "
-                "config/settings.py. Never invent baseline values or configuration facts. diagnosis must "
+                "editable_source_paths and source_snapshots. When a read_only_configuration_facts value informs "
+                "your diagnosis, cite its fact_id in configuration_fact_ids; cite only listed fact_id values. "
+                "Those facts are read-only baselines, never source snapshots or editable paths; "
+                "config/settings.py must not appear in files_to_change or steps. Never invent baseline values "
+                "or configuration facts. diagnosis must "
                 "state only observed gate facts; "
                 "causal_hypothesis is explicitly unproven and falsifiable. Use JSON arrays for "
                 "source_evidence, configuration_fact_ids, invariants, files_to_change, and steps; "
@@ -7584,16 +7584,8 @@ def _validate_reasoning_plan_grounding(
         {evidence.path for evidence in plan.source_evidence}
     ):
         raise PatchPolicyError("reasoning evidence must anchor every changed file")
-    evidence_fact_ids = {
-        f"settings.{match.group(1)}"
-        for evidence in plan.source_evidence
-        for match in re.finditer(
-            r"\bsettings\.([A-Z][A-Z0-9_]{0,127})\b", "\n".join(evidence.lines)
-        )
-    }
-    required_fact_ids = set(available_fact_ids) & evidence_fact_ids
-    if set(plan.configuration_fact_ids) != required_fact_ids:
-        raise PatchPolicyError("reasoning plan cited configuration facts outside exact evidence")
+    if not set(plan.configuration_fact_ids).issubset(set(available_fact_ids)):
+        raise PatchPolicyError("reasoning plan cited unsupplied configuration facts")
 
 
 def _validate_configuration_preservation(
