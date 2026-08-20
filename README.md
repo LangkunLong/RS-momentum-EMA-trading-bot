@@ -154,11 +154,14 @@ A useful canary ends with `batch_complete`, exit code `10`, exactly three author
 accounted calls, `completed_samples=1`, `source_modified=false`, and `cleanup_complete=true` in
 `AGENT_LOOP_SUMMARY`. Exit `0` means the sealed gate already passed and no proposal was needed;
 exit `22` is a fail-closed controller/batch failure. Proposal metadata deliberately remains
-`verification_status=not_backtested` and `security_attestation=false` until a separate human-led
-validation workflow.
+`security_attestation=false`; a completed proposal is marked
+`verification_status=privately_backtested` only after the controller applies it to a fresh
+disposable candidate, runs pytest, Ruff, compileall, `git diff --check`, and the sealed backtest,
+then removes that candidate. This is evidence for review, not merge or trading authorization.
 
 Do not turn a canary into a 50-attempt run automatically. First inspect the payload, rendered diff,
-audit chain, source immutability, and whether the edit changes an existing executed strategy path.
+private-evaluation artifact, audit chain, source immutability, exact cited source/configuration
+facts, and whether the edit changes an existing executed strategy path.
 Only a separately authorized same-commit run may use `--proposal-samples 50`,
 `--max-api-calls 150`, `--canary-max-usd 0.50`, `--max-usd 2.00`,
 `--max-tokens 2000000`, `--max-iterations 1`, no `--apply`, and a wall timeout large enough for

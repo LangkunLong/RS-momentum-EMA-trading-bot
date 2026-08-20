@@ -42,7 +42,15 @@ def _route_json(**overrides: object) -> str:
 def _plan_json(**overrides: object) -> str:
     payload: dict[str, object] = {
         "diagnosis": "A boundary is wrong.",
-        "root_cause": "The inclusive condition was omitted.",
+        "causal_hypothesis": "The inclusive condition may have been omitted.",
+        "source_evidence": [
+            {
+                "path": "core/backtest_engine.py",
+                "start_line": 1,
+                "lines": ["VALUE = 1"],
+            }
+        ],
+        "configuration_fact_ids": [],
         "invariants": ["Existing valid signals remain valid."],
         "files_to_change": ["core/backtest_engine.py"],
         "steps": ["Correct the boundary comparison."],
@@ -1166,7 +1174,9 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
         ),
         "reasoner": (
             "diagnosis",
-            "root_cause",
+            "causal_hypothesis",
+            "source_evidence",
+            "configuration_fact_ids",
             "invariants",
             "files_to_change",
             "steps",
@@ -1183,6 +1193,8 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     coder_prompt = OpenRouterGateway.SYSTEM_PROMPTS["coder"]
     assert "path, start_line, old_lines, and new_lines" in coder_prompt
     assert "Do not return unified diff text" in coder_prompt
+    assert "Preserve every supplied configuration reference" in coder_prompt
+    assert "do not replace it with a hard-coded literal" in coder_prompt
     reasoner_prompt = OpenRouterGateway.SYSTEM_PROMPTS["reasoner"]
     assert "closed numeric diagnostics" in reasoner_prompt
     assert "all supplied source snapshots" in reasoner_prompt
@@ -2704,14 +2716,22 @@ def test_oversized_typed_coder_response_is_accounted_protocol_rejection() -> Non
 
 
 def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> None:
-    """The reasoner prompt makes the strict seven-field schema mechanically checkable."""
+    """The reasoner prompt pins exact evidence anchors, facts, and hypothesis semantics."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ReasoningPlan
 
     model = "qwen/qwen3-next-80b-a3b-instruct"
     plan = json.dumps(
         {
             "diagnosis": "The measured return misses the configured threshold.",
-            "root_cause": "The sealed evidence supports one bounded filter adjustment.",
+            "causal_hypothesis": "The sealed evidence supports one bounded experiment.",
+            "source_evidence": [
+                {
+                    "path": "core/pivot_detector.py",
+                    "start_line": 10,
+                    "lines": ["SUPPORTED = True"],
+                }
+            ],
+            "configuration_fact_ids": [],
             "invariants": ["Preserve the downstream confirmation flow."],
             "files_to_change": ["core/pivot_detector.py"],
             "steps": ["Adjust only the supported guard expression."],
@@ -2729,11 +2749,372 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
     gateway.request_once("reasoner", "sealed evidence and source", ReasoningPlan.from_json)
 
     system_prompt = client.completions.calls[0]["messages"][0]["content"]
-    assert "diagnosis, root_cause, and skip_reason must be JSON strings" in system_prompt
+    assert '"causal_hypothesis", "source_evidence", "configuration_fact_ids"' in system_prompt
+    assert "causal_hypothesis is explicitly unproven and falsifiable" in system_prompt
+    assert "source_evidence objects require exactly path, start_line, and lines" in system_prompt
+    assert "cite every supplied configuration fact ID exactly once" in system_prompt
+    assert "Never invent baseline values" in system_prompt
+    assert "diagnosis, causal_hypothesis, and skip_reason must be JSON strings" in system_prompt
     assert "invariants, files_to_change, and steps must be JSON arrays of strings" in system_prompt
     assert "skip must be the JSON boolean true or false" in system_prompt
     assert 'when skip is false, skip_reason must be exactly ""' in system_prompt
     assert "when skip is true, skip_reason must be a nonblank JSON string" in system_prompt
+
+
+def test_reasoning_plan_requires_structured_source_grounding() -> None:
+    """Break caught: a narrative cause could pass without exact source evidence or config facts."""
+    from agent_loop import ReasoningPlan
+
+    plan = ReasoningPlan.from_json(
+        json.dumps(
+            {
+                "diagnosis": "The measured return misses the configured threshold.",
+                "causal_hypothesis": (
+                    "The current recent-quarter weighting may under-rank accelerating stocks."
+                ),
+                "source_evidence": [
+                    {
+                        "path": "core/momentum_analysis.py",
+                        "start_line": 60,
+                        "lines": [
+                            "    if q1_weight is None:",
+                            "        q1_weight = settings.RS_Q1_WEIGHT",
+                        ],
+                    }
+                ],
+                "configuration_fact_ids": ["settings.RS_Q1_WEIGHT"],
+                "invariants": ["Preserve the existing ranking call path."],
+                "files_to_change": ["core/momentum_analysis.py"],
+                "steps": ["Change only the source-grounded weighting expression."],
+                "skip": False,
+                "skip_reason": "",
+            }
+        )
+    )
+
+    assert plan.causal_hypothesis.startswith("The current recent-quarter weighting")
+    assert plan.source_evidence[0].path == "core/momentum_analysis.py"
+    assert plan.source_evidence[0].start_line == 60
+    assert plan.source_evidence[0].lines == (
+        "    if q1_weight is None:",
+        "        q1_weight = settings.RS_Q1_WEIGHT",
+    )
+    assert plan.configuration_fact_ids == ("settings.RS_Q1_WEIGHT",)
+
+
+def test_reasoning_plan_skip_may_omit_source_grounding() -> None:
+    """Break caught: an evidence-based skip was forced to invent a source anchor."""
+    from agent_loop import ReasoningPlan
+
+    plan = ReasoningPlan.from_json(
+        json.dumps(
+            {
+                "diagnosis": "The aggregate evidence cannot identify a controlling expression.",
+                "causal_hypothesis": "No source-backed causal hypothesis is available.",
+                "source_evidence": [],
+                "configuration_fact_ids": [],
+                "invariants": ["Do not invent a strategy edit."],
+                "files_to_change": [],
+                "steps": [],
+                "skip": True,
+                "skip_reason": "The supplied evidence is insufficient.",
+            }
+        )
+    )
+
+    assert plan.skip is True
+    assert plan.source_evidence == ()
+    assert plan.configuration_fact_ids == ()
+
+
+def test_reasoner_configuration_facts_resolve_referenced_literal_settings(
+    tmp_path: Path,
+) -> None:
+    """Break caught: referenced settings values were absent, so the reasoner invented defaults."""
+    import agent_loop
+
+    repo = _task2_repo(tmp_path)
+    settings_bytes = (
+        b"RS_Q1_WEIGHT = 0.40\n"
+        b"RS_Q2_WEIGHT = 0.20\n"
+        b"PUBLIC_LABEL = 'sk-or-v1-never-expose-this'\n"
+        b"OPENROUTER_API_KEY = 'never-expose-this'\n"
+    )
+    (repo / "config").mkdir()
+    (repo / "config" / "settings.py").write_bytes(settings_bytes)
+    (repo / "core" / "momentum_analysis.py").write_text(
+        "from config import settings\n"
+        "CURRENT = settings.RS_Q1_WEIGHT + settings.RS_Q2_WEIGHT\n"
+        "LABEL = settings.PUBLIC_LABEL\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _run_git(repo, "add", "config/settings.py", "core/momentum_analysis.py")
+    _run_git(repo, "commit", "-m", "add literal strategy settings")
+    external = tempfile.TemporaryDirectory(prefix="agent-loop-config-facts-")
+    controller = Path(external.name).resolve()
+    state = agent_loop.preflight_source(
+        repo,
+        acquire_lock=False,
+        controller_temp_parent=controller,
+    )
+    candidate = agent_loop.export_candidate(state)
+    try:
+        snapshot = agent_loop.read_candidate_source_snapshot(
+            candidate,
+            "core/momentum_analysis.py",
+            approved_paths=("core/momentum_analysis.py",),
+        )
+
+        facts = agent_loop._configuration_facts_for_snapshots(candidate, (snapshot,))
+
+        assert [
+            (fact.fact_id, fact.path, fact.line, fact.value, fact.source_sha256)
+            for fact in facts
+        ] == [
+            (
+                "settings.RS_Q1_WEIGHT",
+                "config/settings.py",
+                1,
+                0.4,
+                hashlib.sha256(settings_bytes).hexdigest(),
+            ),
+            (
+                "settings.RS_Q2_WEIGHT",
+                "config/settings.py",
+                2,
+                0.2,
+                hashlib.sha256(settings_bytes).hexdigest(),
+            ),
+        ]
+        assert "never-expose-this" not in json.dumps([asdict(fact) for fact in facts])
+    finally:
+        agent_loop.dispose_candidate(candidate)
+        external.cleanup()
+
+
+def test_reasoning_grounding_rejects_omitted_configuration_facts() -> None:
+    """Break caught: a plan could cite the fallback while hiding its actual configured value."""
+    import agent_loop
+
+    snapshot = agent_loop.SourceSnapshot(
+        path="core/momentum_analysis.py",
+        sha256="a" * 64,
+        byte_count=94,
+        line_count=61,
+        selected_start_line=60,
+        selected_end_line=61,
+        truncated=True,
+        sanitized_text=(
+            "    if q1_weight is None:\n"
+            "        q1_weight = settings.RS_Q1_WEIGHT\n"
+        ),
+    )
+    plan = agent_loop.ReasoningPlan(
+        diagnosis="The measured return misses the configured threshold.",
+        causal_hypothesis="The defaults are 4/3/2/1 and may dilute recent momentum.",
+        source_evidence=(
+            agent_loop.ReasoningSourceEvidence(
+                path="core/momentum_analysis.py",
+                start_line=60,
+                lines=(
+                    "    if q1_weight is None:",
+                    "        q1_weight = settings.RS_Q1_WEIGHT",
+                ),
+            ),
+        ),
+        configuration_fact_ids=(),
+        invariants=("Preserve the existing ranking call path.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change only the source-grounded weighting expression.",),
+        skip=False,
+        skip_reason="",
+    )
+    facts = (
+        agent_loop.ConfigurationFact(
+            fact_id="settings.RS_Q1_WEIGHT",
+            path="config/settings.py",
+            line=303,
+            value=0.4,
+            source_sha256="b" * 64,
+        ),
+    )
+
+    with pytest.raises(agent_loop.PatchPolicyError, match="configuration facts"):
+        agent_loop._validate_reasoning_plan_grounding(plan, (snapshot,), facts)
+
+
+def test_reasoning_grounding_accepts_all_configuration_facts_in_any_order() -> None:
+    """Fact citation order is not semantic and must not waste a paid canary."""
+    import agent_loop
+
+    snapshot = agent_loop.SourceSnapshot(
+        path="core/momentum_analysis.py",
+        sha256="a" * 64,
+        byte_count=12,
+        line_count=1,
+        selected_start_line=1,
+        selected_end_line=1,
+        truncated=False,
+        sanitized_text="MOMENTUM = 1",
+    )
+    facts = (
+        agent_loop.ConfigurationFact(
+            "settings.RS_Q1_WEIGHT", "config/settings.py", 1, 0.4, "b" * 64
+        ),
+        agent_loop.ConfigurationFact(
+            "settings.RS_Q2_WEIGHT", "config/settings.py", 2, 0.2, "b" * 64
+        ),
+    )
+    plan = agent_loop.ReasoningPlan(
+        diagnosis="The measured return misses its threshold.",
+        causal_hypothesis="The exact momentum expression may be causal.",
+        source_evidence=(
+            agent_loop.ReasoningSourceEvidence(
+                "core/momentum_analysis.py", 1, ("MOMENTUM = 1",)
+            ),
+        ),
+        configuration_fact_ids=("settings.RS_Q2_WEIGHT", "settings.RS_Q1_WEIGHT"),
+        invariants=("Preserve the caller.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change the exact expression.",),
+        skip=False,
+        skip_reason="",
+    )
+
+    agent_loop._validate_reasoning_plan_grounding(plan, (snapshot,), facts)
+
+
+def test_reasoning_grounding_rejects_stale_source_anchor() -> None:
+    """Break caught: a reasoner could cite invented old text instead of the sealed snapshot."""
+    import agent_loop
+
+    snapshot = agent_loop.SourceSnapshot(
+        path="core/momentum_analysis.py",
+        sha256="a" * 64,
+        byte_count=94,
+        line_count=61,
+        selected_start_line=60,
+        selected_end_line=61,
+        truncated=True,
+        sanitized_text=(
+            "    if q1_weight is None:\n"
+            "        q1_weight = settings.RS_Q1_WEIGHT\n"
+        ),
+    )
+    plan = agent_loop.ReasoningPlan(
+        diagnosis="The measured return misses the configured threshold.",
+        causal_hypothesis="The current weighting may dilute recent momentum.",
+        source_evidence=(
+            agent_loop.ReasoningSourceEvidence(
+                path="core/momentum_analysis.py",
+                start_line=60,
+                lines=(
+                    "    if q1_weight is None:",
+                    "        q1_weight = 4.0",
+                ),
+            ),
+        ),
+        configuration_fact_ids=("settings.RS_Q1_WEIGHT",),
+        invariants=("Preserve the existing ranking call path.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change only the source-grounded weighting expression.",),
+        skip=False,
+        skip_reason="",
+    )
+    facts = (
+        agent_loop.ConfigurationFact(
+            fact_id="settings.RS_Q1_WEIGHT",
+            path="config/settings.py",
+            line=303,
+            value=0.4,
+            source_sha256="b" * 64,
+        ),
+    )
+
+    with pytest.raises(agent_loop.PatchPolicyError, match="exact source snapshot"):
+        agent_loop._validate_reasoning_plan_grounding(plan, (snapshot,), facts)
+
+
+def test_reasoning_grounding_requires_an_anchor_for_every_changed_file() -> None:
+    """Break caught: a plan could change a file it never cited as evidence."""
+    import agent_loop
+
+    snapshots = (
+        agent_loop.SourceSnapshot(
+            path="core/momentum_analysis.py",
+            sha256="a" * 64,
+            byte_count=11,
+            line_count=1,
+            selected_start_line=1,
+            selected_end_line=1,
+            truncated=False,
+            sanitized_text="MOMENTUM = 1\n",
+        ),
+        agent_loop.SourceSnapshot(
+            path="core/pivot_detector.py",
+            sha256="b" * 64,
+            byte_count=10,
+            line_count=1,
+            selected_start_line=1,
+            selected_end_line=1,
+            truncated=False,
+            sanitized_text="PIVOT = 1\n",
+        ),
+    )
+    plan = agent_loop.ReasoningPlan(
+        diagnosis="The measured return misses the configured threshold.",
+        causal_hypothesis="The momentum expression may be too weak.",
+        source_evidence=(
+            agent_loop.ReasoningSourceEvidence(
+                path="core/pivot_detector.py",
+                start_line=1,
+                lines=("PIVOT = 1",),
+            ),
+        ),
+        configuration_fact_ids=(),
+        invariants=("Preserve the existing ranking call path.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change the momentum expression.",),
+        skip=False,
+        skip_reason="",
+    )
+
+    with pytest.raises(agent_loop.PatchPolicyError, match="every changed file"):
+        agent_loop._validate_reasoning_plan_grounding(plan, snapshots, ())
+
+
+def test_typed_proposal_cannot_replace_a_configuration_reference_with_literals() -> None:
+    """Break caught: the canary replaced audited settings with hard-coded weights."""
+    import agent_loop
+
+    fact = agent_loop.ConfigurationFact(
+        fact_id="settings.RS_Q1_WEIGHT",
+        path="config/settings.py",
+        line=10,
+        value=0.4,
+        source_sha256="a" * 64,
+    )
+    proposal = agent_loop.TypedCodingProposal(
+        summary="Hard-code a stronger recency weighting.",
+        replacements=(
+            agent_loop.ExactLineReplacement(
+                path="core/momentum_analysis.py",
+                start_line=58,
+                old_lines=(
+                    "    if q1_weight is None:",
+                    "        q1_weight = settings.RS_Q1_WEIGHT",
+                ),
+                new_lines=(
+                    "    if q1_weight is None:",
+                    "        q1_weight = 6.0",
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(agent_loop.PatchPolicyError, match="configuration reference"):
+        agent_loop._validate_configuration_preservation(proposal, (fact,))
 
 
 def test_reasoner_rejects_nonempty_skip_reason_when_skip_is_false() -> None:
@@ -2751,7 +3132,15 @@ def test_reasoner_rejects_nonempty_skip_reason_when_skip_is_false() -> None:
     plan = json.dumps(
         {
             "diagnosis": "A bounded diagnosis.",
-            "root_cause": "A bounded cause.",
+            "causal_hypothesis": "A bounded causal hypothesis.",
+            "source_evidence": [
+                {
+                    "path": "core/pivot_detector.py",
+                    "start_line": 1,
+                    "lines": ["PIVOT = 1"],
+                }
+            ],
+            "configuration_fact_ids": [],
             "invariants": ["Preserve behavior outside the approved edit."],
             "files_to_change": ["core/pivot_detector.py"],
             "steps": ["Change the approved expression."],
@@ -3664,6 +4053,109 @@ def test_controller_renders_typed_replacements_as_canonical_exact_diff(
             assert target.read_bytes() == source_before
         finally:
             dispose_candidate(candidate)
+
+
+def test_inert_proposal_evaluation_uses_a_disposable_patched_candidate(
+    tmp_path: Path,
+) -> None:
+    """A proposal is privately checked without applying to source or retaining its candidate."""
+    import agent_loop
+
+    repo = _task2_repo(tmp_path)
+    source_before = (repo / "core" / "momentum_analysis.py").read_bytes()
+    with tempfile.TemporaryDirectory(prefix="agent-loop-private-evaluation-") as controller_name:
+        controller = Path(controller_name)
+        state = agent_loop.preflight_source(
+            repo,
+            acquire_lock=False,
+            controller_temp_parent=controller,
+        )
+        proposal = agent_loop.CodingProposal(
+            summary="Evaluate one exact private change.",
+            files=("core/momentum_analysis.py",),
+            unified_diff=_task2_diff(
+                path="core/momentum_analysis.py",
+                old="MOMENTUM = 1",
+                new="MOMENTUM = 2",
+            ),
+        )
+        observed: list[str] = []
+
+        def quality(candidate: Any) -> Any:
+            observed.append(
+                (candidate.root / "core" / "momentum_analysis.py").read_text(
+                    encoding="utf-8"
+                )
+            )
+            return agent_loop.QualityObservation(True, True, True, True)
+
+        def backtest(candidate: Any) -> Any:
+            observed.append(
+                (candidate.root / "core" / "momentum_analysis.py").read_text(
+                    encoding="utf-8"
+                )
+            )
+            return _gate_evidence(True)
+
+        evaluation = agent_loop.evaluate_inert_proposal(
+            state,
+            proposal,
+            gate="test",
+            editable_paths=("core/momentum_analysis.py",),
+            compile_runner=lambda _layout, _paths: True,
+            run_quality=quality,
+            run_primary_gate=backtest,
+        )
+
+        assert observed == ["MOMENTUM = 2\n", "MOMENTUM = 2\n"]
+        assert evaluation.quality.passed is True
+        assert evaluation.gate.outcome == "exit_zero"
+        assert evaluation.eligible_for_export is True
+        assert evaluation.cleanup_complete is True
+        assert evaluation.source_modified is False
+        assert (repo / "core" / "momentum_analysis.py").read_bytes() == source_before
+        assert list(controller.iterdir()) == []
+
+
+def test_inert_proposal_evaluation_classifies_compile_failure_as_patch_policy(
+    tmp_path: Path,
+) -> None:
+    """Candidate-authored invalid Python is a safe rejection and its private copy is removed."""
+    import agent_loop
+
+    repo = _task2_repo(tmp_path)
+    with tempfile.TemporaryDirectory(prefix="agent-loop-private-evaluation-") as controller_name:
+        controller = Path(controller_name)
+        state = agent_loop.preflight_source(
+            repo,
+            acquire_lock=False,
+            controller_temp_parent=controller,
+        )
+        proposal = agent_loop.CodingProposal(
+            summary="Evaluate one compile-failing private change.",
+            files=("core/momentum_analysis.py",),
+            unified_diff=_task2_diff(
+                path="core/momentum_analysis.py",
+                old="MOMENTUM = 1",
+                new="MOMENTUM = 2",
+            ),
+        )
+
+        with pytest.raises(agent_loop.PatchPolicyError, match="private proposal evaluation"):
+            agent_loop.evaluate_inert_proposal(
+                state,
+                proposal,
+                gate="test",
+                editable_paths=("core/momentum_analysis.py",),
+                compile_runner=lambda _layout, _paths: False,
+                run_quality=lambda _candidate: pytest.fail("quality ran after compile failure"),
+                run_primary_gate=lambda _candidate: pytest.fail("gate ran after compile failure"),
+            )
+
+        assert list(controller.iterdir()) == []
+        assert (repo / "core" / "momentum_analysis.py").read_text(encoding="utf-8") == (
+            "MOMENTUM = 1\n"
+        )
 
 
 def test_typed_replacement_rejects_stale_or_out_of_view_old_lines(tmp_path: Path) -> None:
@@ -7716,11 +8208,21 @@ def _loop_route(*, path: str = "core/backtest_engine.py") -> Any:
 
 
 def _loop_plan(*, path: str = "core/backtest_engine.py") -> Any:
-    from agent_loop import ReasoningPlan
+    from agent_loop import ReasoningPlan, ReasoningSourceEvidence
+
+    source_line = {
+        "core/backtest_engine.py": "VALUE = 1",
+        "core/momentum_analysis.py": "MOMENTUM = 1",
+        "core/pivot_detector.py": "PIVOT = 1",
+    }[path]
 
     return ReasoningPlan(
         diagnosis="The constant is incorrect.",
-        root_cause="The implementation retained the old value.",
+        causal_hypothesis="The implementation may have retained the old value.",
+        source_evidence=(
+            ReasoningSourceEvidence(path=path, start_line=1, lines=(source_line,)),
+        ),
+        configuration_fact_ids=(),
         invariants=("Keep the public interface unchanged.",),
         files_to_change=(path,),
         steps=("Change the isolated constant from one to two.",),
@@ -7753,6 +8255,9 @@ def _run_proposal_batch_fixture(
     samples: int,
     outcomes: list[object],
     clock: Any = None,
+    source_setup: Any = None,
+    evaluation_quality: Any = None,
+    evaluation_callback: Any = None,
 ) -> tuple[Any, _StrictBatchGateway, Any, Any]:
     from agent_loop import (
         AuditTrail,
@@ -7763,9 +8268,11 @@ def _run_proposal_batch_fixture(
         LoopConfig,
         LoopLimits,
         ModelConfig,
+        ProposalEvaluation,
         ProposalBatchLimits,
         ProposalBatchServices,
         ProviderGateEvidence,
+        QualityObservation,
         export_candidate,
         preflight_source,
         read_candidate_source_snapshot,
@@ -7773,6 +8280,10 @@ def _run_proposal_batch_fixture(
     )
 
     source = _task2_repo(tmp_path)
+    if source_setup is not None:
+        source_setup(source)
+        _run_git(source, "add", ".")
+        _run_git(source, "commit", "-m", "configure proposal batch fixture")
     external = tempfile.TemporaryDirectory(prefix="agent-loop-proposal-batch-")
     root = Path(external.name).resolve()
     controller = root / "controller"
@@ -7862,6 +8373,18 @@ def _run_proposal_batch_fixture(
             gateway=gateway,
             run_primary_gate=lambda _candidate: evidence,
             read_snapshots=snapshots,
+            evaluate_proposal=(
+                (lambda proposal, sample: evaluation_callback(proposal, sample, evidence))
+                if evaluation_callback is not None
+                else lambda _proposal, _sample: ProposalEvaluation(
+                    quality=evaluation_quality
+                    or QualityObservation(True, True, True, True),
+                    gate=evidence,
+                    candidate_manifest_sha256="c" * 64,
+                    cleanup_complete=True,
+                    source_modified=False,
+                )
+            ),
             monotonic=clock or time.monotonic,
             editable_paths=("core/momentum_analysis.py", "core/pivot_detector.py"),
         ),
@@ -7870,11 +8393,258 @@ def _run_proposal_batch_fixture(
     return result, gateway, candidate, external
 
 
+def test_proposal_batch_supplies_and_enforces_grounded_configuration_facts(
+    tmp_path: Path,
+) -> None:
+    """Break caught: the paid reasoner could invent settings and still reach the coder."""
+    from agent_loop import (
+        ExactLineReplacement,
+        ReasoningPlan,
+        ReasoningSourceEvidence,
+        Route,
+        TypedCodingProposal,
+    )
+
+    def configure_source(source: Path) -> None:
+        (source / "config").mkdir()
+        (source / "config" / "settings.py").write_text(
+            "RS_Q1_WEIGHT = 0.40\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (source / "core" / "momentum_analysis.py").write_text(
+            "from config import settings\n"
+            "MOMENTUM = settings.RS_Q1_WEIGHT\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    route = Route(
+        action="reason",
+        failure_summary="The deterministic backtest thresholds were not met.",
+        relevant_files=("core/momentum_analysis.py",),
+        reasoning_focus="Inspect the exact configured momentum baseline.",
+    )
+    plan = ReasoningPlan(
+        diagnosis="The measured return misses the configured threshold.",
+        causal_hypothesis="The current 0.40 recent-quarter weight may be too weak.",
+        source_evidence=(
+            ReasoningSourceEvidence(
+                path="core/momentum_analysis.py",
+                start_line=2,
+                lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
+            ),
+        ),
+        configuration_fact_ids=("settings.RS_Q1_WEIGHT",),
+        invariants=("Preserve the existing settings reference.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Scale the source-grounded value in the existing expression.",),
+        skip=False,
+        skip_reason="",
+    )
+    proposal = TypedCodingProposal(
+        summary="Scale the existing configured momentum expression.",
+        replacements=(
+            ExactLineReplacement(
+                path="core/momentum_analysis.py",
+                start_line=2,
+                old_lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
+                new_lines=("MOMENTUM = settings.RS_Q1_WEIGHT * 2",),
+            ),
+        ),
+    )
+
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        outcomes=[route, plan, proposal],
+        source_setup=configure_source,
+    )
+    try:
+        assert result.status == "batch_complete"
+        reasoner_payload = json.loads(gateway.dynamic_inputs[1][1])
+        coder_payload = json.loads(gateway.dynamic_inputs[2][1])
+        expected_facts = [
+            {
+                "fact_id": "settings.RS_Q1_WEIGHT",
+                "line": 1,
+                "path": "config/settings.py",
+                "source_sha256": hashlib.sha256(b"RS_Q1_WEIGHT = 0.40\n").hexdigest(),
+                "value": 0.4,
+            }
+        ]
+        assert reasoner_payload["configuration_facts"] == expected_facts
+        assert coder_payload["configuration_facts"] == expected_facts
+        assert result.budget.api_calls == 3
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_rejects_ungrounded_reasoner_before_coder(
+    tmp_path: Path,
+) -> None:
+    """Break caught: an ungrounded paid plan still consumed a coder call and exported a patch."""
+    from agent_loop import ReasoningPlan, ReasoningSourceEvidence, Route
+
+    def configure_source(source: Path) -> None:
+        (source / "config").mkdir()
+        (source / "config" / "settings.py").write_text(
+            "RS_Q1_WEIGHT = 0.40\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (source / "core" / "momentum_analysis.py").write_text(
+            "from config import settings\n"
+            "MOMENTUM = settings.RS_Q1_WEIGHT\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    route = Route(
+        action="reason",
+        failure_summary="The deterministic backtest thresholds were not met.",
+        relevant_files=("core/momentum_analysis.py",),
+        reasoning_focus="Inspect the exact configured momentum baseline.",
+    )
+    ungrounded = ReasoningPlan(
+        diagnosis="The measured return misses the configured threshold.",
+        causal_hypothesis="The defaults are 4/3/2/1 and may dilute recent momentum.",
+        source_evidence=(
+            ReasoningSourceEvidence(
+                path="core/momentum_analysis.py",
+                start_line=2,
+                lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
+            ),
+        ),
+        configuration_fact_ids=(),
+        invariants=("Preserve the existing settings reference.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change the source-grounded expression.",),
+        skip=False,
+        skip_reason="",
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        outcomes=[route, ungrounded, _loop_proposal(path="core/momentum_analysis.py")],
+        source_setup=configure_source,
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "canary_rejected"
+        assert result.budget.api_calls == 2
+        assert gateway.roles == ["orchestrator", "reasoner"]
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert [
+            event["details"]
+            for event in events
+            if event["event"] == "proposal_sample_rejected"
+        ] == [
+            {
+                "calls_consumed": 2,
+                "code": "reasoner_evidence_rejected",
+                "sample": 1,
+            }
+        ]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_rejects_configuration_bypass_before_export(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a paid coder could erase an audited settings reference and export literals."""
+    from agent_loop import (
+        ExactLineReplacement,
+        ReasoningPlan,
+        ReasoningSourceEvidence,
+        Route,
+        TypedCodingProposal,
+        verify_audit_chain,
+    )
+
+    def configure_source(source: Path) -> None:
+        (source / "config").mkdir()
+        (source / "config" / "settings.py").write_text(
+            "RS_Q1_WEIGHT = 0.40\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (source / "core" / "momentum_analysis.py").write_text(
+            "from config import settings\n"
+            "MOMENTUM = settings.RS_Q1_WEIGHT\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    route = Route(
+        action="reason",
+        failure_summary="The deterministic backtest thresholds were not met.",
+        relevant_files=("core/momentum_analysis.py",),
+        reasoning_focus="Inspect the exact configured momentum baseline.",
+    )
+    plan = ReasoningPlan(
+        diagnosis="The measured return misses the configured threshold.",
+        causal_hypothesis="A bounded weighting experiment may improve the observed return.",
+        source_evidence=(
+            ReasoningSourceEvidence(
+                path="core/momentum_analysis.py",
+                start_line=2,
+                lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
+            ),
+        ),
+        configuration_fact_ids=("settings.RS_Q1_WEIGHT",),
+        invariants=("Preserve the audited settings reference.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change only the existing configured expression.",),
+        skip=False,
+        skip_reason="",
+    )
+    proposal = TypedCodingProposal(
+        summary="Replace the configured weight with a literal.",
+        replacements=(
+            ExactLineReplacement(
+                path="core/momentum_analysis.py",
+                start_line=2,
+                old_lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
+                new_lines=("MOMENTUM = 6.0",),
+            ),
+        ),
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        outcomes=[route, plan, proposal],
+        source_setup=configure_source,
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "canary_rejected"
+        assert result.attempted_samples == 1
+        assert result.completed_samples == 0
+        assert result.rejected_samples == 1
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        assert result.samples == ()
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        rejected = [event for event in events if event["event"] == "proposal_sample_rejected"]
+        assert rejected[0]["details"]["code"] == "patch_rejected"
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
 def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
     tmp_path: Path,
 ) -> None:
     """Break caught: a fifty-sample rollout retried, applied, retained, or exceeded three calls/sample."""
-    from agent_loop import ReasoningPlan, Route
+    from agent_loop import ReasoningPlan, ReasoningSourceEvidence, Route
 
     route = Route(
         action="reason",
@@ -7884,7 +8654,15 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
     )
     plan = ReasoningPlan(
         diagnosis="The momentum constant is incorrect.",
-        root_cause="The prior value was retained.",
+        causal_hypothesis="The prior value may have been retained.",
+        source_evidence=(
+            ReasoningSourceEvidence(
+                path="core/momentum_analysis.py",
+                start_line=1,
+                lines=("MOMENTUM = 1",),
+            ),
+        ),
+        configuration_fact_ids=(),
         invariants=("Keep the public interface unchanged.",),
         files_to_change=("core/momentum_analysis.py",),
         steps=("Change the momentum constant from one to two.",),
@@ -8120,7 +8898,9 @@ def test_proposal_batch_continues_after_a_post_canary_reasoner_skip(
 
     skip = ReasoningPlan(
         diagnosis="The bounded facts do not establish a causal defect.",
-        root_cause="The selected source cannot explain the observed metric gap.",
+        causal_hypothesis="The selected source may not explain the observed metric gap.",
+        source_evidence=(),
+        configuration_fact_ids=(),
         invariants=("Do not invent a strategy change without causal evidence.",),
         files_to_change=(),
         steps=(),
@@ -8295,10 +9075,10 @@ def test_proposal_batch_stops_on_an_accounted_coder_payload_rejection(
         external.cleanup()
 
 
-def test_proposal_batch_continues_after_a_post_canary_reasoner_scope_rejection(
+def test_proposal_batch_continues_after_a_post_canary_reasoner_evidence_rejection(
     tmp_path: Path,
 ) -> None:
-    """A schema-valid scope expansion is rejected without ending the later ensemble."""
+    """An out-of-snapshot plan is rejected by grounding without ending the later ensemble."""
     result, gateway, candidate, external = _run_proposal_batch_fixture(
         tmp_path,
         samples=2,
@@ -8335,7 +9115,7 @@ def test_proposal_batch_continues_after_a_post_canary_reasoner_scope_rejection(
             for event in events
             if event["event"] == "proposal_sample_rejected"
         ] == [
-            {"calls_consumed": 2, "code": "reasoner_scope_rejected", "sample": 2}
+            {"calls_consumed": 2, "code": "reasoner_evidence_rejected", "sample": 2}
         ]
         assert not candidate.root.exists()
     finally:
@@ -8383,10 +9163,10 @@ def test_proposal_batch_treats_preflight_failure_as_a_controller_boundary(
         external.cleanup()
 
 
-def test_proposal_batch_hash_binds_sanitized_evidence_to_unbacktested_proposal(
+def test_proposal_batch_hash_binds_private_evaluation_to_inert_proposal(
     tmp_path: Path,
 ) -> None:
-    """Break caught: an inert proposal could not be traced to the metrics disclosed to models."""
+    """An inert proposal binds both disclosed baseline facts and private patched evaluation."""
     result, _gateway, candidate, external = _run_proposal_batch_fixture(
         tmp_path,
         samples=1,
@@ -8417,7 +9197,15 @@ def test_proposal_batch_hash_binds_sanitized_evidence_to_unbacktested_proposal(
 
         metadata = json.loads(result.samples[0].metadata_path.read_text(encoding="utf-8"))
         assert metadata["provider_evidence_sha256"] == evidence_sha256
-        assert metadata["verification_status"] == "not_backtested"
+        evaluation_path = result.audit_path / "proposal-evaluation-001.json"
+        evaluation_sha256 = hashlib.sha256(evaluation_path.read_bytes()).hexdigest()
+        evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        assert evaluation["quality"]["test_gate_passed"] is True
+        assert evaluation["gate"]["outcome"] == "thresholds_not_met"
+        assert result.samples[0].evaluation_path == evaluation_path
+        assert result.samples[0].evaluation_sha256 == evaluation_sha256
+        assert metadata["proposal_evaluation_sha256"] == evaluation_sha256
+        assert metadata["verification_status"] == "privately_backtested"
         accepted = [event for event in events if event["event"] == "provider_call_accepted"]
         assert [event["details"]["role"] for event in accepted] == [
             "orchestrator",
@@ -8431,7 +9219,7 @@ def test_proposal_batch_hash_binds_sanitized_evidence_to_unbacktested_proposal(
                 "payload_sha256"
             ]
         coder_payload_sha256 = accepted[-1]["details"]["payload_sha256"]
-        assert metadata["schema_version"] == 2
+        assert metadata["schema_version"] == 3
         assert metadata["kind"] == "inert_controller_rendered_proposal"
         assert metadata["renderer_contract"] == "coding_exact_replacements_v1"
         assert metadata["proposal_payload_sha256"] == coder_payload_sha256
@@ -8440,12 +9228,108 @@ def test_proposal_batch_hash_binds_sanitized_evidence_to_unbacktested_proposal(
         )
         assert exported["details"] == {
             "diff_sha256": result.samples[0].diff_sha256,
+            "proposal_evaluation_sha256": evaluation_sha256,
             "metadata_sha256": hashlib.sha256(
                 result.samples[0].metadata_path.read_bytes()
             ).hexdigest(),
             "proposal_payload_sha256": coder_payload_sha256,
             "sample": 1,
         }
+        batch_summary = json.loads(
+            (result.audit_path / "batch-summary.json").read_text(encoding="utf-8")
+        )
+        assert batch_summary["proposal_artifacts"][0]["evaluation_sha256"] == (
+            evaluation_sha256
+        )
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_rejects_private_quality_failure_before_export(
+    tmp_path: Path,
+) -> None:
+    """A compile/test/Ruff failure remains an audited sample rejection, never a handoff."""
+    from agent_loop import QualityObservation, verify_audit_chain
+
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
+        evaluation_quality=QualityObservation(
+            False,
+            True,
+            True,
+            True,
+            ("pytest_failed",),
+        ),
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "canary_rejected"
+        assert result.completed_samples == 0
+        assert result.rejected_samples == 1
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        assert result.samples == ()
+        assert (result.audit_path / "proposal-evaluation-001.json").is_file()
+        assert not (result.audit_path / "proposal-001.diff").exists()
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        rejected = [event for event in events if event["event"] == "proposal_sample_rejected"]
+        assert rejected[0]["details"]["code"] == "patch_rejected"
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_stops_if_private_evaluation_crosses_wall_deadline(
+    tmp_path: Path,
+) -> None:
+    """A completed private evaluation cannot export after consuming the shared wall budget."""
+    from agent_loop import ProposalEvaluation, QualityObservation
+
+    class MutableClock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = MutableClock()
+
+    def evaluate(_proposal: object, _sample: int, evidence: object) -> object:
+        clock.now = 2.0
+        return ProposalEvaluation(
+            quality=QualityObservation(True, True, True, True),
+            gate=evidence,
+            candidate_manifest_sha256="c" * 64,
+            cleanup_complete=True,
+            source_modified=False,
+        )
+
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
+        clock=clock,
+        evaluation_callback=evaluate,
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "budget_exceeded"
+        assert result.attempted_samples == 1
+        assert result.completed_samples == 0
+        assert result.rejected_samples == 0
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        assert result.samples == ()
+        assert (result.audit_path / "proposal-evaluation-001.json").is_file()
+        assert not (result.audit_path / "proposal-001.diff").exists()
         assert not candidate.root.exists()
     finally:
         external.cleanup()
@@ -8731,7 +9615,13 @@ def test_proposal_batch_audits_a_global_rollout_overage_without_next_call(
     tmp_path: Path,
 ) -> None:
     """Break caught: a later sample could exceed the shared cap without a terminal call record."""
-    from agent_loop import ProviderCallFacts, ReasoningPlan, Route, Usage
+    from agent_loop import (
+        ProviderCallFacts,
+        ReasoningPlan,
+        ReasoningSourceEvidence,
+        Route,
+        Usage,
+    )
 
     facts = ProviderCallFacts(
         call_index=4,
@@ -8757,7 +9647,15 @@ def test_proposal_batch_audits_a_global_rollout_overage_without_next_call(
     )
     plan = ReasoningPlan(
         diagnosis="The momentum constant is incorrect.",
-        root_cause="The prior value was retained.",
+        causal_hypothesis="The prior value may have been retained.",
+        source_evidence=(
+            ReasoningSourceEvidence(
+                path="core/momentum_analysis.py",
+                start_line=1,
+                lines=("MOMENTUM = 1",),
+            ),
+        ),
+        configuration_fact_ids=(),
         invariants=("Keep the public interface unchanged.",),
         files_to_change=("core/momentum_analysis.py",),
         steps=("Change the momentum constant from one to two.",),
@@ -8798,6 +9696,7 @@ def _run_state_machine_fixture(
     max_api_calls: int = 12,
     clock: Any = None,
     quality_result: Any = None,
+    source_setup: Any = None,
 ) -> tuple[Any, Any, Any, Any, list[str]]:
     from agent_loop import (
         AuditTrail,
@@ -8815,6 +9714,10 @@ def _run_state_machine_fixture(
     )
 
     source = _task2_repo(tmp_path)
+    if source_setup is not None:
+        source_setup(source)
+        _run_git(source, "add", ".")
+        _run_git(source, "commit", "-m", "configure state-machine fixture")
     external = tempfile.TemporaryDirectory(prefix="agent-loop-state-machine-")
     external_root = Path(external.name).resolve()
     controller = external_root / "controller"
@@ -9182,7 +10085,9 @@ def test_state_machine_reasoner_skip_never_calls_coder(tmp_path: Path) -> None:
 
     skipped = ReasoningPlan(
         diagnosis="The failure is environmental.",
-        root_cause="No safe code change is justified.",
+        causal_hypothesis="No safe code change is justified by the bounded evidence.",
+        source_evidence=(),
+        configuration_fact_ids=(),
         invariants=("Do not change strategy code.",),
         files_to_change=(),
         steps=(),
@@ -9200,6 +10105,133 @@ def test_state_machine_reasoner_skip_never_calls_coder(tmp_path: Path) -> None:
         assert result.status.value == "limits_exhausted"
         assert gateway.roles == ["orchestrator", "reasoner"]
         assert result.patches_applied == 0
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_rejects_ungrounded_reasoner_before_coder(tmp_path: Path) -> None:
+    """Break caught: the ordinary loop trusted stale reasoner evidence and applied its coder patch."""
+    from agent_loop import ReasoningPlan, ReasoningSourceEvidence
+
+    ungrounded = ReasoningPlan(
+        diagnosis="The deterministic test gate failed.",
+        causal_hypothesis="The constant may retain the wrong value.",
+        source_evidence=(
+            ReasoningSourceEvidence(
+                path="core/backtest_engine.py",
+                start_line=1,
+                lines=("VALUE = 0",),
+            ),
+        ),
+        configuration_fact_ids=(),
+        invariants=("Preserve the public interface.",),
+        files_to_change=("core/backtest_engine.py",),
+        steps=("Change the exact grounded constant.",),
+        skip=False,
+        skip_reason="",
+    )
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[_loop_route(), ungrounded, _loop_proposal()],
+        primary_results=[_gate_evidence(False)],
+        apply=True,
+        max_iterations=1,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert gateway.roles == ["orchestrator", "reasoner"]
+        assert result.patches_applied == 0
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert any(
+            event["event"] == "iteration_skipped"
+            and event["details"]["code"] == "evidence_rejected"
+            for event in events
+        )
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_state_machine_rejects_configuration_bypass_before_apply(tmp_path: Path) -> None:
+    """Break caught: the ordinary loop applied hard-coded literals over audited settings."""
+    from agent_loop import (
+        ExactLineReplacement,
+        ReasoningPlan,
+        ReasoningSourceEvidence,
+        Route,
+        TypedCodingProposal,
+        verify_audit_chain,
+    )
+
+    def configure_source(source: Path) -> None:
+        (source / "config").mkdir()
+        (source / "config" / "settings.py").write_text(
+            "RS_Q1_WEIGHT = 0.40\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (source / "core" / "momentum_analysis.py").write_text(
+            "from config import settings\n"
+            "MOMENTUM = settings.RS_Q1_WEIGHT\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    route = Route(
+        action="reason",
+        failure_summary="The deterministic test gate failed.",
+        relevant_files=("core/momentum_analysis.py",),
+        reasoning_focus="Inspect the configured momentum expression.",
+    )
+    plan = ReasoningPlan(
+        diagnosis="The deterministic gate did not pass.",
+        causal_hypothesis="A bounded weighting experiment may change the observed result.",
+        source_evidence=(
+            ReasoningSourceEvidence(
+                path="core/momentum_analysis.py",
+                start_line=2,
+                lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
+            ),
+        ),
+        configuration_fact_ids=("settings.RS_Q1_WEIGHT",),
+        invariants=("Preserve the audited settings reference.",),
+        files_to_change=("core/momentum_analysis.py",),
+        steps=("Change only the existing configured expression.",),
+        skip=False,
+        skip_reason="",
+    )
+    proposal = TypedCodingProposal(
+        summary="Replace the configured weight with a literal.",
+        replacements=(
+            ExactLineReplacement(
+                path="core/momentum_analysis.py",
+                start_line=2,
+                old_lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
+                new_lines=("MOMENTUM = 6.0",),
+            ),
+        ),
+    )
+    result, gateway, candidate, external, _observed = _run_state_machine_fixture(
+        tmp_path,
+        outcomes=[route, plan, proposal],
+        primary_results=[_gate_evidence(False)],
+        apply=True,
+        max_iterations=1,
+        source_setup=configure_source,
+    )
+    try:
+        assert result.status.value == "limits_exhausted"
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"]
+        assert result.patches_applied == 0
+        events = verify_audit_chain(result.audit_path / "events.jsonl")
+        rejected = [event for event in events if event["event"] == "proposal_rejected"]
+        assert rejected[0]["details"]["code"] == "patch_policy"
         assert not candidate.root.exists()
     finally:
         external.cleanup()

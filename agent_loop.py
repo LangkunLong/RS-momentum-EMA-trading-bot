@@ -591,6 +591,29 @@ def _text_tuple(value: Any, field: str, *, maximum: int = _MAX_LIST_ITEMS) -> tu
     return tuple(_required_text(item, field) for item in value)
 
 
+_CONFIGURATION_FACT_ID_RE = re.compile(r"settings\.[A-Z][A-Z0-9_]{0,127}")
+
+
+def _configuration_fact_id_list(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
+        raise PayloadFieldValidationError("configuration_fact_ids must be a bounded list")
+    result: list[str] = []
+    for item in value:
+        fact_id = _required_text(item, "configuration_fact_ids", max_bytes=256)
+        if _CONFIGURATION_FACT_ID_RE.fullmatch(fact_id) is None or fact_id in result:
+            raise PayloadFieldValidationError(
+                "configuration_fact_ids must contain unique controller fact IDs"
+            )
+        result.append(fact_id)
+    return tuple(result)
+
+
+def _configuration_fact_id_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise PayloadFieldValidationError("configuration_fact_ids must be an immutable tuple")
+    return _configuration_fact_id_list(list(value))
+
+
 @dataclass(frozen=True)
 class Route:
     """Validated decision from the Orchestrator role."""
@@ -627,11 +650,57 @@ class Route:
 
 
 @dataclass(frozen=True)
+class ReasoningSourceEvidence:
+    """One provider-cited exact excerpt from a controller-supplied source snapshot."""
+
+    path: str
+    start_line: int
+    lines: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        path = _relative_path(self.path, "source evidence path")
+        if type(self.start_line) is not int or not 1 <= self.start_line <= 1_000_000:
+            raise PayloadFieldValidationError("source evidence start_line must be positive")
+        if not isinstance(self.lines, tuple) or not 1 <= len(self.lines) <= 32:
+            raise PayloadFieldValidationError("source evidence lines must be a nonempty bounded tuple")
+        lines = tuple(
+            _source_line(value, "source evidence lines", allow_trailing_whitespace=True)
+            for value in self.lines
+        )
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "lines", lines)
+
+
+def _reasoning_source_evidence_list(value: Any) -> tuple[ReasoningSourceEvidence, ...]:
+    if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
+        raise PayloadFieldValidationError("source_evidence must be a bounded list")
+    result: list[ReasoningSourceEvidence] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"path", "start_line", "lines"}:
+            raise PayloadKeysValidationError(
+                "source evidence objects require exactly path, start_line, and lines"
+            )
+        lines = item["lines"]
+        if not isinstance(lines, list):
+            raise PayloadFieldValidationError("source evidence lines must be a list")
+        result.append(
+            ReasoningSourceEvidence(
+                path=item["path"],
+                start_line=item["start_line"],
+                lines=tuple(lines),
+            )
+        )
+    return tuple(result)
+
+
+@dataclass(frozen=True)
 class ReasoningPlan:
     """Validated concise repair plan from the Reasoner role."""
 
     diagnosis: str
-    root_cause: str
+    causal_hypothesis: str
+    source_evidence: tuple[ReasoningSourceEvidence, ...]
+    configuration_fact_ids: tuple[str, ...]
     invariants: tuple[str, ...]
     files_to_change: tuple[str, ...]
     steps: tuple[str, ...]
@@ -641,12 +710,22 @@ class ReasoningPlan:
     def __post_init__(self) -> None:
         """Validate direct construction as strictly as parsed model input."""
         _required_text(self.diagnosis, "diagnosis")
-        _required_text(self.root_cause, "root_cause")
+        _required_text(self.causal_hypothesis, "causal_hypothesis")
+        if not isinstance(self.source_evidence, tuple) or len(
+            self.source_evidence
+        ) > _MAX_LIST_ITEMS:
+            raise PayloadFieldValidationError("source_evidence must be a bounded immutable tuple")
+        for item in self.source_evidence:
+            if not isinstance(item, ReasoningSourceEvidence):
+                raise PayloadFieldValidationError("source_evidence contains an invalid item")
+        _configuration_fact_id_tuple(self.configuration_fact_ids)
         _text_tuple(self.invariants, "invariants")
         _path_tuple(self.files_to_change, "files_to_change")
         _text_tuple(self.steps, "steps")
         if type(self.skip) is not bool:
             raise PayloadFieldValidationError("skip must be a boolean")
+        if not self.skip and not self.source_evidence:
+            raise PayloadFieldValidationError("non-skip plans require source_evidence")
         _optional_text(self.skip_reason, "skip_reason")
         if self.skip and not self.skip_reason.strip():
             raise PayloadFieldValidationError("skip_reason must not be blank when skip is true")
@@ -660,7 +739,9 @@ class ReasoningPlan:
             raw,
             {
                 "diagnosis",
-                "root_cause",
+                "causal_hypothesis",
+                "source_evidence",
+                "configuration_fact_ids",
                 "invariants",
                 "files_to_change",
                 "steps",
@@ -677,7 +758,13 @@ class ReasoningPlan:
             raise PayloadFieldValidationError("skip_reason must be empty when skip is false")
         return cls(
             diagnosis=_required_text(value["diagnosis"], "diagnosis"),
-            root_cause=_required_text(value["root_cause"], "root_cause"),
+            causal_hypothesis=_required_text(
+                value["causal_hypothesis"], "causal_hypothesis"
+            ),
+            source_evidence=_reasoning_source_evidence_list(value["source_evidence"]),
+            configuration_fact_ids=_configuration_fact_id_list(
+                value["configuration_fact_ids"]
+            ),
             invariants=_text_list(value["invariants"], "invariants"),
             files_to_change=_path_list(value["files_to_change"], "files_to_change"),
             steps=_text_list(value["steps"], "steps"),
@@ -1751,10 +1838,18 @@ class OpenRouterGateway:
             ),
             "reasoner": (
                 "You are the Reasoner. Return exactly one concise JSON object with exactly these keys: "
-                '"diagnosis", "root_cause", "invariants", "files_to_change", "steps", "skip", '
-                '"skip_reason". Use JSON arrays for invariants, files_to_change, and steps; choose files '
-                "only from the provided source snapshots. Use the closed numeric diagnostics and all "
-                "supplied source snapshots to establish a specific causal edit. Treat those snapshots "
+                '"diagnosis", "causal_hypothesis", "source_evidence", "configuration_fact_ids", '
+                '"invariants", "files_to_change", "steps", "skip", "skip_reason". '
+                "source_evidence objects require exactly path, start_line, and lines; path must be a "
+                "provided source snapshot, start_line must be its immutable original coordinate, and "
+                "lines must exactly reproduce consecutive supplied source lines without annotations. "
+                "For a non-skip plan, anchor every files_to_change path and cite every supplied "
+                "configuration fact ID exactly once in configuration_fact_ids. Never invent baseline "
+                "values or configuration facts. diagnosis must state only observed gate facts; "
+                "causal_hypothesis is explicitly unproven and falsifiable. Use JSON arrays for "
+                "source_evidence, configuration_fact_ids, invariants, files_to_change, and steps; "
+                "choose files only from the provided source snapshots. Use the closed numeric diagnostics "
+                "and all supplied source snapshots to establish a specific causal edit. Treat those snapshots "
                 "as the complete approved editing scope; never require an inaccessible path as a repair "
                 "prerequisite. A minimal change may be a bounded falsifiable experiment when the closed "
                 "metrics identify a bottleneck and a supplied snapshot contains its controlling expression. "
@@ -1763,7 +1858,8 @@ class OpenRouterGateway:
                 "already-executed logic instead. "
                 "Set skip to true only when no such causal experiment is supported; otherwise set skip to "
                 "false and skip_reason to an empty "
-                "string for a repairable issue. diagnosis, root_cause, and skip_reason must be JSON strings; "
+                "string for a repairable issue. A skip plan may use empty source_evidence and "
+                "configuration_fact_ids. diagnosis, causal_hypothesis, and skip_reason must be JSON strings; "
                 "invariants, files_to_change, and steps must be JSON arrays of strings; skip must be the JSON "
                 'boolean true or false; when skip is false, skip_reason must be exactly ""; when skip is true, '
                 "skip_reason must be a nonblank JSON string. Never invent a patch merely to satisfy a target. Do not "
@@ -1782,6 +1878,8 @@ class OpenRouterGateway:
                 "old_lines must exactly match consecutive visible source lines including indentation. "
                 "Do not add any new defaulted parameter in a function, method, or lambda, even with a proposed "
                 "caller; make a direct change to already-executed logic and never add dormant optional knobs. "
+                "Preserve every supplied configuration reference that appears in old_lines; do not replace it "
+                "with a hard-coded literal or otherwise bypass the controller-supplied configuration fact. "
                 "Order replacements by path and original start_line, with no duplicate, overlapping, or "
                 "adjacent source ranges; merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -6327,6 +6425,31 @@ class SourceSnapshot:
         object.__setattr__(self, "path", path)
 
 
+@dataclass(frozen=True)
+class ConfigurationFact:
+    """One controller-resolved non-secret literal referenced by an approved snapshot."""
+
+    fact_id: str
+    path: str
+    line: int
+    value: int | float | bool | None
+    source_sha256: str
+
+    def __post_init__(self) -> None:
+        if _CONFIGURATION_FACT_ID_RE.fullmatch(self.fact_id) is None:
+            raise ConfigurationError("configuration fact ID is invalid")
+        if self.path != "config/settings.py":
+            raise ConfigurationError("configuration fact path is invalid")
+        if type(self.line) is not int or self.line < 1:
+            raise ConfigurationError("configuration fact line is invalid")
+        if self.value is not None and type(self.value) not in {int, float, bool}:
+            raise ConfigurationError("configuration fact value is not a JSON scalar")
+        if isinstance(self.value, float) and not math.isfinite(self.value):
+            raise ConfigurationError("configuration fact value is not finite")
+        if _SHA256_RE.fullmatch(self.source_sha256) is None:
+            raise ConfigurationError("configuration fact source hash is invalid")
+
+
 def _coder_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, object]:
     """Add controller-owned line annotations to one provider-safe coder snapshot."""
     if not isinstance(snapshot, SourceSnapshot):
@@ -7176,6 +7299,176 @@ def read_candidate_source_snapshot(
     )
 
 
+_CONFIGURATION_SECRET_NAME_RE = re.compile(
+    r"(?:API_KEY|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|ACCESS_KEY)",
+    re.IGNORECASE,
+)
+
+
+def _configuration_facts_for_snapshots(
+    candidate: Candidate,
+    snapshots: Sequence[SourceSnapshot],
+) -> tuple[ConfigurationFact, ...]:
+    """Resolve only referenced, literal, non-secret settings into closed provider facts."""
+    root = _require_candidate(candidate)
+    if not isinstance(snapshots, (tuple, list)) or any(
+        not isinstance(snapshot, SourceSnapshot) for snapshot in snapshots
+    ):
+        raise ConfigurationError("configuration facts require source snapshots")
+    referenced = {
+        match.group(1)
+        for snapshot in snapshots
+        for match in re.finditer(
+            r"\bsettings\.([A-Z][A-Z0-9_]{0,127})\b",
+            snapshot.sanitized_text,
+        )
+        if _CONFIGURATION_SECRET_NAME_RE.search(match.group(1)) is None
+    }
+    if not referenced:
+        return ()
+    relative = "config/settings.py"
+    if relative not in candidate.tracked_files:
+        return ()
+    target = root / relative
+    try:
+        before = target.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or _has_reparse_point(target)
+            or before.st_nlink != 1
+            or before.st_size > _SOURCE_FILE_LIMIT
+        ):
+            raise ConfigurationError("configuration fact source must be a bounded regular file")
+        raw = target.read_bytes()
+        after = target.lstat()
+    except OSError as exc:
+        raise ConfigurationError("configuration fact source cannot be read") from exc
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or len(raw) != before.st_size
+    ):
+        raise ConfigurationError("configuration fact source changed while it was read")
+    try:
+        decoded = raw.decode("utf-8")
+        tree = ast.parse(decoded, filename=relative)
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise ConfigurationError("configuration fact source is not valid UTF-8 Python") from exc
+    assignments: dict[str, list[tuple[int, ast.expr]]] = {}
+    for statement in tree.body:
+        target_name: str | None = None
+        value_node: ast.expr | None = None
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            target_name = statement.targets[0].id
+            value_node = statement.value
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            target_name = statement.target.id
+            value_node = statement.value
+        if target_name in referenced and value_node is not None:
+            assignments.setdefault(target_name, []).append((statement.lineno, value_node))
+    source_sha256 = hashlib.sha256(raw).hexdigest()
+    facts: list[ConfigurationFact] = []
+    for name in sorted(referenced):
+        candidates = assignments.get(name, [])
+        if len(candidates) != 1:
+            continue
+        line, value_node = candidates[0]
+        try:
+            value = ast.literal_eval(value_node)
+        except (ValueError, TypeError):
+            continue
+        if value is not None and type(value) not in {int, float, bool}:
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        facts.append(
+            ConfigurationFact(
+                fact_id=f"settings.{name}",
+                path=relative,
+                line=line,
+                value=value,
+                source_sha256=source_sha256,
+            )
+        )
+    return tuple(facts)
+
+
+def _validate_reasoning_plan_grounding(
+    plan: ReasoningPlan,
+    snapshots: Sequence[SourceSnapshot],
+    configuration_facts: Sequence[ConfigurationFact],
+) -> None:
+    """Require every controller-resolved configuration fact in a non-skip plan."""
+    if not isinstance(plan, ReasoningPlan):
+        raise ConfigurationError("reasoning grounding requires a validated plan")
+    if not isinstance(snapshots, (tuple, list)) or any(
+        not isinstance(snapshot, SourceSnapshot) for snapshot in snapshots
+    ):
+        raise ConfigurationError("reasoning grounding requires source snapshots")
+    if not isinstance(configuration_facts, (tuple, list)) or any(
+        not isinstance(fact, ConfigurationFact) for fact in configuration_facts
+    ):
+        raise ConfigurationError("reasoning grounding requires configuration facts")
+    if plan.skip:
+        return
+    required_fact_ids = tuple(fact.fact_id for fact in configuration_facts)
+    if len(required_fact_ids) != len(set(required_fact_ids)):
+        raise ConfigurationError("reasoning grounding configuration facts are duplicated")
+    if set(plan.configuration_fact_ids) != set(required_fact_ids):
+        raise PatchPolicyError("reasoning plan did not cite all supplied configuration facts")
+    snapshot_by_path: dict[str, SourceSnapshot] = {}
+    for snapshot in snapshots:
+        if snapshot.path in snapshot_by_path:
+            raise ConfigurationError("reasoning grounding snapshots are duplicated")
+        snapshot_by_path[snapshot.path] = snapshot
+    for evidence in plan.source_evidence:
+        snapshot = snapshot_by_path.get(evidence.path)
+        if snapshot is None:
+            raise PatchPolicyError("reasoning evidence is outside the exact source snapshots")
+        offset = evidence.start_line - snapshot.selected_start_line
+        visible_lines = tuple(snapshot.sanitized_text.splitlines())
+        if (
+            offset < 0
+            or offset + len(evidence.lines) > len(visible_lines)
+            or evidence.start_line + len(evidence.lines) - 1 > snapshot.selected_end_line
+            or visible_lines[offset : offset + len(evidence.lines)] != evidence.lines
+        ):
+            raise PatchPolicyError("reasoning evidence does not match the exact source snapshot")
+    if not set(plan.files_to_change).issubset(
+        {evidence.path for evidence in plan.source_evidence}
+    ):
+        raise PatchPolicyError("reasoning evidence must anchor every changed file")
+
+
+def _validate_configuration_preservation(
+    proposal: TypedCodingProposal,
+    configuration_facts: Sequence[ConfigurationFact],
+) -> None:
+    """Reject edits that remove a controller-supplied settings reference."""
+    if not isinstance(proposal, TypedCodingProposal):
+        raise ConfigurationError("configuration preservation requires a typed proposal")
+    if not isinstance(configuration_facts, (tuple, list)) or any(
+        not isinstance(fact, ConfigurationFact) for fact in configuration_facts
+    ):
+        raise ConfigurationError("configuration preservation requires configuration facts")
+    for replacement in proposal.replacements:
+        old_text = "\n".join(replacement.old_lines)
+        new_text = "\n".join(replacement.new_lines)
+        for fact in configuration_facts:
+            reference = re.compile(
+                rf"(?<![A-Za-z0-9_]){re.escape(fact.fact_id)}(?![A-Za-z0-9_])"
+            )
+            if reference.search(old_text) is not None and reference.search(new_text) is None:
+                raise PatchPolicyError(
+                    "proposal removed a controller-supplied configuration reference"
+                )
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     try:
         return json.dumps(
@@ -7570,6 +7863,26 @@ class AuditTrail:
         path = self._write_json(self.run_root / "provider-evidence.json", payload)
         return path, _file_sha256(path)
 
+    def write_proposal_evaluation(
+        self,
+        evaluation: ProposalEvaluation,
+        *,
+        sample: int,
+    ) -> tuple[Path, str]:
+        """Persist closed private quality/backtest facts for one inert proposal."""
+        if not isinstance(evaluation, ProposalEvaluation):
+            raise AuditError("proposal evaluation audit requires validated facts")
+        if type(sample) is not int or not 1 <= sample <= MAX_PROPOSAL_SAMPLES:
+            raise AuditError("proposal evaluation sample index is invalid")
+        payload = asdict(evaluation)
+        if len(_canonical_json_bytes(payload)) > _MAX_PROVIDER_EVIDENCE_BYTES:
+            raise AuditError("proposal evaluation exceeds the closed byte limit")
+        path = self._write_json(
+            self.run_root / f"proposal-evaluation-{sample:03d}.json",
+            payload,
+        )
+        return path, _file_sha256(path)
+
     def write_inert_diff(self, raw: str, *, name: str = "candidate") -> tuple[Path, str]:
         """Persist one exact sanitized diff as inert bytes; never execute or apply the export."""
         if not isinstance(raw, str) or not raw:
@@ -7740,6 +8053,8 @@ class HandoffArtifact:
 class ProposalSampleResult:
     sample: int
     provider_call_paths: tuple[tuple[Path, str], ...]
+    evaluation_path: Path
+    evaluation_sha256: str
     diff_path: Path
     diff_sha256: str
     metadata_path: Path
@@ -7754,9 +8069,13 @@ class ProposalSampleResult:
             _absolute_configuration_path(path, "provider call artifact")
             if _SHA256_RE.fullmatch(digest) is None:
                 raise ConfigurationError("provider call artifact digest is invalid")
-        for path in (self.diff_path, self.metadata_path):
+        for path in (self.evaluation_path, self.diff_path, self.metadata_path):
             _absolute_configuration_path(path, "proposal artifact")
-        for digest in (self.diff_sha256, self.metadata_sha256):
+        for digest in (
+            self.evaluation_sha256,
+            self.diff_sha256,
+            self.metadata_sha256,
+        ):
             if _SHA256_RE.fullmatch(digest) is None:
                 raise ConfigurationError("proposal artifact digest is invalid")
 
@@ -8006,6 +8325,100 @@ def cleanup_run_resources(
     )
 
 
+@dataclass(frozen=True)
+class ProposalEvaluation:
+    """Closed results from evaluating one proposal in a disposable private candidate."""
+
+    quality: QualityObservation
+    gate: ProviderGateEvidence
+    candidate_manifest_sha256: str
+    cleanup_complete: bool
+    source_modified: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.quality, QualityObservation):
+            raise ConfigurationError("proposal evaluation quality is invalid")
+        if not isinstance(self.gate, ProviderGateEvidence):
+            raise ConfigurationError("proposal evaluation gate evidence is invalid")
+        if _SHA256_RE.fullmatch(self.candidate_manifest_sha256) is None:
+            raise ConfigurationError("proposal evaluation manifest digest is invalid")
+        if type(self.cleanup_complete) is not bool or type(self.source_modified) is not bool:
+            raise ConfigurationError("proposal evaluation cleanup facts are invalid")
+        if not self.cleanup_complete or self.source_modified:
+            raise ConfigurationError("proposal evaluation must close without source mutation")
+
+    @property
+    def eligible_for_export(self) -> bool:
+        """Require quality plus a confined, exit-zero private gate observation."""
+        return (
+            self.quality.passed
+            and self.gate.observed_exit_zero
+            and self.gate.worker_confined
+            and self.gate.returncode == 0
+        )
+
+
+def evaluate_inert_proposal(
+    state: SourceState,
+    proposal: CodingProposal,
+    *,
+    gate: str,
+    editable_paths: Sequence[str],
+    compile_runner: Callable[[WorkerLayout, tuple[str, ...]], bool],
+    run_quality: Callable[[Candidate], QualityObservation],
+    run_primary_gate: Callable[[Candidate], ProviderGateEvidence],
+) -> ProposalEvaluation:
+    """Apply and observe a proposal only inside a fresh disposable candidate."""
+    if not isinstance(state, SourceState) or not isinstance(proposal, CodingProposal):
+        raise ConfigurationError("private proposal evaluation inputs are invalid")
+    if not all(callable(value) for value in (compile_runner, run_quality, run_primary_gate)):
+        raise ConfigurationError("private proposal evaluation services must be callable")
+    if recheck_source_unchanged(state).source_modified:
+        raise CandidateMutationError("source changed before private proposal evaluation")
+    evaluation_candidate = export_candidate(state)
+    try:
+        apply_candidate_patch(
+            evaluation_candidate,
+            proposal,
+            gate=gate,
+            editable_paths=editable_paths,
+            compile_runner=compile_runner,
+        )
+        patched_manifest = _candidate_tracked_manifest_sha256(evaluation_candidate)
+        quality = run_quality(evaluation_candidate)
+        if not isinstance(quality, QualityObservation):
+            raise ConfigurationError("private proposal quality service returned invalid facts")
+        if _candidate_tracked_manifest_sha256(evaluation_candidate) != patched_manifest:
+            raise CandidateMutationError("private quality checks changed the evaluation candidate")
+        gate_evidence = run_primary_gate(evaluation_candidate)
+        if not isinstance(gate_evidence, ProviderGateEvidence):
+            raise ConfigurationError("private proposal gate service returned invalid facts")
+        if _candidate_tracked_manifest_sha256(evaluation_candidate) != patched_manifest:
+            raise CandidateMutationError("private gate changed the evaluation candidate")
+    except Exception as exc:
+        dispose_candidate(evaluation_candidate)
+        if recheck_source_unchanged(state).source_modified:
+            raise CandidateMutationError(
+                "source changed during private proposal evaluation"
+            ) from exc
+        if isinstance(exc, PatchApplicationError):
+            raise PatchPolicyError(
+                "private proposal evaluation rejected the candidate patch"
+            ) from exc
+        raise
+    dispose_candidate(evaluation_candidate)
+    source_modified = recheck_source_unchanged(state).source_modified
+    if source_modified:
+        raise CandidateMutationError("source changed during private proposal evaluation")
+    return ProposalEvaluation(
+        quality=quality,
+        gate=gate_evidence,
+        candidate_manifest_sha256=patched_manifest,
+        cleanup_complete=True,
+        source_modified=False,
+    )
+
+
 class AgentGatewayProtocol(Protocol):
     ledger: BudgetLedger
 
@@ -8085,6 +8498,7 @@ class ProposalBatchServices:
     gateway: StrictAgentGatewayProtocol
     run_primary_gate: Callable[[Candidate], ProviderGateEvidence]
     read_snapshots: Callable[[Candidate, tuple[str, ...]], tuple[SourceSnapshot, ...]]
+    evaluate_proposal: Callable[[CodingProposal, int], ProposalEvaluation]
     monotonic: Callable[[], float] = time.monotonic
     known_secrets: tuple[str, ...] = ()
     editable_paths: tuple[str, ...] = ()
@@ -8093,6 +8507,7 @@ class ProposalBatchServices:
         if not all(callable(value) for value in (
             self.run_primary_gate,
             self.read_snapshots,
+            self.evaluate_proposal,
             self.monotonic,
         )):
             raise ConfigurationError("proposal batch service boundary must be callable")
@@ -8183,6 +8598,7 @@ def export_inert_proposal(
     artifact_name: str = "candidate",
     provider_evidence_sha256: str | None = None,
     proposal_payload_sha256: str | None = None,
+    proposal_evaluation_sha256: str | None = None,
     renderer_contract: str | None = None,
 ) -> HandoffArtifact:
     """Export one validated model proposal as inert bytes without mutating quarantine."""
@@ -8196,12 +8612,20 @@ def export_inert_proposal(
         proposal_payload_sha256
     ) is None:
         raise ConfigurationError("proposal payload digest must be lowercase SHA-256")
+    if proposal_evaluation_sha256 is not None and _SHA256_RE.fullmatch(
+        proposal_evaluation_sha256
+    ) is None:
+        raise ConfigurationError("proposal evaluation digest must be lowercase SHA-256")
     if (proposal_payload_sha256 is None) != (renderer_contract is None):
         raise ConfigurationError("controller-rendered proposal provenance is incomplete")
     if renderer_contract not in {None, "coding_exact_replacements_v1"}:
         raise ConfigurationError("proposal renderer contract is invalid")
     if provider_evidence_sha256 is not None and proposal_payload_sha256 is None:
         raise ConfigurationError("evidence-bound proposal requires typed payload provenance")
+    if proposal_evaluation_sha256 is not None and (
+        provider_evidence_sha256 is None or proposal_payload_sha256 is None
+    ):
+        raise ConfigurationError("evaluated proposal requires complete provider provenance")
     root = _require_candidate(candidate)
     before = _candidate_tracked_manifest_sha256(candidate)
     parsed = validate_unified_diff(
@@ -8228,7 +8652,11 @@ def export_inert_proposal(
         name=artifact_name,
     )
     metadata: dict[str, object] = {
-        "schema_version": 2 if renderer_contract is not None else 1,
+        "schema_version": (
+            3
+            if proposal_evaluation_sha256 is not None
+            else 2 if renderer_contract is not None else 1
+        ),
         "kind": (
             "inert_controller_rendered_proposal"
             if renderer_contract is not None
@@ -8255,6 +8683,13 @@ def export_inert_proposal(
             {
                 "provider_evidence_sha256": provider_evidence_sha256,
                 "verification_status": "not_backtested",
+            }
+        )
+    if proposal_evaluation_sha256 is not None:
+        metadata.update(
+            {
+                "proposal_evaluation_sha256": proposal_evaluation_sha256,
+                "verification_status": "privately_backtested",
             }
         )
     metadata_path = audit.write_handoff_metadata(
@@ -8708,6 +9143,10 @@ def run_proposal_batch(
                     )
                     continue
                 snapshots = load_snapshots(services.editable_paths)
+                configuration_facts = _configuration_facts_for_snapshots(
+                    candidate,
+                    snapshots,
+                )
                 plan, artifact, _plan_payload_sha256 = call_role(
                     sample,
                     2,
@@ -8717,6 +9156,9 @@ def run_proposal_batch(
                         "evidence": evidence_payload,
                         "route": asdict(route),
                         "source_snapshots": [asdict(value) for value in snapshots],
+                        "configuration_facts": [
+                            asdict(value) for value in configuration_facts
+                        ],
                     },
                     ReasoningPlan.from_json,
                     ReasoningPlan,
@@ -8724,6 +9166,22 @@ def run_proposal_batch(
                 )
                 calls.append(artifact)
                 assert isinstance(plan, ReasoningPlan)
+                try:
+                    _validate_reasoning_plan_grounding(
+                        plan,
+                        snapshots,
+                        configuration_facts,
+                    )
+                except PatchPolicyError:
+                    record_sample_rejection(
+                        sample=sample,
+                        code="reasoner_evidence_rejected",
+                        calls_before=calls_before,
+                        expected_calls=2,
+                        sealed_manifest=sealed_manifest,
+                        state=LoopState.RECORD_REJECTION,
+                    )
+                    continue
                 readable = {value.path for value in snapshots}
                 if plan.skip:
                     record_sample_rejection(
@@ -8753,6 +9211,9 @@ def run_proposal_batch(
                         "batch_sample": sample,
                         "evidence": evidence_payload,
                         "plan": asdict(plan),
+                        "configuration_facts": [
+                            asdict(value) for value in configuration_facts
+                        ],
                         "source_snapshots": [
                             _coder_snapshot_payload(value) for value in snapshots
                         ],
@@ -8766,11 +9227,28 @@ def run_proposal_batch(
                 try:
                     if not set(typed_proposal.files).issubset(set(plan.files_to_change)):
                         raise PatchPolicyError("proposal batch coder expanded approved scope")
+                    _validate_configuration_preservation(
+                        typed_proposal,
+                        configuration_facts,
+                    )
                     proposal = render_typed_coding_proposal(
                         candidate,
                         typed_proposal,
                         snapshots,
                     )
+                    evaluation = services.evaluate_proposal(proposal, sample)
+                    if not isinstance(evaluation, ProposalEvaluation):
+                        raise ConfigurationError(
+                            "proposal evaluation service returned invalid facts"
+                        )
+                    evaluation_path, evaluation_sha256 = (
+                        audit.write_proposal_evaluation(evaluation, sample=sample)
+                    )
+                    check_wall()
+                    if not evaluation.eligible_for_export:
+                        raise PatchPolicyError(
+                            "proposal did not pass private quality and gate evaluation"
+                        )
                     handoff = export_inert_proposal(
                         candidate,
                         audit,
@@ -8780,6 +9258,7 @@ def run_proposal_batch(
                         artifact_name=f"proposal-{sample:03d}",
                         provider_evidence_sha256=evidence_sha256,
                         proposal_payload_sha256=proposal_payload_sha256,
+                        proposal_evaluation_sha256=evaluation_sha256,
                         renderer_contract="coding_exact_replacements_v1",
                     )
                 except PatchPolicyError as exc:
@@ -8803,6 +9282,8 @@ def run_proposal_batch(
                     ProposalSampleResult(
                         sample=sample,
                         provider_call_paths=tuple(calls),
+                        evaluation_path=evaluation_path,
+                        evaluation_sha256=evaluation_sha256,
                         diff_path=handoff.diff_path,
                         diff_sha256=handoff.diff_sha256,
                         metadata_path=handoff.metadata_path,
@@ -8817,6 +9298,7 @@ def run_proposal_batch(
                         "diff_sha256": handoff.diff_sha256,
                         "metadata_sha256": _file_sha256(handoff.metadata_path),
                         "proposal_payload_sha256": proposal_payload_sha256,
+                        "proposal_evaluation_sha256": evaluation_sha256,
                     },
                 )
             if sample_results:
@@ -8895,6 +9377,7 @@ def run_proposal_batch(
         "proposal_artifacts": [
             {
                 "sample": value.sample,
+                "evaluation_sha256": value.evaluation_sha256,
                 "diff_sha256": value.diff_sha256,
                 "metadata_sha256": value.metadata_sha256,
             }
@@ -9173,6 +9656,10 @@ def run_agent_loop(
                 terminal_state = LoopState.FINISH_AGENT_ABORTED
                 break
             snapshots = load_snapshots(route.relevant_files)
+            configuration_facts = _configuration_facts_for_snapshots(
+                candidate,
+                snapshots,
+            )
             emit(
                 LoopState.CALL_REASONER,
                 "reasoner_called",
@@ -9184,6 +9671,9 @@ def run_agent_loop(
                     "evidence": evidence_payload,
                     "route": asdict(route),
                     "source_snapshots": [asdict(value) for value in snapshots],
+                    "configuration_facts": [
+                        asdict(value) for value in configuration_facts
+                    ],
                 },
                 ReasoningPlan.from_json,
                 ReasoningPlan,
@@ -9194,6 +9684,15 @@ def run_agent_loop(
                 continue
             assert isinstance(plan, ReasoningPlan)
             audit.write_validated_payload(f"reasoner-{iterations_started:02d}", plan)
+            try:
+                _validate_reasoning_plan_grounding(
+                    plan,
+                    snapshots,
+                    configuration_facts,
+                )
+            except PatchPolicyError:
+                skip_iteration("reasoner", "evidence_rejected")
+                continue
             readable = {value.path for value in snapshots}
             if plan.skip or not set(plan.files_to_change).issubset(readable):
                 skip_iteration("reasoner", "plan_skipped" if plan.skip else "scope_rejected")
@@ -9208,6 +9707,9 @@ def run_agent_loop(
                 {
                     "evidence": evidence_payload,
                     "plan": asdict(plan),
+                    "configuration_facts": [
+                        asdict(value) for value in configuration_facts
+                    ],
                     "source_snapshots": [
                         _coder_snapshot_payload(value) for value in snapshots
                     ],
@@ -9235,6 +9737,10 @@ def run_agent_loop(
             try:
                 if not set(typed_proposal.files).issubset(set(plan.files_to_change)):
                     raise PatchPolicyError("proposal expands the reasoner-approved file set")
+                _validate_configuration_preservation(
+                    typed_proposal,
+                    configuration_facts,
+                )
                 proposal = render_typed_coding_proposal(
                     candidate,
                     typed_proposal,
@@ -10038,6 +10544,27 @@ def _execute_cli_run(
         if batch_limits is not None:
             if not isinstance(config.gate, BacktestGateConfig) or bundle is None:
                 raise ConfigurationError("proposal batch backtest inputs are absent")
+            proposal_compile_runner = sandbox_compile_runner(sandbox)
+
+            def evaluate_proposal(
+                proposal: CodingProposal,
+                _sample: int,
+            ) -> ProposalEvaluation:
+                return evaluate_inert_proposal(
+                    state,
+                    proposal,
+                    gate="backtest",
+                    editable_paths=_proposal_batch_editable_paths(),
+                    compile_runner=proposal_compile_runner,
+                    run_quality=lambda current: run_final_quality(current, sandbox),
+                    run_primary_gate=lambda current: _backtest_provider_evidence(
+                        current,
+                        sandbox,
+                        config.gate,
+                        bundle,
+                    ),
+                )
+
             result: LoopResult | ProposalBatchResult = run_proposal_batch(
                 config,
                 state,
@@ -10049,6 +10576,7 @@ def _execute_cli_run(
                         current, sandbox, config.gate, bundle
                     ),
                     read_snapshots=snapshots,
+                    evaluate_proposal=evaluate_proposal,
                     known_secrets=known_secrets,
                     editable_paths=_proposal_batch_editable_paths(),
                 ),
@@ -10151,6 +10679,8 @@ def _proposal_batch_summary(result: ProposalBatchResult) -> dict[str, object]:
         "proposal_artifacts": [
             {
                 "sample": sample.sample,
+                "evaluation_path": str(sample.evaluation_path),
+                "evaluation_sha256": sample.evaluation_sha256,
                 "diff_path": str(sample.diff_path),
                 "diff_sha256": sample.diff_sha256,
                 "metadata_path": str(sample.metadata_path),

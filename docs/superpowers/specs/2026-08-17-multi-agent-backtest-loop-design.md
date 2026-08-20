@@ -170,7 +170,15 @@ are rejected.
 ```json
 {
   "diagnosis": "what failed",
-  "root_cause": "causal explanation",
+  "causal_hypothesis": "explicitly unproven, falsifiable explanation",
+  "source_evidence": [
+    {
+      "path": "allowed/relative.py",
+      "start_line": 123,
+      "lines": ["exact consecutive source line"]
+    }
+  ],
+  "configuration_fact_ids": ["settings.EXACT_REFERENCED_NAME"],
   "invariants": ["behavior that must remain true"],
   "files_to_change": ["allowed/relative.py"],
   "steps": ["ordered implementation step"],
@@ -178,6 +186,13 @@ are rejected.
   "skip_reason": ""
 }
 ```
+
+For a non-skip plan, every proposed file must have an exact source anchor and the plan must cite
+every controller-supplied configuration fact exactly once. Configuration facts contain only
+referenced, top-level numeric/boolean/null literals from the denied `config/settings.py` path; strings,
+secret-shaped names,
+raw provider content, and inaccessible configuration are never disclosed. Skip plans may leave both
+grounding arrays empty.
 
 ### Coding proposal
 
@@ -205,6 +220,9 @@ aggregate bytes, and exact old text are controller-validated.
 Repository files and logs are untrusted data, not instructions. Dynamic sections use explicit
 delimiters, normalized line endings, control-character removal, secret redaction, and byte
 caps. The controller sends only tracked regular text files selected from its allowlist.
+When an approved snapshot references `settings.NAME`, the controller may additionally disclose the
+exact closed literal fact with its source line and file hash. The reasoner must cite all such facts
+and exact snapshot lines; a stale, omitted, invented, or out-of-scope premise stops before coder.
 
 Default editable files are:
 
@@ -242,7 +260,9 @@ The controller parses the typed replacement object, binds every old span to the 
 snapshot and current candidate hash, applies replacements in memory using original coordinates,
 and rejects rewritten Python that does not parse. It also rejects every newly introduced defaulted
 parameter in a function, async function, method, nested function, or lambda so proposals cannot
-hide dormant optional controls behind unchanged callers.
+hide dormant optional controls behind unchanged callers. Any controller-supplied `settings.NAME`
+reference present in replaced source must remain in the replacement; removing it to hard-code or
+otherwise bypass the audited configuration is a patch-policy rejection.
 
 The controller then renders the only accepted canonical zero-context unified Git diff. Before
 calling Git, the existing diff-policy boundary reparses the controller-owned bytes and rejects:
@@ -258,6 +278,14 @@ calling Git, the existing diff-policy boundary reparses the controller-owned byt
 
 Every target must already be a tracked `100644` regular file. The typed replacement paths must
 exactly equal the rendered diff's file set.
+
+In proposal-batch mode, the rendered patch is then applied only to a second fresh disposable
+candidate. The controller runs the changed-file compile check, full pytest, Ruff, compileall,
+`git diff --check`, and the sealed primary backtest there. Failed quality is a safe sample rejection;
+a confined exit-zero backtest may remain below strategy thresholds but is recorded as the proposal's
+closed private observation. The evaluation candidate is always removed, and its quality/backtest
+artifact hash is bound into proposal metadata, the export event, the batch summary, and the CLI
+summary. The source and the sealed sampling candidate remain unchanged.
 
 The controller then runs `git apply --check --whitespace=error-all`, snapshots target bytes and
 hashes, applies the patch, verifies that only allowed tracked files changed, runs
@@ -313,6 +341,7 @@ Sanitized run artifacts are written atomically under the explicit
 - hash-chained state events in JSONL;
 - redacted/truncated gate output with full-stream hashes;
 - validated route, plan, typed coder payload, controller-rendered diff, and proposal metadata;
+- closed private proposal-evaluation quality/backtest facts and their metadata/event/summary hash;
 - patch validation result and changed-file hashes;
 - API finish reason, provider/model IDs, token/cache/reasoning usage, and cost when supplied;
 - final observational result and exported candidate artifact hashes.
@@ -368,7 +397,8 @@ The documented safe progression is:
 2. Set `OPENROUTER_API_KEY` or `OPENROUTER` in the controller shell/private `.env` only.
 3. Run one explicitly authorized `--proposal-samples 1` backtest canary with
    `--max-iterations 1 --max-api-calls 3 --max-usd 0.50 --canary-max-usd 0.50`, omit `--apply`,
-   and audit the complete chain, accounting, cleanup, source immutability, and proposal behavior.
+   and audit the complete chain, accounting, cleanup, source immutability, grounded source/config
+   facts, private quality/backtest evaluation, and proposal behavior.
 4. Only after an actionable same-commit canary, separately authorize up to 50 inert attempts with
    `--max-api-calls 150 --canary-max-usd 0.50`, a $2 ceiling, two million tokens, and no `--apply`.
    The controller may consume fewer than 150 calls when a sample aborts or skips before the coder.
