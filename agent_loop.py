@@ -1819,9 +1819,9 @@ class OpenRouterGateway:
                 "When read_only_execution_facts is supplied, treat it as controller-owned behavioral evidence: "
                 "use it to rule out edits that cannot affect the observed execution path, and never treat it "
                 "as editable source or configuration. "
-                "When allowed_edit is supplied, it is the sole controller-approved bounded experiment for this "
-                "batch: for a non-skip plan, use its path and mechanism exactly and do not propose an alternative "
-                "source change. "
+                "When controller_owned_allowed_replacement is supplied, it is the sole controller-approved "
+                "bounded experiment for this batch: for a non-skip plan, use its path and mechanism exactly and "
+                "do not propose an alternative source change. "
                 "diagnosis must "
                 "state only observed gate facts; "
                 "causal_hypothesis is explicitly unproven and falsifiable. Use JSON arrays for "
@@ -1867,8 +1867,9 @@ class OpenRouterGateway:
                 "replacement. "
                 "Treat any read_only_execution_facts as immutable behavioral constraints; do not propose an edit "
                 "whose stated mechanism they rule out. "
-                "When allowed_edit is supplied, return exactly its one path, old_lines, and new_lines; do not "
-                "change comments, docs, imports, configuration, fallback behavior, tests, or any other line. "
+                "When controller_owned_allowed_replacement is supplied, return exactly its one path, old_lines, "
+                "and new_lines; do not change comments, docs, imports, configuration, fallback behavior, tests, "
+                "or any other line. "
                 "Order multiple replacements by path; use no duplicate, overlapping, or adjacent source ranges "
                 "and merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -8680,6 +8681,7 @@ class ProposalBatchServices:
     monotonic: Callable[[], float] = time.monotonic
     known_secrets: tuple[str, ...] = ()
     editable_paths: tuple[str, ...] = ()
+    allowed_replacement: ExactLineReplacement | None = None
 
     def __post_init__(self) -> None:
         if not all(callable(value) for value in (
@@ -8702,6 +8704,20 @@ class ProposalBatchServices:
         except PatchPolicyError as exc:
             raise ConfigurationError("proposal batch editable path is invalid") from exc
         object.__setattr__(self, "editable_paths", editable)
+        if self.allowed_replacement is not None:
+            if not isinstance(self.allowed_replacement, ExactLineReplacement):
+                raise ConfigurationError("proposal batch allowed replacement is invalid")
+            if (
+                self.allowed_replacement.path not in editable
+                or any(
+                    "settings." in line
+                    for line in (
+                        *self.allowed_replacement.old_lines,
+                        *self.allowed_replacement.new_lines,
+                    )
+                )
+            ):
+                raise ConfigurationError("proposal batch allowed replacement is outside policy")
 
 
 class _LoopLimitReached(RuntimeError):
@@ -8914,33 +8930,13 @@ def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
     )
 
 
-def _proposal_batch_allowed_edit_payload() -> dict[str, object]:
-    """Pin the first batch experiment to one executable, non-configuration pivot guard."""
-    return {
-        "id": "pivot_right_lip_confirmation_v1",
-        "path": "core/pivot_detector.py",
-        "old_lines": ["    if right_lip < left_lip * 0.95:"],
-        "new_lines": ["    if right_lip < left_lip * 0.98:"],
-        "intent": (
-            "A bounded counterfactual: require a 98% right-lip recovery before accepting a "
-            "cup pivot, while preserving the existing fallback and buy-zone flow."
-        ),
-    }
-
-
-def _validate_proposal_batch_allowed_edit(proposal: TypedCodingProposal) -> None:
-    """Fail closed unless the first batch proposal is exactly the controller-owned experiment."""
-    if not isinstance(proposal, TypedCodingProposal):
-        raise ConfigurationError("proposal batch allowed-edit input is invalid")
-    if len(proposal.replacements) != 1:
-        raise PatchPolicyError("proposal batch must contain exactly one allowed replacement")
-    replacement = proposal.replacements[0]
-    if (
-        replacement.path != "core/pivot_detector.py"
-        or replacement.old_lines != ("    if right_lip < left_lip * 0.95:",)
-        or replacement.new_lines != ("    if right_lip < left_lip * 0.98:",)
-    ):
-        raise PatchPolicyError("proposal batch replacement is outside the approved experiment")
+def _proposal_batch_allowed_replacement() -> ExactLineReplacement:
+    """Return the first controller-owned, non-configuration pivot experiment."""
+    return ExactLineReplacement(
+        path="core/pivot_detector.py",
+        old_lines=("    if right_lip < left_lip * 0.95:",),
+        new_lines=("    if right_lip < left_lip * 0.98:",),
+    )
 
 
 def run_proposal_batch(
@@ -9376,24 +9372,28 @@ def run_proposal_batch(
                     candidate,
                     snapshots,
                 )
+                reasoner_input: dict[str, object] = {
+                    "batch_sample": sample,
+                    "evidence": evidence_payload,
+                    "route": asdict(route),
+                    "source_snapshots": [
+                        _provider_editable_snapshot_payload(value) for value in snapshots
+                    ],
+                    "editable_source_paths": [value.path for value in snapshots],
+                    "read_only_configuration_facts": [],
+                    "read_only_execution_facts": list(
+                        _proposal_batch_execution_facts()
+                    ),
+                }
+                if services.allowed_replacement is not None:
+                    reasoner_input["controller_owned_allowed_replacement"] = asdict(
+                        services.allowed_replacement
+                    )
                 plan, artifact, _plan_payload_sha256 = call_role(
                     sample,
                     2,
                     "reasoner",
-                    {
-                        "batch_sample": sample,
-                        "evidence": evidence_payload,
-                        "route": asdict(route),
-                        "source_snapshots": [
-                            _provider_editable_snapshot_payload(value) for value in snapshots
-                        ],
-                        "editable_source_paths": [value.path for value in snapshots],
-                        "read_only_configuration_facts": [],
-                        "read_only_execution_facts": list(
-                            _proposal_batch_execution_facts()
-                        ),
-                        "allowed_edit": _proposal_batch_allowed_edit_payload(),
-                    },
+                    reasoner_input,
                     ReasoningPlan.from_json,
                     ReasoningPlan,
                     window,
@@ -9437,24 +9437,28 @@ def run_proposal_batch(
                         state=LoopState.RECORD_REJECTION,
                     )
                     continue
+                coder_input: dict[str, object] = {
+                    "batch_sample": sample,
+                    "evidence": evidence_payload,
+                    "plan": asdict(plan),
+                    "editable_source_paths": [value.path for value in snapshots],
+                    "read_only_configuration_facts": [],
+                    "read_only_execution_facts": list(
+                        _proposal_batch_execution_facts()
+                    ),
+                    "source_snapshots": [
+                        _provider_editable_snapshot_payload(value) for value in snapshots
+                    ],
+                }
+                if services.allowed_replacement is not None:
+                    coder_input["controller_owned_allowed_replacement"] = asdict(
+                        services.allowed_replacement
+                    )
                 typed_proposal, artifact, proposal_payload_sha256 = call_role(
                     sample,
                     3,
                     "coder",
-                    {
-                        "batch_sample": sample,
-                        "evidence": evidence_payload,
-                        "plan": asdict(plan),
-                        "editable_source_paths": [value.path for value in snapshots],
-                        "read_only_configuration_facts": [],
-                        "read_only_execution_facts": list(
-                            _proposal_batch_execution_facts()
-                        ),
-                        "allowed_edit": _proposal_batch_allowed_edit_payload(),
-                        "source_snapshots": [
-                            _provider_editable_snapshot_payload(value) for value in snapshots
-                        ],
-                    },
+                    coder_input,
                     TypedCodingProposal.from_json,
                     TypedCodingProposal,
                     window,
@@ -9468,7 +9472,14 @@ def run_proposal_batch(
                         typed_proposal,
                         configuration_facts,
                     )
-                    _validate_proposal_batch_allowed_edit(typed_proposal)
+                    if (
+                        services.allowed_replacement is not None
+                        and typed_proposal.replacements
+                        != (services.allowed_replacement,)
+                    ):
+                        raise PatchPolicyError(
+                            "proposal batch replacement is outside the approved experiment"
+                        )
                     proposal = render_typed_coding_proposal(
                         candidate,
                         typed_proposal,
@@ -10821,6 +10832,7 @@ def _execute_cli_run(
                     evaluate_proposal=evaluate_proposal,
                     known_secrets=known_secrets,
                     editable_paths=_proposal_batch_editable_paths(),
+                    allowed_replacement=_proposal_batch_allowed_replacement(),
                 ),
                 batch_limits,
             )
