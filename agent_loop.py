@@ -654,13 +654,10 @@ class ReasoningSourceEvidence:
     """One provider-cited exact excerpt from a controller-supplied source snapshot."""
 
     path: str
-    start_line: int
     lines: tuple[str, ...]
 
     def __post_init__(self) -> None:
         path = _relative_path(self.path, "source evidence path")
-        if type(self.start_line) is not int or not 1 <= self.start_line <= 1_000_000:
-            raise PayloadFieldValidationError("source evidence start_line must be positive")
         if not isinstance(self.lines, tuple) or not 1 <= len(self.lines) <= 32:
             raise PayloadFieldValidationError("source evidence lines must be a nonempty bounded tuple")
         lines = tuple(
@@ -676,9 +673,9 @@ def _reasoning_source_evidence_list(value: Any) -> tuple[ReasoningSourceEvidence
         raise PayloadFieldValidationError("source_evidence must be a bounded list")
     result: list[ReasoningSourceEvidence] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) != {"path", "start_line", "lines"}:
+        if not isinstance(item, dict) or set(item) != {"path", "lines"}:
             raise PayloadKeysValidationError(
-                "source evidence objects require exactly path, start_line, and lines"
+                "source evidence objects require exactly path and lines"
             )
         lines = item["lines"]
         if not isinstance(lines, list):
@@ -686,7 +683,6 @@ def _reasoning_source_evidence_list(value: Any) -> tuple[ReasoningSourceEvidence
         result.append(
             ReasoningSourceEvidence(
                 path=item["path"],
-                start_line=item["start_line"],
                 lines=tuple(lines),
             )
         )
@@ -796,17 +792,14 @@ def _source_line(value: Any, field: str, *, allow_trailing_whitespace: bool) -> 
 
 @dataclass(frozen=True)
 class ExactLineReplacement:
-    """One provider-authored replacement anchored to original candidate line numbers."""
+    """One provider-authored replacement anchored by exact original source text."""
 
     path: str
-    start_line: int
     old_lines: tuple[str, ...]
     new_lines: tuple[str, ...]
 
     def __post_init__(self) -> None:
         path = _relative_path(self.path, "replacement path")
-        if type(self.start_line) is not int or not 1 <= self.start_line <= 1_000_000:
-            raise PayloadFieldValidationError("replacement start_line must be a positive integer")
         if (
             not isinstance(self.old_lines, tuple)
             or not isinstance(self.new_lines, tuple)
@@ -834,7 +827,7 @@ class ExactLineReplacement:
     def from_mapping(cls, value: object) -> ExactLineReplacement:
         if not isinstance(value, Mapping):
             raise PayloadFieldValidationError("replacement must be a JSON object")
-        allowed = {"path", "start_line", "old_lines", "new_lines"}
+        allowed = {"path", "old_lines", "new_lines"}
         if set(value) != allowed:
             raise PayloadKeysValidationError("replacement keys must exactly match the protocol")
         old_lines = value["old_lines"]
@@ -843,7 +836,6 @@ class ExactLineReplacement:
             raise PayloadFieldValidationError("replacement lines must be JSON arrays")
         return cls(
             path=_relative_path(value["path"], "replacement path"),
-            start_line=value["start_line"],
             old_lines=tuple(old_lines),
             new_lines=tuple(new_lines),
         )
@@ -873,26 +865,10 @@ class TypedCodingProposal:
         )
         if changed_lines > 400:
             raise PayloadFieldValidationError("replacements exceed the changed-line limit")
-        by_path: dict[str, list[ExactLineReplacement]] = {}
-        for value in self.replacements:
-            by_path.setdefault(value.path, []).append(value)
-        for values in by_path.values():
-            ordered = sorted(values, key=lambda item: item.start_line)
-            if values != ordered:
-                raise PayloadFieldValidationError("replacements must be ordered by path and start_line")
-            previous_end = 0
-            for value in ordered:
-                if value.start_line <= previous_end:
-                    raise PayloadFieldValidationError("replacement source ranges overlap")
-                if previous_end and value.start_line == previous_end + 1:
-                    raise PayloadFieldValidationError(
-                        "adjacent replacement ranges must be merged"
-                    )
-                previous_end = value.start_line + len(value.old_lines) - 1
         if tuple(self.replacements) != tuple(
-            sorted(self.replacements, key=lambda item: (item.path, item.start_line))
+            sorted(self.replacements, key=lambda item: item.path)
         ):
-            raise PayloadFieldValidationError("replacements must be canonically ordered")
+            raise PayloadFieldValidationError("replacements must be canonically ordered by path")
         canonical_payload = json.dumps(
             {
                 "summary": self.summary,
@@ -1840,10 +1816,11 @@ class OpenRouterGateway:
                 "You are the Reasoner. Return exactly one concise JSON object with exactly these keys: "
                 '"diagnosis", "causal_hypothesis", "source_evidence", "configuration_fact_ids", '
                 '"invariants", "files_to_change", "steps", "skip", "skip_reason". '
-                "source_evidence objects require exactly path, start_line, and lines; path must be a "
-                "provided source snapshot. Each visible source snapshot line begins with the controller-rendered "
-                "N: annotation: set start_line to that N for the first cited line, and reproduce the consecutive "
-                "source lines exactly without the N: annotation. Include the exact existing expression the Coder "
+                "source_evidence objects require exactly path and lines; path must be a provided source "
+                "snapshot. Each visible source snapshot line begins with a controller-rendered N: annotation. "
+                "Reproduce consecutive source lines exactly without that annotation; the controller resolves "
+                "their immutable source coordinate only when they have one exact match. Include the exact "
+                "existing expression the Coder "
                 "should change in source_evidence, not only diagnostic context. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
                 "editable_source_paths and source_snapshots. When a read_only_configuration_facts value informs "
@@ -1874,24 +1851,23 @@ class OpenRouterGateway:
             "coder": (
                 "You are the Coder. Return exactly one JSON object with exactly these keys: "
                 '"summary", "replacements". replacements must be a nonempty JSON array of objects '
-                "with exactly these keys: path, start_line, old_lines, and new_lines. path must be an "
-                "approved plan and source-snapshot path. Each sanitized_text line begins with an exact "
-                "numbered source annotation 'N: '; start_line must be the positive integer N from the "
-                "first exact annotated source line and is always an immutable original snapshot coordinate. "
-                "For every later replacement, never add or subtract earlier replacement deltas; the controller "
-                "alone calculates new output coordinates. old_lines and new_lines must be nonempty JSON "
+                "with exactly these keys: path, old_lines, and new_lines. path must be an approved plan and "
+                "source-snapshot path. Each sanitized_text line begins with an exact numbered source annotation "
+                "'N: '; omit that annotation from old_lines and new_lines. The controller resolves an edit only "
+                "when old_lines have one exact match in the immutable visible source. old_lines and new_lines "
+                "must be nonempty JSON "
                 "arrays of source-line strings without newline characters; omit the annotation prefix. "
                 "Return exactly one replacement. It must be a direct executable logic edit within a "
-                "source_evidence span in plan: start_line must identify old_lines[0], never a preceding "
-                "unmodified line. old_lines must exactly match consecutive visible source lines including indentation. "
+                "source_evidence span in plan. old_lines must exactly match consecutive visible source lines "
+                "including indentation. "
                 "Do not add any new defaulted parameter in a function, method, or lambda, even with a proposed "
                 "caller; make a direct change to already-executed logic and never add dormant optional knobs. "
                 "Every replacement path must appear in editable_source_paths. Preserve every reference from "
                 "read_only_configuration_facts that appears in old_lines; do not replace it with a hard-coded "
                 "literal or otherwise bypass the controller-supplied read-only configuration fact. Do not edit "
                 "config/settings.py, adjust a settings value, or turn a settings reference into a literal. "
-                "Order replacements by path and original start_line, with no duplicate, overlapping, or "
-                "adjacent source ranges; merge adjacent changes into one replacement. Use the sealed gate "
+                "Order multiple replacements by path; use no duplicate, overlapping, or adjacent source ranges "
+                "and merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
                 "the plan changes a threshold or guard, change the guard predicate or expression and preserve "
                 "its branch body, return type, and downstream flow unless explicitly told otherwise. "
@@ -1962,10 +1938,9 @@ class OpenRouterGateway:
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["path", "start_line", "lines"],
+                            "required": ["path", "lines"],
                             "properties": {
                                 "path": {"type": "string"},
-                                "start_line": {"type": "integer", "minimum": 1},
                                 "lines": {
                                     "type": "array",
                                     "items": {"type": "string"},
@@ -1995,10 +1970,9 @@ class OpenRouterGateway:
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["path", "start_line", "old_lines", "new_lines"],
+                            "required": ["path", "old_lines", "new_lines"],
                             "properties": {
                                 "path": {"type": "string"},
-                                "start_line": {"type": "integer", "minimum": 1},
                                 "old_lines": {
                                     "type": "array",
                                     "items": {"type": "string"},
@@ -6624,6 +6598,38 @@ def _coder_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, object]:
     return payload
 
 
+def _unique_visible_snapshot_span_start(
+    snapshot: SourceSnapshot,
+    lines: Sequence[str],
+    *,
+    field: str,
+) -> int:
+    """Resolve a provider excerpt only when it has one exact visible source match."""
+    if not isinstance(snapshot, SourceSnapshot):
+        raise ConfigurationError("visible source span requires a source snapshot")
+    if not isinstance(lines, (tuple, list)) or not lines:
+        raise ConfigurationError("visible source span requires nonempty source lines")
+    if not isinstance(field, str) or not field:
+        raise ConfigurationError("visible source span requires a closed field name")
+    view = _coder_snapshot_payload(snapshot)
+    effective_end = view["selected_end_line"]
+    if type(effective_end) is not int:
+        raise ConfigurationError("visible source span has an invalid snapshot view")
+    visible_count = effective_end - snapshot.selected_start_line + 1
+    visible_lines = tuple(snapshot.sanitized_text.splitlines()[:visible_count])
+    if len(visible_lines) != visible_count:
+        raise ConfigurationError("visible source span does not contain complete source lines")
+    target = tuple(lines)
+    matches = [
+        offset
+        for offset in range(len(visible_lines) - len(target) + 1)
+        if visible_lines[offset : offset + len(target)] == target
+    ]
+    if len(matches) != 1:
+        raise PatchPolicyError(f"{field} must uniquely match exact visible source")
+    return snapshot.selected_start_line + matches[0]
+
+
 def _qualified_functions(
     tree: ast.Module,
 ) -> dict[tuple[str, ...], tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]]:
@@ -6777,6 +6783,7 @@ def render_typed_coding_proposal(
     candidate: Candidate,
     proposal: TypedCodingProposal,
     snapshots: tuple[SourceSnapshot, ...],
+    source_evidence: Sequence[ReasoningSourceEvidence] | None = None,
 ) -> CodingProposal:
     """Render validated provider edits into the sole canonical zero-context diff dialect."""
     root = _require_candidate(candidate)
@@ -6791,6 +6798,25 @@ def render_typed_coding_proposal(
     snapshot_by_path = {value.path: value for value in snapshots}
     if len(snapshot_by_path) != len(snapshots) or set(proposal.files) - set(snapshot_by_path):
         raise PatchPolicyError("typed replacement path is outside the visible source snapshots")
+    if source_evidence is not None and (
+        not isinstance(source_evidence, (tuple, list))
+        or any(not isinstance(value, ReasoningSourceEvidence) for value in source_evidence)
+    ):
+        raise ConfigurationError("typed coder source evidence is invalid")
+    evidence_spans_by_path: dict[str, list[tuple[int, int]]] = {}
+    if source_evidence is not None:
+        for evidence in source_evidence:
+            snapshot = snapshot_by_path.get(evidence.path)
+            if snapshot is None:
+                raise PatchPolicyError("reasoning evidence is outside the visible source snapshots")
+            start = _unique_visible_snapshot_span_start(
+                snapshot,
+                evidence.lines,
+                field="reasoning evidence",
+            )
+            evidence_spans_by_path.setdefault(evidence.path, []).append(
+                (start, start + len(evidence.lines) - 1)
+            )
     grouped: dict[str, list[ExactLineReplacement]] = {}
     for replacement in proposal.replacements:
         grouped.setdefault(replacement.path, []).append(replacement)
@@ -6838,15 +6864,18 @@ def render_typed_coding_proposal(
             f"+++ b/{path}\n",
         ]
         replacements = grouped[path]
+        resolved_replacements: list[tuple[int, ExactLineReplacement]] = []
         for replacement in replacements:
             old_count = len(replacement.old_lines)
             new_count = len(replacement.new_lines)
-            old_start = replacement.start_line
+            old_start = _unique_visible_snapshot_span_start(
+                snapshot,
+                replacement.old_lines,
+                field="typed replacement old lines",
+            )
             old_end = old_start + old_count - 1
             if (
-                old_start < snapshot.selected_start_line
-                or old_end > effective_end
-                or old_end > len(source_lines)
+                old_end > effective_end or old_end > len(source_lines)
             ):
                 raise PatchPolicyError("typed replacement range is outside the exact visible source")
             source_slice = tuple(source_lines[old_start - 1 : old_end])
@@ -6854,13 +6883,34 @@ def render_typed_coding_proposal(
             visible_slice = visible_lines[view_offset : view_offset + old_count]
             if source_slice != replacement.old_lines or visible_slice != replacement.old_lines:
                 raise PatchPolicyError("typed replacement old lines do not match exact visible source")
+            if source_evidence is not None and not any(
+                old_start >= evidence_start and old_end <= evidence_end
+                for evidence_start, evidence_end in evidence_spans_by_path.get(path, ())
+            ):
+                raise PatchPolicyError(
+                    "typed replacement is outside its exact reasoning evidence span"
+                )
+            resolved_replacements.append((old_start, replacement))
+        if resolved_replacements != sorted(resolved_replacements, key=lambda item: item[0]):
+            raise PatchPolicyError("typed replacements must be ordered by resolved source position")
+        previous_end = 0
+        for old_start, replacement in resolved_replacements:
+            old_end = old_start + len(replacement.old_lines) - 1
+            if old_start <= previous_end:
+                raise PatchPolicyError("typed replacement source ranges overlap")
+            if previous_end and old_start == previous_end + 1:
+                raise PatchPolicyError("adjacent typed replacement ranges must be merged")
+            previous_end = old_end
+        for old_start, replacement in resolved_replacements:
+            old_count = len(replacement.old_lines)
+            new_count = len(replacement.new_lines)
             new_start = old_start + cumulative_delta
             section.append(f"@@ -{old_start},{old_count} +{new_start},{new_count} @@\n")
             section.extend(f"-{line}\n" for line in replacement.old_lines)
             section.extend(f"+{line}\n" for line in replacement.new_lines)
             cumulative_delta += new_count - old_count
-        for replacement in reversed(replacements):
-            start = replacement.start_line - 1
+        for old_start, replacement in reversed(resolved_replacements):
+            start = old_start - 1
             expected_lines[start : start + len(replacement.old_lines)] = replacement.new_lines
         if expected_lines == source_lines:
             raise PatchPolicyError("typed replacements do not change candidate source")
@@ -7575,15 +7625,11 @@ def _validate_reasoning_plan_grounding(
         snapshot = snapshot_by_path.get(evidence.path)
         if snapshot is None:
             raise PatchPolicyError("reasoning evidence is outside the exact source snapshots")
-        offset = evidence.start_line - snapshot.selected_start_line
-        visible_lines = tuple(snapshot.sanitized_text.splitlines())
-        if (
-            offset < 0
-            or offset + len(evidence.lines) > len(visible_lines)
-            or evidence.start_line + len(evidence.lines) - 1 > snapshot.selected_end_line
-            or visible_lines[offset : offset + len(evidence.lines)] != evidence.lines
-        ):
-            raise PatchPolicyError("reasoning evidence does not match the exact source snapshot")
+        _unique_visible_snapshot_span_start(
+            snapshot,
+            evidence.lines,
+            field="reasoning evidence",
+        )
     if not set(plan.files_to_change).issubset(
         {evidence.path for evidence in plan.source_evidence}
     ):
@@ -9386,6 +9432,7 @@ def run_proposal_batch(
                         candidate,
                         typed_proposal,
                         snapshots,
+                        plan.source_evidence,
                     )
                     evaluation = services.evaluate_proposal(proposal, sample)
                     if not isinstance(evaluation, ProposalEvaluation):
@@ -9900,6 +9947,7 @@ def run_agent_loop(
                     candidate,
                     typed_proposal,
                     snapshots,
+                    plan.source_evidence,
                 )
                 validate_unified_diff(
                     candidate.root,
