@@ -183,7 +183,7 @@ def test_task3_models_and_limits_validate_exact_boundaries() -> None:
 
     models = ModelConfig()
     assert models.orchestrator == "qwen/qwen3-next-80b-a3b-instruct"
-    assert models.reasoner == "deepseek/deepseek-r1"
+    assert models.reasoner == "qwen/qwen3-next-80b-a3b-instruct"
     assert models.coder == "deepseek/deepseek-chat"
     with pytest.raises(ConfigurationError, match="model slug"):
         ModelConfig(coder="bad model")
@@ -1186,6 +1186,8 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     reasoner_prompt = OpenRouterGateway.SYSTEM_PROMPTS["reasoner"]
     assert "closed numeric diagnostics" in reasoner_prompt
     assert "all supplied source snapshots" in reasoner_prompt
+    assert "complete approved editing scope" in reasoner_prompt
+    assert "bounded falsifiable experiment" in reasoner_prompt
     assert "set skip to true" in reasoner_prompt.lower()
     assert "Never invent" in reasoner_prompt
     assert "sealed gate evidence" in coder_prompt
@@ -2106,10 +2108,7 @@ def test_generation_accounting_prefers_complete_native_token_pair() -> None:
         ("normalized_tokens_invalid", "normalized_token_pair_invalid"),
         ("optional_token_invalid", "optional_token_invalid"),
         ("cached_exceeds_prompt", "cached_exceeds_prompt"),
-        (
-            "reasoning_exceeds_completion_without_normalized_pair",
-            "normalized_token_pair_invalid",
-        ),
+        ("reasoning_exceeds_completion", "reasoning_exceeds_completion"),
     ),
 )
 def test_generation_accounting_uses_closed_content_free_usage_subcodes(
@@ -2143,11 +2142,10 @@ def test_generation_accounting_uses_closed_content_free_usage_subcodes(
         data["native_tokens_prompt"] = 11
         data["native_tokens_completion"] = 7
         data["native_tokens_cached"] = 12
-    elif case == "reasoning_exceeds_completion_without_normalized_pair":
+    elif case == "reasoning_exceeds_completion":
         data["native_tokens_prompt"] = 11
         data["native_tokens_completion"] = 7
         data["native_tokens_reasoning"] = 8
-        data["tokens_completion"] = "provider-secret-tokens"
     else:  # pragma: no cover - parameter table is closed above
         raise AssertionError(case)
 
@@ -2184,11 +2182,12 @@ def test_generation_accounting_never_mixes_native_details_with_normalized_pair()
     assert usage.reasoning_tokens is None
 
 
-def test_generation_accounting_four_misses_then_uses_normalized_reasoning_fallback() -> None:
-    """The observed native reasoning drift falls back to the complete normalized pair."""
+def test_generation_accounting_four_misses_then_invalid_record_is_fail_closed() -> None:
+    """The observed 404x4 -> invalid-record timeline stops one paid call exactly."""
     from agent_loop import (
         BudgetLedger,
         GatewayError,
+        IncompleteAccountingError,
         OpenRouterGateway,
         Route,
     )
@@ -2242,21 +2241,23 @@ def test_generation_accounting_four_misses_then_uses_normalized_reasoning_fallba
         ledger=ledger,
     )
 
-    completion = gateway.request_once("reasoner", "sealed evidence", Route.from_json)
+    with pytest.raises(IncompleteAccountingError) as raised:
+        gateway.request_once("reasoner", "sealed evidence", Route.from_json)
 
-    assert completion.usage.prompt_tokens == 11
-    assert completion.usage.completion_tokens == 7
-    assert completion.usage.total_tokens == 18
-    assert completion.usage.cached_tokens is None
-    assert completion.usage.reasoning_tokens is None
-    assert completion.usage.accounting_source == "generation_endpoint"
+    facts = raised.value.facts
+    assert facts.inline_failure_code.value == "inline_reasoning_exceeds_completion"
+    assert facts.recovery_failure_code.value == "recovery_usage_invalid"
+    assert facts.recovery_usage_diagnostic.value == "reasoning_exceeds_completion"
+    assert facts.generation_attempts == 5
+    assert facts.response_id_safe is True
     assert polls == [generation_id] * 5
     assert sleeps == [1.0, 2.0, 4.0, 8.0]
     assert len(client.completions.calls) == 1
     assert ledger.calls == 1
-    assert ledger.incomplete_accounting_calls == 0
-    assert ledger.total_tokens == 18
-    assert ledger.spent_usd == pytest.approx(0.012)
+    assert ledger.incomplete_accounting_calls == 1
+    assert facts.retained_reservation_tokens == ledger.retained_reservation_tokens
+    assert facts.retained_reservation_usd == pytest.approx(ledger.retained_reservation_usd)
+    assert "provider" not in json.dumps(asdict(facts))
 
 
 def test_generation_accounting_fetch_rejects_redirect_without_forwarding_key(
@@ -2398,7 +2399,7 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
         ),
         (
             "reasoner",
-            "deepseek/deepseek-r1",
+            "qwen/qwen3-next-80b-a3b-instruct",
             _plan_json(),
             ReasoningPlan.from_json,
             4096,
@@ -2546,7 +2547,7 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
     """The reasoner prompt makes the strict seven-field schema mechanically checkable."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ReasoningPlan
 
-    model = "deepseek/deepseek-r1"
+    model = "qwen/qwen3-next-80b-a3b-instruct"
     plan = json.dumps(
         {
             "diagnosis": "The measured return misses the configured threshold.",
@@ -2918,7 +2919,7 @@ def test_gateway_uses_immutable_three_message_prefix_and_reasoner_cap() -> None:
     call = client.completions.calls[0]
 
     assert completion.payload.diagnosis == "A boundary is wrong."
-    assert call["model"] == "deepseek/deepseek-r1"
+    assert call["model"] == "qwen/qwen3-next-80b-a3b-instruct"
     assert call["max_tokens"] == 4096
     assert call["response_format"] == {"type": "json_object"}
     assert call["stream"] is False
@@ -7129,7 +7130,7 @@ class _StrictBatchGateway:
         self.ledger.reconcile(reservation, usage, window=budget_window)
         model = {
             "orchestrator": "qwen/qwen3-next-80b-a3b-instruct",
-            "reasoner": "deepseek/deepseek-r1",
+            "reasoner": "qwen/qwen3-next-80b-a3b-instruct",
             "coder": "deepseek/deepseek-chat",
         }[role]
         return AgentCompletion(outcome, usage, "stop", model)
@@ -7488,8 +7489,8 @@ def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
     facts = ProviderCallFacts(
         call_index=2,
         role="reasoner",
-        requested_model="deepseek/deepseek-r1",
-        returned_model="deepseek/deepseek-r1",
+        requested_model="qwen/qwen3-next-80b-a3b-instruct",
+        returned_model="qwen/qwen3-next-80b-a3b-instruct",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=10,
@@ -7525,10 +7526,10 @@ def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
         external.cleanup()
 
 
-def test_proposal_batch_classifies_a_reasoner_skip_as_insufficient_evidence(
+def test_proposal_batch_records_a_reasoner_skip_and_continues_the_ensemble(
     tmp_path: Path,
 ) -> None:
-    """Break caught: an evidence-grounded safety skip was mislabeled as invalid JSON."""
+    """One harmless decline must not make a fifty-sample ensemble all-or-nothing."""
     from agent_loop import ReasoningPlan
 
     skip = ReasoningPlan(
@@ -7543,14 +7544,91 @@ def test_proposal_batch_classifies_a_reasoner_skip_as_insufficient_evidence(
     result, gateway, candidate, external = _run_proposal_batch_fixture(
         tmp_path,
         samples=2,
-        outcomes=[_loop_route(), skip, _loop_proposal()],
+        outcomes=[
+            _loop_route(),
+            skip,
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
     )
     try:
-        assert result.status == "batch_failed"
-        assert result.failure_code == "insufficient_evidence"
-        assert result.completed_samples == 0
-        assert result.budget.api_calls == 2
-        assert gateway.roles == ["orchestrator", "reasoner"]
+        assert result.status == "batch_complete"
+        assert result.failure_code == "none"
+        assert result.attempted_samples == 2
+        assert result.completed_samples == 1
+        assert result.budget.api_calls == 5
+        assert gateway.roles == [
+            "orchestrator",
+            "reasoner",
+            "orchestrator",
+            "reasoner",
+            "coder",
+        ]
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        rejected = [
+            event for event in events if event["event"] == "proposal_sample_rejected"
+        ]
+        assert [event["details"] for event in rejected] == [
+            {"calls_consumed": 2, "code": "reasoner_skip", "sample": 1}
+        ]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_records_an_inert_patch_rejection_and_continues(
+    tmp_path: Path,
+) -> None:
+    """A rejected inert edit is model-quality evidence, not a controller failure."""
+    from agent_loop import ExactLineReplacement, TypedCodingProposal
+
+    invalid = TypedCodingProposal(
+        summary="Attempt an edit whose source precondition is stale.",
+        replacements=(
+            ExactLineReplacement(
+                path="core/momentum_analysis.py",
+                start_line=1,
+                old_lines=("MOMENTUM = 999",),
+                new_lines=("MOMENTUM = 2",),
+            ),
+        ),
+    )
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            invalid,
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
+    )
+    try:
+        assert result.status == "batch_complete"
+        assert result.attempted_samples == 2
+        assert result.completed_samples == 1
+        assert result.budget.api_calls == 6
+        assert gateway.roles == ["orchestrator", "reasoner", "coder"] * 2
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        rejected = [
+            event for event in events if event["event"] == "proposal_sample_rejected"
+        ]
+        assert [event["details"] for event in rejected] == [
+            {"calls_consumed": 3, "code": "patch_rejected", "sample": 1}
+        ]
         assert not candidate.root.exists()
     finally:
         external.cleanup()
@@ -8491,6 +8569,7 @@ def test_cli_routes_batch_to_dedicated_runner_and_prints_closed_summary(
             exit_code=22,
             run_id=str(kwargs["run_id"]),
             requested_samples=limits.samples,
+            attempted_samples=1,
             completed_samples=0,
             failure_code="provider_failed",
             budget=agent_loop.BudgetSnapshot(

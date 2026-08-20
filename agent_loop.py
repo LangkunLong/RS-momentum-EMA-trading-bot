@@ -39,7 +39,7 @@ from typing import Any, BinaryIO, Callable, Generic, Mapping, Protocol, Sequence
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
-REASONER_MODEL = "deepseek/deepseek-r1"
+REASONER_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
 CODER_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
@@ -1490,11 +1490,10 @@ def _usage_from_generation_record(
                 RecoveryUsageDiagnosticCode.OPTIONAL_TOKEN_INVALID
             ),
         ) from exc
-    if (
-        token_basis is _GenerationTokenBasis.NATIVE
-        and cached_tokens is not None
-        and cached_tokens > prompt_tokens
-    ):
+    if token_basis is _GenerationTokenBasis.NORMALIZED:
+        cached_tokens = None
+        reasoning_tokens = None
+    elif cached_tokens is not None and cached_tokens > prompt_tokens:
         raise AccountingValidationError(
             "generation cached token accounting is inconsistent",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
@@ -1502,29 +1501,14 @@ def _usage_from_generation_record(
                 RecoveryUsageDiagnosticCode.CACHED_EXCEEDS_PROMPT
             ),
         )
-    if (
-        token_basis is _GenerationTokenBasis.NATIVE
-        and reasoning_tokens is not None
-        and reasoning_tokens > completion_tokens
-    ):
-        normalized_prompt = _non_negative_int(_present_field(data, "tokens_prompt"))
-        normalized_completion = _non_negative_int(
-            _present_field(data, "tokens_completion")
+    elif reasoning_tokens is not None and reasoning_tokens > completion_tokens:
+        raise AccountingValidationError(
+            "generation reasoning token accounting is inconsistent",
+            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            recovery_usage_diagnostic=(
+                RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
+            ),
         )
-        if normalized_prompt is None or normalized_completion is None:
-            raise AccountingValidationError(
-                "generation normalized token accounting is incomplete",
-                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-                recovery_usage_diagnostic=(
-                    RecoveryUsageDiagnosticCode.NORMALIZED_TOKEN_PAIR_INVALID
-                ),
-            )
-        prompt_tokens = normalized_prompt
-        completion_tokens = normalized_completion
-        token_basis = _GenerationTokenBasis.NORMALIZED
-    if token_basis is _GenerationTokenBasis.NORMALIZED:
-        cached_tokens = None
-        reasoning_tokens = None
     return Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -1694,8 +1678,12 @@ class OpenRouterGateway:
                 '"diagnosis", "root_cause", "invariants", "files_to_change", "steps", "skip", '
                 '"skip_reason". Use JSON arrays for invariants, files_to_change, and steps; choose files '
                 "only from the provided source snapshots. Use the closed numeric diagnostics and all "
-                "supplied source snapshots to establish a specific causal edit. Set skip to true when "
-                "that evidence is insufficient; otherwise set skip to false and skip_reason to an empty "
+                "supplied source snapshots to establish a specific causal edit. Treat those snapshots "
+                "as the complete approved editing scope; never require an inaccessible path as a repair "
+                "prerequisite. A minimal change may be a bounded falsifiable experiment when the closed "
+                "metrics identify a bottleneck and a supplied snapshot contains its controlling expression. "
+                "Set skip to true only when no such causal experiment is supported; otherwise set skip to "
+                "false and skip_reason to an empty "
                 "string for a repairable issue. diagnosis, root_cause, and skip_reason must be JSON strings; "
                 "invariants, files_to_change, and steps must be JSON arrays of strings; skip must be the JSON "
                 'boolean true or false; when skip is false, skip_reason must be exactly ""; when skip is true, '
@@ -7468,6 +7456,7 @@ class ProposalBatchResult:
     exit_code: int
     run_id: str
     requested_samples: int
+    attempted_samples: int
     completed_samples: int
     failure_code: str
     budget: BudgetSnapshot
@@ -7490,10 +7479,17 @@ class ProposalBatchResult:
             raise ConfigurationError("proposal batch run id is invalid")
         if (
             type(self.requested_samples) is not int
+            or type(self.attempted_samples) is not int
             or type(self.completed_samples) is not int
-            or not 0 <= self.completed_samples <= self.requested_samples <= MAX_PROPOSAL_SAMPLES
+            or not 0
+            <= self.completed_samples
+            <= self.attempted_samples
+            <= self.requested_samples
+            <= MAX_PROPOSAL_SAMPLES
         ):
             raise ConfigurationError("proposal batch sample counters are invalid")
+        if self.status == "batch_complete" and self.attempted_samples != self.requested_samples:
+            raise ConfigurationError("completed proposal batch must attempt every requested sample")
         if not isinstance(self.failure_code, str) or not self.failure_code:
             raise ConfigurationError("proposal batch failure code is invalid")
         if not isinstance(self.budget, BudgetSnapshot):
@@ -8005,6 +8001,7 @@ def run_proposal_batch(
         raise ConfigurationError("proposal batch monotonic clock is invalid")
     deadline = float(started) + limits.wall_timeout_seconds
     sample_results: list[ProposalSampleResult] = []
+    attempted_samples = 0
     provider_call_artifacts: list[tuple[int, str, Path, str]] = []
     failure_code = "none"
     status = "batch_failed"
@@ -8317,6 +8314,7 @@ def run_proposal_batch(
             sealed_manifest = _candidate_tracked_manifest_sha256(candidate)
             evidence_payload = {"primary": asdict(evidence)}
             for sample in range(1, limits.samples + 1):
+                attempted_samples = sample
                 check_wall()
                 calls_before = ledger.calls
                 window = BudgetWindow(
@@ -8342,7 +8340,22 @@ def run_proposal_batch(
                 calls.append(artifact)
                 assert isinstance(route, Route)
                 if route.action != "reason":
-                    raise ProtocolValidationError("proposal batch orchestrator aborted")
+                    if ledger.calls - calls_before != 1:
+                        raise BudgetExceededError(
+                            "proposal sample did not consume its exact call count"
+                        )
+                    if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
+                        raise CandidateMutationError("candidate changed during proposal batch")
+                    audit.append_event(
+                        LoopState.RECORD_SKIP,
+                        "proposal_sample_rejected",
+                        {
+                            "sample": sample,
+                            "code": "orchestrator_abort",
+                            "calls_consumed": 1,
+                        },
+                    )
+                    continue
                 snapshots = load_snapshots(services.editable_paths)
                 plan, artifact, _plan_payload_sha256 = call_role(
                     sample,
@@ -8362,11 +8375,39 @@ def run_proposal_batch(
                 assert isinstance(plan, ReasoningPlan)
                 readable = {value.path for value in snapshots}
                 if plan.skip:
-                    raise InsufficientEvidenceError(
-                        "proposal batch reasoner reported insufficient evidence"
+                    if ledger.calls - calls_before != 2:
+                        raise BudgetExceededError(
+                            "proposal sample did not consume its exact call count"
+                        )
+                    if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
+                        raise CandidateMutationError("candidate changed during proposal batch")
+                    audit.append_event(
+                        LoopState.RECORD_SKIP,
+                        "proposal_sample_rejected",
+                        {
+                            "sample": sample,
+                            "code": "reasoner_skip",
+                            "calls_consumed": 2,
+                        },
                     )
+                    continue
                 if not set(plan.files_to_change).issubset(readable):
-                    raise ProtocolValidationError("proposal batch reasoner skipped or expanded scope")
+                    if ledger.calls - calls_before != 2:
+                        raise BudgetExceededError(
+                            "proposal sample did not consume its exact call count"
+                        )
+                    if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
+                        raise CandidateMutationError("candidate changed during proposal batch")
+                    audit.append_event(
+                        LoopState.RECORD_REJECTION,
+                        "proposal_sample_rejected",
+                        {
+                            "sample": sample,
+                            "code": "reasoner_scope_rejected",
+                            "calls_consumed": 2,
+                        },
+                    )
+                    continue
                 typed_proposal, artifact, proposal_payload_sha256 = call_role(
                     sample,
                     3,
@@ -8385,24 +8426,44 @@ def run_proposal_batch(
                 )
                 calls.append(artifact)
                 assert isinstance(typed_proposal, TypedCodingProposal)
-                if not set(typed_proposal.files).issubset(set(plan.files_to_change)):
-                    raise PatchPolicyError("proposal batch coder expanded approved scope")
-                proposal = render_typed_coding_proposal(
-                    candidate,
-                    typed_proposal,
-                    snapshots,
-                )
-                handoff = export_inert_proposal(
-                    candidate,
-                    audit,
-                    proposal,
-                    gate="backtest",
-                    editable_paths=services.editable_paths,
-                    artifact_name=f"proposal-{sample:03d}",
-                    provider_evidence_sha256=evidence_sha256,
-                    proposal_payload_sha256=proposal_payload_sha256,
-                    renderer_contract="coding_exact_replacements_v1",
-                )
+                try:
+                    if not set(typed_proposal.files).issubset(set(plan.files_to_change)):
+                        raise PatchPolicyError("proposal batch coder expanded approved scope")
+                    proposal = render_typed_coding_proposal(
+                        candidate,
+                        typed_proposal,
+                        snapshots,
+                    )
+                    handoff = export_inert_proposal(
+                        candidate,
+                        audit,
+                        proposal,
+                        gate="backtest",
+                        editable_paths=services.editable_paths,
+                        artifact_name=f"proposal-{sample:03d}",
+                        provider_evidence_sha256=evidence_sha256,
+                        proposal_payload_sha256=proposal_payload_sha256,
+                        renderer_contract="coding_exact_replacements_v1",
+                    )
+                except (PatchPolicyError, PreflightError) as exc:
+                    if ledger.calls - calls_before != 3:
+                        raise BudgetExceededError(
+                            "proposal sample did not consume its exact call count"
+                        ) from exc
+                    if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
+                        raise CandidateMutationError(
+                            "candidate changed during proposal batch"
+                        ) from exc
+                    audit.append_event(
+                        LoopState.RECORD_REJECTION,
+                        "proposal_sample_rejected",
+                        {
+                            "sample": sample,
+                            "code": "patch_rejected",
+                            "calls_consumed": 3,
+                        },
+                    )
+                    continue
                 if ledger.calls - calls_before != 3:
                     raise BudgetExceededError("proposal sample did not consume exactly three calls")
                 if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
@@ -8427,7 +8488,10 @@ def run_proposal_batch(
                         "proposal_payload_sha256": proposal_payload_sha256,
                     },
                 )
-            status = "batch_complete"
+            if sample_results:
+                status = "batch_complete"
+            else:
+                failure_code = "no_valid_proposals"
     except AccountingValidationError:
         failure_code = "accounting_invalid"
     except BudgetExceededError:
@@ -8470,7 +8534,9 @@ def run_proposal_batch(
         {
             "status": status,
             "requested_samples": limits.samples,
+            "attempted_samples": attempted_samples,
             "completed_samples": len(sample_results),
+            "rejected_samples": attempted_samples - len(sample_results),
             "failure_code": failure_code,
             "cleanup_complete": cleanup.cleanup_complete,
             "source_modified": cleanup.source_modified,
@@ -8483,7 +8549,9 @@ def run_proposal_batch(
         "schema_version": 1,
         "status": status,
         "requested_samples": limits.samples,
+        "attempted_samples": attempted_samples,
         "completed_samples": len(sample_results),
+        "rejected_samples": attempted_samples - len(sample_results),
         "failure_code": failure_code,
         "budget": asdict(_budget_snapshot(ledger)),
         "cleanup_complete": cleanup.cleanup_complete,
@@ -8510,6 +8578,7 @@ def run_proposal_batch(
         exit_code={"batch_complete": 10, "gate_observed_pass": 0, "batch_failed": 22}[status],
         run_id=audit.run_id,
         requested_samples=limits.samples,
+        attempted_samples=attempted_samples,
         completed_samples=len(sample_results),
         failure_code=failure_code,
         budget=_budget_snapshot(ledger),
@@ -9707,7 +9776,9 @@ def _proposal_batch_summary(result: ProposalBatchResult) -> dict[str, object]:
         "exit_code": result.exit_code,
         "run_id": result.run_id,
         "requested_samples": result.requested_samples,
+        "attempted_samples": result.attempted_samples,
         "completed_samples": result.completed_samples,
+        "rejected_samples": result.attempted_samples - result.completed_samples,
         "failure_code": result.failure_code,
         "accounting_failure": (
             asdict(result.accounting_failure)
