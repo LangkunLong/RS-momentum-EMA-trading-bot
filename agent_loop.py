@@ -1814,6 +1814,8 @@ class OpenRouterGateway:
                 "config/settings.py must not appear in files_to_change or steps. Never invent baseline values "
                 "or configuration facts. Any source expression containing settings. is an immutable controller-"
                 "owned configuration boundary: do not propose changing, replacing, or hard-coding its effect. "
+                "A source display marked [LOCKED CONFIGURATION EXPRESSION] is immutable. When "
+                "read_only_configuration_facts is empty, configuration_fact_ids must be an empty JSON array. "
                 "diagnosis must "
                 "state only observed gate facts; "
                 "causal_hypothesis is explicitly unproven and falsifiable. Use JSON arrays for "
@@ -1855,6 +1857,8 @@ class OpenRouterGateway:
                 "literal or otherwise bypass the controller-supplied read-only configuration fact. Do not edit "
                 "config/settings.py, adjust a settings value, or turn a settings reference into a literal. "
                 "A source line containing settings. is locked and must not appear in old_lines or new_lines. "
+                "A source display marked [LOCKED CONFIGURATION EXPRESSION] is controller-owned and cannot "
+                "appear in any replacement. "
                 "Order multiple replacements by path; use no duplicate, overlapping, or adjacent source ranges "
                 "and merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -6583,6 +6587,26 @@ def _coder_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, object]:
     return payload
 
 
+def _provider_editable_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, object]:
+    """Hide controller-locked settings expressions from provider-editable source views."""
+    payload = _coder_snapshot_payload(snapshot)
+    annotated = payload["sanitized_text"]
+    if not isinstance(annotated, str):
+        raise ConfigurationError("provider snapshot text is invalid")
+    locked: list[str] = []
+    for line in annotated.splitlines(keepends=True):
+        if "settings." not in line:
+            locked.append(line)
+            continue
+        prefix, separator, _ = line.partition(": ")
+        if not separator:
+            raise ConfigurationError("provider snapshot annotation is invalid")
+        newline = "\n" if line.endswith("\n") else ""
+        locked.append(f"{prefix}: [LOCKED CONFIGURATION EXPRESSION]{newline}")
+    payload["sanitized_text"] = "".join(locked)
+    return payload
+
+
 def _unique_visible_snapshot_span_start(
     snapshot: SourceSnapshot,
     lines: Sequence[str],
@@ -9301,12 +9325,10 @@ def run_proposal_batch(
                         "evidence": evidence_payload,
                         "route": asdict(route),
                         "source_snapshots": [
-                            _coder_snapshot_payload(value) for value in snapshots
+                            _provider_editable_snapshot_payload(value) for value in snapshots
                         ],
                         "editable_source_paths": [value.path for value in snapshots],
-                        "read_only_configuration_facts": (
-                            _read_only_configuration_fact_payload(configuration_facts)
-                        ),
+                        "read_only_configuration_facts": [],
                     },
                     ReasoningPlan.from_json,
                     ReasoningPlan,
@@ -9318,7 +9340,7 @@ def run_proposal_batch(
                     _validate_reasoning_plan_grounding(
                         plan,
                         snapshots,
-                        configuration_facts,
+                        (),
                     )
                 except PatchPolicyError:
                     record_sample_rejection(
@@ -9360,11 +9382,9 @@ def run_proposal_batch(
                         "evidence": evidence_payload,
                         "plan": asdict(plan),
                         "editable_source_paths": [value.path for value in snapshots],
-                        "read_only_configuration_facts": (
-                            _read_only_configuration_fact_payload(configuration_facts)
-                        ),
+                        "read_only_configuration_facts": [],
                         "source_snapshots": [
-                            _coder_snapshot_payload(value) for value in snapshots
+                            _provider_editable_snapshot_payload(value) for value in snapshots
                         ],
                     },
                     TypedCodingProposal.from_json,
@@ -9820,12 +9840,10 @@ def run_agent_loop(
                     "evidence": evidence_payload,
                     "route": asdict(route),
                     "source_snapshots": [
-                        _coder_snapshot_payload(value) for value in snapshots
+                        _provider_editable_snapshot_payload(value) for value in snapshots
                     ],
                     "editable_source_paths": [value.path for value in snapshots],
-                    "read_only_configuration_facts": (
-                        _read_only_configuration_fact_payload(configuration_facts)
-                    ),
+                    "read_only_configuration_facts": [],
                 },
                 ReasoningPlan.from_json,
                 ReasoningPlan,
@@ -9840,7 +9858,7 @@ def run_agent_loop(
                 _validate_reasoning_plan_grounding(
                     plan,
                     snapshots,
-                    configuration_facts,
+                    (),
                 )
             except PatchPolicyError:
                 skip_iteration("reasoner", "evidence_rejected")
@@ -9860,11 +9878,9 @@ def run_agent_loop(
                     "evidence": evidence_payload,
                     "plan": asdict(plan),
                     "editable_source_paths": [value.path for value in snapshots],
-                    "read_only_configuration_facts": (
-                        _read_only_configuration_fact_payload(configuration_facts)
-                    ),
+                    "read_only_configuration_facts": [],
                     "source_snapshots": [
-                        _coder_snapshot_payload(value) for value in snapshots
+                        _provider_editable_snapshot_payload(value) for value in snapshots
                     ],
                 },
                 TypedCodingProposal.from_json,
