@@ -1758,6 +1758,9 @@ class OpenRouterGateway:
                 "as the complete approved editing scope; never require an inaccessible path as a repair "
                 "prerequisite. A minimal change may be a bounded falsifiable experiment when the closed "
                 "metrics identify a bottleneck and a supplied snapshot contains its controlling expression. "
+                "Every proposed edit must directly change an existing source path relevant to the current observed "
+                "gate. Do not add any new defaulted parameter in a function, method, or lambda; edit the "
+                "already-executed logic instead. "
                 "Set skip to true only when no such causal experiment is supported; otherwise set skip to "
                 "false and skip_reason to an empty "
                 "string for a repairable issue. diagnosis, root_cause, and skip_reason must be JSON strings; "
@@ -1777,6 +1780,8 @@ class OpenRouterGateway:
                 "alone calculates new output coordinates. old_lines and new_lines must be nonempty JSON "
                 "arrays of source-line strings without newline characters; omit the annotation prefix. "
                 "old_lines must exactly match consecutive visible source lines including indentation. "
+                "Do not add any new defaulted parameter in a function, method, or lambda, even with a proposed "
+                "caller; make a direct change to already-executed logic and never add dormant optional knobs. "
                 "Order replacements by path and original start_line, with no duplicate, overlapping, or "
                 "adjacent source ranges; merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -6349,6 +6354,155 @@ def _coder_snapshot_payload(snapshot: SourceSnapshot) -> dict[str, object]:
     return payload
 
 
+def _qualified_functions(
+    tree: ast.Module,
+) -> dict[tuple[str, ...], tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]]:
+    """Collect every function under a stable lexical scope without resolving code."""
+    collected: dict[
+        tuple[str, ...],
+        list[ast.FunctionDef | ast.AsyncFunctionDef],
+    ] = {}
+
+    class _FunctionCollector(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scope: tuple[str, ...] = ()
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            previous = self.scope
+            self.scope = (*previous, f"class:{node.name}")
+            for statement in node.body:
+                self.visit(statement)
+            self.scope = previous
+
+        def _visit_function(
+            self,
+            node: ast.FunctionDef | ast.AsyncFunctionDef,
+        ) -> None:
+            previous = self.scope
+            qualified = (*previous, f"function:{node.name}")
+            collected.setdefault(qualified, []).append(node)
+            self.scope = qualified
+            for statement in node.body:
+                self.visit(statement)
+            self.scope = previous
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+    _FunctionCollector().visit(tree)
+    return {key: tuple(value) for key, value in collected.items()}
+
+
+def _parameter_defaults(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+) -> dict[str, ast.expr]:
+    """Map explicitly defaulted parameters without evaluating candidate expressions."""
+    result: dict[str, ast.expr] = {}
+    positional = (*node.args.posonlyargs, *node.args.args)
+    offset = len(positional) - len(node.args.defaults)
+    for index, argument in enumerate(positional):
+        if index >= offset:
+            result[argument.arg] = node.args.defaults[index - offset]
+    for argument, default in zip(
+        node.args.kwonlyargs,
+        node.args.kw_defaults,
+        strict=True,
+    ):
+        if default is not None:
+            result[argument.arg] = default
+    return result
+
+
+def _lambdas_by_path(tree: ast.Module) -> dict[tuple[str, ...], ast.Lambda]:
+    """Bind lambdas to deterministic structural AST paths."""
+    result: dict[tuple[str, ...], ast.Lambda] = {}
+
+    def visit(node: ast.AST, path: tuple[str, ...]) -> None:
+        if isinstance(node, ast.Lambda):
+            result[path] = node
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                visit(value, (*path, field))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    if isinstance(child, ast.AST):
+                        visit(child, (*path, f"{field}[{index}]"))
+
+    visit(tree, ())
+    return result
+
+
+def _validate_typed_proposal_actionability(
+    original_trees: Mapping[str, ast.Module],
+    rewritten_trees: Mapping[str, ast.Module],
+) -> None:
+    """Reject every newly introduced defaulted parameter, including lambdas."""
+    for path, rewritten_tree in rewritten_trees.items():
+        original_tree = original_trees.get(path)
+        if original_tree is None:
+            raise ConfigurationError("typed proposal syntax provenance is incomplete")
+        original_lambdas = _lambdas_by_path(original_tree)
+        for lambda_path, rewritten_lambda in _lambdas_by_path(rewritten_tree).items():
+            original_lambda = original_lambdas.get(lambda_path)
+            original_parameters = (
+                {
+                    argument.arg
+                    for argument in (
+                        *original_lambda.args.posonlyargs,
+                        *original_lambda.args.args,
+                        *original_lambda.args.kwonlyargs,
+                    )
+                }
+                if original_lambda is not None
+                else set()
+            )
+            if any(
+                parameter not in original_parameters
+                for parameter in _parameter_defaults(rewritten_lambda)
+            ):
+                raise PatchPolicyError(
+                    "typed replacements may not add defaulted optional parameters"
+                )
+        original_functions = _qualified_functions(original_tree)
+        rewritten_functions = _qualified_functions(rewritten_tree)
+        for qualified_scope, rewritten_matches in rewritten_functions.items():
+            original_matches = original_functions.get(qualified_scope, ())
+            original_signatures = tuple(
+                ast.dump(node.args, include_attributes=False)
+                for node in original_matches
+            )
+            rewritten_signatures = tuple(
+                ast.dump(node.args, include_attributes=False)
+                for node in rewritten_matches
+            )
+            if original_signatures == rewritten_signatures:
+                continue
+            if len(original_matches) != 1 or len(rewritten_matches) != 1:
+                if any(_parameter_defaults(node) for node in rewritten_matches):
+                    raise PatchPolicyError(
+                        "typed replacements may not add defaulted optional parameters"
+                    )
+                continue
+            original_parameters = {
+                argument.arg
+                for argument in (
+                    *original_matches[0].args.posonlyargs,
+                    *original_matches[0].args.args,
+                    *original_matches[0].args.kwonlyargs,
+                )
+            }
+            if any(
+                parameter not in original_parameters
+                for parameter in _parameter_defaults(rewritten_matches[0])
+            ):
+                raise PatchPolicyError(
+                    "typed replacements may not add defaulted optional parameters"
+                )
+    return
+
 def render_typed_coding_proposal(
     candidate: Candidate,
     proposal: TypedCodingProposal,
@@ -6371,6 +6525,8 @@ def render_typed_coding_proposal(
     for replacement in proposal.replacements:
         grouped.setdefault(replacement.path, []).append(replacement)
     sections: list[str] = []
+    original_trees: dict[str, ast.Module] = {}
+    rewritten_trees: dict[str, ast.Module] = {}
     for path in proposal.files:
         snapshot = snapshot_by_path[path]
         view = _coder_snapshot_payload(snapshot)
@@ -6440,12 +6596,16 @@ def render_typed_coding_proposal(
             raise PatchPolicyError("typed replacements do not change candidate source")
         if path.endswith(".py"):
             try:
-                ast.parse("\n".join(expected_lines) + "\n", filename=path)
+                original_trees[path] = ast.parse(decoded, filename=path)
+                rewritten_trees[path] = ast.parse(
+                    "\n".join(expected_lines) + "\n", filename=path
+                )
             except SyntaxError:
                 raise PatchPolicyError(
                     "typed replacements must produce valid Python syntax"
                 ) from None
         sections.extend(section)
+    _validate_typed_proposal_actionability(original_trees, rewritten_trees)
     rendered = CodingProposal(
         summary=proposal.summary,
         files=proposal.files,

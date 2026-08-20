@@ -1188,12 +1188,17 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
     assert "all supplied source snapshots" in reasoner_prompt
     assert "complete approved editing scope" in reasoner_prompt
     assert "bounded falsifiable experiment" in reasoner_prompt
+    assert "directly change an existing source path" in reasoner_prompt
+    assert "Do not add any new defaulted parameter" in reasoner_prompt
     assert "set skip to true" in reasoner_prompt.lower()
     assert "Never invent" in reasoner_prompt
     assert "sealed gate evidence" in coder_prompt
     assert "exact numbered source annotation" in coder_prompt
     assert "omit the annotation" in coder_prompt
     assert "old_lines must exactly match" in coder_prompt
+    assert "dormant optional knobs" in coder_prompt
+    assert "Do not add any new defaulted parameter" in coder_prompt
+    assert "even with a proposed caller" in coder_prompt
     assert "change the guard predicate" in coder_prompt
 
 
@@ -2652,6 +2657,7 @@ def test_coder_request_requires_typed_exact_replacements_at_provider_boundary() 
     assert "path, start_line, old_lines, and new_lines" in messages[0]["content"]
     assert "original snapshot coordinate" in messages[0]["content"]
     assert "never add or subtract earlier replacement deltas" in messages[0]["content"]
+    assert "Do not add any new defaulted parameter" in messages[0]["content"]
     assert "Do not return unified diff text" in messages[0]["content"]
 
 
@@ -3771,6 +3777,322 @@ def test_typed_replacement_rejects_invalid_rewritten_python_syntax(tmp_path: Pat
                 render_typed_coding_proposal(candidate, invalid, (snapshot,))
         finally:
             dispose_candidate(candidate)
+
+
+@pytest.mark.parametrize(
+    ("sentinel", "activation_value"),
+    (
+        ("None", None),
+        ("None", "None"),
+        ("None", "3"),
+        ("False", None),
+        ("False", "False"),
+        ("False", "0"),
+        ("False", "OFF"),
+        ("False", "True"),
+        ("None", "DEFAULT"),
+    ),
+)
+def test_typed_replacement_rejects_new_sentinel_optional_parameters(
+    tmp_path: Path,
+    sentinel: str,
+    activation_value: str | None,
+) -> None:
+    """New None/False optional parameters are forbidden even with caller wiring."""
+    from agent_loop import (
+        ExactLineReplacement,
+        PatchPolicyError,
+        TypedCodingProposal,
+        dispose_candidate,
+        export_candidate,
+        preflight_source,
+        read_candidate_source_snapshot,
+        render_typed_coding_proposal,
+    )
+
+    repo = _task2_repo(tmp_path)
+    target = repo / "core" / "momentum_analysis.py"
+    target.write_text(
+        "def score(value):\n    return value\n\nRESULT = score(2)\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _run_git(repo, "add", "core/momentum_analysis.py")
+    _run_git(repo, "commit", "-m", "callable momentum source")
+    with tempfile.TemporaryDirectory(prefix="agent-loop-typed-action-") as controller_name:
+        state = preflight_source(
+            repo,
+            acquire_lock=False,
+            controller_temp_parent=Path(controller_name),
+        )
+        candidate = export_candidate(state)
+        snapshot = read_candidate_source_snapshot(
+            candidate,
+            "core/momentum_analysis.py",
+            approved_paths=("core/momentum_analysis.py",),
+        )
+        if sentinel == "None":
+            new_function = (
+                "def score(value, control=None):",
+                "    if control is not None:",
+                "        return value * control",
+                "    return value",
+            )
+        else:
+            new_function = (
+                "def score(value, control=False):",
+                "    if control:",
+                "        return value * 2",
+                "    return value",
+            )
+        replacements = [
+            ExactLineReplacement(
+                path="core/momentum_analysis.py",
+                start_line=1,
+                old_lines=("def score(value):", "    return value"),
+                new_lines=new_function,
+            )
+        ]
+        if activation_value is not None:
+            replacements.append(
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=4,
+                    old_lines=("RESULT = score(2)",),
+                    new_lines=(f"RESULT = score(2, control={activation_value})",),
+                )
+            )
+        proposal = TypedCodingProposal(
+            summary="Add and optionally activate one bounded score factor.",
+            replacements=tuple(replacements),
+        )
+        try:
+            with pytest.raises(PatchPolicyError, match="optional parameters"):
+                render_typed_coding_proposal(candidate, proposal, (snapshot,))
+        finally:
+            dispose_candidate(candidate)
+
+
+@pytest.mark.parametrize(
+    ("source", "old_lines", "new_lines"),
+    (
+        (
+            "def outer(value):\n    def adjust(item):\n        return item\n    return adjust(value)\n\nRESULT = outer(2)\n",
+            ("    def adjust(item):", "        return item"),
+            (
+                "    def adjust(item, factor=None):",
+                "        if factor is not None:",
+                "            return item * factor",
+                "        return item",
+            ),
+        ),
+        (
+            "class Scorer:\n    def score(self, value):\n        return value\n\nRESULT = Scorer().score(2)\n",
+            ("    def score(self, value):", "        return value"),
+            (
+                "    def score(self, value, factor=None):",
+                "        if factor is not None:",
+                "            return value * factor",
+                "        return value",
+            ),
+        ),
+        (
+            "helper = lambda value: value\nRESULT = helper(2)\n",
+            ("helper = lambda value: value",),
+            ("helper = lambda value, control=DEFAULT: value",),
+        ),
+        (
+            "helper = lambda value: value\nRESULT = helper(2)\n",
+            ("helper = lambda value: value",),
+            ("helper = lambda value, enabled=bool(): value",),
+        ),
+    ),
+)
+def test_typed_replacement_rejects_defaulted_nested_method_and_lambda_parameters(
+    tmp_path: Path,
+    source: str,
+    old_lines: tuple[str, ...],
+    new_lines: tuple[str, ...],
+) -> None:
+    """Nested functions, methods, and lambdas cannot bypass the default rule."""
+    from agent_loop import (
+        ExactLineReplacement,
+        PatchPolicyError,
+        TypedCodingProposal,
+        dispose_candidate,
+        export_candidate,
+        preflight_source,
+        read_candidate_source_snapshot,
+        render_typed_coding_proposal,
+    )
+
+    repo = _task2_repo(tmp_path)
+    target = repo / "core" / "momentum_analysis.py"
+    target.write_text(source, encoding="utf-8", newline="\n")
+    _run_git(repo, "add", "core/momentum_analysis.py")
+    _run_git(repo, "commit", "-m", "nested callable source")
+    start_line = source.splitlines().index(old_lines[0]) + 1
+    with tempfile.TemporaryDirectory(prefix="agent-loop-typed-action-") as controller_name:
+        state = preflight_source(
+            repo,
+            acquire_lock=False,
+            controller_temp_parent=Path(controller_name),
+        )
+        candidate = export_candidate(state)
+        snapshot = read_candidate_source_snapshot(
+            candidate,
+            "core/momentum_analysis.py",
+            approved_paths=("core/momentum_analysis.py",),
+        )
+        proposal = TypedCodingProposal(
+            summary="Attempt to add one dormant nested control.",
+            replacements=(
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=start_line,
+                    old_lines=old_lines,
+                    new_lines=new_lines,
+                ),
+            ),
+        )
+        try:
+            with pytest.raises(PatchPolicyError, match="optional parameters"):
+                render_typed_coding_proposal(candidate, proposal, (snapshot,))
+        finally:
+            dispose_candidate(candidate)
+
+
+
+
+
+def test_typed_replacement_rejects_two_wired_sentinel_parameters(
+    tmp_path: Path,
+) -> None:
+    """Even fully wired sentinel parameters are outside the conservative contract."""
+    from agent_loop import (
+        ExactLineReplacement,
+        PatchPolicyError,
+        TypedCodingProposal,
+        dispose_candidate,
+        export_candidate,
+        preflight_source,
+        read_candidate_source_snapshot,
+        render_typed_coding_proposal,
+    )
+
+    repo = _task2_repo(tmp_path)
+    target = repo / "core" / "momentum_analysis.py"
+    target.write_text(
+        "def score(value):\n    return value\n\nRESULT = score(2)\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _run_git(repo, "add", "core/momentum_analysis.py")
+    _run_git(repo, "commit", "-m", "two-control caller")
+    with tempfile.TemporaryDirectory(prefix="agent-loop-typed-action-") as controller_name:
+        state = preflight_source(
+            repo,
+            acquire_lock=False,
+            controller_temp_parent=Path(controller_name),
+        )
+        candidate = export_candidate(state)
+        snapshot = read_candidate_source_snapshot(
+            candidate,
+            "core/momentum_analysis.py",
+            approved_paths=("core/momentum_analysis.py",),
+        )
+        proposal = TypedCodingProposal(
+            summary="Activate two bounded controls at the existing caller.",
+            replacements=(
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=1,
+                    old_lines=("def score(value):", "    return value"),
+                    new_lines=(
+                        "def score(value, factor=None, enabled=False):",
+                        "    if factor is not None:",
+                        "        value *= factor",
+                        "    if enabled:",
+                        "        value += 1",
+                        "    return value",
+                    ),
+                ),
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=4,
+                    old_lines=("RESULT = score(2)",),
+                    new_lines=("RESULT = score(2, factor=3, enabled=True)",),
+                ),
+            ),
+        )
+        try:
+            with pytest.raises(PatchPolicyError, match="optional parameters"):
+                render_typed_coding_proposal(candidate, proposal, (snapshot,))
+        finally:
+            dispose_candidate(candidate)
+
+
+def test_typed_replacement_rejects_defaulted_lambda_signature_transfer(
+    tmp_path: Path,
+) -> None:
+    """An existing defaulted signature cannot be moved to a different lambda."""
+    from agent_loop import (
+        ExactLineReplacement,
+        PatchPolicyError,
+        TypedCodingProposal,
+        dispose_candidate,
+        export_candidate,
+        preflight_source,
+        read_candidate_source_snapshot,
+        render_typed_coding_proposal,
+    )
+
+    repo = _task2_repo(tmp_path)
+    target = repo / "core" / "momentum_analysis.py"
+    target.write_text(
+        "a = lambda value, control=None: value\nb = lambda value: value\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _run_git(repo, "add", "core/momentum_analysis.py")
+    _run_git(repo, "commit", "-m", "two lambda signatures")
+    with tempfile.TemporaryDirectory(prefix="agent-loop-typed-action-") as controller_name:
+        state = preflight_source(
+            repo,
+            acquire_lock=False,
+            controller_temp_parent=Path(controller_name),
+        )
+        candidate = export_candidate(state)
+        snapshot = read_candidate_source_snapshot(
+            candidate,
+            "core/momentum_analysis.py",
+            approved_paths=("core/momentum_analysis.py",),
+        )
+        proposal = TypedCodingProposal(
+            summary="Attempt to transfer an optional lambda signature.",
+            replacements=(
+                ExactLineReplacement(
+                    path="core/momentum_analysis.py",
+                    start_line=1,
+                    old_lines=(
+                        "a = lambda value, control=None: value",
+                        "b = lambda value: value",
+                    ),
+                    new_lines=(
+                        "a = lambda value: value",
+                        "b = lambda value, control=None: value",
+                    ),
+                ),
+            ),
+        )
+        try:
+            with pytest.raises(PatchPolicyError, match="optional parameters"):
+                render_typed_coding_proposal(candidate, proposal, (snapshot,))
+        finally:
+            dispose_candidate(candidate)
+
+
+
 
 
 @pytest.mark.parametrize("failure_kind", ("wrong_start", "wrong_old_text"))
