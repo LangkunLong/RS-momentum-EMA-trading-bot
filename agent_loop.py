@@ -140,6 +140,16 @@ _CONTROLLER_INITIALIZATION_STAGES = frozenset(
     {
         "git_capability",
         "source_preflight",
+        "source_preflight_branch",
+        "source_preflight_dirty",
+        "source_preflight_git_config",
+        "source_preflight_git_operation",
+        "source_preflight_git_root",
+        "source_preflight_lock",
+        "source_preflight_replace_ref",
+        "source_preflight_tracked_file",
+        "source_preflight_unstable",
+        "source_preflight_unknown",
         "candidate_export",
         "docker_capability",
         "sandbox_init",
@@ -160,6 +170,32 @@ class ControllerInitializationError(RuntimeError):
             raise ConfigurationError("controller initialization stage is invalid")
         super().__init__(stage)
         self.stage = stage
+
+
+def _closed_source_preflight_stage(exc: "PreflightError") -> str:
+    """Map controller-owned preflight failures to a value-free CLI code."""
+    message = str(exc)
+    if message.startswith("Git operation failed:"):
+        code = "git_operation"
+    elif "local Git config" in message:
+        code = "git_config"
+    elif "replacement refs" in message:
+        code = "replace_ref"
+    elif "source lock" in message or "agent loop holds" in message:
+        code = "lock"
+    elif "working tree must be clean" in message:
+        code = "dirty"
+    elif "did not remain stable" in message:
+        code = "unstable"
+    elif "tracked source path" in message:
+        code = "tracked_file"
+    elif "repository root" in message or "Git metadata" in message:
+        code = "git_root"
+    elif "HEAD" in message or "non-protected codex" in message:
+        code = "branch"
+    else:
+        code = "unknown"
+    return f"source_preflight_{code}"
 
 
 class ProtocolValidationError(ValueError):
@@ -9687,12 +9723,17 @@ def _execute_cli_run(
     try:
         git_capability = configure_git_executable(config.git_executable)
         stage = "source_preflight"
-        state = preflight_source(
-            config.source_root,
-            permanent_runtime_root=config.permanent_runtime_root,
-            controller_temp_parent=config.controller_temp_parent,
-            git=git_capability,
-        )
+        try:
+            state = preflight_source(
+                config.source_root,
+                permanent_runtime_root=config.permanent_runtime_root,
+                controller_temp_parent=config.controller_temp_parent,
+                git=git_capability,
+            )
+        except PreflightError as exc:
+            raise ControllerInitializationError(
+                _closed_source_preflight_stage(exc)
+            ) from exc
         stage = "candidate_export"
         candidate = export_candidate(state)
         stage = "docker_capability"
