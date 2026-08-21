@@ -2573,7 +2573,7 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
             "qwen/qwen3-coder-next",
             coder_payload,
             TypedCodingProposal.from_json,
-            4096,
+            8192,
         ),
     )
     client = FakeClient(
@@ -9560,7 +9560,7 @@ def test_proposal_batch_rejects_private_quality_failure_before_export(
     )
     try:
         assert result.status == "batch_failed"
-        assert result.failure_code == "patch_rejected"
+        assert result.failure_code == "quality_rejected"
         assert result.completed_samples == 0
         assert result.rejected_samples == 1
         assert gateway.roles == ["orchestrator", "reasoner", "coder"]
@@ -9569,7 +9569,7 @@ def test_proposal_batch_rejects_private_quality_failure_before_export(
         assert not (result.audit_path / "proposal-001.diff").exists()
         events = verify_audit_chain(result.audit_path / "events.jsonl")
         rejected = [event for event in events if event["event"] == "proposal_sample_rejected"]
-        assert rejected[0]["details"]["code"] == "patch_rejected"
+        assert rejected[0]["details"]["code"] == "quality_rejected"
         assert not candidate.root.exists()
     finally:
         external.cleanup()

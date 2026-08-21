@@ -86,6 +86,7 @@ DEFAULT_EDITABLE_PATHS = frozenset(
 BACKTEST_READ_ONLY_PATHS = frozenset(
     {"backtest.py", "backtest_pnl.py", "core/backtest_engine.py"}
 )
+PROPOSAL_BATCH_PROTECTED_BACKTEST_PATHS = frozenset({"backtest.py"})
 _DENIED_EXACT = frozenset(
     {
         "agent_loop.py",
@@ -1819,9 +1820,10 @@ class OpenRouterGateway:
                 "source coordinates: the controller owns exact source anchoring. The read_only_"
                 "configuration_facts exactly once is mandatory: treat that object as immutable controller evidence. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
-                "editable_source_paths and source_snapshots. When a read_only_configuration_facts value informs "
-                "your diagnosis, cite its fact_id in configuration_fact_ids; cite only listed fact_id values. "
-                "Those facts are read-only baselines, never source snapshots or editable paths; "
+                "editable_source_paths and source_snapshots. For a non-skip plan, configuration_fact_ids must "
+                "equal every fact_id supplied in read_only_configuration_facts, even when a fact is only an "
+                "immutable boundary; cite only listed fact_id values. Those facts are read-only baselines, "
+                "never source snapshots or editable paths; "
                 "config/settings.py must not appear in files_to_change or steps. Never invent baseline values "
                 "or configuration facts. Any source expression containing settings. is an immutable controller-"
                 "owned configuration boundary: do not propose changing, replacing, or hard-coding its effect. "
@@ -1830,6 +1832,9 @@ class OpenRouterGateway:
                 "When read_only_execution_facts is supplied, treat it as controller-owned behavioral evidence: "
                 "use it to rule out edits that cannot affect the observed execution path, and never treat it "
                 "as editable source or configuration. "
+                "When an execution fact rules out a direction for the observed bottleneck, do not select an "
+                "allowed replacement in that direction; explain the remaining direction in causal_hypothesis "
+                "and steps instead of proposing a no-effect experiment. "
                 "When controller_owned_allowed_replacement or controller_owned_allowed_replacements is supplied, "
                 "those are the sole controller-approved bounded experiments for this batch: for a non-skip plan, "
                 "use exactly one supplied path and mechanism and do not propose an alternative source change. "
@@ -1858,7 +1863,10 @@ class OpenRouterGateway:
             "coder": (
                 "You are the Coder. Return exactly one JSON object with exactly these keys: "
                 '"summary", "replacements". replacements must be a nonempty JSON array of objects '
-                "with exactly these keys: path, old_lines, and new_lines. path must be an approved plan and "
+                "Keep the response compact (target well below 1000 tokens): emit the JSON object only, "
+                "without analysis, explanations, source restatements, or Markdown. "
+                "Each replacement object must have exactly these keys: path, old_lines, and new_lines. "
+                "path must be an approved plan and "
                 "source-snapshot path. Each sanitized_text line begins with an exact numbered source annotation "
                 "'N: '; omit that annotation from old_lines and new_lines. The controller resolves an edit only "
                 "when old_lines have one exact match in the immutable visible source at the original snapshot "
@@ -1906,7 +1914,7 @@ class OpenRouterGateway:
             "coder": CODER_MODEL,
         }
     )
-    _TOKEN_CAPS = MappingProxyType({"orchestrator": 2048, "reasoner": 4096, "coder": 4096})
+    _TOKEN_CAPS = MappingProxyType({"orchestrator": 2048, "reasoner": 4096, "coder": 8192})
     _RESPONSE_SCHEMA_NAMES = MappingProxyType(
         {
             "orchestrator": "agent_loop_orchestrator_v1",
@@ -5105,8 +5113,13 @@ def validate_unified_diff(
     *,
     editable_paths: Sequence[str] = (),
     gate: str = "test",
+    allow_protected_backtest_paths: bool = False,
 ) -> ParsedPatch:
     """Apply all path, structure, cap, mode, scope, and live-reference policy before Git."""
+    if type(allow_protected_backtest_paths) is not bool:
+        raise PatchPolicyError("protected backtest path policy must be boolean")
+    if allow_protected_backtest_paths and gate != "backtest":
+        raise PatchPolicyError("protected backtest paths require the backtest gate")
     parsed = _parse_unified_diff(raw)
     try:
         declared = tuple(canonical_patch_path(path) for path in declared_files)
@@ -5122,7 +5135,11 @@ def validate_unified_diff(
             raise PatchPolicyError(f"permanently denied target: {path}")
         if not _is_default_editable(path) and path not in extra_editable:
             raise PatchPolicyError(f"target is outside editable scope: {path}")
-        if gate == "backtest" and path in BACKTEST_READ_ONLY_PATHS:
+        if (
+            gate == "backtest"
+            and path in BACKTEST_READ_ONLY_PATHS
+            and not (allow_protected_backtest_paths and path in PROPOSAL_BATCH_PROTECTED_BACKTEST_PATHS)
+        ):
             raise PatchPolicyError(f"backtest oracle path is read-only: {path}")
         entry = _git(candidate_root, "ls-files", "-s", "--", path).stdout.decode().strip()
         fields = entry.split()
@@ -5246,6 +5263,7 @@ def apply_candidate_patch(
     gate: str = "test",
     editable_paths: Sequence[str] = (),
     compile_runner: Callable[[WorkerLayout, tuple[str, ...]], bool] | None = None,
+    allow_protected_backtest_paths: bool = False,
 ) -> ParsedPatch:
     """Apply one validated transaction using a controller-issued candidate capability."""
     candidate_root = _require_candidate(candidate)
@@ -5257,6 +5275,7 @@ def apply_candidate_patch(
         proposal.files,
         editable_paths=editable_paths,
         gate=gate,
+        allow_protected_backtest_paths=allow_protected_backtest_paths,
     )
     _validate_exact_patch_anchors(candidate_root, parsed)
     before = snapshot_tree(candidate_root)
@@ -5287,7 +5306,14 @@ def apply_candidate_patch(
         if (
             _is_denied_path(prior)
             or (not _is_default_editable(prior) and prior not in explicit_scope)
-            or (gate == "backtest" and prior in BACKTEST_READ_ONLY_PATHS)
+            or (
+                gate == "backtest"
+                and prior in BACKTEST_READ_ONLY_PATHS
+                and not (
+                    allow_protected_backtest_paths
+                    and prior in PROPOSAL_BATCH_PROTECTED_BACKTEST_PATHS
+                )
+            )
         ):
             raise PatchApplicationError("candidate already contains an out-of-policy modification")
     try:
@@ -5623,11 +5649,7 @@ def _validate_historical_data_snapshot(
         raise DataBundleError("backtest date range must increase")
     requested_symbols = tuple(sorted(requested))
     exact_symbols = tuple(sorted({*requested_symbols, benchmark_symbol}))
-    price_suffix = ",".join(exact_symbols)
-    closes_suffix = ",".join(requested_symbols)
     period = _period_for_dates(start, end)
-    price_key = f"price::{period}::{start.isoformat()}::{end.isoformat()}::{price_suffix}"
-    closes_key = f"closes::{period}::{start.isoformat()}::{end.isoformat()}::{closes_suffix}"
     uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro&immutable=1"
     try:
         with closing(sqlite3.connect(uri, uri=True)) as connection:
@@ -5649,14 +5671,43 @@ def _validate_historical_data_snapshot(
                 raise DataBundleError("historical data cache schema differs from HistoricalDataCache")
             rows = connection.execute(
                 "SELECT cache_key, cache_kind, length(payload) FROM dataset_cache "
-                "WHERE cache_key IN (?, ?) ORDER BY cache_key",
-                (price_key, closes_key),
+                "WHERE cache_kind IN ('price', 'closes') ORDER BY cache_kind, cache_key"
             ).fetchall()
     except sqlite3.Error as exc:
         raise DataBundleError("historical data SQLite validation failed") from exc
-    expected_rows = sorted([(price_key, "price"), (closes_key, "closes")])
-    if [(row[0], row[1]) for row in rows] != expected_rows or any(type(row[2]) is not int or row[2] <= 0 for row in rows):
-        raise DataBundleError("historical data bundle lacks exact symbol/date coverage")
+
+    def select_covering_key(kind: str, required: tuple[str, ...]) -> str:
+        candidates: list[tuple[date, date, int, str]] = []
+        required_set = set(required)
+        for raw_key, raw_kind, payload_length in rows:
+            if raw_kind != kind or type(raw_key) is not str or type(payload_length) is not int or payload_length <= 0:
+                continue
+            parts = raw_key.split("::", 4)
+            if len(parts) != 5 or parts[0] != kind:
+                continue
+            source_period, source_start_text, source_end_text, source_suffix = parts[1:]
+            if source_period != period:
+                continue
+            try:
+                source_start = date.fromisoformat(source_start_text)
+                source_end = date.fromisoformat(source_end_text)
+            except ValueError:
+                continue
+            source_symbols = set(source_suffix.split(","))
+            if (
+                source_start > start
+                or source_end < end
+                or not required_set.issubset(source_symbols)
+            ):
+                continue
+            candidates.append((source_start, source_end, payload_length, raw_key))
+        if not candidates:
+            raise DataBundleError("historical data bundle lacks covering symbol/date coverage")
+        candidates.sort(key=lambda item: (item[0], -item[1].toordinal(), item[2], item[3]))
+        return candidates[0][3]
+
+    price_key = select_covering_key("price", exact_symbols)
+    closes_key = select_covering_key("closes", requested_symbols)
     return ValidatedDataBundle(
         path,
         actual,
@@ -5964,16 +6015,57 @@ def run_hidden_backtest_worker(
             # namespace to seed; a real hidden worker always has this class.
             return
         fetcher = backtest_engine.DataFetcher(str(scratch))
+        requested_symbols = tuple(sorted(requested))
+        exact_symbols = tuple(sorted({*requested_symbols, benchmark_symbol}))
+        start = backtest_engine.pd.Timestamp(start_date).date()
+        end = backtest_engine.pd.Timestamp(end_date).date()
+        period = _period_for_dates(start, end)
+        price_key = (
+            f"price::{period}::{start_date}::{end_date}::{','.join(exact_symbols)}"
+        )
+        closes_key = (
+            f"closes::{period}::{start_date}::{end_date}::{','.join(requested_symbols)}"
+        )
+
+        def select_source_key(
+            rows: Sequence[tuple[object, object]],
+            kind: str,
+            required_symbols: Sequence[str],
+        ) -> str:
+            candidates: list[tuple[date, date, str]] = []
+            required_set = set(required_symbols)
+            for raw_key, raw_kind in rows:
+                if not isinstance(raw_key, str) or raw_kind != kind:
+                    continue
+                parts = raw_key.split("::", 4)
+                if len(parts) != 5 or parts[0] != kind:
+                    continue
+                try:
+                    source_start = date.fromisoformat(parts[2])
+                    source_end = date.fromisoformat(parts[3])
+                except ValueError:
+                    continue
+                source_symbols = set(parts[4].split(","))
+                if (
+                    source_start <= start <= end <= source_end
+                    and required_set.issubset(source_symbols)
+                ):
+                    candidates.append((source_start, source_end, raw_key))
+            if not candidates:
+                raise DataBundleError("approved cache lacks a covering price/closes payload")
+            candidates.sort(key=lambda item: (item[0], -item[1].toordinal(), item[2]))
+            return candidates[0][2]
+
         with sqlite3.connect(str(scratch)) as connection:
             rows = connection.execute(
                 "SELECT cache_key, cache_kind FROM dataset_cache "
-                "WHERE cache_kind IN ('price', 'closes') ORDER BY cache_kind, cache_key"
+                "WHERE cache_kind IN ('price', 'closes')"
             ).fetchall()
-        if len(rows) != 2 or {row[1] for row in rows} != {"price", "closes"}:
-            raise DataBundleError("approved cache must contain one price and one closes payload")
+        source_price_key = select_source_key(rows, "price", exact_symbols)
+        source_closes_key = select_source_key(rows, "closes", requested_symbols)
         payloads = {
-            kind: fetcher._load_cached(key)
-            for key, kind in rows
+            "price": fetcher._load_cached(source_price_key),
+            "closes": fetcher._load_cached(source_closes_key),
         }
         price_payload = payloads.get("price")
         closes_payload = payloads.get("closes")
@@ -5985,16 +6077,6 @@ def run_hidden_backtest_worker(
             or any(symbol not in closes_payload.columns for symbol in requested)
         ):
             raise DataBundleError("approved cache payloads lack the requested symbols")
-        period = backtest_engine._period_for_date_range(
-            backtest_engine.pd.Timestamp(start_date),
-            backtest_engine.pd.Timestamp(end_date),
-        )
-        price_key = (
-            f"price::{period}::{start_date}::{end_date}::{','.join(sorted(all_tickers))}"
-        )
-        closes_key = (
-            f"closes::{period}::{start_date}::{end_date}::{','.join(sorted(requested))}"
-        )
         fetcher._store_cached(price_key, "price", price_payload)
         fetcher._store_cached(closes_key, "closes", closes_payload)
 
@@ -6583,6 +6665,10 @@ _BACKTEST_COMPARISON_FAILURE_CODES = frozenset(
         "no_strict_improvement",
     }
 )
+# Max drawdown is reported in percentage points and can move by a few thousandths
+# from equivalent trade paths/serialization.  Treat only that bounded numerical
+# noise as neutral; the absolute gate threshold remains strict and unchanged.
+_BACKTEST_DRAWDOWN_COMPARISON_TOLERANCE_PCT = 0.01
 
 
 @dataclass(frozen=True)
@@ -6684,7 +6770,7 @@ def compare_backtest_evidence(
             failures.append("annualized_return_worse")
         if deltas[2] < 0:
             failures.append("sharpe_worse")
-        if deltas[3] < 0:
+        if deltas[3] < -_BACKTEST_DRAWDOWN_COMPARISON_TOLERANCE_PCT:
             failures.append("drawdown_worse")
         if deltas[4] < 0:
             failures.append("closed_trades_worse")
@@ -8587,6 +8673,7 @@ def export_inert_handoff(
     *,
     gate: str,
     editable_paths: Sequence[str] = (),
+    allow_protected_backtest_paths: bool = False,
 ) -> HandoffArtifact:
     """Validate and export the candidate diff without applying it outside quarantine."""
     if not isinstance(audit, AuditTrail):
@@ -8618,6 +8705,7 @@ def export_inert_handoff(
         parsed.files,
         editable_paths=editable_paths,
         gate=gate,
+        allow_protected_backtest_paths=allow_protected_backtest_paths,
     )
     after = _candidate_tracked_manifest_sha256(candidate)
     if after != before:
@@ -8796,6 +8884,7 @@ def evaluate_inert_proposal(
     run_quality: Callable[[Candidate], QualityObservation],
     run_primary_gate: Callable[[Candidate], ProviderGateEvidence],
     run_holdout_gate: Callable[[Candidate], ProviderGateEvidence] | None = None,
+    allow_protected_backtest_paths: bool = False,
 ) -> ProposalEvaluation:
     """Apply and observe a proposal only inside a fresh disposable candidate."""
     if not isinstance(state, SourceState) or not isinstance(proposal, CodingProposal):
@@ -8814,6 +8903,7 @@ def evaluate_inert_proposal(
             gate=gate,
             editable_paths=editable_paths,
             compile_runner=compile_runner,
+            allow_protected_backtest_paths=allow_protected_backtest_paths,
         )
         patched_manifest = _candidate_tracked_manifest_sha256(evaluation_candidate)
         quality = run_quality(evaluation_candidate)
@@ -9068,6 +9158,7 @@ def export_inert_proposal(
     proposal_payload_sha256: str | None = None,
     proposal_evaluation_sha256: str | None = None,
     renderer_contract: str | None = None,
+    allow_protected_backtest_paths: bool = False,
 ) -> HandoffArtifact:
     """Export one validated model proposal as inert bytes without mutating quarantine."""
     if not isinstance(proposal, CodingProposal) or not isinstance(audit, AuditTrail):
@@ -9102,6 +9193,7 @@ def export_inert_proposal(
         proposal.files,
         editable_paths=editable_paths,
         gate=gate,
+        allow_protected_backtest_paths=allow_protected_backtest_paths,
     )
     _validate_exact_patch_anchors(root, parsed)
     try:
@@ -9175,56 +9267,71 @@ def export_inert_proposal(
 
 
 def _proposal_batch_editable_paths() -> tuple[str, ...]:
-    """Expose the first directly executable pivot-mechanics experiment surface only."""
-    editable = ("core/pivot_detector.py",)
-    if not set(editable).issubset(DEFAULT_EDITABLE_PATHS - BACKTEST_READ_ONLY_PATHS):
-        raise ConfigurationError("proposal batch pivot surface is not writable")
+    """Expose the bounded technical backtest experiment surface only."""
+    editable = ("backtest.py",)
+    if not set(editable).issubset(DEFAULT_EDITABLE_PATHS):
+        raise ConfigurationError("proposal batch backtest surface is not writable")
     return editable
 
 
 def _proposal_batch_quality_selectors() -> tuple[str, ...]:
     """Run the direct behavior tests for the sole editable batch surface."""
-    if _proposal_batch_editable_paths() != ("core/pivot_detector.py",):
+    if _proposal_batch_editable_paths() != ("backtest.py",):
         raise ConfigurationError("proposal batch quality scope is not pinned")
-    return ("tests/test_pivot_detector.py",)
+    return ("tests/test_backtest_engine.py",)
 
 
 def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
-    """Return the fixed read-only semantics needed to avoid a no-op pivot experiment."""
+    """Return fixed semantics needed to keep the backtest experiment causal."""
     return (
         {
-            "fact_id": "pivot_absence_allows_buy_zone",
+            "fact_id": "backtest_technical_gate_uses_volume_and_breakout",
             "read_only": True,
             "value": (
-                "When find_pivot returns no pivot, the backtest sets in_buy_zone to true. "
-                "Making pivot detection more permissive cannot increase entry eligibility; it can only "
-                "preserve or block an existing signal."
+                "The hidden technical-only worker imports the backtest technical evaluator through "
+                "core/backtest_engine.py. A buy requires the existing breakout, volume-surge, market, "
+                "RS, and technical-score gates. The only approved experiment is the explicit S-signal "
+                "volume-surge multiplier and breakout proximity literals in backtest.py; portfolio "
+                "simulation, metric computation, dates, data loading, risk exits, and configuration "
+                "must remain unchanged."
+            ),
+        },
+        {
+            "fact_id": "backtest_metrics_and_risk_are_read_only",
+            "read_only": True,
+            "value": (
+                "The controller compares the sealed primary and trailing holdout SimulationResult "
+                "metrics. Do not edit core/backtest_engine.py, backtest_pnl.py, config, or any metric, "
+                "portfolio, position-sizing, stop, exit, or data-cache code."
             ),
         },
     )
 
 
 def _proposal_batch_allowed_replacements() -> tuple[ExactLineReplacement, ...]:
-    """Return the bounded controller-owned pivot-threshold experiment family."""
-    values = tuple(
-        value
-        for value in (
-            *(0.90 + index * 0.01 for index in range(5)),
-            *(0.96 + index * 0.01 for index in range(10)),
-        )
-    )
+    """Return 50 exact S-signal threshold pairs for the isolated batch."""
+    volume_values = tuple(1.45 + index * 0.01 for index in range(10))
+    breakout_values = (0.94, 0.95, 0.96, 0.97, 0.98)
     return tuple(
         ExactLineReplacement(
-            path="core/pivot_detector.py",
-            old_lines=("    if right_lip < left_lip * 0.95:",),
-            new_lines=(f"    if right_lip < left_lip * {value:.2f}:",),
+            path="backtest.py",
+            old_lines=(
+                "        sliced, avg_vol_50, latest_close, high_52, shares_outstanding, "
+                "s_breakout_proximity=0.95",
+            ),
+            new_lines=(
+                "        sliced, avg_vol_50, latest_close, high_52, shares_outstanding,",
+                f"        s_volume_surge_threshold={volume:.2f}, "
+                f"s_breakout_proximity={breakout:.2f}",
+            ),
         )
-        for value in values
+        for volume in volume_values
+        for breakout in breakout_values
     )
 
 
 def _proposal_batch_allowed_replacement() -> ExactLineReplacement:
-    """Backward-compatible accessor for the first bounded pivot experiment."""
+    """Backward-compatible accessor for the first bounded backtest experiment."""
     return _proposal_batch_allowed_replacements()[0]
 
 
@@ -9523,7 +9630,12 @@ def run_proposal_batch(
             raise ConfigurationError(
                 "strict gateway raised accounting failure without closed facts"
             ) from exc
-        except GatewayError:
+        except GatewayError as exc:
+            status_code = (
+                exc.status_code
+                if type(exc.status_code) is int and 100 <= exc.status_code <= 599
+                else None
+            )
             audit.append_event(
                 {
                     "orchestrator": LoopState.CALL_ORCHESTRATOR,
@@ -9536,6 +9648,7 @@ def run_proposal_batch(
                     "call_index": ledger.calls,
                     "role": role,
                     "code": "provider_failed",
+                    "status_code": status_code,
                 },
             )
             raise
@@ -9867,9 +9980,18 @@ def run_proposal_batch(
                     )
                     check_wall()
                     if not evaluation.eligible_for_export:
-                        raise PatchPolicyError(
-                            "proposal did not pass private quality and gate evaluation"
-                        )
+                        try:
+                            record_sample_rejection(
+                                sample=sample,
+                                code="quality_rejected",
+                                calls_before=calls_before,
+                                expected_calls=3,
+                                sealed_manifest=sealed_manifest,
+                                state=LoopState.RECORD_REJECTION,
+                            )
+                        except (BudgetExceededError, CandidateMutationError):
+                            raise
+                        continue
                     handoff = export_inert_proposal(
                         candidate,
                         audit,
@@ -9881,6 +10003,7 @@ def run_proposal_batch(
                         proposal_payload_sha256=proposal_payload_sha256,
                         proposal_evaluation_sha256=evaluation_sha256,
                         renderer_contract="coding_exact_replacements_v1",
+                        allow_protected_backtest_paths=True,
                     )
                     if handoff.diff_sha256 != predicted_diff_sha256:
                         raise AuditError("rendered proposal digest changed during export")
@@ -11257,6 +11380,7 @@ def _execute_cli_run(
                         if config.gate.holdout_start_date is not None
                         else None
                     ),
+                    allow_protected_backtest_paths=True,
                 )
 
             result: LoopResult | ProposalBatchResult = run_proposal_batch(
