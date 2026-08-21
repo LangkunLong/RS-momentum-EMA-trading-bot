@@ -1862,7 +1862,10 @@ class OpenRouterGateway:
             "coder": (
                 "You are the Coder. Return exactly one JSON object with exactly these keys: "
                 '"summary", "replacements". replacements must be a nonempty JSON array of objects '
-                "with exactly these keys: path, old_lines, and new_lines. path must be an approved plan and "
+                "Keep the response compact (target well below 1000 tokens): emit the JSON object only, "
+                "without analysis, explanations, source restatements, or Markdown. "
+                "Each replacement object must have exactly these keys: path, old_lines, and new_lines. "
+                "path must be an approved plan and "
                 "source-snapshot path. Each sanitized_text line begins with an exact numbered source annotation "
                 "'N: '; omit that annotation from old_lines and new_lines. The controller resolves an edit only "
                 "when old_lines have one exact match in the immutable visible source at the original snapshot "
@@ -1910,7 +1913,7 @@ class OpenRouterGateway:
             "coder": CODER_MODEL,
         }
     )
-    _TOKEN_CAPS = MappingProxyType({"orchestrator": 2048, "reasoner": 4096, "coder": 4096})
+    _TOKEN_CAPS = MappingProxyType({"orchestrator": 2048, "reasoner": 4096, "coder": 8192})
     _RESPONSE_SCHEMA_NAMES = MappingProxyType(
         {
             "orchestrator": "agent_loop_orchestrator_v1",
