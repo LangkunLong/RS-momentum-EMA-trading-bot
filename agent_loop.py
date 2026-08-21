@@ -5627,11 +5627,7 @@ def _validate_historical_data_snapshot(
         raise DataBundleError("backtest date range must increase")
     requested_symbols = tuple(sorted(requested))
     exact_symbols = tuple(sorted({*requested_symbols, benchmark_symbol}))
-    price_suffix = ",".join(exact_symbols)
-    closes_suffix = ",".join(requested_symbols)
     period = _period_for_dates(start, end)
-    price_key = f"price::{period}::{start.isoformat()}::{end.isoformat()}::{price_suffix}"
-    closes_key = f"closes::{period}::{start.isoformat()}::{end.isoformat()}::{closes_suffix}"
     uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro&immutable=1"
     try:
         with closing(sqlite3.connect(uri, uri=True)) as connection:
@@ -5653,14 +5649,43 @@ def _validate_historical_data_snapshot(
                 raise DataBundleError("historical data cache schema differs from HistoricalDataCache")
             rows = connection.execute(
                 "SELECT cache_key, cache_kind, length(payload) FROM dataset_cache "
-                "WHERE cache_key IN (?, ?) ORDER BY cache_key",
-                (price_key, closes_key),
+                "WHERE cache_kind IN ('price', 'closes') ORDER BY cache_kind, cache_key"
             ).fetchall()
     except sqlite3.Error as exc:
         raise DataBundleError("historical data SQLite validation failed") from exc
-    expected_rows = sorted([(price_key, "price"), (closes_key, "closes")])
-    if [(row[0], row[1]) for row in rows] != expected_rows or any(type(row[2]) is not int or row[2] <= 0 for row in rows):
-        raise DataBundleError("historical data bundle lacks exact symbol/date coverage")
+
+    def select_covering_key(kind: str, required: tuple[str, ...]) -> str:
+        candidates: list[tuple[date, date, int, str]] = []
+        required_set = set(required)
+        for raw_key, raw_kind, payload_length in rows:
+            if raw_kind != kind or type(raw_key) is not str or type(payload_length) is not int or payload_length <= 0:
+                continue
+            parts = raw_key.split("::", 4)
+            if len(parts) != 5 or parts[0] != kind:
+                continue
+            source_period, source_start_text, source_end_text, source_suffix = parts[1:]
+            if source_period != period:
+                continue
+            try:
+                source_start = date.fromisoformat(source_start_text)
+                source_end = date.fromisoformat(source_end_text)
+            except ValueError:
+                continue
+            source_symbols = set(source_suffix.split(","))
+            if (
+                source_start > start
+                or source_end < end
+                or not required_set.issubset(source_symbols)
+            ):
+                continue
+            candidates.append((source_start, source_end, payload_length, raw_key))
+        if not candidates:
+            raise DataBundleError("historical data bundle lacks covering symbol/date coverage")
+        candidates.sort(key=lambda item: (item[0], -item[1].toordinal(), item[2], item[3]))
+        return candidates[0][3]
+
+    price_key = select_covering_key("price", exact_symbols)
+    closes_key = select_covering_key("closes", requested_symbols)
     return ValidatedDataBundle(
         path,
         actual,
@@ -5983,21 +6008,26 @@ def run_hidden_backtest_worker(
         def select_source_key(
             rows: Sequence[tuple[object, object]],
             kind: str,
-            suffix: str,
+            required_symbols: Sequence[str],
         ) -> str:
             candidates: list[tuple[date, date, str]] = []
+            required_set = set(required_symbols)
             for raw_key, raw_kind in rows:
                 if not isinstance(raw_key, str) or raw_kind != kind:
                     continue
                 parts = raw_key.split("::", 4)
-                if len(parts) != 5 or parts[0] != kind or parts[4] != suffix:
+                if len(parts) != 5 or parts[0] != kind:
                     continue
                 try:
                     source_start = date.fromisoformat(parts[2])
                     source_end = date.fromisoformat(parts[3])
                 except ValueError:
                     continue
-                if source_start <= start <= end <= source_end:
+                source_symbols = set(parts[4].split(","))
+                if (
+                    source_start <= start <= end <= source_end
+                    and required_set.issubset(source_symbols)
+                ):
                     candidates.append((source_start, source_end, raw_key))
             if not candidates:
                 raise DataBundleError("approved cache lacks a covering price/closes payload")
@@ -6009,8 +6039,8 @@ def run_hidden_backtest_worker(
                 "SELECT cache_key, cache_kind FROM dataset_cache "
                 "WHERE cache_kind IN ('price', 'closes')"
             ).fetchall()
-        source_price_key = select_source_key(rows, "price", ",".join(exact_symbols))
-        source_closes_key = select_source_key(rows, "closes", ",".join(requested_symbols))
+        source_price_key = select_source_key(rows, "price", exact_symbols)
+        source_closes_key = select_source_key(rows, "closes", requested_symbols)
         payloads = {
             "price": fetcher._load_cached(source_price_key),
             "closes": fetcher._load_cached(source_closes_key),
@@ -9225,14 +9255,14 @@ def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
         {
             "fact_id": "pivot_absence_allows_buy_zone",
             "read_only": True,
-                "value": (
-                    "When find_pivot returns no pivot, the backtest sets in_buy_zone to true. "
+            "value": (
+                "When find_pivot returns no pivot, the backtest sets in_buy_zone to true. "
                 "Making pivot detection more permissive cannot increase entry eligibility; it can only "
                 "preserve or block an existing signal. When the observed bottleneck is too few closed "
                 "trades, a lower right_lip threshold is therefore directionally incapable of improving "
                 "the bottleneck; only the supplied higher-threshold replacements are directionally valid "
                 "experiments for that symptom."
-                ),
+            ),
         },
     )
 
