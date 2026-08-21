@@ -459,7 +459,11 @@ def _make_full_sim(
     """Build a simulator with pre-loaded open positions and matching OHLCV data.
     positions: {symbol: (entry_price, rs_score, current_close)}
     """
-    sim = PortfolioSimulator(initial_capital=capital, stagnation_days=999)
+    sim = PortfolioSimulator(
+        initial_capital=capital,
+        max_positions=5,
+        stagnation_days=999,
+    )
     ohlcv_map: dict = {}
     for sym, (entry_px, rs, close_px) in positions.items():
         trade = Trade(
