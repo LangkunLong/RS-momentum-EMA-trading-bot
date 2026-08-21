@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -39,8 +39,8 @@ from typing import Any, BinaryIO, Callable, Generic, Mapping, Protocol, Sequence
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
-REASONER_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
-CODER_MODEL = "deepseek/deepseek-chat"
+REASONER_MODEL = "deepseek/deepseek-r1"
+CODER_MODEL = "qwen/qwen3-coder-next"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
 DEFAULT_MAX_TOKENS = 131_072
@@ -57,7 +57,7 @@ _MAX_DIFF_BYTES = 256 * 1024
 _MAX_DATA_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
 _CONTAINER_SHM_SIZE_BYTES = 64 * 1024 * 1024
 _MAX_GENERATION_ACCOUNTING_BYTES = 64 * 1024
-_MAX_PROVIDER_EVIDENCE_BYTES = 2 * 1024
+_MAX_PROVIDER_EVIDENCE_BYTES = 8 * 1024
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529})
 _GENERATION_ACCOUNTING_RETRYABLE_STATUS_CODES = frozenset(
     {404, 408, 429, 500, 502, 503, 504, 524, 529}
@@ -483,6 +483,16 @@ class InsufficientEvidenceError(RuntimeError):
 
 class CanaryRejectedError(RuntimeError):
     """The first proposal sample did not produce one validated inert handoff."""
+
+
+class ProposalSampleRejectedError(RuntimeError):
+    """One proposal sample failed a closed policy/evidence gate; stop the batch."""
+
+    def __init__(self, code: str) -> None:
+        if not isinstance(code, str) or re.fullmatch(r"[a-z][a-z0-9_]{2,63}", code) is None:
+            raise ConfigurationError("proposal sample rejection code is invalid")
+        super().__init__(code)
+        self.code = code
 
 
 class DataBundleError(ValueError):
@@ -1806,7 +1816,8 @@ class OpenRouterGateway:
                 '"invariants", "files_to_change", "steps", "skip", "skip_reason". '
                 "source_evidence objects require exactly path; path must be a provided source snapshot and "
                 "identifies the approved file supporting the diagnosis. Do not reproduce source lines or "
-                "source coordinates: the controller owns exact source anchoring. "
+                "source coordinates: the controller owns exact source anchoring. The read_only_"
+                "configuration_facts exactly once is mandatory: treat that object as immutable controller evidence. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
                 "editable_source_paths and source_snapshots. When a read_only_configuration_facts value informs "
                 "your diagnosis, cite its fact_id in configuration_fact_ids; cite only listed fact_id values. "
@@ -1819,9 +1830,9 @@ class OpenRouterGateway:
                 "When read_only_execution_facts is supplied, treat it as controller-owned behavioral evidence: "
                 "use it to rule out edits that cannot affect the observed execution path, and never treat it "
                 "as editable source or configuration. "
-                "When controller_owned_allowed_replacement is supplied, it is the sole controller-approved "
-                "bounded experiment for this batch: for a non-skip plan, use its path and mechanism exactly and "
-                "do not propose an alternative source change. "
+                "When controller_owned_allowed_replacement or controller_owned_allowed_replacements is supplied, "
+                "those are the sole controller-approved bounded experiments for this batch: for a non-skip plan, "
+                "use exactly one supplied path and mechanism and do not propose an alternative source change. "
                 "diagnosis must "
                 "state only observed gate facts; "
                 "causal_hypothesis is explicitly unproven and falsifiable. Use JSON arrays for "
@@ -1850,7 +1861,8 @@ class OpenRouterGateway:
                 "with exactly these keys: path, old_lines, and new_lines. path must be an approved plan and "
                 "source-snapshot path. Each sanitized_text line begins with an exact numbered source annotation "
                 "'N: '; omit that annotation from old_lines and new_lines. The controller resolves an edit only "
-                "when old_lines have one exact match in the immutable visible source. old_lines and new_lines "
+                "when old_lines have one exact match in the immutable visible source at the original snapshot "
+                "coordinate. old_lines and new_lines "
                 "must be nonempty JSON "
                 "arrays of source-line strings without newline characters; omit the annotation prefix. "
                 "Return exactly one replacement. It must be a direct executable logic edit within a "
@@ -1867,9 +1879,12 @@ class OpenRouterGateway:
                 "replacement. "
                 "Treat any read_only_execution_facts as immutable behavioral constraints; do not propose an edit "
                 "whose stated mechanism they rule out. "
-                "When controller_owned_allowed_replacement is supplied, return exactly its one path, old_lines, "
-                "and new_lines; do not change comments, docs, imports, configuration, fallback behavior, tests, "
-                "or any other line. "
+                "When controller_owned_allowed_replacement is supplied, return exactly its path, old_lines, and "
+                "new_lines. When controller_owned_allowed_replacements is supplied, return exactly one member "
+                "of that list. Do not change comments, docs, imports, configuration, fallback behavior, tests, or "
+                "any other line. "
+                "never add or subtract earlier replacement deltas while rendering a replacement; the controller "
+                "owns all hunk arithmetic and source coordinates. "
                 "Order multiple replacements by path; use no duplicate, overlapping, or adjacent source ranges "
                 "and merge adjacent changes into one replacement. Use the sealed gate "
                 "evidence to verify the plan's numeric premise. When "
@@ -5829,11 +5844,17 @@ def run_backtest_gate(
         for value in dict.fromkeys(_validate_symbol(value) for value in tickers)
         if value != benchmark_symbol
     )
+    try:
+        requested_start = date.fromisoformat(start_date)
+        requested_end = date.fromisoformat(end_date)
+        bundle_start = date.fromisoformat(bundle.start_date)
+        bundle_end = date.fromisoformat(bundle.end_date)
+    except (TypeError, ValueError) as exc:
+        raise GateConfigurationError("backtest dates are not canonical") from exc
     if (
         tuple(sorted({*requested, benchmark_symbol})) != bundle.symbols
         or benchmark_symbol != bundle.benchmark
-        or start_date != bundle.start_date
-        or end_date != bundle.end_date
+        or not (bundle_start <= requested_start < requested_end <= bundle_end)
     ):
         raise GateConfigurationError("backtest invocation differs from the validated data approval")
 
@@ -5929,6 +5950,55 @@ def run_hidden_backtest_worker(
     settings.EXTRA_SYMBOLS = []
     settings.BACKTEST_DATA_CACHE_DB_PATH = str(scratch)
     from core import backtest_engine
+
+    def seed_requested_window_cache() -> None:
+        """Alias the approved full-range payloads to the requested evaluation window.
+
+        The sealed bundle is intentionally validated without deserializing its pickle
+        payloads.  The hidden worker may deserialize only after the SHA-256-verified
+        copy is private and writable.  This keeps trailing holdout runs offline while
+        preserving the lookback bars present in the approved payload.
+        """
+        if not hasattr(backtest_engine, "DataFetcher"):
+            # Test doubles that do not execute the real engine have no cache
+            # namespace to seed; a real hidden worker always has this class.
+            return
+        fetcher = backtest_engine.DataFetcher(str(scratch))
+        with sqlite3.connect(str(scratch)) as connection:
+            rows = connection.execute(
+                "SELECT cache_key, cache_kind FROM dataset_cache "
+                "WHERE cache_kind IN ('price', 'closes') ORDER BY cache_kind, cache_key"
+            ).fetchall()
+        if len(rows) != 2 or {row[1] for row in rows} != {"price", "closes"}:
+            raise DataBundleError("approved cache must contain one price and one closes payload")
+        payloads = {
+            kind: fetcher._load_cached(key)
+            for key, kind in rows
+        }
+        price_payload = payloads.get("price")
+        closes_payload = payloads.get("closes")
+        all_tickers = tuple(dict.fromkeys((*requested, benchmark_symbol)))
+        if (
+            not isinstance(price_payload, dict)
+            or any(symbol not in price_payload for symbol in all_tickers)
+            or not hasattr(closes_payload, "columns")
+            or any(symbol not in closes_payload.columns for symbol in requested)
+        ):
+            raise DataBundleError("approved cache payloads lack the requested symbols")
+        period = backtest_engine._period_for_date_range(
+            backtest_engine.pd.Timestamp(start_date),
+            backtest_engine.pd.Timestamp(end_date),
+        )
+        price_key = (
+            f"price::{period}::{start_date}::{end_date}::{','.join(sorted(all_tickers))}"
+        )
+        closes_key = (
+            f"closes::{period}::{start_date}::{end_date}::{','.join(sorted(requested))}"
+        )
+        fetcher._store_cached(price_key, "price", price_payload)
+        fetcher._store_cached(closes_key, "closes", closes_payload)
+
+    seed_requested_window_cache()
 
     def cache_miss(*_args: object, **_kwargs: object) -> object:
         raise GateConfigurationError("approved historical cache miss; provider access is forbidden")
@@ -6092,9 +6162,13 @@ class ModelConfig:
     coder: str = CODER_MODEL
 
     def __post_init__(self) -> None:
-        for value in (self.orchestrator, self.reasoner, self.coder):
+        values = (self.orchestrator, self.reasoner, self.coder)
+        expected = (ORCHESTRATOR_MODEL, REASONER_MODEL, CODER_MODEL)
+        for value, fixed in zip(values, expected, strict=True):
             if not isinstance(value, str) or _MODEL_SLUG_RE.fullmatch(value) is None:
                 raise ConfigurationError("model slug must be provider/model")
+            if value != fixed:
+                raise ConfigurationError("role model is fixed; alternate model fallbacks are disabled")
 
 
 @dataclass(frozen=True)
@@ -6186,6 +6260,8 @@ class BacktestGateConfig:
     historical_data_bundle: Path
     historical_data_sha256: str
     thresholds: BacktestThresholds
+    holdout_start_date: str | None = None
+    holdout_end_date: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.tickers, tuple):
@@ -6205,6 +6281,18 @@ class BacktestGateConfig:
             raise ConfigurationError("backtest dates must be ISO calendar dates") from exc
         if start >= end:
             raise ConfigurationError("backtest date range must have start before end")
+        if (self.holdout_start_date is None) != (self.holdout_end_date is None):
+            raise ConfigurationError("holdout dates must be supplied together")
+        if self.holdout_start_date is not None and self.holdout_end_date is not None:
+            try:
+                holdout_start = date.fromisoformat(self.holdout_start_date)
+                holdout_end = date.fromisoformat(self.holdout_end_date)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError("holdout dates must be ISO calendar dates") from exc
+            if not (start < holdout_start < holdout_end == end):
+                raise ConfigurationError(
+                    "holdout must be a nonempty trailing window inside the approved range"
+                )
         bundle = _absolute_configuration_path(
             self.historical_data_bundle, "historical_data_bundle"
         )
@@ -6479,6 +6567,138 @@ class ProviderGateEvidence:
             raise ConfigurationError(
                 "successful gate observation requires exit zero and a confined worker"
             )
+
+
+_BACKTEST_COMPARISON_FAILURE_CODES = frozenset(
+    {
+        "baseline_unsafe",
+        "candidate_unsafe",
+        "comparison_identity_mismatch",
+        "thresholds_not_met",
+        "total_return_worse",
+        "annualized_return_worse",
+        "sharpe_worse",
+        "drawdown_worse",
+        "closed_trades_worse",
+        "no_strict_improvement",
+    }
+)
+
+
+@dataclass(frozen=True)
+class BacktestComparison:
+    """Provider-safe deltas proving a candidate is not worse than its sealed baseline."""
+
+    total_return_delta: float
+    annualized_return_delta: float
+    sharpe_delta: float
+    drawdown_headroom_delta: float
+    closed_trades_delta: int
+    failure_codes: tuple[str, ...]
+    accepted: bool
+    provider_safe: bool = True
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("total_return_delta", self.total_return_delta),
+            ("annualized_return_delta", self.annualized_return_delta),
+            ("sharpe_delta", self.sharpe_delta),
+            ("drawdown_headroom_delta", self.drawdown_headroom_delta),
+        ):
+            if type(value) not in {int, float} or not math.isfinite(value):
+                raise ConfigurationError(f"backtest comparison {name} is invalid")
+            if abs(float(value)) > _BACKTEST_DIAGNOSTIC_MARGIN_LIMIT:
+                raise ConfigurationError(f"backtest comparison {name} is unbounded")
+        if type(self.closed_trades_delta) is not int or abs(self.closed_trades_delta) > 1_000_000:
+            raise ConfigurationError("backtest comparison trade delta is invalid")
+        if (
+            not isinstance(self.failure_codes, tuple)
+            or len(self.failure_codes) > 16
+            or len(set(self.failure_codes)) != len(self.failure_codes)
+            or any(code not in _BACKTEST_COMPARISON_FAILURE_CODES for code in self.failure_codes)
+        ):
+            raise ConfigurationError("backtest comparison failure codes are invalid")
+        if type(self.accepted) is not bool or self.provider_safe is not True:
+            raise ConfigurationError("backtest comparison flags are invalid")
+        expected = not self.failure_codes
+        if self.accepted is not expected:
+            raise ConfigurationError("backtest comparison acceptance is inconsistent")
+
+
+def compare_backtest_evidence(
+    baseline: ProviderGateEvidence,
+    candidate: ProviderGateEvidence,
+) -> BacktestComparison:
+    """Compare one private candidate to the exact sealed baseline, fail closed on ambiguity."""
+    if not isinstance(baseline, ProviderGateEvidence) or not isinstance(
+        candidate, ProviderGateEvidence
+    ):
+        raise ConfigurationError("backtest comparison requires provider gate evidence")
+    baseline_diag = baseline.backtest_diagnostics
+    candidate_diag = candidate.backtest_diagnostics
+    zero = (0.0, 0.0, 0.0, 0.0, 0)
+    failures: list[str] = []
+    if (
+        baseline.gate_kind != "backtest"
+        or not baseline.observed_exit_zero
+        or not baseline.worker_confined
+        or baseline.returncode != 0
+        or baseline_diag is None
+    ):
+        failures.append("baseline_unsafe")
+    if (
+        candidate.gate_kind != "backtest"
+        or not candidate.observed_exit_zero
+        or not candidate.worker_confined
+        or candidate.returncode != 0
+        or candidate_diag is None
+    ):
+        failures.append("candidate_unsafe")
+    if candidate.outcome != "thresholds_met" or not candidate.gate_observation:
+        failures.append("thresholds_not_met")
+    if baseline_diag is None or candidate_diag is None:
+        deltas = zero
+    else:
+        identities = (
+            baseline_diag.ticker_count == candidate_diag.ticker_count,
+            baseline_diag.calendar_days == candidate_diag.calendar_days,
+            baseline_diag.minimum_total_return == candidate_diag.minimum_total_return,
+            baseline_diag.minimum_annualized_return == candidate_diag.minimum_annualized_return,
+            baseline_diag.minimum_sharpe_ratio == candidate_diag.minimum_sharpe_ratio,
+            baseline_diag.maximum_drawdown_magnitude
+            == candidate_diag.maximum_drawdown_magnitude,
+            baseline_diag.minimum_closed_trades == candidate_diag.minimum_closed_trades,
+        )
+        if not all(identities):
+            failures.append("comparison_identity_mismatch")
+        deltas = (
+            candidate_diag.total_return_pct - baseline_diag.total_return_pct,
+            candidate_diag.annualized_return_pct - baseline_diag.annualized_return_pct,
+            candidate_diag.sharpe_ratio - baseline_diag.sharpe_ratio,
+            candidate_diag.drawdown_headroom - baseline_diag.drawdown_headroom,
+            candidate_diag.closed_trades - baseline_diag.closed_trades,
+        )
+        if deltas[0] < 0:
+            failures.append("total_return_worse")
+        if deltas[1] < 0:
+            failures.append("annualized_return_worse")
+        if deltas[2] < 0:
+            failures.append("sharpe_worse")
+        if deltas[3] < 0:
+            failures.append("drawdown_worse")
+        if deltas[4] < 0:
+            failures.append("closed_trades_worse")
+        if not any(delta > 0 for delta in deltas):
+            failures.append("no_strict_improvement")
+    return BacktestComparison(
+        total_return_delta=float(deltas[0]),
+        annualized_return_delta=float(deltas[1]),
+        sharpe_delta=float(deltas[2]),
+        drawdown_headroom_delta=float(deltas[3]),
+        closed_trades_delta=int(deltas[4]),
+        failure_codes=tuple(dict.fromkeys(failures)),
+        accepted=not failures,
+    )
 
 
 @dataclass(frozen=True)
@@ -7620,8 +7840,11 @@ def _validate_reasoning_plan_grounding(
         {evidence.path for evidence in plan.source_evidence}
     ):
         raise PatchPolicyError("reasoning evidence must anchor every changed file")
-    if not set(plan.configuration_fact_ids).issubset(set(available_fact_ids)):
-        raise PatchPolicyError("reasoning plan cited unsupplied configuration facts")
+    cited_fact_ids = set(plan.configuration_fact_ids)
+    if cited_fact_ids != set(available_fact_ids):
+        if not cited_fact_ids.issubset(set(available_fact_ids)):
+            raise PatchPolicyError("reasoning plan cited unsupplied configuration facts")
+        raise PatchPolicyError("reasoning plan omitted supplied configuration facts")
 
 
 def _validate_configuration_preservation(
@@ -8031,7 +8254,7 @@ class AuditTrail:
         return path, digest
 
     def write_provider_evidence(
-        self, evidence: ProviderGateEvidence
+        self, evidence: ProviderGateEvidence, *, name: str = "provider-evidence"
     ) -> tuple[Path, str]:
         """Persist the exact closed facts disclosed to model roles for this run."""
         if not isinstance(evidence, ProviderGateEvidence) or evidence.provider_safe is not True:
@@ -8039,7 +8262,9 @@ class AuditTrail:
         payload = asdict(evidence)
         if len(_canonical_json_bytes(payload)) > _MAX_PROVIDER_EVIDENCE_BYTES:
             raise AuditError("provider evidence exceeds the closed byte limit")
-        path = self._write_json(self.run_root / "provider-evidence.json", payload)
+        if _AUDIT_NAME_RE.fullmatch(name) is None:
+            raise AuditError("provider evidence artifact name is invalid")
+        path = self._write_json(self.run_root / f"{name}.json", payload)
         return path, _file_sha256(path)
 
     def write_proposal_evaluation(
@@ -8513,6 +8738,9 @@ class ProposalEvaluation:
     candidate_manifest_sha256: str
     cleanup_complete: bool
     source_modified: bool
+    comparison: BacktestComparison | None = None
+    holdout_gate: ProviderGateEvidence | None = None
+    holdout_comparison: BacktestComparison | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.quality, QualityObservation):
@@ -8525,15 +8753,36 @@ class ProposalEvaluation:
             raise ConfigurationError("proposal evaluation cleanup facts are invalid")
         if not self.cleanup_complete or self.source_modified:
             raise ConfigurationError("proposal evaluation must close without source mutation")
+        if self.comparison is not None and not isinstance(self.comparison, BacktestComparison):
+            raise ConfigurationError("proposal evaluation comparison is invalid")
+        if self.holdout_gate is not None and not isinstance(
+            self.holdout_gate, ProviderGateEvidence
+        ):
+            raise ConfigurationError("proposal evaluation holdout gate is invalid")
+        if self.holdout_comparison is not None and not isinstance(
+            self.holdout_comparison, BacktestComparison
+        ):
+            raise ConfigurationError("proposal evaluation holdout comparison is invalid")
+        if self.holdout_comparison is not None and self.holdout_gate is None:
+            raise ConfigurationError("holdout comparison requires holdout gate evidence")
 
     @property
     def eligible_for_export(self) -> bool:
-        """Require quality plus a confined, exit-zero private gate observation."""
-        return (
+        """Require quality, confinement, and a non-worsening backtest comparison."""
+        if not (
             self.quality.passed
             and self.gate.observed_exit_zero
             and self.gate.worker_confined
             and self.gate.returncode == 0
+        ):
+            return False
+        if self.gate.gate_kind == "backtest":
+            if self.comparison is None or not self.comparison.accepted:
+                return False
+        elif self.gate.gate_kind not in _PROVIDER_GATE_KINDS:
+            return False
+        return self.holdout_gate is None or (
+            self.holdout_comparison is not None and self.holdout_comparison.accepted
         )
 
 
@@ -8546,12 +8795,15 @@ def evaluate_inert_proposal(
     compile_runner: Callable[[WorkerLayout, tuple[str, ...]], bool],
     run_quality: Callable[[Candidate], QualityObservation],
     run_primary_gate: Callable[[Candidate], ProviderGateEvidence],
+    run_holdout_gate: Callable[[Candidate], ProviderGateEvidence] | None = None,
 ) -> ProposalEvaluation:
     """Apply and observe a proposal only inside a fresh disposable candidate."""
     if not isinstance(state, SourceState) or not isinstance(proposal, CodingProposal):
         raise ConfigurationError("private proposal evaluation inputs are invalid")
     if not all(callable(value) for value in (compile_runner, run_quality, run_primary_gate)):
         raise ConfigurationError("private proposal evaluation services must be callable")
+    if run_holdout_gate is not None and not callable(run_holdout_gate):
+        raise ConfigurationError("private holdout gate service must be callable")
     if recheck_source_unchanged(state).source_modified:
         raise CandidateMutationError("source changed before private proposal evaluation")
     evaluation_candidate = export_candidate(state)
@@ -8574,6 +8826,15 @@ def evaluate_inert_proposal(
             raise ConfigurationError("private proposal gate service returned invalid facts")
         if _candidate_tracked_manifest_sha256(evaluation_candidate) != patched_manifest:
             raise CandidateMutationError("private gate changed the evaluation candidate")
+        holdout_gate = (
+            run_holdout_gate(evaluation_candidate)
+            if run_holdout_gate is not None
+            else None
+        )
+        if holdout_gate is not None and not isinstance(holdout_gate, ProviderGateEvidence):
+            raise ConfigurationError("private holdout gate service returned invalid facts")
+        if _candidate_tracked_manifest_sha256(evaluation_candidate) != patched_manifest:
+            raise CandidateMutationError("private holdout gate changed the evaluation candidate")
     except Exception as exc:
         dispose_candidate(evaluation_candidate)
         if recheck_source_unchanged(state).source_modified:
@@ -8595,6 +8856,7 @@ def evaluate_inert_proposal(
         candidate_manifest_sha256=patched_manifest,
         cleanup_complete=True,
         source_modified=False,
+        holdout_gate=holdout_gate,
     )
 
 
@@ -8678,10 +8940,12 @@ class ProposalBatchServices:
     run_primary_gate: Callable[[Candidate], ProviderGateEvidence]
     read_snapshots: Callable[[Candidate, tuple[str, ...]], tuple[SourceSnapshot, ...]]
     evaluate_proposal: Callable[[CodingProposal, int], ProposalEvaluation]
+    run_holdout_gate: Callable[[Candidate], ProviderGateEvidence] | None = None
     monotonic: Callable[[], float] = time.monotonic
     known_secrets: tuple[str, ...] = ()
     editable_paths: tuple[str, ...] = ()
     allowed_replacement: ExactLineReplacement | None = None
+    allowed_replacements: tuple[ExactLineReplacement, ...] = ()
 
     def __post_init__(self) -> None:
         if not all(callable(value) for value in (
@@ -8691,6 +8955,8 @@ class ProposalBatchServices:
             self.monotonic,
         )):
             raise ConfigurationError("proposal batch service boundary must be callable")
+        if self.run_holdout_gate is not None and not callable(self.run_holdout_gate):
+            raise ConfigurationError("proposal batch holdout gate must be callable")
         if not hasattr(self.gateway, "request_once") or not hasattr(self.gateway, "preload_pricing"):
             raise ConfigurationError("proposal batch requires a strict gateway")
         if not isinstance(getattr(self.gateway, "ledger", None), BudgetLedger):
@@ -8704,20 +8970,28 @@ class ProposalBatchServices:
         except PatchPolicyError as exc:
             raise ConfigurationError("proposal batch editable path is invalid") from exc
         object.__setattr__(self, "editable_paths", editable)
+        replacements = list(self.allowed_replacements)
         if self.allowed_replacement is not None:
-            if not isinstance(self.allowed_replacement, ExactLineReplacement):
-                raise ConfigurationError("proposal batch allowed replacement is invalid")
+            replacements.append(self.allowed_replacement)
+        if any(not isinstance(value, ExactLineReplacement) for value in replacements):
+            raise ConfigurationError("proposal batch allowed replacement is invalid")
+        unique_replacements: list[ExactLineReplacement] = []
+        for replacement in replacements:
+            if replacement in unique_replacements:
+                continue
             if (
-                self.allowed_replacement.path not in editable
+                replacement.path not in editable
                 or any(
                     "settings." in line
                     for line in (
-                        *self.allowed_replacement.old_lines,
-                        *self.allowed_replacement.new_lines,
+                        *replacement.old_lines,
+                        *replacement.new_lines,
                     )
                 )
             ):
                 raise ConfigurationError("proposal batch allowed replacement is outside policy")
+            unique_replacements.append(replacement)
+        object.__setattr__(self, "allowed_replacements", tuple(unique_replacements))
 
 
 class _LoopLimitReached(RuntimeError):
@@ -8930,13 +9204,28 @@ def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
     )
 
 
-def _proposal_batch_allowed_replacement() -> ExactLineReplacement:
-    """Return the first controller-owned, non-configuration pivot experiment."""
-    return ExactLineReplacement(
-        path="core/pivot_detector.py",
-        old_lines=("    if right_lip < left_lip * 0.95:",),
-        new_lines=("    if right_lip < left_lip * 0.98:",),
+def _proposal_batch_allowed_replacements() -> tuple[ExactLineReplacement, ...]:
+    """Return the bounded controller-owned pivot-threshold experiment family."""
+    values = tuple(
+        value
+        for value in (
+            *(0.90 + index * 0.01 for index in range(5)),
+            *(0.96 + index * 0.01 for index in range(10)),
+        )
     )
+    return tuple(
+        ExactLineReplacement(
+            path="core/pivot_detector.py",
+            old_lines=("    if right_lip < left_lip * 0.95:",),
+            new_lines=(f"    if right_lip < left_lip * {value:.2f}:",),
+        )
+        for value in values
+    )
+
+
+def _proposal_batch_allowed_replacement() -> ExactLineReplacement:
+    """Backward-compatible accessor for the first bounded pivot experiment."""
+    return _proposal_batch_allowed_replacements()[0]
 
 
 def run_proposal_batch(
@@ -8988,9 +9277,13 @@ def run_proposal_batch(
     attempted_samples = 0
     rejected_samples = 0
     provider_call_artifacts: list[tuple[int, str, Path, str]] = []
+    seen_diff_sha256: set[str] = set()
+    sample_scores: dict[int, tuple[float, float, float, float, int]] = {}
     failure_code = "none"
     status = "batch_failed"
     accounting_failure: IncompleteAccountingFacts | None = None
+    holdout_evidence: ProviderGateEvidence | None = None
+    holdout_required = config.gate.holdout_start_date is not None
 
     def check_wall() -> None:
         current = services.monotonic()
@@ -9047,8 +9340,7 @@ def run_proposal_batch(
             },
         )
         rejected_samples += 1
-        if sample == 1:
-            raise CanaryRejectedError("proposal batch canary was rejected")
+        raise ProposalSampleRejectedError(code)
 
     role_models = {
         "orchestrator": config.models.orchestrator,
@@ -9302,6 +9594,19 @@ def run_proposal_batch(
         if not isinstance(evidence, ProviderGateEvidence) or evidence.gate_kind != "backtest":
             raise ConfigurationError("proposal batch gate returned invalid provider-safe evidence")
         _evidence_path, evidence_sha256 = audit.write_provider_evidence(evidence)
+        if holdout_required:
+            if services.run_holdout_gate is None:
+                raise ConfigurationError("configured holdout requires a holdout gate service")
+            holdout_evidence = services.run_holdout_gate(candidate)
+            if (
+                not isinstance(holdout_evidence, ProviderGateEvidence)
+                or holdout_evidence.gate_kind != "backtest"
+            ):
+                raise ConfigurationError("proposal batch holdout gate returned invalid evidence")
+            _holdout_path, _holdout_evidence_sha256 = audit.write_provider_evidence(
+                holdout_evidence,
+                name="provider-evidence-holdout",
+            )
         audit.append_event(
             LoopState.RUN_PRIMARY_GATE,
             "proposal_batch_gate_observed",
@@ -9312,10 +9617,27 @@ def run_proposal_batch(
                 "provider_evidence_sha256": evidence_sha256,
             },
         )
-        if evidence.gate_observation:
+        holdout_is_safe = (
+            not holdout_required
+            or (
+                holdout_evidence is not None
+                and holdout_evidence.outcome in {"thresholds_met", "thresholds_not_met"}
+                and holdout_evidence.observed_exit_zero
+                and holdout_evidence.worker_confined
+                and holdout_evidence.returncode == 0
+                and holdout_evidence.backtest_diagnostics is not None
+            )
+        )
+        if not holdout_is_safe:
+            failure_code = "holdout_gate_failed"
+        elif evidence.gate_observation and (
+            not holdout_required or holdout_evidence is not None and holdout_evidence.gate_observation
+        ):
             if not evidence.worker_confined or not evidence.observed_exit_zero:
                 raise SandboxError("passing proposal batch gate is not confined and exit-zero")
             status = "gate_observed_pass"
+        elif evidence.gate_observation:
+            failure_code = "holdout_gate_failed"
         elif (
             not evidence.worker_confined
             or not evidence.observed_exit_zero
@@ -9331,6 +9653,8 @@ def run_proposal_batch(
             )
             sealed_manifest = _candidate_tracked_manifest_sha256(candidate)
             evidence_payload = {"primary": asdict(evidence)}
+            if holdout_evidence is not None:
+                evidence_payload["holdout"] = asdict(holdout_evidence)
             for sample in range(1, limits.samples + 1):
                 check_wall()
                 attempted_samples = sample
@@ -9380,14 +9704,23 @@ def run_proposal_batch(
                         _provider_editable_snapshot_payload(value) for value in snapshots
                     ],
                     "editable_source_paths": [value.path for value in snapshots],
-                    "read_only_configuration_facts": [],
+                    "read_only_configuration_facts": _read_only_configuration_fact_payload(
+                        configuration_facts
+                    ),
                     "read_only_execution_facts": list(
                         _proposal_batch_execution_facts()
                     ),
                 }
-                if services.allowed_replacement is not None:
-                    reasoner_input["controller_owned_allowed_replacement"] = asdict(
-                        services.allowed_replacement
+                if services.allowed_replacements:
+                    key = (
+                        "controller_owned_allowed_replacement"
+                        if len(services.allowed_replacements) == 1
+                        else "controller_owned_allowed_replacements"
+                    )
+                    reasoner_input[key] = (
+                        asdict(services.allowed_replacements[0])
+                        if len(services.allowed_replacements) == 1
+                        else [asdict(value) for value in services.allowed_replacements]
                     )
                 plan, artifact, _plan_payload_sha256 = call_role(
                     sample,
@@ -9404,7 +9737,7 @@ def run_proposal_batch(
                     _validate_reasoning_plan_grounding(
                         plan,
                         snapshots,
-                        (),
+                        configuration_facts,
                     )
                 except PatchPolicyError:
                     record_sample_rejection(
@@ -9442,7 +9775,9 @@ def run_proposal_batch(
                     "evidence": evidence_payload,
                     "plan": asdict(plan),
                     "editable_source_paths": [value.path for value in snapshots],
-                    "read_only_configuration_facts": [],
+                    "read_only_configuration_facts": _read_only_configuration_fact_payload(
+                        configuration_facts
+                    ),
                     "read_only_execution_facts": list(
                         _proposal_batch_execution_facts()
                     ),
@@ -9450,9 +9785,16 @@ def run_proposal_batch(
                         _provider_editable_snapshot_payload(value) for value in snapshots
                     ],
                 }
-                if services.allowed_replacement is not None:
-                    coder_input["controller_owned_allowed_replacement"] = asdict(
-                        services.allowed_replacement
+                if services.allowed_replacements:
+                    key = (
+                        "controller_owned_allowed_replacement"
+                        if len(services.allowed_replacements) == 1
+                        else "controller_owned_allowed_replacements"
+                    )
+                    coder_input[key] = (
+                        asdict(services.allowed_replacements[0])
+                        if len(services.allowed_replacements) == 1
+                        else [asdict(value) for value in services.allowed_replacements]
                     )
                 typed_proposal, artifact, proposal_payload_sha256 = call_role(
                     sample,
@@ -9472,10 +9814,8 @@ def run_proposal_batch(
                         typed_proposal,
                         configuration_facts,
                     )
-                    if (
-                        services.allowed_replacement is not None
-                        and typed_proposal.replacements
-                        != (services.allowed_replacement,)
+                    if services.allowed_replacements and typed_proposal.replacements not in tuple(
+                        (replacement,) for replacement in services.allowed_replacements
                     ):
                         raise PatchPolicyError(
                             "proposal batch replacement is outside the approved experiment"
@@ -9485,11 +9825,43 @@ def run_proposal_batch(
                         typed_proposal,
                         snapshots,
                     )
+                    normalized_diff = proposal.unified_diff.replace("\r\n", "\n").replace(
+                        "\r", "\n"
+                    )
+                    predicted_diff_sha256 = hashlib.sha256(
+                        normalized_diff.encode("utf-8")
+                    ).hexdigest()
+                    if predicted_diff_sha256 in seen_diff_sha256:
+                        record_sample_rejection(
+                            sample=sample,
+                            code="duplicate_proposal",
+                            calls_before=calls_before,
+                            expected_calls=3,
+                            sealed_manifest=sealed_manifest,
+                            state=LoopState.RECORD_REJECTION,
+                        )
                     evaluation = services.evaluate_proposal(proposal, sample)
                     if not isinstance(evaluation, ProposalEvaluation):
                         raise ConfigurationError(
                             "proposal evaluation service returned invalid facts"
                         )
+                    if evaluation.gate.gate_kind == "backtest":
+                        evaluation = replace(
+                            evaluation,
+                            comparison=compare_backtest_evidence(evidence, evaluation.gate),
+                        )
+                        if holdout_required:
+                            if evaluation.holdout_gate is None or holdout_evidence is None:
+                                raise PatchPolicyError(
+                                    "proposal has no holdout evaluation evidence"
+                                )
+                            evaluation = replace(
+                                evaluation,
+                                holdout_comparison=compare_backtest_evidence(
+                                    holdout_evidence,
+                                    evaluation.holdout_gate,
+                                ),
+                            )
                     evaluation_path, evaluation_sha256 = (
                         audit.write_proposal_evaluation(evaluation, sample=sample)
                     )
@@ -9510,6 +9882,9 @@ def run_proposal_batch(
                         proposal_evaluation_sha256=evaluation_sha256,
                         renderer_contract="coding_exact_replacements_v1",
                     )
+                    if handoff.diff_sha256 != predicted_diff_sha256:
+                        raise AuditError("rendered proposal digest changed during export")
+                    seen_diff_sha256.add(handoff.diff_sha256)
                 except PatchPolicyError as exc:
                     try:
                         record_sample_rejection(
@@ -9539,6 +9914,14 @@ def run_proposal_batch(
                         metadata_sha256=_file_sha256(handoff.metadata_path),
                     )
                 )
+                assert evaluation.comparison is not None
+                sample_scores[sample] = (
+                    evaluation.comparison.total_return_delta,
+                    evaluation.comparison.annualized_return_delta,
+                    evaluation.comparison.sharpe_delta,
+                    evaluation.comparison.drawdown_headroom_delta,
+                    evaluation.comparison.closed_trades_delta,
+                )
                 audit.append_event(
                     LoopState.EXPORT_DIFF,
                     "proposal_sample_exported",
@@ -9548,9 +9931,20 @@ def run_proposal_batch(
                         "metadata_sha256": _file_sha256(handoff.metadata_path),
                         "proposal_payload_sha256": proposal_payload_sha256,
                         "proposal_evaluation_sha256": evaluation_sha256,
+                        "comparison": {
+                            "total_return_delta": evaluation.comparison.total_return_delta,
+                            "annualized_return_delta": evaluation.comparison.annualized_return_delta,
+                            "sharpe_delta": evaluation.comparison.sharpe_delta,
+                            "drawdown_headroom_delta": evaluation.comparison.drawdown_headroom_delta,
+                            "closed_trades_delta": evaluation.comparison.closed_trades_delta,
+                        },
                     },
                 )
             if sample_results:
+                sample_results.sort(
+                    key=lambda item: (sample_scores[item.sample], -item.sample),
+                    reverse=True,
+                )
                 status = "batch_complete"
             else:
                 failure_code = "no_valid_proposals"
@@ -9560,6 +9954,8 @@ def run_proposal_batch(
         failure_code = "budget_exceeded"
     except GatewayError:
         failure_code = "provider_failed"
+    except ProposalSampleRejectedError as exc:
+        failure_code = exc.code
     except CanaryRejectedError:
         failure_code = "canary_rejected"
     except InsufficientEvidenceError:
@@ -9631,6 +10027,20 @@ def run_proposal_batch(
                 "metadata_sha256": value.metadata_sha256,
             }
             for value in sample_results
+        ],
+        "ranking": [
+            {
+                "rank": rank,
+                "sample": value.sample,
+                "comparison": {
+                    "total_return_delta": sample_scores[value.sample][0],
+                    "annualized_return_delta": sample_scores[value.sample][1],
+                    "sharpe_delta": sample_scores[value.sample][2],
+                    "drawdown_headroom_delta": sample_scores[value.sample][3],
+                    "closed_trades_delta": sample_scores[value.sample][4],
+                },
+            }
+            for rank, value in enumerate(sample_results, start=1)
         ],
         "provider_call_artifacts": [
             {"call_index": index, "outcome": outcome, "sha256": digest}
@@ -9923,7 +10333,9 @@ def run_agent_loop(
                         _provider_editable_snapshot_payload(value) for value in snapshots
                     ],
                     "editable_source_paths": [value.path for value in snapshots],
-                    "read_only_configuration_facts": [],
+                    "read_only_configuration_facts": _read_only_configuration_fact_payload(
+                        configuration_facts
+                    ),
                 },
                 ReasoningPlan.from_json,
                 ReasoningPlan,
@@ -9938,7 +10350,7 @@ def run_agent_loop(
                 _validate_reasoning_plan_grounding(
                     plan,
                     snapshots,
-                    (),
+                    configuration_facts,
                 )
             except PatchPolicyError:
                 skip_iteration("reasoner", "evidence_rejected")
@@ -9958,7 +10370,9 @@ def run_agent_loop(
                     "evidence": evidence_payload,
                     "plan": asdict(plan),
                     "editable_source_paths": [value.path for value in snapshots],
-                    "read_only_configuration_facts": [],
+                    "read_only_configuration_facts": _read_only_configuration_fact_payload(
+                        configuration_facts
+                    ),
                     "source_snapshots": [
                         _provider_editable_snapshot_payload(value) for value in snapshots
                     ],
@@ -10335,6 +10749,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark")
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
+    parser.add_argument("--holdout-start-date")
+    parser.add_argument("--holdout-end-date")
     parser.add_argument("--historical-data-bundle", type=Path)
     parser.add_argument("--historical-data-sha256")
     parser.add_argument("--minimum-total-return", type=float)
@@ -10391,6 +10807,8 @@ def _build_cli_config(
         namespace.benchmark,
         namespace.start_date,
         namespace.end_date,
+        namespace.holdout_start_date,
+        namespace.holdout_end_date,
         namespace.historical_data_bundle,
         namespace.historical_data_sha256,
         namespace.minimum_total_return,
@@ -10434,6 +10852,8 @@ def _build_cli_config(
                 maximum_drawdown_magnitude=namespace.maximum_drawdown_magnitude,
                 minimum_closed_trades=namespace.minimum_closed_trades,
             ),
+            holdout_start_date=namespace.holdout_start_date,
+            holdout_end_date=namespace.holdout_end_date,
         )
     config = LoopConfig(
         source_root=_absolute_cli_path(namespace.repo_root, "repository root"),
@@ -10478,6 +10898,8 @@ def _build_proposal_batch_limits(
         raise ConfigurationError("proposal batch cannot apply generated patches")
     if not isinstance(config.gate, BacktestGateConfig):
         raise ConfigurationError("proposal batch requires the backtest gate")
+    if config.gate.holdout_start_date is None or config.gate.holdout_end_date is None:
+        raise ConfigurationError("proposal batch requires a trailing holdout window")
     if config.limits.max_iterations != 1:
         raise ConfigurationError("proposal batch requires max_iterations=1")
     return ProposalBatchLimits(
@@ -10582,15 +11004,20 @@ def _backtest_provider_evidence(
     sandbox: SandboxRunner,
     gate: BacktestGateConfig,
     bundle: ValidatedDataBundle,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> ProviderGateEvidence:
+    window_start = gate.start_date if start_date is None else start_date
+    window_end = gate.end_date if end_date is None else end_date
     result = run_backtest_gate(
         candidate,
         sandbox,
         bundle,
         gate.tickers,
         gate.benchmark,
-        gate.start_date,
-        gate.end_date,
+        window_start,
+        window_end,
         gate.thresholds,
     )
     if result.provider_safe is not True:
@@ -10816,6 +11243,20 @@ def _execute_cli_run(
                         config.gate,
                         bundle,
                     ),
+                    run_holdout_gate=(
+                        (
+                            lambda current: _backtest_provider_evidence(
+                                current,
+                                sandbox,
+                                config.gate,
+                                bundle,
+                                start_date=config.gate.holdout_start_date,
+                                end_date=config.gate.holdout_end_date,
+                            )
+                        )
+                        if config.gate.holdout_start_date is not None
+                        else None
+                    ),
                 )
 
             result: LoopResult | ProposalBatchResult = run_proposal_batch(
@@ -10828,11 +11269,25 @@ def _execute_cli_run(
                     run_primary_gate=lambda current: _backtest_provider_evidence(
                         current, sandbox, config.gate, bundle
                     ),
+                    run_holdout_gate=(
+                        (
+                            lambda current: _backtest_provider_evidence(
+                                current,
+                                sandbox,
+                                config.gate,
+                                bundle,
+                                start_date=config.gate.holdout_start_date,
+                                end_date=config.gate.holdout_end_date,
+                            )
+                        )
+                        if config.gate.holdout_start_date is not None
+                        else None
+                    ),
                     read_snapshots=snapshots,
                     evaluate_proposal=evaluate_proposal,
                     known_secrets=known_secrets,
                     editable_paths=_proposal_batch_editable_paths(),
-                    allowed_replacement=_proposal_batch_allowed_replacement(),
+                    allowed_replacements=_proposal_batch_allowed_replacements(),
                 ),
                 batch_limits,
             )

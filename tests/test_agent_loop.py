@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -46,8 +46,6 @@ def _plan_json(**overrides: object) -> str:
         "source_evidence": [
             {
                 "path": "core/backtest_engine.py",
-                "start_line": 1,
-                "lines": ["VALUE = 1"],
             }
         ],
         "configuration_fact_ids": [],
@@ -191,8 +189,8 @@ def test_task3_models_and_limits_validate_exact_boundaries() -> None:
 
     models = ModelConfig()
     assert models.orchestrator == "qwen/qwen3-next-80b-a3b-instruct"
-    assert models.reasoner == "qwen/qwen3-next-80b-a3b-instruct"
-    assert models.coder == "deepseek/deepseek-chat"
+    assert models.reasoner == "deepseek/deepseek-r1"
+    assert models.coder == "qwen/qwen3-coder-next"
     with pytest.raises(ConfigurationError, match="model slug"):
         ModelConfig(coder="bad model")
 
@@ -1098,8 +1096,8 @@ def test_typed_coding_proposal_rejects_unsafe_or_noop_replacements(
         TypedCodingProposal.from_json(raw)
 
 
-def test_typed_coding_proposal_rejects_legacy_diff_and_adjacent_ranges() -> None:
-    """The provider cannot regain diff grammar or represent one edit ambiguously."""
+def test_typed_coding_proposal_rejects_legacy_diff_and_preserves_typed_ranges() -> None:
+    """The parser rejects legacy diff grammar; source adjacency is enforced later by policy."""
     from agent_loop import ProtocolValidationError, TypedCodingProposal
 
     with pytest.raises(ProtocolValidationError, match="keys"):
@@ -1112,28 +1110,26 @@ def test_typed_coding_proposal_rejects_legacy_diff_and_adjacent_ranges() -> None
                 }
             )
         )
-    with pytest.raises(ProtocolValidationError, match="adjacent"):
-        TypedCodingProposal.from_json(
-            json.dumps(
-                {
-                    "summary": "Ambiguous adjacent replacements.",
-                    "replacements": [
-                        {
-                            "path": "core/pivot_detector.py",
-                            "start_line": 1,
-                            "old_lines": ["A = 1"],
-                            "new_lines": ["A = 2"],
-                        },
-                        {
-                            "path": "core/pivot_detector.py",
-                            "start_line": 2,
-                            "old_lines": ["B = 1"],
-                            "new_lines": ["B = 2"],
-                        },
-                    ],
-                }
-            )
+    proposal = TypedCodingProposal.from_json(
+        json.dumps(
+            {
+                "summary": "Two typed replacements for later source-policy validation.",
+                "replacements": [
+                    {
+                        "path": "core/pivot_detector.py",
+                        "old_lines": ["A = 1"],
+                        "new_lines": ["A = 2"],
+                    },
+                    {
+                        "path": "core/pivot_detector.py",
+                        "old_lines": ["B = 1"],
+                        "new_lines": ["B = 2"],
+                    },
+                ],
+            }
         )
+    )
+    assert len(proposal.replacements) == 2
 
 
 def test_typed_coding_proposal_enforces_aggregate_payload_byte_cap() -> None:
@@ -1153,7 +1149,6 @@ def test_typed_coding_proposal_enforces_aggregate_payload_byte_cap() -> None:
             replacements=(
                 ExactLineReplacement(
                     path="core/pivot_detector.py",
-                    start_line=1,
                     old_lines=old_lines,
                     new_lines=new_lines,
                 ),
@@ -1191,7 +1186,7 @@ def test_openrouter_system_prompts_pin_each_exact_json_contract() -> None:
         assert "exactly these keys" in prompt
         assert all(f'"{key}"' in prompt for key in keys)
     coder_prompt = OpenRouterGateway.SYSTEM_PROMPTS["coder"]
-    assert "path, start_line, old_lines, and new_lines" in coder_prompt
+    assert "path, old_lines, and new_lines" in coder_prompt
     assert "Do not return unified diff text" in coder_prompt
     assert "Preserve every reference from" in coder_prompt
     assert "read_only_configuration_facts" in coder_prompt
@@ -2552,7 +2547,6 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
             "replacements": [
                 {
                     "path": "core/momentum_analysis.py",
-                    "start_line": 167,
                     "old_lines": ["        value = 1"],
                     "new_lines": ["        value = 2"],
                 }
@@ -2569,14 +2563,14 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
         ),
         (
             "reasoner",
-            "qwen/qwen3-next-80b-a3b-instruct",
+            "deepseek/deepseek-r1",
             _plan_json(),
             ReasoningPlan.from_json,
             4096,
         ),
         (
             "coder",
-            "deepseek/deepseek-chat",
+            "qwen/qwen3-coder-next",
             coder_payload,
             TypedCodingProposal.from_json,
             4096,
@@ -2629,7 +2623,7 @@ def test_gateway_pins_role_models_and_only_orchestrator_temperature() -> None:
 
         assert_provider_subset(schema)
         if role == "reasoner":
-            assert schema_wrapper["name"] == "agent_loop_reasoning_plan_v1"
+            assert schema_wrapper["name"] == "agent_loop_reasoning_plan_v3"
             assert schema["properties"]["skip"]["type"] == "boolean"
             assert schema["properties"]["skip_reason"]["type"] == "string"
             assert schema["properties"]["source_evidence"]["items"][
@@ -2674,14 +2668,13 @@ def test_coder_request_requires_typed_exact_replacements_at_provider_boundary() 
     """The model never owns diff headers, hunk arithmetic, prefixes, or terminal newlines."""
     from agent_loop import BudgetLedger, OpenRouterGateway, TypedCodingProposal
 
-    model = "deepseek/deepseek-chat"
+    model = "qwen/qwen3-coder-next"
     proposal = json.dumps(
         {
             "summary": "Replace one assignment.",
             "replacements": [
                 {
                     "path": "core/momentum_analysis.py",
-                    "start_line": 167,
                     "old_lines": ["        wp = calculate_weighted_performance(clean)"],
                     "new_lines": [
                         "        wp = calculate_weighted_performance(clean, q1_weight=0.4)"
@@ -2702,7 +2695,7 @@ def test_coder_request_requires_typed_exact_replacements_at_provider_boundary() 
     )
 
     messages = client.completions.calls[0]["messages"]
-    assert "path, start_line, old_lines, and new_lines" in messages[0]["content"]
+    assert "path, old_lines, and new_lines" in messages[0]["content"]
     assert "original snapshot coordinate" in messages[0]["content"]
     assert "never add or subtract earlier replacement deltas" in messages[0]["content"]
     assert "Do not add any new defaulted parameter" in messages[0]["content"]
@@ -2719,7 +2712,7 @@ def test_oversized_typed_coder_response_is_accounted_protocol_rejection() -> Non
         TypedCodingProposal,
     )
 
-    model = "deepseek/deepseek-chat"
+    model = "qwen/qwen3-coder-next"
     padding = " " * 15_000
     oversized = json.dumps(
         {
@@ -2755,7 +2748,7 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
     """The reasoner prompt pins exact evidence anchors, facts, and hypothesis semantics."""
     from agent_loop import BudgetLedger, OpenRouterGateway, ReasoningPlan
 
-    model = "qwen/qwen3-next-80b-a3b-instruct"
+    model = "deepseek/deepseek-r1"
     plan = json.dumps(
         {
             "diagnosis": "The measured return misses the configured threshold.",
@@ -2763,8 +2756,6 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
             "source_evidence": [
                 {
                     "path": "core/pivot_detector.py",
-                    "start_line": 10,
-                    "lines": ["SUPPORTED = True"],
                 }
             ],
             "configuration_fact_ids": [],
@@ -2787,7 +2778,7 @@ def test_reasoner_request_pins_exact_json_field_types_at_provider_boundary() -> 
     system_prompt = client.completions.calls[0]["messages"][0]["content"]
     assert '"causal_hypothesis", "source_evidence", "configuration_fact_ids"' in system_prompt
     assert "causal_hypothesis is explicitly unproven and falsifiable" in system_prompt
-    assert "source_evidence objects require exactly path, start_line, and lines" in system_prompt
+    assert "source_evidence objects require exactly path" in system_prompt
     assert "read_only_configuration_facts exactly once" in system_prompt
     assert "never source snapshots or editable paths" in system_prompt
     assert "Never invent baseline values" in system_prompt
@@ -2812,11 +2803,6 @@ def test_reasoning_plan_requires_structured_source_grounding() -> None:
                 "source_evidence": [
                     {
                         "path": "core/momentum_analysis.py",
-                        "start_line": 60,
-                        "lines": [
-                            "    if q1_weight is None:",
-                            "        q1_weight = settings.RS_Q1_WEIGHT",
-                        ],
                     }
                 ],
                 "configuration_fact_ids": ["settings.RS_Q1_WEIGHT"],
@@ -2831,11 +2817,6 @@ def test_reasoning_plan_requires_structured_source_grounding() -> None:
 
     assert plan.causal_hypothesis.startswith("The current recent-quarter weighting")
     assert plan.source_evidence[0].path == "core/momentum_analysis.py"
-    assert plan.source_evidence[0].start_line == 60
-    assert plan.source_evidence[0].lines == (
-        "    if q1_weight is None:",
-        "        q1_weight = settings.RS_Q1_WEIGHT",
-    )
     assert plan.configuration_fact_ids == ("settings.RS_Q1_WEIGHT",)
 
 
@@ -2953,11 +2934,6 @@ def test_reasoning_grounding_rejects_omitted_configuration_facts() -> None:
         source_evidence=(
             agent_loop.ReasoningSourceEvidence(
                 path="core/momentum_analysis.py",
-                start_line=60,
-                lines=(
-                    "    if q1_weight is None:",
-                    "        q1_weight = settings.RS_Q1_WEIGHT",
-                ),
             ),
         ),
         configuration_fact_ids=(),
@@ -3007,9 +2983,7 @@ def test_reasoning_grounding_accepts_all_configuration_facts_in_any_order() -> N
         diagnosis="The measured return misses its threshold.",
         causal_hypothesis="The exact momentum expression may be causal.",
         source_evidence=(
-            agent_loop.ReasoningSourceEvidence(
-                "core/momentum_analysis.py", 1, ("MOMENTUM = 1",)
-            ),
+            agent_loop.ReasoningSourceEvidence("core/momentum_analysis.py"),
         ),
         configuration_fact_ids=("settings.RS_Q2_WEIGHT", "settings.RS_Q1_WEIGHT"),
         invariants=("Preserve the caller.",),
@@ -3022,8 +2996,8 @@ def test_reasoning_grounding_accepts_all_configuration_facts_in_any_order() -> N
     agent_loop._validate_reasoning_plan_grounding(plan, (snapshot,), facts)
 
 
-def test_reasoning_grounding_rejects_stale_source_anchor() -> None:
-    """Break caught: a reasoner could cite invented old text instead of the sealed snapshot."""
+def test_reasoning_grounding_rejects_evidence_outside_snapshot() -> None:
+    """Break caught: a reasoner could cite a path outside the sealed snapshot set."""
     import agent_loop
 
     snapshot = agent_loop.SourceSnapshot(
@@ -3044,12 +3018,7 @@ def test_reasoning_grounding_rejects_stale_source_anchor() -> None:
         causal_hypothesis="The current weighting may dilute recent momentum.",
         source_evidence=(
             agent_loop.ReasoningSourceEvidence(
-                path="core/momentum_analysis.py",
-                start_line=60,
-                lines=(
-                    "    if q1_weight is None:",
-                    "        q1_weight = 4.0",
-                ),
+                path="core/pivot_detector.py",
             ),
         ),
         configuration_fact_ids=("settings.RS_Q1_WEIGHT",),
@@ -3069,7 +3038,7 @@ def test_reasoning_grounding_rejects_stale_source_anchor() -> None:
         ),
     )
 
-    with pytest.raises(agent_loop.PatchPolicyError, match="exact source snapshot"):
+    with pytest.raises(agent_loop.PatchPolicyError, match="outside the exact source snapshots"):
         agent_loop._validate_reasoning_plan_grounding(plan, (snapshot,), facts)
 
 
@@ -3105,8 +3074,6 @@ def test_reasoning_grounding_requires_an_anchor_for_every_changed_file() -> None
         source_evidence=(
             agent_loop.ReasoningSourceEvidence(
                 path="core/pivot_detector.py",
-                start_line=1,
-                lines=("PIVOT = 1",),
             ),
         ),
         configuration_fact_ids=(),
@@ -3137,7 +3104,6 @@ def test_typed_proposal_cannot_replace_a_configuration_reference_with_literals()
         replacements=(
             agent_loop.ExactLineReplacement(
                 path="core/momentum_analysis.py",
-                start_line=58,
                 old_lines=(
                     "    if q1_weight is None:",
                     "        q1_weight = settings.RS_Q1_WEIGHT",
@@ -3164,7 +3130,7 @@ def test_reasoner_rejects_nonempty_skip_reason_when_skip_is_false() -> None:
         ReasoningPlan,
     )
 
-    model = "qwen/qwen3-next-80b-a3b-instruct"
+    model = "deepseek/deepseek-r1"
     planted = "provider-nonempty-skip-reason-canary"
     plan = json.dumps(
         {
@@ -3173,8 +3139,6 @@ def test_reasoner_rejects_nonempty_skip_reason_when_skip_is_false() -> None:
             "source_evidence": [
                 {
                     "path": "core/pivot_detector.py",
-                    "start_line": 1,
-                    "lines": ["PIVOT = 1"],
                 }
             ],
             "configuration_fact_ids": [],
@@ -3505,10 +3469,10 @@ def test_gateway_uses_immutable_three_message_prefix_and_reasoner_cap() -> None:
     call = client.completions.calls[0]
 
     assert completion.payload.diagnosis == "A boundary is wrong."
-    assert call["model"] == "qwen/qwen3-next-80b-a3b-instruct"
+    assert call["model"] == "deepseek/deepseek-r1"
     assert call["max_tokens"] == 4096
     assert call["response_format"]["type"] == "json_schema"
-    assert call["response_format"]["json_schema"]["name"] == "agent_loop_reasoning_plan_v1"
+    assert call["response_format"]["json_schema"]["name"] == "agent_loop_reasoning_plan_v3"
     assert call["response_format"]["json_schema"]["strict"] is True
     assert call["stream"] is False
     assert call["extra_body"] == {"provider": {"require_parameters": True}}
@@ -4057,13 +4021,11 @@ def test_controller_renders_typed_replacements_as_canonical_exact_diff(
             replacements=(
                 ExactLineReplacement(
                     path="core/momentum_analysis.py",
-                    start_line=2,
                     old_lines=("B = 1",),
                     new_lines=("B = 10", "B2 = 11"),
                 ),
                 ExactLineReplacement(
                     path="core/momentum_analysis.py",
-                    start_line=4,
                     old_lines=("D = 3",),
                     new_lines=("D = 30",),
                 ),
@@ -4234,7 +4196,6 @@ def test_typed_replacement_rejects_stale_or_out_of_view_old_lines(tmp_path: Path
             replacements=(
                 ExactLineReplacement(
                     path="core/momentum_analysis.py",
-                    start_line=2,
                     old_lines=("MOMENTUM = 999",),
                     new_lines=("MOMENTUM = 2",),
                 ),
@@ -4248,13 +4209,12 @@ def test_typed_replacement_rejects_stale_or_out_of_view_old_lines(tmp_path: Path
                 replacements=(
                     ExactLineReplacement(
                         path="core/momentum_analysis.py",
-                        start_line=1,
                         old_lines=("A = 0",),
                         new_lines=("A = 1",),
                     ),
                 ),
             )
-            with pytest.raises(PatchPolicyError, match="outside the exact visible source"):
+            with pytest.raises(PatchPolicyError, match="exact visible source"):
                 render_typed_coding_proposal(candidate, outside_view, (snapshot,))
             candidate_target = candidate.root / "core" / "momentum_analysis.py"
             candidate_target.write_text(
@@ -4297,7 +4257,6 @@ def test_typed_replacement_rejects_invalid_rewritten_python_syntax(tmp_path: Pat
             replacements=(
                 ExactLineReplacement(
                     path="core/momentum_analysis.py",
-                    start_line=1,
                     old_lines=("MOMENTUM = 1",),
                     new_lines=("try:", "    MOMENTUM = 2"),
                 ),
@@ -4379,7 +4338,6 @@ def test_typed_replacement_rejects_new_sentinel_optional_parameters(
         replacements = [
             ExactLineReplacement(
                 path="core/momentum_analysis.py",
-                start_line=1,
                 old_lines=("def score(value):", "    return value"),
                 new_lines=new_function,
             )
@@ -4388,7 +4346,6 @@ def test_typed_replacement_rejects_new_sentinel_optional_parameters(
             replacements.append(
                 ExactLineReplacement(
                     path="core/momentum_analysis.py",
-                    start_line=4,
                     old_lines=("RESULT = score(2)",),
                     new_lines=(f"RESULT = score(2, control={activation_value})",),
                 )
@@ -4462,7 +4419,6 @@ def test_typed_replacement_rejects_defaulted_nested_method_and_lambda_parameters
     target.write_text(source, encoding="utf-8", newline="\n")
     _run_git(repo, "add", "core/momentum_analysis.py")
     _run_git(repo, "commit", "-m", "nested callable source")
-    start_line = source.splitlines().index(old_lines[0]) + 1
     with tempfile.TemporaryDirectory(prefix="agent-loop-typed-action-") as controller_name:
         state = preflight_source(
             repo,
@@ -4478,10 +4434,9 @@ def test_typed_replacement_rejects_defaulted_nested_method_and_lambda_parameters
         proposal = TypedCodingProposal(
             summary="Attempt to add one dormant nested control.",
             replacements=(
-                ExactLineReplacement(
-                    path="core/momentum_analysis.py",
-                    start_line=start_line,
-                    old_lines=old_lines,
+            ExactLineReplacement(
+                path="core/momentum_analysis.py",
+                old_lines=old_lines,
                     new_lines=new_lines,
                 ),
             ),
@@ -4537,7 +4492,6 @@ def test_typed_replacement_rejects_two_wired_sentinel_parameters(
             replacements=(
                 ExactLineReplacement(
                     path="core/momentum_analysis.py",
-                    start_line=1,
                     old_lines=("def score(value):", "    return value"),
                     new_lines=(
                         "def score(value, factor=None, enabled=False):",
@@ -4550,7 +4504,6 @@ def test_typed_replacement_rejects_two_wired_sentinel_parameters(
                 ),
                 ExactLineReplacement(
                     path="core/momentum_analysis.py",
-                    start_line=4,
                     old_lines=("RESULT = score(2)",),
                     new_lines=("RESULT = score(2, factor=3, enabled=True)",),
                 ),
@@ -4602,10 +4555,9 @@ def test_typed_replacement_rejects_defaulted_lambda_signature_transfer(
         proposal = TypedCodingProposal(
             summary="Attempt to transfer an optional lambda signature.",
             replacements=(
-                ExactLineReplacement(
-                    path="core/momentum_analysis.py",
-                    start_line=1,
-                    old_lines=(
+            ExactLineReplacement(
+                path="core/momentum_analysis.py",
+                old_lines=(
                         "a = lambda value, control=None: value",
                         "b = lambda value: value",
                     ),
@@ -5333,6 +5285,197 @@ def test_backtest_threshold_boundaries_are_deterministic(metrics: dict[str, floa
 
     thresholds = BacktestThresholds(10.0, 8.0, 1.0, 5.0, 3)
     assert evaluate_backtest_metrics(metrics, thresholds).thresholds_met_observation is expected
+
+
+def test_backtest_config_requires_a_trailing_holdout_window(tmp_path: Path) -> None:
+    from agent_loop import BacktestGateConfig, BacktestThresholds, ConfigurationError
+
+    common = {
+        "tickers": ("AAPL",),
+        "benchmark": "SPY",
+        "start_date": "2023-01-01",
+        "end_date": "2026-01-01",
+        "historical_data_bundle": (tmp_path / "bundle.sqlite3").resolve(),
+        "historical_data_sha256": "a" * 64,
+        "thresholds": BacktestThresholds(1.0, 0.0, 0.0, 20.0, 1),
+    }
+    config = BacktestGateConfig(
+        **common,
+        holdout_start_date="2025-01-01",
+        holdout_end_date="2026-01-01",
+    )
+    assert config.holdout_start_date == "2025-01-01"
+    with pytest.raises(ConfigurationError, match="trailing window"):
+        BacktestGateConfig(
+            **common,
+            holdout_start_date="2022-01-01",
+            holdout_end_date="2024-01-01",
+        )
+
+
+def _comparison_gate(metrics: dict[str, float | int], thresholds: Any) -> Any:
+    from agent_loop import (
+        BacktestDiagnosticEvidence,
+        ProviderGateEvidence,
+        evaluate_backtest_metrics,
+    )
+
+    evaluation = evaluate_backtest_metrics(metrics, thresholds)
+    diagnostics = BacktestDiagnosticEvidence.from_metrics(
+        metrics,
+        thresholds,
+        evaluation,
+        ticker_count=1,
+        start_date="2024-01-01",
+        end_date="2025-01-01",
+    )
+    return ProviderGateEvidence(
+        gate_kind="backtest",
+        outcome="thresholds_met" if evaluation.thresholds_met_observation else "thresholds_not_met",
+        gate_observation=evaluation.thresholds_met_observation,
+        observed_exit_zero=True,
+        worker_confined=True,
+        returncode=0,
+        stdout_sha256="a" * 64,
+        stderr_sha256="b" * 64,
+        failure_codes=() if evaluation.thresholds_met_observation else ("thresholds_not_met",),
+        backtest_diagnostics=diagnostics,
+    )
+
+
+def test_compare_backtest_evidence_accepts_strict_pareto_improvement() -> None:
+    from agent_loop import BacktestThresholds, compare_backtest_evidence
+
+    thresholds = BacktestThresholds(2.0, 2.0, 0.8, 10.0, 5)
+    baseline = _comparison_gate(
+        {
+            "total_return_pct": 1.0,
+            "annualized_return_pct": 1.0,
+            "sharpe_ratio": 0.5,
+            "max_drawdown_pct": -5.0,
+            "closed_trades": 10,
+        },
+        thresholds,
+    )
+    candidate = _comparison_gate(
+        {
+            "total_return_pct": 2.5,
+            "annualized_return_pct": 2.5,
+            "sharpe_ratio": 0.9,
+            "max_drawdown_pct": -4.0,
+            "closed_trades": 12,
+        },
+        thresholds,
+    )
+
+    comparison = compare_backtest_evidence(baseline, candidate)
+
+    assert comparison.accepted is True
+    assert comparison.failure_codes == ()
+    assert comparison.total_return_delta == 1.5
+    assert comparison.drawdown_headroom_delta == 1.0
+
+
+@pytest.mark.parametrize(
+    ("candidate_metrics", "failure_code"),
+    (
+        (
+            {
+                "total_return_pct": 2.5,
+                "annualized_return_pct": 2.5,
+                "sharpe_ratio": 0.9,
+                "max_drawdown_pct": -6.0,
+                "closed_trades": 12,
+            },
+            "drawdown_worse",
+        ),
+        (
+            {
+                "total_return_pct": 1.5,
+                "annualized_return_pct": 1.5,
+                "sharpe_ratio": 0.7,
+                "max_drawdown_pct": -4.0,
+                "closed_trades": 12,
+            },
+            "thresholds_not_met",
+        ),
+    ),
+)
+def test_compare_backtest_evidence_rejects_unsafe_or_unproven_candidates(
+    candidate_metrics: dict[str, float | int],
+    failure_code: str,
+) -> None:
+    from agent_loop import BacktestThresholds, compare_backtest_evidence
+
+    thresholds = BacktestThresholds(2.0, 2.0, 0.8, 10.0, 5)
+    baseline = _comparison_gate(
+        {
+            "total_return_pct": 1.0,
+            "annualized_return_pct": 1.0,
+            "sharpe_ratio": 0.5,
+            "max_drawdown_pct": -5.0,
+            "closed_trades": 10,
+        },
+        thresholds,
+    )
+    candidate = _comparison_gate(candidate_metrics, thresholds)
+
+    comparison = compare_backtest_evidence(baseline, candidate)
+
+    assert comparison.accepted is False
+    assert failure_code in comparison.failure_codes
+
+
+def test_proposal_export_requires_holdout_comparison_when_holdout_is_evaluated() -> None:
+    from agent_loop import (
+        BacktestThresholds,
+        ProposalEvaluation,
+        QualityObservation,
+        compare_backtest_evidence,
+    )
+
+    thresholds = BacktestThresholds(2.0, 2.0, 0.8, 10.0, 5)
+    baseline = _comparison_gate(
+        {
+            "total_return_pct": 1.0,
+            "annualized_return_pct": 1.0,
+            "sharpe_ratio": 0.5,
+            "max_drawdown_pct": -5.0,
+            "closed_trades": 10,
+        },
+        thresholds,
+    )
+    candidate = _comparison_gate(
+        {
+            "total_return_pct": 2.5,
+            "annualized_return_pct": 2.5,
+            "sharpe_ratio": 0.9,
+            "max_drawdown_pct": -4.0,
+            "closed_trades": 12,
+        },
+        thresholds,
+    )
+    holdout_bad = _comparison_gate(
+        {
+            "total_return_pct": 1.5,
+            "annualized_return_pct": 1.5,
+            "sharpe_ratio": 0.7,
+            "max_drawdown_pct": -4.0,
+            "closed_trades": 12,
+        },
+        thresholds,
+    )
+    evaluation = ProposalEvaluation(
+        quality=QualityObservation(True, True, True, True),
+        gate=candidate,
+        candidate_manifest_sha256="c" * 64,
+        cleanup_complete=True,
+        source_modified=False,
+        comparison=compare_backtest_evidence(baseline, candidate),
+        holdout_gate=holdout_bad,
+        holdout_comparison=compare_backtest_evidence(baseline, holdout_bad),
+    )
+    assert evaluation.eligible_for_export is False
 
 
 def test_backtest_gate_hidden_worker_uses_exact_tickers_and_neutralizes_extra_symbols(
@@ -8208,8 +8351,8 @@ class _StrictBatchGateway:
         self.ledger.reconcile(reservation, usage, window=budget_window)
         model = {
             "orchestrator": "qwen/qwen3-next-80b-a3b-instruct",
-            "reasoner": "qwen/qwen3-next-80b-a3b-instruct",
-            "coder": "deepseek/deepseek-chat",
+            "reasoner": "deepseek/deepseek-r1",
+            "coder": "qwen/qwen3-coder-next",
         }[role]
         return AgentCompletion(outcome, usage, "stop", model)
 
@@ -8249,17 +8392,11 @@ def _loop_route(*, path: str = "core/backtest_engine.py") -> Any:
 def _loop_plan(*, path: str = "core/backtest_engine.py") -> Any:
     from agent_loop import ReasoningPlan, ReasoningSourceEvidence
 
-    source_line = {
-        "core/backtest_engine.py": "VALUE = 1",
-        "core/momentum_analysis.py": "MOMENTUM = 1",
-        "core/pivot_detector.py": "PIVOT = 1",
-    }[path]
-
     return ReasoningPlan(
         diagnosis="The constant is incorrect.",
         causal_hypothesis="The implementation may have retained the old value.",
         source_evidence=(
-            ReasoningSourceEvidence(path=path, start_line=1, lines=(source_line,)),
+            ReasoningSourceEvidence(path=path),
         ),
         configuration_fact_ids=(),
         invariants=("Keep the public interface unchanged.",),
@@ -8270,17 +8407,18 @@ def _loop_plan(*, path: str = "core/backtest_engine.py") -> Any:
     )
 
 
-def _loop_proposal(*, path: str = "core/backtest_engine.py") -> Any:
+def _loop_proposal(*, path: str = "core/backtest_engine.py", value: int = 2) -> Any:
     from agent_loop import ExactLineReplacement, TypedCodingProposal
 
     old_line = "MOMENTUM = 1" if path == "core/momentum_analysis.py" else "VALUE = 1"
-    new_line = "MOMENTUM = 2" if path == "core/momentum_analysis.py" else "VALUE = 2"
+    new_line = (
+        f"MOMENTUM = {value}" if path == "core/momentum_analysis.py" else f"VALUE = {value}"
+    )
     return TypedCodingProposal(
         summary="Correct the isolated constant.",
         replacements=(
             ExactLineReplacement(
                 path=path,
-                start_line=1,
                 old_lines=(old_line,),
                 new_lines=(new_line,),
             ),
@@ -8293,6 +8431,7 @@ def _run_proposal_batch_fixture(
     *,
     samples: int,
     outcomes: list[object],
+    holdout: bool = False,
     clock: Any = None,
     source_setup: Any = None,
     evaluation_quality: Any = None,
@@ -8352,6 +8491,8 @@ def _run_proposal_batch_fixture(
             historical_data_bundle=(root / "bundle.sqlite3").resolve(),
             historical_data_sha256="a" * 64,
             thresholds=BacktestThresholds(1.0, 0.0, 0.0, 100.0, 0),
+            holdout_start_date="2024-07-01" if holdout else None,
+            holdout_end_date="2025-01-01" if holdout else None,
         ),
         models=ModelConfig(),
         limits=LoopLimits(
@@ -8396,6 +8537,18 @@ def _run_proposal_batch_fixture(
             calendar_days=366,
         ),
     )
+    candidate_evidence = replace(
+        evidence,
+        outcome="thresholds_met",
+        gate_observation=True,
+        failure_codes=(),
+        backtest_diagnostics=replace(
+            evidence.backtest_diagnostics,
+            total_return_pct=2.0,
+            total_return_margin=1.0,
+            failed_metrics=(),
+        ),
+    )
 
     def snapshots(current: Any, paths: tuple[str, ...]) -> tuple[Any, ...]:
         return tuple(
@@ -8413,17 +8566,23 @@ def _run_proposal_batch_fixture(
             run_primary_gate=lambda _candidate: evidence,
             read_snapshots=snapshots,
             evaluate_proposal=(
-                (lambda proposal, sample: evaluation_callback(proposal, sample, evidence))
+                (
+                    lambda proposal, sample: evaluation_callback(
+                        proposal, sample, candidate_evidence
+                    )
+                )
                 if evaluation_callback is not None
                 else lambda _proposal, _sample: ProposalEvaluation(
                     quality=evaluation_quality
                     or QualityObservation(True, True, True, True),
-                    gate=evidence,
+                    gate=candidate_evidence,
                     candidate_manifest_sha256="c" * 64,
                     cleanup_complete=True,
                     source_modified=False,
+                    holdout_gate=candidate_evidence if holdout else None,
                 )
             ),
+            run_holdout_gate=(lambda _candidate: evidence) if holdout else None,
             monotonic=clock or time.monotonic,
             editable_paths=("core/momentum_analysis.py", "core/pivot_detector.py"),
         ),
@@ -8470,8 +8629,6 @@ def test_proposal_batch_supplies_and_enforces_grounded_configuration_facts(
         source_evidence=(
             ReasoningSourceEvidence(
                 path="core/momentum_analysis.py",
-                start_line=2,
-                lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
             ),
         ),
         configuration_fact_ids=("settings.RS_Q1_WEIGHT",),
@@ -8486,7 +8643,6 @@ def test_proposal_batch_supplies_and_enforces_grounded_configuration_facts(
         replacements=(
             ExactLineReplacement(
                 path="core/momentum_analysis.py",
-                start_line=2,
                 old_lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
                 new_lines=("MOMENTUM = settings.RS_Q1_WEIGHT * 2",),
             ),
@@ -8560,8 +8716,6 @@ def test_proposal_batch_rejects_ungrounded_reasoner_before_coder(
         source_evidence=(
             ReasoningSourceEvidence(
                 path="core/momentum_analysis.py",
-                start_line=2,
-                lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
             ),
         ),
         configuration_fact_ids=(),
@@ -8579,7 +8733,7 @@ def test_proposal_batch_rejects_ungrounded_reasoner_before_coder(
     )
     try:
         assert result.status == "batch_failed"
-        assert result.failure_code == "canary_rejected"
+        assert result.failure_code == "reasoner_evidence_rejected"
         assert result.budget.api_calls == 2
         assert gateway.roles == ["orchestrator", "reasoner"]
         events = [
@@ -8643,8 +8797,6 @@ def test_proposal_batch_rejects_configuration_bypass_before_export(
         source_evidence=(
             ReasoningSourceEvidence(
                 path="core/momentum_analysis.py",
-                start_line=2,
-                lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
             ),
         ),
         configuration_fact_ids=("settings.RS_Q1_WEIGHT",),
@@ -8659,7 +8811,6 @@ def test_proposal_batch_rejects_configuration_bypass_before_export(
         replacements=(
             ExactLineReplacement(
                 path="core/momentum_analysis.py",
-                start_line=2,
                 old_lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
                 new_lines=("MOMENTUM = 6.0",),
             ),
@@ -8673,7 +8824,7 @@ def test_proposal_batch_rejects_configuration_bypass_before_export(
     )
     try:
         assert result.status == "batch_failed"
-        assert result.failure_code == "canary_rejected"
+        assert result.failure_code == "patch_rejected"
         assert result.attempted_samples == 1
         assert result.completed_samples == 0
         assert result.rejected_samples == 1
@@ -8705,8 +8856,6 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
         source_evidence=(
             ReasoningSourceEvidence(
                 path="core/momentum_analysis.py",
-                start_line=1,
-                lines=("MOMENTUM = 1",),
             ),
         ),
         configuration_fact_ids=(),
@@ -8716,11 +8865,14 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
         skip=False,
         skip_reason="",
     )
-    proposal = _loop_proposal(path="core/momentum_analysis.py")
     outcomes = [
         item
         for _sample in range(50)
-        for item in (route, plan, proposal)
+        for item in (
+            route,
+            plan,
+            _loop_proposal(path="core/momentum_analysis.py", value=_sample + 2),
+        )
     ]
     result, gateway, candidate, external = _run_proposal_batch_fixture(
         tmp_path,
@@ -8768,6 +8920,90 @@ def test_proposal_batch_canary_and_fifty_samples_are_exactly_three_calls_each(
         external.cleanup()
 
 
+def test_proposal_batch_rejects_duplicate_diffs_after_the_canary(tmp_path: Path) -> None:
+    """Identical patches must not be exported repeatedly as independent optimization results."""
+    result, gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
+    )
+    try:
+        assert result.status == "batch_failed"
+        assert result.failure_code == "duplicate_proposal"
+        assert result.attempted_samples == 2
+        assert result.completed_samples == 1
+        assert result.rejected_samples == 1
+        events = [
+            json.loads(line)
+            for line in (result.audit_path / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert [
+            event["details"]
+            for event in events
+            if event["event"] == "proposal_sample_rejected"
+        ] == [{"calls_consumed": 3, "code": "duplicate_proposal", "sample": 2}]
+        assert len(result.samples) == 1
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_ranks_completed_samples_by_quality_delta(tmp_path: Path) -> None:
+    from agent_loop import ProviderGateEvidence, ProposalEvaluation, QualityObservation
+
+    def evaluate(_proposal: object, sample: int, evidence: object) -> object:
+        assert isinstance(evidence, ProviderGateEvidence)
+        diagnostics = replace(
+            evidence.backtest_diagnostics,
+            total_return_pct=float(sample + 2),
+            total_return_margin=float(sample + 1),
+            failed_metrics=(),
+        )
+        gate = replace(
+            evidence,
+            outcome="thresholds_met",
+            gate_observation=True,
+            failure_codes=(),
+            backtest_diagnostics=diagnostics,
+        )
+        return ProposalEvaluation(
+            quality=QualityObservation(True, True, True, True),
+            gate=gate,
+            candidate_manifest_sha256="c" * 64,
+            cleanup_complete=True,
+            source_modified=False,
+        )
+
+    result, _gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=2,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py", value=2),
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py", value=3),
+        ],
+        evaluation_callback=evaluate,
+    )
+    try:
+        assert result.status == "batch_complete", result.failure_code
+        assert [sample.sample for sample in result.samples] == [2, 1]
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
 def test_proposal_batch_failure_stops_before_the_next_role_or_sample(tmp_path: Path) -> None:
     """Break caught: an abort or invalid canary still allowed paid rollout calls."""
     from agent_loop import Route
@@ -8785,7 +9021,7 @@ def test_proposal_batch_failure_stops_before_the_next_role_or_sample(tmp_path: P
     )
     try:
         assert result.status == "batch_failed"
-        assert result.failure_code == "canary_rejected"
+        assert result.failure_code == "orchestrator_abort"
         assert result.attempted_samples == 1
         assert result.completed_samples == 0
         assert result.rejected_samples == 1
@@ -8846,8 +9082,8 @@ def test_proposal_batch_rejects_accounted_facts_not_bound_to_active_call(
     fabricated = ProviderCallFacts(
         call_index=99,
         role="coder",
-        requested_model="deepseek/deepseek-chat",
-        returned_model="deepseek/deepseek-chat",
+        requested_model="qwen/qwen3-coder-next",
+        returned_model="qwen/qwen3-coder-next",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=10,
@@ -8900,8 +9136,8 @@ def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
     facts = ProviderCallFacts(
         call_index=2,
         role="reasoner",
-        requested_model="qwen/qwen3-next-80b-a3b-instruct",
-        returned_model="qwen/qwen3-next-80b-a3b-instruct",
+        requested_model="deepseek/deepseek-r1",
+        returned_model="deepseek/deepseek-r1",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=10,
@@ -8937,10 +9173,10 @@ def test_proposal_batch_rejects_accounted_facts_with_corrupted_committed_budget(
         external.cleanup()
 
 
-def test_proposal_batch_continues_after_a_post_canary_reasoner_skip(
+def test_proposal_batch_stops_after_a_post_canary_reasoner_skip(
     tmp_path: Path,
 ) -> None:
-    """One harmless decline must not make a fifty-sample ensemble all-or-nothing."""
+    """A model-quality decline stops the batch before another paid sample."""
     from agent_loop import ReasoningPlan
 
     skip = ReasoningPlan(
@@ -8966,8 +9202,8 @@ def test_proposal_batch_continues_after_a_post_canary_reasoner_skip(
         ],
     )
     try:
-        assert result.status == "batch_complete"
-        assert result.failure_code == "none"
+        assert result.status == "batch_failed"
+        assert result.failure_code == "reasoner_skip"
         assert result.attempted_samples == 2
         assert result.completed_samples == 1
         assert result.rejected_samples == 1
@@ -8996,10 +9232,10 @@ def test_proposal_batch_continues_after_a_post_canary_reasoner_skip(
         external.cleanup()
 
 
-def test_proposal_batch_continues_after_a_post_canary_inert_patch_rejection(
+def test_proposal_batch_stops_after_a_post_canary_inert_patch_rejection(
     tmp_path: Path,
 ) -> None:
-    """A rejected inert edit is model-quality evidence, not a controller failure."""
+    """A rejected inert edit stops the batch before another paid sample."""
     from agent_loop import ExactLineReplacement, TypedCodingProposal
 
     invalid = TypedCodingProposal(
@@ -9007,7 +9243,6 @@ def test_proposal_batch_continues_after_a_post_canary_inert_patch_rejection(
         replacements=(
             ExactLineReplacement(
                 path="core/momentum_analysis.py",
-                start_line=1,
                 old_lines=("MOMENTUM = 999",),
                 new_lines=("MOMENTUM = 2",),
             ),
@@ -9026,7 +9261,8 @@ def test_proposal_batch_continues_after_a_post_canary_inert_patch_rejection(
         ],
     )
     try:
-        assert result.status == "batch_complete"
+        assert result.status == "batch_failed"
+        assert result.failure_code == "patch_rejected"
         assert result.attempted_samples == 2
         assert result.completed_samples == 1
         assert result.rejected_samples == 1
@@ -9073,8 +9309,8 @@ def test_proposal_batch_stops_on_an_accounted_coder_payload_rejection(
     facts = ProviderCallFacts(
         call_index=6,
         role="coder",
-        requested_model="deepseek/deepseek-chat",
-        returned_model="deepseek/deepseek-chat",
+        requested_model="qwen/qwen3-coder-next",
+        returned_model="qwen/qwen3-coder-next",
         finish_reason="stop",
         usage=Usage(
             prompt_tokens=10,
@@ -9122,10 +9358,10 @@ def test_proposal_batch_stops_on_an_accounted_coder_payload_rejection(
         external.cleanup()
 
 
-def test_proposal_batch_continues_after_a_post_canary_reasoner_evidence_rejection(
+def test_proposal_batch_stops_after_a_post_canary_reasoner_evidence_rejection(
     tmp_path: Path,
 ) -> None:
-    """An out-of-snapshot plan is rejected by grounding without ending the later ensemble."""
+    """An out-of-snapshot plan is rejected by grounding and stops the batch."""
     result, gateway, candidate, external = _run_proposal_batch_fixture(
         tmp_path,
         samples=2,
@@ -9138,8 +9374,8 @@ def test_proposal_batch_continues_after_a_post_canary_reasoner_evidence_rejectio
         ],
     )
     try:
-        assert result.status == "batch_complete"
-        assert result.failure_code == "none"
+        assert result.status == "batch_failed"
+        assert result.failure_code == "reasoner_evidence_rejected"
         assert result.attempted_samples == 2
         assert result.completed_samples == 1
         assert result.rejected_samples == 1
@@ -9248,7 +9484,7 @@ def test_proposal_batch_hash_binds_private_evaluation_to_inert_proposal(
         evaluation_sha256 = hashlib.sha256(evaluation_path.read_bytes()).hexdigest()
         evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
         assert evaluation["quality"]["test_gate_passed"] is True
-        assert evaluation["gate"]["outcome"] == "thresholds_not_met"
+        assert evaluation["gate"]["outcome"] == "thresholds_met"
         assert result.samples[0].evaluation_path == evaluation_path
         assert result.samples[0].evaluation_sha256 == evaluation_sha256
         assert metadata["proposal_evaluation_sha256"] == evaluation_sha256
@@ -9281,6 +9517,13 @@ def test_proposal_batch_hash_binds_private_evaluation_to_inert_proposal(
             ).hexdigest(),
             "proposal_payload_sha256": coder_payload_sha256,
             "sample": 1,
+            "comparison": {
+                "total_return_delta": evaluation["comparison"]["total_return_delta"],
+                "annualized_return_delta": evaluation["comparison"]["annualized_return_delta"],
+                "sharpe_delta": evaluation["comparison"]["sharpe_delta"],
+                "drawdown_headroom_delta": evaluation["comparison"]["drawdown_headroom_delta"],
+                "closed_trades_delta": evaluation["comparison"]["closed_trades_delta"],
+            },
         }
         batch_summary = json.loads(
             (result.audit_path / "batch-summary.json").read_text(encoding="utf-8")
@@ -9317,7 +9560,7 @@ def test_proposal_batch_rejects_private_quality_failure_before_export(
     )
     try:
         assert result.status == "batch_failed"
-        assert result.failure_code == "canary_rejected"
+        assert result.failure_code == "patch_rejected"
         assert result.completed_samples == 0
         assert result.rejected_samples == 1
         assert gateway.roles == ["orchestrator", "reasoner", "coder"]
@@ -9327,6 +9570,35 @@ def test_proposal_batch_rejects_private_quality_failure_before_export(
         events = verify_audit_chain(result.audit_path / "events.jsonl")
         rejected = [event for event in events if event["event"] == "proposal_sample_rejected"]
         assert rejected[0]["details"]["code"] == "patch_rejected"
+        assert not candidate.root.exists()
+    finally:
+        external.cleanup()
+
+
+def test_proposal_batch_requires_and_records_trailing_holdout_evidence(
+    tmp_path: Path,
+) -> None:
+    result, _gateway, candidate, external = _run_proposal_batch_fixture(
+        tmp_path,
+        samples=1,
+        holdout=True,
+        outcomes=[
+            _loop_route(path="core/momentum_analysis.py"),
+            _loop_plan(path="core/momentum_analysis.py"),
+            _loop_proposal(path="core/momentum_analysis.py"),
+        ],
+    )
+    try:
+        assert result.status == "batch_complete", result.failure_code
+        holdout_path = result.audit_path / "provider-evidence-holdout.json"
+        assert holdout_path.is_file()
+        evaluation = json.loads(
+            (result.audit_path / "proposal-evaluation-001.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert evaluation["holdout_gate"]["outcome"] == "thresholds_met"
+        assert evaluation["holdout_comparison"]["accepted"] is True
         assert not candidate.root.exists()
     finally:
         external.cleanup()
@@ -9698,8 +9970,6 @@ def test_proposal_batch_audits_a_global_rollout_overage_without_next_call(
         source_evidence=(
             ReasoningSourceEvidence(
                 path="core/momentum_analysis.py",
-                start_line=1,
-                lines=("MOMENTUM = 1",),
             ),
         ),
         configuration_fact_ids=(),
@@ -10172,9 +10442,7 @@ def test_state_machine_rejects_ungrounded_reasoner_before_coder(tmp_path: Path) 
         causal_hypothesis="The constant may retain the wrong value.",
         source_evidence=(
             ReasoningSourceEvidence(
-                path="core/backtest_engine.py",
-                start_line=1,
-                lines=("VALUE = 0",),
+                path="core/pivot_detector.py",
             ),
         ),
         configuration_fact_ids=(),
@@ -10248,8 +10516,6 @@ def test_state_machine_rejects_configuration_bypass_before_apply(tmp_path: Path)
         source_evidence=(
             ReasoningSourceEvidence(
                 path="core/momentum_analysis.py",
-                start_line=2,
-                lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
             ),
         ),
         configuration_fact_ids=("settings.RS_Q1_WEIGHT",),
@@ -10264,7 +10530,6 @@ def test_state_machine_rejects_configuration_bypass_before_apply(tmp_path: Path)
         replacements=(
             ExactLineReplacement(
                 path="core/momentum_analysis.py",
-                start_line=2,
                 old_lines=("MOMENTUM = settings.RS_Q1_WEIGHT",),
                 new_lines=("MOMENTUM = 6.0",),
             ),
@@ -10342,6 +10607,8 @@ def _batch_cli_argv(tmp_path: Path, *, samples: int = 50) -> list[str]:
         "--benchmark", "SPY",
         "--start-date", "2024-01-01",
         "--end-date", "2025-01-01",
+        "--holdout-start-date", "2024-07-01",
+        "--holdout-end-date", "2025-01-01",
         "--historical-data-bundle", str((tmp_path / "bundle.sqlite3").resolve()),
         "--historical-data-sha256", "a" * 64,
         "--minimum-total-return", "0",
@@ -10404,11 +10671,19 @@ def test_production_proposal_scope_excludes_read_only_backtest_oracles() -> None
 
     editable = agent_loop._proposal_batch_editable_paths()
 
-    assert editable == (
-        "core/momentum_analysis.py",
-        "core/pivot_detector.py",
-    )
+    assert editable == ("core/pivot_detector.py",)
     assert not set(editable) & agent_loop.BACKTEST_READ_ONLY_PATHS
+
+
+def test_proposal_batch_experiment_family_is_bounded_and_nonidentical() -> None:
+    import agent_loop
+
+    family = agent_loop._proposal_batch_allowed_replacements()
+    assert 2 <= len(family) <= 50
+    assert len(set(family)) == len(family)
+    assert all(item.path == "core/pivot_detector.py" for item in family)
+    assert all(item.old_lines == ("    if right_lip < left_lip * 0.95:",) for item in family)
+    assert all(item.new_lines != item.old_lines for item in family)
 
 
 def test_cli_routes_batch_to_dedicated_runner_and_prints_closed_summary(

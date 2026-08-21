@@ -118,8 +118,10 @@ not permission to expose provider credentials.
 Default models are exactly:
 
 - Orchestrator: `qwen/qwen3-next-80b-a3b-instruct`
-- Reasoner: `qwen/qwen3-next-80b-a3b-instruct`
-- Coder: `deepseek/deepseek-chat`
+- Reasoner: `deepseek/deepseek-r1`
+- Coder: `qwen/qwen3-coder-next`
+
+These role slugs are fixed controller constants; alternate model selection and fallback routing are disabled.
 
 The controller uses the official OpenAI Python SDK pinned to `openai==2.54.0` and configured
 with `base_url="https://openrouter.ai/api/v1"`. The conservative 2.x pin avoids adopting the

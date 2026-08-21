@@ -25,8 +25,9 @@ OpenRouter Chat Completions.
 - Work only in `.worktrees/multi-agent-backtest-loop` on
   `codex/multi-agent-backtest-loop`; never edit the root checkout or paper runtime.
 - `MAX_ITERATIONS = 10`; a CLI override may lower but never raise it.
-- The exact role models are Qwen3 Next 80B A3B Instruct for orchestrator and reasoner, and
-  DeepSeek Chat for coder; Reasoner `max_tokens=4096` is fixed.
+- The exact role models are Qwen3 Next 80B A3B Instruct for orchestrator, DeepSeek R1 for
+  reasoner, and Qwen3 Coder Next for coder; Reasoner `max_tokens=4096` is fixed.
+- Alternate model selection and fallback routing are disabled.
 - Use the official OpenAI SDK with OpenRouter base URL, explicit timeout, `max_retries=0`, and
   non-streaming Chat Completions.
 - Orchestrator and Reasoner use `response_format={"type": "json_object"}`; Coder does too.

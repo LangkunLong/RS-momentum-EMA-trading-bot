@@ -139,7 +139,7 @@ CI runs Ruff, compilation, and the non-integration test suite on Python 3.11 and
 
 `agent_loop.py` is not part of paper trading or the scheduler. It runs one sealed technical-only
 backtest in an attested, network-disabled Docker worker, then asks a fixed three-role model set for
-an inert proposal: Qwen orchestrator, Qwen reasoner, and DeepSeek Chat coder. The coder returns
+an inert proposal: Qwen3 Next 80B A3B orchestrator, DeepSeek R1 reasoner, and Qwen3 Coder Next coder. The coder returns
 typed exact-line replacements; the controller verifies immutable source coordinates and old text,
 rejects invalid Python and newly introduced defaulted parameters, renders the unified diff itself,
 and never writes it to this checkout. Broker, FMP, mail, Git, and OpenRouter credentials are absent
@@ -168,6 +168,8 @@ New-Item -ItemType Directory -Force $controllerRoot, $auditRoot | Out-Null
   --benchmark '<approved-benchmark>' `
   --start-date '<YYYY-MM-DD>' `
   --end-date '<YYYY-MM-DD>' `
+  --holdout-start-date '<trailing-holdout-YYYY-MM-DD>' `
+  --holdout-end-date '<same-as-end-date>' `
   --historical-data-bundle '<absolute-approved-sqlite-path>' `
   --historical-data-sha256 '<64-lowercase-hex>' `
   --minimum-total-return '<operator-threshold>' `
@@ -193,6 +195,15 @@ exit `22` is a fail-closed controller/batch failure. Proposal metadata deliberat
 disposable candidate, runs pytest, Ruff, compileall, `git diff --check`, and the sealed backtest,
 then removes that candidate. This is evidence for review, not merge or trading authorization.
 
+Proposal quality is evaluated against the sealed baseline, not against thresholds alone. A candidate
+must pass the primary window, be non-worse on return, annualized return, Sharpe, drawdown headroom,
+and closed trades, and improve at least one of those measures. When a trailing holdout window is
+configured (required for proposal-batch CLI runs), the same comparison must also pass out of sample.
+Accepted diffs are deduplicated and returned in deterministic quality order; rejected duplicates remain
+audit-classified and are never exported as separate experiments. The orchestrator uses Qwen3 Next 80B
+A3B Instruct, the reasoner uses DeepSeek R1, and the coder uses Qwen3 Coder Next.
+These role slugs are fixed controller constants; alternate model selection and fallback routing are disabled.
+
 Do not turn a canary into a 50-attempt run automatically. First inspect the payload, rendered diff,
 private-evaluation artifact, audit chain, source immutability, exact cited source/configuration
 facts, and whether the edit changes an existing executed strategy path.
@@ -200,10 +211,11 @@ Only a separately authorized same-commit run may use `--proposal-samples 50`,
 `--max-api-calls 150`, `--canary-max-usd 0.50`, `--max-usd 2.00`,
 `--max-tokens 2000000`, `--max-iterations 1`, no `--apply`, and a wall timeout large enough for
 the observed model latency. The 150-call value is a hard ceiling/reservation; actual authoritative
-calls may be lower because an orchestrator abort or reasoner skip classifies a sample before the
-coder call. In a completed batch, `completed_samples` counts exported proposals and
-`rejected_samples` counts safe model-quality rejections; `batch_complete` means all requested
-attempts were classified, not that every attempt produced a proposal.
+calls may be lower because the batch fails closed on the first orchestrator abort, reasoner skip,
+scope/policy rejection, duplicate, provider failure, or accounting failure. `completed_samples`
+counts exported proposals; `rejected_samples` records any classified sample before the terminal
+failure. A `batch_complete` result means every requested sample completed with an accepted,
+privately evaluated, unique proposal; any rejection stops further model calls.
 
 Outside proposal-batch mode, `--apply` still means apply only inside the disposable controller
 candidate so another quarantined iteration can observe the change. It never applies to this
