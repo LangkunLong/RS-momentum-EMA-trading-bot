@@ -363,6 +363,7 @@ def test_backtest_provider_evidence_exposes_only_bounded_diagnostics() -> None:
         "ticker_count": 11,
         "calendar_days": 1096,
         "provider_safe": True,
+        "signal_funnel": None,
     }
     assert not hasattr(evidence, "stdout") and not hasattr(evidence, "metrics")
 
@@ -5240,6 +5241,7 @@ def test_backtest_gate_copies_approved_bundle_and_fails_closed_on_missing_sentin
         "ticker_count": 1,
         "calendar_days": 31,
         "provider_safe": True,
+        "signal_funnel": None,
     }
 
     missing = FakeSandbox("ordinary output only\n")

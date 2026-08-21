@@ -6498,6 +6498,10 @@ class BacktestSignalFunnelEvidence:
             raise ConfigurationError("backtest signal funnel counts are invalid")
         if self.signal_days > self.evaluated_rows or self.symbols_evaluated > self.evaluated_rows:
             raise ConfigurationError("backtest signal funnel dimensions are inconsistent")
+        if not 1 <= self.candidate_universe_count <= 5000:
+            raise ConfigurationError("backtest candidate universe count is invalid")
+        if not 1 <= self.rs_universe_count <= 5000:
+            raise ConfigurationError("backtest RS universe count is invalid")
         for name in (
             "rs_pass",
             "market_pass",
