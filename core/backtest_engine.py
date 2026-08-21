@@ -632,6 +632,7 @@ def _new_execution_diagnostics() -> dict[str, int]:
         "entry_rejected_missing_data": 0,
         "entry_rejected_invalid_price": 0,
         "entry_rejected_invalid_risk": 0,
+        "entry_rejected_no_cash": 0,
         "eviction_attempts": 0,
         "evictions_executed": 0,
         "eviction_rejections": 0,
@@ -644,7 +645,10 @@ class PortfolioSimulator:
     def __init__(
         self,
         initial_capital: float = DEFAULT_CAPITAL,
-        max_positions: Optional[int] = settings.MAX_OPEN_POSITIONS,
+        # Backtests should evaluate every eligible signal by default.  The
+        # live execution guard in config.settings remains unchanged; callers
+        # can still pass an explicit cap for a concentration experiment.
+        max_positions: Optional[int] = None,
         position_size_pct: float = DEFAULT_POSITION_SIZE_PCT,
         position_risk_pct: float = DEFAULT_POSITION_RISK_PCT,
         stop_loss_pct: float = settings.STOP_LOSS_PCT,
@@ -865,7 +869,7 @@ class PortfolioSimulator:
         market_allowed = bool(
             not self.require_bullish_market or market_state["market_is_bullish"]
         )
-        if not regime_allowed:
+        if self.use_stateful_regime_gate and not regime_allowed:
             self._execution_diagnostics["blocked_by_regime_days"] += 1
         if not market_allowed:
             self._execution_diagnostics["blocked_by_market_days"] += 1
@@ -1009,6 +1013,10 @@ class PortfolioSimulator:
 
         if entry_price <= 0:
             self._execution_diagnostics["entry_rejected_invalid_price"] += 1
+            return
+
+        if self._equity <= 0:
+            self._execution_diagnostics["entry_rejected_no_cash"] += 1
             return
 
         total_portfolio_value = self._mark_equity(ticker_ohlcv, entry_date)
@@ -1351,6 +1359,11 @@ def print_pnl_report(result: SimulationResult) -> None:
             "Capacity-truncated / capacity-rejected: "
             f"{execution.get('capacity_truncated_signals', 0)} / "
             f"{execution.get('entry_rejected_capacity', 0)}"
+        )
+        print(
+            "No-cash / invalid-risk rejections: "
+            f"{execution.get('entry_rejected_no_cash', 0)} / "
+            f"{execution.get('entry_rejected_invalid_risk', 0)}"
         )
 
     warnings: list[str] = []
