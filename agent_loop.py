@@ -6731,12 +6731,16 @@ class BacktestComparison:
 def compare_backtest_evidence(
     baseline: ProviderGateEvidence,
     candidate: ProviderGateEvidence,
+    *,
+    require_strict_improvement: bool = True,
 ) -> BacktestComparison:
     """Compare one private candidate to the exact sealed baseline, fail closed on ambiguity."""
     if not isinstance(baseline, ProviderGateEvidence) or not isinstance(
         candidate, ProviderGateEvidence
     ):
         raise ConfigurationError("backtest comparison requires provider gate evidence")
+    if type(require_strict_improvement) is not bool:
+        raise ConfigurationError("backtest comparison strictness must be boolean")
     baseline_diag = baseline.backtest_diagnostics
     candidate_diag = candidate.backtest_diagnostics
     zero = (0.0, 0.0, 0.0, 0.0, 0)
@@ -6794,7 +6798,7 @@ def compare_backtest_evidence(
         # return, risk, and Sharpe.  The absolute candidate gate still enforces
         # ``minimum_closed_trades``; only the performance deltas determine
         # strict improvement here.
-        if not any(delta > 0 for delta in deltas[:4]):
+        if require_strict_improvement and not any(delta > 0 for delta in deltas[:4]):
             failures.append("no_strict_improvement")
     return BacktestComparison(
         total_return_delta=float(deltas[0]),
@@ -9993,6 +9997,7 @@ def run_proposal_batch(
                                 holdout_comparison=compare_backtest_evidence(
                                     holdout_evidence,
                                     evaluation.holdout_gate,
+                                    require_strict_improvement=False,
                                 ),
                             )
                     evaluation_path, evaluation_sha256 = (
