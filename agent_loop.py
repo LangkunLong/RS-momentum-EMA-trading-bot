@@ -1914,7 +1914,7 @@ class OpenRouterGateway:
             "coder": CODER_MODEL,
         }
     )
-    _TOKEN_CAPS = MappingProxyType({"orchestrator": 2048, "reasoner": 4096, "coder": 8192})
+    _TOKEN_CAPS = MappingProxyType({"orchestrator": 2048, "reasoner": 4096, "coder": 16384})
     _RESPONSE_SCHEMA_NAMES = MappingProxyType(
         {
             "orchestrator": "agent_loop_orchestrator_v1",
