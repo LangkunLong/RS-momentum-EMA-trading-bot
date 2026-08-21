@@ -10,6 +10,7 @@ CANSLIM Stock Screening Bot — an algorithmic stock screener implementing Willi
 ├── enhanced_scanner.py            # Main entry point — CLI scanner
 ├── quality_stocks.py              # Ticker retrieval interface
 ├── backtest.py                    # Walk-forward backtesting engine
+├── agent_loop.py                  # Isolated, proposal-only multi-agent backtest controller
 ├── pyproject.toml                 # Ruff, pytest, and coverage configuration
 ├── .pre-commit-config.yaml        # Pre-commit hooks (ruff-format, ruff lint)
 ├── config/
@@ -32,17 +33,20 @@ CANSLIM Stock Screening Bot — an algorithmic stock screener implementing Willi
 ├── tests/
 │   ├── conftest.py                # Shared fixtures (mock_opportunity, tmp_csv_path)
 │   ├── test_canslim_logic.py      # Pure unit tests for CANSLIM business logic
-│   └── test_data_client.py        # Unit tests for data client (mocked API calls)
+│   ├── test_data_client.py        # Unit tests for data client (mocked API calls)
+│   └── test_agent_loop.py         # Offline controller, audit, sandbox, and protocol tests
 ```
 
 ## API Keys Required
 
-Two external APIs are used. Both keys must be present in a `.env` file (see `.env.example`):
+Scanner and trading workflows use Alpaca and FMP. The separate proposal controller uses OpenRouter
+only when explicitly invoked (see `.env.example`):
 
 | Variable | Service | Used For |
 |----------|---------|---------|
 | `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | [Alpaca Markets](https://alpaca.markets) | All price/OHLCV data |
 | `FMP_API_KEY` | [Financial Modeling Prep](https://financialmodelingprep.com) | Earnings, balance sheets, company info |
+| `OPENROUTER_API_KEY` or `OPENROUTER` | [OpenRouter](https://openrouter.ai) | Optional proposal-only `agent_loop.py` controller |
 
 ## How to Run
 
@@ -177,6 +181,7 @@ python -m pytest --cov=. --cov-report=html
 |------|---------------|
 | `tests/test_canslim_logic.py` | Pure business logic — `_safe_growth`, index alias routing, RS import source |
 | `tests/test_data_client.py` | Data client — CSV export, `validate_ticker` (mocked), column schema |
+| `tests/test_agent_loop.py` | Fail-closed model protocols, budgets, Docker confinement, audit chain, and inert proposal rendering |
 
 **Rules for writing tests in this project:**
 

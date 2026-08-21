@@ -1,0 +1,626 @@
+# Task 2 report: quarantine, deterministic gates, and patch policy
+
+## Scope and files
+
+- Modified `agent_loop.py`: source preflight/locking, tracked quarantine export, child environment,
+  bounded processes, attested sandbox runner, deterministic gates, historical-bundle validation,
+  hidden backtest worker, unified-diff policy, and transactional patch application/rollback.
+- Modified `tests/test_agent_loop.py`: real temporary Git repositories and high-impact Task 2
+  behavior tests. External sandbox execution is represented only at the process boundary.
+- Added `Dockerfile.agent-loop`: digest-pinned Python 3.13.14 slim base, exact
+  `requirements-lock.txt`, UID/GID 65532, and Python entrypoint.
+- No provider calls, credential reads/prints, live execution imports, source-checkout execution, or
+  changes outside Task 2 files were made.
+
+## Named breaks covered
+
+- `test_preflight_rejects_unsafe_source_state`: unsafe dirty/detached/protected state becomes a
+  promotion baseline.
+- `test_preflight_captures_head_and_uses_worktree_git_lock_path`: linked worktree locks resolve to
+  the wrong Git path or exact HEAD is lost.
+- `test_preflight_exclusive_lock_and_permanent_runtime_fail_closed`: concurrent loops or the
+  permanent paper checkout become a controller.
+- `test_quarantine_exports_only_exact_tracked_commit_and_private_git`: ignored credentials or
+  artifacts leak into the private candidate.
+- `test_child_environment_is_allowlisted_scrubbed_and_parent_is_unchanged`: provider, broker,
+  cloud, proxy, or Git credentials reach a child, or parent environment is mutated.
+- `test_unsafe_local_mode_can_never_apply_or_promote`: the explicit local escape hatch executes
+  model-authored code or permits promotion.
+- `test_patch_policy_rejects_windows_and_traversal_paths`: traversal, drive, UNC, backslash, ADS,
+  reserved, trailing-dot, or quoted paths escape the approved scope.
+- `test_patch_policy_rejects_structural_diff_features`: create/delete/rename/mode/binary/combined
+  patch features reach Git.
+- `test_patch_policy_checks_hunk_counts_declared_files_deny_precedence_and_live_imports`: malformed
+  hunks, declaration mismatch, denylist override, or live reference reaches Git.
+- `test_backtest_gate_makes_engine_files_read_only_and_requires_mode_100644`: a metrics proposal
+  rewrites its oracle or targets a non-100644 entry.
+- `test_patch_apply_rolls_back_exact_bytes_on_compile_failure`: failed compilation leaves candidate
+  bytes mutated.
+- `test_patch_application_accumulates_valid_iterations_without_rejecting_prior_changes`: a second
+  valid iteration is rejected because the first valid patch remains.
+- `test_worker_export_has_no_git_and_hostile_runner_cannot_change_candidate`: worker execution sees
+  candidate Git metadata or changes the candidate manifest.
+- `test_sandbox_command_and_inspection_contract_is_fail_closed`: absent or weakly configured
+  container execution is trusted.
+- `test_data_bundle_validates_hash_schema_exact_keys_and_copies_privately`: wrong hash, schema, or
+  coverage introduces an unapproved pickle cache.
+- `test_backtest_gate_copies_approved_bundle_and_fails_closed_on_missing_sentinel`: process exit 0
+  without a trusted `SimulationResult` sentinel passes.
+- `test_backtest_threshold_boundaries_are_deterministic`: an LLM or off-by-one condition decides
+  total/annualized return, Sharpe, drawdown, or trade thresholds.
+- `test_backtest_gate_hidden_worker_uses_exact_tickers_and_neutralizes_extra_symbols`: hidden
+  settings or S&P expansion widens the approved ticker-plus-benchmark universe.
+- `test_fixed_test_gate_accepts_only_tracked_tests_selectors`: a pytest selector injects an option
+  or addresses an untracked/non-test path.
+
+## TDD evidence
+
+Initial required focused RED, before Task 2 production code:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "preflight or quarantine or child or gate or patch or rollback"
+24 failed, 32 passed, 36 deselected, 1 warning in 0.48s
+```
+
+All 24 failures were expected missing Task 2 imports/APIs; the 32 existing focused tests remained
+green. Subsequent targeted RED cases found real gaps:
+
+```text
+test_patch_application_accumulates_valid_iterations_without_rejecting_prior_changes
+1 failed, 92 deselected, 1 warning in 0.95s
+Failure: second patch saw the prior valid modification as out-of-scope.
+
+test_backtest_gate_copies_approved_bundle_and_fails_closed_on_missing_sentinel
+1 failed, 94 deselected, 1 warning in 0.18s
+Failure: run_backtest_gate was not yet implemented.
+
+exact-ticker mutation check (benchmark deliberately removed from hidden provider)
+1 failed, 93 deselected, 1 warning in 0.15s
+Failure: expected ["MSFT", "AAPL", "SPY"], got ["MSFT", "AAPL"].
+```
+
+Final required focused GREEN:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "preflight or quarantine or child or gate or patch or rollback"
+60 passed, 36 deselected, 1 warning in 16.40s
+
+python -m ruff check agent_loop.py tests/test_agent_loop.py
+All checks passed!
+```
+
+Fresh complete Task 2 verification:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py
+96 passed, 1 warning in 18.63s
+
+python -m py_compile agent_loop.py tests/test_agent_loop.py
+exit 0, no output
+
+git diff --check
+exit 0; Git emitted only the host core.autocrlf LF-to-CRLF advisory.
+```
+
+The pytest warning in all runs is the repository's existing `PytestConfigWarning: Unknown config
+option: cache_dir`; it is not introduced by these changes.
+
+## Sandbox and data evidence
+
+The container contract test exercises the real controller-built command/inspection behavior:
+
+- approved `repository@sha256:<64 hex>` resolves to a valid immutable image ID;
+- `create` uses that inspected image ID plus `--pull never`, non-root `65532:65532`, overridden
+  Python entrypoint, `--network none`, read-only root, `--cap-drop ALL`, no-new-privileges,
+  PID/memory/CPU caps, with protected inputs read-only and narrow writable scratch binds;
+- post-create inspection verifies the image ID, user, entrypoint, network, root mode, capability,
+  security, resource, and mount fields before `start --attach`;
+- child environment and argv are reconstructed from fixed allowlists; arbitrary Python commands
+  and non-private historical paths are rejected;
+- real-engine execution rejects an absent/non-regular executable before trusting output.
+
+The data validator uses the repository's real `dataset_cache` contract without importing or
+unpickling the payload:
+
+```text
+cache_key  TEXT PRIMARY KEY
+cache_kind TEXT NOT NULL
+created_at TEXT NOT NULL
+payload    BLOB NOT NULL
+```
+
+It requires the SQLite header, exact SHA-256, no symlink/reparse point, no unexpected schema
+objects, and both exact cache keys:
+
+```text
+price::<period>::<start>::<end>::<sorted requested tickers + benchmark>
+closes::<period>::<start>::<end>::<sorted requested tickers + benchmark>
+```
+
+Validation opens SQLite read-only/immutable with `trusted_schema=OFF` and `query_only=ON`; only key,
+kind, and payload length are selected. The opaque BLOB is never deserialized in the trusted
+controller. The approved file is copied once with exclusive creation into a controller-owned
+immutable snapshot, validated there, mounted read-only, and rehash-verified after use. The hidden
+worker clears `settings.EXTRA_SYMBOLS`, points the engine at that snapshot, and replaces the engine's
+S&P provider with exactly the requested symbols plus benchmark.
+
+## Self-review
+
+- Candidate code is never run from its private Git repository. Compile, pytest, and backtest paths
+  receive fresh tracked-only no-`.git` exports.
+- Patch application has no local compile fallback. Its runner must be explicitly supplied; the
+  production helper binds compilation to the attested sandbox.
+- Candidate snapshots include files, links/reparse points, directories, modes, hashes, and bytes.
+  Worker exceptions and hostile writes both trigger manifest comparison and exact restoration.
+- Diff validation completes path, structure, hunk, cap, deny/allow, mode, gate-read-only, and added
+  live-reference checks before the first `git apply` call.
+- Existing valid candidate changes may accumulate, while pre-existing untracked, structural, denied,
+  or gate-read-only state fails closed. Apply/check/diff/compile failures restore the full snapshot.
+- Git calls disable system/global config and prompts; candidate initialization disables templates.
+- The source lock uses the linked-worktree-aware `git rev-parse --git-path agent-loop.lock` path.
+
+## Limitations
+
+- This host has neither Docker nor Podman (`NO_SANDBOX_ENGINE`). The production path was therefore
+  not weakened or run locally: command creation and post-create attestation are covered with an
+  injected purpose-built process boundary, while the real backend's absence is tested fail-closed.
+- The worker image was not built on this host. `Dockerfile.agent-loop` pins the exact approved base
+  digest and lock file, but a later environment with the approved engine must build/inspect it.
+- No operator-approved real historical bundle was supplied. Tests use a structurally exact SQLite
+  cache whose BLOBs remain deliberately opaque, plus a fake engine boundary to prove exact ticker
+  and sentinel behavior.
+- Task 3 still owns the public CLI/state-machine wiring. Task 2 exposes enforceable APIs and the
+  hidden worker function/argv contract for that integration.
+
+## Review fix round 1/5 — proposal-only quarantine
+
+### Files
+
+- `agent_loop.py`: candidate capability, non-mutating source fingerprint/recheck, sanitized Git,
+  immutable data snapshot, six-mount sandbox contract, host-sealed completion envelopes, AST live
+  import rejection, observational results, and exact static/hidden argv grammars.
+- `tests/test_agent_loop.py`: deterministic regression coverage for all round findings and migrated
+  legacy tests to candidate-only and observational APIs.
+- `Dockerfile.agent-loop`: fixed numeric UID/GID; mutable build identity arguments removed.
+
+### Named breaks covered
+
+- `test_patch_policy_ast_rejects_multiline_core_live_import_alias`: multiline/aliased
+  `ImportFrom` bypassed the line regex.
+- `test_patch_application_allows_same_file_full_revert`: accumulated-scope equality rejected a
+  complete later revert.
+- `test_git_subprocess_environment_is_minimal_and_disables_extension_points`: Git inherited keys,
+  credentials, proxy/config/worktree controls, hooks, fsmonitor, pager, or external diff.
+- `test_quarantine_force_tracks_commit_files_even_when_ignore_rule_matches`: tracked-but-ignored
+  oracle input disappeared from the candidate index.
+- `test_unsafe_local_commit_export_ignores_mutable_worktree_bytes`: unsafe-local copied mutable
+  checkout bytes instead of the captured commit.
+- `test_data_bundle_is_streamed_once_to_immutable_controller_snapshot`: hash/use raced the operator
+  database and whole-file hashing bypassed the size bound.
+- `test_hidden_backtest_argv_grammar_rejects_reordering_duplicates_and_unknown_values`: an option
+  allowlist admitted ambiguous hidden-worker commands.
+- `test_candidate_apply_api_rejects_source_checkout_paths`: a generic `Path` apply surface could
+  target source instead of a controller-issued candidate.
+- `test_execution_mode_has_no_promotion_surface_and_gate_results_are_observational`: stale promotion
+  authority and `passed` vocabulary treated spoofable evidence as authorization.
+- `test_worker_dockerfile_uses_fixed_numeric_identity_without_build_args`: image identity could vary
+  through build arguments.
+- `test_worker_completion_envelope_is_host_sealed_chained_and_observational`: candidate output lacked
+  a controller-only nonce/run/image/config/manifest/argv/time/result/stream/cleanup record and chain.
+- `test_worker_mounts_candidate_gate_and_data_read_only_with_narrow_writable_dirs`: candidate,
+  protected gate, and data shared a writable bind.
+- `test_container_attestation_rejects_every_privilege_env_command_and_mount_weakening` (10 cases):
+  inspection admitted Privileged, CapAdd, Devices, DeviceRequests, extra SecurityOpt/Env, wrong
+  WorkingDir/Cmd, a writable protected mount, or a non-bind mount.
+- `test_engine_path_is_resolved_once_and_every_call_uses_canonical_absolute_path`: engine lookup
+  could change between inspection and execution.
+- `test_malformed_create_output_still_cleans_deterministic_name_and_verifies_absence`: malformed
+  create output stranded a named container.
+- `test_cleanup_failure_is_fatal_and_never_returns_observation`: successful stdout escaped failed
+  removal/absence confirmation.
+- `test_source_completion_recheck_reports_external_change_without_restoring_it`: completion cleanup
+  could overwrite a concurrent source edit.
+- `test_data_bundle_rejects_sidecars_size_overflow_and_post_run_tampering`: WAL/SHM/journal,
+  oversized input, or daemon-side mutation escaped the approved hash.
+
+### Exact TDD and verification output
+
+First focused RED, before the review fixes:
+
+```text
+10 failed, 96 deselected, 1 warning in 4.44s
+```
+
+The failures were the AST import, full revert, Git environment, tracked-ignore export,
+captured-commit unsafe-local, streaming snapshot, hidden grammar, candidate-only apply, observational
+API, and fixed Docker identity tests above.
+
+Second focused RED, for the engine/envelope/data lifecycle:
+
+```text
+17 failed, 106 deselected, 1 warning in 21.71s
+```
+
+The failures were the envelope, six mounts, ten strict inspection mutations, canonical engine,
+deterministic cleanup, cleanup failure, source recheck, and data lifecycle cases above.
+
+Focused GREEN:
+
+```text
+26 passed, 97 deselected, 3 warnings in 37.64s
+```
+
+Complete GREEN after legacy API migration:
+
+```text
+123 passed, 8 warnings in 65.17s (0:01:05)
+```
+
+Final static verification:
+
+```text
+python -m ruff check agent_loop.py tests/test_agent_loop.py
+All checks passed!
+
+python -m compileall -q agent_loop.py tests/test_agent_loop.py
+exit 0, no output
+
+git diff --check
+exit 0; only host core.autocrlf LF-to-CRLF advisories
+```
+
+Warnings are the repository's existing unknown `cache_dir` pytest option plus Python resource
+warnings from short-lived test-created SQLite fixtures; no production connection remains open.
+
+### Sandbox/data/schema evidence
+
+Each run receives a deterministic controller name and six exact binds: `/workspace/src`,
+`/workspace/gate`, and the empty data directory or dedicated approved SQLite file are read-only;
+`/workspace/tmp`, `/workspace/home`, and `/workspace/output` are the only writable binds. The image
+repository digest resolves to an immutable ID. Before and after start, inspection requires exact
+user, Python entrypoint, working directory, argv, base-plus-controller environment, bind sources and
+destinations/options, network none, read-only root, `CapDrop=[ALL]`, empty CapAdd/devices/device
+requests, exact no-new-privileges, and PID/memory/CPU limits. Cleanup is by name on every post-create
+path and success requires a subsequent inspect miss. Injected engines always report
+`worker_confined=false` and `security_attestation=false`; the daemon remains TCB and all outcomes are
+`gate_observation` only.
+
+The controller creates one private snapshot with exclusive creation while streaming SHA-256 under
+an 8 GiB hard limit, rejects database sidecars, validates and later mounts that same snapshot, uses
+a percent-encoded `file:...?mode=ro&immutable=1` SQLite URI, and rehashes after the worker. Validation
+still requires the exact `HistoricalDataCache` table/schema and exact price/closes cache keys for
+requested tickers plus benchmark without selecting or unpickling payload bytes.
+
+### Self-review and limitations
+
+- Source is never reset, cleaned, restored, patched, or promoted. `SourceFingerprint` covers
+  HEAD/branch, normalized index entries, tracked modes/content, and nonignored untracked names;
+  recheck only reports mismatch. Unsafe-local exports `SourceState.head` before local observation.
+- Only a live controller capability registered to a `Candidate` can reach `apply_candidate_patch`.
+  Worker callbacks receive tracked-only no-`.git` exports; candidate rollback authority never
+  extends to source.
+- Git children receive a minimal allowlist and explicit hook/fsmonitor/diff/pager disabling. Exact
+  tracked files are force-staged and paths/modes compared to the captured commit.
+- Completion envelopes are created in host memory after verified cleanup, HMAC sealed with a
+  controller-only ephemeral key, and chained to the previous envelope. They deliberately do not
+  convert same-interpreter pytest/backtest semantics into authorization.
+- Docker/Podman remains absent, so the production backend was only exercised fail-closed; a faithful
+  injected Docker-shaped boundary verifies the command/inspect lifecycle but can never produce
+  production-attested provenance.
+- Controller-owned approved snapshots persist for the caller's run lifetime; Task 3 owns lifecycle
+  disposal and inert diff/archive export wiring. No source-checkout apply or promotion API remains.
+
+## Review fix round 2/5 — controller/daemon boundary hardening
+
+### Files and named breaks
+
+- `agent_loop.py`: added stable lock-first source capture, explicit safe controller temp roots,
+  no-follow cleanup, absolute sanitized Git execution, a Windows Job Object/POSIX process-group
+  runner, Docker-only command and inspection attestation, controller-private engine state, exact
+  official image environment validation, approved-DB scratch copying, and hidden-worker import/cache
+  isolation.
+- `tests/test_agent_loop.py`: added deterministic regressions for engine environment leakage;
+  hostile symlink/junction cleanup; temp fallback; relative/alpaca live imports; exact digest argv;
+  verified writable DB scratch and real `DataFetcher`; namespace, port, and terminal-state mutations;
+  authoritative cleanup errors; unstable source capture; captured gate bytes; executable modes; a
+  real linked worktree lock; reproducible candidate commits; snapshot cleanup; absolute Git PATH
+  poisoning; controller-private engine config; and Windows grandchild/assignment containment.
+
+The highest-impact named breaks are:
+
+- `test_bounded_process_kills_pipe_holding_grandchild_on_success_and_timeout` (2 cases) and
+  `test_windows_job_assignment_failure_never_releases_target`: a successful/expired parent could
+  leave descendants and live stream readers; a target could start before containment.
+- `test_private_tree_cleanup_does_not_follow_hostile_symlink`, the Windows junction counterpart,
+  and `test_private_tree_cleanup_propagates_exact_root_removal_failure`: cleanup could chmod an
+  outside target or hide an incomplete removal.
+- `test_engine_cli_receives_only_minimal_controller_owned_environment` and
+  `test_engine_control_directories_are_never_mounted_to_candidate`: Docker inherited controller
+  secrets and its mutable home/config/temp was visible to candidate code.
+- `test_hidden_gate_streams_verified_approved_db_to_writable_scratch_before_import` and
+  `test_real_data_fetcher_opens_verified_writable_scratch_without_network`: the immutable approved
+  bind was opened as a mutable cache rather than copied, rehashed, and isolated before candidate
+  imports.
+- `test_container_attestation_rejects_host_namespaces_cgroups_and_published_ports` (6 cases) and
+  `test_terminal_state_attestation_rejects_nonterminal_or_exit_mismatch` (6 cases): inspection did
+  not prove private namespace/port state or exact terminal flags/exit/OOM shape.
+- `test_git_execution_keeps_resolved_absolute_binary_after_path_poisoning`,
+  `test_preflight_rejects_unstable_double_capture`, and
+  `test_protected_gate_bytes_come_from_captured_commit_not_live_controller_file`: mutable PATH or
+  checkout state could change controller tools, source capture, or protected gate bytes.
+- `test_bundle_snapshot_rejects_temp_parent_inside_git_checkout` and
+  `test_failed_bundle_validation_deletes_controller_snapshot`: poisoned TEMP or late validation
+  failure could place/leak controller data in the checkout.
+- `test_create_transport_failure_still_cleans_deterministic_name`: a post-create transport failure
+  could bypass deterministic named-container cleanup.
+
+### Exact TDD and verification output
+
+Initial round-two focused RED:
+
+```text
+24 failed, 2 passed, 2 skipped, 123 deselected, 1 warning in 37.95s
+```
+
+The separately corrected engine-environment RED was:
+
+```text
+1 failed, 151 deselected, 1 warning in 3.10s
+```
+
+Complete GREEN before the final post-create transport regression was added:
+
+```text
+158 passed, 2 skipped, 2 warnings in 123.39s (0:02:03)
+```
+
+Final verification after all round-two tests:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py
+159 passed, 2 skipped, 2 warnings in 123.22s (0:02:03)
+
+python -m ruff check agent_loop.py tests/test_agent_loop.py
+All checks passed!
+
+python -m compileall -q agent_loop.py tests/test_agent_loop.py
+exit 0, no output
+
+git diff --check
+exit 0; only host core.autocrlf LF-to-CRLF advisories
+```
+
+The two skips are POSIX-only executable-mode behavior and the Windows junction test when junction
+creation is unavailable. The Windows Job Object success, timeout, and assignment-failure tests ran
+and passed on this host.
+
+### Sandbox/data/schema evidence and self-review
+
+The production adapter is explicitly Docker-only. It resolves one canonical absolute `docker`
+binary and gives every CLI child only OS essentials plus unmounted controller-private
+home/config/temp directories. The approved image must expose the exact four-entry official
+`python:3.13.14-slim` environment map (including the public CPython GPG signing key and exact Python
+source SHA). Create uses Docker-supported private IPC/cgroup namespaces; inspection requires empty
+PID/UTS modes (Docker private defaults), no network or ports, exact read-only bind objects (`Mode`
+empty and `RW=false` for `--mount`), non-root user, read-only root, dropped capabilities,
+no-new-privileges, and exact resource/terminal state. Successful forced removal plus an empty,
+successful exact-name `container ls -a` is the locale-independent absence proof.
+
+On Windows, a fixed `python -I -S` launcher waits for one controller byte; the controller assigns
+it to a `KILL_ON_JOB_CLOSE` Job Object before release, then always terminates the job, verifies zero
+active processes, reaps the launcher, joins non-daemon drain threads, and only then seals hashes.
+POSIX uses a new session/process group and verifies group absence. There is no `taskkill` fallback.
+
+The approved SQLite snapshot is a dedicated 0444 bind at
+`/workspace/data/historical_data.sqlite3`. The protected gate exclusively creates
+`/workspace/tmp/backtest-cache/historical_data.sqlite3`, streams under the 8 GiB cap, checks the
+approved SHA during copy and the destination SHA afterward, then prepends only `/workspace/src`,
+sets the cache path, fixes the exact ticker universe, and replaces all three provider download
+functions with cache-miss failures. The controller never unpickles payloads and rehashes the
+approved snapshot after observation.
+
+Remaining limitation: Docker is absent on this host, so real daemon provenance remains untested and
+`security_attestation=false`; faithful injected Docker-shaped tests cannot become production
+attestation. Controller snapshots/candidates still have caller-owned run-lifetime disposal, which
+Task 3 must close after inert diff/archive export.
+
+## Review fix round 3/5 — explicit capabilities and provider-safe evidence
+
+### Files, APIs, and named breaks
+
+- `agent_loop.py`: added `GitCapability` and `configure_git_executable(Path)`, exact-byte Git
+  revalidation before every spawn, execution-affecting common/worktree-config rejection, lazy-fetch
+  disabling, link-safe `SourceLock`, POSIX leader reaping, executable read-only modes, random
+  container ownership labels/full-ID cleanup, credential-like tracked-path rejection, and
+  provider-safe `GateResult`/`BacktestGateResult` views.
+- `tests/test_agent_loop.py`: added round-three regressions for poisoned Git discovery and gateway
+  construction, local filter/worktree promisor config, canonical environment names, redirected
+  lock files, POSIX descendant cleanup, foreign container collisions, high-entropy ownership,
+  tracked dotenv export, and raw test/backtest-output canaries.
+- `Dockerfile.agent-loop`: unchanged in this round; its fixed UID/GID and digest-pinned build
+  contract remain covered by the prior tests.
+
+High-impact breaks are named by:
+
+- `test_round3_poisoned_path_before_import_never_executes_fake_git`,
+  `test_round3_gateway_key_lookup_never_starts_git`, and
+  `test_round3_repo_contained_git_capability_is_rejected_before_spawn`: no controller Git operation
+  may discover a binary from PATH/current directory or trust a repository-contained executable.
+- `test_round3_preflight_rejects_execution_local_config_before_filter_runs` and
+  `test_round3_worktree_promisor_config_is_rejected_before_object_reads`: filters and partial-clone
+  transport are rejected before status, index, or object reads.
+- `test_round3_posix_bounded_process_kills_live_grandchild` and
+  `test_round3_posix_tree_helper_reaps_leader_before_absence_poll`: process-group termination reaps
+  the leader before proving descendant absence; these are POSIX-only and skipped on Windows.
+- `test_round3_foreign_name_collision_is_never_removed` and
+  `test_round3_owned_container_cleanup_uses_full_id_and_high_entropy_label`: predictable names never
+  authorize deletion; only a unique owner label plus inspected full container ID does.
+- `test_round3_provider_safe_gate_result_never_contains_hostile_stream_canaries` and its backtest
+  counterpart: public results have `provider_safe=true`, closed observation outcomes, hashes, and
+  envelopes, but no raw `.stdout`, `.stderr`, `.process`, parsed sentinel map, or arbitrary metrics.
+- `test_round3_force_tracked_credential_path_is_rejected_before_export`: all tree entries are
+  classified before any blob export, so `.env.production` and credential/key/token filenames never
+  enter a candidate.
+
+### Exact TDD and verification output
+
+Initial round-three RED:
+
+```text
+10 failed, 3 skipped, 161 deselected, 1 warning in 10.15s
+```
+
+Additional provider-safe backtest/worktree-config RED after the interface clarification:
+
+```text
+2 failed, 1 passed, 1 skipped, 173 deselected, 3 warnings in 5.32s
+```
+
+First complete run after implementation, before correcting two stale test-harness assumptions:
+
+```text
+2 failed, 169 passed, 6 skipped, 9 warnings in 168.89s (0:02:48)
+```
+
+Final GREEN and static verification:
+
+```text
+python -m pytest -q tests/test_agent_loop.py
+171 passed, 6 skipped, 9 warnings in 156.55s (0:02:36)
+
+python -m ruff check agent_loop.py tests/test_agent_loop.py
+All checks passed!
+
+python -m compileall -q agent_loop.py tests/test_agent_loop.py
+exit 0, no output
+
+git diff --check
+exit 0; only host core.autocrlf LF-to-CRLF advisories
+```
+
+The six skips are platform capability tests: POSIX executable/process-group cases on Windows and
+link/junction creation cases unavailable without the corresponding host privilege. Windows Job
+Object coverage from round two still ran in the full suite.
+
+### Security evidence, self-review, and limitation
+
+Git now starts only through an explicitly configured canonical absolute `git`/`git.exe` capability.
+The capability records device/inode, size, and streamed SHA-256; every spawn rechecks non-reparse
+ancestors, identity, size, and bytes. Git receives no ambient PATH, provider/broker/cloud/proxy or
+credential state, disables hooks/fsmonitor/external diff/pagers/lazy fetch, and rejects dangerous
+local plus worktree config before reading checkout state. Dotenv discovery is filesystem-only and
+does not start Git.
+
+Container creation carries a fresh 256-bit owner label. A failed create/name collision performs
+only a narrow owner-label query and never removes by name. A successful or transport-ambiguous
+create is cleaned only after exact label, deterministic name, and full 64-hex ID ownership are
+inspected; absence proof is a successful exact ID-plus-label list returning empty. Raw worker
+streams remain ephemeral in controller-local `ProcessResult`/`WorkerObservation`
+(`provider_safe=false`) and only their digests enter the host-sealed envelope.
+
+Docker Desktop is now available on the host, but per coordination this round did not pull, build,
+or run any image/container. Therefore real daemon/image provenance remains deliberately unverified;
+all sandbox contract coverage here uses the faithful injected Docker-shaped backend, which always
+reports `worker_confined=false` and `security_attestation=false`.
+
+## Review fix round 4/5 - cache routing and host capability tightening
+
+### Files, APIs, and named breaks
+
+- `agent_loop.py`: added `DockerCapability` and
+  `configure_docker_executable(executable, *, source_root, controller_root,
+  permanent_runtime_root)`, revalidated Docker identity/bytes before every production engine
+  spawn, disabled Git replacement objects, canonicalized Windows allowlisted environments,
+  rejected hardlinked source locks, classified every tracked-path component, pre-created a
+  writable output pycache mirror, made Ruff explicitly cacheless, and made unsafe-local acquire
+  and retain the source lock while enforcing permanent-runtime exclusion.
+- `tests/test_agent_loop.py`: added round-four behavior regressions and moved import-laziness into
+  a fresh interpreter so its result cannot depend on earlier collection/import order.
+- `Dockerfile.agent-loop`: unchanged in this round.
+
+High-impact breaks are named by:
+
+- `test_round4_compile_cache_routes_to_writable_output_with_read_only_source` and
+  `test_round4_container_compile_and_ruff_cache_policy_is_exact`: real `py_compile`/`compileall`
+  no longer attempt writes below the read-only source bind; `PYTHONPYCACHEPREFIX` is exactly
+  `/workspace/output/pycache`, its source/gate mirrors are writable by UID 65532, and Ruff uses
+  `--no-cache` with its cache path confined to output.
+- `test_round4_git_replacement_refs_are_rejected_before_object_reads`: every Git command carries
+  both `--no-replace-objects` and `GIT_NO_REPLACE_OBJECTS=1`, while preflight rejects a populated
+  `refs/replace` namespace.
+- `test_round4_docker_capability_revalidates_bytes_before_bounded_spawn` and the three containment
+  cases: production Docker is an explicit canonical absolute external capability recording file
+  identity, size, and streamed SHA-256; it is revalidated before each `_bounded_process` call.
+  Injected Docker-shaped tests remain a separate non-production path.
+- `test_round4_windows_environment_canonicalizes_names_and_rejects_conflicts`: Windows accepts
+  case-insensitive input but emits only canonical names and rejects conflicting variants; POSIX
+  continues to accept exact names only.
+- `test_round4_credential_path_policy_checks_every_component`: credential-like names in any path
+  component are rejected, with only final `.env.example` and `.env.template` names exempted.
+- `test_round4_unsafe_local_entry_owns_lock_and_excludes_runtime` and
+  `test_round4_source_lock_rejects_hardlink_without_touching_target`: unsafe-local cannot bypass
+  the source lock/runtime boundary, and a hardlinked lock is rejected without changing its target.
+- `test_import_is_lazy_and_never_reads_key_or_execution_modules`: the regression now runs in a
+  fresh subprocess and remains independent of module state created by earlier tests.
+
+### Exact TDD and verification output
+
+Initial round-four focused RED:
+
+```text
+12 failed, 1 passed, 176 deselected, 2 warnings in 6.10s
+```
+
+Focused GREEN after implementing the full round-four contract:
+
+```text
+18 passed, 174 deselected, 1 warning in 8.34s
+```
+
+The final cache-permission self-review regression also passed:
+
+```text
+2 passed, 190 deselected, 1 warning in 3.56s
+```
+
+Final full and static verification after the last implementation change:
+
+```text
+python -m pytest -q tests/test_agent_loop.py
+186 passed, 6 skipped, 10 warnings in 147.10s (0:02:27)
+
+python -m ruff check agent_loop.py tests/test_agent_loop.py
+All checks passed!
+
+python -m compileall -q agent_loop.py tests/test_agent_loop.py
+exit 0, no output
+
+git diff --check
+exit 0; only host core.autocrlf LF-to-CRLF advisories
+```
+
+The six skips are four POSIX-only cases (executable-mode behavior, process-group leader reaping,
+and the two parent-success/timeout process-group cases) plus two Windows symlink cases skipped
+because this account lacks symlink privilege. The Windows junction and Job Object cases ran. The
+ten warnings are existing SQLite resource/deprecation warnings plus the workspace pytest-cache
+permission warning; none changed a gate result.
+
+### Security evidence, self-review, and limitations
+
+The approved Docker executable is no longer a mutable path string. Production construction needs
+an operator-supplied capability outside source, controller, and permanent-runtime roots; every
+engine invocation rechecks non-reparse ancestry, file identity, size, and SHA-256. The simulated
+runner API accepts only an explicit absolute Docker-shaped endpoint and cannot yield production
+attestation. Git object reads are replacement-disabled even if a ref appears after preflight.
+
+Worker source, gate, and approved data remain read-only. Controller setup creates only the exact
+output-side pycache directory mirrors required for the fixed `/workspace/src` and
+`/workspace/gate` paths, leaving candidate bytes immutable. No `.alc-*` or `.controller-tmp`
+directory remained after verification.
+
+Per coordination, Docker Desktop was not invoked, and no image was pulled, built, or run. Real
+daemon/image provenance therefore remains unverified in this round. Provider-safe results still
+intentionally omit raw worker stdout/stderr and arbitrary sentinel/metric content. Before Task 3
+can form useful model feedback, it must derive bounded controller-owned diagnostic facts and
+finite normalized metrics/threshold outcomes without exposing worker streams; that is a Task 3
+prerequisite, not a reason to weaken this boundary.

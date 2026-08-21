@@ -52,6 +52,7 @@ Optional:
 ALPACA_STOCK_FEED=iex
 FMP_PLAN=free
 FMP_DAILY_REQUEST_BUDGET=198
+OPENROUTER_API_KEY (or OPENROUTER; required only for agent_loop.py)
 EXECUTION_STORE_DB_PATH
 NOTIFY_EMAIL_FROM
 NOTIFY_EMAIL_TO
@@ -115,6 +116,7 @@ Profile and institutional-ownership calls are skipped in free mode. Unknown shar
 - `fill_monitor.py` routes Alpaca trade-update events into the order manager.
 - `scheduler.py` runs the 09:31 ET daily cycle and hourly exit checks.
 - `paper_trading_console.py` provides deployment diagnostics and supervised operations.
+- `agent_loop.py` runs the separate Docker-confined, proposal-only OpenRouter backtest controller.
 
 Alpaca is the execution source of truth. SQLite is the audit and recovery view. With no explicit reference, workflow resolution uses active symbol ownership and then latest symbol history. When a workflow id, client order id, or broker order id is supplied but unknown, resolution fails closed instead of falling back to another workflow.
 
@@ -132,6 +134,86 @@ python scheduler.py --help
 ```
 
 CI runs Ruff, compilation, and the non-integration test suite on Python 3.11 and 3.13. Tests use synthetic or mocked provider data unless explicitly marked `integration`.
+
+### Isolated multi-agent backtest proposals
+
+`agent_loop.py` is not part of paper trading or the scheduler. It runs one sealed technical-only
+backtest in an attested, network-disabled Docker worker, then asks a fixed three-role model set for
+an inert proposal: Qwen orchestrator, Qwen reasoner, and DeepSeek Chat coder. The coder returns
+typed exact-line replacements; the controller verifies immutable source coordinates and old text,
+rejects invalid Python and newly introduced defaulted parameters, renders the unified diff itself,
+and never writes it to this checkout. Broker, FMP, mail, Git, and OpenRouter credentials are absent
+from worker containers.
+
+The first paid rollout step is always one explicitly authorized sample. Use fresh empty controller
+and audit roots, an operator-approved historical-data bundle and SHA-256, a digest-pinned sandbox
+image, and operator-selected failing thresholds that are meant to produce diagnostic evidence.
+Omit `--apply`:
+
+```powershell
+$controllerRoot = Join-Path $env:TEMP 'agent-loop-canary-controller'
+$auditRoot = Join-Path $env:TEMP 'agent-loop-canary-audit'
+New-Item -ItemType Directory -Force $controllerRoot, $auditRoot | Out-Null
+
+& .\.venv\Scripts\python.exe -u .\agent_loop.py `
+  --repo-root (Resolve-Path .).Path `
+  --permanent-runtime-root 'C:\Projects\trading_bot\paper-trading-runtime' `
+  --git-executable (Get-Command git).Source `
+  --controller-temp-parent $controllerRoot `
+  --artifact-root $auditRoot `
+  --docker-executable (Get-Command docker).Source `
+  --sandbox-image '<repository>@sha256:<64-lowercase-hex>' `
+  --gate backtest `
+  --tickers '<approved-symbol>' `
+  --benchmark '<approved-benchmark>' `
+  --start-date '<YYYY-MM-DD>' `
+  --end-date '<YYYY-MM-DD>' `
+  --historical-data-bundle '<absolute-approved-sqlite-path>' `
+  --historical-data-sha256 '<64-lowercase-hex>' `
+  --minimum-total-return '<operator-threshold>' `
+  --minimum-annualized-return '<operator-threshold>' `
+  --minimum-sharpe-ratio '<operator-threshold>' `
+  --maximum-drawdown-magnitude '<operator-threshold>' `
+  --minimum-closed-trades '<operator-threshold>' `
+  --proposal-samples 1 `
+  --canary-max-usd 0.50 `
+  --max-usd 0.50 `
+  --max-iterations 1 `
+  --max-api-calls 3 `
+  --max-tokens 200000 `
+  --wall-timeout-seconds 1800
+```
+
+A useful canary ends with `batch_complete`, exit code `10`, exactly three authoritatively
+accounted calls, `completed_samples=1`, `source_modified=false`, and `cleanup_complete=true` in
+`AGENT_LOOP_SUMMARY`. Exit `0` means the sealed gate already passed and no proposal was needed;
+exit `22` is a fail-closed controller/batch failure. Proposal metadata deliberately remains
+`security_attestation=false`; a completed proposal is marked
+`verification_status=privately_backtested` only after the controller applies it to a fresh
+disposable candidate, runs pytest, Ruff, compileall, `git diff --check`, and the sealed backtest,
+then removes that candidate. This is evidence for review, not merge or trading authorization.
+
+Do not turn a canary into a 50-attempt run automatically. First inspect the payload, rendered diff,
+private-evaluation artifact, audit chain, source immutability, exact cited source/configuration
+facts, and whether the edit changes an existing executed strategy path.
+Only a separately authorized same-commit run may use `--proposal-samples 50`,
+`--max-api-calls 150`, `--canary-max-usd 0.50`, `--max-usd 2.00`,
+`--max-tokens 2000000`, `--max-iterations 1`, no `--apply`, and a wall timeout large enough for
+the observed model latency. The 150-call value is a hard ceiling/reservation; actual authoritative
+calls may be lower because an orchestrator abort or reasoner skip classifies a sample before the
+coder call. In a completed batch, `completed_samples` counts exported proposals and
+`rejected_samples` counts safe model-quality rejections; `batch_complete` means all requested
+attempts were classified, not that every attempt produced a proposal.
+
+Outside proposal-batch mode, `--apply` still means apply only inside the disposable controller
+candidate so another quarantined iteration can observe the change. It never applies to this
+checkout. Do not use `--apply` in a canary or proposal batch; real-source application and
+backtesting of an exported diff remain separate manual workflows.
+
+The full design and implementation record is in
+[`docs/superpowers/specs/2026-08-17-multi-agent-backtest-loop-design.md`](docs/superpowers/specs/2026-08-17-multi-agent-backtest-loop-design.md)
+and
+[`docs/superpowers/plans/2026-08-17-multi-agent-backtest-loop.md`](docs/superpowers/plans/2026-08-17-multi-agent-backtest-loop.md).
 
 ## Scanner and backtester
 
