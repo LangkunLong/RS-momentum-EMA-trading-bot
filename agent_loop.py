@@ -1819,9 +1819,10 @@ class OpenRouterGateway:
                 "source coordinates: the controller owns exact source anchoring. The read_only_"
                 "configuration_facts exactly once is mandatory: treat that object as immutable controller evidence. "
                 "For a non-skip plan, every source_evidence and files_to_change path must appear in "
-                "editable_source_paths and source_snapshots. When a read_only_configuration_facts value informs "
-                "your diagnosis, cite its fact_id in configuration_fact_ids; cite only listed fact_id values. "
-                "Those facts are read-only baselines, never source snapshots or editable paths; "
+                "editable_source_paths and source_snapshots. For a non-skip plan, configuration_fact_ids must "
+                "equal every fact_id supplied in read_only_configuration_facts, even when a fact is only an "
+                "immutable boundary; cite only listed fact_id values. Those facts are read-only baselines, "
+                "never source snapshots or editable paths; "
                 "config/settings.py must not appear in files_to_change or steps. Never invent baseline values "
                 "or configuration facts. Any source expression containing settings. is an immutable controller-"
                 "owned configuration boundary: do not propose changing, replacing, or hard-coding its effect. "
@@ -5964,16 +5965,52 @@ def run_hidden_backtest_worker(
             # namespace to seed; a real hidden worker always has this class.
             return
         fetcher = backtest_engine.DataFetcher(str(scratch))
+        requested_symbols = tuple(sorted(requested))
+        exact_symbols = tuple(sorted({*requested_symbols, benchmark_symbol}))
+        start = backtest_engine.pd.Timestamp(start_date).date()
+        end = backtest_engine.pd.Timestamp(end_date).date()
+        period = _period_for_dates(start, end)
+        price_key = (
+            f"price::{period}::{start_date}::{end_date}::{','.join(exact_symbols)}"
+        )
+        closes_key = (
+            f"closes::{period}::{start_date}::{end_date}::{','.join(requested_symbols)}"
+        )
+
+        def select_source_key(
+            rows: Sequence[tuple[object, object]],
+            kind: str,
+            suffix: str,
+        ) -> str:
+            candidates: list[tuple[date, date, str]] = []
+            for raw_key, raw_kind in rows:
+                if not isinstance(raw_key, str) or raw_kind != kind:
+                    continue
+                parts = raw_key.split("::", 4)
+                if len(parts) != 5 or parts[0] != kind or parts[4] != suffix:
+                    continue
+                try:
+                    source_start = date.fromisoformat(parts[2])
+                    source_end = date.fromisoformat(parts[3])
+                except ValueError:
+                    continue
+                if source_start <= start <= end <= source_end:
+                    candidates.append((source_start, source_end, raw_key))
+            if not candidates:
+                raise DataBundleError("approved cache lacks a covering price/closes payload")
+            candidates.sort(key=lambda item: (item[0], -item[1].toordinal(), item[2]))
+            return candidates[0][2]
+
         with sqlite3.connect(str(scratch)) as connection:
             rows = connection.execute(
                 "SELECT cache_key, cache_kind FROM dataset_cache "
-                "WHERE cache_kind IN ('price', 'closes') ORDER BY cache_kind, cache_key"
+                "WHERE cache_kind IN ('price', 'closes')"
             ).fetchall()
-        if len(rows) != 2 or {row[1] for row in rows} != {"price", "closes"}:
-            raise DataBundleError("approved cache must contain one price and one closes payload")
+        source_price_key = select_source_key(rows, "price", ",".join(exact_symbols))
+        source_closes_key = select_source_key(rows, "closes", ",".join(requested_symbols))
         payloads = {
-            kind: fetcher._load_cached(key)
-            for key, kind in rows
+            "price": fetcher._load_cached(source_price_key),
+            "closes": fetcher._load_cached(source_closes_key),
         }
         price_payload = payloads.get("price")
         closes_payload = payloads.get("closes")
@@ -5985,16 +6022,6 @@ def run_hidden_backtest_worker(
             or any(symbol not in closes_payload.columns for symbol in requested)
         ):
             raise DataBundleError("approved cache payloads lack the requested symbols")
-        period = backtest_engine._period_for_date_range(
-            backtest_engine.pd.Timestamp(start_date),
-            backtest_engine.pd.Timestamp(end_date),
-        )
-        price_key = (
-            f"price::{period}::{start_date}::{end_date}::{','.join(sorted(all_tickers))}"
-        )
-        closes_key = (
-            f"closes::{period}::{start_date}::{end_date}::{','.join(sorted(requested))}"
-        )
         fetcher._store_cached(price_key, "price", price_payload)
         fetcher._store_cached(closes_key, "closes", closes_payload)
 
@@ -9523,7 +9550,12 @@ def run_proposal_batch(
             raise ConfigurationError(
                 "strict gateway raised accounting failure without closed facts"
             ) from exc
-        except GatewayError:
+        except GatewayError as exc:
+            status_code = (
+                exc.status_code
+                if type(exc.status_code) is int and 100 <= exc.status_code <= 599
+                else None
+            )
             audit.append_event(
                 {
                     "orchestrator": LoopState.CALL_ORCHESTRATOR,
@@ -9536,6 +9568,7 @@ def run_proposal_batch(
                     "call_index": ledger.calls,
                     "role": role,
                     "code": "provider_failed",
+                    "status_code": status_code,
                 },
             )
             raise
