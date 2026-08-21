@@ -613,6 +613,28 @@ class CanslimStrategy:
         }
 
 
+def _new_execution_diagnostics() -> dict[str, int]:
+    return {
+        "signal_days": 0,
+        "entries_allowed_days": 0,
+        "blocked_by_regime_days": 0,
+        "blocked_by_market_days": 0,
+        "buy_signal_rows": 0,
+        "buy_signal_rows_when_entries_allowed": 0,
+        "capacity_truncated_signals": 0,
+        "entry_attempts": 0,
+        "entries_executed": 0,
+        "entry_rejected_already_open": 0,
+        "entry_rejected_capacity": 0,
+        "entry_rejected_missing_data": 0,
+        "entry_rejected_invalid_price": 0,
+        "entry_rejected_invalid_risk": 0,
+        "eviction_attempts": 0,
+        "evictions_executed": 0,
+        "eviction_rejections": 0,
+    }
+
+
 class PortfolioSimulator:
     """Simulates the full CANSLIM portfolio lifecycle."""
 
@@ -676,6 +698,7 @@ class PortfolioSimulator:
         self._weekly_snapshots: List[dict] = []
         self._signal_rows: List[dict] = []
         self._ticker_industry: Dict[str, str] = {}
+        self._execution_diagnostics = _new_execution_diagnostics()
 
     def run(
         self,
@@ -692,25 +715,7 @@ class PortfolioSimulator:
         self._transactions = []
         self._weekly_snapshots = []
         self._signal_rows = []
-        self._execution_diagnostics = {
-            "signal_days": 0,
-            "entries_allowed_days": 0,
-            "blocked_by_regime_days": 0,
-            "blocked_by_market_days": 0,
-            "buy_signal_rows": 0,
-            "buy_signal_rows_when_entries_allowed": 0,
-            "capacity_truncated_signals": 0,
-            "entry_attempts": 0,
-            "entries_executed": 0,
-            "entry_rejected_already_open": 0,
-            "entry_rejected_capacity": 0,
-            "entry_rejected_missing_data": 0,
-            "entry_rejected_invalid_price": 0,
-            "entry_rejected_invalid_risk": 0,
-            "eviction_attempts": 0,
-            "evictions_executed": 0,
-            "eviction_rejections": 0,
-        }
+        self._execution_diagnostics = _new_execution_diagnostics()
 
         clear_session_cache()
         benchmark = benchmark_symbol or self.benchmark_symbol
