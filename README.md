@@ -252,6 +252,71 @@ On the free FMP plan, use technical-only mode for broad-universe historical back
 python backtest_pnl.py --universe sp500 --start-date 2023-04-01 --end-date 2026-04-01 --technical-only --export-equity --export-holdings
 ```
 
+For a true no-survivorship-bias replay, use a hashed point-in-time SQLite
+bundle. The bundle must contain dated membership transitions, split-adjusted
+OHLCV bars, and fundamentals with a public/accepted date; the normal
+`historical_data.sqlite3` provider cache is intentionally rejected for this
+mode because it contains only cached provider responses.
+
+The fundamentals header is:
+`ticker,statement_type,period_end,public_date,basic_eps,diluted_eps,total_revenue,net_income,common_stock,total_stockholders_equity,shares_outstanding,held_percent_institutions,institution_count,prev_institution_count`.
+
+If the membership source is a sparse snapshot export (`as_of,ticker,...`),
+convert it before building the bundle:
+
+```powershell
+python convert_membership_snapshots.py `
+  --snapshots-csv exports/sp500_snapshots.csv `
+  --output exports/sp500_membership.csv
+```
+
+Build that bundle offline from reviewed exports. The builder requires exact
+CSV headers (`effective_date,ticker,member` for membership;
+`trade_date,ticker,open,high,low,close,volume` for prices; and the documented
+fundamental columns) and refuses to overwrite an existing output:
+
+```powershell
+python build_pit_bundle.py `
+  --membership-csv exports/sp500_membership.csv `
+  --prices-csv exports/daily_prices.csv `
+  --fundamentals-csv exports/fundamentals.csv `
+  --data-cutoff 2026-04-01 `
+  --output .artifacts/cache/backtest/canslim_pit.sqlite3 `
+  --manifest-output .artifacts/cache/backtest/canslim_pit.manifest.json
+```
+
+Verify the bundle/manifest pair before running either simulator:
+
+```powershell
+python verify_pit_bundle.py `
+  --bundle .artifacts/cache/backtest/canslim_pit.sqlite3 `
+  --sha256 <bundle-sha256> `
+  --manifest .artifacts/cache/backtest/canslim_pit.manifest.json
+```
+
+```powershell
+python backtest_pnl.py `
+  --pit-bundle .artifacts/cache/backtest/canslim_pit.sqlite3 `
+  --pit-bundle-sha256 <lowercase-sha256> `
+  --start-date 2023-04-01 --end-date 2026-04-01 `
+  --no-csv
+```
+
+To benchmark a separate equal-weight basket of the top point-in-time leaders,
+rebalance at the following day's open with:
+
+```powershell
+python leader_basket.py `
+  --pit-bundle .artifacts/cache/backtest/canslim_pit.sqlite3 `
+  --bundle-sha256 <lowercase-sha256> `
+  --start-date 2023-04-01 --end-date 2026-04-01 `
+  --leader-count 50 --rebalance-days 20
+```
+
+The basket ranks only members known on each rebalance date and reports its
+return, benchmark return, drawdown, Sharpe, cash utilization, and rebalance
+transactions independently from tactical CANSLIM entries.
+
 Backtest execution treats the market-direction score as diagnostics by default:
 an otherwise-valid signal is sized and entered whenever cash is available. Use
 `--require-bullish-market` only for an explicit conservative M-gated replay.

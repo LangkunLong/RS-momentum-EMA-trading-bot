@@ -10,7 +10,7 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -27,10 +27,14 @@ from backtest import (
     _evaluate_technical_at_date,
 )
 from core.canslim.m_market_direction import MarketRegimeTracker
+from core.canslim.a_annual_earnings import evaluate_a
+from core.canslim.c_current_earnings import evaluate_c
+from core.canslim.i_institutional import evaluate_i
 from core.industry_group import get_top_groups, load_industry_map
 from core.data_client import clear_session_cache, fetch_bulk_ohlcv
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
+from core.pit_data import PITDataBundle
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -96,9 +100,16 @@ def _resolve_window(
     return start_ts.normalize(), end_ts.normalize()
 
 
-def _calculate_rs_snapshot(all_closes: pd.DataFrame, eval_date: pd.Timestamp) -> Dict[str, float]:
+def _calculate_rs_snapshot(
+    all_closes: pd.DataFrame,
+    eval_date: pd.Timestamp,
+    eligible_tickers: Optional[Iterable[str]] = None,
+) -> Dict[str, float]:
     """Calculate RS scores for the full universe once as-of a specific date."""
     sliced = all_closes.loc[:eval_date].dropna(axis=1, how="all")
+    if eligible_tickers is not None:
+        eligible = {str(ticker).upper() for ticker in eligible_tickers}
+        sliced = sliced.loc[:, [column for column in sliced.columns if str(column).upper() in eligible]]
     if sliced.empty:
         return {}
 
@@ -466,6 +477,7 @@ class CanslimStrategy:
         min_technical_score: float = DEFAULT_MIN_TECHNICAL_SCORE,
         require_bullish_market: bool = False,
         technical_only: bool = False,
+        fundamental_provider: Optional[Callable[[str, pd.Timestamp], dict[str, Any]]] = None,
     ) -> None:
         self.min_c_a_growth = min_c_a_growth
         self.min_rs_score = min_rs_score
@@ -473,6 +485,7 @@ class CanslimStrategy:
         self.min_technical_score = min_technical_score
         self.require_bullish_market = require_bullish_market
         self.technical_only = technical_only
+        self.fundamental_provider = fundamental_provider
 
     @staticmethod
     def _compute_technical_score(
@@ -537,8 +550,37 @@ class CanslimStrategy:
                 "institutional_data_available": False,
                 "shares_outstanding": None,
             }
-        else:
+        elif self.fundamental_provider is None:
+            # Preserve the legacy provider's already-scored contract.  PIT
+            # mode supplies raw, as-of frames through ``fundamental_provider``
+            # and is scored locally below.
             fund = _evaluate_fundamentals_at_date(ticker, eval_date)
+        else:
+            fund_data = self.fundamental_provider(ticker, eval_date)
+            qi = fund_data["quarterly_income"]
+            ai = fund_data["annual_income"]
+            bs = fund_data["balance_sheet"]
+            info = fund_data["company_info"]
+            c_score, current_growth = evaluate_c(qi)
+            a_score, annual_growth, roe = evaluate_a(ai, balance_sheet=bs)
+            held_pct = info.get("held_percent_institutions")
+            holder_count = info.get("institution_count")
+            prev_holder_count = info.get("prev_institution_count")
+            i_score = evaluate_i(
+                held_pct,
+                num_institutional_holders=holder_count,
+                prev_num_institutional_holders=prev_holder_count,
+            )
+            fund = {
+                "c_score": c_score,
+                "a_score": a_score,
+                "i_score": i_score,
+                "current_growth": current_growth,
+                "annual_growth": annual_growth,
+                "roe": roe,
+                "shares_outstanding": info.get("shares_outstanding"),
+                "institutional_data_available": held_pct is not None or holder_count is not None,
+            }
         tech = _evaluate_technical_at_date(tdata, eval_date, fund.get("shares_outstanding"))
 
         c_growth = fund.get("current_growth")
@@ -684,6 +726,7 @@ class PortfolioSimulator:
         strategy: Optional[CanslimStrategy] = None,
         benchmark_symbol: str = BENCHMARK,
         enable_eviction: bool = settings.ENABLE_EVICTION,
+        pit_bundle: Optional[PITDataBundle] = None,
     ) -> None:
         self.initial_capital = initial_capital
         self.max_positions = max_positions
@@ -702,6 +745,9 @@ class PortfolioSimulator:
             raise ValueError("cash_deployment_threshold_pct must be between 0 and 1")
         self.cash_deployment_threshold_pct = cash_deployment_threshold_pct
         self.technical_only = technical_only
+        if pit_bundle is not None and technical_only:
+            raise ValueError("point-in-time CANSLIM mode requires historical fundamentals")
+        self.pit_bundle = pit_bundle
         self.take_profit_pct = take_profit_pct
         self.scale_out_fraction = scale_out_fraction
         self.stagnation_days = stagnation_days
@@ -714,7 +760,12 @@ class PortfolioSimulator:
             min_technical_score=min_technical_score,
             require_bullish_market=require_bullish_market,
             technical_only=technical_only,
+            fundamental_provider=pit_bundle.fundamentals_provider if pit_bundle is not None else None,
         )
+        if pit_bundle is not None and not technical_only:
+            # A custom strategy is still bound to the immutable bundle.  This
+            # prevents a caller from silently falling back to today's provider.
+            self.strategy.fundamental_provider = pit_bundle.fundamentals_provider
         self.benchmark_symbol = benchmark_symbol
         self.enable_eviction = enable_eviction
 
@@ -746,23 +797,42 @@ class PortfolioSimulator:
         self._execution_diagnostics = _new_execution_diagnostics()
 
         clear_session_cache()
-        benchmark = benchmark_symbol or self.benchmark_symbol
+        benchmark = str(benchmark_symbol or self.benchmark_symbol).upper()
         start_ts, end_ts = _resolve_window(
             start_date=start_date,
             end_date=end_date,
             lookback_weeks=lookback_weeks,
         )
 
-        all_tickers = list(dict.fromkeys([*tickers, benchmark]))
-        print(f"Downloading price data for {len(all_tickers)} tickers...")
-        ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, start_ts, end_ts)
+        if self.pit_bundle is not None:
+            bundle_symbols = set(self.pit_bundle.symbols())
+            requested = [str(ticker).upper() for ticker in tickers] or list(self.pit_bundle.symbols())
+            tickers = list(
+                dict.fromkeys(
+                    ticker for ticker in requested if ticker in bundle_symbols and ticker != benchmark
+                )
+            )
+            if not tickers:
+                raise ValueError("point-in-time bundle has no requested candidate symbols")
+            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
+            print(f"Reading point-in-time price data for {len(all_tickers)} tickers...")
+            ticker_ohlcv = self.pit_bundle.fetch_price_data(all_tickers, start_ts, end_ts)
+        else:
+            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
+            print(f"Downloading price data for {len(all_tickers)} tickers...")
+            ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, start_ts, end_ts)
         if benchmark not in ticker_ohlcv:
             print(f"FATAL: Could not download {benchmark} benchmark data.")
             return SimulationResult()
 
-        universe = list(dict.fromkeys([*tickers, *get_sp500_tickers()]))
-        print(f"Downloading RS universe closes for {len(universe)} tickers...")
-        all_closes = self.data_fetcher.fetch_rs_universe_closes(universe, start_ts, end_ts)
+        if self.pit_bundle is not None:
+            universe = list(self.pit_bundle.symbols())
+            print(f"Reading point-in-time RS closes for {len(universe)} symbols...")
+            all_closes = self.pit_bundle.fetch_closes(universe, start_ts, end_ts)
+        else:
+            universe = list(dict.fromkeys([*tickers, *get_sp500_tickers()]))
+            print(f"Downloading RS universe closes for {len(universe)} tickers...")
+            all_closes = self.data_fetcher.fetch_rs_universe_closes(universe, start_ts, end_ts)
 
         benchmark_df = ticker_ohlcv[benchmark]
         trading_days = benchmark_df.loc[start_ts:end_ts].index
@@ -773,7 +843,7 @@ class PortfolioSimulator:
         regime_tracker = MarketRegimeTracker()
         regime_tracker.bootstrap(benchmark_df, start_ts)
         self._regime_tracker = regime_tracker
-        self._ticker_industry = {} if self.technical_only else load_industry_map(tickers)
+        self._ticker_industry = {} if self.technical_only or self.pit_bundle is not None else load_industry_map(tickers)
 
         equity_series: Dict[str, float] = {}
         benchmark_series: Dict[str, float] = {}
@@ -810,8 +880,12 @@ class PortfolioSimulator:
             is_signal_day = day_idx % self.signal_every_n_days == 0
             market_state = self.strategy.evaluate_market(benchmark_df, eval_date)
             if is_signal_day:
+                active_tickers = tickers
+                if self.pit_bundle is not None:
+                    active_members = self.pit_bundle.members_at(eval_date)
+                    active_tickers = [ticker for ticker in tickers if ticker in active_members]
                 pending_entries = self._evaluate_signals(
-                    tickers=tickers,
+                    tickers=active_tickers,
                     ticker_ohlcv=ticker_ohlcv,
                     all_closes=all_closes,
                     eval_date=eval_date,
@@ -862,6 +936,10 @@ class PortfolioSimulator:
                 "min_rs_score": self.min_rs_score,
                 "min_technical_score": self.min_technical_score,
                 "technical_only": self.technical_only,
+                "data_mode": "point_in_time" if self.pit_bundle is not None else "provider_cache",
+                "pit_bundle_sha256": self.pit_bundle.sha256 if self.pit_bundle is not None else None,
+                "pit_data_cutoff": str(self.pit_bundle.data_cutoff.date()) if self.pit_bundle is not None else None,
+                "pit_manifest": self.pit_bundle.manifest() if self.pit_bundle is not None else None,
                 "take_profit_pct": self.take_profit_pct,
                 "scale_out_fraction": self.scale_out_fraction,
                 "stagnation_days": self.stagnation_days,
@@ -919,7 +997,10 @@ class PortfolioSimulator:
             self._execution_diagnostics["entries_allowed_days"] += 1
 
         signals: List[dict] = []
-        rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date)
+        rs_eligible = None
+        if self.pit_bundle is not None:
+            rs_eligible = self.pit_bundle.members_at(eval_date) - {self.benchmark_symbol.upper()}
+        rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date, eligible_tickers=rs_eligible)
         top_groups = get_top_groups(rs_snapshot, self._ticker_industry)
         for ticker in tickers:
             if ticker in self._open_positions or ticker not in ticker_ohlcv:
@@ -1683,16 +1764,35 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
     parser.add_argument("--min-technical-score", type=float, default=DEFAULT_MIN_TECHNICAL_SCORE)
     parser.add_argument("--benchmark", default=BENCHMARK)
     parser.add_argument("--technical-only", action="store_true")
+    parser.add_argument(
+        "--pit-bundle",
+        default=None,
+        help="validated SQLite point-in-time bundle; enables true PIT CANSLIM mode",
+    )
+    parser.add_argument(
+        "--pit-bundle-sha256",
+        default=None,
+        help="lowercase SHA-256 digest for --pit-bundle",
+    )
     parser.add_argument("--no-csv", action="store_true")
     parser.add_argument("--export-equity", action="store_true")
     parser.add_argument("--export-holdings", action="store_true")
     parser.add_argument("--export-charts", action="store_true")
     args = parser.parse_args(argv)
 
-    tickers = _resolve_universe(args.universe, args.tickers)
-    extra = [s for s in settings.EXTRA_SYMBOLS if s not in tickers]
-    if extra:
-        tickers.extend(extra)
+    pit_bundle: Optional[PITDataBundle] = None
+    if args.pit_bundle:
+        if args.technical_only:
+            parser.error("--pit-bundle requires full CANSLIM fundamentals; remove --technical-only")
+        if not args.pit_bundle_sha256:
+            parser.error("--pit-bundle-sha256 is required with --pit-bundle")
+        pit_bundle = PITDataBundle(args.pit_bundle, expected_sha256=args.pit_bundle_sha256)
+        tickers = list(args.tickers or pit_bundle.symbols())
+    else:
+        tickers = _resolve_universe(args.universe, args.tickers)
+        extra = [s for s in settings.EXTRA_SYMBOLS if s not in tickers]
+        if extra:
+            tickers.extend(extra)
 
     simulator = PortfolioSimulator(
         initial_capital=args.capital,
@@ -1714,15 +1814,20 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
         stagnation_threshold_pct=args.stagnation_threshold,
         breakeven_trigger_pct=args.breakeven_trigger,
         benchmark_symbol=args.benchmark,
+        pit_bundle=pit_bundle,
     )
 
-    result = simulator.run(
-        tickers=tickers,
-        lookback_weeks=args.weeks,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        benchmark_symbol=args.benchmark,
-    )
+    try:
+        result = simulator.run(
+            tickers=tickers,
+            lookback_weeks=args.weeks,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            benchmark_symbol=args.benchmark,
+        )
+    finally:
+        if pit_bundle is not None:
+            pit_bundle.close()
     print_pnl_report(result)
 
     if not args.no_csv:
