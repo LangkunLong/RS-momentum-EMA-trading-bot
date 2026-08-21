@@ -2727,7 +2727,7 @@ def test_oversized_typed_coder_response_is_accounted_protocol_rejection() -> Non
             ],
         }
     )
-    ledger = BudgetLedger(max_usd=1.0, max_calls=1, max_tokens=10_000)
+    ledger = BudgetLedger(max_usd=1.0, max_calls=1, max_tokens=100_000)
     gateway = OpenRouterGateway(
         client=FakeClient([FakeResponse(oversized, cost=0.012, model=model)]),
         pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
@@ -5118,6 +5118,30 @@ def test_data_bundle_uses_requested_symbols_for_closes_and_benchmark_for_prices(
     assert validated.price_key.endswith("::AAPL,MSFT,SPY")
     assert validated.closes_key.endswith("::AAPL,MSFT")
 
+    covering = tmp_path / "covering.sqlite3"
+    covering_digest = _create_bundle(
+        covering,
+        [
+            (
+                "price::6mo::2026-01-01::2026-02-01::AAPL,MSFT,SPY",
+                "price",
+            ),
+            (
+                "closes::6mo::2026-01-01::2026-02-01::AAPL,MSFT,SPY",
+                "closes",
+            ),
+        ],
+    )
+    covering_validated = validate_historical_data_bundle(
+        covering,
+        covering_digest,
+        ["MSFT", "AAPL"],
+        "SPY",
+        "2026-01-01",
+        "2026-02-01",
+    )
+    assert covering_validated.closes_key.endswith("::AAPL,MSFT,SPY")
+
     wrong = tmp_path / "wrong.sqlite3"
     wrong_digest = _create_bundle(
         wrong,
@@ -5127,7 +5151,7 @@ def test_data_bundle_uses_requested_symbols_for_closes_and_benchmark_for_prices(
                 "price",
             ),
             (
-                "closes::6mo::2026-01-01::2026-02-01::AAPL,MSFT,SPY",
+                "closes::6mo::2026-01-01::2026-02-01::AAPL",
                 "closes",
             ),
         ],
@@ -9731,6 +9755,7 @@ def test_proposal_batch_records_closed_transport_failure_and_stops(
                 "call_index": 1,
                 "code": "provider_failed",
                 "role": "orchestrator",
+                "status_code": None,
             }
         ]
         assert "untrusted provider canary" not in json.dumps(events)
