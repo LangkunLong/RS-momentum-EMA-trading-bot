@@ -644,7 +644,7 @@ class PortfolioSimulator:
     def __init__(
         self,
         initial_capital: float = DEFAULT_CAPITAL,
-        max_positions: int = settings.MAX_OPEN_POSITIONS,
+        max_positions: Optional[int] = settings.MAX_OPEN_POSITIONS,
         position_size_pct: float = DEFAULT_POSITION_SIZE_PCT,
         position_risk_pct: float = DEFAULT_POSITION_RISK_PCT,
         stop_loss_pct: float = settings.STOP_LOSS_PCT,
@@ -655,6 +655,7 @@ class PortfolioSimulator:
         min_rs_score: float = DEFAULT_MIN_RS_SCORE,
         min_technical_score: float = DEFAULT_MIN_TECHNICAL_SCORE,
         require_bullish_market: bool = True,
+        use_stateful_regime_gate: bool = False,
         technical_only: bool = False,
         take_profit_pct: float = DEFAULT_TAKE_PROFIT_PCT,
         scale_out_fraction: float = DEFAULT_SCALE_OUT_FRACTION,
@@ -678,6 +679,7 @@ class PortfolioSimulator:
         self.min_rs_score = min_rs_score
         self.min_technical_score = min_technical_score
         self.require_bullish_market = require_bullish_market
+        self.use_stateful_regime_gate = use_stateful_regime_gate
         self.technical_only = technical_only
         self.take_profit_pct = take_profit_pct
         self.scale_out_fraction = scale_out_fraction
@@ -823,6 +825,7 @@ class PortfolioSimulator:
                 "rs_universe_count": len(all_closes.columns),
                 "benchmark_symbol": benchmark,
                 "max_positions": self.max_positions,
+                "use_stateful_regime_gate": self.use_stateful_regime_gate,
                 "position_size_pct": self.position_size_pct,
                 "stop_loss_pct": self.stop_loss_pct,
                 "ma_exit_period": self.ma_exit_period,
@@ -866,11 +869,11 @@ class PortfolioSimulator:
             self._execution_diagnostics["blocked_by_regime_days"] += 1
         if not market_allowed:
             self._execution_diagnostics["blocked_by_market_days"] += 1
-        if regime_allowed and market_allowed:
-            self._execution_diagnostics["entries_allowed_days"] += 1
-        entries_allowed = self._regime_tracker.allows_entries and (
-            not self.require_bullish_market or market_state["market_is_bullish"]
+        entries_allowed = market_allowed and (
+            not self.use_stateful_regime_gate or regime_allowed
         )
+        if entries_allowed:
+            self._execution_diagnostics["entries_allowed_days"] += 1
 
         signals: List[dict] = []
         rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date)
@@ -910,10 +913,13 @@ class PortfolioSimulator:
             return []
 
         signals.sort(key=lambda item: (item["canslim_score"], item["rs_score"]), reverse=True)
-        open_slots = max(self.max_positions - len(self._open_positions), 0)
-        candidate_limit = open_slots
-        if candidate_limit == 0 and self.enable_eviction and self.max_positions > 0:
-            candidate_limit = 1
+        if self.max_positions is None:
+            candidate_limit = len(signals)
+        else:
+            open_slots = max(self.max_positions - len(self._open_positions), 0)
+            candidate_limit = open_slots
+            if candidate_limit == 0 and self.enable_eviction and self.max_positions > 0:
+                candidate_limit = 1
         self._execution_diagnostics["capacity_truncated_signals"] += max(
             len(signals) - candidate_limit,
             0,
@@ -982,7 +988,7 @@ class PortfolioSimulator:
         if symbol in self._open_positions:
             self._execution_diagnostics["entry_rejected_already_open"] += 1
             return
-        if len(self._open_positions) >= self.max_positions:
+        if self.max_positions is not None and len(self._open_positions) >= self.max_positions:
             if not self._try_evict(signal, ticker_ohlcv, entry_date):
                 self._execution_diagnostics["entry_rejected_capacity"] += 1
                 return
@@ -1565,6 +1571,11 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
     parser.add_argument("--stagnation-threshold", type=float, default=DEFAULT_STAGNATION_THRESHOLD_PCT)
     parser.add_argument("--breakeven-trigger", type=float, default=DEFAULT_BREAKEVEN_TRIGGER_PCT)
     parser.add_argument("--signal-days", type=int, default=DEFAULT_SIGNAL_EVERY_N_DAYS)
+    parser.add_argument(
+        "--stateful-regime-gate",
+        action="store_true",
+        help="also require the stateful O'Neil correction tracker to allow entries",
+    )
     parser.add_argument("--min-canslim", type=float, default=float(settings.MIN_CANSLIM_SCORE))
     parser.add_argument("--min-rs", type=float, default=DEFAULT_MIN_RS_SCORE)
     parser.add_argument("--min-technical-score", type=float, default=DEFAULT_MIN_TECHNICAL_SCORE)
@@ -1592,6 +1603,7 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
         min_rs_score=args.min_rs,
         min_technical_score=args.min_technical_score,
         require_bullish_market=True,
+        use_stateful_regime_gate=args.stateful_regime_gate,
         technical_only=args.technical_only,
         take_profit_pct=args.take_profit,
         scale_out_fraction=args.scale_out_fraction,

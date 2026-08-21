@@ -2492,7 +2492,11 @@ class OpenRouterGateway:
                 timeout=request_timeout,
                 extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
                 extra_body=extra_body,
-                **({"temperature": 0} if role == "orchestrator" else {}),
+                **(
+                    {"temperature": 0}
+                    if role in {"orchestrator", "coder"}
+                    else {}
+                ),
             )
         except Exception:
             self.ledger.reconcile(reservation, Usage(), window=budget_window)
