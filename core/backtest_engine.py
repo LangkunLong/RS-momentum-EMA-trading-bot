@@ -1550,6 +1550,12 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
     parser.add_argument("--end-date", default=DEFAULT_END_DATE)
     parser.add_argument("--weeks", type=int, default=DEFAULT_LOOKBACK_WEEKS)
     parser.add_argument("--capital", type=float, default=DEFAULT_CAPITAL)
+    parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=settings.MAX_OPEN_POSITIONS,
+        help="maximum simultaneous positions for optimizer/backtest experiments",
+    )
     parser.add_argument("--stop", type=float, default=settings.STOP_LOSS_PCT)
     parser.add_argument("--position-size-pct", type=float, default=DEFAULT_POSITION_SIZE_PCT)
     parser.add_argument("--position-risk-pct", type=float, default=DEFAULT_POSITION_RISK_PCT)
@@ -1577,7 +1583,7 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
 
     simulator = PortfolioSimulator(
         initial_capital=args.capital,
-        max_positions=settings.MAX_OPEN_POSITIONS,
+        max_positions=args.max_positions,
         position_size_pct=args.position_size_pct,
         position_risk_pct=args.position_risk_pct,
         stop_loss_pct=args.stop,
