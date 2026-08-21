@@ -252,6 +252,47 @@ On the free FMP plan, use technical-only mode for broad-universe historical back
 python backtest_pnl.py --universe sp500 --start-date 2023-04-01 --end-date 2026-04-01 --technical-only --export-equity --export-holdings
 ```
 
+Backtest execution treats the market-direction score as diagnostics by default:
+an otherwise-valid signal is sized and entered whenever cash is available. Use
+`--require-bullish-market` only for an explicit conservative M-gated replay.
+
+To select a cash-deployment threshold without fitting the full period, run the
+walk-forward optimizer against the approved local cache:
+
+```powershell
+python cash_utilization_optimizer.py `
+  --historical-data-bundle .artifacts/cache/backtest/historical_data.sqlite3 `
+  --start-date 2023-04-01 --holdout-start-date 2025-04-01 --end-date 2026-04-01 `
+  --thresholds none,0.75,0.60,0.50 --target-cash-pct 60 `
+  --min-holdout-sharpe-delta 0 --min-holdout-return-delta 0 `
+  --max-holdout-drawdown-degradation-pct 0
+```
+
+The selector chooses on the training window, reports a trailing holdout
+comparison against the bullish-only baseline, and emits a `promote` or
+`hold_baseline` decision. Promotion requires lower holdout cash plus nonnegative
+holdout return/Sharpe deltas and no drawdown deterioration by default. It does
+not change the backtest execution default. Backtests execute otherwise-valid
+entries whenever cash is available; pass `--require-bullish-market` to opt into
+the M-gate for a conservative comparison. A threshold is an explicit backtest
+experiment; it is not a live or paper-trading setting.
+
+Backtest reports also separate final buy signals from technically valid signals
+that were blocked by the M (market-direction) gate. This prevents idle cash from
+being misdiagnosed as an order-entry or position-capacity failure.
+
+On the approved 2023--2026 cache, a 75% cash trigger passed a trailing holdout
+promotion check when allowing up to 3 percentage points of additional maximum
+drawdown (`avg_cash_pct` 58.4% vs 76.9%, Sharpe 1.36 vs 1.26). Treat that as an
+explicit research profile, not a new default: run it with
+`--cash-deployment-threshold 0.75` and review the resulting risk budget before
+using it outside backtesting.
+
+Rolling one-year replays show the same cash reduction in all three windows
+(roughly 12.6--18.5 percentage points), while return and Sharpe are mixed and
+maximum drawdown is 1.6--2.7 points worse. This is therefore a utilization
+profile with an explicit risk tradeoff, not a universally superior strategy.
+
 Full fundamental backtests can use three FMP requests per uncached ticker and free-tier history is limited to five records. Run them only on small explicit ticker lists after checking the persisted daily budget.
 
 Generated outputs are ignored under `scan_results/`, `backtest_results*`, and `.artifacts/`.

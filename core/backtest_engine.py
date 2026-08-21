@@ -464,12 +464,14 @@ class CanslimStrategy:
         min_rs_score: float = DEFAULT_MIN_RS_SCORE,
         min_canslim_score: float = float(settings.MIN_CANSLIM_SCORE),
         min_technical_score: float = DEFAULT_MIN_TECHNICAL_SCORE,
+        require_bullish_market: bool = False,
         technical_only: bool = False,
     ) -> None:
         self.min_c_a_growth = min_c_a_growth
         self.min_rs_score = min_rs_score
         self.min_canslim_score = min_canslim_score
         self.min_technical_score = min_technical_score
+        self.require_bullish_market = require_bullish_market
         self.technical_only = technical_only
 
     @staticmethod
@@ -570,14 +572,19 @@ class CanslimStrategy:
         c_pass = c_growth is not None and c_growth >= self.min_c_a_growth
         a_pass = a_growth is not None and a_growth >= self.min_c_a_growth
         l_pass = rs_score >= self.min_rs_score
-        m_pass = bool(market_state["market_is_bullish"])
+        m_pass = bool(
+            not self.require_bullish_market
+            or market_state["market_is_bullish"]
+            or market_state.get("cash_deployment_override", False)
+        )
         tech_pass = (has_breakout and has_surge and in_buy_zone) or has_peg_today
         composite_pass = total_score >= self.min_canslim_score
         technical_composite_pass = technical_score >= self.min_technical_score
         if self.technical_only:
-            buy_signal = all([l_pass, m_pass, tech_pass, technical_composite_pass])
+            buy_signal_without_market = all([l_pass, tech_pass, technical_composite_pass])
         else:
-            buy_signal = all([c_pass, a_pass, l_pass, m_pass, tech_pass, composite_pass])
+            buy_signal_without_market = all([c_pass, a_pass, l_pass, tech_pass, composite_pass])
+        buy_signal = bool(buy_signal_without_market and m_pass)
 
         if has_peg_today:
             signal_reason = "PEG Breakout"
@@ -602,6 +609,8 @@ class CanslimStrategy:
             "canslim_score": total_score,
             "technical_score": technical_score,
             "market_is_bullish": m_pass,
+            "market_regime_is_bullish": bool(market_state["market_is_bullish"]),
+            "buy_signal_without_market": bool(buy_signal_without_market),
             "has_breakout": has_breakout,
             "has_volume_surge": has_surge,
             "has_peg_today": has_peg_today,
@@ -619,11 +628,15 @@ def _new_execution_diagnostics() -> dict[str, int]:
         "entries_allowed_days": 0,
         "blocked_by_regime_days": 0,
         "blocked_by_market_days": 0,
+        "cash_deployment_override_days": 0,
         "buy_signal_rows": 0,
+        "potential_buy_signal_rows": 0,
+        "potential_buy_signal_rows_blocked_by_market": 0,
         "buy_signal_rows_when_entries_allowed": 0,
         "buy_signal_rows_blocked_by_regime": 0,
         "buy_signal_rows_blocked_by_market": 0,
         "buy_signal_rows_blocked_by_both": 0,
+        "buy_signal_rows_when_cash_override": 0,
         "capacity_truncated_signals": 0,
         "entry_attempts": 0,
         "entries_executed": 0,
@@ -658,8 +671,9 @@ class PortfolioSimulator:
         min_canslim_score: float = float(settings.MIN_CANSLIM_SCORE),
         min_rs_score: float = DEFAULT_MIN_RS_SCORE,
         min_technical_score: float = DEFAULT_MIN_TECHNICAL_SCORE,
-        require_bullish_market: bool = True,
+        require_bullish_market: bool = False,
         use_stateful_regime_gate: bool = False,
+        cash_deployment_threshold_pct: Optional[float] = None,
         technical_only: bool = False,
         take_profit_pct: float = DEFAULT_TAKE_PROFIT_PCT,
         scale_out_fraction: float = DEFAULT_SCALE_OUT_FRACTION,
@@ -684,6 +698,9 @@ class PortfolioSimulator:
         self.min_technical_score = min_technical_score
         self.require_bullish_market = require_bullish_market
         self.use_stateful_regime_gate = use_stateful_regime_gate
+        if cash_deployment_threshold_pct is not None and not 0.0 <= cash_deployment_threshold_pct <= 1.0:
+            raise ValueError("cash_deployment_threshold_pct must be between 0 and 1")
+        self.cash_deployment_threshold_pct = cash_deployment_threshold_pct
         self.technical_only = technical_only
         self.take_profit_pct = take_profit_pct
         self.scale_out_fraction = scale_out_fraction
@@ -695,6 +712,7 @@ class PortfolioSimulator:
             min_rs_score=min_rs_score,
             min_canslim_score=min_canslim_score,
             min_technical_score=min_technical_score,
+            require_bullish_market=require_bullish_market,
             technical_only=technical_only,
         )
         self.benchmark_symbol = benchmark_symbol
@@ -708,6 +726,7 @@ class PortfolioSimulator:
         self._signal_rows: List[dict] = []
         self._ticker_industry: Dict[str, str] = {}
         self._execution_diagnostics = _new_execution_diagnostics()
+        self._pending_entries_remaining = 0
 
     def run(
         self,
@@ -782,8 +801,10 @@ class PortfolioSimulator:
                 if ohlcv is not None:
                     self._check_exits(symbol, ohlcv, eval_date)
 
-            for pending in pending_entries:
+            for pending_idx, pending in enumerate(pending_entries):
+                self._pending_entries_remaining = len(pending_entries) - pending_idx
                 self._enter_position(pending, ticker_ohlcv, eval_date)
+            self._pending_entries_remaining = 0
             pending_entries = []
 
             is_signal_day = day_idx % self.signal_every_n_days == 0
@@ -829,7 +850,9 @@ class PortfolioSimulator:
                 "rs_universe_count": len(all_closes.columns),
                 "benchmark_symbol": benchmark,
                 "max_positions": self.max_positions,
+                "require_bullish_market": self.require_bullish_market,
                 "use_stateful_regime_gate": self.use_stateful_regime_gate,
+                "cash_deployment_threshold_pct": self.cash_deployment_threshold_pct,
                 "position_size_pct": self.position_size_pct,
                 "stop_loss_pct": self.stop_loss_pct,
                 "ma_exit_period": self.ma_exit_period,
@@ -866,8 +889,24 @@ class PortfolioSimulator:
     ) -> List[dict]:
         self._execution_diagnostics["signal_days"] += 1
         regime_allowed = bool(self._regime_tracker.allows_entries)
+        cash_override = False
+        if (
+            self.require_bullish_market
+            and
+            self.cash_deployment_threshold_pct is not None
+            and not market_state["market_is_bullish"]
+        ):
+            total_equity = self._mark_equity(ticker_ohlcv, eval_date)
+            cash_ratio = self._equity / total_equity if total_equity > 0 else 0.0
+            cash_override = cash_ratio >= self.cash_deployment_threshold_pct
+            if cash_override:
+                self._execution_diagnostics["cash_deployment_override_days"] += 1
+        effective_market_state = dict(market_state)
+        effective_market_state["cash_deployment_override"] = cash_override
         market_allowed = bool(
-            not self.require_bullish_market or market_state["market_is_bullish"]
+            not self.require_bullish_market
+            or market_state["market_is_bullish"]
+            or cash_override
         )
         if self.use_stateful_regime_gate and not regime_allowed:
             self._execution_diagnostics["blocked_by_regime_days"] += 1
@@ -894,16 +933,26 @@ class PortfolioSimulator:
                 ticker_ohlcv=ticker_ohlcv,
                 all_closes=all_closes,
                 eval_date=eval_date,
-                market_state=market_state,
+                market_state=effective_market_state,
                 rs_score=rs_snapshot.get(ticker),
             )
             if row is None:
                 continue
             self._signal_rows.append(row)
+            if row["buy_signal_without_market"]:
+                self._execution_diagnostics["potential_buy_signal_rows"] += 1
+                if (
+                    self.require_bullish_market
+                    and not row["market_regime_is_bullish"]
+                    and not cash_override
+                ):
+                    self._execution_diagnostics["potential_buy_signal_rows_blocked_by_market"] += 1
             if row["buy_signal"]:
                 self._execution_diagnostics["buy_signal_rows"] += 1
                 if entries_allowed:
                     self._execution_diagnostics["buy_signal_rows_when_entries_allowed"] += 1
+                    if cash_override:
+                        self._execution_diagnostics["buy_signal_rows_when_cash_override"] += 1
                 elif not regime_allowed and not market_allowed:
                     self._execution_diagnostics["buy_signal_rows_blocked_by_both"] += 1
                 elif not regime_allowed:
@@ -1028,7 +1077,16 @@ class PortfolioSimulator:
         if risk_per_share <= 0:
             self._execution_diagnostics["entry_rejected_invalid_risk"] += 1
             return
-        position_value = min(self._equity, risk_amount / risk_per_share * entry_price)
+        target_position_value = risk_amount / risk_per_share * entry_price
+        if self.max_positions is None and self._pending_entries_remaining > 1:
+            # In uncapped backtests, do not let early-ranked signals consume
+            # all cash and starve valid same-day signals.  Spread available
+            # cash over the pending batch without using leverage; each trade
+            # remains at or below its configured risk target.
+            batch_allocation = self._equity / self._pending_entries_remaining
+            position_value = min(self._equity, target_position_value, batch_allocation)
+        else:
+            position_value = min(self._equity, target_position_value)
         if position_value <= 0:
             self._execution_diagnostics["entry_rejected_invalid_risk"] += 1
             return
@@ -1285,6 +1343,10 @@ def print_pnl_report(result: SimulationResult) -> None:
     print(f"Benchmark:        {result.benchmark_symbol}")
     print(f"Window:           {cfg.get('start_date', '?')} -> {cfg.get('end_date', '?')}")
     print(f"Signal cadence:   every {cfg.get('signal_every_n_days', DEFAULT_SIGNAL_EVERY_N_DAYS)} trading days")
+    print(
+        "M-gate:           "
+        + ("required" if cfg.get("require_bullish_market", False) else "diagnostic only")
+    )
     print(f"Stop-loss:        {cfg.get('stop_loss_pct', settings.STOP_LOSS_PCT) * 100:.1f}%")
     print(f"Take-profit:      {cfg.get('take_profit_pct', DEFAULT_TAKE_PROFIT_PCT) * 100:.1f}%")
     print(f"Time stop:        {cfg.get('stagnation_days', DEFAULT_STAGNATION_DAYS)} days")
@@ -1350,6 +1412,17 @@ def print_pnl_report(result: SimulationResult) -> None:
             f"{execution.get('buy_signal_rows', 0)} / "
             f"{execution.get('buy_signal_rows_when_entries_allowed', 0)}"
         )
+        print(
+            "Potential buys before M gate / blocked by M gate: "
+            f"{execution.get('potential_buy_signal_rows', 0)} / "
+            f"{execution.get('potential_buy_signal_rows_blocked_by_market', 0)}"
+        )
+        if cfg.get("cash_deployment_threshold_pct") is not None:
+            print(
+                "Cash override days / admitted signals: "
+                f"{execution.get('cash_deployment_override_days', 0)} / "
+                f"{execution.get('buy_signal_rows_when_cash_override', 0)}"
+            )
         print(
             "Entry attempts / executed: "
             f"{execution.get('entry_attempts', 0)} / "
@@ -1572,8 +1645,8 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
     parser.add_argument(
         "--max-positions",
         type=int,
-        default=settings.MAX_OPEN_POSITIONS,
-        help="maximum simultaneous positions for optimizer/backtest experiments",
+        default=None,
+        help="maximum simultaneous positions; omit for uncapped backtests",
     )
     parser.add_argument("--stop", type=float, default=settings.STOP_LOSS_PCT)
     parser.add_argument("--position-size-pct", type=float, default=DEFAULT_POSITION_SIZE_PCT)
@@ -1588,6 +1661,22 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
         "--stateful-regime-gate",
         action="store_true",
         help="also require the stateful O'Neil correction tracker to allow entries",
+    )
+    parser.add_argument(
+        "--require-bullish-market",
+        action="store_true",
+        help="opt in to the O'Neil M-gate; otherwise valid entries execute when cash is available",
+    )
+    parser.add_argument(
+        "--allow-non-bullish-entries",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--cash-deployment-threshold",
+        type=float,
+        default=None,
+        help="fraction of cash above which non-bullish signals may be admitted (0-1)",
     )
     parser.add_argument("--min-canslim", type=float, default=float(settings.MIN_CANSLIM_SCORE))
     parser.add_argument("--min-rs", type=float, default=DEFAULT_MIN_RS_SCORE)
@@ -1615,8 +1704,9 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
         min_canslim_score=args.min_canslim,
         min_rs_score=args.min_rs,
         min_technical_score=args.min_technical_score,
-        require_bullish_market=True,
+        require_bullish_market=args.require_bullish_market and not args.allow_non_bullish_entries,
         use_stateful_regime_gate=args.stateful_regime_gate,
+        cash_deployment_threshold_pct=args.cash_deployment_threshold,
         technical_only=args.technical_only,
         take_profit_pct=args.take_profit,
         scale_out_fraction=args.scale_out_fraction,
