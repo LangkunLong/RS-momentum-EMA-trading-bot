@@ -9272,13 +9272,11 @@ def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
 
 def _proposal_batch_allowed_replacements() -> tuple[ExactLineReplacement, ...]:
     """Return the bounded controller-owned pivot-threshold experiment family."""
-    values = tuple(
-        value
-        for value in (
-            *(0.90 + index * 0.01 for index in range(5)),
-            *(0.96 + index * 0.01 for index in range(10)),
-        )
-    )
+    # A lower right-lip threshold is explicitly ruled out by the execution
+    # facts above: it only makes an already pass-through pivot more permissive
+    # and cannot increase entry eligibility. Keep the paid experiment family
+    # on the causally valid stricter side of the observed bottleneck.
+    values = tuple(0.96 + index * 0.01 for index in range(5))
     return tuple(
         ExactLineReplacement(
             path="core/pivot_detector.py",
