@@ -621,6 +621,9 @@ def _new_execution_diagnostics() -> dict[str, int]:
         "blocked_by_market_days": 0,
         "buy_signal_rows": 0,
         "buy_signal_rows_when_entries_allowed": 0,
+        "buy_signal_rows_blocked_by_regime": 0,
+        "buy_signal_rows_blocked_by_market": 0,
+        "buy_signal_rows_blocked_by_both": 0,
         "capacity_truncated_signals": 0,
         "entry_attempts": 0,
         "entries_executed": 0,
@@ -894,6 +897,12 @@ class PortfolioSimulator:
                 self._execution_diagnostics["buy_signal_rows"] += 1
                 if entries_allowed:
                     self._execution_diagnostics["buy_signal_rows_when_entries_allowed"] += 1
+                elif not regime_allowed and not market_allowed:
+                    self._execution_diagnostics["buy_signal_rows_blocked_by_both"] += 1
+                elif not regime_allowed:
+                    self._execution_diagnostics["buy_signal_rows_blocked_by_regime"] += 1
+                elif not market_allowed:
+                    self._execution_diagnostics["buy_signal_rows_blocked_by_market"] += 1
             if entries_allowed and row["buy_signal"]:
                 signals.append(row)
 
