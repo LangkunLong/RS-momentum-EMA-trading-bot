@@ -2015,6 +2015,12 @@ class OpenRouterGateway:
     @classmethod
     def _response_format_for_role(cls, role: str) -> dict[str, object]:
         """Return an isolated strict provider schema for one closed role payload."""
+        # DeepSeek R1 is required to emit a JSON object, but routed providers do
+        # not consistently expose OpenAI's strict JSON-schema mode.  Keep the
+        # controller-side closed-schema validation below as the authority while
+        # using the interoperable JSON-object request format for this role.
+        if role == "reasoner":
+            return {"type": "json_object"}
         try:
             name = cls._RESPONSE_SCHEMA_NAMES[role]
             schema = cls._RESPONSE_SCHEMAS[role]
