@@ -188,6 +188,7 @@ class SimulationResult:
     transaction_log: pd.DataFrame = field(default_factory=pd.DataFrame)
     weekly_holdings: pd.DataFrame = field(default_factory=pd.DataFrame)
     signal_log: pd.DataFrame = field(default_factory=pd.DataFrame)
+    execution_diagnostics: dict[str, int] = field(default_factory=dict)
     benchmark_symbol: str = BENCHMARK
 
     @property
@@ -691,6 +692,25 @@ class PortfolioSimulator:
         self._transactions = []
         self._weekly_snapshots = []
         self._signal_rows = []
+        self._execution_diagnostics = {
+            "signal_days": 0,
+            "entries_allowed_days": 0,
+            "blocked_by_regime_days": 0,
+            "blocked_by_market_days": 0,
+            "buy_signal_rows": 0,
+            "buy_signal_rows_when_entries_allowed": 0,
+            "capacity_truncated_signals": 0,
+            "entry_attempts": 0,
+            "entries_executed": 0,
+            "entry_rejected_already_open": 0,
+            "entry_rejected_capacity": 0,
+            "entry_rejected_missing_data": 0,
+            "entry_rejected_invalid_price": 0,
+            "entry_rejected_invalid_risk": 0,
+            "eviction_attempts": 0,
+            "evictions_executed": 0,
+            "eviction_rejections": 0,
+        }
 
         clear_session_cache()
         benchmark = benchmark_symbol or self.benchmark_symbol
@@ -816,6 +836,7 @@ class PortfolioSimulator:
             transaction_log=pd.DataFrame(self._transactions),
             weekly_holdings=pd.DataFrame(self._weekly_snapshots),
             signal_log=pd.DataFrame(self._signal_rows),
+            execution_diagnostics=dict(self._execution_diagnostics),
             benchmark_symbol=benchmark,
         )
 
@@ -828,6 +849,17 @@ class PortfolioSimulator:
         eval_date: pd.Timestamp,
         market_state: dict,
     ) -> List[dict]:
+        self._execution_diagnostics["signal_days"] += 1
+        regime_allowed = bool(self._regime_tracker.allows_entries)
+        market_allowed = bool(
+            not self.require_bullish_market or market_state["market_is_bullish"]
+        )
+        if not regime_allowed:
+            self._execution_diagnostics["blocked_by_regime_days"] += 1
+        if not market_allowed:
+            self._execution_diagnostics["blocked_by_market_days"] += 1
+        if regime_allowed and market_allowed:
+            self._execution_diagnostics["entries_allowed_days"] += 1
         entries_allowed = self._regime_tracker.allows_entries and (
             not self.require_bullish_market or market_state["market_is_bullish"]
         )
@@ -853,6 +885,10 @@ class PortfolioSimulator:
             if row is None:
                 continue
             self._signal_rows.append(row)
+            if row["buy_signal"]:
+                self._execution_diagnostics["buy_signal_rows"] += 1
+                if entries_allowed:
+                    self._execution_diagnostics["buy_signal_rows_when_entries_allowed"] += 1
             if entries_allowed and row["buy_signal"]:
                 signals.append(row)
 
@@ -864,6 +900,10 @@ class PortfolioSimulator:
         candidate_limit = open_slots
         if candidate_limit == 0 and self.enable_eviction and self.max_positions > 0:
             candidate_limit = 1
+        self._execution_diagnostics["capacity_truncated_signals"] += max(
+            len(signals) - candidate_limit,
+            0,
+        )
         return signals[:candidate_limit]
 
     def _try_evict(
@@ -880,6 +920,8 @@ class PortfolioSimulator:
         """
         if not self.enable_eviction:
             return False
+
+        self._execution_diagnostics["eviction_attempts"] += 1
 
         new_rs = new_signal.get("rs_score", 0.0)
 
@@ -907,10 +949,12 @@ class PortfolioSimulator:
 
         pool = losers if losers else fallback
         if not pool:
+            self._execution_diagnostics["eviction_rejections"] += 1
             return False
 
         evict_sym, _, evict_close = min(pool, key=lambda x: x[1].rs_score)
         self._close_trade(evict_sym, evict_close, "evicted", str(eval_date.date()))
+        self._execution_diagnostics["evictions_executed"] += 1
         return True
 
     def _enter_position(
@@ -919,15 +963,19 @@ class PortfolioSimulator:
         ticker_ohlcv: Dict[str, pd.DataFrame],
         entry_date: pd.Timestamp,
     ) -> None:
+        self._execution_diagnostics["entry_attempts"] += 1
         symbol = signal["symbol"]
         if symbol in self._open_positions:
+            self._execution_diagnostics["entry_rejected_already_open"] += 1
             return
         if len(self._open_positions) >= self.max_positions:
             if not self._try_evict(signal, ticker_ohlcv, entry_date):
+                self._execution_diagnostics["entry_rejected_capacity"] += 1
                 return
 
         ohlcv = ticker_ohlcv.get(symbol)
         if ohlcv is None:
+            self._execution_diagnostics["entry_rejected_missing_data"] += 1
             return
 
         bar = ohlcv.loc[entry_date:entry_date]
@@ -940,6 +988,7 @@ class PortfolioSimulator:
             entry_price = float(bar["Open"].iloc[0]) if "Open" in bar.columns else float(bar["Close"].iloc[0])
 
         if entry_price <= 0:
+            self._execution_diagnostics["entry_rejected_invalid_price"] += 1
             return
 
         total_portfolio_value = self._mark_equity(ticker_ohlcv, entry_date)
@@ -949,9 +998,11 @@ class PortfolioSimulator:
         risk_amount = total_portfolio_value * self.position_risk_pct
         risk_per_share = entry_price * self.stop_loss_pct
         if risk_per_share <= 0:
+            self._execution_diagnostics["entry_rejected_invalid_risk"] += 1
             return
         position_value = min(self._equity, risk_amount / risk_per_share * entry_price)
         if position_value <= 0:
+            self._execution_diagnostics["entry_rejected_invalid_risk"] += 1
             return
 
         qty = position_value / entry_price
@@ -968,6 +1019,7 @@ class PortfolioSimulator:
         )
         self._open_positions[symbol] = trade
         self._equity -= position_value
+        self._execution_diagnostics["entries_executed"] += 1
         self._record_transaction(
             date=str(entry_date.date()),
             ticker=symbol,
@@ -1257,6 +1309,29 @@ def print_pnl_report(result: SimulationResult) -> None:
         f"{funnel['buy_zone_pass']} / {funnel['peg_pass']} / "
         f"{funnel['technical_score_pass']} / {funnel['buy_signal_count']}"
     )
+    execution = result.execution_diagnostics
+    if execution:
+        print("\n--- Execution Diagnostics ---")
+        print(
+            "Signal days / entry-allowed days: "
+            f"{execution.get('signal_days', 0)} / "
+            f"{execution.get('entries_allowed_days', 0)}"
+        )
+        print(
+            "Buy signals / entry-eligible signals: "
+            f"{execution.get('buy_signal_rows', 0)} / "
+            f"{execution.get('buy_signal_rows_when_entries_allowed', 0)}"
+        )
+        print(
+            "Entry attempts / executed: "
+            f"{execution.get('entry_attempts', 0)} / "
+            f"{execution.get('entries_executed', 0)}"
+        )
+        print(
+            "Capacity-truncated / capacity-rejected: "
+            f"{execution.get('capacity_truncated_signals', 0)} / "
+            f"{execution.get('entry_rejected_capacity', 0)}"
+        )
 
     warnings: list[str] = []
     if result.signal_log.empty:
