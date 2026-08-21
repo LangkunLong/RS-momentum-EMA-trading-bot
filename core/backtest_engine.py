@@ -191,6 +191,56 @@ class SimulationResult:
     benchmark_symbol: str = BENCHMARK
 
     @property
+    def signal_funnel(self) -> dict[str, int]:
+        """Return bounded, content-free counts for each CANSLIM signal gate.
+
+        The funnel is deliberately derived from ``signal_log`` rather than from
+        trade outcomes.  That lets a replay distinguish an empty candidate
+        universe, weak RS, market gating, breakout/volume gating, and portfolio
+        capacity without exposing symbols, prices, or provider output.
+        """
+        columns = self.signal_log.columns
+
+        def count_true(name: str) -> int:
+            if name not in columns:
+                return 0
+            return int(self.signal_log[name].fillna(False).astype(bool).sum())
+
+        def count_threshold(name: str, threshold: float) -> int:
+            if name not in columns:
+                return 0
+            values = pd.to_numeric(self.signal_log[name], errors="coerce")
+            return int((values >= threshold).fillna(False).sum())
+
+        return {
+            "evaluated_rows": int(len(self.signal_log)),
+            "signal_days": int(
+                self.signal_log["signal_date"].nunique()
+                if "signal_date" in columns
+                else 0
+            ),
+            "symbols_evaluated": int(
+                self.signal_log["symbol"].nunique()
+                if "symbol" in columns
+                else 0
+            ),
+            "rs_pass": count_threshold("rs_score", self.config.get("min_rs_score", DEFAULT_MIN_RS_SCORE)),
+            "market_pass": count_true("market_is_bullish"),
+            "breakout_pass": count_true("has_breakout"),
+            "volume_surge_pass": count_true("has_volume_surge"),
+            "buy_zone_pass": count_true("in_buy_zone"),
+            "peg_pass": count_true("has_peg_today"),
+            "technical_score_pass": count_threshold(
+                "technical_score", self.config.get("min_technical_score", DEFAULT_MIN_TECHNICAL_SCORE)
+            ),
+            "buy_signal_count": count_true("buy_signal"),
+            "candidate_universe_count": int(
+                self.config.get("candidate_universe_count", len(self.config.get("tickers", [])))
+            ),
+            "rs_universe_count": int(self.config.get("rs_universe_count", 0)),
+        }
+
+    @property
     def closed_trades(self) -> List[Trade]:
         return [t for t in self.trades if not t.is_open]
 
@@ -741,6 +791,8 @@ class PortfolioSimulator:
             initial_capital=self.initial_capital,
             config={
                 "tickers": tickers,
+                "candidate_universe_count": len(tickers),
+                "rs_universe_count": len(all_closes.columns),
                 "benchmark_symbol": benchmark,
                 "max_positions": self.max_positions,
                 "position_size_pct": self.position_size_pct,
@@ -1182,6 +1234,29 @@ def print_pnl_report(result: SimulationResult) -> None:
         print(f"Transactions:      {len(result.transaction_log)}")
     if not result.weekly_holdings.empty:
         print(f"Weekly snapshots:  {len(result.weekly_holdings)}")
+
+    funnel = result.signal_funnel
+    print("\n--- Signal Funnel ---")
+    print(
+        "Evaluated rows:    "
+        f"{funnel['evaluated_rows']} across {funnel['symbols_evaluated']} symbols / "
+        f"{funnel['signal_days']} signal days"
+    )
+    print(
+        "RS universe:       "
+        f"{funnel['rs_universe_count']} | candidate universe: "
+        f"{funnel['candidate_universe_count']}"
+    )
+    print(
+        "RS / market / breakout / volume: "
+        f"{funnel['rs_pass']} / {funnel['market_pass']} / "
+        f"{funnel['breakout_pass']} / {funnel['volume_surge_pass']}"
+    )
+    print(
+        "Buy-zone / PEG / technical / buy: "
+        f"{funnel['buy_zone_pass']} / {funnel['peg_pass']} / "
+        f"{funnel['technical_score_pass']} / {funnel['buy_signal_count']}"
+    )
 
     warnings: list[str] = []
     if result.signal_log.empty:

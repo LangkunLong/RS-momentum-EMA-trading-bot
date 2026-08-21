@@ -34,7 +34,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, BinaryIO, Callable, Generic, Mapping, Protocol, Sequence, TypeVar
+from typing import Any, BinaryIO, Callable, ClassVar, Generic, Mapping, Protocol, Sequence, TypeVar
 
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -5842,7 +5842,8 @@ def evaluate_backtest_metrics(
         "max_drawdown_pct",
         "closed_trades",
     }
-    if set(metrics) != expected:
+    optional = {"signal_funnel"}
+    if set(metrics) - expected - optional or not expected.issubset(metrics):
         return BacktestEvaluation(False, ("metrics shape",))
     values: dict[str, float] = {}
     for name in expected - {"closed_trades"}:
@@ -5974,14 +5975,27 @@ def run_backtest_gate(
             True, False, True, bool(payload["worker_confined"]), False, False,
             "sentinel_invalid", evaluation, observation.completion_envelope,
         )
-    diagnostics = BacktestDiagnosticEvidence.from_metrics(
-        metrics,
-        thresholds,
-        evaluation,
-        ticker_count=len(requested),
-        start_date=start_date,
-        end_date=end_date,
-    )
+    try:
+        funnel = (
+            BacktestSignalFunnelEvidence.from_mapping(metrics["signal_funnel"])
+            if "signal_funnel" in metrics
+            else None
+        )
+        diagnostics = BacktestDiagnosticEvidence.from_metrics(
+            metrics,
+            thresholds,
+            evaluation,
+            ticker_count=len(requested),
+            start_date=start_date,
+            end_date=end_date,
+            signal_funnel=funnel,
+        )
+    except (ConfigurationError, GateConfigurationError):
+        evaluation = BacktestEvaluation(False, ("sentinel",))
+        return BacktestGateResult(
+            True, False, True, bool(payload["worker_confined"]), False, False,
+            "sentinel_invalid", evaluation, observation.completion_envelope,
+        )
     return BacktestGateResult(
         True,
         evaluation.thresholds_met_observation,
@@ -6010,6 +6024,7 @@ def run_hidden_backtest_worker(
     """Hidden child-only technical backtest entrypoint; imports engine code only when invoked."""
     requested = tuple(dict.fromkeys(_validate_symbol(value) for value in tickers))
     benchmark_symbol = _validate_symbol(benchmark)
+    rs_universe_symbols = requested
     scratch = prepare_backtest_scratch_copy(bundle_path, expected_sha256, scratch_path)
     source_root = candidate_source_root.resolve(strict=True)
     sys.path.insert(0, str(source_root))
@@ -6020,6 +6035,7 @@ def run_hidden_backtest_worker(
     from core import backtest_engine
 
     def seed_requested_window_cache() -> None:
+        nonlocal rs_universe_symbols
         """Alias the approved full-range payloads to the requested evaluation window.
 
         The sealed bundle is intentionally validated without deserializing its pickle
@@ -6040,10 +6056,6 @@ def run_hidden_backtest_worker(
         price_key = (
             f"price::{period}::{start_date}::{end_date}::{','.join(exact_symbols)}"
         )
-        closes_key = (
-            f"closes::{period}::{start_date}::{end_date}::{','.join(requested_symbols)}"
-        )
-
         def select_source_key(
             rows: Sequence[tuple[object, object]],
             kind: str,
@@ -6094,8 +6106,26 @@ def run_hidden_backtest_worker(
             or any(symbol not in closes_payload.columns for symbol in requested)
         ):
             raise DataBundleError("approved cache payloads lack the requested symbols")
+        try:
+            cached_symbols = tuple(
+                sorted(
+                    {
+                        _validate_symbol(str(symbol))
+                        for symbol in closes_payload.columns
+                        if _validate_symbol(str(symbol)) != benchmark_symbol
+                    }
+                )
+            )
+        except (DataBundleError, TypeError, ValueError) as exc:
+            raise DataBundleError("approved closes payload contains an invalid symbol") from exc
+        if not cached_symbols or len(cached_symbols) > 5000:
+            raise DataBundleError("approved closes payload has an invalid RS universe size")
+        rs_universe_symbols = cached_symbols
+        full_closes_key = (
+            f"closes::{period}::{start_date}::{end_date}::{','.join(cached_symbols)}"
+        )
         fetcher._store_cached(price_key, "price", price_payload)
-        fetcher._store_cached(closes_key, "closes", closes_payload)
+        fetcher._store_cached(full_closes_key, "closes", closes_payload)
 
     seed_requested_window_cache()
 
@@ -6105,7 +6135,11 @@ def run_hidden_backtest_worker(
     for attribute in ("_download_price_data", "_download_bulk_closes", "fetch_bulk_ohlcv"):
         setattr(backtest_engine, attribute, cache_miss)
 
-    backtest_engine.get_sp500_tickers = lambda *_args, **_kwargs: list(requested)
+    # The approved closes payload is the point-in-time RS universe for this
+    # replay.  Do not silently substitute the trade candidates; that would make
+    # a leader-recall test unable to discover names outside the small candidate
+    # list while still appearing to have a valid RS score.
+    backtest_engine.get_sp500_tickers = lambda *_args, **_kwargs: list(rs_universe_symbols)
     result = backtest_engine.run_cli(
         [
             "--tickers",
@@ -6127,6 +6161,9 @@ def run_hidden_backtest_worker(
         "max_drawdown_pct": float(result.max_drawdown_pct),
         "closed_trades": len(result.closed_trades),
     }
+    funnel = getattr(result, "signal_funnel", None)
+    if isinstance(funnel, Mapping):
+        payload["signal_funnel"] = dict(funnel)
     if any(type(value) is float and not math.isfinite(value) for value in payload.values()):
         raise GateConfigurationError("SimulationResult contains non-finite metrics")
     print(BACKTEST_SENTINEL + json.dumps(payload, sort_keys=True, separators=(",", ":")))
@@ -6415,6 +6452,73 @@ _BACKTEST_METRIC_NAMES = (
 )
 _BACKTEST_DIAGNOSTIC_ABS_LIMIT = 1_000_000.0
 _BACKTEST_DIAGNOSTIC_MARGIN_LIMIT = 2_000_000.0
+_BACKTEST_FUNNEL_COUNT_LIMIT = 1_000_000_000
+
+
+@dataclass(frozen=True)
+class BacktestSignalFunnelEvidence:
+    """Bounded, content-free counts explaining where CANSLIM signals stop."""
+
+    evaluated_rows: int
+    signal_days: int
+    symbols_evaluated: int
+    rs_pass: int
+    market_pass: int
+    breakout_pass: int
+    volume_surge_pass: int
+    buy_zone_pass: int
+    peg_pass: int
+    technical_score_pass: int
+    buy_signal_count: int
+    candidate_universe_count: int
+    rs_universe_count: int
+
+    _FIELDS: ClassVar[tuple[str, ...]] = (
+        "evaluated_rows",
+        "signal_days",
+        "symbols_evaluated",
+        "rs_pass",
+        "market_pass",
+        "breakout_pass",
+        "volume_surge_pass",
+        "buy_zone_pass",
+        "peg_pass",
+        "technical_score_pass",
+        "buy_signal_count",
+        "candidate_universe_count",
+        "rs_universe_count",
+    )
+
+    def __post_init__(self) -> None:
+        values = {name: getattr(self, name) for name in self._FIELDS}
+        if any(
+            type(value) is not int or not 0 <= value <= _BACKTEST_FUNNEL_COUNT_LIMIT
+            for value in values.values()
+        ):
+            raise ConfigurationError("backtest signal funnel counts are invalid")
+        if self.signal_days > self.evaluated_rows or self.symbols_evaluated > self.evaluated_rows:
+            raise ConfigurationError("backtest signal funnel dimensions are inconsistent")
+        for name in (
+            "rs_pass",
+            "market_pass",
+            "breakout_pass",
+            "volume_surge_pass",
+            "buy_zone_pass",
+            "peg_pass",
+            "technical_score_pass",
+            "buy_signal_count",
+        ):
+            if getattr(self, name) > self.evaluated_rows:
+                raise ConfigurationError("backtest signal funnel stage exceeds evaluations")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> BacktestSignalFunnelEvidence:
+        if not isinstance(value, Mapping) or set(value) != set(cls._FIELDS):
+            raise GateConfigurationError("backtest signal funnel shape is invalid")
+        try:
+            return cls(**{name: value[name] for name in cls._FIELDS})
+        except (TypeError, ConfigurationError) as exc:
+            raise GateConfigurationError("backtest signal funnel values are invalid") from exc
 
 
 @dataclass(frozen=True)
@@ -6440,6 +6544,7 @@ class BacktestDiagnosticEvidence:
     ticker_count: int
     calendar_days: int
     provider_safe: bool = True
+    signal_funnel: BacktestSignalFunnelEvidence | None = None
 
     def __post_init__(self) -> None:
         operands = (
@@ -6487,6 +6592,10 @@ class BacktestDiagnosticEvidence:
             raise ConfigurationError("backtest diagnostic closed_trades_margin is outside its bound")
         if self.provider_safe is not True:
             raise ConfigurationError("backtest diagnostics must be provider-safe")
+        if self.signal_funnel is not None and not isinstance(
+            self.signal_funnel, BacktestSignalFunnelEvidence
+        ):
+            raise ConfigurationError("backtest signal funnel evidence has the wrong type")
 
         observed = {
             "total_return_pct": self.total_return_pct,
@@ -6540,6 +6649,7 @@ class BacktestDiagnosticEvidence:
         ticker_count: int,
         start_date: str,
         end_date: str,
+        signal_funnel: BacktestSignalFunnelEvidence | None = None,
     ) -> BacktestDiagnosticEvidence:
         """Build one quantized diagnostic from already validated controller facts."""
         total_return = float(metrics["total_return_pct"])
@@ -6571,6 +6681,7 @@ class BacktestDiagnosticEvidence:
             failed_metrics=evaluation.failures,
             ticker_count=ticker_count,
             calendar_days=(date.fromisoformat(end_date) - date.fromisoformat(start_date)).days,
+            signal_funnel=signal_funnel,
         )
 
 
@@ -9317,7 +9428,10 @@ def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
                 "RS, and technical-score gates. The only approved experiment is the explicit S-signal "
                 "volume-surge multiplier and breakout proximity literals in backtest.py; portfolio "
                 "simulation, metric computation, dates, data loading, risk exits, and configuration "
-                "must remain unchanged."
+                "must remain unchanged. The evidence includes a signal_funnel object with bounded "
+                "counts for evaluated rows, RS, market, breakout, volume, buy-zone, PEG, technical "
+                "score, and final buy-signal stages; use those counts to identify the measured bottleneck "
+                "instead of inferring causality from total return alone."
             ),
         },
         {
