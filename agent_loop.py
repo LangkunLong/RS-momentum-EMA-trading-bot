@@ -9906,9 +9906,18 @@ def run_proposal_batch(
                     )
                     check_wall()
                     if not evaluation.eligible_for_export:
-                        raise PatchPolicyError(
-                            "proposal did not pass private quality and gate evaluation"
-                        )
+                        try:
+                            record_sample_rejection(
+                                sample=sample,
+                                code="quality_rejected",
+                                calls_before=calls_before,
+                                expected_calls=3,
+                                sealed_manifest=sealed_manifest,
+                                state=LoopState.RECORD_REJECTION,
+                            )
+                        except (BudgetExceededError, CandidateMutationError):
+                            raise
+                        continue
                     handoff = export_inert_proposal(
                         candidate,
                         audit,
