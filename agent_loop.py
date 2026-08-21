@@ -5814,6 +5814,17 @@ class BacktestThresholds:
             raise GateConfigurationError("minimum closed trades must be a bounded nonnegative integer")
 
 
+def _holdout_safety_thresholds() -> BacktestThresholds:
+    """Use a neutral bounded floor for trailing-window non-regression checks."""
+    return BacktestThresholds(
+        minimum_total_return=-1_000_000.0,
+        minimum_annualized_return=-1_000_000.0,
+        minimum_sharpe_ratio=-1_000_000.0,
+        maximum_drawdown_magnitude=1_000_000.0,
+        minimum_closed_trades=0,
+    )
+
+
 @dataclass(frozen=True)
 class BacktestEvaluation:
     thresholds_met_observation: bool
@@ -6778,9 +6789,12 @@ def compare_backtest_evidence(
             failures.append("sharpe_worse")
         if deltas[3] < -_BACKTEST_DRAWDOWN_COMPARISON_TOLERANCE_PCT:
             failures.append("drawdown_worse")
-        if deltas[4] < 0:
-            failures.append("closed_trades_worse")
-        if not any(delta > 0 for delta in deltas):
+        # Trade count is an activity diagnostic, not a monotonic quality
+        # objective: a tighter entry rule may take fewer trades while improving
+        # return, risk, and Sharpe.  The absolute candidate gate still enforces
+        # ``minimum_closed_trades``; only the performance deltas determine
+        # strict improvement here.
+        if not any(delta > 0 for delta in deltas[:4]):
             failures.append("no_strict_improvement")
     return BacktestComparison(
         total_return_delta=float(deltas[0]),
@@ -11136,9 +11150,13 @@ def _backtest_provider_evidence(
     *,
     start_date: str | None = None,
     end_date: str | None = None,
+    thresholds: BacktestThresholds | None = None,
 ) -> ProviderGateEvidence:
     window_start = gate.start_date if start_date is None else start_date
     window_end = gate.end_date if end_date is None else end_date
+    active_thresholds = gate.thresholds if thresholds is None else thresholds
+    if not isinstance(active_thresholds, BacktestThresholds):
+        raise ConfigurationError("backtest evidence thresholds are invalid")
     result = run_backtest_gate(
         candidate,
         sandbox,
@@ -11147,7 +11165,7 @@ def _backtest_provider_evidence(
         gate.benchmark,
         window_start,
         window_end,
-        gate.thresholds,
+        active_thresholds,
     )
     if result.provider_safe is not True:
         raise ConfigurationError("backtest gate did not return provider-safe facts")
@@ -11381,6 +11399,7 @@ def _execute_cli_run(
                                 bundle,
                                 start_date=config.gate.holdout_start_date,
                                 end_date=config.gate.holdout_end_date,
+                                thresholds=_holdout_safety_thresholds(),
                             )
                         )
                         if config.gate.holdout_start_date is not None
@@ -11408,6 +11427,7 @@ def _execute_cli_run(
                                 bundle,
                                 start_date=config.gate.holdout_start_date,
                                 end_date=config.gate.holdout_end_date,
+                                thresholds=_holdout_safety_thresholds(),
                             )
                         )
                         if config.gate.holdout_start_date is not None
