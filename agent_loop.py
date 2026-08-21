@@ -9969,14 +9969,25 @@ def run_proposal_batch(
                         normalized_diff.encode("utf-8")
                     ).hexdigest()
                     if predicted_diff_sha256 in seen_diff_sha256:
-                        record_sample_rejection(
-                            sample=sample,
-                            code="duplicate_proposal",
-                            calls_before=calls_before,
-                            expected_calls=3,
-                            sealed_manifest=sealed_manifest,
-                            state=LoopState.RECORD_REJECTION,
+                        if ledger.calls - calls_before != 3:
+                            raise BudgetExceededError(
+                                "duplicate proposal did not consume its exact call count"
+                            )
+                        if _candidate_tracked_manifest_sha256(candidate) != sealed_manifest:
+                            raise CandidateMutationError(
+                                "candidate changed during duplicate proposal"
+                            )
+                        audit.append_event(
+                            LoopState.RECORD_SKIP,
+                            "proposal_sample_rejected",
+                            {
+                                "sample": sample,
+                                "code": "duplicate_proposal",
+                                "calls_consumed": 3,
+                            },
                         )
+                        rejected_samples += 1
+                        continue
                     evaluation = services.evaluate_proposal(proposal, sample)
                     if not isinstance(evaluation, ProposalEvaluation):
                         raise ConfigurationError(
