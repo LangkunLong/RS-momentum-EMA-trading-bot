@@ -1831,6 +1831,9 @@ class OpenRouterGateway:
                 "When read_only_execution_facts is supplied, treat it as controller-owned behavioral evidence: "
                 "use it to rule out edits that cannot affect the observed execution path, and never treat it "
                 "as editable source or configuration. "
+                "When an execution fact rules out a direction for the observed bottleneck, do not select an "
+                "allowed replacement in that direction; explain the remaining direction in causal_hypothesis "
+                "and steps instead of proposing a no-effect experiment. "
                 "When controller_owned_allowed_replacement or controller_owned_allowed_replacements is supplied, "
                 "those are the sole controller-approved bounded experiments for this batch: for a non-skip plan, "
                 "use exactly one supplied path and mechanism and do not propose an alternative source change. "
@@ -9222,11 +9225,14 @@ def _proposal_batch_execution_facts() -> tuple[dict[str, object], ...]:
         {
             "fact_id": "pivot_absence_allows_buy_zone",
             "read_only": True,
-            "value": (
-                "When find_pivot returns no pivot, the backtest sets in_buy_zone to true. "
+                "value": (
+                    "When find_pivot returns no pivot, the backtest sets in_buy_zone to true. "
                 "Making pivot detection more permissive cannot increase entry eligibility; it can only "
-                "preserve or block an existing signal."
-            ),
+                "preserve or block an existing signal. When the observed bottleneck is too few closed "
+                "trades, a lower right_lip threshold is therefore directionally incapable of improving "
+                "the bottleneck; only the supplied higher-threshold replacements are directionally valid "
+                "experiments for that symptom."
+                ),
         },
     )
 
