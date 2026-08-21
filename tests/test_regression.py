@@ -36,7 +36,8 @@ class TestBug1LatestCloseColumnName:
     def test_latest_close_returns_float_not_none(self):
         from auto_trader import _latest_close
 
-        with patch("auto_trader.fetch_ohlcv", return_value=self._make_bars()):
+        with patch("auto_trader.fetch_ohlcv", return_value=self._make_bars()), \
+             patch("auto_trader._is_market_open", return_value=False):
             result = _latest_close("NVDA")
 
         assert result is not None, "_latest_close returned None — lowercase column bug is back"
@@ -62,6 +63,7 @@ class TestBug1LatestCloseColumnName:
              patch("auto_trader.get_open_positions", return_value=[]), \
              patch("auto_trader.get_open_orders", return_value=[]), \
              patch("auto_trader.fetch_ohlcv", return_value=self._make_bars()), \
+             patch("auto_trader._is_market_open", return_value=False), \
              patch("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", False), \
              patch("auto_trader.OrderManager") as mock_manager_cls, \
              patch("builtins.print", side_effect=lambda *a: logged.append(" ".join(str(x) for x in a))):

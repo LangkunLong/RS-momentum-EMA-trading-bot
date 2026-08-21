@@ -939,11 +939,11 @@ class PortfolioSimulator:
             if row is None:
                 continue
             self._signal_rows.append(row)
-            if row["buy_signal_without_market"]:
+            if row.get("buy_signal_without_market", row.get("buy_signal", False)):
                 self._execution_diagnostics["potential_buy_signal_rows"] += 1
                 if (
                     self.require_bullish_market
-                    and not row["market_regime_is_bullish"]
+                    and not row.get("market_regime_is_bullish", market_state["market_is_bullish"])
                     and not cash_override
                 ):
                     self._execution_diagnostics["potential_buy_signal_rows_blocked_by_market"] += 1

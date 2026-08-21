@@ -109,6 +109,7 @@ class TestPathA_BuySignalToOrder:
              patch("auto_trader.get_open_positions", return_value=[]), \
              patch("auto_trader.get_open_orders", return_value=[]), \
              patch("auto_trader.fetch_ohlcv", return_value=bars), \
+             patch("auto_trader._is_market_open", return_value=False), \
              patch("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", False), \
              patch("auto_trader.OrderManager", return_value=manager):
             result = execute_entries([signal], execution_ready=lambda: True)
@@ -151,6 +152,7 @@ class TestPathA_BuySignalToOrder:
              patch("auto_trader.get_open_positions", return_value=[]), \
              patch("auto_trader.get_open_orders", return_value=[]), \
              patch("auto_trader.fetch_ohlcv", return_value=bars), \
+             patch("auto_trader._is_market_open", return_value=False), \
              patch("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", False), \
              patch("auto_trader.OrderManager", return_value=manager):
             execute_entries(
