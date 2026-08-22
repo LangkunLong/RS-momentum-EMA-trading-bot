@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import pickle
 import re
 import sqlite3
@@ -183,6 +184,7 @@ def export_prices(request_path: Path, cache_path: Path, output_path: Path) -> No
         )
         for trade_date, ticker, values in sorted(records):
             writer.writerow((trade_date.isoformat(), ticker, *(_format_number(value) for value in values)))
+    os.chmod(output_path, 0o644)
 
 
 def main() -> int:
