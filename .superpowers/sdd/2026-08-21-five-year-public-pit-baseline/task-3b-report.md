@@ -58,7 +58,7 @@ Publication left zero staging files and zero owned worker containers.
 ## Focused verification
 
 - `python -B -m pytest tests/test_export_pit_prices.py -q`:
-  20 passed, 1 skipped. The skip is the platform-specific POSIX access test on
+  23 passed, 1 skipped. The skip is the platform-specific POSIX access test on
   Windows. Pytest emitted only the environment's known cache-permission and
   websockets deprecation warnings.
 - Compile, Ruff, `git diff --check`, no-trading-import inspection, artifact
@@ -74,3 +74,19 @@ the frozen admitted cache remains row-authoritative while SIP is consolidated.
 No volume threshold or source-precedence rule was weakened. Downstream Task 5
 must also implement the already-recorded holding-transfer/fail-closed rule for
 same-issuer ticker changes; PSKY must never receive an implicit transfer.
+
+## Review fix round 1
+
+The price-identity manifest loader now rejects a mapped identity unless its
+`admitted_end` exactly equals the reviewed membership history end for the same
+canonical ticker; `identity_asof` must still equal that admitted end. It also
+requires `provider_symbol == canonical_ticker` except for the exact reviewed
+provider formatting `BF-B -> BF.B` and `BRK-B -> BRK.B`. These checks run while
+loading the hash-pinned manifest, before credentials are resolved or any
+provider client is created.
+
+Three narrow mutation checks cover acceptance of the two class-share aliases,
+rejection of another provider-symbol substitution, and rejection of a shortened
+admitted interval. The valid production manifest is unchanged, so no provider
+rerun was performed. The four published artifact hashes remain exactly those
+recorded above.

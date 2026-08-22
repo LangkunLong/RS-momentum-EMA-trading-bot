@@ -29,6 +29,85 @@ def _provenance() -> dict[str, object]:
     return {"source_kind": "existing_hash_pinned_cache"}
 
 
+def _write_minimal_price_identity_manifest(
+    path: Path,
+    *,
+    bf_provider: str = "BF.B",
+    psky_provider: str = "PSKY",
+    bf_end: date = date(2025, 12, 31),
+) -> tuple[exporter.Membership, exporter.IdentityBounds, str]:
+    rows = (
+        ("BF-B", bf_provider, bf_end, date(2020, 1, 1), bf_end, "bf", "historical_identity", "", "1", "https://example.test/bf"),
+        ("BRK-B", "BRK.B", date(2025, 12, 31), date(2020, 1, 1), date(2025, 12, 31), "brk", "historical_identity", "", "1", "https://example.test/brk"),
+        ("PSKY", psky_provider, date(2025, 12, 31), date(2025, 8, 7), date(2025, 12, 31), "paramount_successor", "successor_reset", "", "1", "https://example.test/psky"),
+    )
+    with path.open("x", encoding="utf-8", newline="") as stream:
+        writer = exporter.csv.writer(stream, lineterminator="\n")
+        writer.writerow(exporter._PRICE_IDENTITY_COLUMNS)
+        for row in rows:
+            writer.writerow(
+                (
+                    row[0],
+                    row[1],
+                    row[2].isoformat(),
+                    row[3].isoformat(),
+                    row[4].isoformat(),
+                    *row[5:],
+                )
+            )
+    membership = exporter.Membership((), ("BF-B", "BRK-B", "PSKY"))
+    history = exporter.IdentityBounds(
+        path,
+        "0" * 64,
+        {ticker: date(2025, 12, 31) for ticker in membership.tickers},
+        3,
+        membership.tickers,
+    )
+    return membership, history, exporter._sha256_file(path)
+
+
+def test_price_identity_manifest_accepts_only_reviewed_class_share_provider_formatting(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "price-identities.csv"
+    membership, history, digest = _write_minimal_price_identity_manifest(path)
+
+    manifest = exporter._load_price_identity_manifest(
+        path, digest, membership, history, date(2025, 12, 31)
+    )
+
+    assert manifest.identities["BF-B"].provider_symbol == "BF.B"
+    assert manifest.identities["BRK-B"].provider_symbol == "BRK.B"
+
+
+def test_price_identity_manifest_rejects_unreviewed_provider_symbol_mismatch(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "price-identities.csv"
+    membership, history, digest = _write_minimal_price_identity_manifest(
+        path, psky_provider="PARA"
+    )
+
+    with pytest.raises(ValueError, match="price-identity row 4 is invalid"):
+        exporter._load_price_identity_manifest(
+            path, digest, membership, history, date(2025, 12, 31)
+        )
+
+
+def test_price_identity_manifest_rejects_end_before_membership_history_end(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "price-identities.csv"
+    membership, history, digest = _write_minimal_price_identity_manifest(
+        path, bf_end=date(2025, 12, 30)
+    )
+
+    with pytest.raises(ValueError, match="price-identity row 2 is invalid"):
+        exporter._load_price_identity_manifest(
+            path, digest, membership, history, date(2025, 12, 31)
+        )
+
+
 def test_cache_only_path_does_not_load_backfill_identity_manifests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

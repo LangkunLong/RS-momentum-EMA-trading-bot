@@ -280,6 +280,7 @@ def _load_price_identity_manifest(
             if (
                 _TICKER_RE.fullmatch(canonical) is None
                 or _TICKER_RE.fullmatch(provider) is None
+                or provider != _provider_symbol(canonical)
                 or canonical in identities
                 or canonical not in membership.tickers
                 or row.get("factor_anchor") not in {"0", "1"}
@@ -287,6 +288,7 @@ def _load_price_identity_manifest(
                 or re.fullmatch(r"[a-z][a-z0-9_]{0,47}", identity.continuity_kind) is None
                 or predecessor is not None and _TICKER_RE.fullmatch(predecessor) is None
                 or not _BASELINE_START <= admitted_start <= admitted_end <= cutoff
+                or admitted_end != history.end_dates.get(canonical)
                 or identity_asof != admitted_end
                 or not identity.evidence_url.startswith("https://")
             ):
