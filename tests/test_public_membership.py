@@ -3,6 +3,7 @@ from datetime import date
 from pathlib import Path
 
 import fetch_sp500_membership as command
+import core.public_membership as membership
 from core.public_membership import _normalize, load_symbol_map
 
 
@@ -96,7 +97,9 @@ def test_symbol_map_provenance_preserves_hash_ranges_and_reasons(tmp_path: Path)
     mapping_path.write_bytes(raw)
     mappings = load_symbol_map(mapping_path)
 
-    assert command._symbol_map_provenance(mapping_path, mappings) == {
+    mapping_path.write_text("changed after parsing\n", encoding="utf-8")
+
+    assert command._symbol_map_provenance(mappings) == {
         "symbol_map_sha256": hashlib.sha256(raw).hexdigest(),
         "reviewed_symbol_mappings": [
             {
@@ -108,3 +111,91 @@ def test_symbol_map_provenance_preserves_hash_ranges_and_reasons(tmp_path: Path)
             }
         ],
     }
+
+
+def test_symbol_map_rejects_full_window_coverage_gap(tmp_path: Path) -> None:
+    mapping_path = tmp_path / "symbols.csv"
+    mapping_path.write_text(
+        "source_ticker,canonical_ticker,effective_start,effective_end,reason\n"
+        "DAY,CDAY,2021-01-01,2024-01-30,Official timeline\n"
+        "DAY,DAY,2024-02-01,2025-12-31,Official timeline\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_symbol_map(mapping_path)
+    except ValueError as exc:
+        assert str(exc) == "symbol map contains a coverage gap for DAY"
+    else:
+        raise AssertionError("coverage gap was accepted")
+
+
+def test_symbol_map_rejects_full_window_overlap(tmp_path: Path) -> None:
+    mapping_path = tmp_path / "symbols.csv"
+    mapping_path.write_text(
+        "source_ticker,canonical_ticker,effective_start,effective_end,reason\n"
+        "DAY,CDAY,2021-01-01,2024-02-01,Official timeline\n"
+        "DAY,DAY,2024-02-01,2025-12-31,Official timeline\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_symbol_map(mapping_path)
+    except ValueError as exc:
+        assert str(exc) == "symbol map contains overlapping ranges for DAY"
+    else:
+        raise AssertionError("overlap was accepted")
+
+
+def test_snapshot_name_is_propagated_to_every_reviewed_identity(tmp_path: Path) -> None:
+    raw = b"""
+    <table>
+      <tr><th>Symbol</th><th>Security</th></tr>
+      <tr><td>DAY</td><td>Dayforce</td></tr>
+      <tr><td>CCC</td><td>Current Co</td></tr>
+    </table>
+    <table>
+      <tr><th rowspan="2">Effective Date</th><th colspan="2">Added</th><th colspan="2">Removed</th></tr>
+      <tr><th>Ticker</th><th>Security</th><th>Ticker</th><th>Security</th></tr>
+      <tr><td>January 3, 2022</td><td>CCC</td><td>Current Co</td><td>BBB</td><td>Before Co</td></tr>
+    </table>
+    """
+    mapping_path = tmp_path / "symbols.csv"
+    mapping_path.write_text(
+        "source_ticker,canonical_ticker,effective_start,effective_end,reason\n"
+        "DAY,CDAY,2021-01-01,2024-01-31,Official timeline\n"
+        "DAY,DAY,2024-02-01,2025-12-31,Official timeline\n",
+        encoding="utf-8",
+    )
+
+    export = _normalize(
+        raw,
+        _PINNED_URL,
+        date(2021, 1, 1),
+        date(2025, 12, 31),
+        mappings=load_symbol_map(mapping_path),
+    )
+
+    assert export.company_names["CDAY"] == "Dayforce"
+    assert export.company_names["DAY"] == "Dayforce"
+
+
+def test_fetch_membership_defaults_to_tracked_reviewed_map(monkeypatch) -> None:
+    sentinel = object()
+    observed: list[Path | None] = []
+    monkeypatch.setattr(membership, "fetch_revision", lambda _url: b"raw")
+    monkeypatch.setattr(
+        membership,
+        "load_symbol_map",
+        lambda path=None: observed.append(path) or {},
+    )
+    monkeypatch.setattr(membership, "_normalize", lambda *_args, **_kwargs: sentinel)
+
+    result = membership.fetch_membership(
+        _PINNED_URL,
+        date(2021, 1, 1),
+        date(2025, 12, 31),
+    )
+
+    assert result is sentinel
+    assert observed == [None]

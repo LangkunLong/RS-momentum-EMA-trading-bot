@@ -10,7 +10,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from core.public_membership import _normalize, fetch_revision, load_symbol_map
+from core.public_membership import (
+    ReviewedSymbolMap,
+    _normalize,
+    default_symbol_map_path,
+    fetch_revision,
+    load_symbol_map,
+)
 
 _OUTPUTS = (
     "membership.csv",
@@ -71,7 +77,7 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _symbol_map_provenance(path: Path | None, mappings: Any) -> dict[str, Any]:
+def _symbol_map_provenance(mappings: ReviewedSymbolMap) -> dict[str, Any]:
     rows = [
         {
             "source_ticker": source,
@@ -84,7 +90,7 @@ def _symbol_map_provenance(path: Path | None, mappings: Any) -> dict[str, Any]:
         for item in mappings[source]
     ]
     return {
-        "symbol_map_sha256": _sha256_file(path) if path is not None else None,
+        "symbol_map_sha256": mappings.source_sha256,
         "reviewed_symbol_mappings": rows,
     }
 
@@ -120,7 +126,7 @@ def main() -> int:
     parser.add_argument("--revision-url", required=True)
     parser.add_argument("--start-date", type=_date, default=_REQUIRED_START_DATE)
     parser.add_argument("--end-date", type=_date, default=_REQUIRED_END_DATE)
-    parser.add_argument("--symbol-map-csv", default=None)
+    parser.add_argument("--symbol-map-csv", default=str(default_symbol_map_path()))
     parser.add_argument("--output-dir", default="exports/pit")
     args = parser.parse_args()
 
@@ -130,7 +136,7 @@ def main() -> int:
         parser.error(str(exc))
     output_dir = _output_dir(args.output_dir)
     raw = fetch_revision(args.revision_url)
-    symbol_map_path = Path(args.symbol_map_csv).resolve() if args.symbol_map_csv else None
+    symbol_map_path = Path(args.symbol_map_csv)
     mappings = load_symbol_map(symbol_map_path)
     export = _normalize(raw, args.revision_url, args.start_date, args.end_date, mappings=mappings)
     checks = _spot_checks(export.events)
@@ -146,7 +152,7 @@ def main() -> int:
         "event_count": len(export.events),
         "symbol_count": len({event.ticker for event in export.events}),
         "exclusions": list(export.exclusions),
-        **_symbol_map_provenance(symbol_map_path, mappings),
+        **_symbol_map_provenance(mappings),
     }
     _atomic_text(
         output_dir / "membership.csv",

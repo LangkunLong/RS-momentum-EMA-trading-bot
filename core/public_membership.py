@@ -11,6 +11,7 @@ import csv
 import hashlib
 import io
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -29,6 +30,9 @@ _USER_AGENT = "canslim-pit-membership/1.0 (+https://github.com/)"
 _ALIASES = {"BRK.B": "BRK-B", "BF.B": "BF-B"}
 _CANONICAL_TICKER = re.compile(r"^[A-Z][A-Z0-9-]{0,7}$")
 _MAP_HEADER = ("source_ticker", "canonical_ticker", "effective_start", "effective_end", "reason")
+_REQUIRED_START_DATE = date(2021, 1, 1)
+_REQUIRED_END_DATE = date(2025, 12, 31)
+_DEFAULT_SYMBOL_MAP = Path(__file__).resolve().parent.parent / "config" / "pit_membership_symbol_map.csv"
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,27 @@ class _ReviewedMapping:
     effective_start: date
     effective_end: date
     reason: str
+
+
+@dataclass(frozen=True)
+class ReviewedSymbolMap(Mapping[str, tuple[_ReviewedMapping, ...]]):
+    """Immutable reviewed mappings plus the digest of the exact parsed bytes."""
+
+    entries: Mapping[str, tuple[_ReviewedMapping, ...]]
+    source_path: Path
+    source_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "entries", MappingProxyType(dict(self.entries)))
+
+    def __getitem__(self, key: str) -> tuple[_ReviewedMapping, ...]:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
 
 
 def _validate_pinned_url(url: str, *, expected_host: str, expected_revision_id: str) -> None:
@@ -152,14 +177,21 @@ def canonical_ticker(
     return canonical
 
 
-def load_symbol_map(path: Path | None) -> Mapping[str, tuple[_ReviewedMapping, ...]]:
+def default_symbol_map_path() -> Path:
+    """Return the repository-tracked reviewed symbol-map path."""
+    return _DEFAULT_SYMBOL_MAP
+
+
+def load_symbol_map(path: Path | None = None) -> ReviewedSymbolMap:
     """Load a reviewed, date-bounded source-symbol mapping CSV."""
     if path is None:
-        return {}
+        path = default_symbol_map_path()
     if not isinstance(path, Path) or not path.is_file() or path.is_symlink():
         raise ValueError("symbol map CSV must be a regular file")
+    path = path.resolve(strict=True)
+    raw = path.read_bytes()
     result: dict[str, list[_ReviewedMapping]] = {}
-    with path.open("r", encoding="utf-8", newline="") as stream:
+    with io.StringIO(raw.decode("utf-8"), newline="") as stream:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != _MAP_HEADER:
             raise ValueError("symbol map CSV header is invalid")
@@ -180,13 +212,15 @@ def load_symbol_map(path: Path | None) -> Mapping[str, tuple[_ReviewedMapping, .
     normalized: dict[str, tuple[_ReviewedMapping, ...]] = {}
     for source, entries in result.items():
         ordered = tuple(sorted(entries, key=lambda item: item.effective_start))
-        if any(
-            previous.effective_end >= current.effective_start
-            for previous, current in zip(ordered, ordered[1:], strict=False)
-        ):
-            raise ValueError(f"symbol map contains overlapping ranges for {source}")
+        if ordered[0].effective_start != _REQUIRED_START_DATE or ordered[-1].effective_end != _REQUIRED_END_DATE:
+            raise ValueError(f"symbol map does not cover the required window for {source}")
+        for previous, current in zip(ordered, ordered[1:], strict=False):
+            if previous.effective_end >= current.effective_start:
+                raise ValueError(f"symbol map contains overlapping ranges for {source}")
+            if previous.effective_end.toordinal() + 1 != current.effective_start.toordinal():
+                raise ValueError(f"symbol map contains a coverage gap for {source}")
         normalized[source] = ordered
-    return normalized
+    return ReviewedSymbolMap(normalized, path, hashlib.sha256(raw).hexdigest())
 
 
 def _identity_changes(
@@ -199,7 +233,7 @@ def _identity_changes(
     for entries in mappings.values():
         for previous, current in zip(entries, entries[1:], strict=False):
             if previous.effective_end.toordinal() + 1 != current.effective_start.toordinal():
-                continue
+                raise ValueError("reviewed symbol map contains a coverage gap")
             if previous.canonical_ticker == current.canonical_ticker:
                 continue
             if start_date < current.effective_start <= end_date:
@@ -303,6 +337,14 @@ def _parse_page(
         current_names[ticker] = company
 
     names = dict(current_names)
+    for row in constituents.itertuples(index=False):
+        source = row[constituents.columns.get_loc(symbol_column)]
+        company = _text(row[constituents.columns.get_loc(company_column)])
+        assert company is not None
+        for item in mappings.get(str(source).strip().upper(), ()):
+            existing = names.setdefault(item.canonical_ticker, company)
+            if existing != company:
+                raise ValueError(f"conflicting company names for reviewed identity: {item.canonical_ticker}")
 
     changes_frame = _changes_table(tables)
     date_column, added_column, removed_column, added_company_column, removed_company_column = _change_columns(changes_frame)
@@ -391,6 +433,18 @@ def _normalize(
     )
 
 
-def fetch_membership(revision_url: str, start_date: date, end_date: date) -> MembershipExport:
+def fetch_membership(
+    revision_url: str,
+    start_date: date,
+    end_date: date,
+    *,
+    symbol_map_path: Path | None = None,
+) -> MembershipExport:
     """Fetch and normalize one pinned public membership-page revision."""
-    return _normalize(fetch_revision(revision_url), revision_url, start_date, end_date, mappings={})
+    return _normalize(
+        fetch_revision(revision_url),
+        revision_url,
+        start_date,
+        end_date,
+        mappings=load_symbol_map(symbol_map_path),
+    )
