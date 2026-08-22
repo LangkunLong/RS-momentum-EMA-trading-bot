@@ -40,3 +40,7 @@ execution_audit/
 # CSV results
 backtest_results*
 scan_results/
+
+# Immutable point-in-time acquisition outputs (directory is retained by .gitkeep)
+exports/pit/*
+!exports/pit/.gitkeep
