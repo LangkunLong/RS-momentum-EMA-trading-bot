@@ -87,6 +87,53 @@ def test_reviewed_map_emits_in_window_ticker_identity_transition(tmp_path: Path)
     ]
 
 
+def test_reviewed_map_emits_return_to_prior_ticker_identity(tmp_path: Path) -> None:
+    raw = b"""
+    <table>
+      <tr><th>Symbol</th><th>Security</th></tr>
+      <tr><td>FISV</td><td>Fiserv</td></tr>
+      <tr><td>NEW</td><td>New Co</td></tr>
+    </table>
+    <table>
+      <tr><th rowspan="2">Effective Date</th><th colspan="2">Added</th><th colspan="2">Removed</th></tr>
+      <tr><th>Ticker</th><th>Security</th><th>Ticker</th><th>Security</th></tr>
+      <tr><td>February 9, 2026</td><td>NEW</td><td>New Co</td><td>OLD</td><td>Old Co</td></tr>
+    </table>
+    """
+    reason = "Official issuer evidence"
+    mapping_path = tmp_path / "symbols.csv"
+    mapping_path.write_text(
+        "source_ticker,canonical_ticker,effective_start,effective_end,reason\n"
+        f"FISV,FISV,2021-01-01,2023-06-06,{reason}\n"
+        f"FISV,FI,2023-06-07,2025-11-10,{reason}\n"
+        f"FISV,FISV,2025-11-11,2025-12-31,{reason}\n",
+        encoding="utf-8",
+    )
+
+    export = _normalize(
+        raw,
+        _PINNED_URL,
+        date(2021, 1, 1),
+        date(2025, 12, 31),
+        mappings=load_symbol_map(mapping_path),
+    )
+
+    timeline = [
+        (event.effective_date.isoformat(), event.ticker, event.member)
+        for event in export.events
+        if event.ticker in {"FI", "FISV"}
+    ]
+    assert timeline == [
+        ("2021-01-01", "FISV", True),
+        ("2023-06-07", "FI", True),
+        ("2023-06-07", "FISV", False),
+        ("2025-11-11", "FI", False),
+        ("2025-11-11", "FISV", True),
+    ]
+    assert export.company_names["FI"] == "Fiserv"
+    assert export.company_names["FISV"] == "Fiserv"
+
+
 def test_symbol_map_provenance_preserves_hash_ranges_and_reasons(tmp_path: Path) -> None:
     """Dropping reviewed identity evidence from provenance must fail this test."""
     mapping_path = tmp_path / "symbols.csv"
