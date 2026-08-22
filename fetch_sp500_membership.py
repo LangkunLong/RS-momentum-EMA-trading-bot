@@ -71,6 +71,24 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _symbol_map_provenance(path: Path | None, mappings: Any) -> dict[str, Any]:
+    rows = [
+        {
+            "source_ticker": source,
+            "canonical_ticker": item.canonical_ticker,
+            "effective_start": item.effective_start.isoformat(),
+            "effective_end": item.effective_end.isoformat(),
+            "reason": item.reason,
+        }
+        for source in sorted(mappings)
+        for item in mappings[source]
+    ]
+    return {
+        "symbol_map_sha256": _sha256_file(path) if path is not None else None,
+        "reviewed_symbol_mappings": rows,
+    }
+
+
 def _require_baseline_window(start_date: date, end_date: date) -> None:
     if start_date != _REQUIRED_START_DATE or end_date != _REQUIRED_END_DATE:
         raise ValueError("membership window must be exactly 2021-01-01 through 2025-12-31")
@@ -112,7 +130,8 @@ def main() -> int:
         parser.error(str(exc))
     output_dir = _output_dir(args.output_dir)
     raw = fetch_revision(args.revision_url)
-    mappings = load_symbol_map(Path(args.symbol_map_csv).resolve() if args.symbol_map_csv else None)
+    symbol_map_path = Path(args.symbol_map_csv).resolve() if args.symbol_map_csv else None
+    mappings = load_symbol_map(symbol_map_path)
     export = _normalize(raw, args.revision_url, args.start_date, args.end_date, mappings=mappings)
     checks = _spot_checks(export.events)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -127,6 +146,7 @@ def main() -> int:
         "event_count": len(export.events),
         "symbol_count": len({event.ticker for event in export.events}),
         "exclusions": list(export.exclusions),
+        **_symbol_map_provenance(symbol_map_path, mappings),
     }
     _atomic_text(
         output_dir / "membership.csv",

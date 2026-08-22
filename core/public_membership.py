@@ -64,6 +64,7 @@ class _ReviewedMapping:
     canonical_ticker: str
     effective_start: date
     effective_end: date
+    reason: str
 
 
 def _validate_pinned_url(url: str, *, expected_host: str, expected_revision_id: str) -> None:
@@ -172,9 +173,10 @@ def load_symbol_map(path: Path | None) -> Mapping[str, tuple[_ReviewedMapping, .
                 raise ValueError(f"symbol map row {row_number} has an invalid date range")
             source = str(row["source_ticker"]).strip().upper()
             canonical = canonical_ticker(str(row["canonical_ticker"]))
-            if not source or not str(row["reason"]).strip():
+            reason = str(row["reason"]).strip()
+            if not source or not reason:
                 raise ValueError(f"symbol map row {row_number} is invalid")
-            result.setdefault(source, []).append(_ReviewedMapping(canonical, start, end))
+            result.setdefault(source, []).append(_ReviewedMapping(canonical, start, end, reason))
     normalized: dict[str, tuple[_ReviewedMapping, ...]] = {}
     for source, entries in result.items():
         ordered = tuple(sorted(entries, key=lambda item: item.effective_start))
@@ -185,6 +187,32 @@ def load_symbol_map(path: Path | None) -> Mapping[str, tuple[_ReviewedMapping, .
             raise ValueError(f"symbol map contains overlapping ranges for {source}")
         normalized[source] = ordered
     return normalized
+
+
+def _identity_changes(
+    mappings: Mapping[str, tuple[_ReviewedMapping, ...]],
+    start_date: date,
+    end_date: date,
+) -> tuple[MembershipChange, ...]:
+    """Materialize contiguous reviewed ticker identities as membership swaps."""
+    changes: list[MembershipChange] = []
+    for entries in mappings.values():
+        for previous, current in zip(entries, entries[1:], strict=False):
+            if previous.effective_end.toordinal() + 1 != current.effective_start.toordinal():
+                continue
+            if previous.canonical_ticker == current.canonical_ticker:
+                continue
+            if start_date < current.effective_start <= end_date:
+                changes.append(
+                    MembershipChange(
+                        current.effective_start,
+                        current.canonical_ticker,
+                        previous.canonical_ticker,
+                        None,
+                        None,
+                    )
+                )
+    return tuple(changes)
 
 
 def _label(column: object) -> str:
@@ -248,7 +276,13 @@ def _change_columns(table: pd.DataFrame) -> tuple[object, object | None, object 
     return date_column, added_ticker, removed_ticker, added_company, removed_company
 
 
-def _parse_page(raw: bytes, *, mappings: Mapping[str, tuple[_ReviewedMapping, ...]]) -> tuple[frozenset[str], dict[str, str], tuple[MembershipChange, ...]]:
+def _parse_page(
+    raw: bytes,
+    *,
+    mappings: Mapping[str, tuple[_ReviewedMapping, ...]],
+    mapping_start: date,
+    mapping_end: date,
+) -> tuple[frozenset[str], dict[str, str], tuple[MembershipChange, ...]]:
     try:
         tables = pd.read_html(io.BytesIO(raw))
     except (ValueError, OSError) as exc:
@@ -263,7 +297,7 @@ def _parse_page(raw: bytes, *, mappings: Mapping[str, tuple[_ReviewedMapping, ..
         company = _text(row[constituents.columns.get_loc(company_column)])
         if company is None:
             raise ValueError("constituent company name is missing")
-        ticker = canonical_ticker(source)
+        ticker = canonical_ticker(source, mappings=mappings, when=mapping_end)
         if ticker in current_names:
             raise ValueError(f"duplicate current constituent ticker: {ticker}")
         current_names[ticker] = company
@@ -282,8 +316,9 @@ def _parse_page(raw: bytes, *, mappings: Mapping[str, tuple[_ReviewedMapping, ..
         previous_date = effective
         added_source = _text(row[added_column])
         removed_source = _text(row[removed_column])
-        added = canonical_ticker(added_source, mappings=mappings, when=effective) if added_source else None
-        removed = canonical_ticker(removed_source, mappings=mappings, when=effective) if removed_source else None
+        mapping_date = min(max(effective, mapping_start), mapping_end)
+        added = canonical_ticker(added_source, mappings=mappings, when=mapping_date) if added_source else None
+        removed = canonical_ticker(removed_source, mappings=mappings, when=mapping_date) if removed_source else None
         if added is None and removed is None:
             continue
         added_company = _text(row[added_company_column]) if added_company_column is not None else None
@@ -309,7 +344,13 @@ def _normalize(
     if not isinstance(start_date, date) or not isinstance(end_date, date) or end_date < start_date:
         raise ValueError("date range is invalid")
     revision_id = _revision_id(revision_url)
-    current_tickers, names, changes = _parse_page(raw, mappings=mappings)
+    current_tickers, names, changes = _parse_page(
+        raw,
+        mappings=mappings,
+        mapping_start=start_date,
+        mapping_end=end_date,
+    )
+    changes = changes + _identity_changes(mappings, start_date, end_date)
     state = set(current_tickers)
     exclusions: list[Mapping[str, str]] = []
     for change in sorted((item for item in changes if item.effective_date > start_date), key=lambda item: item.effective_date, reverse=True):
