@@ -245,6 +245,31 @@ git add export_pit_prices.py tools/export_price_cache_worker.py
 git commit -m "feat: export validated PIT price bars"
 ```
 
+### Task 3B: Fill Missing Prices from an Explicit Licensed SIP Snapshot
+
+**Files:**
+- Modify: `export_pit_prices.py`
+- Create: `core/alpaca_pit_backfill.py`
+- Create: `config/pit_price_identity_map.csv`
+
+- [x] Preserve the unchanged cache-only path and require an explicit
+  `--alpaca-sip-backfill` operator flag for licensed provider access.
+- [x] Acquire deterministic Alpaca SIP/SPLIT daily bars and SIP/RAW calibration
+  bars through market-data APIs only; retain only `BF-B -> BF.B` and
+  `BRK-B -> BRK.B` provider formatting aliases.
+- [x] Bind the reviewed membership and price-identity maps, request each mapped
+  identity at its reviewed `asof`, retain only admitted rows, and build
+  same-issuer warmup by copying normalized predecessor rows. The Fiserv chain
+  uses cutoff-asof `FISV` as its factor anchor and admits `FI` only from
+  `2023-06-07` through `2025-11-10`; the 610-row admitted overlap agrees exactly.
+- [x] Derive stable terminal-anchor RAW/SPLIT factors, normalize provider and
+  mixed-basis cache rows to the `2025-12-31` share basis, keep admitted cache
+  rows primary, and fill only missing keys from SIP.
+- [x] Publish the merged price CSV, SPY calendar, provenance, and normalized SIP
+  sidecar atomically without overwrite. The functional export produced
+  `631,782 / 631,965 = 99.97104270%` active-member/day coverage, 1,508 SPY
+  sessions, and 183 remaining gaps.
+
 ### Task 4: Build and Audit the Five-Year PIT Bundle
 
 **Files:**

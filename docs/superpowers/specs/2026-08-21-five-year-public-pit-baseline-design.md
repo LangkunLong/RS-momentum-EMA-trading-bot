@@ -59,15 +59,28 @@ as if they were known earlier.
 
 ### Prices
 
-For the first deliverable, export split-adjusted OHLCV from the existing local
-historical cache after validating its expected SHA-256. Deserialization occurs
-in an isolated, network-disabled process because the cache stores pickle
-payloads. The exporter writes plain CSV; all subsequent bundle construction and
-backtesting consume only the CSV or the strict read-only PIT SQLite bundle.
+For the first deliverable, export OHLCV from the existing local historical
+cache after validating its expected SHA-256. Deserialization occurs in an
+isolated, network-disabled process because the cache stores pickle payloads.
+The cache alone covered only `84.90755026%` of the original active-member/day
+pairs; reviewed public archives reached only `96.44996163%` and were rejected
+for current-constituent bias, undocumented transformations, and insufficient
+upstream redistribution evidence. An operator-explicit, licensed Alpaca SIP
+historical-bars snapshot therefore fills cache-missing rows. It is not public
+data and never runs as an implicit fallback.
 
-This price source is a deliberate MVP compromise. The report must label it as
-`existing_hash_pinned_cache`, not as a public-data source. Replacing it with an
-independent public or licensed price history is a later validation milestone.
+Both SIP/SPLIT and calibration-only SIP/RAW bars are bound to a reviewed,
+hash-pinned price-identity manifest. The exporter normalizes current SPLIT bars
+to the `2025-12-31` share basis, classifies and normalizes the frozen cache per
+symbol, retains admitted cache rows as primary, and fills only absent keys from
+the cutoff-normalized SIP snapshot. Provider rows outside admitted identity
+intervals cannot enter output. Manifest-approved same-issuer warmup is copied
+from the normalized predecessor identity; successor/predecessor admitted
+overlaps must agree exactly. `PSKY` remains a reset chain with no predecessor.
+The exporter writes plain CSV plus a normalized SIP sidecar, and all subsequent
+bundle construction and backtesting consume only those artifacts or the strict
+read-only PIT SQLite bundle. Provenance labels the source exactly
+`existing_hash_pinned_cache_plus_alpaca_sip_snapshot`.
 
 ## Architecture
 
@@ -83,7 +96,8 @@ The workflow is:
 
 1. Acquire and hash public membership and SEC bulk inputs.
 2. Normalize membership, security identities, and filing-time fundamentals.
-3. Export and hash the existing cached OHLCV into the strict price CSV.
+3. Export and hash admitted cache-primary OHLCV plus explicit cutoff-normalized
+   Alpaca SIP missing-row fills into the strict price CSV.
 4. Build and verify the PIT SQLite bundle.
 5. Run the unchanged CANSLIM engine over the strict PIT universe.
 6. Run the mechanical top-100 leader basket independently.

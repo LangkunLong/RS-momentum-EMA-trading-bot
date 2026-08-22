@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -22,6 +23,16 @@ from pathlib import Path
 from typing import BinaryIO, Callable, Sequence
 from urllib.parse import quote
 
+from core.alpaca_pit_backfill import (
+    ProviderIdentity,
+    REQUEST_ALIASES,
+    _apply_cutoff_split_factors,
+    _derive_cutoff_split_factors,
+    fetch_alpaca_sip_raw_calibration,
+    fetch_alpaca_sip_snapshot,
+    load_alpaca_credentials,
+)
+
 _BASELINE_START = date(2020, 1, 1)
 _BASELINE_END = date(2025, 12, 31)
 _EXPECTED_SCHEMA = [
@@ -31,12 +42,34 @@ _EXPECTED_SCHEMA = [
     (3, "payload", "BLOB", 1, None, 0),
 ]
 _MEMBERSHIP_COLUMNS = ("effective_date", "ticker", "member")
+_SYMBOL_HISTORY_COLUMNS = (
+    "source_ticker",
+    "canonical_ticker",
+    "effective_start",
+    "effective_end",
+    "reason",
+)
+_PRICE_IDENTITY_COLUMNS = (
+    "canonical_ticker",
+    "provider_symbol",
+    "identity_asof",
+    "admitted_start",
+    "admitted_end",
+    "chain_id",
+    "continuity_kind",
+    "warmup_predecessor",
+    "factor_anchor",
+    "evidence_url",
+)
 _PRICE_COLUMNS = ("trade_date", "ticker", "open", "high", "low", "close", "volume")
 _OUTPUT_NAMES = ("prices.csv", "spy_trading_days.csv", "prices_provenance.json")
+_BACKFILL_OUTPUT_NAMES = (*_OUTPUT_NAMES, "alpaca_sip_snapshot.csv")
 _TICKER_RE = re.compile(r"[A-Z0-9][A-Z0-9.-]{0,14}")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_RE = re.compile(r"[^\s]+@sha256:[0-9a-f]{64}")
 _COMPLETION = '{"status":"complete","version":1}\n'
+_REVIEWED_SYMBOL_HISTORY_SHA256 = "6284214a6a4cefd766b3c52e84be57ac7e087cbf76d642d22abad131d61d8fa4"
+_REVIEWED_PRICE_IDENTITY_SHA256 = "6a9ec69bc0fe05decea1b832cac8e26a611d706cce831d5687fa5424f9544955"
 _WORKER_UID_GID = "65532:65532"
 _PIDS_LIMIT = 64
 _MEMORY_BYTES = 2 * 1024 * 1024 * 1024
@@ -77,6 +110,37 @@ class CacheSnapshot:
     sha256: str
     key_count: int
     keys_sha256: str
+
+
+@dataclass(frozen=True)
+class IdentityBounds:
+    path: Path
+    sha256: str
+    end_dates: dict[str, date]
+    mapped_symbol_count: int
+    canonical_tickers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PriceIdentity:
+    canonical_ticker: str
+    provider_symbol: str
+    identity_asof: date
+    admitted_start: date
+    admitted_end: date
+    chain_id: str
+    continuity_kind: str
+    warmup_predecessor: str | None
+    factor_anchor: bool
+    evidence_url: str
+
+
+@dataclass(frozen=True)
+class PriceIdentityManifest:
+    path: Path
+    sha256: str
+    identities: dict[str, PriceIdentity]
+    chain_count: int
 
 
 def _iso_date(value: str) -> date:
@@ -128,6 +192,225 @@ def _load_membership(path: Path) -> Membership:
     if not events or events != sorted(events, key=lambda item: (item[0], item[1])):
         raise ValueError("membership rows must be non-empty and sorted by date/ticker")
     return Membership(tuple(events), tuple(sorted({ticker for _, ticker, _ in events})))
+
+
+def _load_identity_bounds(
+    path: Path,
+    expected_sha256: str,
+    membership: Membership,
+    cutoff: date,
+) -> IdentityBounds:
+    path = _regular_file(path, "reviewed symbol-history map")
+    if _DIGEST_RE.fullmatch(expected_sha256) is None or _sha256_file(path) != expected_sha256:
+        raise ValueError("reviewed symbol-history map does not match its required SHA-256")
+    mapped: dict[str, date] = {}
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != _SYMBOL_HISTORY_COLUMNS:
+            raise ValueError("reviewed symbol-history map has an unexpected header")
+        for row_number, row in enumerate(reader, start=2):
+            source = row.get("source_ticker", "")
+            canonical = row.get("canonical_ticker", "")
+            try:
+                effective_start = date.fromisoformat(row["effective_start"])
+                effective_end = date.fromisoformat(row["effective_end"])
+            except (KeyError, ValueError):
+                raise ValueError(f"reviewed symbol-history row {row_number} has invalid dates") from None
+            if (
+                _TICKER_RE.fullmatch(source) is None
+                or _TICKER_RE.fullmatch(canonical) is None
+                or canonical not in membership.tickers
+                or not _BASELINE_START <= effective_start <= effective_end <= cutoff
+                or not row.get("reason", "").strip()
+            ):
+                raise ValueError(f"reviewed symbol-history row {row_number} is invalid")
+            mapped[canonical] = max(mapped.get(canonical, effective_end), effective_end)
+    if not mapped:
+        raise ValueError("reviewed symbol-history map contains no canonical identities")
+    end_dates = {ticker: mapped.get(ticker, cutoff) for ticker in membership.tickers}
+    end_dates["SPY"] = cutoff
+    return IdentityBounds(
+        path,
+        expected_sha256,
+        end_dates,
+        len(mapped),
+        tuple(sorted(mapped)),
+    )
+
+
+def _load_price_identity_manifest(
+    path: Path,
+    expected_sha256: str,
+    membership: Membership,
+    history: IdentityBounds,
+    cutoff: date,
+) -> PriceIdentityManifest:
+    path = _regular_file(path, "reviewed price-identity map")
+    if _DIGEST_RE.fullmatch(expected_sha256) is None or _sha256_file(path) != expected_sha256:
+        raise ValueError("reviewed price-identity map does not match its required SHA-256")
+    identities: dict[str, PriceIdentity] = {}
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != _PRICE_IDENTITY_COLUMNS:
+            raise ValueError("reviewed price-identity map has an unexpected header")
+        for row_number, row in enumerate(reader, start=2):
+            canonical = row.get("canonical_ticker", "")
+            provider = row.get("provider_symbol", "")
+            predecessor = row.get("warmup_predecessor", "") or None
+            try:
+                identity_asof = date.fromisoformat(row["identity_asof"])
+                admitted_start = date.fromisoformat(row["admitted_start"])
+                admitted_end = date.fromisoformat(row["admitted_end"])
+            except (KeyError, ValueError):
+                raise ValueError(
+                    f"reviewed price-identity row {row_number} has invalid dates"
+                ) from None
+            identity = PriceIdentity(
+                canonical,
+                provider,
+                identity_asof,
+                admitted_start,
+                admitted_end,
+                row.get("chain_id", ""),
+                row.get("continuity_kind", ""),
+                predecessor,
+                row.get("factor_anchor") == "1",
+                row.get("evidence_url", ""),
+            )
+            if (
+                _TICKER_RE.fullmatch(canonical) is None
+                or _TICKER_RE.fullmatch(provider) is None
+                or canonical in identities
+                or canonical not in membership.tickers
+                or row.get("factor_anchor") not in {"0", "1"}
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,47}", identity.chain_id) is None
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,47}", identity.continuity_kind) is None
+                or predecessor is not None and _TICKER_RE.fullmatch(predecessor) is None
+                or not _BASELINE_START <= admitted_start <= admitted_end <= cutoff
+                or identity_asof != admitted_end
+                or not identity.evidence_url.startswith("https://")
+            ):
+                raise ValueError(f"reviewed price-identity row {row_number} is invalid")
+            identities[canonical] = identity
+    if set(identities) != set(history.canonical_tickers):
+        raise ValueError("price-identity map does not exactly cover the membership symbol map")
+    chains: dict[str, list[PriceIdentity]] = {}
+    for identity in identities.values():
+        chains.setdefault(identity.chain_id, []).append(identity)
+    for chain_id, members in chains.items():
+        members.sort(key=lambda item: (item.admitted_start, item.canonical_ticker))
+        anchors = [member for member in members if member.factor_anchor]
+        terminal = max(members, key=lambda item: (item.admitted_end, item.canonical_ticker))
+        if len(anchors) != 1 or anchors[0] != terminal:
+            raise ValueError(f"price-identity chain {chain_id} lacks one terminal factor anchor")
+        for index, identity in enumerate(members):
+            if index == 0:
+                if identity.warmup_predecessor is not None:
+                    raise ValueError(f"price-identity chain {chain_id} has an invalid first predecessor")
+            elif identity.warmup_predecessor != members[index - 1].canonical_ticker:
+                raise ValueError(f"price-identity chain {chain_id} is not explicitly contiguous")
+            if index:
+                predecessor = members[index - 1]
+                contiguous = predecessor.admitted_end + timedelta(days=1) == identity.admitted_start
+                containing = (
+                    predecessor.admitted_start <= identity.admitted_start
+                    and identity.admitted_end <= predecessor.admitted_end
+                )
+                if not contiguous and not containing:
+                    raise ValueError(
+                        f"price-identity chain {chain_id} has an invalid admission boundary"
+                    )
+    psky = identities.get("PSKY")
+    if (
+        psky is None
+        or psky.chain_id != "paramount_successor"
+        or psky.continuity_kind != "successor_reset"
+        or psky.warmup_predecessor is not None
+        or psky.admitted_start != date(2025, 8, 7)
+    ):
+        raise ValueError("PSKY must remain an explicit no-predecessor successor reset")
+    return PriceIdentityManifest(path, expected_sha256, identities, len(chains))
+
+
+def _provider_symbol(canonical_ticker: str) -> str:
+    return next(
+        (
+            provider
+            for provider, canonical in REQUEST_ALIASES.items()
+            if canonical == canonical_ticker
+        ),
+        canonical_ticker,
+    )
+
+
+def _complete_price_identities(
+    membership: Membership,
+    manifest: PriceIdentityManifest,
+    cutoff: date,
+) -> dict[str, PriceIdentity]:
+    identities = dict(manifest.identities)
+    for ticker in (*membership.tickers, "SPY"):
+        if ticker not in identities:
+            identities[ticker] = PriceIdentity(
+                ticker,
+                _provider_symbol(ticker),
+                cutoff,
+                _BASELINE_START,
+                cutoff,
+                f"unmapped_{ticker.casefold().replace('-', '_').replace('.', '_')}",
+                "unmapped_cutoff_identity",
+                None,
+                True,
+                "https://docs.alpaca.markets/reference/stockbars",
+            )
+    return {ticker: identities[ticker] for ticker in sorted(identities)}
+
+
+def _provider_identity_contracts(
+    identities: dict[str, PriceIdentity],
+) -> dict[str, ProviderIdentity]:
+    return {
+        ticker: ProviderIdentity(
+            ticker,
+            identity.provider_symbol,
+            identity.identity_asof,
+            identity.admitted_start,
+            identity.admitted_end,
+            True,
+        )
+        for ticker, identity in sorted(identities.items())
+    }
+
+
+def _expand_chain_cutoff_factors(
+    anchor_factors: dict[str, float],
+    identities: dict[str, PriceIdentity],
+    cutoff: date,
+) -> dict[str, float]:
+    chains: dict[str, list[PriceIdentity]] = {}
+    for identity in identities.values():
+        chains.setdefault(identity.chain_id, []).append(identity)
+    expected_anchors = {
+        identity.canonical_ticker
+        for identity in identities.values()
+        if identity.factor_anchor
+    }
+    if set(anchor_factors) != expected_anchors:
+        raise ValueError("cutoff factor anchors differ from reviewed price-identity chains")
+    factors: dict[str, float] = {}
+    for chain_id, members in sorted(chains.items()):
+        anchors = [member for member in members if member.factor_anchor]
+        if len(anchors) != 1:
+            raise ValueError(f"price-identity chain {chain_id} lacks one factor anchor")
+        anchor = anchors[0]
+        factor = anchor_factors[anchor.canonical_ticker]
+        if max(member.admitted_end for member in members) < cutoff and factor != 1.0:
+            raise ValueError(
+                f"pre-cutoff chain {chain_id} has an unproved non-unity terminal factor"
+            )
+        for member in members:
+            factors[member.canonical_ticker] = factor
+    return {ticker: factors[ticker] for ticker in sorted(factors)}
 
 
 def _copy_and_validate_cache(source: Path, expected_sha256: str, root: Path) -> CacheSnapshot:
@@ -539,6 +822,8 @@ def _validate_prices(
     membership: Membership,
     start: date,
     end: date,
+    *,
+    enforce_gates: bool = True,
 ) -> tuple[dict[str, object], tuple[date, ...]]:
     requested = {*membership.tickers, "SPY"}
     closes: dict[date, set[str]] = {}
@@ -546,6 +831,7 @@ def _validate_prices(
     previous: tuple[date, str] | None = None
     first_price_date: date | None = None
     last_price_date: date | None = None
+    price_row_count = 0
     with path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != _PRICE_COLUMNS:
@@ -568,6 +854,7 @@ def _validate_prices(
             ):
                 raise ValueError(f"worker prices row {row_number} violates the output contract")
             previous = identity
+            price_row_count += 1
             first_price_date = first_price_date or trade_date
             last_price_date = trade_date
             closes.setdefault(trade_date, set()).add(ticker)
@@ -618,8 +905,9 @@ def _validate_prices(
         "symbols_with_partial_prices": partial,
         "spy_first_date": spy_days[0].isoformat(),
         "spy_last_date": spy_days[-1].isoformat(),
+        "price_row_count": price_row_count,
     }
-    if tuple(spy_days) != expected_spy:
+    if enforce_gates and tuple(spy_days) != expected_spy:
         missing = sorted(set(expected_spy) - set(spy_days))
         unexpected = sorted(set(spy_days) - set(expected_spy))
         detail = f"; first missing trading day: {missing[0]}" if missing else ""
@@ -632,9 +920,431 @@ def _validate_prices(
             f"; member coverage: {covered}/{pairs} ({coverage_ratio:.8%})"
             + detail
         )
-    if coverage_ratio < 0.98:
+    if enforce_gates and coverage_ratio < 0.98:
         raise ValueError(f"member/trading-day close coverage is below 98%: {coverage_ratio:.6%}")
     return metrics, tuple(spy_days)
+
+
+def _relative_difference(left: float, right: float) -> float:
+    return abs(left - right) / max(abs(left), abs(right), 1e-12)
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(math.ceil(percentile * len(ordered)) - 1, len(ordered) - 1)
+    return ordered[max(index, 0)]
+
+
+class _OverlapAudit:
+    _SAMPLE_LIMIT = 100_000
+    _FIELDS = ("open", "high", "low", "close", "volume")
+
+    def __init__(self) -> None:
+        self._random = random.Random(0)
+        self.count = 0
+        self.samples: list[tuple[float, ...]] = []
+        self.sums = [0.0] * len(self._FIELDS)
+        self.maxima = [0.0] * len(self._FIELDS)
+        self.symbol_totals: dict[str, int] = {}
+        self.symbol_incompatible: dict[str, int] = {}
+        self.symbol_max_ohlc_difference: dict[str, float] = {}
+
+    def add(self, ticker: str, cache_values: Sequence[float], provider_values: Sequence[float]) -> None:
+        differences = tuple(
+            _relative_difference(cache_value, provider_value)
+            for cache_value, provider_value in zip(cache_values, provider_values, strict=True)
+        )
+        self.count += 1
+        for index, difference in enumerate(differences):
+            self.sums[index] += difference
+            self.maxima[index] = max(self.maxima[index], difference)
+        if len(self.samples) < self._SAMPLE_LIMIT:
+            self.samples.append(differences)
+        else:
+            replacement = self._random.randrange(self.count)
+            if replacement < self._SAMPLE_LIMIT:
+                self.samples[replacement] = differences
+        self.symbol_totals[ticker] = self.symbol_totals.get(ticker, 0) + 1
+        max_ohlc_difference = max(differences[:4])
+        self.symbol_max_ohlc_difference[ticker] = max(
+            self.symbol_max_ohlc_difference.get(ticker, 0.0), max_ohlc_difference
+        )
+        if max_ohlc_difference > 0.20:
+            self.symbol_incompatible[ticker] = self.symbol_incompatible.get(ticker, 0) + 1
+
+    def incompatible_symbols(self) -> tuple[str, ...]:
+        return tuple(sorted(
+            ticker
+            for ticker, bad_count in self.symbol_incompatible.items()
+            if bad_count >= 5 and bad_count / self.symbol_totals[ticker] >= 0.10
+        ))
+
+    def finish(self, *, fail_closed: bool = True) -> dict[str, object]:
+        incompatible = self.incompatible_symbols()
+        if fail_closed and incompatible:
+            ticker = incompatible[0]
+            bad_count = self.symbol_incompatible[ticker]
+            total = self.symbol_totals[ticker]
+            raise ValueError(
+                "cache/SIP overlap shows a clear price-scale or corporate-action incompatibility "
+                f"for {ticker}: {bad_count}/{total} rows exceed 0.20 "
+                f"({bad_count / total:.8%}); max OHLC relative difference "
+                f"{self.symbol_max_ohlc_difference[ticker]:.12f}"
+            )
+        fields: dict[str, object] = {}
+        for index, field in enumerate(self._FIELDS):
+            sampled = [row[index] for row in self.samples]
+            fields[field] = {
+                "mean": round(self.sums[index] / self.count, 12) if self.count else 0.0,
+                "p50_sample": round(_percentile(sampled, 0.50), 12),
+                "p95_sample": round(_percentile(sampled, 0.95), 12),
+                "max": round(self.maxima[index], 12),
+            }
+        return {
+            "relative_difference_definition": "abs(cache-sip)/max(abs(cache),abs(sip),1e-12)",
+            "overlap_row_count": self.count,
+            "sample_limit": self._SAMPLE_LIMIT,
+            "sampled_row_count": len(self.samples),
+            "incompatibility_rule": (
+                "fail when at least 5 and at least 10% of one symbol's overlap rows have "
+                "an OHLC relative difference above 0.20"
+            ),
+            "incompatible_symbol_count": len(incompatible),
+            "incompatible_symbols": list(incompatible),
+            "fields": fields,
+        }
+
+
+def _audit_price_source_overlaps(left_path: Path, right_path: Path) -> _OverlapAudit:
+    audit = _OverlapAudit()
+    with (
+        left_path.open("r", encoding="utf-8", newline="") as left_stream,
+        right_path.open("r", encoding="utf-8", newline="") as right_stream,
+    ):
+        left_reader = csv.DictReader(left_stream)
+        right_reader = csv.DictReader(right_stream)
+        if tuple(left_reader.fieldnames or ()) != _PRICE_COLUMNS:
+            raise ValueError("left overlap source has an unexpected header")
+        if tuple(right_reader.fieldnames or ()) != _PRICE_COLUMNS:
+            raise ValueError("right overlap source has an unexpected header")
+        left_row = next(left_reader, None)
+        right_row = next(right_reader, None)
+        while left_row is not None and right_row is not None:
+            left_key = (left_row["trade_date"], left_row["ticker"])
+            right_key = (right_row["trade_date"], right_row["ticker"])
+            if left_key < right_key:
+                left_row = next(left_reader, None)
+            elif right_key < left_key:
+                right_row = next(right_reader, None)
+            else:
+                left_values = tuple(float(left_row[name]) for name in _PRICE_COLUMNS[2:])
+                right_values = tuple(float(right_row[name]) for name in _PRICE_COLUMNS[2:])
+                audit.add(left_row["ticker"], left_values, right_values)
+                left_row = next(left_reader, None)
+                right_row = next(right_reader, None)
+    return audit
+
+
+def _build_price_identity_warmup(
+    admitted_path: Path,
+    identities: dict[str, PriceIdentity],
+    output_path: Path,
+) -> dict[str, object]:
+    """Copy only reviewed predecessor rows into successor warm-up history."""
+    rows: dict[str, dict[date, tuple[float, ...]]] = {
+        ticker: {} for ticker in identities
+    }
+    with admitted_path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != _PRICE_COLUMNS:
+            raise ValueError("cutoff snapshot has an unexpected continuity header")
+        for row in reader:
+            ticker = row["ticker"]
+            identity = identities.get(ticker)
+            if identity is None:
+                raise ValueError("cutoff snapshot contains an unreviewed price identity")
+            trade_date = date.fromisoformat(row["trade_date"])
+            if not identity.admitted_start <= trade_date <= identity.admitted_end:
+                raise ValueError("cutoff snapshot contains a row outside its admitted interval")
+            if trade_date in rows[ticker]:
+                raise ValueError("cutoff snapshot contains a duplicate identity/date row")
+            rows[ticker][trade_date] = tuple(
+                float(row[name]) for name in _PRICE_COLUMNS[2:]
+            )
+    audits: dict[str, object] = {}
+    for ticker, identity in sorted(identities.items()):
+        predecessor = identity.warmup_predecessor
+        if predecessor is None:
+            continue
+        predecessor_identity = identities.get(predecessor)
+        if predecessor_identity is None or predecessor_identity.chain_id != identity.chain_id:
+            raise ValueError(f"warmup predecessor {predecessor} is outside {ticker}'s price chain")
+        shared = sorted(set(rows[ticker]).intersection(rows[predecessor]))
+        mismatches = [
+            trade_date
+            for trade_date in shared
+            if rows[ticker][trade_date] != rows[predecessor][trade_date]
+        ]
+        if mismatches:
+            raise ValueError(
+                f"provider identities {predecessor}/{ticker} disagree on an admitted overlap"
+            )
+        audits[ticker] = {
+            "predecessor": predecessor,
+            "exact_overlap_row_count": len(shared),
+            "overlap_first_date": shared[0].isoformat() if shared else None,
+            "overlap_last_date": shared[-1].isoformat() if shared else None,
+        }
+    augmented = {ticker: dict(ticker_rows) for ticker, ticker_rows in rows.items()}
+    unresolved = {
+        ticker for ticker, identity in identities.items() if identity.warmup_predecessor is not None
+    }
+    copied_by_symbol: dict[str, int] = {}
+    while unresolved:
+        progress = False
+        for ticker in sorted(unresolved):
+            identity = identities[ticker]
+            predecessor = identity.warmup_predecessor
+            if predecessor in unresolved:
+                continue
+            if predecessor is None:
+                raise ValueError("reviewed warmup dependency is missing")
+            copied = 0
+            for trade_date, values in augmented[predecessor].items():
+                if trade_date < identity.admitted_start:
+                    existing = augmented[ticker].setdefault(trade_date, values)
+                    if existing != values:
+                        raise ValueError("reviewed predecessor warmup conflicts with admitted rows")
+                    copied += 1
+            if copied == 0:
+                raise ValueError(f"reviewed predecessor {predecessor} supplies no warmup for {ticker}")
+            copied_by_symbol[ticker] = copied
+            unresolved.remove(ticker)
+            progress = True
+        if not progress:
+            raise ValueError("reviewed price-identity warmup dependencies contain a cycle")
+    created = False
+    try:
+        with output_path.open("x", encoding="utf-8", newline="") as output:
+            created = True
+            writer = csv.writer(output, lineterminator="\n")
+            writer.writerow(_PRICE_COLUMNS)
+            for trade_date, ticker, values in sorted(
+                (
+                    (trade_date, ticker, values)
+                    for ticker, ticker_rows in augmented.items()
+                    for trade_date, values in ticker_rows.items()
+                ),
+                key=lambda item: (item[0], item[1]),
+            ):
+                writer.writerow(
+                    (trade_date.isoformat(), ticker, *(repr(value) for value in values))
+                )
+    except Exception:
+        if created:
+            output_path.unlink(missing_ok=True)
+        raise
+    return {
+        "validated_successor_count": len(audits),
+        "copied_warmup_row_count": sum(copied_by_symbol.values()),
+        "copied_warmup_rows_by_symbol": copied_by_symbol,
+        "successor_audits": audits,
+    }
+
+
+def _clip_cache_to_admitted_identities(
+    source_path: Path,
+    identities: dict[str, PriceIdentity],
+    output_path: Path,
+) -> dict[str, int]:
+    kept = 0
+    discarded = 0
+    created = False
+    try:
+        with (
+            source_path.open("r", encoding="utf-8", newline="") as source,
+            output_path.open("x", encoding="utf-8", newline="") as output,
+        ):
+            created = True
+            reader = csv.DictReader(source)
+            if tuple(reader.fieldnames or ()) != _PRICE_COLUMNS:
+                raise ValueError("cache identity clipping source has an unexpected header")
+            writer = csv.DictWriter(output, fieldnames=_PRICE_COLUMNS, lineterminator="\n")
+            writer.writeheader()
+            for row in reader:
+                identity = identities.get(row["ticker"])
+                if identity is None:
+                    raise ValueError("cache row lacks a reviewed price identity")
+                trade_date = date.fromisoformat(row["trade_date"])
+                if identity.admitted_start <= trade_date <= identity.admitted_end:
+                    writer.writerow(row)
+                    kept += 1
+                else:
+                    discarded += 1
+    except Exception:
+        if created:
+            output_path.unlink(missing_ok=True)
+        raise
+    return {"kept_row_count": kept, "discarded_row_count": discarded}
+
+
+def _normalize_cache_to_cutoff_basis(
+    cache_path: Path,
+    split_path: Path,
+    cutoff_path: Path,
+    cutoff_factors: dict[str, float],
+    output_path: Path,
+    identities: dict[str, PriceIdentity] | None = None,
+) -> dict[str, object]:
+    """Classify each frozen-cache symbol basis and normalize lookahead splits away."""
+    split_audit = _audit_price_source_overlaps(cache_path, split_path)
+    cutoff_audit = _audit_price_source_overlaps(cache_path, cutoff_path)
+    split_incompatible = set(split_audit.incompatible_symbols())
+    cutoff_incompatible = set(cutoff_audit.incompatible_symbols())
+    cache_symbols = set(split_audit.symbol_totals).union(cutoff_audit.symbol_totals)
+    classification: dict[str, str] = {}
+    cache_factors: dict[str, float] = {}
+    for ticker in sorted(cutoff_factors):
+        if ticker not in cache_symbols:
+            classification[ticker] = "no_cache_overlap"
+            continue
+        if ticker not in cutoff_incompatible:
+            classification[ticker] = "already_cutoff_aligned"
+            cache_factors[ticker] = 1.0
+        elif ticker not in split_incompatible:
+            factor = cutoff_factors[ticker]
+            if factor == 1.0:
+                raise ValueError(f"cache basis classification is contradictory for {ticker}")
+            classification[ticker] = "current_split_transformed_to_cutoff"
+            cache_factors[ticker] = factor
+        else:
+            raise ValueError(f"cache matches neither cutoff nor current SPLIT basis for {ticker}")
+    created = False
+    try:
+        with (
+            cache_path.open("r", encoding="utf-8", newline="") as source,
+            output_path.open("x", encoding="utf-8", newline="") as output,
+        ):
+            created = True
+            reader = csv.DictReader(source)
+            if tuple(reader.fieldnames or ()) != _PRICE_COLUMNS:
+                raise ValueError("cache normalization source has an unexpected header")
+            writer = csv.writer(output, lineterminator="\n")
+            writer.writerow(_PRICE_COLUMNS)
+            for row in reader:
+                ticker = row["ticker"]
+                trade_date = date.fromisoformat(row["trade_date"])
+                identity = identities.get(ticker) if identities is not None else None
+                if identities is not None and identity is None:
+                    raise ValueError(f"cache row lacks a canonical price-identity contract for {ticker}")
+                if identity is not None and (
+                    trade_date > identity.admitted_end
+                    or identity.continuity_kind == "successor_reset"
+                    and trade_date < identity.admitted_start
+                ):
+                    continue
+                factor = cache_factors.get(ticker)
+                if factor is None:
+                    raise ValueError(f"cache row lacks a proved cutoff-basis classification for {ticker}")
+                values = tuple(float(row[name]) for name in _PRICE_COLUMNS[2:])
+                adjusted = (
+                    *(value * factor for value in values[:4]),
+                    values[4] / factor,
+                )
+                writer.writerow((row["trade_date"], ticker, *(repr(value) for value in adjusted)))
+    except Exception:
+        if created:
+            output_path.unlink(missing_ok=True)
+        raise
+    normalized_audit = _audit_price_source_overlaps(output_path, cutoff_path)
+    normalized_summary = normalized_audit.finish()
+    counts = {
+        basis: sum(value == basis for value in classification.values())
+        for basis in (
+            "already_cutoff_aligned",
+            "current_split_transformed_to_cutoff",
+            "no_cache_overlap",
+        )
+    }
+    return {
+        "cache_basis_by_symbol": classification,
+        "cache_basis_counts": counts,
+        "cache_vs_current_split_overlap_audit": split_audit.finish(fail_closed=False),
+        "cache_vs_cutoff_overlap_audit_before_normalization": cutoff_audit.finish(fail_closed=False),
+        "normalized_cache_vs_cutoff_overlap_audit": normalized_summary,
+    }
+
+
+def _merge_price_sources(cache_path: Path, sip_path: Path, output_path: Path) -> dict[str, object]:
+    """Stream two sorted price CSVs, retaining the cache row on every overlap."""
+    cache_count = 0
+    sip_count = 0
+    sip_fill_count = 0
+    merged_count = 0
+    output_created = False
+    audit = _OverlapAudit()
+    try:
+        with (
+            cache_path.open("r", encoding="utf-8", newline="") as cache_stream,
+            sip_path.open("r", encoding="utf-8", newline="") as sip_stream,
+            output_path.open("x", encoding="utf-8", newline="") as output_stream,
+        ):
+            output_created = True
+            cache_reader = csv.DictReader(cache_stream)
+            sip_reader = csv.DictReader(sip_stream)
+            if tuple(cache_reader.fieldnames or ()) != _PRICE_COLUMNS:
+                raise ValueError("cache price CSV has an unexpected merge header")
+            if tuple(sip_reader.fieldnames or ()) != _PRICE_COLUMNS:
+                raise ValueError("Alpaca SIP snapshot has an unexpected merge header")
+            writer = csv.DictWriter(output_stream, fieldnames=_PRICE_COLUMNS, lineterminator="\n")
+            writer.writeheader()
+            cache_row = next(cache_reader, None)
+            sip_row = next(sip_reader, None)
+            while cache_row is not None or sip_row is not None:
+                cache_key = (
+                    (cache_row["trade_date"], cache_row["ticker"])
+                    if cache_row is not None
+                    else None
+                )
+                sip_key = (
+                    (sip_row["trade_date"], sip_row["ticker"])
+                    if sip_row is not None
+                    else None
+                )
+                if sip_key is None or cache_key is not None and cache_key < sip_key:
+                    writer.writerow(cache_row)
+                    cache_count += 1
+                    merged_count += 1
+                    cache_row = next(cache_reader, None)
+                elif cache_key is None or sip_key < cache_key:
+                    writer.writerow(sip_row)
+                    sip_count += 1
+                    sip_fill_count += 1
+                    merged_count += 1
+                    sip_row = next(sip_reader, None)
+                else:
+                    cache_values = tuple(float(cache_row[name]) for name in _PRICE_COLUMNS[2:])
+                    sip_values = tuple(float(sip_row[name]) for name in _PRICE_COLUMNS[2:])
+                    audit.add(cache_row["ticker"], cache_values, sip_values)
+                    writer.writerow(cache_row)
+                    cache_count += 1
+                    sip_count += 1
+                    merged_count += 1
+                    cache_row = next(cache_reader, None)
+                    sip_row = next(sip_reader, None)
+    except Exception:
+        if output_created:
+            output_path.unlink(missing_ok=True)
+        raise
+    return {
+        "cache_source_row_count": cache_count,
+        "alpaca_sip_source_row_count": sip_count,
+        "alpaca_sip_fill_row_count": sip_fill_count,
+        "merged_row_count": merged_count,
+        "overlap_audit": audit.finish(),
+    }
 
 
 def _csv_text(rows: Sequence[Sequence[object]], header: Sequence[str]) -> str:
@@ -687,9 +1397,17 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _publish(output_dir: Path, source_prices: Path, spy_days: Sequence[date], provenance: dict[str, object]) -> None:
+def _publish(
+    output_dir: Path,
+    source_prices: Path,
+    spy_days: Sequence[date],
+    provenance: dict[str, object],
+    *,
+    alpaca_snapshot: Path | None = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    finals = tuple(output_dir / name for name in _OUTPUT_NAMES)
+    output_names = _BACKFILL_OUTPUT_NAMES if alpaca_snapshot is not None else _OUTPUT_NAMES
+    finals = tuple(output_dir / name for name in output_names)
     staging = tuple(
         final.with_name(f".{final.name}.{uuid.uuid4().hex}.tmp") for final in finals
     )
@@ -714,6 +1432,12 @@ def _publish(output_dir: Path, source_prices: Path, spy_days: Sequence[date], pr
         staged_identities[staging[2]] = _write_staged(
             staging[2], lambda stream: stream.write(provenance_bytes)
         )
+        if alpaca_snapshot is not None:
+            def copy_snapshot(stream: BinaryIO) -> None:
+                with alpaca_snapshot.open("rb") as reader:
+                    shutil.copyfileobj(reader, stream, length=1024 * 1024)
+
+            staged_identities[staging[3]] = _write_staged(staging[3], copy_snapshot)
         for staged, final in zip(staging, finals, strict=True):
             os.link(staged, final)
             installed_identities[final] = staged_identities[staged]
@@ -737,6 +1461,53 @@ def export(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("price window must be exactly 2020-01-01 through 2025-12-31")
     membership_path = _regular_file(Path(args.membership_csv), "membership CSV")
     membership = _load_membership(membership_path)
+    alpaca_sip_backfill = bool(getattr(args, "alpaca_sip_backfill", False))
+    alpaca_env_file_value = getattr(args, "alpaca_env_file", None)
+    if not alpaca_sip_backfill and alpaca_env_file_value is not None:
+        raise ValueError("--alpaca-env-file requires explicit --alpaca-sip-backfill")
+    if alpaca_sip_backfill:
+        identity_bounds = _load_identity_bounds(
+            Path(args.symbol_history_map),
+            args.symbol_history_map_sha256,
+            membership,
+            args.end_date,
+        )
+        price_identity_manifest = _load_price_identity_manifest(
+            Path(args.price_identity_map),
+            args.price_identity_map_sha256,
+            membership,
+            identity_bounds,
+            args.end_date,
+        )
+        price_identities = _complete_price_identities(
+            membership,
+            price_identity_manifest,
+            args.end_date,
+        )
+        provider_identities = _provider_identity_contracts(price_identities)
+        identity_end_values = {
+            ticker: identity_end.isoformat()
+            for ticker, identity_end in sorted(identity_bounds.end_dates.items())
+        }
+        identity_end_bytes = (
+            json.dumps(identity_end_values, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        identity_request_values = {
+            ticker: {
+                "provider_symbol": identity.provider_symbol,
+                "identity_asof": identity.identity_asof.isoformat(),
+                "admitted_start": identity.admitted_start.isoformat(),
+                "admitted_end": identity.admitted_end.isoformat(),
+                "chain_id": identity.chain_id,
+                "continuity_kind": identity.continuity_kind,
+                "warmup_predecessor": identity.warmup_predecessor,
+                "factor_anchor": identity.factor_anchor,
+            }
+            for ticker, identity in sorted(price_identities.items())
+        }
+        identity_request_bytes = (
+            json.dumps(identity_request_values, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
     source = _regular_file(Path(args.cache), "cache")
     source_before = source.stat()
     worker_script = _regular_file(Path(args.worker_script), "worker script")
@@ -755,7 +1526,194 @@ def export(args: argparse.Namespace) -> dict[str, object]:
             Path(args.docker_executable), args.sandbox_image, prepared_worker,
             snapshot, request_path, worker_output,
         )
-        metrics, spy_days = _validate_prices(prices_path, membership, args.start_date, args.end_date)
+        cache_metrics, _cache_spy_days = _validate_prices(
+            prices_path,
+            membership,
+            args.start_date,
+            args.end_date,
+            enforce_gates=not alpaca_sip_backfill,
+        )
+        publication_prices = prices_path
+        alpaca_snapshot_path: Path | None = None
+        merge_metrics: dict[str, object] = {}
+        provider_provenance: dict[str, object] = {}
+        if alpaca_sip_backfill:
+            env_path = Path(alpaca_env_file_value) if alpaca_env_file_value is not None else None
+            api_key, secret_key = load_alpaca_credentials(env_path)
+            provider_symbols = tuple(sorted({*membership.tickers, "SPY"}))
+            expected_trading_days = _expected_trading_days(args.start_date, args.end_date)
+            split_snapshot = fetch_alpaca_sip_snapshot(
+                provider_symbols,
+                membership_symbol_count=len(membership.tickers),
+                start=args.start_date,
+                end=args.end_date,
+                expected_trading_days=expected_trading_days,
+                output_path=root / "alpaca_sip_split.csv",
+                api_key=api_key,
+                secret_key=secret_key,
+                identities=provider_identities,
+            )
+            factor_anchor_symbols = tuple(
+                sorted(
+                    ticker
+                    for ticker, identity in price_identities.items()
+                    if identity.factor_anchor
+                )
+            )
+            raw_snapshot = fetch_alpaca_sip_raw_calibration(
+                factor_anchor_symbols,
+                membership_symbol_count=len(factor_anchor_symbols) - 1,
+                start=args.start_date,
+                end=args.end_date,
+                expected_trading_days=expected_trading_days,
+                output_path=root / "alpaca_sip_raw.csv",
+                api_key=api_key,
+                secret_key=secret_key,
+                identities={
+                    ticker: provider_identities[ticker] for ticker in factor_anchor_symbols
+                },
+            )
+            anchor_factors = _derive_cutoff_split_factors(
+                split_snapshot.path,
+                raw_snapshot.path,
+                factor_anchor_symbols,
+            )
+            cutoff_factors = _expand_chain_cutoff_factors(
+                anchor_factors,
+                price_identities,
+                args.end_date,
+            )
+            factor_bytes = (
+                json.dumps(cutoff_factors, allow_nan=False, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode()
+            admitted_snapshot_path = root / "alpaca_sip_cutoff_admitted.csv"
+            _apply_cutoff_split_factors(
+                split_snapshot.path,
+                cutoff_factors,
+                admitted_snapshot_path,
+            )
+            alpaca_snapshot_path = root / "alpaca_sip_snapshot.csv"
+            warmup_continuity = _build_price_identity_warmup(
+                admitted_snapshot_path,
+                price_identities,
+                alpaca_snapshot_path,
+            )
+            admitted_cache_path = root / "admitted_cache.csv"
+            cache_identity_clipping = _clip_cache_to_admitted_identities(
+                prices_path,
+                price_identities,
+                admitted_cache_path,
+            )
+            normalized_cache_path = root / "cutoff_normalized_cache.csv"
+            cache_basis = _normalize_cache_to_cutoff_basis(
+                admitted_cache_path,
+                split_snapshot.path,
+                alpaca_snapshot_path,
+                cutoff_factors,
+                normalized_cache_path,
+            )
+            cache_basis_bytes = (
+                json.dumps(
+                    cache_basis["cache_basis_by_symbol"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+            publication_prices = root / "merged_prices.csv"
+            merge_metrics = _merge_price_sources(
+                normalized_cache_path,
+                alpaca_snapshot_path,
+                publication_prices,
+            )
+            metrics, spy_days = _validate_prices(
+                publication_prices,
+                membership,
+                args.start_date,
+                args.end_date,
+            )
+            member_pair_fill_count = int(metrics["covered_member_trading_day_pairs"]) - int(
+                cache_metrics["covered_member_trading_day_pairs"]
+            )
+            provider_provenance = {
+                "alpaca_retrieved_at_utc": split_snapshot.retrieved_at_utc,
+                "alpaca_request_start_date": args.start_date.isoformat(),
+                "alpaca_request_end_date": args.end_date.isoformat(),
+                "alpaca_feed": "SIP",
+                "alpaca_adjustment": "SPLIT",
+                "alpaca_timeframe": "1Day",
+                "alpaca_requested_symbol_count": split_snapshot.requested_symbol_count,
+                "alpaca_requested_membership_symbol_count": (
+                    split_snapshot.requested_membership_symbol_count
+                ),
+                "alpaca_returned_symbol_count": split_snapshot.returned_symbol_count,
+                "alpaca_returned_membership_symbol_count": (
+                    split_snapshot.returned_membership_symbol_count
+                ),
+                "alpaca_chunk_count": split_snapshot.chunk_count,
+                "alpaca_alias_map": {
+                    canonical: provider
+                    for provider, canonical in sorted(REQUEST_ALIASES.items())
+                },
+                "symbol_history_map_sha256": identity_bounds.sha256,
+                "symbol_history_mapped_symbol_count": identity_bounds.mapped_symbol_count,
+                "price_identity_map_sha256": price_identity_manifest.sha256,
+                "price_identity_mapped_symbol_count": len(price_identity_manifest.identities),
+                "price_identity_chain_count": price_identity_manifest.chain_count,
+                "price_identity_request_contracts": identity_request_values,
+                "price_identity_request_contracts_sha256": hashlib.sha256(
+                    identity_request_bytes
+                ).hexdigest(),
+                "alpaca_identity_end_by_symbol": identity_end_values,
+                "alpaca_identity_end_sha256": hashlib.sha256(identity_end_bytes).hexdigest(),
+                "alpaca_identity_group_count": split_snapshot.identity_group_count,
+                "alpaca_raw_identity_group_count": raw_snapshot.identity_group_count,
+                "successor_identity_caveat": (
+                    "PSKY returned no pre-2025-08-07 predecessor rows in the reviewed identity probe; "
+                    "no predecessor synthesis or price alias is applied"
+                ),
+                "alpaca_split_source_row_count": split_snapshot.row_count,
+                "alpaca_raw_calibration_retrieved_at_utc": raw_snapshot.retrieved_at_utc,
+                "alpaca_raw_calibration_adjustment": "RAW",
+                "alpaca_raw_calibration_chunk_count": raw_snapshot.chunk_count,
+                "alpaca_raw_calibration_request_count": raw_snapshot.chunk_count,
+                "alpaca_raw_calibration_row_count": raw_snapshot.row_count,
+                "alpaca_raw_factor_anchor_symbols": list(factor_anchor_symbols),
+                "alpaca_raw_factor_anchor_count": len(factor_anchor_symbols),
+                "cutoff_adjustment_date": args.end_date.isoformat(),
+                "cutoff_factor_tail_size": 20,
+                "cutoff_factor_minimum_matching_days": 5,
+                "cutoff_factor_count": len(cutoff_factors),
+                "cutoff_factor_anchor_factors": anchor_factors,
+                "cutoff_factor_non_unity_symbols": sorted(
+                    ticker for ticker, factor in cutoff_factors.items() if factor != 1.0
+                ),
+                "cutoff_factors": cutoff_factors,
+                "cutoff_factors_sha256": hashlib.sha256(factor_bytes).hexdigest(),
+                "price_identity_warmup_validation": warmup_continuity,
+                "cache_identity_clipping": cache_identity_clipping,
+                "cache_basis_by_symbol": cache_basis["cache_basis_by_symbol"],
+                "cache_basis_counts": cache_basis["cache_basis_counts"],
+                "cache_basis_sha256": hashlib.sha256(cache_basis_bytes).hexdigest(),
+                "cutoff_normalized_cache_sha256": _sha256_file(normalized_cache_path),
+                "cache_basis_audits": {
+                    "current_split": cache_basis["cache_vs_current_split_overlap_audit"],
+                    "cutoff_before_normalization": cache_basis[
+                        "cache_vs_cutoff_overlap_audit_before_normalization"
+                    ],
+                    "cutoff_after_normalization": cache_basis[
+                        "normalized_cache_vs_cutoff_overlap_audit"
+                    ],
+                },
+                "alpaca_sip_snapshot_sha256": _sha256_file(alpaca_snapshot_path),
+                "member_pair_fill_count": member_pair_fill_count,
+                "remaining_member_pair_gap_count": int(metrics["member_trading_day_pairs"])
+                - int(metrics["covered_member_trading_day_pairs"]),
+                **merge_metrics,
+            }
+        else:
+            metrics, spy_days = cache_metrics, _cache_spy_days
         source_after = source.stat()
         if (
             (source_before.st_dev, source_before.st_ino, source_before.st_size, source_before.st_mtime_ns)
@@ -764,7 +1722,11 @@ def export(args: argparse.Namespace) -> dict[str, object]:
         ):
             raise ValueError("source cache changed during the confined export")
         provenance: dict[str, object] = {
-            "source_kind": "existing_hash_pinned_cache",
+            "source_kind": (
+                "existing_hash_pinned_cache_plus_alpaca_sip_snapshot"
+                if alpaca_sip_backfill
+                else "existing_hash_pinned_cache"
+            ),
             "source_sha256": snapshot.sha256,
             "cache_key_count": snapshot.key_count,
             "cache_keys_sha256": snapshot.keys_sha256,
@@ -772,12 +1734,19 @@ def export(args: argparse.Namespace) -> dict[str, object]:
             "start_date": args.start_date.isoformat(),
             "end_date": args.end_date.isoformat(),
             "sandbox_image": args.sandbox_image,
-            "prices_sha256": _sha256_file(prices_path),
+            "prices_sha256": _sha256_file(publication_prices),
             **metrics,
+            **provider_provenance,
         }
         spy_text = _csv_text([(value.isoformat(),) for value in spy_days], ("trade_date",))
         provenance["spy_trading_days_sha256"] = hashlib.sha256(spy_text.encode()).hexdigest()
-        _publish(output_dir, prices_path, spy_days, provenance)
+        _publish(
+            output_dir,
+            publication_prices,
+            spy_days,
+            provenance,
+            alpaca_snapshot=alpaca_snapshot_path,
+        )
         return provenance
 
 
@@ -791,11 +1760,36 @@ def main() -> int:
     parser.add_argument("--cache", required=True)
     parser.add_argument("--cache-sha256", required=True)
     parser.add_argument("--membership-csv", required=True)
+    parser.add_argument(
+        "--symbol-history-map",
+        default=str(Path(__file__).resolve().parent / "config" / "pit_membership_symbol_map.csv"),
+    )
+    parser.add_argument(
+        "--symbol-history-map-sha256",
+        default=_REVIEWED_SYMBOL_HISTORY_SHA256,
+    )
+    parser.add_argument(
+        "--price-identity-map",
+        default=str(Path(__file__).resolve().parent / "config" / "pit_price_identity_map.csv"),
+    )
+    parser.add_argument(
+        "--price-identity-map-sha256",
+        default=_REVIEWED_PRICE_IDENTITY_SHA256,
+    )
     parser.add_argument("--start-date", type=_iso_date, default=_BASELINE_START)
     parser.add_argument("--end-date", type=_iso_date, default=_BASELINE_END)
     parser.add_argument("--output-dir", default="exports/pit")
     parser.add_argument("--docker-executable", default=_default_docker())
     parser.add_argument("--sandbox-image", required=True)
+    parser.add_argument(
+        "--alpaca-sip-backfill",
+        action="store_true",
+        help="explicitly fill cache-missing rows from an Alpaca SIP/SPLIT/1Day snapshot",
+    )
+    parser.add_argument(
+        "--alpaca-env-file",
+        help="optional dotenv file containing ALPACA_API_KEY and ALPACA_SECRET_KEY",
+    )
     parser.add_argument(
         "--worker-script",
         default=str(Path(__file__).resolve().parent / "tools" / "export_price_cache_worker.py"),
