@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -18,6 +19,8 @@ _OUTPUTS = (
     "membership_raw.html",
     "membership_spot_checks.json",
 )
+_REQUIRED_START_DATE = date(2021, 1, 1)
+_REQUIRED_END_DATE = date(2025, 12, 31)
 _SPOT_CHECKS = (
     {"effective_date": "2021-07-21", "addition": "MRNA", "removal": "ALXN", "official_announcement_url": "https://press.spglobal.com/2021-07-15-Moderna-Set-to-Join-S-P-500"},
     {"effective_date": "2022-02-15", "addition": "NDSN", "removal": "XLNX", "official_announcement_url": "https://www.spglobal.com/spdji/en/documents/indexnews/announcements/20220210-1449702/1449702_xlnx5.pdf"},
@@ -40,8 +43,8 @@ def _output_dir(value: str) -> Path:
         raise ValueError("output directory must be a regular directory")
     if path.exists():
         entries = {item.name for item in path.iterdir()}
-        if entries - {".gitkeep"}:
-            raise ValueError("refusing an existing non-empty output directory")
+        if entries != {".gitkeep"}:
+            raise ValueError("existing output directory must contain exactly .gitkeep")
     return path
 
 
@@ -62,6 +65,15 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
     temporary = path.with_name(f"{path.name}.tmp")
     temporary.write_bytes(value)
     temporary.replace(path)
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _require_baseline_window(start_date: date, end_date: date) -> None:
+    if start_date != _REQUIRED_START_DATE or end_date != _REQUIRED_END_DATE:
+        raise ValueError("membership window must be exactly 2021-01-01 through 2025-12-31")
 
 
 def _csv_text(rows: list[tuple[Any, ...]], header: tuple[str, ...]) -> str:
@@ -88,12 +100,16 @@ def _spot_checks(events: tuple[Any, ...]) -> list[dict[str, Any]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch an immutable five-year S&P 500 membership export")
     parser.add_argument("--revision-url", required=True)
-    parser.add_argument("--start-date", type=_date, default=date(2021, 1, 1))
-    parser.add_argument("--end-date", type=_date, default=date(2025, 12, 31))
+    parser.add_argument("--start-date", type=_date, default=_REQUIRED_START_DATE)
+    parser.add_argument("--end-date", type=_date, default=_REQUIRED_END_DATE)
     parser.add_argument("--symbol-map-csv", default=None)
     parser.add_argument("--output-dir", default="exports/pit")
     args = parser.parse_args()
 
+    try:
+        _require_baseline_window(args.start_date, args.end_date)
+    except ValueError as exc:
+        parser.error(str(exc))
     output_dir = _output_dir(args.output_dir)
     raw = fetch_revision(args.revision_url)
     mappings = load_symbol_map(Path(args.symbol_map_csv).resolve() if args.symbol_map_csv else None)
@@ -117,9 +133,16 @@ def main() -> int:
         _csv_text([(event.effective_date.isoformat(), event.ticker, int(event.member)) for event in export.events], ("effective_date", "ticker", "member")),
     )
     _atomic_text(output_dir / "security_names.csv", _csv_text(sorted(export.company_names.items()), ("ticker", "company_name")))
-    _atomic_text(output_dir / "membership_provenance.json", json.dumps(provenance, indent=2, sort_keys=True) + "\n")
     _atomic_bytes(output_dir / "membership_raw.html", raw)
     _atomic_text(output_dir / "membership_spot_checks.json", json.dumps(checks, indent=2, sort_keys=True) + "\n")
+    provenance.update(
+        {
+            "membership_sha256": _sha256_file(output_dir / "membership.csv"),
+            "security_names_sha256": _sha256_file(output_dir / "security_names.csv"),
+            "membership_spot_checks_sha256": _sha256_file(output_dir / "membership_spot_checks.json"),
+        }
+    )
+    _atomic_text(output_dir / "membership_provenance.json", json.dumps(provenance, indent=2, sort_keys=True) + "\n")
     print(json.dumps(provenance, sort_keys=True))
     return 0
 

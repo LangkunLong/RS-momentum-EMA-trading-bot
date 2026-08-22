@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
@@ -49,6 +50,14 @@ class MembershipExport:
     revision_id: str
     exclusions: tuple[Mapping[str, str], ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "company_names", MappingProxyType(dict(self.company_names)))
+        object.__setattr__(
+            self,
+            "exclusions",
+            tuple(MappingProxyType(dict(exclusion)) for exclusion in self.exclusions),
+        )
+
 
 @dataclass(frozen=True)
 class _ReviewedMapping:
@@ -57,10 +66,29 @@ class _ReviewedMapping:
     effective_end: date
 
 
+def _validate_pinned_url(url: str, *, expected_host: str, expected_revision_id: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != expected_host:
+        raise ValueError("redirect changed HTTPS host")
+    if _revision_id(url) != expected_revision_id:
+        raise ValueError("redirect changed immutable revision")
+
+
 class _SameHostRedirects(HTTPRedirectHandler):
+    def __init__(self, *, expected_host: str, expected_revision_id: str) -> None:
+        super().__init__()
+        self._expected_host = expected_host
+        self._expected_revision_id = expected_revision_id
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-        if urlparse(newurl).hostname != urlparse(req.full_url).hostname:
-            raise HTTPError(req.full_url, code, "redirect changed host", headers, fp)
+        try:
+            _validate_pinned_url(
+                newurl,
+                expected_host=self._expected_host,
+                expected_revision_id=self._expected_revision_id,
+            )
+        except ValueError as exc:
+            raise HTTPError(req.full_url, code, str(exc), headers, fp) from exc
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -76,14 +104,15 @@ def _revision_id(url: str) -> str:
 
 def fetch_revision(url: str, *, timeout_seconds: float = 30.0) -> bytes:
     """Fetch one immutable HTTPS page revision without cross-host redirects."""
-    _revision_id(url)
+    revision_id = _revision_id(url)
+    host = urlparse(url).hostname
+    assert host is not None
     if not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= 300:
         raise ValueError("timeout_seconds must be between zero and 300")
     request = Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
-    opener = build_opener(_SameHostRedirects())
+    opener = build_opener(_SameHostRedirects(expected_host=host, expected_revision_id=revision_id))
     with opener.open(request, timeout=float(timeout_seconds)) as response:
-        if urlparse(response.geturl()).hostname != urlparse(url).hostname:
-            raise ValueError("redirect changed host")
+        _validate_pinned_url(response.geturl(), expected_host=host, expected_revision_id=revision_id)
         content_length = response.headers.get("Content-Length")
         if content_length and int(content_length) > _MAX_RESPONSE_BYTES:
             raise ValueError("revision response exceeds 10 MiB cap")
