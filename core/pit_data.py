@@ -28,12 +28,16 @@ is missing.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import sqlite3
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping
+
 import pandas as pd
 
 from core.leader_evaluation import PointInTimeUniverse
@@ -74,6 +78,128 @@ _FUNDAMENTAL_COLUMN_MAP = {
     "total_stockholders_equity": "Total Stockholders Equity",
 }
 _STATEMENT_TYPES = {"quarterly", "annual", "balance", "institutional"}
+_REQUIRED_METADATA = {
+    "bundle_kind",
+    "schema_version",
+    "data_cutoff",
+    "evaluation_start",
+    "warmup_start",
+    "membership_source_sha256",
+    "prices_source_sha256",
+    "fundamentals_source_sha256",
+    "membership_provenance_sha256",
+    "prices_provenance_sha256",
+    "fundamentals_provenance_sha256",
+    "membership_source_kind",
+    "membership_revision_id",
+    "membership_raw_sha256",
+    "membership_symbol_map_sha256",
+    "membership_security_names_sha256",
+    "prices_source_kind",
+    "prices_upstream_source_sha256",
+    "spy_trading_days_sha256",
+    "price_identity_map_sha256",
+    "price_identity_request_contracts_sha256",
+    "price_exclusion_count",
+    "price_exclusions_sha256",
+    "fundamentals_source_kind",
+    "fundamentals_submissions_archive_sha256",
+    "fundamentals_companyfacts_archive_sha256",
+    "fundamentals_identity_manifest_csv_sha256",
+}
+_SAME_ISSUER_CONTINUITIES = {
+    "same_issuer_rename",
+    "same_issuer_ticker_reuse",
+    "legacy_survivor_rename",
+    "accounting_acquirer_rename",
+}
+
+
+@dataclass(frozen=True)
+class IdentityTransition:
+    effective_date: date
+    predecessor: str
+    successor: str
+    chain_id: str
+    continuity_kind: str
+
+
+@dataclass(frozen=True)
+class PriceIdentityTransitionContract:
+    """Hash-bound rules for carrying an open holding across ticker identities."""
+
+    prices_provenance_sha256: str
+    request_contracts_sha256: str
+    identities: Mapping[str, Mapping[str, object]]
+    transitions: tuple[IdentityTransition, ...]
+
+    def __post_init__(self) -> None:
+        frozen = {
+            ticker: MappingProxyType(dict(values))
+            for ticker, values in self.identities.items()
+        }
+        object.__setattr__(self, "identities", MappingProxyType(frozen))
+        boundary_predecessors: set[tuple[date, str]] = set()
+        boundary_successors: set[tuple[date, str]] = set()
+        for transition in self.transitions:
+            predecessor = frozen.get(transition.predecessor)
+            successor = frozen.get(transition.successor)
+            if predecessor is None or successor is None:
+                raise ValueError("holding transition references an unknown identity")
+            successor_bounds = (
+                date.fromisoformat(str(successor["admitted_start"])),
+                date.fromisoformat(str(successor["admitted_end"])),
+            )
+            if not successor_bounds[0] <= transition.effective_date <= successor_bounds[1]:
+                raise ValueError("holding transition successor is not admitted at the boundary")
+            predecessor_key = (transition.effective_date, transition.predecessor)
+            successor_key = (transition.effective_date, transition.successor)
+            if predecessor_key in boundary_predecessors or successor_key in boundary_successors:
+                raise ValueError("holding transition boundary is not one-to-one")
+            boundary_predecessors.add(predecessor_key)
+            boundary_successors.add(successor_key)
+
+    def resolve_open_holding(self, ticker: str, on_date: date | str) -> str:
+        """Return an approved identity or fail closed after an ended identity."""
+        symbol = _canonical_ticker(ticker)
+        when = date.fromisoformat(on_date) if isinstance(on_date, str) else on_date
+        if not isinstance(when, date):
+            raise ValueError("holding transition date is invalid")
+        matches = [
+            item
+            for item in self.transitions
+            if item.predecessor == symbol and item.effective_date == when
+        ]
+        if len(matches) > 1:
+            raise ValueError("holding identity transition is ambiguous")
+        if matches:
+            transition = matches[0]
+            successor = self.identities.get(transition.successor)
+            if successor is None:
+                raise ValueError("holding transition successor is unknown")
+            successor_start = date.fromisoformat(str(successor["admitted_start"]))
+            successor_end = date.fromisoformat(str(successor["admitted_end"]))
+            if not successor_start <= when <= successor_end:
+                raise ValueError("holding transition successor is not admitted at the boundary")
+            return transition.successor
+        identity = self.identities.get(symbol)
+        if identity is None:
+            raise ValueError(f"holding identity is not in the hash-bound contract: {symbol}")
+        admitted_start = date.fromisoformat(str(identity["admitted_start"]))
+        admitted_end = date.fromisoformat(str(identity["admitted_end"]))
+        if when < admitted_start or when > admitted_end:
+            raise ValueError(f"open holding crossed an unsupported price identity boundary: {symbol}")
+        active = True
+        for transition in self.transitions:
+            if transition.effective_date > when:
+                continue
+            if transition.predecessor == symbol:
+                active = False
+            if transition.successor == symbol:
+                active = True
+        if not active:
+            raise ValueError(f"open holding crossed an unhandled same-issuer transition: {symbol}")
+        return symbol
 
 
 def sha256_file(path: Path) -> str:
@@ -102,6 +228,25 @@ def _canonical_ticker(value: object) -> str:
     return ticker
 
 
+def _canonical_json_sha256(value: object) -> str:
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _json_file(path: str | Path) -> tuple[Path, Mapping[str, object]]:
+    candidate = Path(path)
+    if not candidate.is_file() or candidate.is_symlink():
+        raise ValueError("provenance must be a regular non-link JSON file")
+    resolved = candidate.resolve()
+    try:
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("provenance JSON is invalid") from exc
+    if not isinstance(value, dict):
+        raise ValueError("provenance JSON must contain an object")
+    return resolved, value
+
+
 class PITDataBundle:
     """Validated, read-only point-in-time price/fundamental data bundle."""
 
@@ -121,6 +266,7 @@ class PITDataBundle:
             self.metadata = self._load_metadata()
             self.membership = self._load_membership()
             self._symbols = self._load_symbols()
+            self._validate_integrity()
         except Exception:
             self._connection.close()
             raise
@@ -166,13 +312,25 @@ class PITDataBundle:
         metadata = {str(row[0]): str(row[1]) for row in rows}
         if metadata.get("schema_version") != "1":
             raise ValueError("point-in-time bundle schema_version must be 1")
+        missing = _REQUIRED_METADATA.difference(metadata)
+        if missing:
+            raise ValueError(f"point-in-time bundle metadata is incomplete: {sorted(missing)}")
+        if metadata.get("bundle_kind") != "canslim_pit_v1":
+            raise ValueError("point-in-time bundle kind is invalid")
         cutoff = metadata.get("data_cutoff", "").strip()
         if not cutoff:
             raise ValueError("point-in-time bundle data_cutoff is required")
         try:
-            pd.Timestamp(cutoff)
+            cutoff_date = date.fromisoformat(cutoff)
+            evaluation_start = date.fromisoformat(metadata["evaluation_start"])
+            warmup_start = date.fromisoformat(metadata["warmup_start"])
         except (TypeError, ValueError) as exc:
-            raise ValueError("point-in-time bundle data_cutoff is invalid") from exc
+            raise ValueError("point-in-time bundle date metadata is invalid") from exc
+        if not warmup_start < evaluation_start <= cutoff_date:
+            raise ValueError("point-in-time bundle date contract is invalid")
+        for key, value in metadata.items():
+            if key.endswith("_sha256") and not _DIGEST_RE.fullmatch(value):
+                raise ValueError(f"point-in-time bundle metadata digest is invalid: {key}")
         return metadata
 
     def _load_membership(self) -> PointInTimeUniverse:
@@ -203,12 +361,159 @@ class PITDataBundle:
         symbols.update(event.ticker for event in self.membership.events)
         return frozenset(symbols)
 
+    def _validate_integrity(self) -> None:
+        duplicate_membership = self._connection.execute(
+            "SELECT 1 FROM membership GROUP BY effective_date,ticker HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        duplicate_prices = self._connection.execute(
+            "SELECT 1 FROM price GROUP BY trade_date,ticker HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        duplicate_fundamentals = self._connection.execute(
+            "SELECT 1 FROM fundamentals GROUP BY ticker,statement_type,period_end,public_date "
+            "HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        if duplicate_membership or duplicate_prices or duplicate_fundamentals:
+            raise ValueError("point-in-time bundle contains duplicate logical rows")
+        bad_fundamental = self._connection.execute(
+            "SELECT 1 FROM fundamentals WHERE public_date <= period_end OR public_date > ? LIMIT 1",
+            (self.metadata["data_cutoff"],),
+        ).fetchone()
+        if bad_fundamental:
+            raise ValueError("point-in-time bundle contains an invalid fundamental public date")
+        after_cutoff = self._connection.execute(
+            "SELECT 1 FROM membership WHERE effective_date > ? UNION ALL "
+            "SELECT 1 FROM price WHERE trade_date > ? LIMIT 1",
+            (self.metadata["data_cutoff"], self.metadata["data_cutoff"]),
+        ).fetchone()
+        if after_cutoff:
+            raise ValueError("point-in-time bundle contains rows after data_cutoff")
+        nonmember_fundamental = self._connection.execute(
+            "SELECT 1 FROM fundamentals f WHERE NOT EXISTS "
+            "(SELECT 1 FROM membership m WHERE m.ticker=f.ticker) LIMIT 1"
+        ).fetchone()
+        if nonmember_fundamental:
+            raise ValueError("point-in-time bundle contains fundamentals outside membership")
+        spy_membership = self._connection.execute(
+            "SELECT 1 FROM membership WHERE ticker='SPY' LIMIT 1"
+        ).fetchone()
+        spy_price = self._connection.execute(
+            "SELECT 1 FROM price WHERE ticker='SPY' LIMIT 1"
+        ).fetchone()
+        if spy_membership or not spy_price:
+            raise ValueError("point-in-time bundle SPY membership/price invariant failed")
+        first_price = self._connection.execute("SELECT MIN(trade_date) FROM price").fetchone()[0]
+        if first_price is None:
+            raise ValueError("point-in-time bundle has no prices")
+        first_price_date = date.fromisoformat(str(first_price))
+        warmup_start = date.fromisoformat(self.metadata["warmup_start"])
+        if first_price_date < warmup_start or first_price_date > date(2020, 1, 2):
+            raise ValueError("point-in-time bundle does not satisfy the warm-up price boundary")
+        evaluation_start = self.metadata["evaluation_start"]
+        spy_days = [
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT trade_date FROM price WHERE ticker='SPY' AND trade_date >= ? ORDER BY trade_date",
+                (evaluation_start,),
+            ).fetchall()
+        ]
+        if not spy_days:
+            raise ValueError("point-in-time bundle has no evaluation-period SPY sessions")
+        counts = [len(self.membership.members_at(day)) for day in spy_days]
+        if min(counts) < 495 or max(counts) > 510:
+            raise ValueError("point-in-time bundle membership count is outside 495 through 510")
+
     @property
     def data_cutoff(self) -> pd.Timestamp:
         return pd.Timestamp(self.metadata["data_cutoff"])
 
     def symbols(self) -> tuple[str, ...]:
         return tuple(sorted(self._symbols))
+
+    def load_price_identity_transition_contract(
+        self,
+        prices_provenance: str | Path,
+    ) -> PriceIdentityTransitionContract:
+        """Load reviewed holding transitions bound to this exact bundle."""
+        path, provenance = _json_file(prices_provenance)
+        provenance_sha = sha256_file(path)
+        if provenance_sha != self.metadata["prices_provenance_sha256"]:
+            raise ValueError("prices provenance does not match the bundle metadata digest")
+        raw_contracts = provenance.get("price_identity_request_contracts")
+        if not isinstance(raw_contracts, dict) or not raw_contracts:
+            raise ValueError("prices provenance has no identity request contract")
+        contract_sha = _canonical_json_sha256(raw_contracts)
+        if contract_sha != self.metadata["price_identity_request_contracts_sha256"]:
+            raise ValueError("price identity request contract digest does not match the bundle")
+        if provenance.get("price_identity_request_contracts_sha256") != contract_sha:
+            raise ValueError("prices provenance identity contract digest is internally inconsistent")
+        if provenance.get("price_identity_map_sha256") != self.metadata.get("price_identity_map_sha256"):
+            raise ValueError("prices provenance identity map digest does not match the bundle")
+        expected_fields = {
+            "provider_symbol",
+            "identity_asof",
+            "admitted_start",
+            "admitted_end",
+            "chain_id",
+            "continuity_kind",
+            "warmup_predecessor",
+            "factor_anchor",
+        }
+        identities: dict[str, Mapping[str, object]] = {}
+        for raw_ticker, raw_identity in raw_contracts.items():
+            ticker = _canonical_ticker(raw_ticker)
+            if ticker != raw_ticker or not isinstance(raw_identity, dict) or set(raw_identity) != expected_fields:
+                raise ValueError("prices provenance contains an invalid identity contract row")
+            start = date.fromisoformat(str(raw_identity["admitted_start"]))
+            end = date.fromisoformat(str(raw_identity["admitted_end"]))
+            date.fromisoformat(str(raw_identity["identity_asof"]))
+            if end < start or not isinstance(raw_identity["chain_id"], str):
+                raise ValueError("prices provenance identity bounds are invalid")
+            if not isinstance(raw_identity["continuity_kind"], str):
+                raise ValueError("prices provenance continuity kind is invalid")
+            identities[ticker] = MappingProxyType(dict(raw_identity))
+        required_identities = {event.ticker for event in self.membership.events}.union({"SPY"})
+        if set(identities) != required_identities:
+            raise ValueError("prices provenance identities do not exactly cover membership plus SPY")
+
+        events_by_date: dict[date, dict[bool, list[str]]] = {}
+        for event in self.membership.events:
+            grouped = events_by_date.setdefault(event.effective_date, {True: [], False: []})
+            grouped[event.member].append(event.ticker)
+        transitions: list[IdentityTransition] = []
+        for effective, grouped in sorted(events_by_date.items()):
+            for predecessor in sorted(grouped[False]):
+                predecessor_identity = identities.get(predecessor)
+                if predecessor_identity is None:
+                    continue
+                predecessor_kind = str(predecessor_identity["continuity_kind"])
+                if predecessor_kind not in _SAME_ISSUER_CONTINUITIES:
+                    continue
+                chain_id = str(predecessor_identity["chain_id"])
+                successors = [
+                    successor
+                    for successor in grouped[True]
+                    if successor in identities
+                    and str(identities[successor]["chain_id"]) == chain_id
+                    and str(identities[successor]["continuity_kind"]) in _SAME_ISSUER_CONTINUITIES
+                ]
+                if len(successors) > 1:
+                    raise ValueError("prices provenance has an ambiguous same-issuer transition")
+                if successors:
+                    transitions.append(
+                        IdentityTransition(
+                            effective,
+                            predecessor,
+                            successors[0],
+                            chain_id,
+                            str(identities[successors[0]]["continuity_kind"]),
+                        )
+                    )
+        return PriceIdentityTransitionContract(
+            provenance_sha,
+            contract_sha,
+            identities,
+            tuple(transitions),
+        )
 
     def manifest(self) -> dict[str, object]:
         """Return content-free identity and coverage facts for audit logs."""
@@ -222,17 +527,23 @@ class PITDataBundle:
         membership_coverage = self._connection.execute(
             "SELECT MIN(effective_date), MAX(effective_date), COUNT(*), COUNT(DISTINCT ticker) FROM membership"
         ).fetchone()
+        spy_days = [
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT trade_date FROM price WHERE ticker='SPY' AND trade_date >= ? ORDER BY trade_date",
+                (self.metadata["evaluation_start"],),
+            ).fetchall()
+        ]
+        membership_counts = [len(self.membership.members_at(day)) for day in spy_days]
         return {
             "bundle_sha256": self.sha256,
             "schema_version": self.metadata["schema_version"],
             "data_cutoff": str(self.data_cutoff.date()),
+            "evaluation_start": self.metadata["evaluation_start"],
+            "warmup_start": self.metadata["warmup_start"],
             "membership_events": len(self.membership.events),
             "symbol_count": len(self._symbols),
-            "metadata": {
-                key: value
-                for key, value in self.metadata.items()
-                if key.endswith("_sha256") or key in {"bundle_kind"}
-            },
+            "metadata": dict(sorted(self.metadata.items())),
             "coverage": {
                 "price": {
                     "first_date": price_coverage[0],
@@ -251,6 +562,8 @@ class PITDataBundle:
                     "last_effective_date": membership_coverage[1],
                     "events": int(membership_coverage[2]),
                     "symbols": int(membership_coverage[3]),
+                    "evaluation_session_min_members": min(membership_counts),
+                    "evaluation_session_max_members": max(membership_counts),
                 },
             },
         }
@@ -368,13 +681,14 @@ class PITDataBundle:
             return pd.DataFrame()
         frame = pd.DataFrame(selected)
         frame["period_end"] = pd.to_datetime(frame["period_end"], errors="raise")
-        frame = frame.sort_values(["period_end", "public_date"]).drop_duplicates(
+        frame["public_date"] = pd.to_datetime(frame["public_date"], errors="raise")
+        frame = frame.sort_values(["period_end", "public_date"], kind="stable").drop_duplicates(
             subset=["period_end"], keep="last"
         )
-        frame = frame.set_index("period_end")
-        return frame.rename(columns=_FUNDAMENTAL_COLUMN_MAP)[
-            list(_FUNDAMENTAL_COLUMN_MAP.values())
-        ]
+        frame = frame.set_index("period_end")[list(_FUNDAMENTAL_COLUMN_MAP)]
+        frame = frame.rename(columns=_FUNDAMENTAL_COLUMN_MAP).transpose()
+        frame = frame.dropna(axis="index", how="all").sort_index(axis="columns")
+        return frame
 
     @staticmethod
     def _company_info(records: list[dict[str, Any]]) -> dict[str, Any]:
