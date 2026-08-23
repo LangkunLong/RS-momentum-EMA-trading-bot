@@ -1810,17 +1810,18 @@ class PortfolioSimulator:
         if trade is None:
             return
 
-        remaining_qty = trade.remaining_qty or 0.0
+        remaining_qty = max(float(trade.remaining_qty or 0.0), 0.0)
         proceeds = exit_price * remaining_qty
         self._equity += proceeds
-        self._record_transaction(
-            date=date_str,
-            ticker=symbol,
-            action="SELL",
-            price=exit_price,
-            quantity=remaining_qty,
-            reason=reason,
-        )
+        if remaining_qty > 1e-12:
+            self._record_transaction(
+                date=date_str,
+                ticker=symbol,
+                action="SELL",
+                price=exit_price,
+                quantity=remaining_qty,
+                reason=reason,
+            )
 
         trade.exit_price = exit_price
         trade.exit_date = date_str
