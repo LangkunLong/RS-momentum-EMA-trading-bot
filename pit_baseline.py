@@ -293,7 +293,7 @@ def _validate_holding_identities(
     frame["Ticker"] = frame["Ticker"].astype(str).str.upper()
     frame["Action"] = frame["Action"].astype(str).str.upper()
     frame["Quantity"] = pd.to_numeric(frame["Quantity"], errors="raise")
-    if (~frame["Action"].isin({"BUY", "SELL"})).any():
+    if (~frame["Action"].isin({"BUY", "SELL", "TRANSFER"})).any():
         raise ValueError("transactions contain an unsupported identity action")
     if any(not math.isfinite(float(value)) or float(value) <= 0 for value in frame["Quantity"]):
         raise ValueError("transactions contain an invalid identity quantity")
