@@ -80,6 +80,12 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
 - All 3 Important findings are closed; no Critical or Important issue remains.
 - One Minor remains: `_tightened_floor` rejects `NaN` but not infinite caller values despite its finite-floor contract. A `+inf` override can reject every finite symbol. Close this one-line fail-closed edge before marking Task 1 complete.
 
+### Task 1 completion
+
+- Minor fixed at `0d051ed3d7aa759f7d229941c4daea6371714389`: every non-finite override resolves to the canonical floor; finite exact/stricter floors remain effective.
+- Final independent re-review PASS: no Critical, Important, or Minor findings; worktree and diff check clean.
+- Task 1 complete. Task 2 may begin.
+
 ### Task 1 independent-review fix round 1 implementation
 
 - Closed the alignment finding with ordered length/index mismatch blockers; unequal histories and equal-length one-session-shifted pandas indexes both fail closed.
@@ -94,3 +100,32 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
 - Updated `_tightened_floor` to use `math.isfinite`, so `NaN`, `+inf`, and `-inf` caller values all fall back to the canonical floor while finite `0` and `90` retain canonical/tightened behavior.
 - Direct probe passed: `caller=nan result=80.0`, `caller=inf result=80.0`, `caller=-inf result=80.0`, `caller=0 result=80.0`, `caller=90 result=90.0`, `tightened_floor_probe=passed` (exit `0`).
 - Relevant Ruff, `py_compile`, and `git diff --check` checks passed (all exit `0`). No unit or broad tests were run.
+
+## Task 2 — daily PIT evaluation and next-open outcomes
+
+- Full PIT qualification now consumes Task 1's canonical entry facts and shared
+  full C/A/RS/non-M composite decision. Legacy M-inclusive scoring remains
+  reported, market remains separate permission, PEG is diagnostic only, and
+  technical-only mode remains fundamental-free using technical setup alone.
+- PIT baseline construction explicitly binds and validates daily cadence while
+  the generic simulator/CLI default remains five sessions.
+- Added immutable terminal outcomes for every queued entry attempt and an
+  inclusive finite-pivot next-open buy-zone gate before cash/risk sizing.
+  Rejection precedence and legacy missing-pivot pass-through are preserved;
+  finite-pivot missing bar/Open never falls back to prior close.
+- Checkpoint schema v2 persists outcomes in checkpoint and state journal,
+  validates them on resume/completed-cache reads, and rejects v1. Pending signal
+  date/pivot remain flattened primitives.
+- Outcome-backed reconciliation now proves exact attempts/executions/rejections
+  and per-symbol next-open/cash/capacity causes, with capacity truncation and
+  final pending kept separate.
+- PIT artifacts now include `entry_attempt_outcomes.csv` and
+  `daily_entry_funnel.csv`, explicit outcome schema/count metadata, hashes, and
+  summary/report funnel counts.
+- Direct full-vs-technical, daily evaluation, exact lower/upper, below/above,
+  missing-pivot, missing-open, one-outcome, checkpoint v1/v2, actual resume,
+  adversarial reconciliation, and artifact-schema probes passed. Relevant
+  imports, compile, Ruff, and diff checks passed. Unit/broad tests remain
+  intentionally deferred.
+- Detailed evidence and deferred-fixture note:
+  `.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-2-report.md`.

@@ -14,9 +14,23 @@ from typing import Any, Callable, Mapping
 
 import pandas as pd
 
-from core.backtest_engine import DEFAULT_MIN_C_A_GROWTH, PortfolioSimulator, SimulationResult
+from core.backtest_engine import (
+    DEFAULT_MIN_C_A_GROWTH,
+    ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION,
+    EntryAttemptOutcome,
+    PortfolioSimulator,
+    SimulationResult,
+)
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
+from core.canslim.entry_contract import (
+    MAX_BUY_ZONE_EXTENSION,
+    MIN_ANNUAL_GROWTH,
+    MIN_COMPOSITE_SCORE,
+    MIN_CURRENT_GROWTH,
+    MIN_RS_SCORE,
+    MIN_VOLUME_RATIO,
+)
 from core.leader_basket import LeaderBasketConfig, LeaderBasketResult, LeaderBasketSimulator
 from core.leader_evaluation import (
     LeaderIdentityContract,
@@ -183,6 +197,10 @@ def _validate_portfolio(
     required_signals = {
         "symbol", "signal_date", "buy_signal", "current_growth", "annual_growth",
         "rs_score", "has_breakout", "has_volume_surge", "in_buy_zone", "canslim_score",
+        "entry_composite_score", "entry_contract_eligible", "entry_blocking_reasons",
+        "pivot", "prior_close", "event_volume", "prior_average_volume_50",
+        "entry_volume_ratio", "entry_extension", "price_advanced",
+        "technical_setup_eligible", "technical_blocking_reasons",
     }
     if not isinstance(result.signal_log, pd.DataFrame) or result.signal_log.empty:
         raise ValueError("CANSLIM signal log is empty")
@@ -201,6 +219,13 @@ def _validate_portfolio(
         "data_mode": "point_in_time", "pit_bundle_sha256": bundle_sha256,
         "technical_only": False, "max_positions": None,
         "require_bullish_market": False, "use_stateful_regime_gate": False,
+        "signal_every_n_days": 1,
+        "entry_contract_min_current_growth": MIN_CURRENT_GROWTH,
+        "entry_contract_min_annual_growth": MIN_ANNUAL_GROWTH,
+        "entry_contract_min_rs_score": MIN_RS_SCORE,
+        "entry_contract_min_composite_score": MIN_COMPOSITE_SCORE,
+        "entry_contract_min_volume_ratio": MIN_VOLUME_RATIO,
+        "entry_contract_max_buy_zone_extension": MAX_BUY_ZONE_EXTENSION,
     }
     for key, value in expected.items():
         if result.config.get(key) != value:
@@ -214,12 +239,20 @@ def _validate_portfolio(
         "buy_signal_rows_when_cash_override", "capacity_truncated_signals",
         "entry_attempts", "entries_executed", "entry_rejected_already_open",
         "entry_rejected_capacity", "entry_rejected_missing_data",
-        "entry_rejected_invalid_price", "entry_rejected_invalid_risk",
+        "entry_rejected_invalid_price", "entry_rejected_next_open_buy_zone",
+        "entry_rejected_invalid_risk",
         "entry_rejected_no_cash", "eviction_attempts", "evictions_executed",
         "eviction_rejections",
     }
     if not required_diagnostics.issubset(result.execution_diagnostics):
         raise ValueError("CANSLIM execution diagnostics schema is incomplete")
+    if not isinstance(result.entry_outcomes, tuple) or any(
+        not isinstance(outcome, EntryAttemptOutcome) for outcome in result.entry_outcomes
+    ):
+        raise ValueError("CANSLIM entry outcomes use an invalid immutable schema")
+    if result.execution_diagnostics["entry_attempts"] != len(result.entry_outcomes):
+        raise ValueError("CANSLIM entry outcomes do not cover every attempt")
+    _json_bytes([outcome.to_primitive() for outcome in result.entry_outcomes])
 
 
 def _validate_basket(
@@ -276,6 +309,50 @@ def _basket_equity_frame(result: LeaderBasketResult) -> pd.DataFrame:
         "leader_basket": result.equity_curve.astype(float).values,
         "benchmark": benchmark.astype(float).values,
     })
+
+
+def _entry_outcomes_frame(result: SimulationResult) -> pd.DataFrame:
+    columns = (
+        "symbol", "signal_date", "entry_date", "pivot", "buy_zone_lower",
+        "buy_zone_upper", "entry_open", "outcome",
+    )
+    return pd.DataFrame(
+        [outcome.to_primitive() for outcome in result.entry_outcomes],
+        columns=columns,
+    )
+
+
+def _daily_entry_funnel_frame(
+    result: SimulationResult,
+    sessions: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    signals = result.signal_log.copy()
+    signals["signal_date"] = pd.to_datetime(signals["signal_date"], errors="raise").dt.normalize()
+    outcomes = _entry_outcomes_frame(result)
+    if not outcomes.empty:
+        outcomes["signal_date"] = pd.to_datetime(
+            outcomes["signal_date"], errors="raise"
+        ).dt.normalize()
+    rows: list[dict[str, object]] = []
+    for session in sessions:
+        day_signals = signals.loc[signals["signal_date"] == session]
+        day_outcomes = (
+            outcomes.loc[outcomes["signal_date"] == session]
+            if not outcomes.empty
+            else outcomes
+        )
+        executed = int((day_outcomes["outcome"] == "entries_executed").sum())
+        rows.append({
+            "signal_date": str(session.date()),
+            "evaluated_count": int(len(day_signals)),
+            "qualified_count": int(
+                day_signals["entry_contract_eligible"].fillna(False).astype(bool).sum()
+            ),
+            "attempted_count": int(len(day_outcomes)),
+            "executed_count": executed,
+            "rejected_count": int(len(day_outcomes) - executed),
+        })
+    return pd.DataFrame(rows)
 
 
 def _validate_holding_identities(
@@ -681,6 +758,7 @@ def _report(
         "Source provenance": _source_summary(sources),
         "Active CANSLIM configuration": config,
         "Execution diagnostics": diagnostics,
+        "Daily entry funnel": summary["entry_contract"],
         "Aggregate failed gates": gate_totals,
     }
     lines = [
@@ -693,6 +771,12 @@ def _report(
         "## Recall", "",
         f"- Top-100 signaled: {summary['leader_recall']['top100_signaled']}",
         f"- Top-100 executed: {summary['leader_recall']['top100_executed']}", "",
+        "## Canonical entry outcomes", "",
+        f"- Daily evaluated symbol-days: {summary['entry_contract']['evaluated_symbol_days']}",
+        f"- Contract-qualified signals: {summary['entry_contract']['qualified_signals']}",
+        f"- Next-open executions: {summary['entry_contract']['executed_attempts']}",
+        f"- Entry rejections: {summary['entry_contract']['rejected_attempts']}",
+        "- Immutable attempt ledger: `entry_attempt_outcomes.csv`", "",
     ]
     for title, value in blocks.items():
         lines.extend([f"## {title}", "", f"```json\n{json.dumps(value, sort_keys=True)}\n```", ""])
@@ -833,7 +917,7 @@ def run_baseline(
             )
             if len(leaders) != 100 or len(rolling) != 4_800:
                 raise ValueError("fixed baseline leader labels are incomplete")
-            portfolio = portfolio_factory(pit_bundle=bundle)
+            portfolio = portfolio_factory(pit_bundle=bundle, signal_every_n_days=1)
             if hasattr(portfolio, "identity_transition_contract"):
                 portfolio.identity_transition_contract = transitions
             result = _run_portfolio(
@@ -863,6 +947,7 @@ def run_baseline(
             )
             reconciliation = reconcile_signals_to_transactions(
                 result.signal_log, result.transaction_log, result.execution_diagnostics,
+                entry_outcomes=result.entry_outcomes,
                 trading_days=sessions,
             )
             if reconciliation["capacity_blocked_count"] != 0:
@@ -909,6 +994,8 @@ def run_baseline(
                 coverage["baseline_publishable"] = True
             top_signaled = int((recall["buy_signal_count"] > 0).sum())
             top_executed = int((recall["entry_count"] > 0).sum())
+            daily_entry_funnel = _daily_entry_funnel_frame(result, sessions)
+            entry_outcomes = _entry_outcomes_frame(result)
             summary = {
                 "canslim": _metrics(result),
                 "leader_basket": _basket_metrics(basket),
@@ -933,6 +1020,19 @@ def run_baseline(
                     "all_gates_passed": coverage["all_gates_passed"],
                     "non_blocking_failed_gates": coverage["non_blocking_failed_gates"],
                 },
+                "entry_contract": {
+                    "outcome_schema_version": ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION,
+                    "daily_session_count": int(len(daily_entry_funnel)),
+                    "evaluated_symbol_days": int(daily_entry_funnel["evaluated_count"].sum()),
+                    "qualified_signals": int(daily_entry_funnel["qualified_count"].sum()),
+                    "attempted_signals": int(daily_entry_funnel["attempted_count"].sum()),
+                    "executed_attempts": int(daily_entry_funnel["executed_count"].sum()),
+                    "rejected_attempts": int(daily_entry_funnel["rejected_count"].sum()),
+                    "next_open_buy_zone_rejections": reconciliation[
+                        "next_open_buy_zone_rejected_count"
+                    ],
+                    "rejection_counts": reconciliation["rejection_counts"],
+                },
             }
             active_config = json.loads(json.dumps(result.config, allow_nan=False))
             diagnostics = json.loads(json.dumps(result.execution_diagnostics, allow_nan=False))
@@ -940,6 +1040,8 @@ def run_baseline(
                 "five_year_leaders.csv": five_year_leaders_frame(leaders),
                 "rolling_leader_labels.csv": rolling_leaders_frame(rolling),
                 "canslim_signals.csv": result.signal_log,
+                "entry_attempt_outcomes.csv": entry_outcomes,
+                "daily_entry_funnel.csv": daily_entry_funnel,
                 "transactions.csv": result.transaction_log,
                 "weekly_holdings.csv": result.weekly_holdings,
                 "equity_curve.csv": _equity_frame(result),
@@ -986,6 +1088,10 @@ def run_baseline(
                 },
                 "canslim_config": active_config,
                 "execution_diagnostics": diagnostics,
+                "entry_attempt_outcome_schema_version": (
+                    ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION
+                ),
+                "entry_attempt_outcome_count": len(result.entry_outcomes),
                 "execution_reconciliation": reconciliation,
                 "coverage_status": {
                     "all_gates_passed": coverage["all_gates_passed"],

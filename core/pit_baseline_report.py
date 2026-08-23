@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from datetime import date, timedelta
+import math
 from typing import Any, Mapping
 
 import pandas as pd
@@ -220,9 +221,10 @@ def reconcile_signals_to_transactions(
     transaction_log: pd.DataFrame,
     execution_diagnostics: Mapping[str, int],
     *,
+    entry_outcomes: Sequence[object] = (),
     trading_days: Sequence[date | str | pd.Timestamp],
 ) -> dict[str, Any]:
-    """Fail closed unless entry transactions and execution counters reconcile."""
+    """Reconcile every attempted signal to one concrete terminal outcome."""
     if not isinstance(signal_log, pd.DataFrame) or not isinstance(transaction_log, pd.DataFrame):
         raise ValueError("signal and transaction logs must be DataFrames")
     calendar = sorted({pd.Timestamp(value).normalize() for value in trading_days})
@@ -256,26 +258,117 @@ def reconcile_signals_to_transactions(
         if not set(entries["Date"]).issubset(calendar):
             raise ValueError("entry date is not a benchmark trading session")
 
-    pending: dict[tuple[str, pd.Timestamp], list[int]] = {}
-    for row_index, row in buy_signals.iterrows():
-        following = next_session.get(row["signal_date"])
-        if following is not None:
-            pending.setdefault((row["symbol"], following), []).append(int(row_index))
-    consumed: set[int] = set()
-    ordered_entries = (
-        entries.sort_values(["Date", "Ticker"], kind="stable")
-        if not entries.empty
-        else entries
+    outcome_fields = (
+        "symbol", "signal_date", "entry_date", "pivot", "buy_zone_lower",
+        "buy_zone_upper", "entry_open", "outcome",
     )
-    for entry in ordered_entries.itertuples(index=False):
-        candidates = pending.get((entry.Ticker, entry.Date), [])
-        available = [row_index for row_index in candidates if row_index not in consumed]
-        if not available:
-            raise ValueError(
-                f"entry has no unique signal from the prior trading session: "
-                f"{entry.Ticker} {entry.Date.date()}"
-            )
-        consumed.add(available[0])
+    outcome_records: list[dict[str, object]] = []
+    for item in entry_outcomes:
+        primitive = item.to_primitive() if hasattr(item, "to_primitive") else item
+        if (
+            not isinstance(primitive, Mapping)
+            or len(primitive) != len(outcome_fields)
+            or set(primitive) != set(outcome_fields)
+        ):
+            raise ValueError("entry outcome schema is invalid")
+        outcome_records.append({field: primitive[field] for field in outcome_fields})
+    outcomes = pd.DataFrame(outcome_records, columns=outcome_fields)
+    valid_outcomes = {
+        "entries_executed",
+        "entry_rejected_already_open",
+        "entry_rejected_capacity",
+        "entry_rejected_missing_data",
+        "entry_rejected_invalid_price",
+        "entry_rejected_next_open_buy_zone",
+        "entry_rejected_invalid_risk",
+        "entry_rejected_no_cash",
+    }
+    if not outcomes.empty:
+        outcomes["symbol"] = outcomes["symbol"].astype(str).str.upper()
+        outcomes["signal_date"] = pd.to_datetime(
+            outcomes["signal_date"], errors="raise"
+        ).dt.normalize()
+        outcomes["entry_date"] = pd.to_datetime(
+            outcomes["entry_date"], errors="raise"
+        ).dt.normalize()
+        if outcomes.duplicated(["symbol", "signal_date"]).any():
+            raise ValueError("entry outcomes are not unique by attempted symbol/session")
+        if (~outcomes["outcome"].isin(valid_outcomes)).any():
+            raise ValueError("entry outcome contains an unsupported terminal value")
+        if not set(outcomes["signal_date"]).issubset(calendar):
+            raise ValueError("entry outcome signal date is not a benchmark trading session")
+        if not set(outcomes["entry_date"]).issubset(calendar):
+            raise ValueError("entry outcome entry date is not a benchmark trading session")
+        for row in outcomes.itertuples(index=False):
+            if next_session.get(row.signal_date) != row.entry_date:
+                raise ValueError("entry outcome is not on the next benchmark session")
+            for field in ("pivot", "buy_zone_lower", "buy_zone_upper", "entry_open"):
+                value = getattr(row, field)
+                if pd.notna(value) and not math.isfinite(float(value)):
+                    raise ValueError(f"entry outcome contains non-finite {field}")
+            if pd.notna(row.pivot):
+                pivot = float(row.pivot)
+                if pivot <= 0:
+                    raise ValueError("entry outcome contains a non-positive pivot")
+                if pd.isna(row.buy_zone_lower) or pd.isna(row.buy_zone_upper):
+                    raise ValueError("entry outcome with a pivot lacks buy-zone bounds")
+                if not math.isclose(float(row.buy_zone_lower), pivot, rel_tol=0, abs_tol=1e-12):
+                    raise ValueError("entry outcome lower buy-zone bound disagrees with pivot")
+                if not math.isclose(
+                    float(row.buy_zone_upper), pivot * 1.05, rel_tol=0, abs_tol=1e-12
+                ):
+                    raise ValueError("entry outcome upper buy-zone bound disagrees with pivot")
+            elif pd.notna(row.buy_zone_lower) or pd.notna(row.buy_zone_upper):
+                raise ValueError("entry outcome without a pivot contains buy-zone bounds")
+            if pd.notna(row.entry_open) and float(row.entry_open) <= 0:
+                raise ValueError("entry outcome contains a non-positive entry open")
+            if row.outcome == "entries_executed":
+                if pd.isna(row.entry_open):
+                    raise ValueError("successful entry outcome lacks an entry open")
+                if pd.notna(row.pivot) and not (
+                    float(row.buy_zone_lower)
+                    <= float(row.entry_open)
+                    <= float(row.buy_zone_upper)
+                ):
+                    raise ValueError("successful entry outcome opened outside its buy zone")
+            if row.outcome == "entry_rejected_next_open_buy_zone":
+                if pd.isna(row.pivot) or pd.isna(row.entry_open):
+                    raise ValueError("next-open buy-zone rejection lacks price facts")
+                if float(row.buy_zone_lower) <= float(row.entry_open) <= float(
+                    row.buy_zone_upper
+                ):
+                    raise ValueError("next-open buy-zone rejection opened inside its buy zone")
+
+    buy_keys = {
+        (row.symbol, row.signal_date)
+        for row in buy_signals.itertuples(index=False)
+    }
+    outcome_keys = {
+        (row.symbol, row.signal_date)
+        for row in outcomes.itertuples(index=False)
+    }
+    if not outcome_keys.issubset(buy_keys):
+        raise ValueError("entry outcome has no unique qualifying signal")
+
+    entry_keys = Counter(
+        (row.Ticker, row.Date) for row in entries.itertuples(index=False)
+    )
+    if any(count != 1 for count in entry_keys.values()):
+        raise ValueError("entry transactions are not unique by symbol/session")
+    executed = outcomes.loc[outcomes["outcome"] == "entries_executed"]
+    executed_keys = Counter(
+        (row.symbol, row.entry_date) for row in executed.itertuples(index=False)
+    )
+    if executed_keys != entry_keys:
+        raise ValueError("successful entry outcomes do not match BUY transactions exactly")
+    rejected_keys = {
+        (row.symbol, row.entry_date)
+        for row in outcomes.loc[outcomes["outcome"] != "entries_executed"].itertuples(
+            index=False
+        )
+    }
+    if rejected_keys.intersection(entry_keys):
+        raise ValueError("a rejected entry outcome has a matching BUY transaction")
 
     def diagnostic(name: str) -> int:
         raw = execution_diagnostics.get(name, 0)
@@ -294,13 +387,22 @@ def reconcile_signals_to_transactions(
         "entry_rejected_capacity",
         "entry_rejected_missing_data",
         "entry_rejected_invalid_price",
+        "entry_rejected_next_open_buy_zone",
         "entry_rejected_invalid_risk",
         "entry_rejected_no_cash",
     )
     rejection_counts = {name: diagnostic(name) for name in rejection_names}
     attempts = diagnostic("entry_attempts")
-    if attempts != entry_count + sum(rejection_counts.values()):
-        raise ValueError("entry attempts do not equal executions plus mutually exclusive rejections")
+    outcome_counts = Counter(outcomes["outcome"]) if not outcomes.empty else Counter()
+    if diagnostic("entries_executed") != outcome_counts["entries_executed"]:
+        raise ValueError("successful outcome count does not match execution diagnostics")
+    for name, count in rejection_counts.items():
+        if count != outcome_counts[name]:
+            raise ValueError(f"outcome count does not match execution diagnostic: {name}")
+    if attempts != len(outcomes) or attempts != entry_count + sum(rejection_counts.values()):
+        raise ValueError(
+            "entry attempts/outcomes do not equal executions plus mutually exclusive rejections"
+        )
     blocked_market = sum(
         diagnostic(name)
         for name in (
@@ -320,50 +422,38 @@ def reconcile_signals_to_transactions(
     if final_pending > last_session_signal_count:
         raise ValueError("final pending signal count exceeds last-session qualifying signals")
 
-    unmatched_with_next = buy_signals.loc[
-        [
-            row_index not in consumed and next_session.get(row["signal_date"]) is not None
-            for row_index, row in buy_signals.iterrows()
-        ]
-    ]
     rejected_total = sum(rejection_counts.values())
-    cash_by_symbol: Counter[str] = Counter()
-    capacity_by_symbol: Counter[str] = Counter()
-    unattributed_rejections = rejected_total
-    if blocked_market == 0 and capacity_truncated == 0 and len(unmatched_with_next) == rejected_total:
-        if rejection_counts["entry_rejected_no_cash"] == rejected_total:
-            cash_by_symbol.update(unmatched_with_next["symbol"])
-            unattributed_rejections = 0
-        elif rejection_counts["entry_rejected_capacity"] == rejected_total:
-            capacity_by_symbol.update(unmatched_with_next["symbol"])
-            unattributed_rejections = 0
-
-    cash_blocked = rejection_counts["entry_rejected_no_cash"]
-    capacity_blocked = rejection_counts["entry_rejected_capacity"] + capacity_truncated
-    unattributed_cash_capacity = (
-        cash_blocked + capacity_blocked
-        - sum(cash_by_symbol.values())
-        - sum(capacity_by_symbol.values())
+    cash_by_symbol = Counter(
+        outcomes.loc[outcomes["outcome"] == "entry_rejected_no_cash", "symbol"]
     )
-    if unattributed_cash_capacity < 0:
-        raise ValueError("per-symbol cash/capacity attribution exceeds aggregate diagnostics")
-    if unattributed_cash_capacity:
-        raise ValueError(
-            "cash/capacity diagnostics cannot be assigned to exact symbols: "
-            f"{unattributed_cash_capacity}"
-        )
+    capacity_by_symbol = Counter(
+        outcomes.loc[outcomes["outcome"] == "entry_rejected_capacity", "symbol"]
+    )
+    next_open_by_symbol = Counter(
+        outcomes.loc[
+            outcomes["outcome"] == "entry_rejected_next_open_buy_zone", "symbol"
+        ]
+    )
+    cash_blocked = rejection_counts["entry_rejected_no_cash"]
+    capacity_blocked = rejection_counts["entry_rejected_capacity"]
 
     return {
         "buy_signal_count": signal_count,
         "entry_count": entry_count,
         "entry_attempt_count": attempts,
         "entry_rejection_count": rejected_total,
+        "next_open_buy_zone_rejected_count": rejection_counts[
+            "entry_rejected_next_open_buy_zone"
+        ],
         "cash_blocked_count": cash_blocked,
         "capacity_blocked_count": capacity_blocked,
         "capacity_truncated_count": capacity_truncated,
         "final_pending_count": final_pending,
-        "unattributed_rejection_count": unattributed_rejections,
-        "unattributed_cash_capacity_count": unattributed_cash_capacity,
+        "unattributed_rejection_count": 0,
+        "unattributed_cash_capacity_count": 0,
+        "blocked_for_next_open_buy_zone_by_symbol": dict(
+            sorted(next_open_by_symbol.items())
+        ),
         "blocked_for_cash_by_symbol": dict(sorted(cash_by_symbol.items())),
         "blocked_for_capacity_by_symbol": dict(sorted(capacity_by_symbol.items())),
         "rejection_counts": rejection_counts,

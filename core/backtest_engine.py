@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pickle
 import sqlite3
@@ -23,11 +24,22 @@ from config import settings
 from backtest import (
     _calculate_rs_at_date,
     _compute_canslim_score,
+    _compute_entry_composite_score,
     _download_bulk_closes,
     _download_price_data,
     _evaluate_fundamentals_at_date,
     _evaluate_market_at_date,
     _evaluate_technical_at_date,
+)
+from core.canslim.entry_contract import (
+    MAX_BUY_ZONE_EXTENSION,
+    MIN_ANNUAL_GROWTH,
+    MIN_COMPOSITE_SCORE,
+    MIN_CURRENT_GROWTH,
+    MIN_RS_SCORE,
+    MIN_VOLUME_RATIO,
+    CanslimEntryFacts,
+    evaluate_entry_contract,
 )
 from core.canslim.m_market_direction import MarketRegime, MarketRegimeTracker
 from core.canslim.a_annual_earnings import evaluate_a
@@ -192,6 +204,104 @@ class Trade:
         return self.entry_price * self.qty
 
 
+ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION = 1
+_ENTRY_OUTCOME_FIELDS = (
+    "symbol",
+    "signal_date",
+    "entry_date",
+    "pivot",
+    "buy_zone_lower",
+    "buy_zone_upper",
+    "entry_open",
+    "outcome",
+)
+_ENTRY_REJECTION_OUTCOMES = (
+    "entry_rejected_already_open",
+    "entry_rejected_capacity",
+    "entry_rejected_missing_data",
+    "entry_rejected_invalid_price",
+    "entry_rejected_next_open_buy_zone",
+    "entry_rejected_invalid_risk",
+    "entry_rejected_no_cash",
+)
+_ENTRY_TERMINAL_OUTCOMES = ("entries_executed", *_ENTRY_REJECTION_OUTCOMES)
+
+
+@dataclass(frozen=True, slots=True)
+class EntryAttemptOutcome:
+    """Immutable terminal result for one queued entry attempt."""
+
+    symbol: str
+    signal_date: str
+    entry_date: str
+    pivot: float | None
+    buy_zone_lower: float | None
+    buy_zone_upper: float | None
+    entry_open: float | None
+    outcome: str
+
+    def to_primitive(self) -> dict[str, str | float | None]:
+        """Return the stable JSON/CSV representation in schema field order."""
+        return {
+            "symbol": self.symbol,
+            "signal_date": self.signal_date,
+            "entry_date": self.entry_date,
+            "pivot": self.pivot,
+            "buy_zone_lower": self.buy_zone_lower,
+            "buy_zone_upper": self.buy_zone_upper,
+            "entry_open": self.entry_open,
+            "outcome": self.outcome,
+        }
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "EntryAttemptOutcome":
+        """Validate and restore one schema-v1 primitive outcome."""
+        if (
+            not isinstance(value, dict)
+            or len(value) != len(_ENTRY_OUTCOME_FIELDS)
+            or set(value) != set(_ENTRY_OUTCOME_FIELDS)
+        ):
+            raise ValueError("portfolio checkpoint entry outcome schema is invalid")
+        symbol = value["symbol"]
+        signal_date = value["signal_date"]
+        entry_date = value["entry_date"]
+        outcome = value["outcome"]
+        if not all(isinstance(item, str) and item for item in (symbol, signal_date, entry_date)):
+            raise ValueError("portfolio checkpoint entry outcome identity is invalid")
+        if outcome not in _ENTRY_TERMINAL_OUTCOMES:
+            raise ValueError("portfolio checkpoint entry outcome value is invalid")
+
+        def optional_finite(name: str) -> float | None:
+            raw = value[name]
+            if raw is None:
+                return None
+            if isinstance(raw, bool):
+                raise ValueError("portfolio checkpoint entry outcome number is invalid")
+            try:
+                number = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("portfolio checkpoint entry outcome number is invalid") from exc
+            if not math.isfinite(number):
+                raise ValueError("portfolio checkpoint entry outcome number is invalid")
+            return number
+
+        try:
+            signal_date = str(pd.Timestamp(signal_date).date())
+            entry_date = str(pd.Timestamp(entry_date).date())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("portfolio checkpoint entry outcome date is invalid") from exc
+        return cls(
+            symbol=symbol.upper(),
+            signal_date=signal_date,
+            entry_date=entry_date,
+            pivot=optional_finite("pivot"),
+            buy_zone_lower=optional_finite("buy_zone_lower"),
+            buy_zone_upper=optional_finite("buy_zone_upper"),
+            entry_open=optional_finite("entry_open"),
+            outcome=outcome,
+        )
+
+
 @dataclass
 class SimulationResult:
     trades: List[Trade] = field(default_factory=list)
@@ -203,6 +313,7 @@ class SimulationResult:
     weekly_holdings: pd.DataFrame = field(default_factory=pd.DataFrame)
     signal_log: pd.DataFrame = field(default_factory=pd.DataFrame)
     execution_diagnostics: dict[str, int] = field(default_factory=dict)
+    entry_outcomes: tuple[EntryAttemptOutcome, ...] = ()
     benchmark_symbol: str = BENCHMARK
 
     @property
@@ -601,12 +712,24 @@ class CanslimStrategy:
             m=market_state["m_score"],
             institutional_data_available=bool(fund.get("institutional_data_available", False)),
         )
+        entry_composite_score = _compute_entry_composite_score(
+            c=c_score,
+            a=a_score,
+            n=tech["n_score"],
+            s=tech["s_score"],
+            l_score=l_score,
+            i=i_score,
+            institutional_data_available=bool(fund.get("institutional_data_available", False)),
+        )
 
         peg_details = tech.get("power_gap_details") or {}
         has_peg_today = bool(tech.get("has_power_gap")) and peg_details.get("days_ago") == 0
-        has_breakout = bool(tech.get("is_breakout"))
-        has_surge = bool(tech.get("has_volume_surge"))
-        in_buy_zone = bool(tech.get("in_buy_zone", True))
+        entry_facts = tech.get("entry_facts")
+        if not isinstance(entry_facts, CanslimEntryFacts):
+            raise ValueError("technical evaluator did not return canonical entry facts")
+        has_breakout = entry_facts.in_buy_zone
+        has_surge = entry_facts.has_volume_surge
+        in_buy_zone = entry_facts.in_buy_zone
         technical_score = self._compute_technical_score(
             n_score=tech["n_score"],
             s_score=tech["s_score"],
@@ -614,26 +737,28 @@ class CanslimStrategy:
             m_score=market_state["m_score"],
         )
 
-        c_pass = c_growth is not None and c_growth >= self.min_c_a_growth
-        a_pass = a_growth is not None and a_growth >= self.min_c_a_growth
-        l_pass = rs_score >= self.min_rs_score
         m_pass = bool(
             not self.require_bullish_market
             or market_state["market_is_bullish"]
             or market_state.get("cash_deployment_override", False)
         )
-        tech_pass = (has_breakout and has_surge and in_buy_zone) or has_peg_today
-        composite_pass = total_score >= self.min_canslim_score
-        technical_composite_pass = technical_score >= self.min_technical_score
         if self.technical_only:
-            buy_signal_without_market = all([l_pass, tech_pass, technical_composite_pass])
+            entry_contract_eligible = entry_facts.eligible
+            entry_blocking_reasons = entry_facts.blocking_reasons
         else:
-            buy_signal_without_market = all([c_pass, a_pass, l_pass, tech_pass, composite_pass])
+            decision = evaluate_entry_contract(
+                entry_facts,
+                current_growth=c_growth,
+                annual_growth=a_growth,
+                rs_score=rs_score,
+                composite_score=entry_composite_score,
+            )
+            entry_contract_eligible = decision.eligible
+            entry_blocking_reasons = decision.blocking_reasons
+        buy_signal_without_market = entry_contract_eligible
         buy_signal = bool(buy_signal_without_market and m_pass)
 
-        if has_peg_today:
-            signal_reason = "PEG Breakout"
-        elif has_breakout and has_surge:
+        if entry_facts.eligible:
             signal_reason = "Volume Breakout"
         else:
             signal_reason = "No Breakout"
@@ -652,6 +777,7 @@ class CanslimStrategy:
             "annual_growth": a_growth,
             "rs_score": rs_score,
             "canslim_score": total_score,
+            "entry_composite_score": entry_composite_score,
             "technical_score": technical_score,
             "market_is_bullish": m_pass,
             "market_regime_is_bullish": bool(market_state["market_is_bullish"]),
@@ -659,8 +785,18 @@ class CanslimStrategy:
             "has_breakout": has_breakout,
             "has_volume_surge": has_surge,
             "has_peg_today": has_peg_today,
-            "pivot": tech.get("pivot"),
+            "pivot": entry_facts.pivot,
+            "prior_close": entry_facts.prior_close,
+            "event_volume": entry_facts.event_volume,
+            "prior_average_volume_50": entry_facts.prior_average_volume_50,
+            "entry_volume_ratio": entry_facts.volume_ratio,
+            "entry_extension": entry_facts.extension,
+            "price_advanced": entry_facts.price_advanced,
             "in_buy_zone": in_buy_zone,
+            "technical_setup_eligible": entry_facts.eligible,
+            "technical_blocking_reasons": ",".join(entry_facts.blocking_reasons),
+            "entry_contract_eligible": entry_contract_eligible,
+            "entry_blocking_reasons": ",".join(entry_blocking_reasons),
             "buy_signal": buy_signal,
             "signal_reason": signal_reason,
             "technical_only": self.technical_only,
@@ -689,6 +825,7 @@ def _new_execution_diagnostics() -> dict[str, int]:
         "entry_rejected_capacity": 0,
         "entry_rejected_missing_data": 0,
         "entry_rejected_invalid_price": 0,
+        "entry_rejected_next_open_buy_zone": 0,
         "entry_rejected_invalid_risk": 0,
         "entry_rejected_no_cash": 0,
         "eviction_attempts": 0,
@@ -697,7 +834,7 @@ def _new_execution_diagnostics() -> dict[str, int]:
     }
 
 
-_PORTFOLIO_CHECKPOINT_SCHEMA = 1
+_PORTFOLIO_CHECKPOINT_SCHEMA = 2
 
 
 def _checkpoint_json_safe(value: Any) -> Any:
@@ -777,6 +914,7 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
         raise ValueError("portfolio state log offset is invalid")
     outputs: dict[str, list[Any]] = {
         "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
+        "entry_outcomes": [],
     }
     expected_day = 0
     consumed = 0
@@ -807,6 +945,7 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
                 outputs["transactions"].extend(event.get("transactions", []))
                 outputs["weekly"].extend(event.get("weekly", []))
                 outputs["signals"].extend(event.get("signals", []))
+                outputs["entry_outcomes"].extend(event.get("entry_outcomes", []))
             elif kind == "final":
                 outputs["transactions"].extend(event.get("transactions", []))
             else:
@@ -989,6 +1128,7 @@ class PortfolioSimulator:
         self._transactions: List[dict] = []
         self._weekly_snapshots: List[dict] = []
         self._signal_rows: List[dict] = []
+        self._entry_outcomes: List[EntryAttemptOutcome] = []
         self._ticker_industry: Dict[str, str] = {}
         self._execution_diagnostics = _new_execution_diagnostics()
         self._pending_entries_remaining = 0
@@ -1017,7 +1157,9 @@ class PortfolioSimulator:
         self._transactions = []
         self._weekly_snapshots = []
         self._signal_rows = []
+        self._entry_outcomes = []
         self._execution_diagnostics = _new_execution_diagnostics()
+        self._pending_entries_remaining = 0
 
         clear_session_cache()
         benchmark = str(benchmark_symbol or self.benchmark_symbol).upper()
@@ -1056,9 +1198,15 @@ class PortfolioSimulator:
         checkpoint_state: Optional[dict[str, Any]] = None
         restored_outputs: dict[str, list[Any]] = {
             "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
+            "entry_outcomes": [],
         }
         if checkpoint is not None and resume:
             checkpoint_state = _load_checkpoint_json(checkpoint)
+            if (
+                checkpoint_state.get("entry_outcome_schema_version")
+                != ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION
+            ):
+                raise ValueError("portfolio checkpoint entry outcome schema is unsupported")
             if checkpoint_state.get("fingerprint") != fingerprint:
                 raise ValueError("portfolio checkpoint does not match the requested run")
             if checkpoint_state.get("code_identity") != checkpoint_code_identity:
@@ -1142,6 +1290,17 @@ class PortfolioSimulator:
             self._transactions = list(restored_outputs["transactions"])
             self._weekly_snapshots = list(restored_outputs["weekly"])
             self._signal_rows = list(restored_outputs["signals"])
+            restored_entry_outcomes = tuple(
+                EntryAttemptOutcome.from_primitive(value)
+                for value in restored_outputs["entry_outcomes"]
+            )
+            checkpoint_entry_outcomes = tuple(
+                EntryAttemptOutcome.from_primitive(value)
+                for value in checkpoint_state["entry_outcomes"]
+            )
+            if restored_entry_outcomes != checkpoint_entry_outcomes:
+                raise ValueError("portfolio checkpoint entry outcomes disagree with state log")
+            self._entry_outcomes = list(restored_entry_outcomes)
             self._execution_diagnostics = {
                 str(key): int(value)
                 for key, value in checkpoint_state["execution_diagnostics"].items()
@@ -1172,6 +1331,7 @@ class PortfolioSimulator:
         total_days = len(trading_days)
         for day_idx, eval_date in enumerate(trading_days[next_day_index:], start=next_day_index):
             signal_start = len(self._signal_rows)
+            outcome_start = len(self._entry_outcomes)
             transaction_start = len(self._transactions)
             weekly_start = len(self._weekly_snapshots)
             if day_idx > 0:
@@ -1237,6 +1397,10 @@ class PortfolioSimulator:
                     "equity": equity_series[date_key],
                     "benchmark": benchmark_series.get(date_key),
                     "signals": self._signal_rows[signal_start:],
+                    "entry_outcomes": [
+                        outcome.to_primitive()
+                        for outcome in self._entry_outcomes[outcome_start:]
+                    ],
                     "transactions": self._transactions[transaction_start:],
                     "weekly": self._weekly_snapshots[weekly_start:],
                 }, stream=state_stream, sync=False)
@@ -1307,6 +1471,7 @@ class PortfolioSimulator:
             weekly_holdings=pd.DataFrame(self._weekly_snapshots),
             signal_log=pd.DataFrame(self._signal_rows),
             execution_diagnostics=dict(self._execution_diagnostics),
+            entry_outcomes=tuple(self._entry_outcomes),
             benchmark_symbol=benchmark,
         )
         if checkpoint is not None:
@@ -1367,6 +1532,12 @@ class PortfolioSimulator:
             "min_canslim_score": self.min_canslim_score,
             "min_rs_score": self.min_rs_score,
             "min_technical_score": self.min_technical_score,
+            "entry_contract_min_current_growth": MIN_CURRENT_GROWTH,
+            "entry_contract_min_annual_growth": MIN_ANNUAL_GROWTH,
+            "entry_contract_min_rs_score": MIN_RS_SCORE,
+            "entry_contract_min_composite_score": MIN_COMPOSITE_SCORE,
+            "entry_contract_min_volume_ratio": MIN_VOLUME_RATIO,
+            "entry_contract_max_buy_zone_extension": MAX_BUY_ZONE_EXTENSION,
             "technical_only": self.technical_only,
             "data_mode": "point_in_time" if self.pit_bundle is not None else "provider_cache",
             "pit_bundle_sha256": self.pit_bundle.sha256 if self.pit_bundle is not None else None,
@@ -1411,6 +1582,8 @@ class PortfolioSimulator:
             },
             "trades": [_trade_checkpoint_dict(trade) for trade in self._trades],
             "execution_diagnostics": self._execution_diagnostics,
+            "entry_outcome_schema_version": ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION,
+            "entry_outcomes": [outcome.to_primitive() for outcome in self._entry_outcomes],
             "pending_entries": pending_entries,
             "benchmark_start_price": benchmark_start_price,
             "regime": _regime_checkpoint_state(regime_tracker),
@@ -1427,6 +1600,18 @@ class PortfolioSimulator:
     ) -> SimulationResult:
         if not checkpoint.get("completed") or "result_config" not in checkpoint:
             raise ValueError("portfolio checkpoint does not contain a completed result")
+        if checkpoint.get("entry_outcome_schema_version") != ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION:
+            raise ValueError("portfolio checkpoint entry outcome schema is unsupported")
+        checkpoint_outcomes = tuple(
+            EntryAttemptOutcome.from_primitive(value)
+            for value in checkpoint["entry_outcomes"]
+        )
+        journal_outcomes = tuple(
+            EntryAttemptOutcome.from_primitive(value)
+            for value in outputs["entry_outcomes"]
+        )
+        if checkpoint_outcomes != journal_outcomes:
+            raise ValueError("completed checkpoint entry outcomes disagree with state log")
         equity = pd.Series(
             [float(row["equity"]) for row in outputs["equity"]],
             index=pd.to_datetime([row["date"] for row in outputs["equity"]]),
@@ -1450,6 +1635,7 @@ class PortfolioSimulator:
                 str(key): int(value)
                 for key, value in checkpoint["execution_diagnostics"].items()
             },
+            entry_outcomes=checkpoint_outcomes,
             benchmark_symbol=benchmark,
         )
 
@@ -1615,35 +1801,86 @@ class PortfolioSimulator:
         entry_date: pd.Timestamp,
     ) -> None:
         self._execution_diagnostics["entry_attempts"] += 1
-        symbol = signal["symbol"]
+        symbol = str(signal["symbol"]).upper()
+        signal_date = str(pd.Timestamp(signal["signal_date"]).date())
+        entry_date_text = str(entry_date.date())
+        pivot: float | None = None
+        raw_pivot = signal.get("pivot")
+        try:
+            candidate_pivot = float(raw_pivot)
+        except (TypeError, ValueError, OverflowError):
+            candidate_pivot = math.nan
+        if math.isfinite(candidate_pivot) and candidate_pivot > 0:
+            pivot = candidate_pivot
+        buy_zone_lower = pivot
+        buy_zone_upper = (
+            pivot * (1 + MAX_BUY_ZONE_EXTENSION) if pivot is not None else None
+        )
+        entry_open: float | None = None
+
+        def finish(outcome: str) -> None:
+            self._execution_diagnostics[outcome] += 1
+            self._entry_outcomes.append(
+                EntryAttemptOutcome(
+                    symbol=symbol,
+                    signal_date=signal_date,
+                    entry_date=entry_date_text,
+                    pivot=pivot,
+                    buy_zone_lower=buy_zone_lower,
+                    buy_zone_upper=buy_zone_upper,
+                    entry_open=entry_open,
+                    outcome=outcome,
+                )
+            )
+
         if symbol in self._open_positions:
-            self._execution_diagnostics["entry_rejected_already_open"] += 1
+            finish("entry_rejected_already_open")
             return
         if self.max_positions is not None and len(self._open_positions) >= self.max_positions:
             if not self._try_evict(signal, ticker_ohlcv, entry_date):
-                self._execution_diagnostics["entry_rejected_capacity"] += 1
+                finish("entry_rejected_capacity")
                 return
 
         ohlcv = ticker_ohlcv.get(symbol)
         if ohlcv is None:
-            self._execution_diagnostics["entry_rejected_missing_data"] += 1
+            finish("entry_rejected_missing_data")
             return
 
         bar = ohlcv.loc[entry_date:entry_date]
+        if pivot is not None and (bar.empty or "Open" not in bar.columns):
+            finish("entry_rejected_missing_data")
+            return
         if bar.empty:
             prev = ohlcv.loc[:entry_date]
-            if prev.empty:
+            if prev.empty or "Close" not in prev.columns:
+                finish("entry_rejected_missing_data")
                 return
-            entry_price = float(prev["Close"].iloc[-1])
+            raw_entry_price = prev["Close"].iloc[-1]
         else:
-            entry_price = float(bar["Open"].iloc[0]) if "Open" in bar.columns else float(bar["Close"].iloc[0])
+            if "Open" in bar.columns:
+                raw_entry_price = bar["Open"].iloc[0]
+            elif "Close" in bar.columns:
+                raw_entry_price = bar["Close"].iloc[0]
+            else:
+                finish("entry_rejected_missing_data")
+                return
 
-        if entry_price <= 0:
-            self._execution_diagnostics["entry_rejected_invalid_price"] += 1
+        try:
+            entry_price = float(raw_entry_price)
+        except (TypeError, ValueError, OverflowError):
+            finish("entry_rejected_invalid_price")
+            return
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            finish("entry_rejected_invalid_price")
+            return
+        entry_open = entry_price
+
+        if pivot is not None and not (pivot <= entry_price <= buy_zone_upper):
+            finish("entry_rejected_next_open_buy_zone")
             return
 
         if self._equity <= 0:
-            self._execution_diagnostics["entry_rejected_no_cash"] += 1
+            finish("entry_rejected_no_cash")
             return
 
         total_portfolio_value = self._mark_equity(ticker_ohlcv, entry_date)
@@ -1652,8 +1889,8 @@ class PortfolioSimulator:
         # position_value = shares * entry = portfolio * risk_pct / stop_pct
         risk_amount = total_portfolio_value * self.position_risk_pct
         risk_per_share = entry_price * self.stop_loss_pct
-        if risk_per_share <= 0:
-            self._execution_diagnostics["entry_rejected_invalid_risk"] += 1
+        if not math.isfinite(risk_per_share) or risk_per_share <= 0:
+            finish("entry_rejected_invalid_risk")
             return
         target_position_value = risk_amount / risk_per_share * entry_price
         if self.max_positions is None and self._pending_entries_remaining > 1:
@@ -1665,8 +1902,8 @@ class PortfolioSimulator:
             position_value = min(self._equity, target_position_value, batch_allocation)
         else:
             position_value = min(self._equity, target_position_value)
-        if position_value <= 0:
-            self._execution_diagnostics["entry_rejected_invalid_risk"] += 1
+        if not math.isfinite(position_value) or position_value <= 0:
+            finish("entry_rejected_invalid_risk")
             return
 
         qty = position_value / entry_price
@@ -1683,7 +1920,6 @@ class PortfolioSimulator:
         )
         self._open_positions[symbol] = trade
         self._equity -= position_value
-        self._execution_diagnostics["entries_executed"] += 1
         self._record_transaction(
             date=str(entry_date.date()),
             ticker=symbol,
@@ -1692,6 +1928,7 @@ class PortfolioSimulator:
             quantity=qty,
             reason=signal.get("signal_reason", "Signal"),
         )
+        finish("entries_executed")
 
     def _check_exits(
         self,
