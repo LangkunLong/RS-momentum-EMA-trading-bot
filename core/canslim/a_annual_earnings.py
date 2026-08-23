@@ -36,6 +36,9 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
 
     import numpy as np
 
+    if not np.isfinite(current) or not np.isfinite(previous):
+        return None
+
     if np.isclose(previous, 0.0):
         return None
 

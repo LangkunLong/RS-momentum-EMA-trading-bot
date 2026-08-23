@@ -186,3 +186,19 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
   qualifying/outcome key sets are now initialized outside the nonempty-outcome
   branch. Zero-qualifier and final-session-only pending controls pass, while a
   missing non-final outcome rejects.
+
+## Task 4 — non-completion status (Steps 1–3 only)
+
+- C/A growth helpers now treat non-finite converted operands as unavailable;
+  EPS-row selection and Net-Income fallback policy remain unchanged.
+- XOM is bound through the existing reviewed-baseline CIK override to
+  `0000034088`. Read-only archive probing proved the present-day
+  `0002115436` current-ticker candidate exists but cannot win; narrow
+  extraction produced 209 XOM normalized rows. The CAH `2021-05-13` bundle
+  probe produced finite-or-missing C/A results.
+- Compile/import, touched-file Ruff, `git diff --check`, and source-hash
+  before/after checks passed. No unit/broad tests, network activity, or
+  normalized regeneration ran.
+- **Task 4 remains incomplete:** Step 4 immutable SEC-output/PIT-bundle
+  regeneration is pending completion of the active multi-hour replay and
+  release of shared-machine resources.

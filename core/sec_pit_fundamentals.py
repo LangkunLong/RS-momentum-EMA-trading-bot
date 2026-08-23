@@ -117,6 +117,7 @@ _REVIEWED_BASELINE_CIKS = {
     "FI": "0000798354",
     "DOC": "0000765880",
     "CTRA": "0000858470",
+    "XOM": "0000034088",
 }
 _SAME_ISSUER_KINDS = {
     "same_issuer_rename",
