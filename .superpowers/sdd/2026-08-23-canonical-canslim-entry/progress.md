@@ -182,3 +182,7 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
   final-session qualifiers may remain pending.
 - Focused invalid-risk/valid-risk eviction and impossible-capacity/control
   probes passed. Final independent re-review is required before Task 3 launch.
+- Both reviewers found the same final zero-outcome funnel initialization bug;
+  qualifying/outcome key sets are now initialized outside the nonempty-outcome
+  branch. Zero-qualifier and final-session-only pending controls pass, while a
+  missing non-final outcome rejects.

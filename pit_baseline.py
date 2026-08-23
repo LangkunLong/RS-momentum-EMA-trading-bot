@@ -466,6 +466,14 @@ def _daily_entry_funnel_frame(
     buy_signal = _strict_boolean_series(signals, "buy_signal")
     if not buy_signal.equals(entry_eligible):
         raise ValueError("daily funnel contains an unqualified buy signal")
+    qualified_keys = set(
+        zip(
+            signals.loc[entry_eligible, "symbol"],
+            signals.loc[entry_eligible, "signal_date"],
+            strict=True,
+        )
+    )
+    outcome_keys: set[tuple[str, pd.Timestamp]] = set()
     outcomes = _entry_outcomes_frame(result)
     if not outcomes.empty:
         normalized_symbols: list[str] = []
@@ -486,13 +494,6 @@ def _daily_entry_funnel_frame(
             raise ValueError("entry outcome signal date is off the benchmark calendar")
         if outcomes.duplicated(["symbol", "signal_date"]).any():
             raise ValueError("entry outcomes are not unique by symbol/session")
-        qualified_keys = set(
-            zip(
-                signals.loc[entry_eligible, "symbol"],
-                signals.loc[entry_eligible, "signal_date"],
-                strict=True,
-            )
-        )
         outcome_keys = set(
             zip(outcomes["symbol"], outcomes["signal_date"], strict=True)
         )

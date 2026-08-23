@@ -159,3 +159,9 @@ Fresh bounded probes passed both invalid-risk/valid-risk eviction paths,
 rejected the prior `AAA` non-final + `BBB` final impossible-capacity ledger in
 both portfolio validation and daily-funnel generation, and accepted the exact
 one-outcome-plus-one-final-pending control. No unit or broad suite was run.
+
+Final re-review found and closed one zero-outcome initialization regression in
+the daily funnel. Qualifying keys are now computed unconditionally and outcome
+keys start as an empty set, so a run with no qualifiers and an all-final-session
+pending run both produce valid zero-attempt funnels, while a missing non-final
+outcome still fails closed.
