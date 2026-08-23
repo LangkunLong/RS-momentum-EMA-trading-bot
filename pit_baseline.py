@@ -315,9 +315,11 @@ def _validate_holding_identities(
             quantities[row.Ticker] = prior + float(row.Quantity)
         else:
             remaining = prior - float(row.Quantity)
-            if remaining < -1e-6:
+            # Transaction quantities are serialized to six decimal places; allow
+            # only the bounded rounding residue, never a material oversell.
+            if remaining < -1e-5:
                 raise ValueError(f"transaction sells more than the open identity: {row.Ticker}")
-            quantities[row.Ticker] = max(remaining, 0.0)
+            quantities[row.Ticker] = 0.0 if remaining <= 1e-5 else remaining
     for symbol, quantity in quantities.items():
         if quantity > 1e-8 and contract.resolve_open_holding(symbol, end_date) != symbol:
             raise ValueError(f"open holding crossed an unsupported ended identity: {symbol}")
