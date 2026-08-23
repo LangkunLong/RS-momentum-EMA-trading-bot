@@ -4,7 +4,8 @@ from pathlib import Path
 
 import fetch_sp500_membership as command
 import core.public_membership as membership
-from core.public_membership import _normalize, load_symbol_map
+import pytest
+from core.public_membership import _normalize, canonical_ticker, load_symbol_map
 
 
 _PINNED_URL = "https://example.com/index?oldid=123"
@@ -246,3 +247,26 @@ def test_fetch_membership_defaults_to_tracked_reviewed_map(monkeypatch) -> None:
 
     assert result is sentinel
     assert observed == [None]
+
+
+def test_reverse_replay_derives_seed_and_rejects_inconsistent_history() -> None:
+    """Break caught: rewind accepted duplicate swaps or changed the historical seed."""
+    raw = b"""
+    <table><tr><th>Symbol</th><th>Security</th></tr>
+    <tr><td>AAA</td><td>Alpha</td></tr><tr><td>BBB</td><td>Beta</td></tr><tr><td>CCC</td><td>Gamma</td></tr></table>
+    <table><tr><th>Effective Date</th><th>Added Ticker</th><th>Added Security</th><th>Removed Ticker</th><th>Removed Security</th></tr>
+    <tr><td>2024-01-03</td><td>CCC</td><td>Gamma</td><td>DDD</td><td>Delta</td></tr>
+    <tr><td>2024-01-02</td><td>BBB</td><td>Beta</td><td>EEE</td><td>Epsilon</td></tr></table>
+    """
+    export = _normalize(raw, _PINNED_URL, date(2024, 1, 1), date(2024, 1, 3), mappings={})
+    state = set()
+    for event in export.events:
+        state.add(event.ticker) if event.member else state.remove(event.ticker)
+    assert {event.ticker for event in export.events if event.effective_date == date(2024, 1, 1)} == {"AAA", "DDD", "EEE"}
+    assert state == {"AAA", "BBB", "CCC"}
+
+    duplicated = raw.replace(b"<td>EEE</td>", b"<td>BBB</td>")
+    with pytest.raises(ValueError, match="addition already active"):
+        _normalize(duplicated, _PINNED_URL, date(2024, 1, 1), date(2024, 1, 3), mappings={})
+    with pytest.raises(ValueError, match="unreviewed punctuation alias"):
+        canonical_ticker("ACME.A")
