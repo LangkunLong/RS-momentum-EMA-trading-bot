@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import settings
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
+from core.canslim.entry_contract import CanslimEntryFacts, build_entry_facts
 from core.canslim.i_institutional import evaluate_i
 from core.canslim.m_market_direction import evaluate_m
 from core.canslim.s_supply_demand import evaluate_s
@@ -43,7 +44,6 @@ from core.data_client import (
 )
 from core.index_ticker_fetcher import get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
-from core.pivot_detector import find_pivot, is_in_buy_zone
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -139,6 +139,8 @@ def _evaluate_technical_at_date(
     """Evaluate N and S technical criteria as-of a specific date."""
     sliced = ticker_data.loc[:eval_date].copy()
     if len(sliced) < 60:
+        closes = extract_float_series(sliced, "Close") if "Close" in sliced else pd.Series(dtype=float)
+        volumes = extract_float_series(sliced, "Volume") if "Volume" in sliced else pd.Series(dtype=float)
         return {
             "n_score": 0.0,
             "s_score": 0.0,
@@ -146,7 +148,8 @@ def _evaluate_technical_at_date(
             "is_breakout": False,
             "has_volume_surge": False,
             "pivot": None,
-            "in_buy_zone": True,
+            "in_buy_zone": False,
+            "entry_facts": build_entry_facts(closes, volumes),
         }
 
     closes = extract_float_series(sliced, "Close")
@@ -157,7 +160,8 @@ def _evaluate_technical_at_date(
     lookback_252 = min(252, len(closes))
     high_52 = coerce_scalar(closes.iloc[-lookback_252:].max())
     proximity = latest_close / high_52 if high_52 else 0.0
-    avg_vol_50 = float(volumes.tail(50).mean()) if len(volumes) >= 50 else float(volumes.mean())
+    entry_facts = build_entry_facts(closes, volumes)
+    avg_vol_50 = entry_facts.prior_average_volume_50 or 0.0
 
     # N score (proximity only — we don't have historical quarterly revenue)
     if proximity >= 0.98:
@@ -176,9 +180,6 @@ def _evaluate_technical_at_date(
         sliced, avg_vol_50, latest_close, high_52, shares_outstanding, s_breakout_proximity=0.95
     )
 
-    pivot = find_pivot(closes)
-    in_buy_zone = is_in_buy_zone(latest_close, pivot) if pivot is not None else True
-
     return {
         "n_score": n_score,
         "s_score": score_s,
@@ -186,12 +187,16 @@ def _evaluate_technical_at_date(
         "close": latest_close,
         "high_52": high_52,
         "avg_vol_50": avg_vol_50,
-        "is_breakout": s_metrics.get("is_breakout", False),
-        "has_volume_surge": s_metrics.get("has_volume_surge", False),
+        "is_breakout": entry_facts.in_buy_zone,
+        "has_volume_surge": entry_facts.has_volume_surge,
+        "diagnostic_near_high": s_metrics.get("is_breakout", False),
         "has_power_gap": s_metrics.get("has_power_gap", False),
         "power_gap_details": s_metrics.get("power_gap_details", {}),
-        "pivot": pivot,
-        "in_buy_zone": in_buy_zone,
+        "pivot": entry_facts.pivot,
+        "in_buy_zone": entry_facts.in_buy_zone,
+        "technical_eligible": entry_facts.eligible,
+        "entry_blocking_reasons": entry_facts.blocking_reasons,
+        "entry_facts": entry_facts,
     }
 
 
@@ -284,25 +289,22 @@ def _compute_canslim_score(
 
 def _should_emit_buy_signal(
     *,
-    total_score: float,
-    rs_score: float,
-    market_is_bullish: bool,
-    has_breakout: bool,
-    has_volume_surge: bool,
-    has_peg_today: bool,
+    entry_facts: CanslimEntryFacts | None = None,
+    total_score: float | None = None,
+    rs_score: float | None = None,
+    market_is_bullish: bool | None = None,
+    has_breakout: bool | None = None,
+    has_volume_surge: bool | None = None,
+    has_peg_today: bool | None = None,
     in_buy_zone: bool = True,
 ) -> bool:
-    """Return True only for signals that satisfy the live-style buy gates.
+    """Return the shared technical setup result for the simple backtest.
 
-    Note: min score is 40 (not MIN_CANSLIM_SCORE=70) because the backtest runs
-    without FMP fundamentals (C, A, I score as 0/neutral), capping achievable scores at ~55.
-    The market bullish gate is intentionally omitted here to let all regime windows evaluate.
+    The legacy keyword arguments remain accepted for call compatibility but are
+    diagnostic only. In particular, a price/volume power gap cannot bypass the
+    canonical completed-session setup.
     """
-    return (
-        total_score >= 40  # Lowered from MIN_CANSLIM_SCORE — FMP unavailable in backtest
-        and rs_score >= settings.MIN_RS_SCORE
-        and ((has_breakout and has_volume_surge and in_buy_zone) or has_peg_today)
-    )
+    return bool(entry_facts is not None and entry_facts.eligible)
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +406,8 @@ def run_backtest() -> pd.DataFrame:
             peg_details = tech.get("power_gap_details") or {}
             has_peg_today = bool(tech.get("has_power_gap", False)) and peg_details.get("days_ago") == 0
 
-            buy_signal = _should_emit_buy_signal(
+            technical_setup = _should_emit_buy_signal(
+                entry_facts=tech.get("entry_facts"),
                 total_score=total,
                 rs_score=rs_score,
                 market_is_bullish=bool(m_bullish),
@@ -436,7 +439,9 @@ def run_backtest() -> pd.DataFrame:
                     "Is_Breakout": tech.get("is_breakout", False),
                     "Has_Vol_Surge": tech.get("has_volume_surge", False),
                     "Has_PEG": has_peg_today,
-                    "BUY_SIGNAL": buy_signal,
+                    "Setup_Blockers": ",".join(tech.get("entry_blocking_reasons", ())),
+                    "TECHNICAL_SETUP": technical_setup,
+                    "BUY_SIGNAL": technical_setup,
                 }
             )
 
@@ -451,19 +456,20 @@ def print_results(df: pd.DataFrame) -> None:
         return
 
     print("\n" + "=" * 100)
-    print("BACKTEST RESULTS — BUY SIGNALS")
+    print("BACKTEST RESULTS — TECHNICAL SETUPS")
     print("=" * 100)
     print(
         "NOTE: C, A, I scores use point-in-time FMP data (filtered by SEC filing date).\n"
         "      N, S, L, M scores are calculated from historical price data.\n"
+        "      BUY_SIGNAL is a compatibility alias for the shared technical setup only;\n"
+        "      it is not a full C/A/RS/composite CANSLIM entry decision.\n"
     )
 
     buys = df[df["BUY_SIGNAL"]]
     if buys.empty:
-        print("No buy signals were generated with the default thresholds")
-        print(f"(RS >= {settings.MIN_RS_SCORE}, CANSLIM >= {settings.MIN_CANSLIM_SCORE}).\n")
+        print("No canonical completed-session technical setups were generated.\n")
     else:
-        print(f"Buy signals generated: {len(buys)}\n")
+        print(f"Technical setups generated: {len(buys)}\n")
         print(
             f"{'Date':<12} {'Ticker':<7} {'Close':>8} {'RS':>5} {'CANSLIM':>8} "
             f"{'C':>4} {'A':>4} {'N':>4} {'S':>4} {'L':>4} {'I':>4} {'M':>4} "

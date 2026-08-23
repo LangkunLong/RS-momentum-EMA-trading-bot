@@ -19,6 +19,7 @@ Spec: `docs/superpowers/specs/2026-08-23-canonical-canslim-entry-design.md`
 - Ruling: completed-session volume uses exactly 50 prior bars and excludes the event bar; pivot uses only prior closes. Cost if wrong: the first corrected run may differ from current live approximations, but all callers converge on one auditable definition.
 - Ruling: the current power-gap detector is not earnings-grounded and cannot bypass the executable CANSLIM contract. Cost if wrong: a genuine earnings-gap setup may be missed until a separate PIT earnings-event feature is designed; no false earnings claim enters this baseline.
 - Ruling: market regime is execution permission, not setup qualification. Cost if wrong: bearish-market qualified setups remain visible but unexecuted, improving diagnostic separation.
+- Ruling: because the legacy total score includes M, full entry qualification uses a separately named non-M composite built from the same active component weights and renormalized to 100%; the M-inclusive total remains unchanged for reporting. Cost if wrong: the entry score can differ from historical reports, but market cannot silently veto setup qualification twice.
 - Ruling: bind daily cadence only in `pit_baseline.py`; keep the generic simulator default, technical-only mode, and simple-backtest CLI compatible. Cost if wrong: non-PIT workflows retain historical cadence, but the canonical baseline proves its own daily setting.
 - Ruling: next-open zone failures need per-attempt audit rows, not aggregate-only inference. Cost if wrong: a modest artifact/checkpoint schema increase; reconciliation remains causal.
 - Ruling: functional probes and real replays precede broad tests, following the operator's explicit instruction. Cost if wrong: some test regressions surface later; per-task functional probes and independent reviews mitigate that risk.
@@ -49,3 +50,19 @@ Spec: `docs/superpowers/specs/2026-08-23-canonical-canslim-entry-design.md`
 | Tasks 1-6 | Task 7 | stable production APIs and artifacts | Tests/documentation bind working behavior rather than drive speculative policy. |
 
 Execution order: `1, 2, 3, 4, 5, 6, 7`.
+
+## Task 3 read-only preflight
+
+- `verify_pit_bundle.py` passed against the preserved bundle manifest and all six bound normalized source/provenance files.
+- Independent SHA-256 recomputation matched `8ca8242dd67db30d456a2b1861f7e7399f8ca418079738ab150d4e44865763c5`.
+- The actual preserved manifest path is `.artifacts/pit-baseline/bundle_manifest.json`.
+- The SQLite reader uses a read-only URI, and the replay performs pre/post source hashing. Windows ACLs still allow the current principal to modify the source files, so Task 3 will additionally run the exact verifier before and after the replay. A soft `READONLY` attribute is not treated as a security boundary.
+- The first replay uses a fresh UTC/digest-qualified output root, no `--resume-checkpoint`, and the explicit `--allow-incomplete-fundamentals` flag for the known `80.20768935%` C/A coverage result. Any other coverage failure remains terminal.
+
+## Task 1 — shared completed-session entry contract
+
+- Added immutable shared technical facts/full decisions with prior-only 252-close pivot, exactly 50 prior volumes, price advance, `1.30x` volume, inclusive pivot-through-`+5%` zone, finite handling, and ordered blockers.
+- Live CANSLIM now exposes both the unchanged M-inclusive `total_score` and the non-M renormalized `entry_composite_score`; screening consumes the fixed full decision and layers market permission afterward.
+- After-close and the simple backtest consume shared technical setup eligibility only. The simple backtest retains its public shape and explicitly labels `BUY_SIGNAL` as a technical compatibility alias; PEG remains diagnostic and cannot bypass qualification.
+- Direct boundary/caller probes passed, including market independence and PEG non-bypass. Relevant imports, compile, Ruff, and diff checks passed. Unit tests/broad suite were intentionally deferred per operator sequencing.
+- Detailed evidence and compatibility notes: `.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-1-report.md`.

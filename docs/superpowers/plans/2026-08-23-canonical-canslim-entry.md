@@ -14,7 +14,7 @@
 
 - Keep thresholds fixed: C 25%, A 25%, RS 80, composite 70, volume 1.30x, buy zone 0% through +5%.
 - Do not add breakout persistence, tune thresholds, change exits/sizing/cash policy, or solve warm-up in this plan.
-- Full CANSLIM qualification never uses market regime; market regime is execution permission.
+- Full CANSLIM qualification never uses market regime, including through its entry composite; use the existing non-M component weights renormalized to 100%, while retaining the legacy M-inclusive total for reporting. Market regime is execution permission.
 - The existing power-gap detector remains diagnostic only and cannot bypass the canonical executable contract.
 - Preserve the simple technical-only/public CLI and generic simulator cadence default; label approximations honestly.
 - Bind daily cadence only in the PIT baseline runner.

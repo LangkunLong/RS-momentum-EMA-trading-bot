@@ -45,7 +45,9 @@ The full CANSLIM decision additionally requires:
 - current quarterly growth at least 25%;
 - annual growth at least 25%;
 - relative-strength score at least 80; and
-- composite score at least 70.
+- entry composite score at least 70. This score uses the existing C/A/N/S/L/I
+  component weights, removes M, and renormalizes the remaining active weights.
+  The legacy seven-component total remains available for reporting.
 
 Missing or non-finite inputs are unavailable, never successful comparisons.
 The decision carries ordered machine-readable blocking reasons plus the exact
@@ -54,7 +56,10 @@ pivot, prior-volume baseline, volume ratio, and extension.
 ## Market and PEG semantics
 
 Market regime is execution permission layered after entry-contract
-qualification. It must not change whether a setup itself satisfies CANSLIM.
+qualification. It must not change whether a setup itself satisfies CANSLIM,
+including indirectly through the composite. Full callers therefore pass the
+renormalized non-M entry composite; they retain the legacy M-inclusive total
+only as a separately named reporting value.
 
 The existing `power earnings gap` detector is price/volume-only and is not tied
 to a filing or earnings event. It remains available as a diagnostic/scoring fact
