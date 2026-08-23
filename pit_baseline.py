@@ -891,9 +891,22 @@ def run_baseline(
                 signal_log=result.signal_log,
             )
             if not coverage["all_gates_passed"]:
-                _write_bytes(run_dir / "coverage.json", _json_bytes(coverage))
                 failed = [name for name, item in coverage["gates"].items() if not item["passed"]]
-                raise CoverageGateError(f"coverage gates failed: {failed}")
+                fundamentals_gate = "evaluated_pit_quarterly_and_annual_at_least_90_pct"
+                non_blocking = (
+                    [fundamentals_gate]
+                    if getattr(args, "allow_incomplete_fundamentals", False)
+                    and failed == [fundamentals_gate]
+                    else []
+                )
+                coverage["non_blocking_failed_gates"] = non_blocking
+                coverage["baseline_publishable"] = not set(failed).difference(non_blocking)
+                if not coverage["baseline_publishable"]:
+                    _write_bytes(run_dir / "coverage.json", _json_bytes(coverage))
+                    raise CoverageGateError(f"coverage gates failed: {failed}")
+            else:
+                coverage["non_blocking_failed_gates"] = []
+                coverage["baseline_publishable"] = True
             top_signaled = int((recall["buy_signal_count"] > 0).sum())
             top_executed = int((recall["entry_count"] > 0).sum())
             summary = {
@@ -917,6 +930,8 @@ def run_baseline(
                     "current_quarterly_and_annual_pct": coverage["evaluated_fundamentals"][
                         "current_quarterly_and_annual_pct"
                     ],
+                    "all_gates_passed": coverage["all_gates_passed"],
+                    "non_blocking_failed_gates": coverage["non_blocking_failed_gates"],
                 },
             }
             active_config = json.loads(json.dumps(result.config, allow_nan=False))
@@ -972,6 +987,11 @@ def run_baseline(
                 "canslim_config": active_config,
                 "execution_diagnostics": diagnostics,
                 "execution_reconciliation": reconciliation,
+                "coverage_status": {
+                    "all_gates_passed": coverage["all_gates_passed"],
+                    "baseline_publishable": coverage["baseline_publishable"],
+                    "non_blocking_failed_gates": coverage["non_blocking_failed_gates"],
+                },
                 "leader_basket_config": asdict(basket_config),
                 "artifacts": artifact_hashes,
             }
@@ -1014,6 +1034,14 @@ def _parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=20,
         help="persist a resumable portfolio checkpoint at this many trading days",
+    )
+    parser.add_argument(
+        "--allow-incomplete-fundamentals",
+        action="store_true",
+        help=(
+            "publish the baseline when the only failed gate is evaluated SEC "
+            "quarterly+annual coverage; the shortfall remains explicit in coverage/report"
+        ),
     )
     return parser
 
