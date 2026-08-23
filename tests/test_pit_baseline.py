@@ -122,6 +122,14 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
     monkeypatch.setattr(pit_baseline, "_metrics", lambda _result: {"total_return_pct": 1.0})
     monkeypatch.setattr(pit_baseline, "_basket_metrics", lambda _result: {"total_return_pct": 1.0})
     monkeypatch.setattr(pit_baseline, "run_baseline", lambda args: real_run_baseline(args, portfolio_factory=FakePortfolio, basket_factory=FakeBasket, require_clean_git=False))
+    real_write_bytes = pit_baseline._write_bytes
+    publication_writes: list[Path] = []
+
+    def record_publication_write(path: Path, payload: bytes) -> None:
+        publication_writes.append(path)
+        real_write_bytes(path, payload)
+
+    monkeypatch.setattr(pit_baseline, "_write_bytes", record_publication_write)
     argv = [
         "pit_baseline.py", "--pit-bundle", str(bundle_path), "--bundle-sha256", bundle_sha,
         "--membership-provenance", str(inputs["membership"]), "--prices-provenance", str(inputs["prices"]),
@@ -136,6 +144,11 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
     assert required == {path.name for path in run_dir.iterdir()}
     manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
+    assert set(manifest["artifacts"]) == required - {"run_manifest.json"}
     assert {name: hashlib.sha256((run_dir / name).read_bytes()).hexdigest() for name in manifest["artifacts"]} == manifest["artifacts"]
+    before_collision = {path.name: path.read_bytes() for path in run_dir.iterdir()}
+    writes_before_collision = len(publication_writes)
     assert pit_baseline.main() == 1
     assert "PIT baseline failed closed" in capsys.readouterr().out
+    assert {path.name: path.read_bytes() for path in run_dir.iterdir()} == before_collision
+    assert len(publication_writes) == writes_before_collision
