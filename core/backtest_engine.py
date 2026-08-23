@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import pickle
 import sqlite3
@@ -10,6 +12,7 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 import numpy as np
@@ -26,7 +29,7 @@ from backtest import (
     _evaluate_market_at_date,
     _evaluate_technical_at_date,
 )
-from core.canslim.m_market_direction import MarketRegimeTracker
+from core.canslim.m_market_direction import MarketRegime, MarketRegimeTracker
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
 from core.canslim.i_institutional import evaluate_i
@@ -694,6 +697,205 @@ def _new_execution_diagnostics() -> dict[str, int]:
     }
 
 
+_PORTFOLIO_CHECKPOINT_SCHEMA = 1
+
+
+def _checkpoint_json_safe(value: Any) -> Any:
+    """Convert simulator state to JSON without serializing executable objects."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, np.generic):
+        return _checkpoint_json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return [_checkpoint_json_safe(item) for item in value.tolist()]
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _checkpoint_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_checkpoint_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    raise ValueError(f"unsupported checkpoint value type: {type(value).__name__}")
+
+
+def _checkpoint_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(_checkpoint_json_safe(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _append_checkpoint_jsonl(path: Path, value: Any, *, stream: Any = None, sync: bool = False) -> int:
+    payload = _checkpoint_bytes(value)
+    if stream is None:
+        with path.open("ab") as handle:
+            handle.write(payload)
+            handle.flush()
+            if sync:
+                os.fsync(handle.fileno())
+            return handle.tell()
+    stream.write(payload)
+    stream.flush()
+    if sync:
+        os.fsync(stream.fileno())
+    return stream.tell()
+
+
+def _write_checkpoint_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = _checkpoint_bytes(value)
+    with temporary.open("wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _load_checkpoint_json(path: Path) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("portfolio checkpoint must be a regular file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("portfolio checkpoint is invalid") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != _PORTFOLIO_CHECKPOINT_SCHEMA:
+        raise ValueError("portfolio checkpoint schema is unsupported")
+    return value
+
+
+def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("portfolio state log is missing")
+    if not isinstance(offset, int) or offset < 0:
+        raise ValueError("portfolio state log offset is invalid")
+    outputs: dict[str, list[Any]] = {
+        "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
+    }
+    expected_day = 0
+    consumed = 0
+    with path.open("rb") as stream:
+        while consumed < offset:
+            line = stream.readline()
+            if not line:
+                raise ValueError("portfolio state log is shorter than its checkpoint")
+            consumed += len(line)
+            if consumed > offset:
+                raise ValueError("portfolio checkpoint splits a state log record")
+            try:
+                event = json.loads(line.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError("portfolio state log contains invalid JSON") from exc
+            if not isinstance(event, dict):
+                raise ValueError("portfolio state log record is not an object")
+            kind = event.get("kind")
+            if kind == "day":
+                day_idx = event.get("day_index")
+                if day_idx != expected_day or day_idx >= next_day_index:
+                    raise ValueError("portfolio state log day sequence does not match checkpoint")
+                expected_day += 1
+                outputs["equity"].append({"date": event["date"], "equity": event["equity"]})
+                benchmark = event.get("benchmark")
+                if benchmark is not None:
+                    outputs["benchmark"].append({"date": event["date"], "equity": benchmark})
+                outputs["transactions"].extend(event.get("transactions", []))
+                outputs["weekly"].extend(event.get("weekly", []))
+                outputs["signals"].extend(event.get("signals", []))
+            elif kind == "final":
+                outputs["transactions"].extend(event.get("transactions", []))
+            else:
+                raise ValueError("portfolio state log contains an unknown record")
+    if expected_day != next_day_index:
+        raise ValueError("portfolio state log is missing checkpointed days")
+    return outputs
+
+
+def _portfolio_checkpoint_fingerprint(
+    *,
+    bundle_sha256: Optional[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    benchmark: str,
+    universe: Iterable[str],
+    simulator: "PortfolioSimulator",
+) -> str:
+    config = {
+        "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
+        "bundle_sha256": bundle_sha256,
+        "start_date": str(start_date.date()),
+        "end_date": str(end_date.date()),
+        "benchmark": benchmark,
+        "universe": sorted(str(item).upper() for item in universe),
+        "initial_capital": simulator.initial_capital,
+        "max_positions": simulator.max_positions,
+        "position_size_pct": simulator.position_size_pct,
+        "position_risk_pct": simulator.position_risk_pct,
+        "stop_loss_pct": simulator.stop_loss_pct,
+        "ma_exit_period": simulator.ma_exit_period,
+        "ma_consecutive": simulator.ma_consecutive,
+        "signal_every_n_days": simulator.signal_every_n_days,
+        "min_canslim_score": simulator.min_canslim_score,
+        "min_rs_score": simulator.min_rs_score,
+        "min_technical_score": simulator.min_technical_score,
+        "require_bullish_market": simulator.require_bullish_market,
+        "use_stateful_regime_gate": simulator.use_stateful_regime_gate,
+        "cash_deployment_threshold_pct": simulator.cash_deployment_threshold_pct,
+        "technical_only": simulator.technical_only,
+        "take_profit_pct": simulator.take_profit_pct,
+        "scale_out_fraction": simulator.scale_out_fraction,
+        "stagnation_days": simulator.stagnation_days,
+        "stagnation_threshold_pct": simulator.stagnation_threshold_pct,
+        "breakeven_trigger_pct": simulator.breakeven_trigger_pct,
+        "enable_eviction": simulator.enable_eviction,
+    }
+    return hashlib.sha256(_checkpoint_bytes(config)).hexdigest()
+
+
+def _regime_checkpoint_state(tracker: MarketRegimeTracker) -> dict[str, Any]:
+    return {
+        "regime": tracker.regime.value,
+        "dist_day_bars": list(tracker._dist_day_bars),
+        "bar_count": tracker._bar_count,
+        "rally_day_count": tracker._rally_day_count,
+        "rally_active": tracker._rally_active,
+        "correction_low": tracker._correction_low,
+    }
+
+
+def _restore_regime_checkpoint(state: dict[str, Any]) -> MarketRegimeTracker:
+    try:
+        tracker = MarketRegimeTracker()
+        tracker.regime = MarketRegime(str(state["regime"]))
+        tracker._dist_day_bars = [int(item) for item in state["dist_day_bars"]]
+        tracker._bar_count = int(state["bar_count"])
+        tracker._rally_day_count = int(state["rally_day_count"])
+        tracker._rally_active = bool(state["rally_active"])
+        correction_low = state["correction_low"]
+        tracker._correction_low = float("inf") if correction_low is None else float(correction_low)
+        return tracker
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("portfolio checkpoint regime state is invalid") from exc
+
+
+def _trade_checkpoint_dict(trade: Trade) -> dict[str, Any]:
+    return _checkpoint_json_safe(trade.__dict__)
+
+
+def _trade_from_checkpoint(value: Any) -> Trade:
+    if not isinstance(value, dict):
+        raise ValueError("portfolio checkpoint trade is invalid")
+    try:
+        return Trade(**value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("portfolio checkpoint trade fields are invalid") from exc
+
+
 class PortfolioSimulator:
     """Simulates the full CANSLIM portfolio lifecycle."""
 
@@ -787,7 +989,15 @@ class PortfolioSimulator:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         benchmark_symbol: Optional[str] = None,
+        checkpoint_path: Optional[str | Path] = None,
+        progress_log_path: Optional[str | Path] = None,
+        resume: bool = False,
+        checkpoint_every_days: int = 20,
     ) -> SimulationResult:
+        if checkpoint_every_days < 1:
+            raise ValueError("checkpoint_every_days must be positive")
+        if resume and checkpoint_path is None:
+            raise ValueError("resume requires checkpoint_path")
         self._equity = self.initial_capital
         self._open_positions = {}
         self._trades = []
@@ -815,42 +1025,139 @@ class PortfolioSimulator:
             if not tickers:
                 raise ValueError("point-in-time bundle has no requested candidate symbols")
             all_tickers = list(dict.fromkeys([*tickers, benchmark]))
+        else:
+            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
+        universe = list(self.pit_bundle.symbols()) if self.pit_bundle is not None else list(dict.fromkeys([*tickers, *get_sp500_tickers()]))
+        checkpoint = Path(checkpoint_path).resolve() if checkpoint_path is not None else None
+        progress = Path(progress_log_path).resolve() if progress_log_path is not None else None
+        state_log = checkpoint.with_name("portfolio_state.jsonl") if checkpoint is not None else None
+        fingerprint = _portfolio_checkpoint_fingerprint(
+            bundle_sha256=self.pit_bundle.sha256 if self.pit_bundle is not None else None,
+            start_date=start_ts,
+            end_date=end_ts,
+            benchmark=benchmark,
+            universe=all_tickers,
+            simulator=self,
+        )
+        checkpoint_state: Optional[dict[str, Any]] = None
+        restored_outputs: dict[str, list[Any]] = {
+            "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
+        }
+        if checkpoint is not None and resume:
+            checkpoint_state = _load_checkpoint_json(checkpoint)
+            if checkpoint_state.get("fingerprint") != fingerprint:
+                raise ValueError("portfolio checkpoint does not match the requested run")
+            if state_log is None:
+                raise ValueError("portfolio checkpoint state log is not configured")
+            restored_outputs = _read_checkpoint_state(
+                state_log,
+                offset=int(checkpoint_state["state_log_offset"]),
+                next_day_index=int(checkpoint_state["next_day_index"]),
+            )
+            if checkpoint_state.get("completed"):
+                _append_checkpoint_jsonl(progress or checkpoint.with_name("portfolio_progress.jsonl"), {
+                    "phase": "resume_cached_result",
+                    "next_day_index": checkpoint_state["next_day_index"],
+                    "total_days": checkpoint_state["total_days"],
+                    "fingerprint": fingerprint,
+                }, sync=True)
+                return self._result_from_checkpoint(checkpoint_state, restored_outputs, benchmark)
+        elif checkpoint is not None and checkpoint.exists():
+            raise ValueError("checkpoint already exists; pass resume=True to continue it")
+
+        if state_log is not None:
+            state_log.parent.mkdir(parents=True, exist_ok=True)
+            if resume:
+                with state_log.open("r+b") as handle:
+                    handle.truncate(int(checkpoint_state["state_log_offset"]))
+            else:
+                state_log.touch(exist_ok=False)
+        state_stream = state_log.open("ab") if state_log is not None else None
+        started_at = datetime.now().timestamp()
+        if progress is not None:
+            _append_checkpoint_jsonl(progress, {
+                "phase": "resumed" if resume else "started",
+                "fingerprint": fingerprint,
+                "start_date": str(start_ts.date()),
+                "end_date": str(end_ts.date()),
+                "universe_count": len(universe),
+            }, sync=True)
+
+        if self.pit_bundle is not None:
             print(f"Reading point-in-time price data for {len(all_tickers)} tickers...")
             ticker_ohlcv = self.pit_bundle.fetch_price_data(all_tickers, start_ts, end_ts)
         else:
-            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
             print(f"Downloading price data for {len(all_tickers)} tickers...")
             ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, start_ts, end_ts)
         if benchmark not in ticker_ohlcv:
+            if state_stream is not None:
+                state_stream.close()
             print(f"FATAL: Could not download {benchmark} benchmark data.")
             return SimulationResult()
 
         if self.pit_bundle is not None:
-            universe = list(self.pit_bundle.symbols())
             print(f"Reading point-in-time RS closes for {len(universe)} symbols...")
             all_closes = self.pit_bundle.fetch_closes(universe, start_ts, end_ts)
         else:
-            universe = list(dict.fromkeys([*tickers, *get_sp500_tickers()]))
             print(f"Downloading RS universe closes for {len(universe)} tickers...")
             all_closes = self.data_fetcher.fetch_rs_universe_closes(universe, start_ts, end_ts)
 
         benchmark_df = ticker_ohlcv[benchmark]
         trading_days = benchmark_df.loc[start_ts:end_ts].index
         if len(trading_days) < 30:
+            if state_stream is not None:
+                state_stream.close()
             print("ERROR: Not enough trading days in range.")
             return SimulationResult()
 
-        regime_tracker = MarketRegimeTracker()
-        regime_tracker.bootstrap(benchmark_df, start_ts)
-        self._regime_tracker = regime_tracker
         self._ticker_industry = {} if self.technical_only or self.pit_bundle is not None else load_industry_map(tickers)
+        if checkpoint_state is not None:
+            next_day_index = int(checkpoint_state["next_day_index"])
+            if next_day_index < 0 or next_day_index > len(trading_days):
+                raise ValueError("portfolio checkpoint day index is outside the requested window")
+            regime_tracker = _restore_regime_checkpoint(checkpoint_state["regime"])
+            self._regime_tracker = regime_tracker
+            self._equity = float(checkpoint_state["equity"])
+            self._open_positions = {
+                str(symbol): _trade_from_checkpoint(value)
+                for symbol, value in checkpoint_state["open_positions"].items()
+            }
+            self._trades = [_trade_from_checkpoint(value) for value in checkpoint_state["trades"]]
+            self._transactions = list(restored_outputs["transactions"])
+            self._weekly_snapshots = list(restored_outputs["weekly"])
+            self._signal_rows = list(restored_outputs["signals"])
+            self._execution_diagnostics = {
+                str(key): int(value)
+                for key, value in checkpoint_state["execution_diagnostics"].items()
+            }
+            benchmark_start_price = checkpoint_state.get("benchmark_start_price")
+            benchmark_start_price = (
+                float(benchmark_start_price) if benchmark_start_price is not None else None
+            )
+            pending_entries = list(checkpoint_state["pending_entries"])
+            equity_series = {
+                str(row["date"]): float(row["equity"])
+                for row in restored_outputs["equity"]
+            }
+            benchmark_series = {
+                str(row["date"]): float(row["equity"])
+                for row in restored_outputs["benchmark"]
+            }
+        else:
+            regime_tracker = MarketRegimeTracker()
+            regime_tracker.bootstrap(benchmark_df, start_ts)
+            self._regime_tracker = regime_tracker
+            next_day_index = 0
+            equity_series = {}
+            benchmark_series = {}
+            benchmark_start_price = None
+            pending_entries = []
 
-        equity_series: Dict[str, float] = {}
-        benchmark_series: Dict[str, float] = {}
-        benchmark_start_price: Optional[float] = None
-        pending_entries: List[dict] = []
-
-        for day_idx, eval_date in enumerate(trading_days):
+        total_days = len(trading_days)
+        for day_idx, eval_date in enumerate(trading_days[next_day_index:], start=next_day_index):
+            signal_start = len(self._signal_rows)
+            transaction_start = len(self._transactions)
+            weekly_start = len(self._weekly_snapshots)
             if day_idx > 0:
                 hist = benchmark_df.loc[:eval_date]
                 if len(hist) >= 2:
@@ -903,7 +1210,51 @@ class PortfolioSimulator:
 
             self._record_weekly_holdings(ticker_ohlcv, eval_date, trading_days)
 
+            if state_stream is not None:
+                date_key = str(eval_date.date())
+                offset = _append_checkpoint_jsonl(state_log, {
+                    "kind": "day",
+                    "day_index": day_idx,
+                    "date": date_key,
+                    "equity": equity_series[date_key],
+                    "benchmark": benchmark_series.get(date_key),
+                    "signals": self._signal_rows[signal_start:],
+                    "transactions": self._transactions[transaction_start:],
+                    "weekly": self._weekly_snapshots[weekly_start:],
+                }, stream=state_stream, sync=False)
+                checkpoint_due = (
+                    (day_idx + 1) % checkpoint_every_days == 0
+                    or day_idx == total_days - 1
+                )
+                if checkpoint_due:
+                    state_stream.flush()
+                    os.fsync(state_stream.fileno())
+                    checkpoint_payload = self._checkpoint_payload(
+                        fingerprint=fingerprint,
+                        next_day_index=day_idx + 1,
+                        total_days=total_days,
+                        state_log_offset=offset,
+                        regime_tracker=regime_tracker,
+                        pending_entries=pending_entries,
+                        benchmark_start_price=benchmark_start_price,
+                    )
+                    _write_checkpoint_json(checkpoint, checkpoint_payload)
+                    if progress is not None:
+                        _append_checkpoint_jsonl(progress, {
+                            "phase": "checkpoint",
+                            "day_index": day_idx,
+                            "date": date_key,
+                            "next_day_index": day_idx + 1,
+                            "total_days": total_days,
+                            "percent": round((day_idx + 1) * 100.0 / total_days, 3),
+                            "elapsed_seconds": round(datetime.now().timestamp() - started_at, 3),
+                            "open_positions": len(self._open_positions),
+                            "signal_rows": len(self._signal_rows),
+                            "transactions": len(self._transactions),
+                        }, sync=True)
+
         last_date = pd.Timestamp(trading_days[-1])
+        final_transaction_start = len(self._transactions)
         for symbol in list(self._open_positions.keys()):
             ohlcv = ticker_ohlcv.get(symbol)
             if ohlcv is None:
@@ -913,46 +1264,170 @@ class PortfolioSimulator:
                 exit_price = float(bar["Close"].iloc[-1])
                 self._close_trade(symbol, exit_price, "end_of_test", str(last_date.date()))
 
-        return SimulationResult(
+        if state_stream is not None:
+            final_offset = _append_checkpoint_jsonl(state_log, {
+                "kind": "final",
+                "transactions": self._transactions[final_transaction_start:],
+            }, stream=state_stream, sync=True)
+        else:
+            final_offset = 0
+        result_config = self._result_config(
+            tickers=tickers,
+            benchmark=benchmark,
+            all_closes=all_closes,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        result = SimulationResult(
             trades=self._trades,
             equity_curve=pd.Series(equity_series),
             benchmark_curve=pd.Series(benchmark_series),
             initial_capital=self.initial_capital,
-            config={
-                "tickers": tickers,
-                "candidate_universe_count": len(tickers),
-                "rs_universe_count": len(all_closes.columns),
-                "benchmark_symbol": benchmark,
-                "max_positions": self.max_positions,
-                "require_bullish_market": self.require_bullish_market,
-                "use_stateful_regime_gate": self.use_stateful_regime_gate,
-                "cash_deployment_threshold_pct": self.cash_deployment_threshold_pct,
-                "position_size_pct": self.position_size_pct,
-                "stop_loss_pct": self.stop_loss_pct,
-                "ma_exit_period": self.ma_exit_period,
-                "ma_consecutive": self.ma_consecutive,
-                "signal_every_n_days": self.signal_every_n_days,
-                "min_canslim_score": self.min_canslim_score,
-                "min_rs_score": self.min_rs_score,
-                "min_technical_score": self.min_technical_score,
-                "technical_only": self.technical_only,
-                "data_mode": "point_in_time" if self.pit_bundle is not None else "provider_cache",
-                "pit_bundle_sha256": self.pit_bundle.sha256 if self.pit_bundle is not None else None,
-                "pit_data_cutoff": str(self.pit_bundle.data_cutoff.date()) if self.pit_bundle is not None else None,
-                "pit_manifest": self.pit_bundle.manifest() if self.pit_bundle is not None else None,
-                "take_profit_pct": self.take_profit_pct,
-                "scale_out_fraction": self.scale_out_fraction,
-                "stagnation_days": self.stagnation_days,
-                "stagnation_threshold_pct": self.stagnation_threshold_pct,
-                "breakeven_trigger_pct": self.breakeven_trigger_pct,
-                "industry_group_top_n": settings.INDUSTRY_GROUP_TOP_N,
-                "start_date": str(start_ts.date()),
-                "end_date": str(end_ts.date()),
-            },
+            config=result_config,
             transaction_log=pd.DataFrame(self._transactions),
             weekly_holdings=pd.DataFrame(self._weekly_snapshots),
             signal_log=pd.DataFrame(self._signal_rows),
             execution_diagnostics=dict(self._execution_diagnostics),
+            benchmark_symbol=benchmark,
+        )
+        if checkpoint is not None:
+            _write_checkpoint_json(
+                checkpoint,
+                self._checkpoint_payload(
+                    fingerprint=fingerprint,
+                    next_day_index=total_days,
+                    total_days=total_days,
+                    state_log_offset=final_offset,
+                    regime_tracker=regime_tracker,
+                    pending_entries=[],
+                    benchmark_start_price=benchmark_start_price,
+                    completed=True,
+                    result_config=result_config,
+                ),
+            )
+            if progress is not None:
+                _append_checkpoint_jsonl(progress, {
+                    "phase": "completed",
+                    "next_day_index": total_days,
+                    "total_days": total_days,
+                    "percent": 100.0,
+                    "elapsed_seconds": round(datetime.now().timestamp() - started_at, 3),
+                    "open_positions": len(self._open_positions),
+                    "signal_rows": len(self._signal_rows),
+                    "transactions": len(self._transactions),
+                }, sync=True)
+        if state_stream is not None:
+            state_stream.close()
+        return result
+
+    def _result_config(
+        self,
+        *,
+        tickers: list[str],
+        benchmark: str,
+        all_closes: pd.DataFrame,
+        start_ts: pd.Timestamp,
+        end_ts: pd.Timestamp,
+    ) -> dict[str, Any]:
+        return {
+            "tickers": tickers,
+            "candidate_universe_count": len(tickers),
+            "rs_universe_count": len(all_closes.columns),
+            "benchmark_symbol": benchmark,
+            "max_positions": self.max_positions,
+            "require_bullish_market": self.require_bullish_market,
+            "use_stateful_regime_gate": self.use_stateful_regime_gate,
+            "cash_deployment_threshold_pct": self.cash_deployment_threshold_pct,
+            "position_size_pct": self.position_size_pct,
+            "position_risk_pct": self.position_risk_pct,
+            "stop_loss_pct": self.stop_loss_pct,
+            "ma_exit_period": self.ma_exit_period,
+            "ma_consecutive": self.ma_consecutive,
+            "signal_every_n_days": self.signal_every_n_days,
+            "min_canslim_score": self.min_canslim_score,
+            "min_rs_score": self.min_rs_score,
+            "min_technical_score": self.min_technical_score,
+            "technical_only": self.technical_only,
+            "data_mode": "point_in_time" if self.pit_bundle is not None else "provider_cache",
+            "pit_bundle_sha256": self.pit_bundle.sha256 if self.pit_bundle is not None else None,
+            "pit_data_cutoff": str(self.pit_bundle.data_cutoff.date()) if self.pit_bundle is not None else None,
+            "pit_manifest": self.pit_bundle.manifest() if self.pit_bundle is not None else None,
+            "take_profit_pct": self.take_profit_pct,
+            "scale_out_fraction": self.scale_out_fraction,
+            "stagnation_days": self.stagnation_days,
+            "stagnation_threshold_pct": self.stagnation_threshold_pct,
+            "breakeven_trigger_pct": self.breakeven_trigger_pct,
+            "industry_group_top_n": settings.INDUSTRY_GROUP_TOP_N,
+            "start_date": str(start_ts.date()),
+            "end_date": str(end_ts.date()),
+        }
+
+    def _checkpoint_payload(
+        self,
+        *,
+        fingerprint: str,
+        next_day_index: int,
+        total_days: int,
+        state_log_offset: int,
+        regime_tracker: MarketRegimeTracker,
+        pending_entries: list[dict],
+        benchmark_start_price: Optional[float],
+        completed: bool = False,
+        result_config: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
+            "fingerprint": fingerprint,
+            "next_day_index": next_day_index,
+            "total_days": total_days,
+            "state_log_offset": state_log_offset,
+            "completed": completed,
+            "equity": self._equity,
+            "open_positions": {
+                symbol: _trade_checkpoint_dict(trade)
+                for symbol, trade in self._open_positions.items()
+            },
+            "trades": [_trade_checkpoint_dict(trade) for trade in self._trades],
+            "execution_diagnostics": self._execution_diagnostics,
+            "pending_entries": pending_entries,
+            "benchmark_start_price": benchmark_start_price,
+            "regime": _regime_checkpoint_state(regime_tracker),
+        }
+        if result_config is not None:
+            payload["result_config"] = result_config
+        return _checkpoint_json_safe(payload)
+
+    def _result_from_checkpoint(
+        self,
+        checkpoint: dict[str, Any],
+        outputs: dict[str, list[Any]],
+        benchmark: str,
+    ) -> SimulationResult:
+        if not checkpoint.get("completed") or "result_config" not in checkpoint:
+            raise ValueError("portfolio checkpoint does not contain a completed result")
+        equity = pd.Series(
+            [float(row["equity"]) for row in outputs["equity"]],
+            index=pd.to_datetime([row["date"] for row in outputs["equity"]]),
+            dtype=float,
+        )
+        benchmark_curve = pd.Series(
+            [float(row["equity"]) for row in outputs["benchmark"]],
+            index=pd.to_datetime([row["date"] for row in outputs["benchmark"]]),
+            dtype=float,
+        )
+        return SimulationResult(
+            trades=[_trade_from_checkpoint(value) for value in checkpoint["trades"]],
+            equity_curve=equity,
+            benchmark_curve=benchmark_curve,
+            initial_capital=self.initial_capital,
+            config=checkpoint["result_config"],
+            transaction_log=pd.DataFrame(outputs["transactions"]),
+            weekly_holdings=pd.DataFrame(outputs["weekly"]),
+            signal_log=pd.DataFrame(outputs["signals"]),
+            execution_diagnostics={
+                str(key): int(value)
+                for key, value in checkpoint["execution_diagnostics"].items()
+            },
             benchmark_symbol=benchmark,
         )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import subprocess
@@ -693,6 +694,37 @@ def _fixed_args(args: argparse.Namespace) -> None:
             raise ValueError(f"fixed PIT baseline requires {field}={value}")
 
 
+def _run_portfolio(
+    simulator: Any,
+    tickers: list[str],
+    *,
+    checkpoint_path: Path,
+    progress_log_path: Path,
+    resume: bool,
+    checkpoint_every_days: int,
+) -> SimulationResult:
+    """Run the production simulator with resumability, preserving test doubles."""
+
+    kwargs: dict[str, Any] = {
+        "start_date": _START,
+        "end_date": _END,
+        "benchmark_symbol": _BENCHMARK,
+    }
+    parameters = inspect.signature(simulator.run).parameters
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_kwargs or "checkpoint_path" in parameters:
+        kwargs.update({
+            "checkpoint_path": checkpoint_path,
+            "progress_log_path": progress_log_path,
+            "resume": resume,
+            "checkpoint_every_days": checkpoint_every_days,
+        })
+    return simulator.run(tickers, **kwargs)
+
+
 def run_baseline(
     args: argparse.Namespace,
     *,
@@ -727,6 +759,11 @@ def run_baseline(
         datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ-") + expected_bundle_sha[:12]
     )
     run_dir.mkdir()
+    resume_checkpoint = (
+        Path(args.resume_checkpoint).resolve() if args.resume_checkpoint else None
+    )
+    portfolio_checkpoint = resume_checkpoint or (run_dir / "portfolio_checkpoint.json")
+    portfolio_progress = portfolio_checkpoint.with_name("portfolio_progress.jsonl")
     try:
         with PITDataBundle(paths["pit_bundle"], expected_sha256=expected_bundle_sha) as bundle:
             if bundle.metadata["evaluation_start"] != _START:
@@ -773,8 +810,13 @@ def run_baseline(
             )
             if len(leaders) != 100 or len(rolling) != 4_800:
                 raise ValueError("fixed baseline leader labels are incomplete")
-            result = portfolio_factory(pit_bundle=bundle).run(
-                tickers, start_date=_START, end_date=_END, benchmark_symbol=_BENCHMARK,
+            result = _run_portfolio(
+                portfolio_factory(pit_bundle=bundle),
+                tickers,
+                checkpoint_path=portfolio_checkpoint,
+                progress_log_path=portfolio_progress,
+                resume=resume_checkpoint is not None,
+                checkpoint_every_days=args.checkpoint_every_days,
             )
             basket_config = LeaderBasketConfig(
                 leader_count=100, rebalance_days=20, lookback_days=252,
@@ -933,6 +975,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--leader-count", type=_positive_int, default=_LEADERS)
     parser.add_argument("--rebalance-days", type=_positive_int, default=_REBALANCE)
     parser.add_argument("--output-root", required=True)
+    parser.add_argument(
+        "--resume-checkpoint",
+        help="resume a prior portfolio checkpoint instead of replaying its completed days",
+    )
+    parser.add_argument(
+        "--checkpoint-every-days",
+        type=_positive_int,
+        default=20,
+        help="persist a resumable portfolio checkpoint at this many trading days",
+    )
     return parser
 
 
