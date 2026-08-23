@@ -523,10 +523,13 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
         _a_score, bundle_annual, _roe = evaluate_a(
             facts["annual_income"], balance_sheet=facts["balance_sheet"]
         )
+        # The unchanged evaluators use NaN for an unavailable growth history.
+        # Treat that sentinel as missing coverage; non-finite values emitted by
+        # the signal log itself remain a hard error below.
         if bundle_current is not None and not math.isfinite(float(bundle_current)):
-            raise ValueError("PIT current-growth evaluator returned a non-finite value")
+            bundle_current = None
         if bundle_annual is not None and not math.isfinite(float(bundle_annual)):
-            raise ValueError("PIT annual-growth evaluator returned a non-finite value")
+            bundle_annual = None
         current_ok = bundle_current is not None
         annual_ok = bundle_annual is not None
 
