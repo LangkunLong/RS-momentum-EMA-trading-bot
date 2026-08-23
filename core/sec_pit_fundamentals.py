@@ -527,6 +527,11 @@ def _scan_candidate_issuers(
 ) -> Mapping[str, _Issuer]:
     target_tickers = set(union)
     target_names = {_name_key(names[ticker]) for ticker in union}
+    reviewed_ciks = {
+        expected_cik
+        for ticker, expected_cik in _REVIEWED_BASELINE_CIKS.items()
+        if ticker in target_tickers
+    }
     handle, members = _zip_members(submissions_archive, max_member_bytes=max_json_member_bytes)
     issuers: dict[str, _Issuer] = {}
     try:
@@ -536,8 +541,45 @@ def _scan_candidate_issuers(
                 continue
             cik = match.group("cik")
             payload = _json_member(handle, info)
+            # The SEC submissions bulk archive includes legacy/non-issuer
+            # records that can have empty names, malformed optional fields, or
+            # no ticker at all.  They cannot match the requested universe, so
+            # do not let their unrelated metadata abort the scan.  Once a
+            # record can match a requested ticker/name, `_issuer` remains the
+            # strict validator and rejects malformed candidate data.
+            raw_tickers = payload.get("tickers")
+            candidate_tickers = (
+                {
+                    ticker
+                    for value in raw_tickers
+                    if (ticker := _sec_ticker_or_none(value)) is not None
+                }
+                if isinstance(raw_tickers, list)
+                else set()
+            )
+            candidate_name = _name_key(payload.get("name", ""))
+            raw_former_names = payload.get("formerNames")
+            candidate_former_names = (
+                {
+                    _name_key(entry["name"])
+                    for entry in raw_former_names
+                    if isinstance(entry, dict) and "name" in entry
+                }
+                if isinstance(raw_former_names, list)
+                else set()
+            )
+            if not (
+                cik in reviewed_ciks
+                or
+                target_tickers.intersection(candidate_tickers)
+                or candidate_name in target_names
+                or target_names.intersection(candidate_former_names)
+            ):
+                continue
             issuer = _issuer(payload, cik)
             if (
+                cik in reviewed_ciks
+                or
                 target_tickers.intersection(issuer.tickers)
                 or issuer.current_name_key in target_names
                 or target_names.intersection(issuer.former_name_keys)
@@ -622,6 +664,23 @@ def _resolve_ciks(
     for ticker in union:
         if ticker not in ticker_resolved and ticker not in ticker_unresolved:
             ticker_unresolved[ticker] = ("no_exact_sec_identity", "no exact ticker or exact normalized-name match")
+
+    # A small set of reviewed PIT identity boundaries intentionally overrides
+    # present-day SEC ticker reuse (for example, PARA is now used by an
+    # unrelated issuer).  Require the reviewed CIK to exist in the archive and
+    # bind every interval for that ticker to it before emitting the result.
+    for ticker, expected_cik in _REVIEWED_BASELINE_CIKS.items():
+        if ticker not in union:
+            continue
+        if expected_cik in issuers:
+            ticker_resolved[ticker] = (expected_cik, "reviewed_baseline_cik")
+            ticker_unresolved.pop(ticker, None)
+        else:
+            ticker_resolved.pop(ticker, None)
+            ticker_unresolved[ticker] = (
+                "reviewed_baseline_cik_missing",
+                expected_cik,
+            )
 
     resolved: dict[_MembershipInterval, tuple[str, str]] = {}
     unresolved: dict[_MembershipInterval, tuple[str, str]] = {}
@@ -912,6 +971,16 @@ def _fact_form(value: object) -> tuple[str, str] | None:
     return None
 
 
+def _form_family(value: str) -> str:
+    """Compare SEC filing variants by their statement family."""
+    base = value.strip().upper().removesuffix("/A")
+    if base in {"10-Q", "10-QT"}:
+        return "10-Q"
+    if base in {"10-K", "10-KT"}:
+        return "10-K"
+    return base
+
+
 def _candidate_metadata(
     raw: Mapping[str, Any],
     *,
@@ -935,8 +1004,12 @@ def _candidate_metadata(
     period_end = _iso_date(raw["end"], "companyfacts end")
     acceptance_record = acceptances.get(accession)
     if acceptance_record is not None:
-        if acceptance_record.form != form or acceptance_record.filed_date != filed:
+        if _form_family(acceptance_record.form) != _form_family(form):
             raise ValueError(f"submission/companyfacts metadata mismatch for CIK {cik} accession {accession}")
+        if acceptance_record.form != form:
+            counters["submission_companyfacts_form_variant_count"] += 1
+        if acceptance_record.filed_date != filed:
+            counters["submission_companyfacts_filed_date_mismatch_count"] += 1
         acceptance = acceptance_record.acceptance_datetime
         basis = "acceptance_datetime"
         source_date = acceptance.date()
@@ -954,7 +1027,8 @@ def _candidate_metadata(
         counters["pre_window_fact_omissions"] += 1
         return None
     if public_date <= period_end:
-        raise ValueError(f"fundamental public date is not after period end for CIK {cik} accession {accession}")
+        counters["public_before_period_end_fact_omissions"] += 1
+        return None
     return (
         accession,
         form,
