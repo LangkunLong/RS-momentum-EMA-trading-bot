@@ -317,6 +317,24 @@ The basket ranks only members known on each rebalance date and reports its
 return, benchmark return, drawdown, Sharpe, cash utilization, and rebalance
 transactions independently from tactical CANSLIM entries.
 
+### Five-year public PIT baseline
+
+The completed, immutable 2021--2025 public point-in-time (PIT) baseline is a
+logic-verification comparison point. Its bundle SHA-256 is
+`8ca8242dd67db30d456a2b1861f7e7399f8ca418079738ab150d4e44865763c5` and its
+completed run directory is:
+
+```text
+.artifacts/pit-baseline/run-20260823e/run-20260823T071322Z-8ca8242dd67d
+```
+
+Do not delete, overwrite, or treat that run as a fully coverage-gated strategy
+performance verdict: it was intentionally published with
+`--allow-incomplete-fundamentals`. The evaluated quarterly-plus-annual
+fundamental coverage is 80.20768935%, below the 90% gate. The operator
+workflow, exact provenance, findings, and the next-milestone decision record
+are in [docs/pit-baseline-data-provenance.md](docs/pit-baseline-data-provenance.md).
+
 Backtest execution treats the market-direction score as diagnostics by default:
 an otherwise-valid signal is sized and entered whenever cash is available. Use
 `--require-bullish-market` only for an explicit conservative M-gated replay.
