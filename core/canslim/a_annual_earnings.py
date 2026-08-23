@@ -48,7 +48,8 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
         return None
 
     try:
-        return (current - previous) / abs(previous)
+        growth = (current - previous) / abs(previous)
+        return growth if np.isfinite(growth) else None
     except ZeroDivisionError:
         return None
 

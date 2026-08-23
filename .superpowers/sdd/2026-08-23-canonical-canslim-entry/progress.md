@@ -202,3 +202,16 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
 - **Task 4 remains incomplete:** Step 4 immutable SEC-output/PIT-bundle
   regeneration is pending completion of the active multi-hour replay and
   release of shared-machine resources.
+
+### Task 4 — Fix Round 1 (non-completion)
+
+- Review found finite extreme C/A operands could overflow the calculated
+  growth. Both helpers now return computed growth only when finite, preserving
+  every prior input/negative/zero/EPS/fallback rule.
+- Focused direct helper probe passed for finite-input overflow, `NaN`,
+  `+inf`, `-inf`, and the ordinary `1.25/1.0` control in both helpers.
+  Touched-file compile/import, Ruff, and `git diff --check` passed; the
+  immutable CAH `2021-05-13` probe again produced finite-or-missing values
+  with an unchanged bundle hash.
+- **Task 4 remains incomplete:** Step 4 regeneration is pending active replay
+  completion and shared-machine resources.

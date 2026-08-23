@@ -42,3 +42,30 @@ Status: production fixes and narrow probes complete; Task 4 is **not complete**.
 
 Do not begin immutable SEC-output/PIT-bundle regeneration until the active
 multi-hour replay has completed and shared-machine capacity is available.
+
+## Fix Round 1 — finite computed growth
+
+Independent review identified that finite extreme operands could overflow the
+growth numerator to infinity. Both C/A `_safe_growth` helpers now assign the
+computed quotient and return it only when `np.isfinite(growth)`; all existing
+input, negative-prior, near-zero-prior, EPS-first, and Net-Income fallback
+semantics are unchanged.
+
+Commands and output:
+
+- `python -m py_compile core/canslim/c_current_earnings.py
+  core/canslim/a_annual_earnings.py` — passed.
+- Direct helper probe covering
+  `(-sys.float_info.max, sys.float_info.max)`, `NaN`, `+inf`, `-inf`, and
+  `(1.25, 1.0)` for both C/A helpers —
+  `safe_growth_extreme_nan_inf_and_control_probe=passed`.
+- `python -m ruff check core/canslim/c_current_earnings.py
+  core/canslim/a_annual_earnings.py` — `All checks passed!`.
+- `git diff --check` — passed.
+- Immutable SQLite CAH probe at `2021-05-13` —
+  `cah_2021_05_13=(0.0, None, 0.09999999999999999,
+  -3.771428571428572, -2.064804469273743);
+  bundle_read_only_hash_unchanged=passed`.
+
+Task 4 remains incomplete: Step 4 regeneration is still pending active replay
+completion and shared-machine capacity.
