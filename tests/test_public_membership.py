@@ -270,3 +270,15 @@ def test_reverse_replay_derives_seed_and_rejects_inconsistent_history() -> None:
         _normalize(duplicated, _PINNED_URL, date(2024, 1, 1), date(2024, 1, 3), mappings={})
     with pytest.raises(ValueError, match="unreviewed punctuation alias"):
         canonical_ticker("ACME.A")
+
+
+def test_reverse_replay_rejects_a_removal_that_was_not_active() -> None:
+    """Break caught: a repeated historical removal fabricated an impossible member state."""
+    raw = b"""
+    <table><tr><th>Symbol</th><th>Security</th></tr><tr><td>AAA</td><td>Alpha</td></tr></table>
+    <table><tr><th>Effective Date</th><th>Added Ticker</th><th>Added Security</th><th>Removed Ticker</th><th>Removed Security</th></tr>
+    <tr><td>2024-01-03</td><td></td><td></td><td>OLD</td><td>Old</td></tr>
+    <tr><td>2024-01-02</td><td></td><td></td><td>OLD</td><td>Old</td></tr></table>
+    """
+    with pytest.raises(ValueError, match="unresolvable historical membership transition"):
+        _normalize(raw, _PINNED_URL, date(2024, 1, 1), date(2024, 1, 3), mappings={})
