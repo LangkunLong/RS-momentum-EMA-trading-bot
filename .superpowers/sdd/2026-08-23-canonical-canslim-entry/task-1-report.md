@@ -77,3 +77,54 @@ exact inclusive eligibility assertions; no production change was needed.
 - Task 2 must consume `entry_facts`/`entry_decision` in the PIT strategy; the
   PIT-local cadence, PEG branch, and next-open behavior were intentionally not
   changed here.
+
+## Independent-review fix round 1
+
+The original scope and probe record above describes commit `ee82414`. This fix
+round supersedes its `BUY_SIGNAL` compatibility-alias wording without rewriting
+that historical record.
+
+### Important findings closed
+
+- `build_entry_facts` now fails closed before all other blockers when close and
+  volume lengths differ. Series-like inputs also require both inputs to carry
+  exactly equal indexes; positional data with a one-session index shift cannot
+  qualify. The new ordered reasons are `close_volume_length_mismatch` followed
+  by `close_volume_index_mismatch` when both apply.
+- Scanner RS and non-M composite overrides now use the effective floors
+  `max(canonical floor, caller floor)`. The same effective RS floor is used by
+  the bulk prefilter and candidate classification. Lower caller values cannot
+  weaken 80/70; higher values tighten. Legacy fundamental/breakout strictness
+  arguments remain accepted but inert.
+- `backtest.py` retains `TECHNICAL_SETUP` as the completed-session diagnostic,
+  computes a separate non-M entry composite using the existing active weights
+  renormalized after excluding M, and derives `BUY_SIGNAL` from
+  `evaluate_entry_contract` with point-in-time current/annual growth and RS.
+  Market remains a separate reported fact and PEG remains diagnostic only.
+  Existing columns remain, with additive `Entry_Composite_Score` and
+  `Entry_Blockers` audit columns.
+
+### Direct adversarial and boundary probes
+
+The final direct probe exited `0` and reported:
+
+```text
+boundaries exact=True epsilons=False prior_volume=True prior_pivot=True plus5=True market_independent=True peg_non_bypass=True
+alignment ('close_volume_length_mismatch', 'close_volume_index_mismatch', 'insufficient_prior_volume_history') ('close_volume_index_mismatch',)
+scanner canonical_floor=True tightening=True bulk_consistent=True
+after_close True False
+backtest [{'TECHNICAL_SETUP': True, 'BUY_SIGNAL': False, 'Entry_Blockers': 'current_growth_below_threshold'}]
+```
+
+The scanner probe separately exercised lower 0/0 caller floors, stricter 90 RS
+and 90 composite floors, and both lower/stricter bulk RS prefilters. The
+backtest helper separately rejected epsilon-low C, A, RS, and composite inputs
+while ignoring bearish market and refusing a PEG bypass. No unit tests or broad
+suite were run, per the required sequencing.
+
+### Fix-round static verification
+
+- Relevant imports: `relevant imports: ok` (exit `0`).
+- Relevant `py_compile`: exit `0`.
+- Relevant Ruff check: `All checks passed!` (exit `0`).
+- `git diff --check`: exit `0` (line-ending conversion warnings only).

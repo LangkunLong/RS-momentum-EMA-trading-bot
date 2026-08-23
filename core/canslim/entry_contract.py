@@ -80,9 +80,20 @@ def build_entry_facts(closes: Iterable[object], volumes: Iterable[object]) -> Ca
     close, up to 252 closes before the event, and exactly 50 volumes before the
     event plus the event volume itself.
     """
+    reasons: list[str] = []
+    close_index = _explicit_index(closes)
+    volume_index = _explicit_index(volumes)
     close_values = tuple(closes)
     volume_values = tuple(volumes)
-    reasons: list[str] = []
+
+    if len(close_values) != len(volume_values):
+        reasons.append("close_volume_length_mismatch")
+    if (close_index is None) != (volume_index is None) or (
+        close_index is not None
+        and volume_index is not None
+        and not _indexes_equal(close_index, volume_index)
+    ):
+        reasons.append("close_volume_index_mismatch")
 
     event_close = _finite_at(close_values, -1)
     prior_close = _finite_at(close_values, -2)
@@ -158,6 +169,26 @@ def build_entry_facts(closes: Iterable[object], volumes: Iterable[object]) -> Ca
         eligible=not ordered_reasons,
         blocking_reasons=ordered_reasons,
     )
+
+
+def _explicit_index(values: Iterable[object]) -> object | None:
+    """Return an index carried by a Series-like input, excluding list.index."""
+    index = getattr(values, "index", None)
+    return None if index is None or callable(index) else index
+
+
+def _indexes_equal(left: object, right: object) -> bool:
+    """Compare index-bearing inputs without coercing or positionally aligning them."""
+    equals = getattr(left, "equals", None)
+    if callable(equals):
+        try:
+            return bool(equals(right))
+        except (TypeError, ValueError):
+            return False
+    try:
+        return tuple(left) == tuple(right)  # type: ignore[arg-type]
+    except TypeError:
+        return False
 
 
 def evaluate_entry_contract(

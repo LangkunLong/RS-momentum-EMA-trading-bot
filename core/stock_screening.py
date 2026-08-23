@@ -7,6 +7,7 @@ filtering for stocks with strong fundamentals, technical strength, and market le
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -21,8 +22,23 @@ from config.settings import (
     WATCHLIST_MIN_CANSLIM_SCORE,
 )
 from core.canslim import MarketTrend, evaluate_canslim, evaluate_market_direction
-from core.canslim.entry_contract import CanslimEntryDecision
+from core.canslim.entry_contract import (
+    MIN_COMPOSITE_SCORE as CANONICAL_MIN_COMPOSITE_SCORE,
+    MIN_RS_SCORE as CANONICAL_MIN_RS_SCORE,
+    CanslimEntryDecision,
+)
 from core.momentum_analysis import calculate_rs_scores_for_tickers
+
+
+def _tightened_floor(canonical_floor: float, caller_floor: object) -> float:
+    """Return a finite caller floor only when it tightens the canonical floor."""
+    try:
+        requested = float(caller_floor)
+    except (TypeError, ValueError, OverflowError):
+        return canonical_floor
+    if math.isnan(requested):
+        return canonical_floor
+    return max(canonical_floor, requested)
 
 
 def _classify_canslim_candidate(
@@ -36,16 +52,25 @@ def _classify_canslim_candidate(
 ) -> tuple[str, List[str]]:
     """Classify a canonical entry decision without duplicating its gates.
 
-    Legacy threshold and strictness arguments remain accepted for API
-    compatibility. They cannot loosen or replace the fixed shared contract.
+    Caller thresholds may tighten but cannot loosen the fixed shared contract.
+    The legacy fundamental and breakout strictness arguments remain accepted
+    for API compatibility but are intentionally inert.
     """
     notes: List[str] = []
 
-    entry_composite_score = float(canslim_view.get("entry_composite_score", 0.0))
+    entry_decision = canslim_view.get("entry_decision")
+    if isinstance(entry_decision, CanslimEntryDecision):
+        rs_score = float(entry_decision.rs_score or 0.0)
+        entry_composite_score = float(entry_decision.composite_score or 0.0)
+    else:
+        rs_score = float(canslim_view.get("rs_score", 0.0))
+        entry_composite_score = float(canslim_view.get("entry_composite_score", 0.0))
+    effective_rs_floor = _tightened_floor(CANONICAL_MIN_RS_SCORE, min_rs_score)
+    effective_composite_floor = _tightened_floor(
+        CANONICAL_MIN_COMPOSITE_SCORE, min_canslim_score
+    )
     market = canslim_view.get("market_trend")
     metrics = canslim_view.get("metrics", {})
-    entry_decision = canslim_view.get("entry_decision")
-
     market_is_bullish = bool(getattr(market, "is_bullish", False))
 
     if bool(metrics.get("fmp_quota_deferred", False)):
@@ -53,7 +78,10 @@ def _classify_canslim_candidate(
 
     market_permission = market_is_bullish if require_bullish_market else True
     contract_eligible = isinstance(entry_decision, CanslimEntryDecision) and entry_decision.eligible
-    if contract_eligible and market_permission:
+    caller_thresholds_met = (
+        rs_score >= effective_rs_floor and entry_composite_score >= effective_composite_floor
+    )
+    if contract_eligible and caller_thresholds_met and market_permission:
         return "actionable_buy", []
 
     if entry_composite_score < watchlist_min_score:
@@ -63,6 +91,10 @@ def _classify_canslim_candidate(
         notes.extend(entry_decision.blocking_reasons)
     else:
         notes.append("entry_contract_unavailable")
+    if rs_score < effective_rs_floor:
+        notes.append("below_rs_threshold")
+    if entry_composite_score < effective_composite_floor:
+        notes.append("below_buy_score")
     if require_bullish_market and not market_is_bullish:
         notes.append("market_not_bullish")
     if not notes:
@@ -177,12 +209,17 @@ def evaluate_stock_canslim(
         )
 
     rs_score = float(canslim_view["rs_score"])
-    _debug(f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | Canonical Minimum: {MIN_RS_SCORE:.1f}")
+    effective_rs_floor = _tightened_floor(CANONICAL_MIN_RS_SCORE, min_rs_score)
+    effective_composite_floor = _tightened_floor(
+        CANONICAL_MIN_COMPOSITE_SCORE, min_canslim_score
+    )
+    _debug(f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | Effective Minimum: {effective_rs_floor:.1f}")
     total_score = float(canslim_view["total_score"])
     entry_score = float(canslim_view.get("entry_composite_score", 0.0))
     _debug(
         f"[DEBUG] Entry Composite (non-M): {entry_score:.1f} | "
-        f"Canonical Minimum: {MIN_CANSLIM_SCORE:.1f} | Legacy M-inclusive Total: {total_score:.1f}"
+        f"Effective Minimum: {effective_composite_floor:.1f} | "
+        f"Legacy M-inclusive Total: {total_score:.1f}"
     )
     category, notes = _classify_canslim_candidate(
         canslim_view,
@@ -278,6 +315,7 @@ def screen_stocks_canslim_detailed(
 
     # Pre-filter: discard symbols whose RS score is already below the threshold
     # to avoid wasting API calls on weak stocks
+    effective_rs_floor = _tightened_floor(CANONICAL_MIN_RS_SCORE, min_rs_score)
     filtered_symbols = []
     rs_score_by_symbol: Dict[str, float] = {}
     rs_below_threshold = 0
@@ -294,17 +332,21 @@ def screen_stocks_canslim_detailed(
             rs_val = 0
             rs_not_found += 1
 
-        if rs_val >= MIN_RS_SCORE:
+        if rs_val >= effective_rs_floor:
             filtered_symbols.append(symbol)
             rs_score_by_symbol[symbol] = rs_val
         else:
             rs_below_threshold += 1
             if debug:
-                print(f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < {MIN_RS_SCORE}, skipped")
+                print(
+                    f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < "
+                    f"{effective_rs_floor:.1f}, skipped"
+                )
 
     if debug:
         print(
-            f"[DEBUG] Pre-filter: {rs_below_threshold} stocks below RS {MIN_RS_SCORE} | "
+            f"[DEBUG] Pre-filter: {rs_below_threshold} stocks below RS "
+            f"{effective_rs_floor:.1f} | "
             f"{rs_not_found} not found in RS universe | "
             f"{len(filtered_symbols)}/{len(symbols_list)} passed"
         )

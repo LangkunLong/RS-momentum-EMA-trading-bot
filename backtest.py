@@ -30,7 +30,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import settings
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
-from core.canslim.entry_contract import CanslimEntryFacts, build_entry_facts
+from core.canslim.entry_contract import (
+    CanslimEntryFacts,
+    build_entry_facts,
+    evaluate_entry_contract,
+)
 from core.canslim.i_institutional import evaluate_i
 from core.canslim.m_market_direction import evaluate_m
 from core.canslim.s_supply_demand import evaluate_s
@@ -257,6 +261,46 @@ def _compute_canslim_score(
     institutional_data_available: bool = True,
 ) -> float:
     """Compute weighted CANSLIM composite score (0-100)."""
+    weights = _active_canslim_weights(institutional_data_available)
+    score = (
+        weights["C"] * c
+        + weights["A"] * a
+        + weights["N"] * n
+        + weights["S"] * s
+        + weights["L"] * l_score
+        + weights["I"] * i
+        + weights["M"] * m
+    ) * 100
+    return float(score)
+
+
+def _compute_entry_composite_score(
+    c: float,
+    a: float,
+    n: float,
+    s: float,
+    l_score: float,
+    i: float,
+    institutional_data_available: bool = True,
+) -> float:
+    """Compute the non-M entry composite, renormalized to 100%."""
+    weights = _active_canslim_weights(institutional_data_available)
+    entry_weight = sum(weight for key, weight in weights.items() if key != "M")
+    if entry_weight <= 0:
+        return 0.0
+    score = (
+        weights["C"] * c
+        + weights["A"] * a
+        + weights["N"] * n
+        + weights["S"] * s
+        + weights["L"] * l_score
+        + weights["I"] * i
+    ) * 100 / entry_weight
+    return float(score)
+
+
+def _active_canslim_weights(institutional_data_available: bool) -> Dict[str, float]:
+    """Return the existing active component weights for one evaluation."""
     weights = {
         "C": settings.CANSLIM_WEIGHT_C,
         "A": settings.CANSLIM_WEIGHT_A,
@@ -275,21 +319,15 @@ def _compute_canslim_score(
                 if key != "I":
                     weights[key] = weights[key] / remaining_weight
 
-    score = (
-        weights["C"] * c
-        + weights["A"] * a
-        + weights["N"] * n
-        + weights["S"] * s
-        + weights["L"] * l_score
-        + weights["I"] * i
-        + weights["M"] * m
-    ) * 100
-    return float(score)
+    return weights
 
 
 def _should_emit_buy_signal(
     *,
     entry_facts: CanslimEntryFacts | None = None,
+    current_growth: object = None,
+    annual_growth: object = None,
+    composite_score: object = None,
     total_score: float | None = None,
     rs_score: float | None = None,
     market_is_bullish: bool | None = None,
@@ -298,13 +336,21 @@ def _should_emit_buy_signal(
     has_peg_today: bool | None = None,
     in_buy_zone: bool = True,
 ) -> bool:
-    """Return the shared technical setup result for the simple backtest.
+    """Return the full shared CANSLIM decision for the simple backtest.
 
-    The legacy keyword arguments remain accepted for call compatibility but are
-    diagnostic only. In particular, a price/volume power gap cannot bypass the
-    canonical completed-session setup.
+    Market and the legacy technical/PEG keywords remain accepted for call
+    compatibility but are diagnostic only. ``total_score`` is M-inclusive and
+    therefore cannot substitute for the non-M ``composite_score``.
     """
-    return bool(entry_facts is not None and entry_facts.eligible)
+    if entry_facts is None:
+        return False
+    return evaluate_entry_contract(
+        entry_facts,
+        current_growth=current_growth,
+        annual_growth=annual_growth,
+        rs_score=rs_score,
+        composite_score=composite_score,
+    ).eligible
 
 
 # ---------------------------------------------------------------------------
@@ -397,25 +443,32 @@ def run_backtest() -> pd.DataFrame:
                 m=m_score,
                 institutional_data_available=bool(fund.get("institutional_data_available", False)),
             )
-
-            # --- UPDATED SIGNAL LOGIC ---
-            has_breakout = bool(tech.get("is_breakout", False))
-            has_surge = bool(tech.get("has_volume_surge", False))
+            entry_composite = _compute_entry_composite_score(
+                c=c_score,
+                a=a_score,
+                n=tech["n_score"],
+                s=tech["s_score"],
+                l_score=l_score,
+                i=i_score,
+                institutional_data_available=bool(fund.get("institutional_data_available", False)),
+            )
 
             # Only count the Power Earnings Gap if it happened exactly on this eval date (days_ago == 0)
             peg_details = tech.get("power_gap_details") or {}
             has_peg_today = bool(tech.get("has_power_gap", False)) and peg_details.get("days_ago") == 0
 
-            technical_setup = _should_emit_buy_signal(
-                entry_facts=tech.get("entry_facts"),
-                total_score=total,
-                rs_score=rs_score,
-                market_is_bullish=bool(m_bullish),
-                has_breakout=has_breakout,
-                has_volume_surge=has_surge,
-                has_peg_today=has_peg_today,
-                in_buy_zone=bool(tech.get("in_buy_zone", True)),
+            entry_facts = tech.get("entry_facts")
+            technical_setup = bool(
+                isinstance(entry_facts, CanslimEntryFacts) and entry_facts.eligible
             )
+            entry_decision = evaluate_entry_contract(
+                entry_facts,
+                current_growth=fund.get("current_growth"),
+                annual_growth=fund.get("annual_growth"),
+                rs_score=rs_score,
+                composite_score=entry_composite,
+            )
+            buy_signal = entry_decision.eligible
             close_price = tech["close"]
 
             records.append(
@@ -425,6 +478,7 @@ def run_backtest() -> pd.DataFrame:
                     "Close": round(close_price, 2),
                     "RS_Score": round(rs_score, 1),
                     "CANSLIM_Score": round(total, 1),
+                    "Entry_Composite_Score": round(entry_composite, 1),
                     "C": round(c_score * 100, 0),
                     "A": round(a_score * 100, 0),
                     "N": round(tech["n_score"] * 100, 0),
@@ -440,8 +494,9 @@ def run_backtest() -> pd.DataFrame:
                     "Has_Vol_Surge": tech.get("has_volume_surge", False),
                     "Has_PEG": has_peg_today,
                     "Setup_Blockers": ",".join(tech.get("entry_blocking_reasons", ())),
+                    "Entry_Blockers": ",".join(entry_decision.blocking_reasons),
                     "TECHNICAL_SETUP": technical_setup,
-                    "BUY_SIGNAL": technical_setup,
+                    "BUY_SIGNAL": buy_signal,
                 }
             )
 
@@ -456,20 +511,21 @@ def print_results(df: pd.DataFrame) -> None:
         return
 
     print("\n" + "=" * 100)
-    print("BACKTEST RESULTS — TECHNICAL SETUPS")
+    print("BACKTEST RESULTS — FULL CANSLIM BUY SIGNALS")
     print("=" * 100)
     print(
         "NOTE: C, A, I scores use point-in-time FMP data (filtered by SEC filing date).\n"
         "      N, S, L, M scores are calculated from historical price data.\n"
-        "      BUY_SIGNAL is a compatibility alias for the shared technical setup only;\n"
-        "      it is not a full C/A/RS/composite CANSLIM entry decision.\n"
+        "      TECHNICAL_SETUP reports the shared completed-session price/volume setup.\n"
+        "      BUY_SIGNAL additionally requires PIT C/A, RS, and the non-M entry composite;\n"
+        "      market regime is reported separately and PEG remains diagnostic only.\n"
     )
 
     buys = df[df["BUY_SIGNAL"]]
     if buys.empty:
-        print("No canonical completed-session technical setups were generated.\n")
+        print("No full canonical CANSLIM buy signals were generated.\n")
     else:
-        print(f"Technical setups generated: {len(buys)}\n")
+        print(f"Full CANSLIM buy signals generated: {len(buys)}\n")
         print(
             f"{'Date':<12} {'Ticker':<7} {'Close':>8} {'RS':>5} {'CANSLIM':>8} "
             f"{'C':>4} {'A':>4} {'N':>4} {'S':>4} {'L':>4} {'I':>4} {'M':>4} "

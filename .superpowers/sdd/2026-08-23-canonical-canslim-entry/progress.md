@@ -66,3 +66,20 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
 - After-close and the simple backtest consume shared technical setup eligibility only. The simple backtest retains its public shape and explicitly labels `BUY_SIGNAL` as a technical compatibility alias; PEG remains diagnostic and cannot bypass qualification.
 - Direct boundary/caller probes passed, including market independence and PEG non-bypass. Relevant imports, compile, Ruff, and diff checks passed. Unit tests/broad suite were intentionally deferred per operator sequencing.
 - Detailed evidence and compatibility notes: `.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-1-report.md`.
+
+### Task 1 independent review — fix round 1
+
+- NOT PASS: 0 Critical, 3 Important, 0 Minor.
+- Shared fact construction must reject unequal lengths and mismatched pandas indexes; a one-day-shifted close/volume pair incorrectly qualified.
+- Scanner override parameters must use `max(canonical floor, caller floor)` consistently; stricter operator RS/composite thresholds were ignored.
+- `backtest.py` must keep `TECHNICAL_SETUP` diagnostic but derive public `BUY_SIGNAL` from the full shared decision using its already available point-in-time C/A, RS, and non-M composite inputs. A technical-only alias cannot be consumed as a CANSLIM buy.
+- Task 2 remains blocked until all three findings close and a fresh independent re-review passes.
+
+### Task 1 independent-review fix round 1 implementation
+
+- Closed the alignment finding with ordered length/index mismatch blockers; unequal histories and equal-length one-session-shifted pandas indexes both fail closed.
+- Closed the scanner override finding by applying `max(canonical, caller)` to RS and non-M entry-composite classification floors and the same effective RS floor to bulk prefiltering. Lower 0/0 floors preserved 80/70 and 90/90 tightened; legacy fundamental/breakout strictness arguments remain inert.
+- Closed the simple-backtest finding: `TECHNICAL_SETUP` remains diagnostic, while `BUY_SIGNAL` now uses the full shared decision with PIT C/A, RS, and a renormalized non-M entry composite at fixed floors. Market remains separate and PEG diagnostic only. Existing public columns were preserved and entry composite/blockers added for auditability.
+- Fresh adversarial probes passed for both alignment failures, lower/stricter scanner floors and bulk prefilter consistency, all four backtest full-decision threshold failures, market independence, and PEG non-bypass. The mocked public backtest row proved `TECHNICAL_SETUP=True` with `BUY_SIGNAL=False` for epsilon-low C.
+- Prior Task 1 boundary and after-close probes passed again. Unit tests and the broad suite remained intentionally deferred. Detailed fix-round evidence is appended to `task-1-report.md`.
+- A fresh independent re-review is still required before Task 2 begins.
