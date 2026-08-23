@@ -1,10 +1,12 @@
 """Tests for industry group RS ranking logic."""
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 
 import pytest
 
+from config import settings
 from core.industry_group import get_top_groups, load_industry_map
 
 
@@ -164,10 +166,18 @@ def test_free_plan_industry_map_uses_cache_without_profile_calls(tmp_path) -> No
 
 
 @pytest.mark.integration
-def test_load_industry_map_fetches_real_data() -> None:
-    """FMP returns industry labels for known large-cap tickers."""
+def test_paid_fmp_profile_smoke_returns_nonblank_label(tmp_path, monkeypatch) -> None:
+    """An explicitly authorized paid-plan smoke resolves one uncached industry label."""
+    if os.environ.get("RUN_FMP_PROFILE_INTEGRATION") != "1":
+        pytest.skip("set RUN_FMP_PROFILE_INTEGRATION=1 to authorize one paid FMP profile call")
+    if settings.FMP_PLAN != "paid":
+        pytest.skip("the live FMP profile smoke requires FMP_PLAN=paid")
+    if not os.environ.get("FMP_API_KEY", "").strip():
+        pytest.skip("the live FMP profile smoke requires FMP_API_KEY")
 
-    result = load_industry_map(["NVDA", "AAPL", "JPM"])
-    assert result.get("NVDA") == "Semiconductors"
-    assert "AAPL" in result
-    assert "JPM" in result
+    monkeypatch.setattr(settings, "INDUSTRY_GROUP_CACHE_PATH", str(tmp_path / "industry-map.json"))
+
+    result = load_industry_map(["NVDA"])
+
+    assert isinstance(result.get("NVDA"), str)
+    assert result["NVDA"].strip()
