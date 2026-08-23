@@ -5,6 +5,7 @@ skipped by default. Run them explicitly with: pytest -m integration
 """
 
 import inspect
+from unittest.mock import patch
 
 import pytest
 import pandas as pd
@@ -25,20 +26,22 @@ def test_index_aliases_contain_large_cap() -> None:
     assert "nasdaq100" in mapped
 
 
-@pytest.mark.integration
 def test_index_routing_large_cap_alias_resolves() -> None:
-    """get_index_tickers('large_cap') must return a non-empty list of string tickers.
+    """The large-cap route combines and deduplicates S&P 500 and Nasdaq-100 symbols."""
+    index_members = {
+        "sp500": ["AAPL", "MSFT"],
+        "nasdaq100": ["MSFT", "NVDA"],
+    }
 
-    Requires network access to iShares ETF CSV endpoints.
-    """
-    tickers = quality_stocks.get_index_tickers("large_cap")
-    assert isinstance(tickers, list), "Expected get_index_tickers to return a list"
-    assert len(tickers) > 0, "Ticker list for 'large_cap' must not be empty"
-    assert all(isinstance(t, str) for t in tickers), "All tickers must be strings"
+    with patch(
+        "quality_stocks._fetch_single_index",
+        side_effect=lambda index, _force_refresh: index_members[index],
+    ):
+        tickers = quality_stocks.get_index_tickers("large_cap")
+        stocks = quality_stocks.get_quality_stock_list(sectors=["large_cap"])
 
-    stocks = quality_stocks.get_quality_stock_list(sectors=["large_cap"])
-    assert stocks is not None, "get_quality_stock_list returned None instead of a list"
-    assert isinstance(stocks, list)
+    assert tickers == ["AAPL", "MSFT", "NVDA"]
+    assert stocks == tickers
 
 
 # ─── Module import integrity ──────────────────────────────────────────────────

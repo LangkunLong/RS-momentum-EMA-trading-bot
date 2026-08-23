@@ -249,7 +249,7 @@ class IndexTickerFetcher:
             return None
 
     def _save_cache(self, data: Dict) -> None:
-        data["timestamp"] = datetime.now().isoformat()
+        data.setdefault("timestamp", datetime.now().isoformat())
         with open(self.cache_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
@@ -403,9 +403,10 @@ class IndexTickerFetcher:
         Returns:
             Flat list of ticker strings, optionally deduplicated.
         """
+        cache_data = self._load_cache()
+
         # Check cache first (unless force refresh)
         if not force_refresh:
-            cache_data = self._load_cache()
             if cache_data and "tickers" in cache_data:
                 cached_indices = cache_data.get("indices", [])
                 requested_indices = indices or ["sp500", "nasdaq100", "russell2000"]
@@ -431,12 +432,18 @@ class IndexTickerFetcher:
         print("Fetching fresh ticker data from indices...")
         index_tickers = self.fetch_all_index_tickers(indices)
 
-        self._save_cache(
-            {
-                "indices": list(index_tickers.keys()),
-                "tickers": index_tickers,
-            }
-        )
+        cached_tickers = dict(cache_data.get("tickers", {})) if cache_data else {}
+        retained_cached_indices = set(cached_tickers) - set(index_tickers)
+        combined_tickers = dict(cached_tickers)
+        combined_tickers.update(index_tickers)
+
+        combined_cache = {
+            "indices": list(combined_tickers.keys()),
+            "tickers": combined_tickers,
+        }
+        if cache_data and retained_cached_indices:
+            combined_cache["timestamp"] = cache_data["timestamp"]
+        self._save_cache(combined_cache)
 
         all_tickers = []
         for tickers in index_tickers.values():
