@@ -129,3 +129,43 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
   intentionally deferred.
 - Detailed evidence and deferred-fixture note:
   `.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-2-report.md`.
+
+### Task 2 independent review — fix round 1
+
+- NOT PASS: two independent reviews found 0 Critical and 7 distinct Important issues.
+- Validate finite-pivot data/open/buy-zone before any capacity eviction; an overextended new signal must not sell an existing holding and then reject.
+- Preserve positional `SimulationResult` compatibility by appending `entry_outcomes` after the existing `benchmark_symbol` field.
+- Gate attribution must use canonical `entry_composite_score`, never the legacy M-inclusive `canslim_score`.
+- Reconciliation must bind each outcome to the exact signal pivot and each executed outcome to the exact BUY price, and enforce outcome-specific required/null facts.
+- Normalize every emitted signal numeric to a finite built-in float or `None`; known pre-Task-4 non-finite fundamentals cannot leak NaN into in-memory/public rows.
+- Validate the full signal log as one row per uppercase symbol/benchmark session, with no off-calendar or duplicate evaluations; daily funnel totals must equal the source log.
+- For the fixed no-market-gate baseline, require `buy_signal == entry_contract_eligible`, finite positive pivot for every qualifying row, and consistent attempted/executed/qualified/pending/truncation funnel bounds.
+- Task 3 remains blocked until all issues close and both independent re-review gates pass.
+
+### Task 2 review-fix implementation
+
+- Closed the eviction-order defect: candidate data/open/finite-pivot zone now
+  validates before capacity eviction, while already-open precedence and one
+  terminal outcome per attempt remain intact.
+- Restored positional `SimulationResult` compatibility by appending outcomes
+  after `benchmark_symbol`; changed leader failure attribution to the canonical
+  non-M composite and fixed 70-point floor.
+- Strengthened reconciliation with exact signal-pivot and rounded BUY-price
+  joins plus outcome-specific fact/nullability rules. Valid legacy missing-pivot
+  execution remains supported; impossible causal ledgers fail closed.
+- Normalized every numeric signal scalar to finite built-in float or `None` and
+  bound emitted C/A/RS/composite fields to the full decision's normalized
+  values. A non-finite-fundamental row is JSON-safe and cannot qualify; PEG
+  remains diagnostic.
+- Added all-row symbol/calendar/uniqueness validation, rowwise fixed-baseline
+  buy/eligibility equivalence, qualifying pivot/technical checks, exact
+  evaluated totals, per-day funnel bounds, and explicit
+  qualified/attempted/truncated/final-pending accounting.
+- Fresh adversarial and prior Task 2 probes passed for both eviction paths,
+  positional compatibility, composite attribution, pivot/BUY-price mismatch,
+  all terminal outcome shapes, non-finite JSON safety, daily duplicates and
+  off-calendar rows, qualification/accounting mismatches, inclusive next-open
+  boundaries, market/PEG/technical separation, and checkpoint v1/v2/journal
+  behavior. Relevant compile/import, Ruff, and diff checks passed; broad/unit
+  tests remain deferred.
+- Both independent re-review gates are still required before Task 3 may run.

@@ -313,8 +313,8 @@ class SimulationResult:
     weekly_holdings: pd.DataFrame = field(default_factory=pd.DataFrame)
     signal_log: pd.DataFrame = field(default_factory=pd.DataFrame)
     execution_diagnostics: dict[str, int] = field(default_factory=dict)
-    entry_outcomes: tuple[EntryAttemptOutcome, ...] = ()
     benchmark_symbol: str = BENCHMARK
+    entry_outcomes: tuple[EntryAttemptOutcome, ...] = ()
 
     @property
     def signal_funnel(self) -> dict[str, int]:
@@ -579,6 +579,17 @@ class DataFetcher:
         return closes
 
 
+def _finite_signal_number(value: object) -> float | None:
+    """Return a JSON-safe built-in float, or ``None`` when unavailable."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 class CanslimStrategy:
     """Modular CANSLIM signal evaluation."""
 
@@ -652,8 +663,17 @@ class CanslimStrategy:
         if len(available) < 60:
             return None
 
-        rs_score = float(rs_score) if rs_score is not None else _calculate_rs_at_date(all_closes, ticker, eval_date)
-        l_score = rs_score / 100.0
+        raw_rs_score = (
+            rs_score
+            if rs_score is not None
+            else _calculate_rs_at_date(all_closes, ticker, eval_date)
+        )
+        normalized_rs_score = _finite_signal_number(raw_rs_score)
+        l_score = (
+            normalized_rs_score / 100.0
+            if normalized_rs_score is not None
+            else math.nan
+        )
         if self.technical_only:
             fund = {
                 "current_growth": None,
@@ -697,28 +717,35 @@ class CanslimStrategy:
             }
         tech = _evaluate_technical_at_date(tdata, eval_date, fund.get("shares_outstanding"))
 
-        c_growth = fund.get("current_growth")
-        a_growth = fund.get("annual_growth")
-        c_score = fund.get("c_score", 0.0)
-        a_score = fund.get("a_score", 0.0)
-        i_score = fund.get("i_score", 0.5)
+        c_growth = _finite_signal_number(fund.get("current_growth"))
+        a_growth = _finite_signal_number(fund.get("annual_growth"))
+        c_score = _finite_signal_number(fund.get("c_score", 0.0))
+        a_score = _finite_signal_number(fund.get("a_score", 0.0))
+        i_score = _finite_signal_number(fund.get("i_score", 0.5))
+        n_score = _finite_signal_number(tech.get("n_score", 0.0))
+        s_score = _finite_signal_number(tech.get("s_score", 0.0))
+        m_score = _finite_signal_number(market_state.get("m_score"))
+
+        def score_value(value: float | None) -> float:
+            return value if value is not None else math.nan
+
         total_score = _compute_canslim_score(
-            c=c_score,
-            a=a_score,
-            n=tech["n_score"],
-            s=tech["s_score"],
+            c=score_value(c_score),
+            a=score_value(a_score),
+            n=score_value(n_score),
+            s=score_value(s_score),
             l_score=l_score,
-            i=i_score,
-            m=market_state["m_score"],
+            i=score_value(i_score),
+            m=score_value(m_score),
             institutional_data_available=bool(fund.get("institutional_data_available", False)),
         )
         entry_composite_score = _compute_entry_composite_score(
-            c=c_score,
-            a=a_score,
-            n=tech["n_score"],
-            s=tech["s_score"],
+            c=score_value(c_score),
+            a=score_value(a_score),
+            n=score_value(n_score),
+            s=score_value(s_score),
             l_score=l_score,
-            i=i_score,
+            i=score_value(i_score),
             institutional_data_available=bool(fund.get("institutional_data_available", False)),
         )
 
@@ -731,10 +758,10 @@ class CanslimStrategy:
         has_surge = entry_facts.has_volume_surge
         in_buy_zone = entry_facts.in_buy_zone
         technical_score = self._compute_technical_score(
-            n_score=tech["n_score"],
-            s_score=tech["s_score"],
+            n_score=score_value(n_score),
+            s_score=score_value(s_score),
             l_score=l_score,
-            m_score=market_state["m_score"],
+            m_score=score_value(m_score),
         )
 
         m_pass = bool(
@@ -750,9 +777,13 @@ class CanslimStrategy:
                 entry_facts,
                 current_growth=c_growth,
                 annual_growth=a_growth,
-                rs_score=rs_score,
+                rs_score=normalized_rs_score,
                 composite_score=entry_composite_score,
             )
+            c_growth = decision.current_growth
+            a_growth = decision.annual_growth
+            normalized_rs_score = decision.rs_score
+            entry_composite_score = decision.composite_score
             entry_contract_eligible = decision.eligible
             entry_blocking_reasons = decision.blocking_reasons
         buy_signal_without_market = entry_contract_eligible
@@ -764,33 +795,35 @@ class CanslimStrategy:
             signal_reason = "No Breakout"
 
         return {
-            "symbol": ticker,
+            "symbol": str(ticker).upper(),
             "signal_date": str(eval_date.date()),
-            "close": tech.get("close"),
+            "close": _finite_signal_number(tech.get("close")),
             "c_score": c_score,
             "a_score": a_score,
-            "n_score": tech.get("n_score", 0.0),
-            "s_score": tech.get("s_score", 0.0),
+            "n_score": n_score,
+            "s_score": s_score,
             "i_score": i_score,
-            "m_score": market_state["m_score"],
+            "m_score": m_score,
             "current_growth": c_growth,
             "annual_growth": a_growth,
-            "rs_score": rs_score,
-            "canslim_score": total_score,
-            "entry_composite_score": entry_composite_score,
-            "technical_score": technical_score,
+            "rs_score": normalized_rs_score,
+            "canslim_score": _finite_signal_number(total_score),
+            "entry_composite_score": _finite_signal_number(entry_composite_score),
+            "technical_score": _finite_signal_number(technical_score),
             "market_is_bullish": m_pass,
             "market_regime_is_bullish": bool(market_state["market_is_bullish"]),
             "buy_signal_without_market": bool(buy_signal_without_market),
             "has_breakout": has_breakout,
             "has_volume_surge": has_surge,
             "has_peg_today": has_peg_today,
-            "pivot": entry_facts.pivot,
-            "prior_close": entry_facts.prior_close,
-            "event_volume": entry_facts.event_volume,
-            "prior_average_volume_50": entry_facts.prior_average_volume_50,
-            "entry_volume_ratio": entry_facts.volume_ratio,
-            "entry_extension": entry_facts.extension,
+            "pivot": _finite_signal_number(entry_facts.pivot),
+            "prior_close": _finite_signal_number(entry_facts.prior_close),
+            "event_volume": _finite_signal_number(entry_facts.event_volume),
+            "prior_average_volume_50": _finite_signal_number(
+                entry_facts.prior_average_volume_50
+            ),
+            "entry_volume_ratio": _finite_signal_number(entry_facts.volume_ratio),
+            "entry_extension": _finite_signal_number(entry_facts.extension),
             "price_advanced": entry_facts.price_advanced,
             "in_buy_zone": in_buy_zone,
             "technical_setup_eligible": entry_facts.eligible,
@@ -1836,10 +1869,6 @@ class PortfolioSimulator:
         if symbol in self._open_positions:
             finish("entry_rejected_already_open")
             return
-        if self.max_positions is not None and len(self._open_positions) >= self.max_positions:
-            if not self._try_evict(signal, ticker_ohlcv, entry_date):
-                finish("entry_rejected_capacity")
-                return
 
         ohlcv = ticker_ohlcv.get(symbol)
         if ohlcv is None:
@@ -1878,6 +1907,11 @@ class PortfolioSimulator:
         if pivot is not None and not (pivot <= entry_price <= buy_zone_upper):
             finish("entry_rejected_next_open_buy_zone")
             return
+
+        if self.max_positions is not None and len(self._open_positions) >= self.max_positions:
+            if not self._try_evict(signal, ticker_ohlcv, entry_date):
+                finish("entry_rejected_capacity")
+                return
 
         if self._equity <= 0:
             finish("entry_rejected_no_cash")

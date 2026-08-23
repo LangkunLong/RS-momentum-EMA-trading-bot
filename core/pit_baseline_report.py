@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from core.canslim.entry_contract import MIN_COMPOSITE_SCORE
 from core.leader_evaluation import FiveYearLeader, RollingLeaderObservation
 
 FIVE_YEAR_LEADER_COLUMNS = (
@@ -130,6 +131,9 @@ def build_leader_recall_frame(
     leader_aliases: Mapping[str, Sequence[str]] | None = None,
 ) -> pd.DataFrame:
     """Join top leaders to independently counted signal, execution, and gate facts."""
+    # Retained only so historical callers do not break. Entry qualification and
+    # attribution use the fixed non-M canonical composite floor.
+    del min_canslim_score
     if not isinstance(signal_log, pd.DataFrame) or not isinstance(transaction_log, pd.DataFrame):
         raise ValueError("signal and transaction logs must be DataFrames")
     if not isinstance(start_date, date):
@@ -138,7 +142,8 @@ def build_leader_recall_frame(
     if not signals.empty:
         required = {
             "symbol", "signal_date", "buy_signal", "current_growth", "annual_growth",
-            "rs_score", "has_breakout", "has_volume_surge", "in_buy_zone", "canslim_score",
+            "rs_score", "has_breakout", "has_volume_surge", "in_buy_zone",
+            "entry_composite_score",
         }
         if not required.issubset(signals):
             raise ValueError(f"signal log lacks recall fields: {sorted(required.difference(signals))}")
@@ -202,7 +207,9 @@ def build_leader_recall_frame(
                 "breakout_fail_count": fail_bool("has_breakout"),
                 "volume_fail_count": fail_bool("has_volume_surge"),
                 "buy_zone_fail_count": fail_bool("in_buy_zone"),
-                "composite_fail_count": fail_numeric("canslim_score", min_canslim_score),
+                "composite_fail_count": fail_numeric(
+                    "entry_composite_score", MIN_COMPOSITE_SCORE
+                ),
                 "missing_fundamentals_count": int(
                     (
                         pd.to_numeric(ticker_signals["current_growth"], errors="coerce").isna()
@@ -214,6 +221,40 @@ def build_leader_recall_frame(
     return pd.DataFrame(rows, columns=LEADER_RECALL_COLUMNS).sort_values(
         ["rank", "ticker"], kind="stable", ignore_index=True
     )
+
+
+def _is_missing_scalar(value: object) -> bool:
+    missing = pd.isna(value)
+    if not isinstance(missing, bool) and not hasattr(missing, "item"):
+        raise ValueError("numeric reconciliation fact is not scalar")
+    try:
+        return bool(missing)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("numeric reconciliation fact is not scalar") from exc
+
+
+def _optional_positive_number(value: object, *, field: str) -> float | None:
+    if value is None or _is_missing_scalar(value):
+        return None
+    return _required_positive_number(value, field=field)
+
+
+def _required_positive_number(value: object, *, field: str) -> float:
+    if value is None or isinstance(value, bool) or _is_missing_scalar(value):
+        raise ValueError(f"{field} must be a finite positive number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a finite positive number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{field} must be a finite positive number")
+    return number
+
+
+def _normalized_symbol(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} symbol is blank or invalid")
+    return value.strip().upper()
 
 
 def reconcile_signals_to_transactions(
@@ -233,9 +274,13 @@ def reconcile_signals_to_transactions(
     next_session = {current: following for current, following in zip(calendar, calendar[1:], strict=False)}
     signals = signal_log.copy()
     transactions = transaction_log.copy()
-    if not signals.empty and not {"symbol", "signal_date", "buy_signal"}.issubset(signals):
+    if not signals.empty and not {
+        "symbol", "signal_date", "buy_signal", "pivot"
+    }.issubset(signals):
         raise ValueError("signal log lacks execution reconciliation fields")
-    if not transactions.empty and not {"Ticker", "Date", "Action"}.issubset(transactions):
+    if not transactions.empty and not {
+        "Ticker", "Date", "Action", "Price"
+    }.issubset(transactions):
         raise ValueError("transaction log lacks execution reconciliation fields")
     buy_signals = signals.loc[
         signals.get("buy_signal", pd.Series(False, index=signals.index)).fillna(False).astype(bool)
@@ -247,14 +292,24 @@ def reconcile_signals_to_transactions(
         buy_signals["signal_date"] = pd.to_datetime(
             buy_signals["signal_date"], errors="raise"
         ).dt.normalize()
-        buy_signals["symbol"] = buy_signals["symbol"].astype(str).str.upper()
+        buy_signals["symbol"] = buy_signals["symbol"].map(
+            lambda value: _normalized_symbol(value, field="qualifying signal")
+        )
+        buy_signals["pivot"] = buy_signals["pivot"].map(
+            lambda value: _optional_positive_number(value, field="signal pivot")
+        )
         if buy_signals.duplicated(["symbol", "signal_date"]).any():
             raise ValueError("qualifying signal rows are not unique by symbol/session")
         if not set(buy_signals["signal_date"]).issubset(calendar):
             raise ValueError("qualifying signal date is not a benchmark trading session")
     if not entries.empty:
         entries["Date"] = pd.to_datetime(entries["Date"], errors="raise").dt.normalize()
-        entries["Ticker"] = entries["Ticker"].astype(str).str.upper()
+        entries["Ticker"] = entries["Ticker"].map(
+            lambda value: _normalized_symbol(value, field="entry transaction")
+        )
+        entries["Price"] = entries["Price"].map(
+            lambda value: _required_positive_number(value, field="BUY transaction Price")
+        )
         if not set(entries["Date"]).issubset(calendar):
             raise ValueError("entry date is not a benchmark trading session")
 
@@ -283,8 +338,14 @@ def reconcile_signals_to_transactions(
         "entry_rejected_invalid_risk",
         "entry_rejected_no_cash",
     }
+    signal_pivots = {
+        (row.symbol, row.signal_date): row.pivot
+        for row in buy_signals.itertuples(index=False)
+    }
     if not outcomes.empty:
-        outcomes["symbol"] = outcomes["symbol"].astype(str).str.upper()
+        outcomes["symbol"] = outcomes["symbol"].map(
+            lambda value: _normalized_symbol(value, field="entry outcome")
+        )
         outcomes["signal_date"] = pd.to_datetime(
             outcomes["signal_date"], errors="raise"
         ).dt.normalize()
@@ -299,50 +360,76 @@ def reconcile_signals_to_transactions(
             raise ValueError("entry outcome signal date is not a benchmark trading session")
         if not set(outcomes["entry_date"]).issubset(calendar):
             raise ValueError("entry outcome entry date is not a benchmark trading session")
+        for field in ("pivot", "buy_zone_lower", "buy_zone_upper", "entry_open"):
+            outcomes[field] = outcomes[field].map(
+                lambda value, name=field: _optional_positive_number(
+                    value, field=f"entry outcome {name}"
+                )
+            )
+
+        requires_entry_open = {
+            "entries_executed",
+            "entry_rejected_capacity",
+            "entry_rejected_next_open_buy_zone",
+            "entry_rejected_invalid_risk",
+            "entry_rejected_no_cash",
+        }
+        forbids_entry_open = {
+            "entry_rejected_already_open",
+            "entry_rejected_missing_data",
+            "entry_rejected_invalid_price",
+        }
         for row in outcomes.itertuples(index=False):
             if next_session.get(row.signal_date) != row.entry_date:
                 raise ValueError("entry outcome is not on the next benchmark session")
-            for field in ("pivot", "buy_zone_lower", "buy_zone_upper", "entry_open"):
-                value = getattr(row, field)
-                if pd.notna(value) and not math.isfinite(float(value)):
-                    raise ValueError(f"entry outcome contains non-finite {field}")
+
+            key = (row.symbol, row.signal_date)
+            if key not in signal_pivots:
+                raise ValueError("entry outcome has no unique qualifying signal")
+            signal_pivot = signal_pivots[key]
+            if pd.isna(signal_pivot) != pd.isna(row.pivot):
+                raise ValueError("entry outcome pivot presence disagrees with signal")
+            if pd.notna(signal_pivot) and not math.isclose(
+                float(row.pivot), float(signal_pivot), rel_tol=1e-12, abs_tol=1e-12
+            ):
+                raise ValueError("entry outcome pivot disagrees with signal")
+
             if pd.notna(row.pivot):
                 pivot = float(row.pivot)
-                if pivot <= 0:
-                    raise ValueError("entry outcome contains a non-positive pivot")
                 if pd.isna(row.buy_zone_lower) or pd.isna(row.buy_zone_upper):
                     raise ValueError("entry outcome with a pivot lacks buy-zone bounds")
-                if not math.isclose(float(row.buy_zone_lower), pivot, rel_tol=0, abs_tol=1e-12):
+                if not math.isclose(
+                    float(row.buy_zone_lower), pivot, rel_tol=1e-12, abs_tol=1e-12
+                ):
                     raise ValueError("entry outcome lower buy-zone bound disagrees with pivot")
                 if not math.isclose(
-                    float(row.buy_zone_upper), pivot * 1.05, rel_tol=0, abs_tol=1e-12
+                    float(row.buy_zone_upper), pivot * 1.05,
+                    rel_tol=1e-12, abs_tol=1e-12,
                 ):
                     raise ValueError("entry outcome upper buy-zone bound disagrees with pivot")
             elif pd.notna(row.buy_zone_lower) or pd.notna(row.buy_zone_upper):
                 raise ValueError("entry outcome without a pivot contains buy-zone bounds")
-            if pd.notna(row.entry_open) and float(row.entry_open) <= 0:
-                raise ValueError("entry outcome contains a non-positive entry open")
-            if row.outcome == "entries_executed":
-                if pd.isna(row.entry_open):
-                    raise ValueError("successful entry outcome lacks an entry open")
-                if pd.notna(row.pivot) and not (
-                    float(row.buy_zone_lower)
-                    <= float(row.entry_open)
-                    <= float(row.buy_zone_upper)
-                ):
-                    raise ValueError("successful entry outcome opened outside its buy zone")
+
+            if row.outcome in requires_entry_open and pd.isna(row.entry_open):
+                raise ValueError(f"{row.outcome} lacks the validated entry open")
+            if row.outcome in forbids_entry_open and pd.notna(row.entry_open):
+                raise ValueError(f"{row.outcome} contains an impossible entry open")
+
+            if row.outcome == "entries_executed" and pd.notna(row.pivot) and not (
+                float(row.buy_zone_lower)
+                <= float(row.entry_open)
+                <= float(row.buy_zone_upper)
+            ):
+                raise ValueError("successful entry outcome opened outside its buy zone")
             if row.outcome == "entry_rejected_next_open_buy_zone":
-                if pd.isna(row.pivot) or pd.isna(row.entry_open):
-                    raise ValueError("next-open buy-zone rejection lacks price facts")
+                if pd.isna(row.pivot):
+                    raise ValueError("next-open buy-zone rejection lacks pivot facts")
                 if float(row.buy_zone_lower) <= float(row.entry_open) <= float(
                     row.buy_zone_upper
                 ):
                     raise ValueError("next-open buy-zone rejection opened inside its buy zone")
 
-    buy_keys = {
-        (row.symbol, row.signal_date)
-        for row in buy_signals.itertuples(index=False)
-    }
+    buy_keys = set(signal_pivots)
     outcome_keys = {
         (row.symbol, row.signal_date)
         for row in outcomes.itertuples(index=False)
@@ -361,6 +448,17 @@ def reconcile_signals_to_transactions(
     )
     if executed_keys != entry_keys:
         raise ValueError("successful entry outcomes do not match BUY transactions exactly")
+    entry_prices = {
+        (row.Ticker, row.Date): float(row.Price)
+        for row in entries.itertuples(index=False)
+    }
+    for row in executed.itertuples(index=False):
+        serialized_open = round(float(row.entry_open), 4)
+        transaction_price = entry_prices[(row.symbol, row.entry_date)]
+        if not math.isclose(
+            transaction_price, serialized_open, rel_tol=0, abs_tol=1e-12
+        ):
+            raise ValueError("successful entry outcome open disagrees with BUY Price")
     rejected_keys = {
         (row.symbol, row.entry_date)
         for row in outcomes.loc[outcomes["outcome"] != "entries_executed"].itertuples(
@@ -372,9 +470,15 @@ def reconcile_signals_to_transactions(
 
     def diagnostic(name: str) -> int:
         raw = execution_diagnostics.get(name, 0)
-        if isinstance(raw, bool) or int(raw) != raw or int(raw) < 0:
+        try:
+            integer = int(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"execution diagnostic must be a nonnegative integer: {name}"
+            ) from exc
+        if isinstance(raw, bool) or integer != raw or integer < 0:
             raise ValueError(f"execution diagnostic must be a nonnegative integer: {name}")
-        return int(raw)
+        return integer
 
     signal_count = int(len(buy_signals))
     entry_count = int(len(entries))

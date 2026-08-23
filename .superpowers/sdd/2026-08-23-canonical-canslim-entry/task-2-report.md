@@ -78,3 +78,64 @@ probe files were removed afterward.
 - Task 3 must perform the first real five-year replay to measure artifact size,
   daily throughput, and observed next-open rejection distribution. No strategy
   thresholds were tuned in Task 2.
+
+## Independent-review fix round 1
+
+Closed all seven Important findings without changing strategy thresholds,
+position sizing, exits, or the generic five-session cadence:
+
+- `_enter_position` now validates the candidate bar, finite open, and finite-
+  pivot next-open buy zone before capacity eviction. Already-open remains the
+  first rejection. A rejected overextended candidate cannot sell an existing
+  holding; a valid in-zone higher-RS candidate still follows the existing
+  eviction path.
+- `SimulationResult.entry_outcomes` is appended after the historical
+  `benchmark_symbol` positional field.
+- Leader attribution requires `entry_composite_score` and the canonical fixed
+  `MIN_COMPOSITE_SCORE`; the legacy M-inclusive floor argument remains accepted
+  only for caller compatibility.
+- Reconciliation binds each outcome to its exact qualifying signal pivot and
+  each successful outcome to one BUY at `round(entry_open, 4)`. It rejects
+  pivot/price mismatches, missing or impossible per-outcome facts, duplicate
+  outcomes/BUYs, and rejected outcomes with BUYs.
+- Every numeric strategy row field is normalized to a built-in finite `float`
+  or `None`. The full decision's normalized C/A/RS/non-M composite values are
+  authoritative, so pre-Task-4 non-finite fundamentals fail closed and
+  `json.dumps(row, allow_nan=False)` succeeds.
+- PIT validation now covers every signal row: nonblank uppercase symbol,
+  benchmark session, and one `(symbol, signal_date)` evaluation. The daily
+  funnel proves its evaluated total equals the source log.
+- The fixed no-market-gate baseline requires rowwise
+  `buy_signal == entry_contract_eligible`, technical eligibility and a finite
+  positive pivot for every qualifier, per-day
+  `executed/rejected <= attempted <= qualified`, and exact global accounting
+  across attempts, capacity truncation, and final-session pending signals.
+
+Fresh narrow probes all exited `0` in their final form:
+
+```text
+engine_reconciliation_probe=passed {'no_evict_rejected': True, 'valid_evict_executed': True, 'legacy_benchmark': 'QQQ', 'composite_fail': 1, 'rounded_price': 100.1235}
+nan_json_probe=passed {'current_growth': None, 'c_score': None, 'canslim_score': None, 'entry_composite_score': None, 'buy_signal': False, 'has_peg_today': True}
+daily_validation_probe=passed evaluated=2 qualified=1 attempted=1 executed=1
+prior_outcome_boundaries=passed
+prior_strategy_contract=passed {'market_separate': True, 'peg_non_bypass': True, 'technical_fundamental_free': True}
+outcome_shape_regression=passed {'terminal_shapes': 7, 'legacy_missing_pivot': True, 'final_pending': 1, 'capacity_truncated': 1}
+checkpoint_regression_probe=passed {'v1_rejected': True, 'v2_loaded': True, 'journal_outcome_roundtrip': True}
+```
+
+Adversarial rejection probes covered mismatched signal pivot, mismatched BUY
+price, invalid-price outcomes carrying an open, capacity outcomes missing the
+validated open, duplicate/all-row/off-calendar/lowercase evaluations,
+buy/eligibility mismatch, missing qualifying pivot, missing technical setup,
+and attempts plus truncation exceeding qualifications.
+
+The first checkpoint rerun used a Python-created Windows temporary directory
+whose ACL denied the production atomic writer. The exact temporary directory
+was removed, then the same production v1/v2/journal probe passed in a
+PowerShell-precreated workspace directory, which was also removed. This was an
+environmental probe-path failure, not a product-code failure.
+
+Final relevant import/`py_compile`, Ruff, and `git diff --check` verification
+passed. No unit or broad test suite was run, preserving the operator-required
+functional-first sequencing; Task 7 still owns fixture migration and the full
+suite.

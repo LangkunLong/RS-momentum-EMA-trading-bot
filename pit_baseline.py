@@ -187,6 +187,58 @@ def _average_cash_pct(result: SimulationResult) -> float:
     return _finite((cash / equity).mean() * 100.0, field="average cash")
 
 
+def _strict_boolean_series(frame: pd.DataFrame, field: str) -> pd.Series:
+    values: list[bool] = []
+    for value in frame[field]:
+        if isinstance(value, bool) or value.__class__.__name__ == "bool_":
+            values.append(bool(value))
+        else:
+            raise ValueError(f"CANSLIM signal field is not boolean: {field}")
+    return pd.Series(values, index=frame.index, dtype=bool)
+
+
+def _validated_signal_frame(
+    result: SimulationResult,
+    sessions: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    if not isinstance(result.signal_log, pd.DataFrame) or result.signal_log.empty:
+        raise ValueError("CANSLIM signal log is empty")
+    signals = result.signal_log.copy()
+    session_index = pd.DatetimeIndex(sessions).normalize()
+    if session_index.has_duplicates:
+        raise ValueError("benchmark sessions are not unique")
+    signals["signal_date"] = pd.to_datetime(
+        signals["signal_date"], errors="raise"
+    ).dt.normalize()
+    normalized_symbols: list[str] = []
+    for value in signals["symbol"]:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or value != value.upper()
+        ):
+            raise ValueError("CANSLIM signal symbol is not nonblank uppercase text")
+        normalized_symbols.append(value)
+    signals["symbol"] = normalized_symbols
+    if signals.duplicated(["symbol", "signal_date"]).any():
+        raise ValueError("CANSLIM signal evaluations are not unique by symbol/session")
+    if not set(signals["signal_date"]).issubset(set(session_index)):
+        raise ValueError("CANSLIM signal evaluation is off the benchmark calendar")
+    return signals
+
+
+def _nonnegative_diagnostic(result: SimulationResult, field: str) -> int:
+    raw = result.execution_diagnostics[field]
+    try:
+        number = int(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"CANSLIM execution diagnostic is invalid: {field}") from exc
+    if isinstance(raw, bool) or number != raw or number < 0:
+        raise ValueError(f"CANSLIM execution diagnostic is invalid: {field}")
+    return number
+
+
 def _validate_portfolio(
     result: SimulationResult, sessions: pd.DatetimeIndex, bundle_sha256: str,
 ) -> None:
@@ -206,6 +258,7 @@ def _validate_portfolio(
         raise ValueError("CANSLIM signal log is empty")
     if not required_signals.issubset(result.signal_log):
         raise ValueError("CANSLIM signal log lacks required baseline fields")
+    signals = _validated_signal_frame(result, sessions)
     _average_cash_pct(result)
     holding_dates = pd.DatetimeIndex(
         pd.to_datetime(result.weekly_holdings["Week_Ending"], errors="raise")
@@ -230,6 +283,24 @@ def _validate_portfolio(
     for key, value in expected.items():
         if result.config.get(key) != value:
             raise ValueError(f"CANSLIM result is not the fixed production baseline: {key}")
+
+    buy_signal = _strict_boolean_series(signals, "buy_signal")
+    entry_eligible = _strict_boolean_series(signals, "entry_contract_eligible")
+    technical_eligible = _strict_boolean_series(signals, "technical_setup_eligible")
+    if not buy_signal.equals(entry_eligible):
+        raise ValueError(
+            "fixed no-market-gate baseline buy signals disagree with entry eligibility"
+        )
+    if bool((entry_eligible & ~technical_eligible).any()):
+        raise ValueError("qualified CANSLIM signal lacks a technical setup")
+    qualifying_pivots = pd.to_numeric(
+        signals.loc[entry_eligible, "pivot"], errors="coerce"
+    )
+    if any(
+        not math.isfinite(float(value)) or float(value) <= 0
+        for value in qualifying_pivots
+    ):
+        raise ValueError("qualified CANSLIM signal lacks a finite positive pivot")
     required_diagnostics = {
         "signal_days", "entries_allowed_days", "blocked_by_regime_days",
         "blocked_by_market_days", "cash_deployment_override_days", "buy_signal_rows",
@@ -253,6 +324,49 @@ def _validate_portfolio(
     if result.execution_diagnostics["entry_attempts"] != len(result.entry_outcomes):
         raise ValueError("CANSLIM entry outcomes do not cover every attempt")
     _json_bytes([outcome.to_primitive() for outcome in result.entry_outcomes])
+
+    qualified_count = int(entry_eligible.sum())
+    attempted_count = _nonnegative_diagnostic(result, "entry_attempts")
+    executed_count = _nonnegative_diagnostic(result, "entries_executed")
+    capacity_truncated = _nonnegative_diagnostic(result, "capacity_truncated_signals")
+    rejected_count = sum(
+        _nonnegative_diagnostic(result, field)
+        for field in (
+            "entry_rejected_already_open",
+            "entry_rejected_capacity",
+            "entry_rejected_missing_data",
+            "entry_rejected_invalid_price",
+            "entry_rejected_next_open_buy_zone",
+            "entry_rejected_invalid_risk",
+            "entry_rejected_no_cash",
+        )
+    )
+    if _nonnegative_diagnostic(result, "buy_signal_rows") != qualified_count:
+        raise ValueError("qualified count disagrees with buy-signal diagnostics")
+    if (
+        _nonnegative_diagnostic(result, "buy_signal_rows_when_entries_allowed")
+        != qualified_count
+    ):
+        raise ValueError("fixed baseline did not admit every qualifying signal")
+    if any(
+        _nonnegative_diagnostic(result, field) != 0
+        for field in (
+            "buy_signal_rows_blocked_by_regime",
+            "buy_signal_rows_blocked_by_market",
+            "buy_signal_rows_blocked_by_both",
+        )
+    ):
+        raise ValueError("fixed no-market-gate baseline blocked a qualifying signal")
+    if executed_count + rejected_count != attempted_count:
+        raise ValueError("entry attempts do not equal executions plus rejections")
+    final_pending = qualified_count - attempted_count - capacity_truncated
+    if final_pending < 0:
+        raise ValueError("attempted and truncated entries exceed qualifying signals")
+    last_session_qualified = int(
+        entry_eligible.loc[signals["signal_date"] == sessions[-1]].sum()
+    )
+    if final_pending > last_session_qualified:
+        raise ValueError("final pending entries exceed final-session qualifications")
 
 
 def _validate_basket(
@@ -326,33 +440,99 @@ def _daily_entry_funnel_frame(
     result: SimulationResult,
     sessions: pd.DatetimeIndex,
 ) -> pd.DataFrame:
-    signals = result.signal_log.copy()
-    signals["signal_date"] = pd.to_datetime(signals["signal_date"], errors="raise").dt.normalize()
+    signals = _validated_signal_frame(result, sessions)
+    entry_eligible = _strict_boolean_series(signals, "entry_contract_eligible")
+    buy_signal = _strict_boolean_series(signals, "buy_signal")
+    if not buy_signal.equals(entry_eligible):
+        raise ValueError("daily funnel contains an unqualified buy signal")
     outcomes = _entry_outcomes_frame(result)
     if not outcomes.empty:
+        normalized_symbols: list[str] = []
+        for value in outcomes["symbol"]:
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or value != value.upper()
+            ):
+                raise ValueError("entry outcome symbol is not nonblank uppercase text")
+            normalized_symbols.append(value)
+        outcomes["symbol"] = normalized_symbols
         outcomes["signal_date"] = pd.to_datetime(
             outcomes["signal_date"], errors="raise"
         ).dt.normalize()
+        if not set(outcomes["signal_date"]).issubset(set(sessions)):
+            raise ValueError("entry outcome signal date is off the benchmark calendar")
+        if outcomes.duplicated(["symbol", "signal_date"]).any():
+            raise ValueError("entry outcomes are not unique by symbol/session")
+        qualified_keys = set(
+            zip(
+                signals.loc[entry_eligible, "symbol"],
+                signals.loc[entry_eligible, "signal_date"],
+                strict=True,
+            )
+        )
+        outcome_keys = set(
+            zip(outcomes["symbol"], outcomes["signal_date"], strict=True)
+        )
+        if not outcome_keys.issubset(qualified_keys):
+            raise ValueError("daily funnel contains an attempt for an unqualified signal")
+        valid_outcomes = {
+            "entries_executed",
+            "entry_rejected_already_open",
+            "entry_rejected_capacity",
+            "entry_rejected_missing_data",
+            "entry_rejected_invalid_price",
+            "entry_rejected_next_open_buy_zone",
+            "entry_rejected_invalid_risk",
+            "entry_rejected_no_cash",
+        }
+        if (~outcomes["outcome"].isin(valid_outcomes)).any():
+            raise ValueError("daily funnel contains an unsupported entry outcome")
     rows: list[dict[str, object]] = []
     for session in sessions:
         day_signals = signals.loc[signals["signal_date"] == session]
+        day_eligible = entry_eligible.loc[day_signals.index]
         day_outcomes = (
             outcomes.loc[outcomes["signal_date"] == session]
             if not outcomes.empty
             else outcomes
         )
         executed = int((day_outcomes["outcome"] == "entries_executed").sum())
+        attempted = int(len(day_outcomes))
+        qualified = int(day_eligible.sum())
+        rejected = attempted - executed
+        if executed > attempted or rejected > attempted or attempted > qualified:
+            raise ValueError("daily entry funnel violates qualification/attempt bounds")
         rows.append({
             "signal_date": str(session.date()),
             "evaluated_count": int(len(day_signals)),
-            "qualified_count": int(
-                day_signals["entry_contract_eligible"].fillna(False).astype(bool).sum()
-            ),
-            "attempted_count": int(len(day_outcomes)),
+            "qualified_count": qualified,
+            "attempted_count": attempted,
             "executed_count": executed,
-            "rejected_count": int(len(day_outcomes) - executed),
+            "rejected_count": rejected,
         })
-    return pd.DataFrame(rows)
+    funnel = pd.DataFrame(rows)
+    if int(funnel["evaluated_count"].sum()) != len(signals):
+        raise ValueError("daily funnel evaluated total disagrees with signal log")
+    qualified_total = int(funnel["qualified_count"].sum())
+    attempted_total = int(funnel["attempted_count"].sum())
+    if attempted_total != _nonnegative_diagnostic(result, "entry_attempts"):
+        raise ValueError("daily funnel attempted total disagrees with diagnostics")
+    if int(funnel["executed_count"].sum()) != _nonnegative_diagnostic(
+        result, "entries_executed"
+    ):
+        raise ValueError("daily funnel executed total disagrees with diagnostics")
+    capacity_truncated = _nonnegative_diagnostic(result, "capacity_truncated_signals")
+    final_pending = qualified_total - attempted_total - capacity_truncated
+    if final_pending < 0:
+        raise ValueError("daily funnel attempts/truncation exceed qualifications")
+    final_qualified = int(funnel.iloc[-1]["qualified_count"])
+    if final_pending > final_qualified:
+        raise ValueError("daily funnel pending total exceeds final-session qualifications")
+    if qualified_total != attempted_total + capacity_truncated + final_pending:
+        raise ValueError("daily funnel qualification accounting is inconsistent")
+    return funnel
 
 
 def _validate_holding_identities(
