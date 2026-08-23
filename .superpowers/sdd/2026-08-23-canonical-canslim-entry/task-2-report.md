@@ -139,3 +139,23 @@ Final relevant import/`py_compile`, Ruff, and `git diff --check` verification
 passed. No unit or broad test suite was run, preserving the operator-required
 functional-first sequencing; Task 7 still owns fixture migration and the full
 suite.
+
+## Independent-review fix round 2
+
+Two residual causal-integrity defects found by the final re-review are closed:
+
+- Replacement risk and target position value are now computed and validated
+  before `_try_evict` can mutate the portfolio. A full portfolio with a
+  zero-risk replacement retains its existing holding and records
+  `entry_rejected_invalid_risk`; a valid in-zone, valid-risk replacement still
+  evicts and executes using the released cash.
+- The fixed PIT baseline already binds `max_positions=None`, so it now rejects
+  any nonzero `capacity_truncated_signals` or `entry_rejected_capacity`. Entry
+  outcomes must equal the complete set of qualifying non-final-session signal
+  keys; only final-session qualifiers may remain pending. Generic capped
+  simulator reconciliation remains unchanged.
+
+Fresh bounded probes passed both invalid-risk/valid-risk eviction paths,
+rejected the prior `AAA` non-final + `BBB` final impossible-capacity ledger in
+both portfolio validation and daily-funnel generation, and accepted the exact
+one-outcome-plus-one-final-pending control. No unit or broad suite was run.

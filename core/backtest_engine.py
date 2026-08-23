@@ -1908,12 +1908,11 @@ class PortfolioSimulator:
             finish("entry_rejected_next_open_buy_zone")
             return
 
-        if self.max_positions is not None and len(self._open_positions) >= self.max_positions:
-            if not self._try_evict(signal, ticker_ohlcv, entry_date):
-                finish("entry_rejected_capacity")
-                return
-
-        if self._equity <= 0:
+        needs_capacity_eviction = (
+            self.max_positions is not None
+            and len(self._open_positions) >= self.max_positions
+        )
+        if not needs_capacity_eviction and self._equity <= 0:
             finish("entry_rejected_no_cash")
             return
 
@@ -1927,6 +1926,23 @@ class PortfolioSimulator:
             finish("entry_rejected_invalid_risk")
             return
         target_position_value = risk_amount / risk_per_share * entry_price
+        if not math.isfinite(target_position_value) or target_position_value <= 0:
+            finish("entry_rejected_invalid_risk")
+            return
+
+        # Validate the replacement's price and risk before an eviction can
+        # mutate the portfolio. A fully invested portfolio may still rotate a
+        # valid replacement and use the cash released by that eviction.
+        if needs_capacity_eviction and not self._try_evict(
+            signal, ticker_ohlcv, entry_date
+        ):
+            finish("entry_rejected_capacity")
+            return
+
+        if self._equity <= 0:
+            finish("entry_rejected_no_cash")
+            return
+
         if self.max_positions is None and self._pending_entries_remaining > 1:
             # In uncapped backtests, do not let early-ranked signals consume
             # all cash and starve valid same-day signals.  Spread available

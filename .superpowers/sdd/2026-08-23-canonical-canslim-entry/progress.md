@@ -169,3 +169,16 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
   behavior. Relevant compile/import, Ruff, and diff checks passed; broad/unit
   tests remain deferred.
 - Both independent re-review gates are still required before Task 3 may run.
+
+### Task 2 independent review — fix round 2
+
+- Re-review found two residual Important issues: risk-invalid replacements
+  could still evict first, and impossible capacity truncation could mask a
+  missing non-final attempt in the fixed uncapped baseline.
+- Risk/target sizing now validates before any eviction; the released-cash path
+  remains available only to a valid replacement.
+- Fixed PIT validation now requires zero capacity truncation/rejection and
+  exact outcome coverage for every qualifying non-final-session signal; only
+  final-session qualifiers may remain pending.
+- Focused invalid-risk/valid-risk eviction and impossible-capacity/control
+  probes passed. Final independent re-review is required before Task 3 launch.

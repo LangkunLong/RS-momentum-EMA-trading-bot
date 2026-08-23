@@ -329,6 +329,9 @@ def _validate_portfolio(
     attempted_count = _nonnegative_diagnostic(result, "entry_attempts")
     executed_count = _nonnegative_diagnostic(result, "entries_executed")
     capacity_truncated = _nonnegative_diagnostic(result, "capacity_truncated_signals")
+    capacity_rejected = _nonnegative_diagnostic(result, "entry_rejected_capacity")
+    if capacity_truncated != 0 or capacity_rejected != 0:
+        raise ValueError("fixed uncapped baseline reported an impossible capacity limit")
     rejected_count = sum(
         _nonnegative_diagnostic(result, field)
         for field in (
@@ -359,7 +362,7 @@ def _validate_portfolio(
         raise ValueError("fixed no-market-gate baseline blocked a qualifying signal")
     if executed_count + rejected_count != attempted_count:
         raise ValueError("entry attempts do not equal executions plus rejections")
-    final_pending = qualified_count - attempted_count - capacity_truncated
+    final_pending = qualified_count - attempted_count
     if final_pending < 0:
         raise ValueError("attempted and truncated entries exceed qualifying signals")
     last_session_qualified = int(
@@ -367,6 +370,24 @@ def _validate_portfolio(
     )
     if final_pending > last_session_qualified:
         raise ValueError("final pending entries exceed final-session qualifications")
+    qualifying_keys = set(
+        zip(
+            signals.loc[entry_eligible, "symbol"],
+            signals.loc[entry_eligible, "signal_date"],
+            strict=True,
+        )
+    )
+    expected_outcome_keys = {
+        key for key in qualifying_keys if key[1] != sessions[-1]
+    }
+    actual_outcome_keys = {
+        (outcome.symbol, pd.Timestamp(outcome.signal_date).normalize())
+        for outcome in result.entry_outcomes
+    }
+    if actual_outcome_keys != expected_outcome_keys:
+        raise ValueError(
+            "entry outcomes do not exactly cover every non-final qualifying signal"
+        )
 
 
 def _validate_basket(
@@ -524,13 +545,23 @@ def _daily_entry_funnel_frame(
     ):
         raise ValueError("daily funnel executed total disagrees with diagnostics")
     capacity_truncated = _nonnegative_diagnostic(result, "capacity_truncated_signals")
-    final_pending = qualified_total - attempted_total - capacity_truncated
+    capacity_rejected = _nonnegative_diagnostic(result, "entry_rejected_capacity")
+    if capacity_truncated != 0 or capacity_rejected != 0:
+        raise ValueError("daily funnel contains an impossible uncapped capacity limit")
+    expected_outcome_keys = {
+        key for key in qualified_keys if key[1] != sessions[-1]
+    }
+    if outcome_keys != expected_outcome_keys:
+        raise ValueError(
+            "daily funnel attempts do not cover every non-final qualification"
+        )
+    final_pending = qualified_total - attempted_total
     if final_pending < 0:
         raise ValueError("daily funnel attempts/truncation exceed qualifications")
     final_qualified = int(funnel.iloc[-1]["qualified_count"])
     if final_pending > final_qualified:
         raise ValueError("daily funnel pending total exceeds final-session qualifications")
-    if qualified_total != attempted_total + capacity_truncated + final_pending:
+    if qualified_total != attempted_total + final_pending:
         raise ValueError("daily funnel qualification accounting is inconsistent")
     return funnel
 
