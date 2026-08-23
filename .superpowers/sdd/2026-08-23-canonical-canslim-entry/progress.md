@@ -75,6 +75,11 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
 - `backtest.py` must keep `TECHNICAL_SETUP` diagnostic but derive public `BUY_SIGNAL` from the full shared decision using its already available point-in-time C/A, RS, and non-M composite inputs. A technical-only alias cannot be consumed as a CANSLIM buy.
 - Task 2 remains blocked until all three findings close and a fresh independent re-review passes.
 
+### Task 1 fix-round re-review
+
+- All 3 Important findings are closed; no Critical or Important issue remains.
+- One Minor remains: `_tightened_floor` rejects `NaN` but not infinite caller values despite its finite-floor contract. A `+inf` override can reject every finite symbol. Close this one-line fail-closed edge before marking Task 1 complete.
+
 ### Task 1 independent-review fix round 1 implementation
 
 - Closed the alignment finding with ordered length/index mismatch blockers; unequal histories and equal-length one-session-shifted pandas indexes both fail closed.
@@ -83,3 +88,9 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
 - Fresh adversarial probes passed for both alignment failures, lower/stricter scanner floors and bulk prefilter consistency, all four backtest full-decision threshold failures, market independence, and PEG non-bypass. The mocked public backtest row proved `TECHNICAL_SETUP=True` with `BUY_SIGNAL=False` for epsilon-low C.
 - Prior Task 1 boundary and after-close probes passed again. Unit tests and the broad suite remained intentionally deferred. Detailed fix-round evidence is appended to `task-1-report.md`.
 - A fresh independent re-review is still required before Task 2 begins.
+
+### Task 1 independent-review minor fix — finite caller floors
+
+- Updated `_tightened_floor` to use `math.isfinite`, so `NaN`, `+inf`, and `-inf` caller values all fall back to the canonical floor while finite `0` and `90` retain canonical/tightened behavior.
+- Direct probe passed: `caller=nan result=80.0`, `caller=inf result=80.0`, `caller=-inf result=80.0`, `caller=0 result=80.0`, `caller=90 result=90.0`, `tightened_floor_probe=passed` (exit `0`).
+- Relevant Ruff, `py_compile`, and `git diff --check` checks passed (all exit `0`). No unit or broad tests were run.

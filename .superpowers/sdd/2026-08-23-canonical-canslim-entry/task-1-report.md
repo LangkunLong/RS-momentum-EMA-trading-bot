@@ -128,3 +128,28 @@ suite were run, per the required sequencing.
 - Relevant `py_compile`: exit `0`.
 - Relevant Ruff check: `All checks passed!` (exit `0`).
 - `git diff --check`: exit `0` (line-ending conversion warnings only).
+
+## Independent-review minor fix — finite caller floors
+
+`_tightened_floor` now fails closed for every non-finite caller value using
+`math.isfinite`: `NaN`, `+inf`, and `-inf` all return the canonical floor;
+finite caller floors still apply `max(canonical, caller)`.
+
+### Direct probe
+
+The requested direct probe exited `0`:
+
+```text
+caller=nan result=80.0
+caller=inf result=80.0
+caller=-inf result=80.0
+caller=0 result=80.0
+caller=90 result=90.0
+tightened_floor_probe=passed
+```
+
+### Static verification
+
+- Relevant Ruff check: `All checks passed!` (exit `0`).
+- Relevant `py_compile`: exit `0`.
+- `git diff --check`: exit `0`.

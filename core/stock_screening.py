@@ -36,7 +36,7 @@ def _tightened_floor(canonical_floor: float, caller_floor: object) -> float:
         requested = float(caller_floor)
     except (TypeError, ValueError, OverflowError):
         return canonical_floor
-    if math.isnan(requested):
+    if not math.isfinite(requested):
         return canonical_floor
     return max(canonical_floor, requested)
 
