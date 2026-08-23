@@ -702,6 +702,7 @@ def _run_portfolio(
     progress_log_path: Path,
     resume: bool,
     checkpoint_every_days: int,
+    code_identity: str,
 ) -> SimulationResult:
     """Run the production simulator with resumability, preserving test doubles."""
 
@@ -722,6 +723,8 @@ def _run_portfolio(
             "resume": resume,
             "checkpoint_every_days": checkpoint_every_days,
         })
+        if accepts_kwargs or "checkpoint_code_identity" in parameters:
+            kwargs["checkpoint_code_identity"] = code_identity
     return simulator.run(tickers, **kwargs)
 
 
@@ -817,6 +820,7 @@ def run_baseline(
                 progress_log_path=portfolio_progress,
                 resume=resume_checkpoint is not None,
                 checkpoint_every_days=args.checkpoint_every_days,
+                code_identity=git_head,
             )
             basket_config = LeaderBasketConfig(
                 leader_count=100, rebalance_days=20, lookback_days=252,

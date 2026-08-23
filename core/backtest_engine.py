@@ -819,6 +819,7 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
 def _portfolio_checkpoint_fingerprint(
     *,
     bundle_sha256: Optional[str],
+    code_identity: Optional[str],
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
     benchmark: str,
@@ -828,6 +829,7 @@ def _portfolio_checkpoint_fingerprint(
     config = {
         "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
         "bundle_sha256": bundle_sha256,
+        "code_identity": code_identity,
         "start_date": str(start_date.date()),
         "end_date": str(end_date.date()),
         "benchmark": benchmark,
@@ -993,6 +995,7 @@ class PortfolioSimulator:
         progress_log_path: Optional[str | Path] = None,
         resume: bool = False,
         checkpoint_every_days: int = 20,
+        checkpoint_code_identity: Optional[str] = None,
     ) -> SimulationResult:
         if checkpoint_every_days < 1:
             raise ValueError("checkpoint_every_days must be positive")
@@ -1033,6 +1036,7 @@ class PortfolioSimulator:
         state_log = checkpoint.with_name("portfolio_state.jsonl") if checkpoint is not None else None
         fingerprint = _portfolio_checkpoint_fingerprint(
             bundle_sha256=self.pit_bundle.sha256 if self.pit_bundle is not None else None,
+            code_identity=checkpoint_code_identity,
             start_date=start_ts,
             end_date=end_ts,
             benchmark=benchmark,
@@ -1047,6 +1051,8 @@ class PortfolioSimulator:
             checkpoint_state = _load_checkpoint_json(checkpoint)
             if checkpoint_state.get("fingerprint") != fingerprint:
                 raise ValueError("portfolio checkpoint does not match the requested run")
+            if checkpoint_state.get("code_identity") != checkpoint_code_identity:
+                raise ValueError("portfolio checkpoint was produced by a different code revision")
             if state_log is None:
                 raise ValueError("portfolio checkpoint state log is not configured")
             restored_outputs = _read_checkpoint_state(
@@ -1231,6 +1237,7 @@ class PortfolioSimulator:
                     os.fsync(state_stream.fileno())
                     checkpoint_payload = self._checkpoint_payload(
                         fingerprint=fingerprint,
+                        code_identity=checkpoint_code_identity,
                         next_day_index=day_idx + 1,
                         total_days=total_days,
                         state_log_offset=offset,
@@ -1295,6 +1302,7 @@ class PortfolioSimulator:
                 checkpoint,
                 self._checkpoint_payload(
                     fingerprint=fingerprint,
+                    code_identity=checkpoint_code_identity,
                     next_day_index=total_days,
                     total_days=total_days,
                     state_log_offset=final_offset,
@@ -1366,6 +1374,7 @@ class PortfolioSimulator:
         self,
         *,
         fingerprint: str,
+        code_identity: Optional[str],
         next_day_index: int,
         total_days: int,
         state_log_offset: int,
@@ -1378,6 +1387,7 @@ class PortfolioSimulator:
         payload: dict[str, Any] = {
             "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
             "fingerprint": fingerprint,
+            "code_identity": code_identity,
             "next_day_index": next_day_index,
             "total_days": total_days,
             "state_log_offset": state_log_offset,
