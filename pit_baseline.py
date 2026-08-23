@@ -299,27 +299,42 @@ def _validate_holding_identities(
         raise ValueError("transactions contain an invalid identity quantity")
     frame = frame.sort_values(["Date", "_order"], kind="stable")
     quantities: dict[str, float] = {}
-    current_day: date | None = None
-    for row in frame.itertuples(index=False):
-        if row.Date != current_day:
-            current_day = row.Date
-            for symbol, quantity in quantities.items():
-                if quantity > 1e-8 and contract.resolve_open_holding(symbol, current_day) != symbol:
-                    raise ValueError(
-                        f"open holding requires an unimplemented identity transfer: {symbol}"
-                    )
-        if contract.resolve_open_holding(row.Ticker, row.Date) != row.Ticker:
-            raise ValueError(f"transaction uses a predecessor at its transition: {row.Ticker}")
-        prior = quantities.get(row.Ticker, 0.0)
-        if row.Action == "BUY":
-            quantities[row.Ticker] = prior + float(row.Quantity)
-        else:
-            remaining = prior - float(row.Quantity)
-            # Transaction quantities are serialized to six decimal places; allow
-            # only the bounded rounding residue, never a material oversell.
-            if remaining < -1e-5:
-                raise ValueError(f"transaction sells more than the open identity: {row.Ticker}")
-            quantities[row.Ticker] = 0.0 if remaining <= 1e-5 else remaining
+    for current_day, day_rows in frame.groupby("Date", sort=True):
+        # The simulators emit an explicit zero-cash transfer before any same-day
+        # exit/rebalance activity.  Apply it first so predecessor holdings cannot
+        # be mistaken for stale or unsupported identities.
+        for row in day_rows.itertuples(index=False):
+            if row.Action != "TRANSFER":
+                continue
+            predecessor = str(getattr(row, "FromTicker", "")).upper()
+            successor = str(row.Ticker).upper()
+            if not predecessor or contract.resolve_open_holding(predecessor, current_day) != successor:
+                raise ValueError("transaction contains an unapproved identity transfer")
+            prior = quantities.get(predecessor, 0.0)
+            if abs(prior - float(row.Quantity)) > 1e-5 or quantities.get(successor, 0.0) > 1e-5:
+                raise ValueError("identity transfer quantity does not match the open holding")
+            quantities.pop(predecessor, None)
+            quantities[successor] = float(row.Quantity)
+        for symbol, quantity in list(quantities.items()):
+            if quantity > 1e-8 and contract.resolve_open_holding(symbol, current_day) != symbol:
+                raise ValueError(
+                    f"open holding requires an unimplemented identity transfer: {symbol}"
+                )
+        for row in day_rows.itertuples(index=False):
+            if row.Action == "TRANSFER":
+                continue
+            if contract.resolve_open_holding(row.Ticker, current_day) != row.Ticker:
+                raise ValueError(f"transaction uses a predecessor at its transition: {row.Ticker}")
+            prior = quantities.get(row.Ticker, 0.0)
+            if row.Action == "BUY":
+                quantities[row.Ticker] = prior + float(row.Quantity)
+            else:
+                remaining = prior - float(row.Quantity)
+                # Transaction quantities are serialized to six decimal places; allow
+                # only the bounded rounding residue, never a material oversell.
+                if remaining < -1e-5:
+                    raise ValueError(f"transaction sells more than the open identity: {row.Ticker}")
+                quantities[row.Ticker] = 0.0 if remaining <= 1e-5 else remaining
     for symbol, quantity in quantities.items():
         if quantity > 1e-8 and contract.resolve_open_holding(symbol, end_date) != symbol:
             raise ValueError(f"open holding crossed an unsupported ended identity: {symbol}")
@@ -815,8 +830,11 @@ def run_baseline(
             )
             if len(leaders) != 100 or len(rolling) != 4_800:
                 raise ValueError("fixed baseline leader labels are incomplete")
+            portfolio = portfolio_factory(pit_bundle=bundle)
+            if hasattr(portfolio, "identity_transition_contract"):
+                portfolio.identity_transition_contract = transitions
             result = _run_portfolio(
-                portfolio_factory(pit_bundle=bundle),
+                portfolio,
                 tickers,
                 checkpoint_path=portfolio_checkpoint,
                 progress_log_path=portfolio_progress,
@@ -828,7 +846,10 @@ def run_baseline(
                 leader_count=100, rebalance_days=20, lookback_days=252,
                 min_history_days=60, initial_capital=100_000.0,
             )
-            basket = basket_factory(bundle, basket_config).run(
+            basket = basket_factory(bundle, basket_config)
+            if hasattr(basket, "identity_transition_contract"):
+                basket.identity_transition_contract = transitions
+            basket = basket.run(
                 start_date=_START, end_date=_END, benchmark_symbol=_BENCHMARK, tickers=tickers,
             )
             _validate_portfolio(result, sessions, bundle.sha256)

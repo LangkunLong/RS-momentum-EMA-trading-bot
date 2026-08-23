@@ -37,7 +37,7 @@ from core.industry_group import get_top_groups, load_industry_map
 from core.data_client import clear_session_cache, fetch_bulk_ohlcv
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
-from core.pit_data import PITDataBundle
+from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -830,6 +830,14 @@ def _portfolio_checkpoint_fingerprint(
         "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
         "bundle_sha256": bundle_sha256,
         "code_identity": code_identity,
+        "identity_prices_provenance_sha256": (
+            simulator.identity_transition_contract.prices_provenance_sha256
+            if simulator.identity_transition_contract is not None else None
+        ),
+        "identity_request_contracts_sha256": (
+            simulator.identity_transition_contract.request_contracts_sha256
+            if simulator.identity_transition_contract is not None else None
+        ),
         "start_date": str(start_date.date()),
         "end_date": str(end_date.date()),
         "benchmark": benchmark,
@@ -931,6 +939,7 @@ class PortfolioSimulator:
         benchmark_symbol: str = BENCHMARK,
         enable_eviction: bool = settings.ENABLE_EVICTION,
         pit_bundle: Optional[PITDataBundle] = None,
+        identity_transition_contract: Optional[PriceIdentityTransitionContract] = None,
     ) -> None:
         self.initial_capital = initial_capital
         self.max_positions = max_positions
@@ -952,6 +961,7 @@ class PortfolioSimulator:
         if pit_bundle is not None and technical_only:
             raise ValueError("point-in-time CANSLIM mode requires historical fundamentals")
         self.pit_bundle = pit_bundle
+        self.identity_transition_contract = identity_transition_contract
         self.take_profit_pct = take_profit_pct
         self.scale_out_fraction = scale_out_fraction
         self.stagnation_days = stagnation_days
@@ -1178,6 +1188,8 @@ class PortfolioSimulator:
                     )
 
             date_str = str(eval_date.date())
+
+            self._apply_identity_transitions(ticker_ohlcv, eval_date)
 
             for symbol in list(self._open_positions.keys()):
                 ohlcv = ticker_ohlcv.get(symbol)
@@ -1751,6 +1763,44 @@ class PortfolioSimulator:
             last_ema = ema.iloc[-self.ma_consecutive:]
             if (last_closes.values < last_ema.values).all():
                 self._close_trade(symbol, close, "ma_violation", date_str)
+
+    def _apply_identity_transitions(
+        self,
+        ticker_ohlcv: Dict[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+    ) -> None:
+        contract = self.identity_transition_contract
+        if contract is None:
+            return
+        effective = eval_date.date()
+        for transition in contract.transitions:
+            if transition.effective_date != effective:
+                continue
+            trade = self._open_positions.pop(transition.predecessor, None)
+            if trade is None:
+                continue
+            if transition.successor in self._open_positions:
+                raise ValueError("identity transition successor is already open")
+            successor_frame = ticker_ohlcv.get(transition.successor)
+            if successor_frame is None:
+                raise ValueError("identity transition successor has no price data")
+            successor_bar = successor_frame.loc[eval_date:eval_date]
+            if successor_bar.empty or float(successor_bar["Open"].iloc[0]) <= 0:
+                raise ValueError("identity transition successor lacks a valid transition bar")
+            trade.symbol = transition.successor
+            self._open_positions[transition.successor] = trade
+            quantity = float(trade.remaining_qty or 0.0)
+            if quantity > 1e-12:
+                self._transactions.append({
+                    "Date": str(eval_date.date()),
+                    "Ticker": transition.successor,
+                    "FromTicker": transition.predecessor,
+                    "Action": "TRANSFER",
+                    "Price": round(float(successor_bar["Open"].iloc[0]), 4),
+                    "Quantity": round(quantity, 6),
+                    "Value": 0.0,
+                    "Reason": "pit_identity_transfer",
+                })
 
     def _update_protective_stop(self, trade: Trade, history: pd.DataFrame, high: float) -> None:
         """Ratchet stops using only end-of-bar information.

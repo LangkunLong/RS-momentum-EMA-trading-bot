@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from core.momentum_analysis import calculate_weighted_performance
-from core.pit_data import PITDataBundle
+from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
 
 
 @dataclass(frozen=True)
@@ -133,9 +133,15 @@ def _rank_leaders(
 class LeaderBasketSimulator:
     """Equal-weight, scheduled-rebalance leader basket using a PIT bundle."""
 
-    def __init__(self, bundle: PITDataBundle, config: LeaderBasketConfig | None = None) -> None:
+    def __init__(
+        self,
+        bundle: PITDataBundle,
+        config: LeaderBasketConfig | None = None,
+        identity_transition_contract: PriceIdentityTransitionContract | None = None,
+    ) -> None:
         self.bundle = bundle
         self.config = config or LeaderBasketConfig()
+        self.identity_transition_contract = identity_transition_contract
 
     def run(
         self,
@@ -185,6 +191,8 @@ class LeaderBasketSimulator:
         pending_target: Optional[list[str]] = None
 
         for day_idx, eval_date in enumerate(trading_days):
+            transfer_rows = self._apply_identity_transitions(price_data, eval_date, holdings)
+            transactions.extend(transfer_rows)
             if pending_target is not None:
                 cash, holdings, rebalance_rows = self._rebalance(
                     pending_target,
@@ -252,6 +260,41 @@ class LeaderBasketSimulator:
                 "universe_count": len(universe),
             },
         )
+
+    def _apply_identity_transitions(
+        self,
+        price_data: dict[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+        holdings: dict[str, float],
+    ) -> list[dict[str, Any]]:
+        contract = self.identity_transition_contract
+        if contract is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        effective = eval_date.date()
+        for transition in contract.transitions:
+            if transition.effective_date != effective or transition.predecessor not in holdings:
+                continue
+            if transition.successor in holdings:
+                raise ValueError("identity transition successor is already held")
+            frame = price_data.get(transition.successor)
+            if frame is None:
+                raise ValueError("identity transition successor has no price data")
+            bar = frame.loc[eval_date:eval_date]
+            if bar.empty or float(bar["Open"].iloc[0]) <= 0:
+                raise ValueError("identity transition successor lacks a valid transition bar")
+            quantity = holdings.pop(transition.predecessor)
+            holdings[transition.successor] = quantity
+            rows.append({
+                "Date": str(eval_date.date()),
+                "Ticker": transition.successor,
+                "FromTicker": transition.predecessor,
+                "Action": "TRANSFER",
+                "Price": float(bar["Open"].iloc[0]),
+                "Quantity": quantity,
+                "Reason": "pit_identity_transfer",
+            })
+        return rows
 
     @staticmethod
     def _rebalance(
