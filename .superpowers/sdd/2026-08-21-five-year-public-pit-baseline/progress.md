@@ -100,3 +100,22 @@ Task 3: implementation complete and safe to retain, but the approved cache remai
 - Task 6 real five-year baseline: run `run-20260823T071322Z-8ca8242dd67d` completed on clean Git `382c11943ac2926152ee5452d444a85430299d96` with bundle `8ca8242dd67db30d456a2b1861f7e7399f8ca418079738ab150d4e44865763c5`. All 14 baseline artifacts were published with manifest-bound hashes. SPY, membership, price, CIK/exclusion, signal/transaction reconciliation, and identity-transition gates passed. SEC quarterly+annual evaluated coverage was 80.20768935% versus the 90% research threshold; the explicit `--allow-incomplete-fundamentals` mode published the baseline with that gate recorded as non-blocking, without weakening any other gate.
 - Real baseline results: CANSLIM total return 1.37670379%, annualized 0.27428841%, Sharpe 0.07436134, max drawdown -14.80975664%, average cash 76.33736906%, 174 closed trades, 42.52873563% win rate. The 100-name PIT leader basket returned 65.05507789% (10.55985107% annualized, Sharpe 0.64333911, -25.55586850% drawdown, 0.07968127% average cash, 6,196 rebalance trades, 63 rebalances); SPY returned 84.79009134%. Top-100 signal and execution recall were both 40%, rolling label recall was 0.25%.
 - Ruling: this is now the first complete, reproducible PIT CANSLIM baseline for logic verification. Missing SEC history is a documented data-coverage defect, not a strategy conclusion. No optimization should be judged until the report's data-coverage limitation is either accepted for the intended analysis or improved; the signal-logic, cash-deployment, and performance gaps are now measurable from the published artifacts.
+
+## Task 7 verification
+
+- Ruling: the plan's literal 65-day/two-member end-to-end fixture conflicts with the hardened production runner's intentional immutable five-year data contract (1,508 SPY sessions, 495–510 members, 100 five-year leaders, and 4,800 rolling labels). Use a test-only domain seam that invokes `pit_baseline.main()` and its real publication, manifest-hash, and no-overwrite paths while preserving every production gate. Cost if wrong: the fixture may miss a real full-data integration regression; the preserved real completed baseline remains the functional evidence.
+- Task 7: fix round 1/5 (5 addressed, 0 open — main-level publication fixture; complete cache mutation coverage; dual ZIP/as-of SEC coverage; SimulationResult reconciliation; repeated-removal coverage; commits 83e4e23..01ed9d3)
+- Task 7: complete (commits fef2951..01ed9d3, review clean)
+
+## Task 8 documentation
+
+- Task 8: fix round 1/5 (2 addressed, 0 open — exact historical resume command; truthful manual SEC archive and immutable sandbox provenance; commits 21d9371..e77e3ec)
+- Task 8: complete (commits 01ed9d3..e77e3ec, review clean)
+
+## Final closeout
+
+- Task 7 final collision-immutability fix: `73a9c64 test: verify baseline collision immutability`.
+- Final whole-branch review initially found the collision-immutability test gap; the gap was cleanly closed by `73a9c64`, and the follow-up review was clean.
+- Dependency-contract fix: `0e0b2ad deps: declare lxml HTML parser runtime`. The declared project virtual environment needs `lxml` because `pandas.read_html` requires an HTML parser.
+- Fresh final suite in `.agent-venv`: `1284 passed, 9 skipped, 2 deselected` in `540.59s`.
+- Direct system Python reported environment-only missing packages; the recorded `.agent-venv` result is the project verification evidence.
