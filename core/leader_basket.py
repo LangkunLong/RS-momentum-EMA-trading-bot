@@ -282,10 +282,17 @@ class LeaderBasketSimulator:
                 tradable.append((ticker, float(bar["Open"].iloc[0])))
         if tradable:
             allocation = cash / len(tradable)
-            for ticker, price in tradable:
-                quantity = allocation / price
+            for index, (ticker, price) in enumerate(tradable):
+                quantity = (cash if index == len(tradable) - 1 else allocation) / price
                 holdings[ticker] = quantity
-                cash -= quantity * price
+                if index == len(tradable) - 1:
+                    # Spend the exact remaining balance on the final
+                    # allocation.  Repeated binary-float subtraction can
+                    # otherwise leave a tiny negative cash residue and make
+                    # an otherwise valid basket fail accounting validation.
+                    cash = 0.0
+                else:
+                    cash -= quantity * price
                 rows.append({"Date": str(trade_date.date()), "Ticker": ticker, "Action": "BUY", "Price": price, "Quantity": quantity, "Reason": "scheduled_rebalance"})
         return cash, holdings, rows
 
