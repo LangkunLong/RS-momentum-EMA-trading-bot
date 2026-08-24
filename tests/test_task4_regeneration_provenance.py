@@ -5,6 +5,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = (
     Path(__file__).resolve().parents[1]
@@ -101,7 +103,7 @@ def test_regeneration_audit_binds_exact_correction_sources_before_publication() 
     assert "$fetchScript $bundleScript $verifyScript $regenerationDriverScript" in pre_audit_guard
 
     audit_block = source[audit:publication]
-    assert "schema_version = 2" in audit_block
+    assert "schema_version = 3" in audit_block
     for field in (
         "correction_git_head",
         "fetch_sec_pit_fundamentals_py_sha256",
@@ -112,8 +114,64 @@ def test_regeneration_audit_binds_exact_correction_sources_before_publication() 
         assert f"{field} =" in audit_block
 
 
-def test_final_provenance_guard_rejects_hidden_generator_drift_before_audit(tmp_path: Path) -> None:
-    """Removing the final byte comparison must publish an audit for unreported drift."""
+def test_preserved_and_fresh_identity_manifest_hashes_are_wired_to_their_own_bytes() -> None:
+    """Recombining the two identity hashes must reintroduce the preserved-provenance failure."""
+    source = SCRIPT.read_text(encoding="utf-8")
+    pinned_manifest = source.index("$pinnedSourceIdentityManifest = Get-RequiredFile")
+    correction_manifest = source.index("$correctionProducerIdentityManifest = Get-RequiredFile")
+    preserved_hashes = source.index("$preservedSourceInputHashes =")
+    fresh_hashes = source.index("$freshSourceInputHashes =")
+    preserved_validation = source.index("foreach ($field in $preservedSourceInputHashes.Keys)")
+    fresh_validation = source.index("foreach ($field in $freshSourceInputHashes.Keys)")
+    normalization = source.index("'--identity-manifest-csv', $correctionProducerIdentityManifest")
+    final_identity_guard = source.index("Assert-IdentityManifestInputsUnchanged `", fresh_validation)
+    audit = source.index("$audit = [ordered]@{")
+    publication = source.index("Write-CreateOnlyUtf8 $auditPath")
+
+    assert pinned_manifest < preserved_hashes < preserved_validation
+    assert correction_manifest < fresh_hashes < normalization < fresh_validation
+    assert preserved_validation < normalization
+    assert fresh_validation < final_identity_guard < audit
+
+    input_hash_setup = source[pinned_manifest:preserved_validation]
+    assert r"Join-Path $sourceWorktreePath 'config\pit_price_identity_map.csv'" in input_hash_setup
+    assert r"Join-Path $correctionWorktree 'config\pit_price_identity_map.csv'" in input_hash_setup
+    assert "$pinnedSourceIdentityManifest" in source[preserved_hashes:fresh_hashes]
+    assert "$correctionProducerIdentityManifest" in source[fresh_hashes:preserved_validation]
+
+    final_guard = source[final_identity_guard:audit]
+    assert "$pinnedSourceIdentityManifest $preservedSourceInputHashes['identity_manifest_csv_sha256']" in final_guard
+    assert "$correctionProducerIdentityManifest $freshSourceInputHashes['identity_manifest_csv_sha256']" in final_guard
+
+    audit_block = source[audit:publication]
+    assert "schema_version = 3" in audit_block
+    assert "pinned_source_identity_manifest_csv_sha256 =" in audit_block
+    assert "correction_producer_identity_manifest_csv_sha256 =" in audit_block
+
+
+@pytest.mark.parametrize(
+    ("drift_target", "expected_error"),
+    (
+        (
+            "fetch_sec_pit_fundamentals.py",
+            "correction source fetch_sec_pit_fundamentals_py_sha256 after generation differs",
+        ),
+        (
+            "pinned_identity_manifest.csv",
+            "pinned source identity manifest SHA-256 after generation differs",
+        ),
+        (
+            "pit_price_identity_map.csv",
+            "correction producer identity manifest SHA-256 after generation differs",
+        ),
+    ),
+)
+def test_final_provenance_guard_rejects_hidden_input_drift_before_audit(
+    tmp_path: Path,
+    drift_target: str,
+    expected_error: str,
+) -> None:
+    """Removing any final byte comparison must publish an audit for unreported drift."""
     repository = tmp_path / "correction-worktree"
     repository.mkdir()
     source_names = (
@@ -121,6 +179,8 @@ def test_final_provenance_guard_rejects_hidden_generator_drift_before_audit(tmp_
         "build_pit_bundle.py",
         "verify_pit_bundle.py",
         "task-4-regenerate.ps1",
+        "pinned_identity_manifest.csv",
+        "pit_price_identity_map.csv",
     )
     for name in source_names:
         (repository / name).write_text(f"original {name}\n", encoding="utf-8")
@@ -145,7 +205,8 @@ def test_final_provenance_guard_rejects_hidden_generator_drift_before_audit(tmp_
             param(
                 [string]$ProductionScript,
                 [string]$Repository,
-                [string]$AuditPath
+                [string]$AuditPath,
+                [string]$DriftTarget
             )
             $ErrorActionPreference = 'Stop'
             Import-Module Microsoft.PowerShell.Utility
@@ -168,7 +229,8 @@ def test_final_provenance_guard_rejects_hidden_generator_drift_before_audit(tmp_
                 'Get-CorrectionGitSnapshot',
                 'Get-CleanCorrectionGitSnapshot',
                 'Get-CorrectionSourceHashes',
-                'Assert-CorrectionProvenanceUnchanged'
+                'Assert-CorrectionProvenanceUnchanged',
+                'Assert-IdentityManifestInputsUnchanged'
             )
             $functionAsts = @($ast.FindAll({
                 param($node)
@@ -188,15 +250,20 @@ def test_final_provenance_guard_rejects_hidden_generator_drift_before_audit(tmp_
             $bundleScript = Join-Path $Repository 'build_pit_bundle.py'
             $verifyScript = Join-Path $Repository 'verify_pit_bundle.py'
             $driverScript = Join-Path $Repository 'task-4-regenerate.ps1'
+            $pinnedIdentityManifest = Join-Path $Repository 'pinned_identity_manifest.csv'
+            $correctionIdentityManifest = Join-Path $Repository 'pit_price_identity_map.csv'
             $launchGit = Get-CleanCorrectionGitSnapshot $gitExecutable $Repository 'at launch'
             $launchHashes = Get-CorrectionSourceHashes $fetchScript $bundleScript $verifyScript $driverScript
+            $pinnedIdentityHashAtLaunch = Get-Sha256 $pinnedIdentityManifest
+            $correctionIdentityHashAtLaunch = Get-Sha256 $correctionIdentityManifest
 
-            & $gitExecutable -C $Repository update-index --assume-unchanged -- fetch_sec_pit_fundamentals.py
+            & $gitExecutable -C $Repository update-index --assume-unchanged -- $DriftTarget
             if ($LASTEXITCODE -ne 0) {
                 Write-Error 'could not hide the controlled drift from Git status'
                 exit 90
             }
-            [System.IO.File]::WriteAllText($fetchScript, "hidden drift`n")
+            $driftPath = Join-Path $Repository $DriftTarget
+            [System.IO.File]::WriteAllText($driftPath, "hidden drift`n")
             $hiddenStatus = Invoke-GitText $gitExecutable $Repository 'hidden-drift status read' @(
                 'status', '--porcelain=v1', '--untracked-files=all'
             )
@@ -209,6 +276,9 @@ def test_final_provenance_guard_rejects_hidden_generator_drift_before_audit(tmp_
                 Assert-CorrectionProvenanceUnchanged `
                     $gitExecutable $Repository $launchGit $launchHashes `
                     $fetchScript $bundleScript $verifyScript $driverScript
+                Assert-IdentityManifestInputsUnchanged `
+                    $pinnedIdentityManifest $pinnedIdentityHashAtLaunch `
+                    $correctionIdentityManifest $correctionIdentityHashAtLaunch
                 [System.IO.File]::WriteAllText($AuditPath, 'incorrectly published')
             }
             catch {
@@ -238,6 +308,8 @@ def test_final_provenance_guard_rejects_hidden_generator_drift_before_audit(tmp_
             str(repository),
             "-AuditPath",
             str(audit),
+            "-DriftTarget",
+            drift_target,
         ],
         capture_output=True,
         text=True,
@@ -246,5 +318,5 @@ def test_final_provenance_guard_rejects_hidden_generator_drift_before_audit(tmp_
 
     output = completed.stdout + completed.stderr
     assert completed.returncode == 42, output
-    assert "correction source fetch_sec_pit_fundamentals_py_sha256 after generation differs" in output
+    assert expected_error in output
     assert not audit.exists()

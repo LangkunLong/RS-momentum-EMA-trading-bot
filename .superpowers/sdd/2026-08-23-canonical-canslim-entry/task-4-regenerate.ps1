@@ -210,6 +210,23 @@ function Assert-CorrectionProvenanceUnchanged {
     }
 }
 
+function Assert-IdentityManifestInputsUnchanged {
+    param(
+        [Parameter(Mandatory = $true)][string]$PinnedSourceManifest,
+        [Parameter(Mandatory = $true)][string]$PinnedSourceHashAtLaunch,
+        [Parameter(Mandatory = $true)][string]$CorrectionProducerManifest,
+        [Parameter(Mandatory = $true)][string]$CorrectionProducerHashAtLaunch
+    )
+    Assert-Equal `
+        (Get-Sha256 $PinnedSourceManifest) `
+        $PinnedSourceHashAtLaunch `
+        'pinned source identity manifest SHA-256 after generation'
+    Assert-Equal `
+        (Get-Sha256 $CorrectionProducerManifest) `
+        $CorrectionProducerHashAtLaunch `
+        'correction producer identity manifest SHA-256 after generation'
+}
+
 function Read-JsonObject {
     param([Parameter(Mandatory = $true)][string]$Path)
     try {
@@ -334,7 +351,8 @@ $spyTradingDaysCsv = Get-RequiredFile (Join-Path $sourceExportsDir 'spy_trading_
 $pricesCsv = Get-RequiredFile (Join-Path $sourceExportsDir 'prices.csv') 'prices CSV'
 $membershipProvenance = Get-RequiredFile (Join-Path $sourceExportsDir 'membership_provenance.json') 'membership provenance'
 $pricesProvenance = Get-RequiredFile (Join-Path $sourceExportsDir 'prices_provenance.json') 'prices provenance'
-$identityManifest = Get-RequiredFile (Join-Path $correctionWorktree 'config\pit_price_identity_map.csv') 'correction-worktree identity manifest'
+$pinnedSourceIdentityManifest = Get-RequiredFile (Join-Path $sourceWorktreePath 'config\pit_price_identity_map.csv') 'pinned source identity manifest'
+$correctionProducerIdentityManifest = Get-RequiredFile (Join-Path $correctionWorktree 'config\pit_price_identity_map.csv') 'correction-producer identity manifest'
 $fetchScript = Get-RequiredFile (Join-Path $correctionWorktree 'fetch_sec_pit_fundamentals.py') 'correction-worktree SEC normalizer'
 $bundleScript = Get-RequiredFile (Join-Path $correctionWorktree 'build_pit_bundle.py') 'correction-worktree bundle builder'
 $verifyScript = Get-RequiredFile (Join-Path $correctionWorktree 'verify_pit_bundle.py') 'correction-worktree bundle verifier'
@@ -349,11 +367,23 @@ foreach ($name in @('submissions.zip', 'companyfacts.zip')) {
     $sourceArchiveHashesBefore[$name] = Get-Sha256 $sourceArchives[$name]
     Assert-Equal $sourceArchiveHashesBefore[$name] $ExpectedArchives[$name]['sha256'] "pinned source $name SHA-256 before copy"
 }
-$sourceInputHashes = @{
+# Preserve the exact byte identities at each provenance boundary.  The pinned
+# publication is validated against the manifest bytes in its source worktree;
+# the fresh publication is generated and validated against producer bytes in
+# this correction worktree.  Deliberately do not normalize line endings.
+$preservedSourceInputHashes = @{
     'membership_csv_sha256' = Get-Sha256 $membershipCsv
     'security_names_csv_sha256' = Get-Sha256 $securityNamesCsv
     'spy_trading_days_csv_sha256' = Get-Sha256 $spyTradingDaysCsv
-    'identity_manifest_csv_sha256' = Get-Sha256 $identityManifest
+    'identity_manifest_csv_sha256' = Get-Sha256 $pinnedSourceIdentityManifest
+    'submissions_archive_sha256' = $ExpectedArchives['submissions.zip']['sha256']
+    'companyfacts_archive_sha256' = $ExpectedArchives['companyfacts.zip']['sha256']
+}
+$freshSourceInputHashes = @{
+    'membership_csv_sha256' = Get-Sha256 $membershipCsv
+    'security_names_csv_sha256' = Get-Sha256 $securityNamesCsv
+    'spy_trading_days_csv_sha256' = Get-Sha256 $spyTradingDaysCsv
+    'identity_manifest_csv_sha256' = Get-Sha256 $correctionProducerIdentityManifest
     'submissions_archive_sha256' = $ExpectedArchives['submissions.zip']['sha256']
     'companyfacts_archive_sha256' = $ExpectedArchives['companyfacts.zip']['sha256']
 }
@@ -379,8 +409,8 @@ foreach ($name in $ProvenanceHashFields.Keys) {
     $field = $ProvenanceHashFields[$name]
     Assert-Equal (Get-RequiredJsonProperty $preservedProvenance $field 'preserved fundamentals provenance') $preservedNormalizedHashes[$name] "preserved fundamentals provenance hash for $name"
 }
-foreach ($field in $sourceInputHashes.Keys) {
-    Assert-Equal (Get-RequiredJsonProperty $preservedProvenance $field 'preserved fundamentals provenance') $sourceInputHashes[$field] "preserved fundamentals provenance $field"
+foreach ($field in $preservedSourceInputHashes.Keys) {
+    Assert-Equal (Get-RequiredJsonProperty $preservedProvenance $field 'preserved fundamentals provenance') $preservedSourceInputHashes[$field] "preserved fundamentals provenance $field"
 }
 $preservedArchiveManifest = Get-RequiredJsonProperty $preservedProvenance 'archive_manifest' 'preserved fundamentals provenance'
 Assert-Equal (Get-RequiredJsonProperty $preservedArchiveManifest 'schema_version' 'preserved provenance archive manifest') 1 'preserved provenance archive manifest schema version'
@@ -426,7 +456,7 @@ try {
         '--end-date', '2025-12-31',
         '--sec-user-agent', $SecUserAgent,
         '--max-archive-bytes', '10737418240',
-        '--identity-manifest-csv', $identityManifest,
+        '--identity-manifest-csv', $correctionProducerIdentityManifest,
         '--output-dir', $freshSecDir
     )
 }
@@ -466,8 +496,8 @@ foreach ($name in $ProvenanceHashFields.Keys) {
     $field = $ProvenanceHashFields[$name]
     Assert-Equal (Get-RequiredJsonProperty $fundamentalsProvenance $field 'fresh fundamentals provenance') $normalizedHashes[$name] "fresh fundamentals provenance hash for $name"
 }
-foreach ($field in $sourceInputHashes.Keys) {
-    Assert-Equal (Get-RequiredJsonProperty $fundamentalsProvenance $field 'fresh fundamentals provenance') $sourceInputHashes[$field] "fresh fundamentals provenance $field"
+foreach ($field in $freshSourceInputHashes.Keys) {
+    Assert-Equal (Get-RequiredJsonProperty $fundamentalsProvenance $field 'fresh fundamentals provenance') $freshSourceInputHashes[$field] "fresh fundamentals provenance $field"
 }
 Assert-Equal (Get-RequiredJsonProperty $fundamentalsProvenance 'security_master_row_count' 'fresh fundamentals provenance') $ExpectedCounts['security_master'] 'fresh security-master row count'
 Assert-Equal (Get-RequiredJsonProperty $fundamentalsProvenance 'security_master_exclusion_row_count' 'fresh fundamentals provenance') $ExpectedCounts['security_master_exclusions'] 'fresh exclusion row count'
@@ -605,17 +635,22 @@ finally {
 Assert-CorrectionProvenanceUnchanged `
     $gitExecutable $correctionWorktree $correctionGitAtLaunch $correctionSourceHashesAtLaunch `
     $fetchScript $bundleScript $verifyScript $regenerationDriverScript
+Assert-IdentityManifestInputsUnchanged `
+    $pinnedSourceIdentityManifest $preservedSourceInputHashes['identity_manifest_csv_sha256'] `
+    $correctionProducerIdentityManifest $freshSourceInputHashes['identity_manifest_csv_sha256']
 
 $auditPath = Join-Path $outputRootPath 'task-4-regeneration-audit.json'
 Assert-True (-not (Test-Path -LiteralPath $auditPath -PathType Any)) "refusing existing regeneration audit: $auditPath"
 $audit = [ordered]@{
-    schema_version = 2
+    schema_version = 3
     status = 'complete'
     correction_git_head = $correctionGitAtLaunch.head
     fetch_sec_pit_fundamentals_py_sha256 = $correctionSourceHashesAtLaunch['fetch_sec_pit_fundamentals_py_sha256']
     build_pit_bundle_py_sha256 = $correctionSourceHashesAtLaunch['build_pit_bundle_py_sha256']
     verify_pit_bundle_py_sha256 = $correctionSourceHashesAtLaunch['verify_pit_bundle_py_sha256']
     regeneration_driver_ps1_sha256 = $correctionSourceHashesAtLaunch['regeneration_driver_ps1_sha256']
+    pinned_source_identity_manifest_csv_sha256 = $preservedSourceInputHashes['identity_manifest_csv_sha256']
+    correction_producer_identity_manifest_csv_sha256 = $freshSourceInputHashes['identity_manifest_csv_sha256']
     date_contract = [ordered]@{
         warmup_start = '2020-01-01'
         evaluation_start = '2021-01-01'
@@ -660,6 +695,8 @@ Assert-ExactJsonProperties $auditRoundTrip @(
     'build_pit_bundle_py_sha256',
     'verify_pit_bundle_py_sha256',
     'regeneration_driver_ps1_sha256',
+    'pinned_source_identity_manifest_csv_sha256',
+    'correction_producer_identity_manifest_csv_sha256',
     'date_contract',
     'source_archives_sha256',
     'sec_archives_provenance_sha256',
