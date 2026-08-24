@@ -134,7 +134,12 @@ def write_after_close_snapshot(
         "shortlist": [row for row in snapshot.rows if row["tomorrow_executable"]],
         "near_misses": [row for row in snapshot.rows if not row["tomorrow_executable"]],
         "rows": snapshot.rows,
-        "artifact_provenance": {"calculation": "completed_daily_bars", "advisory_only": True},
+        "artifact_provenance": {
+            "calculation": "completed_daily_bars",
+            "advisory_only": True,
+            "signal_scope": "technical_ranking_only",
+            "full_canslim_entry": False,
+        },
     }
     json_path.write_text(json.dumps(_json_safe(payload), allow_nan=False, sort_keys=True), encoding="utf-8")
     return csv_path, json_path

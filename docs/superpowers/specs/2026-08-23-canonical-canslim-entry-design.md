@@ -49,6 +49,12 @@ The full CANSLIM decision additionally requires:
   component weights, removes M, and renormalizes the remaining active weights.
   The legacy seven-component total remains available for reporting.
 
+Legacy scanner/backtest `min_rs_score` and `min_canslim_score` inputs remain
+accepted for API and CLI compatibility only. They are deprecated advisory
+metadata: they can neither tighten nor loosen the fixed 80/70 contract, do not
+participate in checkpoint identity, and are reported separately from the
+effective canonical values.
+
 Missing or non-finite inputs are unavailable, never successful comparisons.
 The decision carries ordered machine-readable blocking reasons plus the exact
 pivot, prior-volume baseline, volume ratio, and extension.

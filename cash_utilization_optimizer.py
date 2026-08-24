@@ -1,10 +1,10 @@
-"""Walk-forward selection for the backtest cash-deployment threshold.
+"""Walk-forward selection for backtest cash-deployment thresholds only.
 
 This research CLI uses the approved local historical cache only.  It never
 downloads data or changes the live/paper trading configuration.  Candidate
-thresholds are selected on a training window, then evaluated once on a
-trailing holdout window so a full-period winner cannot silently become the
-default.
+cash-deployment thresholds are selected on a training window, then evaluated
+once on a trailing holdout window so a full-period winner cannot silently
+become the default.  It never tunes the fixed CANSLIM entry floors.
 """
 
 from __future__ import annotations
@@ -137,7 +137,6 @@ def _run_candidate(
         position_risk_pct=risk_pct,
         stop_loss_pct=float(settings.STOP_LOSS_PCT),
         signal_every_n_days=signal_days,
-        min_rs_score=80,
         min_technical_score=70,
         require_bullish_market=True,
         use_stateful_regime_gate=False,
@@ -258,7 +257,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", default="2023-04-01")
     parser.add_argument("--holdout-start-date", default="2025-04-01")
     parser.add_argument("--end-date", default="2026-04-01")
-    parser.add_argument("--thresholds", default="none,0.75,0.60,0.50")
+    parser.add_argument(
+        "--thresholds",
+        default="none,0.75,0.60,0.50",
+        help=(
+            "cash-deployment thresholds only; this optimizer never tunes the "
+            "fixed CANSLIM entry floors"
+        ),
+    )
     parser.add_argument("--target-cash-pct", type=float, default=60.0)
     parser.add_argument(
         "--min-holdout-sharpe-delta",

@@ -51,13 +51,11 @@ FUNDAMENTALS_CACHE_DIR = os.path.join(CACHE_DIR, "fundamentals")
 # Stock screening thresholds
 START_DATE = "2024-01-01"  # Analysis start date
 MIN_MARKET_CAP = 10e9  # Minimum market cap ($10 billion)
-# O'Neil's IBD RS rating requires 80+ for institutional-quality leaders.
-# 75 was an earlier default when FMP fundamentals were incomplete; now that fundamentals
-# are available, 80 is the appropriate live-entry floor.
-# Tradeoff: raising to 85 further reduces false positives but also filters out
-# early-stage leaders that have not yet attracted broad attention.
+# Fixed canonical entry floors.  These names remain for settings/API
+# compatibility; callers must not treat them as optimizer or scanner knobs.
+# The authoritative values also live in core.canslim.entry_contract.
 MIN_RS_SCORE = 80
-MIN_CANSLIM_SCORE = 70  # Minimum composite CANSLIM score for actionable entries
+MIN_CANSLIM_SCORE = 70
 INDUSTRY_GROUP_TOP_N: int = 20  # number of top industry groups allowed for entries
 INDUSTRY_GROUP_MIN_SIZE: int = 3  # min stocks in a group to include it in ranking
 INDUSTRY_GROUP_CACHE_PATH: str = os.path.join(CACHE_DIR, "industry_group_cache.json")

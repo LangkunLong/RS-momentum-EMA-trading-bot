@@ -339,8 +339,15 @@ Backtest execution treats the market-direction score as diagnostics by default:
 an otherwise-valid signal is sized and entered whenever cash is available. Use
 `--require-bullish-market` only for an explicit conservative M-gated replay.
 
+The full CANSLIM entry floors are fixed at RS 80 and non-M composite 70. Legacy
+`min_rs_score` / `min_canslim_score` Python arguments and the backtest
+`--min-rs` / `--min-canslim` options remain accepted for compatibility, but are
+deprecated advisory metadata and do not alter entry qualification. Reports show
+the fixed effective values separately from any finite requested values.
+
 To select a cash-deployment threshold without fitting the full period, run the
-walk-forward optimizer against the approved local cache:
+walk-forward optimizer against the approved local cache. This tool varies only
+cash-deployment admission; it never tunes the fixed CANSLIM entry floors:
 
 ```powershell
 python cash_utilization_optimizer.py `
@@ -357,8 +364,9 @@ comparison against the bullish-only baseline, and emits a `promote` or
 holdout return/Sharpe deltas and no drawdown deterioration by default. It does
 not change the backtest execution default. Backtests execute otherwise-valid
 entries whenever cash is available; pass `--require-bullish-market` to opt into
-the M-gate for a conservative comparison. A threshold is an explicit backtest
-experiment; it is not a live or paper-trading setting.
+the M-gate for a conservative comparison. A cash-deployment threshold is an
+explicit backtest experiment; it is not a CANSLIM threshold or a live or
+paper-trading setting.
 
 Backtest reports also separate final buy signals from technically valid signals
 that were blocked by the M (market-direction) gate. This prevents idle cash from

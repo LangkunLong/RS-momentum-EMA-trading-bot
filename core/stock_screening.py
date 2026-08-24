@@ -7,7 +7,6 @@ filtering for stocks with strong fundamentals, technical strength, and market le
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import math
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -30,17 +29,6 @@ from core.canslim.entry_contract import (
 from core.momentum_analysis import calculate_rs_scores_for_tickers
 
 
-def _tightened_floor(canonical_floor: float, caller_floor: object) -> float:
-    """Return a finite caller floor only when it tightens the canonical floor."""
-    try:
-        requested = float(caller_floor)
-    except (TypeError, ValueError, OverflowError):
-        return canonical_floor
-    if not math.isfinite(requested):
-        return canonical_floor
-    return max(canonical_floor, requested)
-
-
 def _classify_canslim_candidate(
     canslim_view: Dict[str, object],
     min_rs_score: float,
@@ -52,23 +40,18 @@ def _classify_canslim_candidate(
 ) -> tuple[str, List[str]]:
     """Classify a canonical entry decision without duplicating its gates.
 
-    Caller thresholds may tighten but cannot loosen the fixed shared contract.
-    The legacy fundamental and breakout strictness arguments remain accepted
-    for API compatibility but are intentionally inert.
+    The legacy threshold, fundamental, and breakout arguments remain accepted
+    for API compatibility but are advisory-only and intentionally inert.  The
+    shared entry decision is the sole C/A/RS/composite/technical authority.
     """
+    del min_rs_score, min_canslim_score, require_fundamentals, strict_breakout
     notes: List[str] = []
 
     entry_decision = canslim_view.get("entry_decision")
     if isinstance(entry_decision, CanslimEntryDecision):
-        rs_score = float(entry_decision.rs_score or 0.0)
         entry_composite_score = float(entry_decision.composite_score or 0.0)
     else:
-        rs_score = float(canslim_view.get("rs_score", 0.0))
         entry_composite_score = float(canslim_view.get("entry_composite_score", 0.0))
-    effective_rs_floor = _tightened_floor(CANONICAL_MIN_RS_SCORE, min_rs_score)
-    effective_composite_floor = _tightened_floor(
-        CANONICAL_MIN_COMPOSITE_SCORE, min_canslim_score
-    )
     market = canslim_view.get("market_trend")
     metrics = canslim_view.get("metrics", {})
     market_is_bullish = bool(getattr(market, "is_bullish", False))
@@ -78,10 +61,7 @@ def _classify_canslim_candidate(
 
     market_permission = market_is_bullish if require_bullish_market else True
     contract_eligible = isinstance(entry_decision, CanslimEntryDecision) and entry_decision.eligible
-    caller_thresholds_met = (
-        rs_score >= effective_rs_floor and entry_composite_score >= effective_composite_floor
-    )
-    if contract_eligible and caller_thresholds_met and market_permission:
+    if contract_eligible and market_permission:
         return "actionable_buy", []
 
     if entry_composite_score < watchlist_min_score:
@@ -91,10 +71,6 @@ def _classify_canslim_candidate(
         notes.extend(entry_decision.blocking_reasons)
     else:
         notes.append("entry_contract_unavailable")
-    if rs_score < effective_rs_floor:
-        notes.append("below_rs_threshold")
-    if entry_composite_score < effective_composite_floor:
-        notes.append("below_buy_score")
     if require_bullish_market and not market_is_bullish:
         notes.append("market_not_bullish")
     if not notes:
@@ -120,8 +96,8 @@ def evaluate_stock_canslim(
 
     Args:
         symbol: Stock ticker symbol
-        min_rs_score: Minimum RS score threshold
-        min_canslim_score: Minimum CANSLIM composite score threshold
+        min_rs_score: Deprecated advisory request; ignored for entry qualification.
+        min_canslim_score: Deprecated advisory request; ignored for entry qualification.
         market_trend: Pre-calculated market trend
         rs_scores_df: DataFrame with pre-calculated RS scores
         debug: Enable verbose output
@@ -215,16 +191,17 @@ def evaluate_stock_canslim(
         )
 
     rs_score = float(canslim_view["rs_score"])
-    effective_rs_floor = _tightened_floor(CANONICAL_MIN_RS_SCORE, min_rs_score)
-    effective_composite_floor = _tightened_floor(
-        CANONICAL_MIN_COMPOSITE_SCORE, min_canslim_score
+    _debug(
+        f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | "
+        f"Canonical Minimum: {CANONICAL_MIN_RS_SCORE:.1f} | "
+        f"Legacy Request (advisory only): {min_rs_score!r}"
     )
-    _debug(f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | Effective Minimum: {effective_rs_floor:.1f}")
     total_score = float(canslim_view["total_score"])
     entry_score = float(canslim_view.get("entry_composite_score", 0.0))
     _debug(
         f"[DEBUG] Entry Composite (non-M): {entry_score:.1f} | "
-        f"Effective Minimum: {effective_composite_floor:.1f} | "
+        f"Canonical Minimum: {CANONICAL_MIN_COMPOSITE_SCORE:.1f} | "
+        f"Legacy Request (advisory only): {min_canslim_score!r} | "
         f"Legacy M-inclusive Total: {total_score:.1f}"
     )
     category, notes = _classify_canslim_candidate(
@@ -276,8 +253,8 @@ def screen_stocks_canslim_detailed(
         symbols: List of stock ticker symbols to screen
         start_date: Start date for analysis (unused but kept for compatibility)
         end_date: End date for analysis (unused but kept for compatibility)
-        min_rs_score: Minimum relative strength score threshold
-        min_canslim_score: Minimum composite CANSLIM score threshold
+        min_rs_score: Deprecated advisory request; ignored for entry qualification.
+        min_canslim_score: Deprecated advisory request; ignored for entry qualification.
         debug: Enable verbose output
 
     Returns:
@@ -323,9 +300,9 @@ def screen_stocks_canslim_detailed(
                 "Only watchlist candidates will surface."
             )
 
-    # Pre-filter: discard symbols whose RS score is already below the threshold
-    # to avoid wasting API calls on weak stocks
-    effective_rs_floor = _tightened_floor(CANONICAL_MIN_RS_SCORE, min_rs_score)
+    # Pre-filter only below the fixed shared RS contract.  Legacy caller values
+    # cannot prevent a canonically eligible symbol from reaching evaluation.
+    effective_rs_floor = CANONICAL_MIN_RS_SCORE
     filtered_symbols = []
     rs_score_by_symbol: Dict[str, float] = {}
     rs_below_threshold = 0

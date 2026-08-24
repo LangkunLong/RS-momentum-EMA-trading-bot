@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from core.canslim.entry_contract import MIN_COMPOSITE_SCORE
+from core.canslim.entry_contract import MIN_COMPOSITE_SCORE, MIN_RS_SCORE
 from core.leader_evaluation import FiveYearLeader, RollingLeaderObservation
 
 FIVE_YEAR_LEADER_COLUMNS = (
@@ -133,8 +133,8 @@ def build_leader_recall_frame(
 ) -> pd.DataFrame:
     """Join top leaders to independently counted signal, execution, and gate facts."""
     # Retained only so historical callers do not break. Entry qualification and
-    # attribution use the fixed non-M canonical composite floor.
-    del min_canslim_score
+    # attribution use the fixed canonical RS and non-M composite floors.
+    del min_rs_score, min_canslim_score
     if not isinstance(signal_log, pd.DataFrame) or not isinstance(transaction_log, pd.DataFrame):
         raise ValueError("signal and transaction logs must be DataFrames")
     if not isinstance(start_date, date):
@@ -205,7 +205,7 @@ def build_leader_recall_frame(
                 "blocked_for_capacity_count": sum(capacity.get(alias, 0) for alias in aliases),
                 "c_fail_count": fail_numeric("current_growth", min_c_a_growth),
                 "a_fail_count": fail_numeric("annual_growth", min_c_a_growth),
-                "rs_fail_count": fail_numeric("rs_score", min_rs_score),
+                "rs_fail_count": fail_numeric("rs_score", MIN_RS_SCORE),
                 "breakout_fail_count": fail_bool("has_breakout"),
                 "volume_fail_count": fail_bool("has_volume_surge"),
                 "buy_zone_fail_count": fail_bool("in_buy_zone"),

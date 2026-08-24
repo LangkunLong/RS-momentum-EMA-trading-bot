@@ -70,7 +70,8 @@ DEFAULT_STAGNATION_THRESHOLD_PCT = 0.05
 DEFAULT_BREAKEVEN_TRIGGER_PCT = 0.08
 DEFAULT_POSITION_SIZE_PCT = settings.POSITION_SIZE_PCT
 DEFAULT_POSITION_RISK_PCT = settings.POSITION_RISK_PCT  # 1% portfolio risk per trade
-DEFAULT_MIN_RS_SCORE = float(settings.MIN_RS_SCORE)
+DEFAULT_MIN_RS_SCORE = MIN_RS_SCORE
+DEFAULT_MIN_CANSLIM_SCORE = MIN_COMPOSITE_SCORE
 DEFAULT_MIN_C_A_GROWTH = 0.25
 DEFAULT_MIN_TECHNICAL_SCORE = 70.0
 DEFAULT_BULK_PRICE_FETCH_THRESHOLD = 25
@@ -360,7 +361,7 @@ class SimulationResult:
                 if "symbol" in columns
                 else 0
             ),
-            "rs_pass": count_threshold("rs_score", self.config.get("min_rs_score", DEFAULT_MIN_RS_SCORE)),
+            "rs_pass": count_threshold("rs_score", MIN_RS_SCORE),
             "market_pass": count_true("market_is_bullish"),
             "breakout_pass": count_true("has_breakout"),
             "volume_surge_pass": count_true("has_volume_surge"),
@@ -619,22 +620,29 @@ def _causal_open_price(ohlcv: pd.DataFrame, eval_date: pd.Timestamp) -> float | 
 
 
 class CanslimStrategy:
-    """Modular CANSLIM signal evaluation."""
+    """Modular CANSLIM signal evaluation under the fixed entry contract.
+
+    ``min_rs_score`` and ``min_canslim_score`` remain constructor-compatible
+    advisory requests.  Effective qualification always uses canonical 80/70.
+    """
 
     def __init__(
         self,
         *,
         min_c_a_growth: float = DEFAULT_MIN_C_A_GROWTH,
         min_rs_score: float = DEFAULT_MIN_RS_SCORE,
-        min_canslim_score: float = float(settings.MIN_CANSLIM_SCORE),
+        min_canslim_score: float = DEFAULT_MIN_CANSLIM_SCORE,
         min_technical_score: float = DEFAULT_MIN_TECHNICAL_SCORE,
         require_bullish_market: bool = False,
         technical_only: bool = False,
         fundamental_provider: Optional[Callable[[str, pd.Timestamp], dict[str, Any]]] = None,
     ) -> None:
         self.min_c_a_growth = min_c_a_growth
-        self.min_rs_score = min_rs_score
-        self.min_canslim_score = min_canslim_score
+        self.requested_min_rs_score = _finite_signal_number(min_rs_score)
+        self.requested_min_canslim_score = _finite_signal_number(min_canslim_score)
+        self.min_rs_score = MIN_RS_SCORE
+        self.min_canslim_score = MIN_COMPOSITE_SCORE
+        self.entry_threshold_requests_advisory_only = True
         self.min_technical_score = min_technical_score
         self.require_bullish_market = require_bullish_market
         self.technical_only = technical_only
@@ -905,7 +913,7 @@ def _new_execution_diagnostics() -> dict[str, int]:
     }
 
 
-_PORTFOLIO_CHECKPOINT_SCHEMA = 2
+_PORTFOLIO_CHECKPOINT_SCHEMA = 3
 
 
 def _checkpoint_json_safe(value: Any) -> Any:
@@ -976,6 +984,24 @@ def _load_checkpoint_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema_version") != _PORTFOLIO_CHECKPOINT_SCHEMA:
         raise ValueError("portfolio checkpoint schema is unsupported")
     return value
+
+
+def _checkpoint_origin_advisory_request(
+    checkpoint: dict[str, Any],
+    field: str,
+) -> float | None:
+    """Return one normalized origin request from a schema-v3 checkpoint."""
+    if field not in checkpoint:
+        raise ValueError("portfolio checkpoint origin advisory request is missing")
+    raw = checkpoint[field]
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("portfolio checkpoint origin advisory request is invalid")
+    number = float(raw)
+    if not math.isfinite(number):
+        raise ValueError("portfolio checkpoint origin advisory request is invalid")
+    return number
 
 
 def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> dict[str, Any]:
@@ -1060,8 +1086,8 @@ def _portfolio_checkpoint_fingerprint(
         "ma_exit_period": simulator.ma_exit_period,
         "ma_consecutive": simulator.ma_consecutive,
         "signal_every_n_days": simulator.signal_every_n_days,
-        "min_canslim_score": simulator.min_canslim_score,
-        "min_rs_score": simulator.min_rs_score,
+        "min_canslim_score": MIN_COMPOSITE_SCORE,
+        "min_rs_score": MIN_RS_SCORE,
         "min_technical_score": simulator.min_technical_score,
         "require_bullish_market": simulator.require_bullish_market,
         "use_stateful_regime_gate": simulator.use_stateful_regime_gate,
@@ -1117,7 +1143,11 @@ def _trade_from_checkpoint(value: Any) -> Trade:
 
 
 class PortfolioSimulator:
-    """Simulates the full CANSLIM portfolio lifecycle."""
+    """Simulate the full CANSLIM portfolio lifecycle.
+
+    Legacy RS/composite request arguments are retained as JSON-safe advisory
+    metadata and cannot alter signals, results, or checkpoint identity.
+    """
 
     def __init__(
         self,
@@ -1132,7 +1162,7 @@ class PortfolioSimulator:
         ma_exit_period: int = DEFAULT_MA_EXIT_PERIOD,
         ma_consecutive: int = DEFAULT_MA_CONSECUTIVE,
         signal_every_n_days: int = DEFAULT_SIGNAL_EVERY_N_DAYS,
-        min_canslim_score: float = float(settings.MIN_CANSLIM_SCORE),
+        min_canslim_score: float = DEFAULT_MIN_CANSLIM_SCORE,
         min_rs_score: float = DEFAULT_MIN_RS_SCORE,
         min_technical_score: float = DEFAULT_MIN_TECHNICAL_SCORE,
         require_bullish_market: bool = False,
@@ -1159,8 +1189,11 @@ class PortfolioSimulator:
         self.ma_exit_period = ma_exit_period
         self.ma_consecutive = ma_consecutive
         self.signal_every_n_days = signal_every_n_days
-        self.min_canslim_score = min_canslim_score
-        self.min_rs_score = min_rs_score
+        self.requested_min_canslim_score = _finite_signal_number(min_canslim_score)
+        self.requested_min_rs_score = _finite_signal_number(min_rs_score)
+        self.min_canslim_score = MIN_COMPOSITE_SCORE
+        self.min_rs_score = MIN_RS_SCORE
+        self.entry_threshold_requests_advisory_only = True
         self.min_technical_score = min_technical_score
         self.require_bullish_market = require_bullish_market
         self.use_stateful_regime_gate = use_stateful_regime_gate
@@ -1178,14 +1211,28 @@ class PortfolioSimulator:
         self.stagnation_threshold_pct = stagnation_threshold_pct
         self.breakeven_trigger_pct = breakeven_trigger_pct
         self.data_fetcher = data_fetcher or DataFetcher()
-        self.strategy = strategy or CanslimStrategy(
-            min_rs_score=min_rs_score,
-            min_canslim_score=min_canslim_score,
-            min_technical_score=min_technical_score,
-            require_bullish_market=require_bullish_market,
-            technical_only=technical_only,
-            fundamental_provider=pit_bundle.fundamentals_provider if pit_bundle is not None else None,
+        self.strategy = (
+            strategy
+            if strategy is not None
+            else CanslimStrategy(
+                min_rs_score=min_rs_score,
+                min_canslim_score=min_canslim_score,
+                min_technical_score=min_technical_score,
+                require_bullish_market=require_bullish_market,
+                technical_only=technical_only,
+                fundamental_provider=(
+                    pit_bundle.fundamentals_provider if pit_bundle is not None else None
+                ),
+            )
         )
+        try:
+            self.strategy.min_rs_score = MIN_RS_SCORE
+            self.strategy.min_canslim_score = MIN_COMPOSITE_SCORE
+            self.strategy.entry_threshold_requests_advisory_only = True
+        except Exception as exc:
+            raise ValueError(
+                "supplied strategy cannot honor the fixed canonical entry thresholds"
+            ) from exc
         if pit_bundle is not None and not technical_only:
             # A custom strategy is still bound to the immutable bundle.  This
             # prevents a caller from silently falling back to today's provider.
@@ -1267,6 +1314,8 @@ class PortfolioSimulator:
             simulator=self,
         )
         checkpoint_state: Optional[dict[str, Any]] = None
+        origin_requested_min_rs_score = self.requested_min_rs_score
+        origin_requested_min_canslim_score = self.requested_min_canslim_score
         restored_outputs: dict[str, list[Any]] = {
             "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
             "entry_outcomes": [],
@@ -1282,6 +1331,12 @@ class PortfolioSimulator:
                 raise ValueError("portfolio checkpoint does not match the requested run")
             if checkpoint_state.get("code_identity") != checkpoint_code_identity:
                 raise ValueError("portfolio checkpoint was produced by a different code revision")
+            origin_requested_min_rs_score = _checkpoint_origin_advisory_request(
+                checkpoint_state, "origin_requested_min_rs_score"
+            )
+            origin_requested_min_canslim_score = _checkpoint_origin_advisory_request(
+                checkpoint_state, "origin_requested_min_canslim_score"
+            )
             if state_log is None:
                 raise ValueError("portfolio checkpoint state log is not configured")
             restored_outputs = _read_checkpoint_state(
@@ -1491,6 +1546,10 @@ class PortfolioSimulator:
                         regime_tracker=regime_tracker,
                         pending_entries=pending_entries,
                         benchmark_start_price=benchmark_start_price,
+                        origin_requested_min_rs_score=origin_requested_min_rs_score,
+                        origin_requested_min_canslim_score=(
+                            origin_requested_min_canslim_score
+                        ),
                     )
                     _write_checkpoint_json(checkpoint, checkpoint_payload)
                     if progress is not None:
@@ -1531,6 +1590,10 @@ class PortfolioSimulator:
             all_closes=all_closes,
             start_ts=start_ts,
             end_ts=end_ts,
+            requested_entry_floors=(
+                origin_requested_min_rs_score,
+                origin_requested_min_canslim_score,
+            ),
         )
         result = SimulationResult(
             trades=self._trades,
@@ -1557,6 +1620,10 @@ class PortfolioSimulator:
                     regime_tracker=regime_tracker,
                     pending_entries=[],
                     benchmark_start_price=benchmark_start_price,
+                    origin_requested_min_rs_score=origin_requested_min_rs_score,
+                    origin_requested_min_canslim_score=(
+                        origin_requested_min_canslim_score
+                    ),
                     completed=True,
                     result_config=result_config,
                 ),
@@ -1584,7 +1651,16 @@ class PortfolioSimulator:
         all_closes: pd.DataFrame,
         start_ts: pd.Timestamp,
         end_ts: pd.Timestamp,
+        requested_entry_floors: tuple[float | None, float | None] | None = None,
     ) -> dict[str, Any]:
+        requested_min_rs_score, requested_min_canslim_score = (
+            requested_entry_floors
+            if requested_entry_floors is not None
+            else (
+                self.requested_min_rs_score,
+                self.requested_min_canslim_score,
+            )
+        )
         return {
             "tickers": tickers,
             "candidate_universe_count": len(tickers),
@@ -1602,6 +1678,11 @@ class PortfolioSimulator:
             "signal_every_n_days": self.signal_every_n_days,
             "min_canslim_score": self.min_canslim_score,
             "min_rs_score": self.min_rs_score,
+            "requested_min_canslim_score": requested_min_canslim_score,
+            "requested_min_rs_score": requested_min_rs_score,
+            "entry_threshold_requests_advisory_only": (
+                self.entry_threshold_requests_advisory_only
+            ),
             "min_technical_score": self.min_technical_score,
             "entry_contract_min_current_growth": MIN_CURRENT_GROWTH,
             "entry_contract_min_annual_growth": MIN_ANNUAL_GROWTH,
@@ -1635,6 +1716,8 @@ class PortfolioSimulator:
         regime_tracker: MarketRegimeTracker,
         pending_entries: list[dict],
         benchmark_start_price: Optional[float],
+        origin_requested_min_rs_score: float | None,
+        origin_requested_min_canslim_score: float | None,
         completed: bool = False,
         result_config: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
@@ -1657,6 +1740,10 @@ class PortfolioSimulator:
             "entry_outcomes": [outcome.to_primitive() for outcome in self._entry_outcomes],
             "pending_entries": pending_entries,
             "benchmark_start_price": benchmark_start_price,
+            "origin_requested_min_rs_score": origin_requested_min_rs_score,
+            "origin_requested_min_canslim_score": (
+                origin_requested_min_canslim_score
+            ),
             "regime": _regime_checkpoint_state(regime_tracker),
         }
         if result_config is not None:
@@ -1673,6 +1760,22 @@ class PortfolioSimulator:
             raise ValueError("portfolio checkpoint does not contain a completed result")
         if checkpoint.get("entry_outcome_schema_version") != ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION:
             raise ValueError("portfolio checkpoint entry outcome schema is unsupported")
+        origin_requested_min_rs_score = _checkpoint_origin_advisory_request(
+            checkpoint, "origin_requested_min_rs_score"
+        )
+        origin_requested_min_canslim_score = _checkpoint_origin_advisory_request(
+            checkpoint, "origin_requested_min_canslim_score"
+        )
+        result_config = checkpoint["result_config"]
+        if (
+            result_config.get("requested_min_rs_score")
+            != origin_requested_min_rs_score
+            or result_config.get("requested_min_canslim_score")
+            != origin_requested_min_canslim_score
+        ):
+            raise ValueError(
+                "completed checkpoint result config disagrees with origin advisory requests"
+            )
         checkpoint_outcomes = tuple(
             EntryAttemptOutcome.from_primitive(value)
             for value in checkpoint["entry_outcomes"]
@@ -1698,7 +1801,7 @@ class PortfolioSimulator:
             equity_curve=equity,
             benchmark_curve=benchmark_curve,
             initial_capital=self.initial_capital,
-            config=checkpoint["result_config"],
+            config=result_config,
             transaction_log=pd.DataFrame(outputs["transactions"]),
             weekly_holdings=pd.DataFrame(outputs["weekly"]),
             signal_log=pd.DataFrame(outputs["signals"]),
@@ -2287,13 +2390,22 @@ def print_pnl_report(result: SimulationResult) -> None:
     print(f"Take-profit:      {cfg.get('take_profit_pct', DEFAULT_TAKE_PROFIT_PCT) * 100:.1f}%")
     print(f"Time stop:        {cfg.get('stagnation_days', DEFAULT_STAGNATION_DAYS)} days")
     print(f"Breakeven trigger:{cfg.get('breakeven_trigger_pct', DEFAULT_BREAKEVEN_TRIGGER_PCT) * 100:>11.1f}%")
-    print(f"RS floor:         {cfg.get('min_rs_score', DEFAULT_MIN_RS_SCORE)}")
+    print(f"RS floor (fixed): {cfg.get('min_rs_score', MIN_RS_SCORE)}")
     if cfg.get("technical_only"):
         print("Mode:             technical-only")
         print(f"Technical floor:  {cfg.get('min_technical_score', DEFAULT_MIN_TECHNICAL_SCORE)}")
     else:
         print("Mode:             full CANSLIM")
-        print(f"CANSLIM floor:    {cfg.get('min_canslim_score', settings.MIN_CANSLIM_SCORE)}")
+        print(
+            "CANSLIM floor (fixed): "
+            f"{cfg.get('min_canslim_score', MIN_COMPOSITE_SCORE)}"
+        )
+    if cfg.get("entry_threshold_requests_advisory_only"):
+        print(
+            "Legacy floor requests (ignored): "
+            f"RS={cfg.get('requested_min_rs_score')}, "
+            f"composite={cfg.get('requested_min_canslim_score')}"
+        )
 
     print("\n--- Portfolio vs Benchmark ---")
     print(f"{'Metric':<22} {'Strategy':>12} {'Benchmark':>12}")
@@ -2614,8 +2726,24 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
         default=None,
         help="fraction of cash above which non-bullish signals may be admitted (0-1)",
     )
-    parser.add_argument("--min-canslim", type=float, default=float(settings.MIN_CANSLIM_SCORE))
-    parser.add_argument("--min-rs", type=float, default=DEFAULT_MIN_RS_SCORE)
+    parser.add_argument(
+        "--min-canslim",
+        type=float,
+        default=DEFAULT_MIN_CANSLIM_SCORE,
+        help=(
+            "deprecated advisory; ignored for entry qualification, which uses "
+            "fixed canonical composite 70"
+        ),
+    )
+    parser.add_argument(
+        "--min-rs",
+        type=float,
+        default=DEFAULT_MIN_RS_SCORE,
+        help=(
+            "deprecated advisory; ignored for entry qualification, which uses "
+            "fixed canonical RS 80"
+        ),
+    )
     parser.add_argument("--min-technical-score", type=float, default=DEFAULT_MIN_TECHNICAL_SCORE)
     parser.add_argument("--benchmark", default=BENCHMARK)
     parser.add_argument("--technical-only", action="store_true")
