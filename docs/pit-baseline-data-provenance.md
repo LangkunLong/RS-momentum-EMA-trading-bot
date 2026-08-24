@@ -174,9 +174,22 @@ python pit_baseline.py `
 ```
 
 The final command above is the recorded completed-run invocation from the
-manifest, including its resume checkpoint. It is evidence, not a command to
-rerun in place: the preserved output root already exists and publication
-correctly refuses an overwrite.
+manifest, including its resume checkpoint. It documents the pre-fix
+split-publication behavior: its checkpoint parent differs from `--output-root`.
+It is historical evidence only, not a valid current resume invocation.
+
+Current in-place resume requires the checkpoint to be owned by the supplied
+output root:
+
+```text
+--output-root OUTPUT_ROOT
+--resume-checkpoint OUTPUT_ROOT/run-<UTC>-<bundle-prefix>/portfolio_checkpoint.json
+```
+
+Before resume, that run directory must contain exactly
+`portfolio_checkpoint.json`, `portfolio_progress.jsonl`, and
+`portfolio_state.jsonl`; a manifest, failure marker, public output, or any
+other entry requires a fresh run instead.
 
 For a fresh offline replay, retain the same hash-bound input arguments but omit
 `--resume-checkpoint` unless resuming that new replay's own checkpoint, and use

@@ -6,6 +6,8 @@ import argparse
 import inspect
 import json
 import math
+import os
+import stat
 import subprocess
 from dataclasses import asdict
 from datetime import date, datetime, timezone
@@ -99,42 +101,83 @@ def _regular_file(path: str | Path) -> Path:
     return value.resolve()
 
 
+def _lexical_path(path: str | Path, *, field: str) -> Path:
+    """Return an absolute path after rejecting every lexical link boundary."""
+
+    value = Path(path).absolute()
+    current = Path(value.anchor)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    components = [current]
+    for part in value.parts[1:]:
+        current = current / part
+        components.append(current)
+    for current in components:
+        try:
+            metadata = os.lstat(current)
+        except OSError as exc:
+            raise ValueError(f"{field} path cannot be inspected: {current}") from exc
+        attributes = int(getattr(metadata, "st_file_attributes", 0) or 0)
+        if stat.S_ISLNK(metadata.st_mode) or (reparse_flag and attributes & reparse_flag):
+            raise ValueError(
+                f"{field} must not traverse a symlink or Windows reparse point: {current}"
+            )
+    return value
+
+
+def _lexical_regular_file(path: str | Path, *, field: str) -> Path:
+    value = _lexical_path(path, field=field)
+    if not value.is_file():
+        raise ValueError(f"{field} must be a regular non-link file: {value}")
+    return value
+
+
+def _lexical_regular_directory(path: str | Path, *, field: str) -> Path:
+    value = _lexical_path(path, field=field)
+    if not value.is_dir():
+        raise ValueError(f"{field} must be a regular non-link directory: {value}")
+    return value
+
+
 def _resume_run_paths(
     *,
     resume_checkpoint: str | Path,
-    output_root: Path,
+    output_root: str | Path,
     expected_bundle_sha: str,
 ) -> tuple[Path, Path, Path]:
     """Validate and return the single run directory that owns a resume journal."""
 
-    checkpoint = _regular_file(resume_checkpoint)
-    run_dir = checkpoint.parent
-    if checkpoint.name != "portfolio_checkpoint.json":
+    lexical_output_root = _lexical_regular_directory(output_root, field="--output-root")
+    lexical_checkpoint = _lexical_regular_file(
+        resume_checkpoint, field="resume checkpoint"
+    )
+    lexical_run_dir = _lexical_regular_directory(
+        lexical_checkpoint.parent, field="resume checkpoint parent"
+    )
+    if lexical_checkpoint.name != "portfolio_checkpoint.json":
         raise ValueError("resume checkpoint must be named portfolio_checkpoint.json")
-    if not run_dir.is_dir() or run_dir.is_symlink():
-        raise ValueError("resume checkpoint parent must be a regular run directory")
-    if run_dir.parent != output_root:
+    if lexical_run_dir.parent != lexical_output_root:
         raise ValueError("resume checkpoint must belong directly to --output-root")
     expected_suffix = f"-{expected_bundle_sha[:12]}"
-    if not run_dir.name.endswith(expected_suffix):
+    if not lexical_run_dir.name.endswith(expected_suffix):
         raise ValueError("resume run directory name does not match the PIT bundle prefix")
-    run_name = run_dir.name[:-len(expected_suffix)]
+    run_name = lexical_run_dir.name[:-len(expected_suffix)]
     try:
         parsed_run_name = datetime.strptime(run_name, "run-%Y%m%dT%H%M%SZ")
     except ValueError as exc:
         raise ValueError("resume run directory name is not a canonical UTC run name") from exc
     if parsed_run_name.strftime("run-%Y%m%dT%H%M%SZ") != run_name:
         raise ValueError("resume run directory name is not a canonical UTC run name")
+    entries = {item.name: item for item in lexical_run_dir.iterdir()}
+    for name, item in entries.items():
+        _lexical_path(item, field=f"resume run entry {name!r}")
     terminal_markers = tuple(
-        name for name in ("run_manifest.json", "run_failed.json")
-        if (run_dir / name).exists()
+        name for name in ("run_manifest.json", "run_failed.json") if name in entries
     )
     if terminal_markers:
         raise ValueError(
             "resume run is terminal; preserve its marker and start a fresh run: "
             + ", ".join(terminal_markers)
         )
-    entries = {item.name: item for item in run_dir.iterdir()}
     if set(entries) != _RESUME_JOURNAL_FILENAMES:
         missing = sorted(_RESUME_JOURNAL_FILENAMES.difference(entries))
         extra = sorted(set(entries).difference(_RESUME_JOURNAL_FILENAMES))
@@ -144,7 +187,21 @@ def _resume_run_paths(
         )
     if any(not item.is_file() or item.is_symlink() for item in entries.values()):
         raise ValueError("resume journals must be regular non-link files")
-    return run_dir, checkpoint, run_dir / "portfolio_progress.jsonl"
+    resolved_output_root = lexical_output_root.resolve()
+    resolved_run_dir = lexical_run_dir.resolve()
+    resolved_checkpoint = lexical_checkpoint.resolve()
+    resolved_entries = {name: item.resolve() for name, item in entries.items()}
+    if resolved_run_dir.parent != resolved_output_root:
+        raise ValueError("resume checkpoint resolves outside --output-root")
+    if resolved_checkpoint.parent != resolved_run_dir:
+        raise ValueError("resume checkpoint resolves outside its run directory")
+    if any(item.parent != resolved_run_dir for item in resolved_entries.values()):
+        raise ValueError("resume journal resolves outside its run directory")
+    return (
+        resolved_run_dir,
+        resolved_checkpoint,
+        resolved_entries["portfolio_progress.jsonl"],
+    )
 
 
 def _git_identity(worktree: Path, *, require_clean: bool) -> str:
@@ -1125,7 +1182,7 @@ def run_baseline(
         "prices": _read_json(paths["prices_provenance"]),
         "fundamentals": _read_json(paths["fundamentals_provenance"]),
     }
-    output_root = Path(args.output_root).resolve()
+    output_root = Path(args.output_root)
     resume = args.resume_checkpoint is not None
     if resume:
         run_dir, portfolio_checkpoint, portfolio_progress = _resume_run_paths(
@@ -1134,6 +1191,7 @@ def run_baseline(
             expected_bundle_sha=expected_bundle_sha,
         )
     else:
+        output_root = output_root.resolve()
         output_root.mkdir(parents=True, exist_ok=True)
         run_dir = output_root / (
             datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ-")
@@ -1409,7 +1467,9 @@ def _parser() -> argparse.ArgumentParser:
         "--resume-checkpoint",
         help=(
             "resume and publish the owning run in place; PATH must be "
-            "OUTPUT_ROOT/run-.../portfolio_checkpoint.json"
+            "OUTPUT_ROOT/run-<UTC>-<bundle-prefix>/portfolio_checkpoint.json, and that "
+            "run directory must contain exactly portfolio_checkpoint.json, "
+            "portfolio_progress.jsonl, and portfolio_state.jsonl"
         ),
     )
     parser.add_argument(
