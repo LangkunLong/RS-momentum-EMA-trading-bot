@@ -590,6 +590,24 @@ def _finite_signal_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _causal_open_price(ohlcv: pd.DataFrame, eval_date: pd.Timestamp) -> float | None:
+    """Return the price knowable at the session open without using that session's close."""
+    current = ohlcv.loc[eval_date:eval_date]
+    if not current.empty and "Open" in current.columns:
+        open_price = _finite_signal_number(current["Open"].iloc[0])
+        if open_price is not None and open_price > 0:
+            return open_price
+
+    if "Close" not in ohlcv.columns:
+        return None
+    prior = ohlcv.loc[ohlcv.index < eval_date, "Close"]
+    for value in prior.iloc[::-1]:
+        prior_close = _finite_signal_number(value)
+        if prior_close is not None and prior_close > 0:
+            return prior_close
+    return None
+
+
 class CanslimStrategy:
     """Modular CANSLIM signal evaluation."""
 
@@ -1384,16 +1402,16 @@ class PortfolioSimulator:
 
             self._apply_identity_transitions(ticker_ohlcv, eval_date)
 
-            for symbol in list(self._open_positions.keys()):
-                ohlcv = ticker_ohlcv.get(symbol)
-                if ohlcv is not None:
-                    self._check_exits(symbol, ohlcv, eval_date)
-
             for pending_idx, pending in enumerate(pending_entries):
                 self._pending_entries_remaining = len(pending_entries) - pending_idx
                 self._enter_position(pending, ticker_ohlcv, eval_date)
             self._pending_entries_remaining = 0
             pending_entries = []
+
+            for symbol in list(self._open_positions.keys()):
+                ohlcv = ticker_ohlcv.get(symbol)
+                if ohlcv is not None:
+                    self._check_exits(symbol, ohlcv, eval_date)
 
             is_signal_day = day_idx % self.signal_every_n_days == 0
             market_state = self.strategy.evaluate_market(benchmark_df, eval_date)
@@ -1784,7 +1802,7 @@ class PortfolioSimulator:
     ) -> bool:
         """Two-pass eviction: free a slot for a higher-RS new signal.
 
-        Pass 1: evict an underwater position (close < entry) with lower RS.
+        Pass 1: evict an underwater position (open-time price < entry) with lower RS.
         Pass 2: evict any position with lower RS if pass 1 finds nothing.
         Returns True if a position was evicted.
         """
@@ -1795,35 +1813,26 @@ class PortfolioSimulator:
 
         new_rs = new_signal.get("rs_score", 0.0)
 
-        def _current_close(symbol: str) -> Optional[float]:
-            ohlcv = ticker_ohlcv.get(symbol)
-            if ohlcv is None:
-                return None
-            bar = ohlcv.loc[eval_date:eval_date]
-            if bar.empty:
-                prev = ohlcv.loc[:eval_date]
-                return float(prev["Close"].iloc[-1]) if not prev.empty else None
-            return float(bar["Close"].iloc[0])
-
         losers: list = []
         fallback: list = []
         for sym, trade in self._open_positions.items():
             if trade.rs_score >= new_rs:
                 continue
-            cc = _current_close(sym)
-            if cc is None:
+            ohlcv = ticker_ohlcv.get(sym)
+            open_price = _causal_open_price(ohlcv, eval_date) if ohlcv is not None else None
+            if open_price is None:
                 continue  # data gap guard
-            fallback.append((sym, trade, cc))
-            if cc < trade.entry_price:
-                losers.append((sym, trade, cc))
+            fallback.append((sym, trade, open_price))
+            if open_price < trade.entry_price:
+                losers.append((sym, trade, open_price))
 
         pool = losers if losers else fallback
         if not pool:
             self._execution_diagnostics["eviction_rejections"] += 1
             return False
 
-        evict_sym, _, evict_close = min(pool, key=lambda x: x[1].rs_score)
-        self._close_trade(evict_sym, evict_close, "evicted", str(eval_date.date()))
+        evict_sym, _, evict_price = min(pool, key=lambda x: x[1].rs_score)
+        self._close_trade(evict_sym, evict_price, "evicted", str(eval_date.date()))
         self._execution_diagnostics["evictions_executed"] += 1
         return True
 
@@ -1916,7 +1925,7 @@ class PortfolioSimulator:
             finish("entry_rejected_no_cash")
             return
 
-        total_portfolio_value = self._mark_equity(ticker_ohlcv, entry_date)
+        total_portfolio_value = self._mark_open_equity(ticker_ohlcv, entry_date)
         # Risk-based sizing: risk exactly position_risk_pct of portfolio per trade.
         # shares = (portfolio * risk_pct) / (entry * stop_pct)
         # position_value = shares * entry = portfolio * risk_pct / stop_pct
@@ -2176,6 +2185,19 @@ class PortfolioSimulator:
                 continue
             current_price = float(bar["Close"].iloc[-1])
             market_value += current_price * (trade.remaining_qty or 0.0)
+        return market_value
+
+    def _mark_open_equity(
+        self,
+        ticker_ohlcv: Dict[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+    ) -> float:
+        market_value = self._equity
+        for symbol, trade in self._open_positions.items():
+            ohlcv = ticker_ohlcv.get(symbol)
+            price = _causal_open_price(ohlcv, eval_date) if ohlcv is not None else None
+            if price is not None:
+                market_value += price * (trade.remaining_qty or 0.0)
         return market_value
 
     def _record_transaction(
