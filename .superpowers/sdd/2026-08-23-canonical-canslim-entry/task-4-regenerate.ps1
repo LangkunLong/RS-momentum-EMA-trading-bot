@@ -126,6 +126,24 @@ function Get-RequiredFile {
     return $item.FullName
 }
 
+function New-CreateOnlyDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    Assert-True ([System.IO.Path]::IsPathRooted($Path)) "$Label must be an absolute path"
+    Assert-True (-not (Test-Path -LiteralPath $Path -PathType Any)) "refusing existing ${Label}: $Path"
+    # Windows PowerShell's New-Item supports -Path, not -LiteralPath.  Without
+    # -Force, a target created after the explicit check still fails atomically.
+    $created = New-Item -ItemType Directory -Path $Path -ErrorAction Stop
+    Assert-True $created.PSIsContainer "$Label creation did not return a directory: $Path"
+    Assert-True ((($created.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0)) "$Label cannot be a reparse point: $Path"
+    $expectedPath = [System.IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+    $createdPath = [System.IO.Path]::GetFullPath($created.FullName).TrimEnd([char[]]@('\', '/'))
+    Assert-True ($createdPath.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) "$Label was created at an unexpected path: $createdPath"
+    return $createdPath
+}
+
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
@@ -423,9 +441,9 @@ foreach ($name in @('submissions.zip', 'companyfacts.zip')) {
 
 # Create-only publication layout.  Failures intentionally leave the fresh root
 # in place for forensic inspection; this script never deletes or overwrites it.
-New-Item -ItemType Directory -LiteralPath $outputRootPath -ErrorAction Stop | Out-Null
+[void](New-CreateOnlyDirectory $outputRootPath 'output root')
 $freshSecDir = Join-Path $outputRootPath 'sec-pit'
-New-Item -ItemType Directory -LiteralPath $freshSecDir -ErrorAction Stop | Out-Null
+[void](New-CreateOnlyDirectory $freshSecDir 'fresh SEC directory')
 foreach ($name in @('submissions.zip', 'companyfacts.zip', 'sec_archives_provenance.json')) {
     $destination = Join-Path $freshSecDir $name
     Assert-True (-not (Test-Path -LiteralPath $destination -PathType Any)) "refusing existing fresh SEC target: $destination"
@@ -591,7 +609,7 @@ print(json.dumps({"non_xom_rows_identical": True, "xom_rows": len(xom_fundamenta
 Invoke-CheckedPython $pythonPath 'SEC output invariant validation' @('-B', '-c', $csvValidationCode, $sourceSecDir, $freshSecDir)
 
 $bundleDir = Join-Path $outputRootPath 'pit-bundle'
-New-Item -ItemType Directory -LiteralPath $bundleDir -ErrorAction Stop | Out-Null
+[void](New-CreateOnlyDirectory $bundleDir 'fresh PIT bundle directory')
 $bundlePath = Join-Path $bundleDir 'pit_baseline.sqlite3'
 $bundleManifestPath = Join-Path $bundleDir 'bundle_manifest.json'
 Assert-True (-not (Test-Path -LiteralPath $bundlePath -PathType Any)) "refusing existing bundle target: $bundlePath"

@@ -85,6 +85,86 @@ def test_regeneration_refuses_dirty_correction_worktree_before_resolving_inputs(
     assert not (tmp_path / "missing-parent").exists()
 
 
+def test_create_only_directory_helper_runs_on_windows_powershell_and_refuses_existing_target(tmp_path: Path) -> None:
+    """Removing create-only behavior must overwrite or accept the occupied probe target."""
+    target = tmp_path / "create-only-target"
+    harness = tmp_path / "create-only-directory-probe.ps1"
+    harness.write_text(
+        textwrap.dedent(
+            """
+            param(
+                [string]$ProductionScript,
+                [string]$Target
+            )
+            $ErrorActionPreference = 'Stop'
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $ProductionScript,
+                [ref]$tokens,
+                [ref]$parseErrors
+            )
+            if ($parseErrors.Count -ne 0) {
+                Write-Error 'production script did not parse'
+                exit 90
+            }
+            $requiredFunctions = @('Assert-True', 'New-CreateOnlyDirectory')
+            $functionAsts = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+            }, $true))
+            foreach ($name in $requiredFunctions) {
+                $matches = @($functionAsts | Where-Object { $_.Name -ceq $name })
+                if ($matches.Count -ne 1) {
+                    Write-Error "required production function missing: $name"
+                    exit 90
+                }
+                Invoke-Expression $matches[0].Extent.Text
+            }
+
+            [void](New-CreateOnlyDirectory $Target 'probe directory')
+            $sentinel = Join-Path $Target 'sentinel.txt'
+            [System.IO.File]::WriteAllText($sentinel, 'preserve me')
+            try {
+                [void](New-CreateOnlyDirectory $Target 'probe directory')
+            }
+            catch {
+                Write-Output $_.Exception.Message
+                exit 42
+            }
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(harness),
+            "-ProductionScript",
+            str(SCRIPT),
+            "-Target",
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 42, output
+    assert "refusing existing probe directory" in output
+    assert (target / "sentinel.txt").read_text(encoding="utf-8") == "preserve me"
+    assert "New-Item -ItemType Directory -LiteralPath" not in SCRIPT.read_text(encoding="utf-8")
+
+
 def test_regeneration_audit_binds_exact_correction_sources_before_publication() -> None:
     """Removing a source hash or the final clean/unchanged guard must break this probe."""
     source = SCRIPT.read_text(encoding="utf-8")
