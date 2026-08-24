@@ -476,3 +476,24 @@ succeeds.
 - If broker and SQLite state disagree, preserve broker/order ids, stop automated submission, and reconcile against Alpaca before retrying.
 
 The stabilization design and execution plans are under `docs/superpowers/`.
+
+## Canonical PIT CANSLIM baseline
+
+The current five-year point-in-time baseline is the immutable replay under
+`.artifacts/task-6-corrected-replay-20260824T100045Z/`. It uses the corrected
+bundle bound to SHA-256
+`1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb`, evaluates
+daily from 2021-01-01 through 2025-12-31, and keeps the exact completed-session
+entry facts separate from next-session open execution.
+
+The independent audit found 286 qualified entries, 225 executions, 61
+rejections (51 next-open buy-zone and 10 cash), and no capacity rejections.
+Average cash was 67.3136%; strategy return was -9.9947%, versus 65.0551% for
+the independent 100-leader basket and 84.7901% for SPY. These are diagnostic
+baseline results, not optimized parameters. Strict-PIT fundamental coverage is
+still below the 90% target and is explicitly reported as the only accepted
+`--allow-incomplete-fundamentals` exception.
+
+Detailed provenance and audit evidence are in
+`docs/pit-baseline-data-provenance.md` and
+`.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-6-report.md`.

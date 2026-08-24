@@ -47,6 +47,25 @@ from core.trading_sessions import (
 )
 
 
+def _approximate_buy_point(
+    closes: pd.Series, *, is_breakout: bool, lookback_252: int
+) -> Optional[float]:
+    """Return the prior-window high for legacy callers.
+
+    The canonical entry contract now derives the pivot in ``build_entry_facts``;
+    this narrow compatibility helper remains for older pure-logic callers and
+    tests.  It deliberately excludes the current breakout bar so it cannot
+    make the buy-zone check self-referential.
+    """
+
+    if not is_breakout or lookback_252 <= 1 or len(closes) <= 1:
+        return None
+    prior_window = closes.iloc[-lookback_252:-1]
+    if prior_window.empty:
+        return None
+    return float(coerce_scalar(prior_window.max()))
+
+
 def evaluate_canslim(
     symbol: str,
     rs_scores_df: pd.DataFrame,

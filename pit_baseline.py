@@ -74,6 +74,15 @@ _EXCLUSION_COLUMNS = (
     "ticker", "company_name", "first_membership_date", "last_membership_date",
     "reason", "details",
 )
+
+
+def rolling_label_recall_pct(*args: Any, **kwargs: Any) -> float:
+    """Compatibility alias for callers that still import the old scalar helper."""
+    return float(
+        rolling_label_recall_summary(*args, **kwargs)["raw_all"]["signal_recall_pct"]
+    )
+
+
 _RESUME_JOURNAL_FILENAMES = frozenset({
     "portfolio_checkpoint.json",
     "portfolio_progress.jsonl",

@@ -233,3 +233,57 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
   formatting churn, reproducible focused probe evidence, and no new Critical
   or Important breakage.
 - Task 5: complete (commits `75ddddbb5d794f7c09b5644bb94c6e126e06f0e9..95e7616decc856cb6dd9375b1ee519a6c242d5ef`, review clean).
+
+## Task 4 completion — corrected immutable bundle
+
+The corrected five-year bundle was regenerated from the pinned public inputs
+under `.artifacts/task-4-regeneration-20260823T223000Z/pit-bundle/`.
+The bundle SHA-256 is
+`1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb` and the
+producer commit is `d555f7f4c7727d9c6a440bba50cced0fbe9f3095`. The manifest,
+provenance, and regeneration audit all verify this exact bundle. CAH has
+finite-or-missing C/A values at the 2021-05-13 as-of date, and XOM resolves to
+the reviewed baseline CIK `0000034088`; no provider rows were invented.
+
+The sole accepted data exception remains strict-PIT quarterly-plus-annual
+fundamental coverage below the 90% target. The replay is explicitly run with
+`--allow-incomplete-fundamentals` so this exception is visible rather than
+silently bypassed.
+
+## Task 6 completion — corrected replay and independent audit
+
+The corrected replay completed at
+`.artifacts/task-6-corrected-replay-20260824T100045Z/run-20260824T100213Z-1af306ef1e46/`
+for 2021-01-01 through 2025-12-31, with SPY benchmark, 100 rolling leaders,
+20-session rebalance cadence, and 20-session checkpoints. The run manifest is
+`status=complete`, is bound to the bundle SHA above and commit `d555f7f`, and
+the final manifest SHA is
+`efeb8c3e9b0189131f04361122395f8ea89adfd0f8bcbb781e333a9359d43bd3`.
+
+The independent auditor replayed the immutable public outputs and matched the
+state/result ledger: 286 qualified attempts, 225 executions, 61 rejections,
+51 next-open buy-zone rejections, and 10 cash rejections. No capacity,
+invalid-data, missing-data, or already-open rejection occurred. Average cash
+was 67.31359377429541%; the strategy total return was -9.994717769465932%
+(annualized -2.0874097904821753%, max drawdown -13.664400600134591%, Sharpe
+-0.2082076838233604). The independent 100-leader basket returned
+65.0550778875779% with 0.0796812749003984% average cash; SPY returned
+84.79009133533889%.
+
+Five-year raw leader recall was 50/100 signaled and 47/100 executed. The
+PIT-exposed denominator was 42/72 signaled and 40/72 executed. Rolling raw
+recall was 29/4,800; PIT-exposed rolling recall was 29/3,700. These are
+diagnostics of data availability and the canonical entry funnel, not tuning
+targets.
+
+## Task 7 verification — current
+
+Canonical signal/engine matrices (283 tests), PIT/publication/replay matrices
+(48 tests), upstream smoke tests (31 tests), and the full offline suite
+excluding the Windows-only agent-loop quarantine module (930 passed, 2
+skipped, 2 deselected) pass. The legacy `backtest_pnl` adapter now restores
+its temporary engine delegates after each run, preventing a stale mocked
+technical evaluator from contaminating later parity checks. Ruff, compile,
+PowerShell parse, CLI-help, and `git diff --check` probes pass. The remaining
+agent-loop module is environment-blocked by the Windows Python temp-directory
+ACL, outside the CANSLIM/PIT change surface.

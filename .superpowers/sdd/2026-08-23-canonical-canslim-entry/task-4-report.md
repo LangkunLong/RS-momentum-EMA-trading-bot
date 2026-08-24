@@ -69,3 +69,25 @@ Commands and output:
 
 Task 4 remains incomplete: Step 4 regeneration is still pending active replay
 completion and shared-machine capacity.
+
+## Completion addendum — corrected regeneration
+
+The earlier sections document the pre-regeneration review state. Step 4 is now
+complete using the immutable corrected bundle produced at:
+
+```text
+.artifacts/task-4-regeneration-20260823T223000Z/pit-bundle/pit_baseline.sqlite3
+```
+
+The bundle SHA-256 is
+`1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb` and its
+producer commit is `d555f7f4c7727d9c6a440bba50cced0fbe9f3095`. The companion
+`bundle_manifest.json` and `task-4-regeneration-audit.json` bind the normalized
+row counts, source hashes, and corrected CAH/XOM facts to that exact database.
+The verifier and independent replay audit both passed. CAH has finite-or-missing
+fundamental values at 2021-05-13, and XOM uses the reviewed baseline CIK
+`0000034088` rather than the current-ticker-only candidate.
+
+The strict-PIT quarterly-plus-annual fundamentals coverage gate remains below
+90% and is the sole accepted exception under `--allow-incomplete-fundamentals`.
+This is a declared data-coverage limitation, not a strategy-threshold change.

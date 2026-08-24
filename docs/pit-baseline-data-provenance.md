@@ -246,3 +246,38 @@ python pit_baseline.py <same-hash-bound-input-arguments> `
 The next milestone is data coverage repair and a repeat of the same immutable
 workflow, followed by execution reconciliation review. No parameter search,
 threshold adjustment, or other optimization is authorized by this record.
+
+## Corrected canonical baseline — 2026-08-24
+
+The findings above are retained as the pre-correction historical record. The
+canonical baseline was then regenerated from the corrected immutable bundle and
+replayed without changing strategy thresholds or running optimization:
+
+- Bundle:
+  `.artifacts/task-4-regeneration-20260823T223000Z/pit-bundle/pit_baseline.sqlite3`
+- Bundle SHA-256:
+  `1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb`
+- Corrected replay:
+  `.artifacts/task-6-corrected-replay-20260824T100045Z/run-20260824T100213Z-1af306ef1e46/`
+- Producer commit: `d555f7f4c7727d9c6a440bba50cced0fbe9f3095`
+- Run manifest SHA-256:
+  `efeb8c3e9b0189131f04361122395f8ea89adfd0f8bcbb781e333a9359d43bd3`
+
+The independent audit matched 1,255 daily sessions and 597,764 evaluated
+symbol-days. It found 286 qualified entries, 225 executions, 61 rejections,
+51 next-open buy-zone rejections, and 10 cash rejections. There were no
+capacity, invalid-data, missing-data, or already-open rejections. Average cash
+was 67.31359377429541%; strategy total return was -9.994717769465932%,
+annualized return -2.0874097904821753%, maximum drawdown -13.664400600134591%,
+and Sharpe -0.2082076838233604.
+
+The independent 100-leader basket returned 65.0550778875779% with
+0.0796812749003984% average cash; SPY returned 84.79009133533889%. Five-year
+raw leader recall was 50/100 signaled and 47/100 executed. The PIT-exposed
+recall was 42/72 signaled and 40/72 executed. Rolling recall was 29/4,800 raw
+and 29/3,700 PIT-exposed.
+
+Strict-PIT quarterly-plus-annual fundamental coverage remains below the 90%
+target and is the sole accepted exception under
+`--allow-incomplete-fundamentals`. It is a declared data limitation, not a
+permission to use future data or a reason to tune the CANSLIM entry contract.

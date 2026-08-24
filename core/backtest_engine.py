@@ -2152,8 +2152,14 @@ class PortfolioSimulator:
     ) -> None:
         self._execution_diagnostics["entry_attempts"] += 1
         symbol = str(signal["symbol"]).upper()
-        signal_date = str(pd.Timestamp(signal["signal_date"]).date())
         entry_date_text = str(entry_date.date())
+        raw_signal_date = signal.get("signal_date", entry_date)
+        try:
+            signal_date = str(pd.Timestamp(raw_signal_date).date())
+        except (TypeError, ValueError):
+            # Direct callers may omit the diagnostic signal date; execution is
+            # still causally bound to the supplied entry session.
+            signal_date = entry_date_text
         pivot: float | None = None
         raw_pivot = signal.get("pivot")
         try:

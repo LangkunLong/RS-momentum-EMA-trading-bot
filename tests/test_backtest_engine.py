@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from core.canslim.entry_contract import CanslimEntryFacts
 from core.backtest_engine import (
     CanslimStrategy,
     DataFetcher,
@@ -73,6 +74,24 @@ def _canonical_full_signal(
         "signal_reason": "Volume Breakout",
         "buy_signal": True,
     }
+
+
+def _eligible_entry_facts() -> CanslimEntryFacts:
+    """Return a canonical completed-session setup for strategy mocks."""
+    return CanslimEntryFacts(
+        event_close=150.0,
+        prior_close=149.0,
+        event_volume=1_950_000.0,
+        prior_average_volume_50=1_500_000.0,
+        pivot=147.0,
+        volume_ratio=1.3,
+        extension=150.0 / 147.0 - 1.0,
+        price_advanced=True,
+        has_volume_surge=True,
+        in_buy_zone=True,
+        eligible=True,
+        blocking_reasons=(),
+    )
 
 
 def test_take_profit_scale_out_fires_all_three_tiers_on_gap_up() -> None:
@@ -303,7 +322,7 @@ def test_technical_only_mode_allows_buy_without_fundamentals() -> None:
         }),
         patch("core.backtest_engine._evaluate_technical_at_date", return_value={
             "n_score": 0.95, "s_score": 0.85, "close": 150.0, "is_breakout": True, "has_volume_surge": True,
-            "has_power_gap": False, "power_gap_details": {}
+            "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
         }),
     ):
         row = strategy.evaluate_symbol(
@@ -341,7 +360,7 @@ def test_technical_only_mode_skips_fundamental_fetch() -> None:
         patch("core.backtest_engine._evaluate_fundamentals_at_date") as mocked_fund,
         patch("core.backtest_engine._evaluate_technical_at_date", return_value={
             "n_score": 0.95, "s_score": 0.85, "close": 150.0, "is_breakout": True, "has_volume_surge": True,
-            "has_power_gap": False, "power_gap_details": {}
+            "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
         }),
     ):
         strategy.evaluate_symbol(
