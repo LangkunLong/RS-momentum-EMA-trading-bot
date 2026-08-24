@@ -135,6 +135,14 @@ python scheduler.py --help
 
 CI runs Ruff, compilation, and the non-integration test suite on Python 3.11 and 3.13. Tests use synthetic or mocked provider data unless explicitly marked `integration`.
 
+The public index-source smoke uses an isolated cache and requires realistic S&P 500 and Nasdaq-100 universe sizes:
+
+```powershell
+python -m pytest -q --no-cov -m integration tests/test_index_ticker_fetcher.py::test_live_large_cap_sources_return_complete_universes
+```
+
+The FMP profile smoke is a separate, explicit paid-plan operation. It makes one profile request only when `RUN_FMP_PROFILE_INTEGRATION=1`, `FMP_PLAN=paid`, and `FMP_API_KEY` are all present; otherwise it skips without spending quota.
+
 ### Isolated multi-agent backtest proposals
 
 `agent_loop.py` is not part of paper trading or the scheduler. It runs one sealed technical-only
