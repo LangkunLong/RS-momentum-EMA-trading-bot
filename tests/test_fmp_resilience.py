@@ -642,15 +642,30 @@ def test_institutional_pit_filters_future_quarters() -> None:
     from datetime import datetime
 
     records = [
-        {"date": "2024-03-31", "ownershipPercent": 55.0, "investorsHolding": 4000},
-        {"date": "2024-06-30", "ownershipPercent": 57.0, "investorsHolding": 4200},
-        {"date": "2024-09-30", "ownershipPercent": 59.0, "investorsHolding": 4500},
+        {
+            "date": "2024-03-31",
+            "acceptedDate": "2024-05-15",
+            "ownershipPercent": 55.0,
+            "investorsHolding": 4000,
+        },
+        {
+            "date": "2024-06-30",
+            "acceptedDate": "2024-08-14",
+            "ownershipPercent": 57.0,
+            "investorsHolding": 4200,
+        },
+        {
+            "date": "2024-09-30",
+            "acceptedDate": "2024-11-14",
+            "ownershipPercent": 59.0,
+            "investorsHolding": 4500,
+        },
     ]
-    as_of = datetime(2024, 7, 1)
+    as_of = datetime(2024, 8, 15)
     filtered = _filter_records_as_of(records, as_of)
 
     dates = [r["date"] for r in filtered]
-    assert "2024-09-30" not in dates, "Q3 2024 data must be excluded when as_of is 2024-07-01"
+    assert "2024-09-30" not in dates, "Q3 2024 data must be excluded when as_of is 2024-08-15"
     assert "2024-06-30" in dates, "Q2 2024 data must be included"
     assert "2024-03-31" in dates, "Q1 2024 data must be included"
     # newest-first order

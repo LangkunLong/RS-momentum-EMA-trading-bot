@@ -1257,10 +1257,6 @@ def _filter_records_as_of(records: List[dict], as_of_date: datetime) -> List[dic
     dated: list[tuple[pd.Timestamp, dict]] = []
     for rec in records:
         public_timestamp = _fmp_revision_timestamp(rec)
-        if public_timestamp is None:
-            # Legacy FMP records sometimes omit every filing field. Preserve
-            # the pre-existing compatibility fallback to their only date.
-            public_timestamp = _fmp_period_end(rec)
         if public_timestamp is not None and public_timestamp.date() <= cutoff:
             dated.append((public_timestamp, rec))
 

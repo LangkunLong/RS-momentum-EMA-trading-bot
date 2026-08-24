@@ -781,11 +781,20 @@ class PITDataBundle:
             "institution_count": None,
             "prev_institution_count": None,
         }
+        institutional_pair_selected = False
         for record in reversed(records):
-            for key in result:
+            for key in ("shares_outstanding", "held_percent_institutions"):
                 value = record.get(key)
                 if result[key] is None and value is not None:
                     result[key] = value
+            institution_count = record.get("institution_count")
+            prev_institution_count = record.get("prev_institution_count")
+            if not institutional_pair_selected and (
+                institution_count is not None or prev_institution_count is not None
+            ):
+                result["institution_count"] = institution_count
+                result["prev_institution_count"] = prev_institution_count
+                institutional_pair_selected = True
         return result
 
     def fundamentals_provider(self, symbol: str, as_of_date: pd.Timestamp) -> dict[str, Any]:

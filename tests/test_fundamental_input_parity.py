@@ -13,6 +13,7 @@ import pytest
 
 from backtest import _evaluate_fundamentals_at_date, _evaluate_technical_at_date
 from core.backtest_engine import CanslimStrategy
+from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
 from core.canslim.i_institutional import _score_ownership_level, evaluate_i
 from core.canslim.m_market_direction import MarketTrend
@@ -66,6 +67,76 @@ def test_c_uses_explicit_diluted_then_basic_then_net_income_priority(
     _score, growth = evaluate_c(frame)
 
     assert growth == pytest.approx(0.5)
+
+
+def test_a_has_adapter_parity_when_basic_growth_would_flip_the_target() -> None:
+    """Break caught: opposite adapter row order made A choose Basic instead of Diluted EPS."""
+    fmp_records = [
+        {
+            "date": "2023-12-31",
+            "acceptedDate": "2024-02-15",
+            "eps": 1.0,
+            "epsDiluted": 1.0,
+            "netIncome": 100.0,
+        },
+        {
+            "date": "2024-12-31",
+            "acceptedDate": "2025-02-15",
+            "eps": 1.1,
+            "epsDiluted": 1.3,
+            "netIncome": 200.0,
+        },
+    ]
+    pit_records = [
+        {
+            "statement_type": "annual",
+            "period_end": record["date"],
+            "public_date": record["acceptedDate"],
+            "basic_eps": record["eps"],
+            "diluted_eps": record["epsDiluted"],
+            "total_revenue": None,
+            "net_income": record["netIncome"],
+            "common_stock": None,
+            "total_stockholders_equity": None,
+        }
+        for record in fmp_records
+    ]
+    fmp_frame = _fmp_records_to_financial_df(fmp_records, _FMP_INCOME_FIELD_MAP)
+    pit_frame = PITDataBundle._statement_frame(pit_records, "annual")
+
+    fmp_score, fmp_growth, _fmp_roe = evaluate_a(fmp_frame)
+    pit_score, pit_growth, _pit_roe = evaluate_a(pit_frame)
+
+    assert fmp_growth == pytest.approx(0.30)
+    assert pit_growth == pytest.approx(0.30)
+    assert fmp_score == pytest.approx(pit_score)
+
+
+@pytest.mark.parametrize(
+    ("labels", "prior_values", "current_values", "expected_growth"),
+    [
+        (["Net Income", "Basic EPS"], [10.0, 1.0], [20.0, 1.2], 0.20),
+        (["Net Income"], [10.0], [15.0], 0.50),
+    ],
+)
+def test_a_falls_back_from_diluted_to_basic_then_net_income(
+    labels: list[str],
+    prior_values: list[float],
+    current_values: list[float],
+    expected_growth: float,
+) -> None:
+    """Break caught: A skipped Basic EPS or failed to use Net Income as a last resort."""
+    frame = pd.DataFrame(
+        {
+            pd.Timestamp("2023-12-31"): prior_values,
+            pd.Timestamp("2024-12-31"): current_values,
+        },
+        index=labels,
+    )
+
+    _score, growth, _roe = evaluate_a(frame)
+
+    assert growth == pytest.approx(expected_growth)
 
 
 def test_sparse_july_periods_pair_by_fiscal_date_instead_of_column_position() -> None:
@@ -294,6 +365,44 @@ def test_fmp_pit_visibility_falls_back_from_malformed_accepted_to_filing_date() 
     assert on_filing_date == [record]
 
 
+def test_fmp_pit_prefers_valid_accepted_date_over_earlier_filing_date() -> None:
+    """Break caught: a valid filingDate overrode the authoritative acceptedDate."""
+    record = {
+        "date": "2024-07-31",
+        "acceptedDate": "2024-08-15 16:00:00",
+        "filingDate": "2024-08-10 16:00:00",
+        "revenue": 150.0,
+    }
+
+    before_acceptance = _filter_records_as_of([record], pd.Timestamp("2024-08-10"))
+    on_acceptance_date = _filter_records_as_of([record], pd.Timestamp("2024-08-15"))
+
+    assert before_acceptance == []
+    assert on_acceptance_date == [record]
+
+
+def test_fmp_pit_excludes_record_without_a_public_timestamp() -> None:
+    """Break caught: an undated filing became visible on its fiscal period end."""
+    record = {
+        "date": "2024-07-31",
+        "revenue": 150.0,
+    }
+
+    assert _filter_records_as_of([record], pd.Timestamp("2025-12-31")) == []
+
+
+def test_fmp_non_pit_adapter_keeps_a_single_record_without_filing_metadata() -> None:
+    """Break caught: tightening PIT visibility also removed current-fetch compatibility."""
+    record = {
+        "date": "2024-07-31",
+        "revenue": 150.0,
+    }
+
+    frame = _fmp_records_to_financial_df([record], _FMP_INCOME_FIELD_MAP)
+
+    assert frame.loc["Total Revenue", pd.Timestamp("2024-07-31")] == pytest.approx(150.0)
+
+
 def test_quarterly_fetch_does_not_reuse_pre_revision_selection_disk_cache(
     tmp_path: Path,
 ) -> None:
@@ -513,6 +622,38 @@ def test_i_trend_requires_both_counts_while_level_remains_independently_availabl
     assert level_only == pytest.approx(_score_ownership_level(0.40))
     assert evaluate_i(None, 110, None) == pytest.approx(0.5)
     assert evaluate_i(None, 110, 100) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("latest_current", "latest_previous"),
+    [(110, None), (None, 100)],
+)
+def test_pit_company_info_never_synthesizes_an_institutional_pair_across_rows(
+    latest_current: int | None,
+    latest_previous: int | None,
+) -> None:
+    """Break caught: PIT independently backfilled half of I from an older snapshot."""
+    records = [
+        {
+            "shares_outstanding": 1_000_000,
+            "held_percent_institutions": 0.35,
+            "institution_count": 90,
+            "prev_institution_count": 80,
+        },
+        {
+            "shares_outstanding": None,
+            "held_percent_institutions": 0.40,
+            "institution_count": latest_current,
+            "prev_institution_count": latest_previous,
+        },
+    ]
+
+    info = PITDataBundle._company_info(records)
+
+    assert info["institution_count"] == latest_current
+    assert info["prev_institution_count"] == latest_previous
+    assert info["shares_outstanding"] == 1_000_000
+    assert info["held_percent_institutions"] == pytest.approx(0.40)
 
 
 @pytest.mark.parametrize(

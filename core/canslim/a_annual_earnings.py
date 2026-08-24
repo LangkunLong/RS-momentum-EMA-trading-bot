@@ -7,7 +7,7 @@ Per William O'Neil's CANSLIM methodology:
 - Return on Equity (ROE) should be 17% or higher
 - Companies with erratic earnings (one good year, one bad) score lower
 
-Priority: EPS (Basic or Diluted) first, then fallback to Net Income.
+Priority: Diluted EPS, then Basic EPS, then fallback to Net Income.
 """
 
 from __future__ import annotations
@@ -58,8 +58,9 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
     """Find the best earnings row label using fuzzy matching.
 
     Priority:
-        1. Basic EPS or Diluted EPS
-        2. Net Income (fallback)
+        1. Diluted EPS
+        2. Basic EPS
+        3. Net Income (fallback)
 
     Args:
         df: Income statement DataFrame with row labels as index.
@@ -67,15 +68,11 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
     Returns:
         The matching index label, or None if nothing found.
     """
-    # Priority 1: EPS rows
-    eps_mask = df.index.str.contains(r"Basic EPS|Diluted EPS", case=False, regex=True)
-    if eps_mask.any():
-        return df.index[eps_mask][0]
-
-    # Priority 2: Net Income
-    ni_mask = df.index.str.contains(r"Net Income", case=False, regex=True)
-    if ni_mask.any():
-        return df.index[ni_mask][0]
+    labels = df.index.astype(str)
+    for pattern in (r"Diluted EPS", r"Basic EPS", r"Net Income"):
+        matches = labels.str.contains(pattern, case=False, regex=True)
+        if matches.any():
+            return df.index[matches][0]
 
     return None
 
