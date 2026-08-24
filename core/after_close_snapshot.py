@@ -23,6 +23,7 @@ from core.canslim.entry_contract import (
 )
 from core.canslim.m_market_direction import MarketTrend
 from core.momentum_analysis import calculate_weighted_performance
+from core.trading_sessions import latest_us_equity_session
 
 
 _ROW_FIELDS = (
@@ -276,7 +277,10 @@ def _realized_volatility(close: pd.Series) -> float | None:
 
 
 def _session_date(history: pd.DataFrame) -> date:
-    return pd.Timestamp(history.index[-1]).date()
+    session = latest_us_equity_session(history)
+    if session is None:
+        raise ValueError("price history has no completed session")
+    return session
 
 
 def _add_blocker(row: dict[str, object], reason: str) -> None:

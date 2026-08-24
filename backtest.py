@@ -48,6 +48,7 @@ from core.data_client import (
 )
 from core.index_ticker_fetcher import get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
+from core.trading_sessions import exact_session_row, history_through_exact_session
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -89,8 +90,19 @@ def _download_bulk_closes(tickers: List[str], period: str = "3y") -> pd.DataFram
 
 def _calculate_rs_at_date(all_closes: pd.DataFrame, ticker: str, eval_date: pd.Timestamp) -> float:
     """Calculate RS score for a ticker as-of a specific date."""
-    # Slice data up to eval_date
-    sliced = all_closes.loc[:eval_date].dropna(axis=1, how="all")
+    sliced = history_through_exact_session(all_closes, eval_date)
+    event_row = exact_session_row(all_closes, eval_date)
+    if sliced is None or event_row is None:
+        return 0.0
+    fresh_columns = []
+    for column in sliced.columns:
+        try:
+            value = float(event_row[column])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if np.isfinite(value):
+            fresh_columns.append(column)
+    sliced = sliced.loc[:, fresh_columns].dropna(axis=1, how="all")
     if ticker not in sliced.columns:
         return 0.0
 
@@ -139,9 +151,11 @@ def _evaluate_technical_at_date(
     ticker_data: pd.DataFrame,
     eval_date: pd.Timestamp,
     shares_outstanding: Optional[float],
-) -> Dict[str, object]:
+) -> Optional[Dict[str, object]]:
     """Evaluate N and S technical criteria as-of a specific date."""
-    sliced = ticker_data.loc[:eval_date].copy()
+    sliced = history_through_exact_session(ticker_data, eval_date)
+    if sliced is None:
+        return None
     if len(sliced) < 60:
         closes = extract_float_series(sliced, "Close") if "Close" in sliced else pd.Series(dtype=float)
         volumes = extract_float_series(sliced, "Volume") if "Volume" in sliced else pd.Series(dtype=float)
@@ -412,8 +426,8 @@ def run_backtest() -> pd.DataFrame:
 
             tdata = ticker_ohlcv[ticker]
             # Check if we have data at this date
-            available = tdata.loc[:eval_date]
-            if len(available) < 60:
+            available = history_through_exact_session(tdata, eval_date)
+            if available is None or len(available) < 60:
                 continue
 
             # RS score
@@ -427,6 +441,8 @@ def run_backtest() -> pd.DataFrame:
 
             # Technical scores (N, S)
             tech = _evaluate_technical_at_date(tdata, eval_date, fund.get("shares_outstanding"))
+            if tech is None:
+                continue
 
             # Fundamental scores
             c_score = fund.get("c_score", 0.0)

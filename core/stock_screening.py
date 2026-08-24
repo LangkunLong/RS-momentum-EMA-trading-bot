@@ -114,6 +114,7 @@ def evaluate_stock_canslim(
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
     require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
     strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
+    as_of_session: object = None,
 ) -> Optional[Dict[str, object]]:
     """Evaluate a single stock against CANSLIM criteria.
 
@@ -160,7 +161,12 @@ def evaluate_stock_canslim(
     _debug("\n" + "-" * 60)
     _debug(f"[DEBUG] Evaluating {symbol}")
 
-    canslim_view = evaluate_canslim(symbol, rs_scores_df=rs_scores_df, market_trend=market_trend)
+    canslim_view = evaluate_canslim(
+        symbol,
+        rs_scores_df=rs_scores_df,
+        market_trend=market_trend,
+        as_of_session=as_of_session,
+    )
     if not canslim_view:
         _debug("[DEBUG] CANSLIM evaluation unavailable.")
         _flush_logs()
@@ -283,7 +289,11 @@ def screen_stocks_canslim_detailed(
 
     # Calculate RS scores for all symbols at once
     symbols_list = list(symbols)
-    rs_scores_df = calculate_rs_scores_for_tickers(symbols_list)
+    as_of_session = getattr(market_trend, "as_of_session", None)
+    rs_scores_df = calculate_rs_scores_for_tickers(
+        symbols_list,
+        as_of_session=as_of_session,
+    )
 
     if debug and not rs_scores_df.empty:
         rs_series = rs_scores_df["RS_Score"].astype(float)
@@ -367,6 +377,7 @@ def screen_stocks_canslim_detailed(
                 require_bullish_market=require_bullish_market,
                 require_fundamentals=require_fundamentals,
                 strict_breakout=strict_breakout,
+                as_of_session=as_of_session,
             )
         except Exception as exc:
             print(f"Error analyzing {sym}: {exc}")

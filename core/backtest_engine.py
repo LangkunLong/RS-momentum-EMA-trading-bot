@@ -50,6 +50,7 @@ from core.data_client import clear_session_cache, fetch_bulk_ohlcv
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
 from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
+from core.trading_sessions import exact_session_row, history_through_exact_session
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -121,7 +122,16 @@ def _calculate_rs_snapshot(
     eligible_tickers: Optional[Iterable[str]] = None,
 ) -> Dict[str, float]:
     """Calculate RS scores for the full universe once as-of a specific date."""
-    sliced = all_closes.loc[:eval_date].dropna(axis=1, how="all")
+    sliced = history_through_exact_session(all_closes, eval_date)
+    event_row = exact_session_row(all_closes, eval_date)
+    if sliced is None or event_row is None:
+        return {}
+    fresh_columns = [
+        column
+        for column in sliced.columns
+        if _finite_signal_number(event_row[column]) is not None
+    ]
+    sliced = sliced.loc[:, fresh_columns].dropna(axis=1, how="all")
     if eligible_tickers is not None:
         eligible = {str(ticker).upper() for ticker in eligible_tickers}
         sliced = sliced.loc[:, [column for column in sliced.columns if str(column).upper() in eligible]]
@@ -592,9 +602,9 @@ def _finite_signal_number(value: object) -> float | None:
 
 def _causal_open_price(ohlcv: pd.DataFrame, eval_date: pd.Timestamp) -> float | None:
     """Return the price knowable at the session open without using that session's close."""
-    current = ohlcv.loc[eval_date:eval_date]
-    if not current.empty and "Open" in current.columns:
-        open_price = _finite_signal_number(current["Open"].iloc[0])
+    current = exact_session_row(ohlcv, eval_date)
+    if current is not None and "Open" in current.index:
+        open_price = _finite_signal_number(current["Open"])
         if open_price is not None and open_price > 0:
             return open_price
 
@@ -677,8 +687,8 @@ class CanslimStrategy:
         if tdata is None:
             return None
 
-        available = tdata.loc[:eval_date]
-        if len(available) < 60:
+        available = history_through_exact_session(tdata, eval_date)
+        if available is None or len(available) < 60:
             return None
 
         raw_rs_score = (
@@ -733,7 +743,9 @@ class CanslimStrategy:
                 "shares_outstanding": info.get("shares_outstanding"),
                 "institutional_data_available": held_pct is not None or holder_count is not None,
             }
-        tech = _evaluate_technical_at_date(tdata, eval_date, fund.get("shares_outstanding"))
+        tech = _evaluate_technical_at_date(available, eval_date, fund.get("shares_outstanding"))
+        if tech is None:
+            return None
 
         c_growth = _finite_signal_number(fund.get("current_growth"))
         a_growth = _finite_signal_number(fund.get("annual_growth"))
@@ -1884,24 +1896,14 @@ class PortfolioSimulator:
             finish("entry_rejected_missing_data")
             return
 
-        bar = ohlcv.loc[entry_date:entry_date]
-        if pivot is not None and (bar.empty or "Open" not in bar.columns):
+        bar = exact_session_row(ohlcv, entry_date)
+        if bar is None or "Open" not in bar.index:
             finish("entry_rejected_missing_data")
             return
-        if bar.empty:
-            prev = ohlcv.loc[:entry_date]
-            if prev.empty or "Close" not in prev.columns:
-                finish("entry_rejected_missing_data")
-                return
-            raw_entry_price = prev["Close"].iloc[-1]
-        else:
-            if "Open" in bar.columns:
-                raw_entry_price = bar["Open"].iloc[0]
-            elif "Close" in bar.columns:
-                raw_entry_price = bar["Close"].iloc[0]
-            else:
-                finish("entry_rejected_missing_data")
-                return
+        raw_entry_price = bar["Open"]
+        if raw_entry_price is None or bool(pd.isna(raw_entry_price)):
+            finish("entry_rejected_missing_data")
+            return
 
         try:
             entry_price = float(raw_entry_price)

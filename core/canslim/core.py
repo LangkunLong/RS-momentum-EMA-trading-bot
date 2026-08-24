@@ -40,6 +40,11 @@ from .l_leader_laggard import evaluate_l
 from .m_market_direction import MarketTrend, evaluate_m
 from .n_new_products import evaluate_n
 from .s_supply_demand import evaluate_s
+from core.trading_sessions import (
+    history_through_exact_session,
+    latest_us_equity_session,
+    normalize_us_equity_session,
+)
 
 
 def evaluate_canslim(
@@ -53,6 +58,7 @@ def evaluate_canslim(
     n_proximity_weight: Optional[float] = None,
     s_turnover_cap: Optional[float] = None,
     i_institutional_cap: Optional[float] = None,
+    as_of_session: object = None,
 ) -> Optional[Dict[str, object]]:
     """Evaluate all CANSLIM components for a given stock.
 
@@ -88,7 +94,34 @@ def evaluate_canslim(
     if n_proximity_weight is None:
         n_proximity_weight = settings.N_PROXIMITY_TO_HIGH_WEIGHT
 
-    # 1. Fetch Fundamental Data with Error Handling
+    # 1. Bind all live inputs to the same completed market session.  Legacy
+    # callers that provide an advisory MarketTrend without session provenance
+    # retain their prior behavior.
+    market_trend = market_trend or evaluate_m()
+    market_session = getattr(market_trend, "as_of_session", None)
+    if as_of_session is not None and market_session is not None:
+        if normalize_us_equity_session(as_of_session) != normalize_us_equity_session(market_session):
+            return None
+    expected_session = as_of_session if as_of_session is not None else market_session
+
+    try:
+        price_history = fetch_ohlcv(symbol, period=period)
+    except Exception:
+        return None
+    if price_history.empty:
+        return None
+    price_history = normalize_price_dataframe(price_history)
+    if expected_session is not None:
+        if latest_us_equity_session(price_history) != normalize_us_equity_session(expected_session).date():
+            return None
+        exact_history = history_through_exact_session(price_history, expected_session)
+        if exact_history is None:
+            return None
+        price_history = exact_history
+    if len(price_history) < 30:
+        return None
+
+    # 2. Fetch Fundamental Data only after price-session freshness is proven.
     reset_fmp_request_context()
     income_statement_error = None
     balance_sheet_error = None
@@ -117,18 +150,7 @@ def evaluate_canslim(
     if quarterly_income.empty and annual_income.empty:
         print(f"[WARN] {symbol}: No fundamental data available — C and A scores will be 0")
 
-    # 2. Market Trend & Price History
-    market_trend = market_trend or evaluate_m()
-    try:
-        price_history = fetch_ohlcv(symbol, period=period)
-    except Exception:
-        return None
-
-    if price_history.empty or len(price_history) < 30:
-        return None
-
     # 3. Extract price and volume metrics
-    price_history = normalize_price_dataframe(price_history)
     closes = extract_float_series(price_history, "Close")
     latest_close = coerce_scalar(closes.iloc[-1])
     lookback_252 = min(252, len(closes))

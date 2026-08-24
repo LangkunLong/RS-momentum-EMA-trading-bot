@@ -246,3 +246,22 @@ def test_capped_eviction_selects_and_sells_using_causal_open_price() -> None:
     assert sell["Ticker"] == "OPEN_LOSER"
     assert sell["Price"] == pytest.approx(90.0)
     assert set(simulator._open_positions) == {"OPEN_WINNER", "NEW"}
+
+
+@pytest.mark.parametrize("bar_state", ["missing", "missing_open", "nan_open"])
+def test_pivotless_pending_entry_requires_exact_next_session_open(bar_state: str) -> None:
+    """Break caught: a pending entry without a pivot fell back to a prior or same-day close."""
+    dates = pd.DatetimeIndex([pd.Timestamp("2026-08-21"), pd.Timestamp("2026-08-24")])
+    history = _ohlcv(dates, opens=[100.0, 101.0], closes=[100.0, 102.0])
+    if bar_state == "missing":
+        history = history.iloc[:1]
+    elif bar_state == "missing_open":
+        history = history.drop(columns="Open")
+    else:
+        history.loc[dates[1], "Open"] = float("nan")
+    simulator = PortfolioSimulator(initial_capital=1_000.0, technical_only=True)
+
+    simulator._enter_position(_signal("LEAD", dates[0]), {"LEAD": history}, dates[1])
+
+    assert simulator._transactions == []
+    assert simulator._entry_outcomes[-1].outcome == "entry_rejected_missing_data"
