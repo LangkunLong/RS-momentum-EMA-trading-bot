@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import inspect
 import json
 import math
@@ -572,7 +573,7 @@ def _daily_entry_funnel_frame(
     result: SimulationResult,
     sessions: pd.DatetimeIndex,
 ) -> pd.DataFrame:
-    signals = _validated_signal_frame(result, sessions)
+    signals = _validated_signal_frame(result, sessions).reset_index(drop=True)
     entry_eligible = _strict_boolean_series(signals, "entry_contract_eligible")
     buy_signal = _strict_boolean_series(signals, "buy_signal")
     if not buy_signal.equals(entry_eligible):
@@ -622,30 +623,50 @@ def _daily_entry_funnel_frame(
         }
         if (~outcomes["outcome"].isin(valid_outcomes)).any():
             raise ValueError("daily funnel contains an unsupported entry outcome")
-    rows: list[dict[str, object]] = []
-    for session in sessions:
-        day_signals = signals.loc[signals["signal_date"] == session]
-        day_eligible = entry_eligible.loc[day_signals.index]
-        day_outcomes = (
-            outcomes.loc[outcomes["signal_date"] == session]
-            if not outcomes.empty
-            else outcomes
+    session_index = pd.DatetimeIndex(sessions)
+    signal_counts = (
+        signals.assign(_entry_eligible=entry_eligible)
+        .groupby("signal_date", sort=False)
+        .agg(
+            evaluated_count=("symbol", "size"),
+            qualified_count=("_entry_eligible", "sum"),
         )
-        executed = int((day_outcomes["outcome"] == "entries_executed").sum())
-        attempted = int(len(day_outcomes))
-        qualified = int(day_eligible.sum())
-        rejected = attempted - executed
-        if executed > attempted or rejected > attempted or attempted > qualified:
-            raise ValueError("daily entry funnel violates qualification/attempt bounds")
-        rows.append({
-            "signal_date": str(session.date()),
-            "evaluated_count": int(len(day_signals)),
-            "qualified_count": qualified,
-            "attempted_count": attempted,
-            "executed_count": executed,
-            "rejected_count": rejected,
-        })
-    funnel = pd.DataFrame(rows)
+        .reindex(session_index, fill_value=0)
+        .astype(int)
+    )
+    if outcomes.empty:
+        outcome_counts = pd.DataFrame(
+            {"attempted_count": 0, "executed_count": 0},
+            index=session_index,
+        )
+    else:
+        outcome_counts = (
+            outcomes.assign(_executed=outcomes["outcome"] == "entries_executed")
+            .groupby("signal_date", sort=False)
+            .agg(
+                attempted_count=("outcome", "size"),
+                executed_count=("_executed", "sum"),
+            )
+            .reindex(session_index, fill_value=0)
+            .astype(int)
+        )
+    rejected = outcome_counts["attempted_count"] - outcome_counts["executed_count"]
+    if bool(
+        (
+            (outcome_counts["executed_count"] > outcome_counts["attempted_count"])
+            | (rejected > outcome_counts["attempted_count"])
+            | (outcome_counts["attempted_count"] > signal_counts["qualified_count"])
+        ).any()
+    ):
+        raise ValueError("daily entry funnel violates qualification/attempt bounds")
+    funnel = pd.DataFrame({
+        "signal_date": [str(session.date()) for session in session_index],
+        "evaluated_count": signal_counts["evaluated_count"].to_numpy(dtype=int),
+        "qualified_count": signal_counts["qualified_count"].to_numpy(dtype=int),
+        "attempted_count": outcome_counts["attempted_count"].to_numpy(dtype=int),
+        "executed_count": outcome_counts["executed_count"].to_numpy(dtype=int),
+        "rejected_count": rejected.to_numpy(dtype=int),
+    })
     if int(funnel["evaluated_count"].sum()) != len(signals):
         raise ValueError("daily funnel evaluated total disagrees with signal log")
     qualified_total = int(funnel["qualified_count"].sum())
@@ -661,7 +682,7 @@ def _daily_entry_funnel_frame(
     if capacity_truncated != 0 or capacity_rejected != 0:
         raise ValueError("daily funnel contains an impossible uncapped capacity limit")
     expected_outcome_keys = {
-        key for key in qualified_keys if key[1] != sessions[-1]
+        key for key in qualified_keys if key[1] != session_index[-1]
     }
     if outcome_keys != expected_outcome_keys:
         raise ValueError(
@@ -906,19 +927,27 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
     required = ["symbol", "signal_date", "current_growth", "annual_growth"]
     if signal_log.empty or not set(required).issubset(signal_log):
         raise ValueError("signal log cannot support evaluated PIT fundamental coverage")
-    frame = signal_log[required].copy()
+    frame = signal_log[required].copy().reset_index(drop=True)
     frame["symbol"] = frame["symbol"].astype(str).str.upper()
     frame["signal_date"] = pd.to_datetime(frame["signal_date"], errors="raise").dt.date
     if frame.duplicated(["symbol", "signal_date"]).any():
         raise ValueError("evaluated PIT symbol-date rows are not unique")
+    membership_by_date: dict[date, frozenset[str]] = {}
+    for signal_date in frame["signal_date"]:
+        if signal_date not in membership_by_date:
+            membership_by_date[signal_date] = bundle.members_at(signal_date.isoformat())
     for row in frame.itertuples(index=False):
-        if row.symbol not in bundle.members_at(row.signal_date.isoformat()):
+        if row.symbol not in membership_by_date[row.signal_date]:
             raise ValueError("signal log contains a symbol outside strict PIT membership")
-    bundle_current_count = 0
-    bundle_annual_count = 0
-    bundle_both_count = 0
-    for row in frame.itertuples(index=False):
-        facts = bundle.fundamentals_as_of(row.symbol, pd.Timestamp(row.signal_date))
+    state_bounds = {
+        str(symbol): (min(group), max(group))
+        for symbol, group in frame.groupby("symbol", sort=False)["signal_date"]
+    }
+    state_dates: dict[str, list[date]] = {symbol: [] for symbol in state_bounds}
+    state_growth: dict[str, list[tuple[float | None, float | None]]] = {
+        symbol: [] for symbol in state_dates
+    }
+    for symbol, public_date, facts in bundle.iter_fundamental_state_boundaries(state_bounds):
         _c_score, bundle_current = evaluate_c(facts["quarterly_income"])
         _a_score, bundle_annual, _roe = evaluate_a(
             facts["annual_income"], balance_sheet=facts["balance_sheet"]
@@ -930,6 +959,17 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
             bundle_current = None
         if bundle_annual is not None and not math.isfinite(float(bundle_annual)):
             bundle_annual = None
+        state_dates[symbol].append(public_date)
+        state_growth[symbol].append((bundle_current, bundle_annual))
+    bundle_current_count = 0
+    bundle_annual_count = 0
+    bundle_both_count = 0
+    for row in frame.itertuples(index=False):
+        state_index = bisect_right(state_dates[row.symbol], row.signal_date) - 1
+        if state_index < 0:
+            bundle_current, bundle_annual = None, None
+        else:
+            bundle_current, bundle_annual = state_growth[row.symbol][state_index]
         current_ok = bundle_current is not None
         annual_ok = bundle_annual is not None
 
