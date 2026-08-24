@@ -204,7 +204,8 @@ def test_finalization_batching_preserves_as_of_coverage_and_daily_funnel(
             "current_quarterly_and_annual_pct": 83.33333333333334,
             "coverage_basis": (
                 "unique strict-PIT signal-log symbol/date rows independently recomputed from "
-                "hash-bound as-of quarterly/annual frames with unchanged evaluate_c/evaluate_a"
+                "hash-bound as-of quarterly/annual frames with fiscal-date-matched "
+                "evaluate_c and unchanged evaluate_a"
             ),
         }
         assert membership_calls == [

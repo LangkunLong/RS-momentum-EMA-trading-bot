@@ -1006,7 +1006,8 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
         "current_quarterly_and_annual_pct": bundle_both_count / len(frame) * 100.0,
         "coverage_basis": (
             "unique strict-PIT signal-log symbol/date rows independently recomputed from "
-            "hash-bound as-of quarterly/annual frames with unchanged evaluate_c/evaluate_a"
+            "hash-bound as-of quarterly/annual frames with fiscal-date-matched "
+            "evaluate_c and unchanged evaluate_a"
         ),
     }
 

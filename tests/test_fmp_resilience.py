@@ -708,7 +708,7 @@ def test_free_plan_raw_history_skips_profile_and_institutional_calls(
     mock_institutional.assert_not_called()
 
 
-# ─── C score 4-quarter YoY fallback ─────────────────────────────────────────
+# ─── C score date-matched fiscal YoY ────────────────────────────────────────
 
 
 def _make_quarterly_df(eps_values: list[float], dates: list[str]) -> pd.DataFrame:
@@ -718,7 +718,7 @@ def _make_quarterly_df(eps_values: list[float], dates: list[str]) -> pd.DataFram
 
 
 def test_c_score_four_quarter_fallback_valid_yoy() -> None:
-    """evaluate_c must compute a score when exactly 4 quarters span >= 330 days (free-tier path)."""
+    """Four sparse records can score when latest and prior fiscal dates match."""
     df = _make_quarterly_df(
         eps_values=[1.00, 1.10, 1.20, 1.42],
         dates=["2023-12-31", "2024-03-31", "2024-06-30", "2024-12-31"],  # ~366-day span
@@ -732,7 +732,7 @@ def test_c_score_four_quarter_fallback_valid_yoy() -> None:
 
 
 def test_c_score_four_quarter_fallback_too_short_span() -> None:
-    """evaluate_c must return 0 when 4 quarters span < 330 days (no valid YoY)."""
+    """Four adjacent records without a prior-year comparator cannot score."""
     df = _make_quarterly_df(
         eps_values=[1.00, 1.10, 1.20, 1.30],
         dates=["2024-01-31", "2024-04-30", "2024-07-31", "2024-10-31"],  # ~274-day span
@@ -750,8 +750,8 @@ def test_c_score_missing_data_returns_zero() -> None:
     assert growth is None
 
 
-def test_c_score_four_quarter_fallback_boundary_at_330_days() -> None:
-    """evaluate_c should accept a span of exactly 330 days as a valid YoY."""
+def test_c_score_span_alone_does_not_create_a_yoy_pair() -> None:
+    """A 330-day span is not a substitute for a matching prior fiscal date."""
     import datetime
 
     start = datetime.date(2024, 1, 1)
@@ -764,7 +764,8 @@ def test_c_score_four_quarter_fallback_boundary_at_330_days() -> None:
 
     score, growth = evaluate_c(df)
 
-    assert score > 0, "Expected non-zero score at exactly 330-day boundary"
+    assert score == 0.0
+    assert growth is None
 
 
 def test_c_score_full_twelve_quarters_uses_yoy() -> None:

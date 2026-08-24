@@ -18,6 +18,8 @@ import pandas as pd
 
 from config import settings
 
+from .fiscal_periods import match_fiscal_year_over_year_periods
+
 
 def _safe_growth(current: float, previous: float) -> Optional[float]:
     """Calculate YoY revenue growth as a decimal.
@@ -36,6 +38,9 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
 
     import numpy as np
 
+    if not np.isfinite(current) or not np.isfinite(previous):
+        return None
+
     if np.isclose(previous, 0.0):
         return None
 
@@ -45,7 +50,8 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
         return None
 
     try:
-        return (current - previous) / abs(previous)
+        growth = (current - previous) / abs(previous)
+        return growth if np.isfinite(growth) else None
     except ZeroDivisionError:
         return None
 
@@ -104,11 +110,15 @@ def evaluate_n(
             ]
 
             if not revenue_row.empty:
-                revs = quarterly_income.loc[revenue_row[0]].sort_index()
-                if len(revs) >= 5:  # Same fiscal quarter one year earlier
-                    revenue_growth = _safe_growth(revs.iloc[-1], revs.iloc[-5])
-                elif len(revs) == 4:
-                    revenue_growth = _safe_growth(revs.iloc[-1], revs.iloc[0])
+                revs = quarterly_income.loc[revenue_row[0]]
+                if isinstance(revs, pd.DataFrame):
+                    revs = revs.iloc[0]
+                matches = match_fiscal_year_over_year_periods(revs)
+                if matches and matches[0].matched:
+                    revenue_growth = _safe_growth(
+                        matches[0].current_value,
+                        matches[0].prior_value,
+                    )
         except Exception:
             pass
 

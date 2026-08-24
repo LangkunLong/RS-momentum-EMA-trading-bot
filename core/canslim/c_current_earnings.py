@@ -17,6 +17,8 @@ import pandas as pd
 
 from config import settings
 
+from .fiscal_periods import match_fiscal_year_over_year_periods
+
 
 def _safe_growth(current: float, previous: float) -> Optional[float]:
     """Calculate growth as a decimal, handling edge cases."""
@@ -58,15 +60,11 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
         The matching index label, or None if nothing found.
 
     """
-    # Priority 1: EPS rows
-    eps_mask = df.index.str.contains(r"Basic EPS|Diluted EPS", case=False, regex=True)
-    if eps_mask.any():
-        return df.index[eps_mask][0]
-
-    # Priority 2: Net Income
-    ni_mask = df.index.str.contains(r"Net Income", case=False, regex=True)
-    if ni_mask.any():
-        return df.index[ni_mask][0]
+    labels = df.index.astype(str)
+    for pattern in (r"Diluted EPS", r"Basic EPS", r"Net Income"):
+        matches = labels.str.contains(pattern, case=False, regex=True)
+        if matches.any():
+            return df.index[matches][0]
 
     return None
 
@@ -74,7 +72,7 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
 def _get_quarterly_yoy_growths(earnings: pd.Series) -> List[Optional[float]]:
     """Calculate year-over-year growth for each quarter.
 
-    Compares each quarter to the same quarter one year prior (4 quarters back).
+    Compares each period to the closest unique prior-year fiscal period.
 
     Args:
         earnings: Time-sorted earnings series (oldest to newest).
@@ -83,13 +81,10 @@ def _get_quarterly_yoy_growths(earnings: pd.Series) -> List[Optional[float]]:
         List of YoY growth rates for available quarters (most recent first).
 
     """
-    growths = []
-    n = len(earnings)
-    # Start from most recent, go backwards
-    for i in range(n - 1, 3, -1):  # Need at least 4 quarters back
-        growth = _safe_growth(earnings.iloc[i], earnings.iloc[i - 4])
-        growths.append(growth)
-    return growths
+    return [
+        _safe_growth(match.current_value, match.prior_value) if match.matched else None
+        for match in match_fiscal_year_over_year_periods(earnings)
+    ]
 
 
 def _check_acceleration(growths: List[Optional[float]]) -> float:
@@ -158,43 +153,12 @@ def evaluate_c(
         if row_label is None:
             return 0.0, None
 
-        # Sort columns by date oldest→newest so iloc[-1] is most recent
-        earnings = quarterly_income.loc[row_label].sort_index()
-
-        if len(earnings) < 5:
-            # Standard path needs 5 quarters for true YoY (current + 4 back).
-            # FMP free-tier often returns exactly 4 quarterly periods.
-            # When those 4 periods span ≥ 11 months (e.g., Q4 2023 → Q3 2024),
-            # the oldest and newest entries are effectively the same calendar
-            # quarter one year apart — we can compute a genuine YoY.
-            # Do NOT fall back to quarter-over-quarter; O'Neil strictly requires
-            # YoY to avoid seasonal distortion.
-            if len(earnings) == 4:
-                try:
-                    dates = pd.to_datetime(earnings.index)
-                    span_days = (dates[-1] - dates[0]).days
-                    if span_days >= 330:  # ≥ 11 months → valid approximate YoY
-                        current_growth = _safe_growth(float(earnings.iloc[-1]), float(earnings.iloc[0]))
-                        if current_growth is not None:
-                            growth_score = float(np.clip(current_growth / c_growth_target, 0, 2) / 2)
-                            # Consistency and acceleration are unknown with a single
-                            # YoY data point — score them neutral (0.5) rather than 0.
-                            score = float(
-                                np.clip(
-                                    settings.C_GROWTH_WEIGHT * growth_score
-                                    + settings.C_CONSISTENCY_WEIGHT * 0.5
-                                    + settings.C_ACCELERATION_WEIGHT * 0.5,
-                                    0,
-                                    1,
-                                )
-                            )
-                            return score, current_growth
-                except Exception:
-                    pass
-            return 0.0, None
+        earnings = quarterly_income.loc[row_label]
+        if isinstance(earnings, pd.DataFrame):
+            earnings = earnings.iloc[0]
 
         # --- O'Neil's methodology: Year-over-Year comparison ---
-        # Compare most recent quarter to same quarter last year (4 quarters back)
+        # Compare the latest period only with its unique date-matched prior year.
         yoy_growths = _get_quarterly_yoy_growths(earnings)
 
         if not yoy_growths or yoy_growths[0] is None:

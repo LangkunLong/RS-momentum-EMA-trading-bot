@@ -711,6 +711,7 @@ class CanslimStrategy:
                 "i_score": 0.5,
                 "institutional_data_available": False,
                 "shares_outstanding": None,
+                "quarterly_income": pd.DataFrame(),
             }
         elif self.fundamental_provider is None:
             # Preserve the legacy provider's already-scored contract.  PIT
@@ -741,9 +742,16 @@ class CanslimStrategy:
                 "annual_growth": annual_growth,
                 "roe": roe,
                 "shares_outstanding": info.get("shares_outstanding"),
-                "institutional_data_available": held_pct is not None or holder_count is not None,
+                "institutional_data_available": held_pct is not None
+                or (holder_count is not None and prev_holder_count is not None),
+                "quarterly_income": qi,
             }
-        tech = _evaluate_technical_at_date(available, eval_date, fund.get("shares_outstanding"))
+        tech = _evaluate_technical_at_date(
+            available,
+            eval_date,
+            fund.get("shares_outstanding"),
+            quarterly_income=fund.get("quarterly_income"),
+        )
         if tech is None:
             return None
 

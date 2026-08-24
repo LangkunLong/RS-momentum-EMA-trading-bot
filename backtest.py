@@ -37,6 +37,7 @@ from core.canslim.entry_contract import (
 )
 from core.canslim.i_institutional import evaluate_i
 from core.canslim.m_market_direction import evaluate_m
+from core.canslim.n_new_products import evaluate_n
 from core.canslim.s_supply_demand import evaluate_s
 from core.data_client import (
     clear_session_cache,
@@ -151,6 +152,8 @@ def _evaluate_technical_at_date(
     ticker_data: pd.DataFrame,
     eval_date: pd.Timestamp,
     shares_outstanding: Optional[float],
+    *,
+    quarterly_income: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict[str, object]]:
     """Evaluate N and S technical criteria as-of a specific date."""
     sliced = history_through_exact_session(ticker_data, eval_date)
@@ -181,17 +184,8 @@ def _evaluate_technical_at_date(
     entry_facts = build_entry_facts(closes, volumes)
     avg_vol_50 = entry_facts.prior_average_volume_50 or 0.0
 
-    # N score (proximity only — we don't have historical quarterly revenue)
-    if proximity >= 0.98:
-        proximity_score = 1.0
-    elif proximity >= 0.90:
-        proximity_score = (proximity - 0.90) / (0.98 - 0.90)
-    elif proximity >= 0.75:
-        proximity_score = (proximity - 0.75) / (0.90 - 0.75) * 0.3
-    else:
-        proximity_score = 0.0
-    # Use proximity as full N score since we can't get historical revenue
-    n_score = float(np.clip(proximity_score, 0, 1))
+    n_frame = quarterly_income if isinstance(quarterly_income, pd.DataFrame) else pd.DataFrame()
+    n_score, revenue_growth = evaluate_n(n_frame, proximity)
 
     # S score
     score_s, s_metrics = evaluate_s(
@@ -200,6 +194,7 @@ def _evaluate_technical_at_date(
 
     return {
         "n_score": n_score,
+        "revenue_growth": revenue_growth,
         "s_score": score_s,
         "proximity": proximity,
         "close": latest_close,
@@ -236,9 +231,15 @@ def _evaluate_fundamentals_at_date(symbol: str, eval_date: pd.Timestamp) -> Dict
 
         held_pct = info.get("held_percent_institutions")
         num_holders = info.get("institution_count")
-        score_i = evaluate_i(held_pct, num_institutional_holders=num_holders)
+        prev_num_holders = info.get("prev_institution_count")
+        score_i = evaluate_i(
+            held_pct,
+            num_institutional_holders=num_holders,
+            prev_num_institutional_holders=prev_num_holders,
+        )
         shares = info.get("shares_outstanding")
-        institutional_data_available = held_pct is not None or num_holders is not None
+        institutional_trend_available = num_holders is not None and prev_num_holders is not None
+        institutional_data_available = held_pct is not None or institutional_trend_available
 
         return {
             "c_score": score_c,
@@ -249,6 +250,7 @@ def _evaluate_fundamentals_at_date(symbol: str, eval_date: pd.Timestamp) -> Dict
             "roe": roe,
             "shares_outstanding": shares,
             "institutional_data_available": institutional_data_available,
+            "quarterly_income": qi,
         }
     except Exception as e:
         print(f"    ERROR fetching fundamentals for {symbol} @ {eval_date.date()}: {e}")
@@ -440,7 +442,12 @@ def run_backtest() -> pd.DataFrame:
             fund = _evaluate_fundamentals_at_date(ticker, eval_date)
 
             # Technical scores (N, S)
-            tech = _evaluate_technical_at_date(tdata, eval_date, fund.get("shares_outstanding"))
+            tech = _evaluate_technical_at_date(
+                tdata,
+                eval_date,
+                fund.get("shares_outstanding"),
+                quarterly_income=fund.get("quarterly_income"),
+            )
             if tech is None:
                 continue
 

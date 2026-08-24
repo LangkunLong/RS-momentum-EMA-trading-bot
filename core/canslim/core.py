@@ -185,8 +185,13 @@ def evaluate_canslim(
     # I - Institutional Sponsorship (sweet-spot + trend)
     held_percent_institutions = company_info.get("held_percent_institutions")
     num_institutional_holders = company_info.get("institution_count")
+    prev_num_institutional_holders = company_info.get("prev_institution_count")
 
-    score_i = evaluate_i(held_percent_institutions, num_institutional_holders=num_institutional_holders)
+    score_i = evaluate_i(
+        held_percent_institutions,
+        num_institutional_holders=num_institutional_holders,
+        prev_num_institutional_holders=prev_num_institutional_holders,
+    )
 
     # M - Market Direction
     score_m = market_trend.score
@@ -207,7 +212,13 @@ def evaluate_canslim(
     # fundamentals behave as missing evidence, not as an implicit free pass.
     # The I component is optional on the free tier, so only that weight is
     # redistributed when institutional data is unavailable.
-    institutional_data_available = held_percent_institutions is not None or num_institutional_holders is not None
+    institutional_trend_available = (
+        num_institutional_holders is not None
+        and prev_num_institutional_holders is not None
+    )
+    institutional_data_available = (
+        held_percent_institutions is not None or institutional_trend_available
+    )
     has_fundamentals = current_growth is not None or annual_growth is not None
     fmp_quota_deferred = fmp_request_was_deferred() and (
         quarterly_income.empty or annual_income.empty
@@ -218,7 +229,7 @@ def evaluate_canslim(
         "N_revenue": revenue_growth is not None,
         "N_price": proximity_to_high is not None and proximity_to_high > 0,
         "I_level": held_percent_institutions is not None,
-        "I_trend": num_institutional_holders is not None,
+        "I_trend": institutional_trend_available,
         "M": market_trend is not None,
     }
     base_weights = {

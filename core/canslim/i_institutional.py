@@ -129,7 +129,7 @@ def evaluate_i(
         level_score = _score_ownership_level(held_percent_institutions)
         active_components.append((settings.I_LEVEL_WEIGHT, level_score))
 
-    if num_institutional_holders is not None or prev_num_institutional_holders is not None:
+    if num_institutional_holders is not None and prev_num_institutional_holders is not None:
         trend_score = _score_ownership_trend(num_institutional_holders, prev_num_institutional_holders)
         active_components.append((settings.I_TREND_WEIGHT, trend_score))
 
