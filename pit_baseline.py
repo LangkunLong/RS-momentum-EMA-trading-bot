@@ -70,6 +70,11 @@ _EXCLUSION_COLUMNS = (
     "ticker", "company_name", "first_membership_date", "last_membership_date",
     "reason", "details",
 )
+_RESUME_JOURNAL_FILENAMES = frozenset({
+    "portfolio_checkpoint.json",
+    "portfolio_progress.jsonl",
+    "portfolio_state.jsonl",
+})
 
 
 class CoverageGateError(ValueError):
@@ -92,6 +97,54 @@ def _regular_file(path: str | Path) -> Path:
     if not value.is_file() or value.is_symlink():
         raise ValueError(f"input must be a regular non-link file: {value}")
     return value.resolve()
+
+
+def _resume_run_paths(
+    *,
+    resume_checkpoint: str | Path,
+    output_root: Path,
+    expected_bundle_sha: str,
+) -> tuple[Path, Path, Path]:
+    """Validate and return the single run directory that owns a resume journal."""
+
+    checkpoint = _regular_file(resume_checkpoint)
+    run_dir = checkpoint.parent
+    if checkpoint.name != "portfolio_checkpoint.json":
+        raise ValueError("resume checkpoint must be named portfolio_checkpoint.json")
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        raise ValueError("resume checkpoint parent must be a regular run directory")
+    if run_dir.parent != output_root:
+        raise ValueError("resume checkpoint must belong directly to --output-root")
+    expected_suffix = f"-{expected_bundle_sha[:12]}"
+    if not run_dir.name.endswith(expected_suffix):
+        raise ValueError("resume run directory name does not match the PIT bundle prefix")
+    run_name = run_dir.name[:-len(expected_suffix)]
+    try:
+        parsed_run_name = datetime.strptime(run_name, "run-%Y%m%dT%H%M%SZ")
+    except ValueError as exc:
+        raise ValueError("resume run directory name is not a canonical UTC run name") from exc
+    if parsed_run_name.strftime("run-%Y%m%dT%H%M%SZ") != run_name:
+        raise ValueError("resume run directory name is not a canonical UTC run name")
+    terminal_markers = tuple(
+        name for name in ("run_manifest.json", "run_failed.json")
+        if (run_dir / name).exists()
+    )
+    if terminal_markers:
+        raise ValueError(
+            "resume run is terminal; preserve its marker and start a fresh run: "
+            + ", ".join(terminal_markers)
+        )
+    entries = {item.name: item for item in run_dir.iterdir()}
+    if set(entries) != _RESUME_JOURNAL_FILENAMES:
+        missing = sorted(_RESUME_JOURNAL_FILENAMES.difference(entries))
+        extra = sorted(set(entries).difference(_RESUME_JOURNAL_FILENAMES))
+        raise ValueError(
+            "resume run directory must contain exactly the checkpoint/progress/state journals; "
+            f"missing={missing}, extra={extra}"
+        )
+    if any(not item.is_file() or item.is_symlink() for item in entries.values()):
+        raise ValueError("resume journals must be regular non-link files")
+    return run_dir, checkpoint, run_dir / "portfolio_progress.jsonl"
 
 
 def _git_identity(worktree: Path, *, require_clean: bool) -> str:
@@ -1073,16 +1126,22 @@ def run_baseline(
         "fundamentals": _read_json(paths["fundamentals_provenance"]),
     }
     output_root = Path(args.output_root).resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
-    run_dir = output_root / (
-        datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ-") + expected_bundle_sha[:12]
-    )
-    run_dir.mkdir()
-    resume_checkpoint = (
-        Path(args.resume_checkpoint).resolve() if args.resume_checkpoint else None
-    )
-    portfolio_checkpoint = resume_checkpoint or (run_dir / "portfolio_checkpoint.json")
-    portfolio_progress = portfolio_checkpoint.with_name("portfolio_progress.jsonl")
+    resume = args.resume_checkpoint is not None
+    if resume:
+        run_dir, portfolio_checkpoint, portfolio_progress = _resume_run_paths(
+            resume_checkpoint=args.resume_checkpoint,
+            output_root=output_root,
+            expected_bundle_sha=expected_bundle_sha,
+        )
+    else:
+        output_root.mkdir(parents=True, exist_ok=True)
+        run_dir = output_root / (
+            datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ-")
+            + expected_bundle_sha[:12]
+        )
+        run_dir.mkdir()
+        portfolio_checkpoint = run_dir / "portfolio_checkpoint.json"
+        portfolio_progress = run_dir / "portfolio_progress.jsonl"
     try:
         with PITDataBundle(paths["pit_bundle"], expected_sha256=expected_bundle_sha) as bundle:
             if bundle.metadata["evaluation_start"] != _START:
@@ -1137,7 +1196,7 @@ def run_baseline(
                 tickers,
                 checkpoint_path=portfolio_checkpoint,
                 progress_log_path=portfolio_progress,
-                resume=resume_checkpoint is not None,
+                resume=resume,
                 checkpoint_every_days=args.checkpoint_every_days,
                 code_identity=git_head,
             )
@@ -1280,9 +1339,12 @@ def run_baseline(
                 raise ValueError("active CANSLIM configuration changed before publication")
             if _json_bytes(result.execution_diagnostics) != _json_bytes(diagnostics):
                 raise ValueError("execution diagnostics changed before publication")
-            artifact_hashes = {
-                item.name: sha256_file(item) for item in sorted(run_dir.iterdir()) if item.is_file()
-            }
+            artifact_items = tuple(sorted(run_dir.iterdir()))
+            if any(not item.is_file() or item.is_symlink() for item in artifact_items):
+                raise ValueError("run directory contains a non-regular artifact before manifest")
+            artifact_hashes = {item.name: sha256_file(item) for item in artifact_items}
+            if resume and not _RESUME_JOURNAL_FILENAMES.issubset(artifact_hashes):
+                raise ValueError("resumed baseline is missing an execution journal before manifest")
             manifest = {
                 "schema_version": 1, "status": "complete",
                 "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1345,7 +1407,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
         "--resume-checkpoint",
-        help="resume a prior portfolio checkpoint instead of replaying its completed days",
+        help=(
+            "resume and publish the owning run in place; PATH must be "
+            "OUTPUT_ROOT/run-.../portfolio_checkpoint.json"
+        ),
     )
     parser.add_argument(
         "--checkpoint-every-days",
