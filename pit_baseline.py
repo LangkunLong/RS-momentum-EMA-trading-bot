@@ -56,7 +56,8 @@ _BENCHMARK = "SPY"
 _LEADERS = 100
 _REBALANCE = 20
 _PUBLIC_DATE_RULE = (
-    "first supplied SPY trading day strictly after SEC acceptance calendar date; filed date fallback only"
+    "first supplied SPY trading day strictly after SEC acceptance calendar date; "
+    "filed date fallback only"
 )
 _SAME_ISSUER_KINDS = {
     "same_issuer_rename",
@@ -65,28 +66,18 @@ _SAME_ISSUER_KINDS = {
     "accounting_acquirer_rename",
 }
 _MASTER_COLUMNS = (
-    "ticker",
-    "cik",
-    "company_name",
-    "first_membership_date",
-    "last_membership_date",
-    "mapping_basis",
+    "ticker", "cik", "company_name", "first_membership_date",
+    "last_membership_date", "mapping_basis",
 )
 _EXCLUSION_COLUMNS = (
-    "ticker",
-    "company_name",
-    "first_membership_date",
-    "last_membership_date",
-    "reason",
-    "details",
+    "ticker", "company_name", "first_membership_date", "last_membership_date",
+    "reason", "details",
 )
-_RESUME_JOURNAL_FILENAMES = frozenset(
-    {
-        "portfolio_checkpoint.json",
-        "portfolio_progress.jsonl",
-        "portfolio_state.jsonl",
-    }
-)
+_RESUME_JOURNAL_FILENAMES = frozenset({
+    "portfolio_checkpoint.json",
+    "portfolio_progress.jsonl",
+    "portfolio_state.jsonl",
+})
 
 
 class CoverageGateError(ValueError):
@@ -128,7 +119,9 @@ def _lexical_path(path: str | Path, *, field: str) -> Path:
             raise ValueError(f"{field} path cannot be inspected: {current}") from exc
         attributes = int(getattr(metadata, "st_file_attributes", 0) or 0)
         if stat.S_ISLNK(metadata.st_mode) or (reparse_flag and attributes & reparse_flag):
-            raise ValueError(f"{field} must not traverse a symlink or Windows reparse point: {current}")
+            raise ValueError(
+                f"{field} must not traverse a symlink or Windows reparse point: {current}"
+            )
     return value
 
 
@@ -155,8 +148,12 @@ def _resume_run_paths(
     """Validate and return the single run directory that owns a resume journal."""
 
     lexical_output_root = _lexical_regular_directory(output_root, field="--output-root")
-    lexical_checkpoint = _lexical_regular_file(resume_checkpoint, field="resume checkpoint")
-    lexical_run_dir = _lexical_regular_directory(lexical_checkpoint.parent, field="resume checkpoint parent")
+    lexical_checkpoint = _lexical_regular_file(
+        resume_checkpoint, field="resume checkpoint"
+    )
+    lexical_run_dir = _lexical_regular_directory(
+        lexical_checkpoint.parent, field="resume checkpoint parent"
+    )
     if lexical_checkpoint.name != "portfolio_checkpoint.json":
         raise ValueError("resume checkpoint must be named portfolio_checkpoint.json")
     if lexical_run_dir.parent != lexical_output_root:
@@ -164,7 +161,7 @@ def _resume_run_paths(
     expected_suffix = f"-{expected_bundle_sha[:12]}"
     if not lexical_run_dir.name.endswith(expected_suffix):
         raise ValueError("resume run directory name does not match the PIT bundle prefix")
-    run_name = lexical_run_dir.name[: -len(expected_suffix)]
+    run_name = lexical_run_dir.name[:-len(expected_suffix)]
     try:
         parsed_run_name = datetime.strptime(run_name, "run-%Y%m%dT%H%M%SZ")
     except ValueError as exc:
@@ -174,10 +171,13 @@ def _resume_run_paths(
     entries = {item.name: item for item in lexical_run_dir.iterdir()}
     for name, item in entries.items():
         _lexical_path(item, field=f"resume run entry {name!r}")
-    terminal_markers = tuple(name for name in ("run_manifest.json", "run_failed.json") if name in entries)
+    terminal_markers = tuple(
+        name for name in ("run_manifest.json", "run_failed.json") if name in entries
+    )
     if terminal_markers:
         raise ValueError(
-            "resume run is terminal; preserve its marker and start a fresh run: " + ", ".join(terminal_markers)
+            "resume run is terminal; preserve its marker and start a fresh run: "
+            + ", ".join(terminal_markers)
         )
     if set(entries) != _RESUME_JOURNAL_FILENAMES:
         missing = sorted(_RESUME_JOURNAL_FILENAMES.difference(entries))
@@ -207,20 +207,12 @@ def _resume_run_paths(
 
 def _git_identity(worktree: Path, *, require_clean: bool) -> str:
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=worktree,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
+        ["git", "rev-parse", "HEAD"], cwd=worktree, check=True,
+        capture_output=True, text=True, timeout=10,
     ).stdout.strip()
     status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=worktree,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=worktree,
+        check=True, capture_output=True, text=True, timeout=10,
     ).stdout
     if require_clean and status:
         raise ValueError("PIT baseline requires a clean Git worktree")
@@ -235,7 +227,9 @@ def _json_bytes(value: object) -> bytes:
             return item.item()
         raise TypeError(f"value is not JSON serializable: {type(item).__name__}")
 
-    return (json.dumps(value, indent=2, sort_keys=True, allow_nan=False, default=default) + "\n").encode()
+    return (
+        json.dumps(value, indent=2, sort_keys=True, allow_nan=False, default=default) + "\n"
+    ).encode()
 
 
 def _write_bytes(path: Path, payload: bytes) -> None:
@@ -324,10 +318,17 @@ def _validated_signal_frame(
     session_index = pd.DatetimeIndex(sessions).normalize()
     if session_index.has_duplicates:
         raise ValueError("benchmark sessions are not unique")
-    signals["signal_date"] = pd.to_datetime(signals["signal_date"], errors="raise").dt.normalize()
+    signals["signal_date"] = pd.to_datetime(
+        signals["signal_date"], errors="raise"
+    ).dt.normalize()
     normalized_symbols: list[str] = []
     for value in signals["symbol"]:
-        if not isinstance(value, str) or not value or value != value.strip() or value != value.upper():
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or value != value.upper()
+        ):
             raise ValueError("CANSLIM signal symbol is not nonblank uppercase text")
         normalized_symbols.append(value)
     signals["symbol"] = normalized_symbols
@@ -350,37 +351,19 @@ def _nonnegative_diagnostic(result: SimulationResult, field: str) -> int:
 
 
 def _validate_portfolio(
-    result: SimulationResult,
-    sessions: pd.DatetimeIndex,
-    bundle_sha256: str,
+    result: SimulationResult, sessions: pd.DatetimeIndex, bundle_sha256: str,
 ) -> None:
     if not _curve_index(result.equity_curve, field="CANSLIM equity").equals(sessions):
         raise ValueError("CANSLIM equity does not exactly cover benchmark sessions")
     if not _curve_index(result.benchmark_curve, field="CANSLIM benchmark").equals(sessions):
         raise ValueError("CANSLIM benchmark does not exactly cover benchmark sessions")
     required_signals = {
-        "symbol",
-        "signal_date",
-        "buy_signal",
-        "current_growth",
-        "annual_growth",
-        "rs_score",
-        "has_breakout",
-        "has_volume_surge",
-        "in_buy_zone",
-        "canslim_score",
-        "entry_composite_score",
-        "entry_contract_eligible",
-        "entry_blocking_reasons",
-        "pivot",
-        "prior_close",
-        "event_volume",
-        "prior_average_volume_50",
-        "entry_volume_ratio",
-        "entry_extension",
-        "price_advanced",
-        "technical_setup_eligible",
-        "technical_blocking_reasons",
+        "symbol", "signal_date", "buy_signal", "current_growth", "annual_growth",
+        "rs_score", "has_breakout", "has_volume_surge", "in_buy_zone", "canslim_score",
+        "entry_composite_score", "entry_contract_eligible", "entry_blocking_reasons",
+        "pivot", "prior_close", "event_volume", "prior_average_volume_50",
+        "entry_volume_ratio", "entry_extension", "price_advanced",
+        "technical_setup_eligible", "technical_blocking_reasons",
     }
     if not isinstance(result.signal_log, pd.DataFrame) or result.signal_log.empty:
         raise ValueError("CANSLIM signal log is empty")
@@ -388,21 +371,18 @@ def _validate_portfolio(
         raise ValueError("CANSLIM signal log lacks required baseline fields")
     signals = _validated_signal_frame(result, sessions)
     _average_cash_pct(result)
-    holding_dates = pd.DatetimeIndex(pd.to_datetime(result.weekly_holdings["Week_Ending"], errors="raise")).normalize()
+    holding_dates = pd.DatetimeIndex(
+        pd.to_datetime(result.weekly_holdings["Week_Ending"], errors="raise")
+    ).normalize()
     if holding_dates.has_duplicates or not set(holding_dates).issubset(sessions):
         raise ValueError("weekly holdings dates are not unique benchmark sessions")
     if not isinstance(result.config, dict) or not isinstance(result.execution_diagnostics, dict):
         raise ValueError("CANSLIM config/diagnostics artifacts are missing")
     expected = {
-        "benchmark_symbol": _BENCHMARK,
-        "start_date": _START,
-        "end_date": _END,
-        "data_mode": "point_in_time",
-        "pit_bundle_sha256": bundle_sha256,
-        "technical_only": False,
-        "max_positions": None,
-        "require_bullish_market": False,
-        "use_stateful_regime_gate": False,
+        "benchmark_symbol": _BENCHMARK, "start_date": _START, "end_date": _END,
+        "data_mode": "point_in_time", "pit_bundle_sha256": bundle_sha256,
+        "technical_only": False, "max_positions": None,
+        "require_bullish_market": False, "use_stateful_regime_gate": False,
         "signal_every_n_days": 1,
         "entry_contract_min_current_growth": MIN_CURRENT_GROWTH,
         "entry_contract_min_annual_growth": MIN_ANNUAL_GROWTH,
@@ -419,38 +399,31 @@ def _validate_portfolio(
     entry_eligible = _strict_boolean_series(signals, "entry_contract_eligible")
     technical_eligible = _strict_boolean_series(signals, "technical_setup_eligible")
     if not buy_signal.equals(entry_eligible):
-        raise ValueError("fixed no-market-gate baseline buy signals disagree with entry eligibility")
+        raise ValueError(
+            "fixed no-market-gate baseline buy signals disagree with entry eligibility"
+        )
     if bool((entry_eligible & ~technical_eligible).any()):
         raise ValueError("qualified CANSLIM signal lacks a technical setup")
-    qualifying_pivots = pd.to_numeric(signals.loc[entry_eligible, "pivot"], errors="coerce")
-    if any(not math.isfinite(float(value)) or float(value) <= 0 for value in qualifying_pivots):
+    qualifying_pivots = pd.to_numeric(
+        signals.loc[entry_eligible, "pivot"], errors="coerce"
+    )
+    if any(
+        not math.isfinite(float(value)) or float(value) <= 0
+        for value in qualifying_pivots
+    ):
         raise ValueError("qualified CANSLIM signal lacks a finite positive pivot")
     required_diagnostics = {
-        "signal_days",
-        "entries_allowed_days",
-        "blocked_by_regime_days",
-        "blocked_by_market_days",
-        "cash_deployment_override_days",
-        "buy_signal_rows",
-        "potential_buy_signal_rows",
-        "potential_buy_signal_rows_blocked_by_market",
-        "buy_signal_rows_when_entries_allowed",
-        "buy_signal_rows_blocked_by_regime",
-        "buy_signal_rows_blocked_by_market",
-        "buy_signal_rows_blocked_by_both",
-        "buy_signal_rows_when_cash_override",
-        "capacity_truncated_signals",
-        "entry_attempts",
-        "entries_executed",
-        "entry_rejected_already_open",
-        "entry_rejected_capacity",
-        "entry_rejected_missing_data",
-        "entry_rejected_invalid_price",
-        "entry_rejected_next_open_buy_zone",
+        "signal_days", "entries_allowed_days", "blocked_by_regime_days",
+        "blocked_by_market_days", "cash_deployment_override_days", "buy_signal_rows",
+        "potential_buy_signal_rows", "potential_buy_signal_rows_blocked_by_market",
+        "buy_signal_rows_when_entries_allowed", "buy_signal_rows_blocked_by_regime",
+        "buy_signal_rows_blocked_by_market", "buy_signal_rows_blocked_by_both",
+        "buy_signal_rows_when_cash_override", "capacity_truncated_signals",
+        "entry_attempts", "entries_executed", "entry_rejected_already_open",
+        "entry_rejected_capacity", "entry_rejected_missing_data",
+        "entry_rejected_invalid_price", "entry_rejected_next_open_buy_zone",
         "entry_rejected_invalid_risk",
-        "entry_rejected_no_cash",
-        "eviction_attempts",
-        "evictions_executed",
+        "entry_rejected_no_cash", "eviction_attempts", "evictions_executed",
         "eviction_rejections",
     }
     if not required_diagnostics.issubset(result.execution_diagnostics):
@@ -484,7 +457,10 @@ def _validate_portfolio(
     )
     if _nonnegative_diagnostic(result, "buy_signal_rows") != qualified_count:
         raise ValueError("qualified count disagrees with buy-signal diagnostics")
-    if _nonnegative_diagnostic(result, "buy_signal_rows_when_entries_allowed") != qualified_count:
+    if (
+        _nonnegative_diagnostic(result, "buy_signal_rows_when_entries_allowed")
+        != qualified_count
+    ):
         raise ValueError("fixed baseline did not admit every qualifying signal")
     if any(
         _nonnegative_diagnostic(result, field) != 0
@@ -500,7 +476,9 @@ def _validate_portfolio(
     final_pending = qualified_count - attempted_count
     if final_pending < 0:
         raise ValueError("attempted and truncated entries exceed qualifying signals")
-    last_session_qualified = int(entry_eligible.loc[signals["signal_date"] == sessions[-1]].sum())
+    last_session_qualified = int(
+        entry_eligible.loc[signals["signal_date"] == sessions[-1]].sum()
+    )
     if final_pending > last_session_qualified:
         raise ValueError("final pending entries exceed final-session qualifications")
     qualifying_keys = set(
@@ -510,12 +488,17 @@ def _validate_portfolio(
             strict=True,
         )
     )
-    expected_outcome_keys = {key for key in qualifying_keys if key[1] != sessions[-1]}
+    expected_outcome_keys = {
+        key for key in qualifying_keys if key[1] != sessions[-1]
+    }
     actual_outcome_keys = {
-        (outcome.symbol, pd.Timestamp(outcome.signal_date).normalize()) for outcome in result.entry_outcomes
+        (outcome.symbol, pd.Timestamp(outcome.signal_date).normalize())
+        for outcome in result.entry_outcomes
     }
     if actual_outcome_keys != expected_outcome_keys:
-        raise ValueError("entry outcomes do not exactly cover every non-final qualifying signal")
+        raise ValueError(
+            "entry outcomes do not exactly cover every non-final qualifying signal"
+        )
 
 
 def _validate_basket(
@@ -532,7 +515,9 @@ def _validate_basket(
         raise ValueError("leader-basket holdings are empty")
     if not required.issubset(result.holdings):
         raise ValueError("leader-basket holdings lack required fields")
-    holding_dates = pd.DatetimeIndex(pd.to_datetime(result.holdings["date"], errors="raise")).normalize()
+    holding_dates = pd.DatetimeIndex(
+        pd.to_datetime(result.holdings["date"], errors="raise")
+    ).normalize()
     if not holding_dates.equals(sessions):
         raise ValueError("leader-basket holdings do not exactly cover benchmark sessions")
     cash = pd.to_numeric(result.holdings["cash"], errors="raise")
@@ -543,7 +528,9 @@ def _validate_basket(
         raise ValueError("leader-basket holdings contain invalid cash/equity")
     if not isinstance(result.transactions, pd.DataFrame) or result.transactions.empty:
         raise ValueError("leader-basket transactions are empty")
-    if not {"Date", "Ticker", "Action", "Price", "Quantity", "Reason"}.issubset(result.transactions):
+    if not {"Date", "Ticker", "Action", "Price", "Quantity", "Reason"}.issubset(
+        result.transactions
+    ):
         raise ValueError("leader-basket transactions lack required fields")
     if not isinstance(result.config, dict):
         raise ValueError("leader-basket result config is missing")
@@ -554,36 +541,26 @@ def _validate_basket(
 
 def _equity_frame(result: SimulationResult) -> pd.DataFrame:
     benchmark = result.benchmark_curve.reindex(result.equity_curve.index)
-    return pd.DataFrame(
-        {
-            "date": pd.to_datetime(result.equity_curve.index).date,
-            "portfolio": result.equity_curve.astype(float).values,
-            "benchmark": benchmark.astype(float).values,
-        }
-    )
+    return pd.DataFrame({
+        "date": pd.to_datetime(result.equity_curve.index).date,
+        "portfolio": result.equity_curve.astype(float).values,
+        "benchmark": benchmark.astype(float).values,
+    })
 
 
 def _basket_equity_frame(result: LeaderBasketResult) -> pd.DataFrame:
     benchmark = result.benchmark_curve.reindex(result.equity_curve.index)
-    return pd.DataFrame(
-        {
-            "date": pd.to_datetime(result.equity_curve.index).date,
-            "leader_basket": result.equity_curve.astype(float).values,
-            "benchmark": benchmark.astype(float).values,
-        }
-    )
+    return pd.DataFrame({
+        "date": pd.to_datetime(result.equity_curve.index).date,
+        "leader_basket": result.equity_curve.astype(float).values,
+        "benchmark": benchmark.astype(float).values,
+    })
 
 
 def _entry_outcomes_frame(result: SimulationResult) -> pd.DataFrame:
     columns = (
-        "symbol",
-        "signal_date",
-        "entry_date",
-        "pivot",
-        "buy_zone_lower",
-        "buy_zone_upper",
-        "entry_open",
-        "outcome",
+        "symbol", "signal_date", "entry_date", "pivot", "buy_zone_lower",
+        "buy_zone_upper", "entry_open", "outcome",
     )
     return pd.DataFrame(
         [outcome.to_primitive() for outcome in result.entry_outcomes],
@@ -612,16 +589,25 @@ def _daily_entry_funnel_frame(
     if not outcomes.empty:
         normalized_symbols: list[str] = []
         for value in outcomes["symbol"]:
-            if not isinstance(value, str) or not value or value != value.strip() or value != value.upper():
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or value != value.upper()
+            ):
                 raise ValueError("entry outcome symbol is not nonblank uppercase text")
             normalized_symbols.append(value)
         outcomes["symbol"] = normalized_symbols
-        outcomes["signal_date"] = pd.to_datetime(outcomes["signal_date"], errors="raise").dt.normalize()
+        outcomes["signal_date"] = pd.to_datetime(
+            outcomes["signal_date"], errors="raise"
+        ).dt.normalize()
         if not set(outcomes["signal_date"]).issubset(set(sessions)):
             raise ValueError("entry outcome signal date is off the benchmark calendar")
         if outcomes.duplicated(["symbol", "signal_date"]).any():
             raise ValueError("entry outcomes are not unique by symbol/session")
-        outcome_keys = set(zip(outcomes["symbol"], outcomes["signal_date"], strict=True))
+        outcome_keys = set(
+            zip(outcomes["symbol"], outcomes["signal_date"], strict=True)
+        )
         if not outcome_keys.issubset(qualified_keys):
             raise ValueError("daily funnel contains an attempt for an unqualified signal")
         valid_outcomes = {
@@ -640,23 +626,25 @@ def _daily_entry_funnel_frame(
     for session in sessions:
         day_signals = signals.loc[signals["signal_date"] == session]
         day_eligible = entry_eligible.loc[day_signals.index]
-        day_outcomes = outcomes.loc[outcomes["signal_date"] == session] if not outcomes.empty else outcomes
+        day_outcomes = (
+            outcomes.loc[outcomes["signal_date"] == session]
+            if not outcomes.empty
+            else outcomes
+        )
         executed = int((day_outcomes["outcome"] == "entries_executed").sum())
         attempted = int(len(day_outcomes))
         qualified = int(day_eligible.sum())
         rejected = attempted - executed
         if executed > attempted or rejected > attempted or attempted > qualified:
             raise ValueError("daily entry funnel violates qualification/attempt bounds")
-        rows.append(
-            {
-                "signal_date": str(session.date()),
-                "evaluated_count": int(len(day_signals)),
-                "qualified_count": qualified,
-                "attempted_count": attempted,
-                "executed_count": executed,
-                "rejected_count": rejected,
-            }
-        )
+        rows.append({
+            "signal_date": str(session.date()),
+            "evaluated_count": int(len(day_signals)),
+            "qualified_count": qualified,
+            "attempted_count": attempted,
+            "executed_count": executed,
+            "rejected_count": rejected,
+        })
     funnel = pd.DataFrame(rows)
     if int(funnel["evaluated_count"].sum()) != len(signals):
         raise ValueError("daily funnel evaluated total disagrees with signal log")
@@ -664,15 +652,21 @@ def _daily_entry_funnel_frame(
     attempted_total = int(funnel["attempted_count"].sum())
     if attempted_total != _nonnegative_diagnostic(result, "entry_attempts"):
         raise ValueError("daily funnel attempted total disagrees with diagnostics")
-    if int(funnel["executed_count"].sum()) != _nonnegative_diagnostic(result, "entries_executed"):
+    if int(funnel["executed_count"].sum()) != _nonnegative_diagnostic(
+        result, "entries_executed"
+    ):
         raise ValueError("daily funnel executed total disagrees with diagnostics")
     capacity_truncated = _nonnegative_diagnostic(result, "capacity_truncated_signals")
     capacity_rejected = _nonnegative_diagnostic(result, "entry_rejected_capacity")
     if capacity_truncated != 0 or capacity_rejected != 0:
         raise ValueError("daily funnel contains an impossible uncapped capacity limit")
-    expected_outcome_keys = {key for key in qualified_keys if key[1] != sessions[-1]}
+    expected_outcome_keys = {
+        key for key in qualified_keys if key[1] != sessions[-1]
+    }
     if outcome_keys != expected_outcome_keys:
-        raise ValueError("daily funnel attempts do not cover every non-final qualification")
+        raise ValueError(
+            "daily funnel attempts do not cover every non-final qualification"
+        )
     final_pending = qualified_total - attempted_total
     if final_pending < 0:
         raise ValueError("daily funnel attempts/truncation exceed qualifications")
@@ -723,7 +717,9 @@ def _validate_holding_identities(
             quantities[successor] = float(row.Quantity)
         for symbol, quantity in list(quantities.items()):
             if quantity > 1e-8 and contract.resolve_open_holding(symbol, current_day) != symbol:
-                raise ValueError(f"open holding requires an unimplemented identity transfer: {symbol}")
+                raise ValueError(
+                    f"open holding requires an unimplemented identity transfer: {symbol}"
+                )
         for row in day_rows.itertuples(index=False):
             if row.Action == "TRANSFER":
                 continue
@@ -747,7 +743,9 @@ def _validate_holding_identities(
 def _metrics(result: SimulationResult) -> dict[str, object]:
     return {
         "total_return_pct": _finite(result.total_return_pct, field="CANSLIM total return"),
-        "annualized_return_pct": _finite(result.annualized_return_pct, field="CANSLIM annualized return"),
+        "annualized_return_pct": _finite(
+            result.annualized_return_pct, field="CANSLIM annualized return"
+        ),
         "max_drawdown_pct": _finite(result.max_drawdown_pct, field="CANSLIM drawdown"),
         "sharpe_ratio": _finite(result.sharpe_ratio, field="CANSLIM Sharpe"),
         "win_rate_pct": _finite(result.win_rate, field="CANSLIM win rate"),
@@ -779,7 +777,9 @@ def _basket_metrics(result: LeaderBasketResult) -> dict[str, object]:
             costs[ticker] -= sold * average_cost
     return {
         "total_return_pct": _finite(result.total_return_pct, field="basket total return"),
-        "annualized_return_pct": _finite(result.annualized_return_pct, field="basket annualized return"),
+        "annualized_return_pct": _finite(
+            result.annualized_return_pct, field="basket annualized return"
+        ),
         "max_drawdown_pct": _finite(result.max_drawdown_pct, field="basket drawdown"),
         "sharpe_ratio": _finite(result.sharpe_ratio, field="basket Sharpe"),
         "win_rate_pct": wins / closed * 100.0 if closed else 0.0,
@@ -793,13 +793,12 @@ def _alias_map(contract: LeaderIdentityContract) -> dict[str, tuple[str, ...]]:
     result: dict[str, tuple[str, ...]] = {}
     for ticker, identity in contract.identities.items():
         if identity.continuity_kind in _SAME_ISSUER_KINDS:
-            result[ticker] = tuple(
-                sorted(
-                    candidate_ticker
-                    for candidate_ticker, candidate in contract.identities.items()
-                    if candidate.chain_id == identity.chain_id and candidate.continuity_kind in _SAME_ISSUER_KINDS
-                )
-            )
+            result[ticker] = tuple(sorted(
+                candidate_ticker
+                for candidate_ticker, candidate in contract.identities.items()
+                if candidate.chain_id == identity.chain_id
+                and candidate.continuity_kind in _SAME_ISSUER_KINDS
+            ))
         else:
             result[ticker] = (ticker,)
     return result
@@ -836,11 +835,12 @@ def _load_task2_audit(
     if provenance.get("public_date_rule") != _PUBLIC_DATE_RULE:
         raise ValueError("Task 2 public-date rule does not match the baseline")
     for field in (
-        "submissions_archive_sha256",
-        "companyfacts_archive_sha256",
+        "submissions_archive_sha256", "companyfacts_archive_sha256",
         "identity_manifest_csv_sha256",
     ):
-        if bundle.metadata[f"fundamentals_{field}"] != _digest(provenance.get(field), field=field):
+        if bundle.metadata[f"fundamentals_{field}"] != _digest(
+            provenance.get(field), field=field
+        ):
             raise ValueError(f"Task 2 source digest does not match the bundle: {field}")
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     exclusions = pd.read_csv(exclusions_path, dtype=str, keep_default_na=False)
@@ -852,7 +852,9 @@ def _load_task2_audit(
         raise ValueError("security master has blank required fields")
     if exclusions[["ticker", "reason"]].eq("").any().any():
         raise ValueError("security-master exclusion has a blank closed reason")
-    if master.duplicated(["ticker", "cik", "first_membership_date", "last_membership_date"]).any():
+    if master.duplicated(
+        ["ticker", "cik", "first_membership_date", "last_membership_date"]
+    ).any():
         raise ValueError("security master has duplicate interval identities")
     resolved = set(master["ticker"])
     excluded = set(exclusions["ticker"])
@@ -872,14 +874,12 @@ def _load_task2_audit(
     resolved_pct = len(resolved) / len(union) * 100.0
     if not math.isclose(
         float(source_coverage.get("resolved_or_closed_exclusion_percentage", -1)),
-        accounted_pct,
-        abs_tol=1e-7,
+        accounted_pct, abs_tol=1e-7,
     ):
         raise ValueError("Task 2 accounted CIK coverage is inconsistent")
     if not math.isclose(
         float(source_coverage.get("resolved_cik_percentage", -1)),
-        resolved_pct,
-        abs_tol=1e-7,
+        resolved_pct, abs_tol=1e-7,
     ):
         raise ValueError("Task 2 resolved CIK coverage is inconsistent")
     audit = {
@@ -891,9 +891,13 @@ def _load_task2_audit(
         "security_master": master.to_dict(orient="records"),
         "exclusions": exclusions.to_dict(orient="records"),
         "filed_date_fallback_count": int(source_coverage.get("filed_date_fallback_count", 0)),
-        "filed_date_fallback_unique_count": int(source_coverage.get("filed_date_fallback_unique_count", 0)),
+        "filed_date_fallback_unique_count": int(
+            source_coverage.get("filed_date_fallback_unique_count", 0)
+        ),
         "task2_coverage": source_coverage,
-        "task2_artifact_sha256": {field: sha256_file(path) for field, path in bindings.items()},
+        "task2_artifact_sha256": {
+            field: sha256_file(path) for field, path in bindings.items()
+        },
     }
     return provenance, audit
 
@@ -916,7 +920,9 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
     for row in frame.itertuples(index=False):
         facts = bundle.fundamentals_as_of(row.symbol, pd.Timestamp(row.signal_date))
         _c_score, bundle_current = evaluate_c(facts["quarterly_income"])
-        _a_score, bundle_annual, _roe = evaluate_a(facts["annual_income"], balance_sheet=facts["balance_sheet"])
+        _a_score, bundle_annual, _roe = evaluate_a(
+            facts["annual_income"], balance_sheet=facts["balance_sheet"]
+        )
         # The unchanged evaluators use NaN for an unavailable growth history.
         # Treat that sentinel as missing coverage; non-finite values emitted by
         # the signal log itself remain a hard error below.
@@ -941,9 +947,13 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
             raise ValueError("signal-log current growth disagrees with hash-bound PIT fundamentals")
         if annual_ok != (logged_annual is not None):
             raise ValueError("signal-log annual growth disagrees with hash-bound PIT fundamentals")
-        if current_ok and not math.isclose(float(bundle_current), logged_current, rel_tol=1e-12, abs_tol=1e-12):
+        if current_ok and not math.isclose(
+            float(bundle_current), logged_current, rel_tol=1e-12, abs_tol=1e-12
+        ):
             raise ValueError("signal-log current growth value differs from the PIT evaluator")
-        if annual_ok and not math.isclose(float(bundle_annual), logged_annual, rel_tol=1e-12, abs_tol=1e-12):
+        if annual_ok and not math.isclose(
+            float(bundle_annual), logged_annual, rel_tol=1e-12, abs_tol=1e-12
+        ):
             raise ValueError("signal-log annual growth value differs from the PIT evaluator")
         bundle_current_count += int(current_ok)
         bundle_annual_count += int(annual_ok)
@@ -977,8 +987,7 @@ def _coverage(
     gates = {
         "membership_495_through_510": {
             "passed": min(counts) >= 495 and max(counts) <= 510,
-            "minimum": min(counts),
-            "maximum": max(counts),
+            "minimum": min(counts), "maximum": max(counts),
         },
         "spy_complete_2020_through_2025": {
             "passed": (
@@ -991,9 +1000,7 @@ def _coverage(
             "last_date": prices.get("spy_last_date"),
         },
         "member_price_coverage_at_least_98_pct": {
-            "passed": price_pct >= 98.0,
-            "value_pct": price_pct,
-            "threshold_pct": 98.0,
+            "passed": price_pct >= 98.0, "value_pct": price_pct, "threshold_pct": 98.0,
         },
         "cik_resolved_or_closed_exclusion_at_least_95_pct": {
             "passed": task2["resolved_or_closed_exclusion_percentage"] >= 95.0,
@@ -1009,9 +1016,7 @@ def _coverage(
     return {
         "schema_version": 1,
         "date_contract": {
-            "warmup_start": _WARMUP,
-            "evaluation_start": _START,
-            "data_cutoff": _END,
+            "warmup_start": _WARMUP, "evaluation_start": _START, "data_cutoff": _END,
         },
         "membership": {
             "event_count": len(bundle.membership.events),
@@ -1043,12 +1048,12 @@ def _source_summary(sources: Mapping[str, Any]) -> dict[str, Any]:
     prices = sources["prices"]
     fundamentals = sources["fundamentals"]
     return {
-        "membership": {key: membership.get(key) for key in ("source_url", "revision_id", "retrieved_at_utc")},
+        "membership": {
+            key: membership.get(key) for key in ("source_url", "revision_id", "retrieved_at_utc")
+        },
         "prices": {
-            key: prices.get(key)
-            for key in (
-                "source_kind",
-                "alpaca_retrieved_at_utc",
+            key: prices.get(key) for key in (
+                "source_kind", "alpaca_retrieved_at_utc",
                 "alpaca_raw_calibration_retrieved_at_utc",
             )
         },
@@ -1080,18 +1085,13 @@ def _report(
         "Aggregate failed gates": gate_totals,
     }
     lines = [
-        "# Five-year PIT CANSLIM baseline",
-        "",
-        "Five-year leader labels are ex-post diagnostics only.",
-        "",
-        "## Performance",
-        "",
+        "# Five-year PIT CANSLIM baseline", "",
+        "Five-year leader labels are ex-post diagnostics only.", "",
+        "## Performance", "",
         f"- CANSLIM return: {summary['canslim']['total_return_pct']:.2f}%",
         f"- Leader basket return: {summary['leader_basket']['total_return_pct']:.2f}%",
-        f"- SPY return: {summary['spy']['total_return_pct']:.2f}%",
-        "",
-        "## Recall",
-        "",
+        f"- SPY return: {summary['spy']['total_return_pct']:.2f}%", "",
+        "## Recall", "",
         (
             "- Five-year raw/all: "
             f"{summary['leader_recall']['five_year']['raw_all']['signaled_count']}"
@@ -1126,35 +1126,28 @@ def _report(
             f"/{summary['leader_recall']['rolling']['pit_exposed_member_at_evaluation']['denominator_count']} "
             f"({summary['leader_recall']['rolling']['pit_exposed_member_at_evaluation']['signal_recall_pct']:.2f}%)."
         ),
-        "- Deprecated raw-count aliases: `top100_signaled`, `top100_executed`.",
-        "",
-        "## Canonical entry outcomes",
-        "",
+        "- Deprecated raw-count aliases: `top100_signaled`, `top100_executed`.", "",
+        "## Canonical entry outcomes", "",
         f"- Daily evaluated symbol-days: {summary['entry_contract']['evaluated_symbol_days']}",
         f"- Contract-qualified signals: {summary['entry_contract']['qualified_signals']}",
         f"- Next-open executions: {summary['entry_contract']['executed_attempts']}",
         f"- Entry rejections: {summary['entry_contract']['rejected_attempts']}",
-        "- Immutable attempt ledger: `entry_attempt_outcomes.csv`",
-        "",
+        "- Immutable attempt ledger: `entry_attempt_outcomes.csv`", "",
     ]
     for title, value in blocks.items():
         lines.extend([f"## {title}", "", f"```json\n{json.dumps(value, sort_keys=True)}\n```", ""])
     lines.extend(["## Largest missed leaders", ""])
     lines.append(
-        "```text\n" + missed[["ticker", "rank", "total_return_pct"]].to_string(index=False) + "\n```"
-        if not missed.empty
-        else "None."
+        "```text\n" + missed[["ticker", "rank", "total_return_pct"]].to_string(index=False)
+        + "\n```" if not missed.empty else "None."
     )
     return "\n".join(lines) + "\n"
 
 
 def _fixed_args(args: argparse.Namespace) -> None:
     expected = {
-        "start_date": _START,
-        "end_date": _END,
-        "benchmark": _BENCHMARK,
-        "leader_count": _LEADERS,
-        "rebalance_days": _REBALANCE,
+        "start_date": _START, "end_date": _END, "benchmark": _BENCHMARK,
+        "leader_count": _LEADERS, "rebalance_days": _REBALANCE,
     }
     for field, value in expected.items():
         if getattr(args, field) != value:
@@ -1179,16 +1172,17 @@ def _run_portfolio(
         "benchmark_symbol": _BENCHMARK,
     }
     parameters = inspect.signature(simulator.run).parameters
-    accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
     if accepts_kwargs or "checkpoint_path" in parameters:
-        kwargs.update(
-            {
-                "checkpoint_path": checkpoint_path,
-                "progress_log_path": progress_log_path,
-                "resume": resume,
-                "checkpoint_every_days": checkpoint_every_days,
-            }
-        )
+        kwargs.update({
+            "checkpoint_path": checkpoint_path,
+            "progress_log_path": progress_log_path,
+            "resume": resume,
+            "checkpoint_every_days": checkpoint_every_days,
+        })
         if accepts_kwargs or "checkpoint_code_identity" in parameters:
             kwargs["checkpoint_code_identity"] = code_identity
     return simulator.run(tickers, **kwargs)
@@ -1233,7 +1227,10 @@ def run_baseline(
     else:
         output_root = output_root.resolve()
         output_root.mkdir(parents=True, exist_ok=True)
-        run_dir = output_root / (datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ-") + expected_bundle_sha[:12])
+        run_dir = output_root / (
+            datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ-")
+            + expected_bundle_sha[:12]
+        )
         run_dir.mkdir()
         portfolio_checkpoint = run_dir / "portfolio_checkpoint.json"
         portfolio_progress = run_dir / "portfolio_progress.jsonl"
@@ -1274,20 +1271,12 @@ def run_baseline(
                 raise ValueError("SPY close calendar is incomplete in the evaluation window")
             sessions = pd.DatetimeIndex(closes[_BENCHMARK].dropna().index).normalize()
             leaders = label_five_year_leaders(
-                closes,
-                bundle.membership,
-                start_date=_START,
-                end_date=_END,
-                identity_contract=identities,
-                top_n=_LEADERS,
+                closes, bundle.membership, start_date=_START, end_date=_END,
+                identity_contract=identities, top_n=_LEADERS,
             )
             rolling = label_rolling_leaders(
-                closes,
-                bundle.membership,
-                start_date=_START,
-                end_date=_END,
-                identity_contract=identities,
-                top_n=_LEADERS,
+                closes, bundle.membership, start_date=_START, end_date=_END,
+                identity_contract=identities, top_n=_LEADERS,
             )
             if len(leaders) != 100 or len(rolling) != 4_800:
                 raise ValueError("fixed baseline leader labels are incomplete")
@@ -1304,31 +1293,23 @@ def run_baseline(
                 code_identity=git_head,
             )
             basket_config = LeaderBasketConfig(
-                leader_count=100,
-                rebalance_days=20,
-                lookback_days=252,
-                min_history_days=60,
-                initial_capital=100_000.0,
+                leader_count=100, rebalance_days=20, lookback_days=252,
+                min_history_days=60, initial_capital=100_000.0,
             )
             basket = basket_factory(bundle, basket_config)
             if hasattr(basket, "identity_transition_contract"):
                 basket.identity_transition_contract = transitions
             basket = basket.run(
-                start_date=_START,
-                end_date=_END,
-                benchmark_symbol=_BENCHMARK,
-                tickers=tickers,
+                start_date=_START, end_date=_END, benchmark_symbol=_BENCHMARK, tickers=tickers,
             )
             _validate_portfolio(result, sessions, bundle.sha256)
             _validate_basket(
-                basket,
-                sessions,
-                {**asdict(basket_config), "benchmark_symbol": _BENCHMARK, "pit_bundle_sha256": bundle.sha256},
+                basket, sessions,
+                {**asdict(basket_config), "benchmark_symbol": _BENCHMARK,
+                 "pit_bundle_sha256": bundle.sha256},
             )
             reconciliation = reconcile_signals_to_transactions(
-                result.signal_log,
-                result.transaction_log,
-                result.execution_diagnostics,
+                result.signal_log, result.transaction_log, result.execution_diagnostics,
                 entry_outcomes=result.entry_outcomes,
                 trading_days=sessions,
             )
@@ -1336,13 +1317,15 @@ def run_baseline(
                 raise ValueError("uncapped fixed baseline reported a capacity block")
             if reconciliation["unattributed_cash_capacity_count"] != 0:
                 raise ValueError("cash/capacity diagnostics cannot be assigned to exact symbols")
-            _validate_holding_identities(result.transaction_log, transitions, end_date=date.fromisoformat(_END))
-            _validate_holding_identities(basket.transactions, transitions, end_date=date.fromisoformat(_END))
+            _validate_holding_identities(
+                result.transaction_log, transitions, end_date=date.fromisoformat(_END)
+            )
+            _validate_holding_identities(
+                basket.transactions, transitions, end_date=date.fromisoformat(_END)
+            )
             aliases = _alias_map(identities)
             recall = build_leader_recall_frame(
-                leaders,
-                result.signal_log,
-                result.transaction_log,
+                leaders, result.signal_log, result.transaction_log,
                 start_date=date.fromisoformat(_START),
                 min_c_a_growth=DEFAULT_MIN_C_A_GROWTH,
                 min_rs_score=float(result.config["min_rs_score"]),
@@ -1352,10 +1335,7 @@ def run_baseline(
                 leader_aliases=aliases,
             )
             coverage = _coverage(
-                bundle=bundle,
-                closes=closes,
-                prices=sources["prices"],
-                task2=task2,
+                bundle=bundle, closes=closes, prices=sources["prices"], task2=task2,
                 signal_log=result.signal_log,
             )
             if not coverage["all_gates_passed"]:
@@ -1363,7 +1343,8 @@ def run_baseline(
                 fundamentals_gate = "evaluated_pit_quarterly_and_annual_at_least_90_pct"
                 non_blocking = (
                     [fundamentals_gate]
-                    if getattr(args, "allow_incomplete_fundamentals", False) and failed == [fundamentals_gate]
+                    if getattr(args, "allow_incomplete_fundamentals", False)
+                    and failed == [fundamentals_gate]
                     else []
                 )
                 coverage["non_blocking_failed_gates"] = non_blocking
@@ -1375,7 +1356,9 @@ def run_baseline(
                 coverage["non_blocking_failed_gates"] = []
                 coverage["baseline_publishable"] = True
             five_year_recall = five_year_leader_recall_summary(recall)
-            rolling_recall = rolling_label_recall_summary(rolling, result.signal_log, label_aliases=aliases)
+            rolling_recall = rolling_label_recall_summary(
+                rolling, result.signal_log, label_aliases=aliases
+            )
             top_signaled = int(five_year_recall["raw_all"]["signaled_count"])
             top_executed = int(five_year_recall["raw_all"]["executed_count"])
             daily_entry_funnel = _daily_entry_funnel_frame(result, sessions)
@@ -1383,23 +1366,35 @@ def run_baseline(
             summary = {
                 "canslim": _metrics(result),
                 "leader_basket": _basket_metrics(basket),
-                "spy": {"total_return_pct": _finite(result.benchmark_return_pct, field="SPY total return")},
+                "spy": {"total_return_pct": _finite(
+                    result.benchmark_return_pct, field="SPY total return"
+                )},
                 "leader_recall": {
                     "five_year": five_year_recall,
                     "rolling": rolling_recall,
                     "top100_signaled": top_signaled,
                     "top100_executed": top_executed,
-                    "signal_recall_pct": five_year_recall["raw_all"]["signal_recall_pct"],
-                    "execution_recall_pct": five_year_recall["raw_all"]["execution_recall_pct"],
-                    "rolling_label_recall_pct": rolling_recall["raw_all"]["signal_recall_pct"],
+                    "signal_recall_pct": five_year_recall["raw_all"][
+                        "signal_recall_pct"
+                    ],
+                    "execution_recall_pct": five_year_recall["raw_all"][
+                        "execution_recall_pct"
+                    ],
+                    "rolling_label_recall_pct": rolling_recall["raw_all"][
+                        "signal_recall_pct"
+                    ],
                     "deprecated_raw_count_aliases": {
                         "top100_signaled": "five_year.raw_all.signaled_count",
                         "top100_executed": "five_year.raw_all.executed_count",
                     },
                     "compatibility_aliases": {
                         "signal_recall_pct": "five_year.raw_all.signal_recall_pct",
-                        "execution_recall_pct": ("five_year.raw_all.execution_recall_pct"),
-                        "rolling_label_recall_pct": ("rolling.raw_all.signal_recall_pct"),
+                        "execution_recall_pct": (
+                            "five_year.raw_all.execution_recall_pct"
+                        ),
+                        "rolling_label_recall_pct": (
+                            "rolling.raw_all.signal_recall_pct"
+                        ),
                     },
                 },
                 "coverage": {
@@ -1419,7 +1414,9 @@ def run_baseline(
                     "attempted_signals": int(daily_entry_funnel["attempted_count"].sum()),
                     "executed_attempts": int(daily_entry_funnel["executed_count"].sum()),
                     "rejected_attempts": int(daily_entry_funnel["rejected_count"].sum()),
-                    "next_open_buy_zone_rejections": reconciliation["next_open_buy_zone_rejected_count"],
+                    "next_open_buy_zone_rejections": reconciliation[
+                        "next_open_buy_zone_rejected_count"
+                    ],
                     "rejection_counts": reconciliation["rejection_counts"],
                 },
             }
@@ -1446,12 +1443,8 @@ def run_baseline(
             _write_bytes(
                 run_dir / "report.md",
                 _report(
-                    summary,
-                    coverage,
-                    recall,
-                    sources=sources,
-                    config=active_config,
-                    diagnostics=diagnostics,
+                    summary, coverage, recall, sources=sources,
+                    config=active_config, diagnostics=diagnostics,
                 ).encode(),
             )
             _recheck_inputs(paths, input_hashes)
@@ -1468,25 +1461,25 @@ def run_baseline(
             if resume and not _RESUME_JOURNAL_FILENAMES.issubset(artifact_hashes):
                 raise ValueError("resumed baseline is missing an execution journal before manifest")
             manifest = {
-                "schema_version": 1,
-                "status": "complete",
+                "schema_version": 1, "status": "complete",
                 "created_at_utc": datetime.now(timezone.utc).isoformat(),
                 "git_head": git_head,
                 "date_contract": {
-                    "warmup_start": _WARMUP,
-                    "evaluation_start": _START,
-                    "data_cutoff": _END,
+                    "warmup_start": _WARMUP, "evaluation_start": _START, "data_cutoff": _END,
                 },
                 "bundle_sha256": bundle.sha256,
                 "bundle_metadata": bundle.metadata,
                 "input_sha256": input_hashes,
                 "source_provenance": sources,
                 "arguments": {
-                    key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+                    key: str(value) if isinstance(value, Path) else value
+                    for key, value in vars(args).items()
                 },
                 "canslim_config": active_config,
                 "execution_diagnostics": diagnostics,
-                "entry_attempt_outcome_schema_version": (ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION),
+                "entry_attempt_outcome_schema_version": (
+                    ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION
+                ),
                 "entry_attempt_outcome_count": len(result.entry_outcomes),
                 "execution_reconciliation": reconciliation,
                 "coverage_status": {
@@ -1501,13 +1494,10 @@ def run_baseline(
             _write_bytes(run_dir / "run_manifest.json", _json_bytes(manifest))
     except Exception as exc:
         failure = {
-            "schema_version": 1,
-            "status": "failed",
+            "schema_version": 1, "status": "failed",
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "git_head": git_head,
-            "input_sha256": input_hashes,
-            "error_type": type(exc).__name__,
-            "message": str(exc),
+            "git_head": git_head, "input_sha256": input_hashes,
+            "error_type": type(exc).__name__, "message": str(exc),
         }
         if not (run_dir / "run_failed.json").exists():
             _write_bytes(run_dir / "run_failed.json", _json_bytes(failure))

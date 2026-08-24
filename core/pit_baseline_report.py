@@ -72,7 +72,9 @@ def five_year_leaders_frame(leaders: Sequence[FiveYearLeader]) -> pd.DataFrame:
                 "rank": leader.rank,
                 "member_at_start": leader.member_at_start,
                 "first_membership_date": (
-                    leader.first_membership_date.isoformat() if leader.first_membership_date is not None else ""
+                    leader.first_membership_date.isoformat()
+                    if leader.first_membership_date is not None
+                    else ""
                 ),
             }
         )
@@ -140,15 +142,8 @@ def build_leader_recall_frame(
     signals = signal_log.copy()
     if not signals.empty:
         required = {
-            "symbol",
-            "signal_date",
-            "buy_signal",
-            "current_growth",
-            "annual_growth",
-            "rs_score",
-            "has_breakout",
-            "has_volume_surge",
-            "in_buy_zone",
+            "symbol", "signal_date", "buy_signal", "current_growth", "annual_growth",
+            "rs_score", "has_breakout", "has_volume_surge", "in_buy_zone",
             "entry_composite_score",
         }
         if not required.issubset(signals):
@@ -169,18 +164,17 @@ def build_leader_recall_frame(
         if not isinstance(leader, FiveYearLeader):
             raise ValueError("leaders contain the wrong model")
         ticker = leader.ticker
-        aliases = {str(value).upper() for value in (leader_aliases or {}).get(ticker, (ticker,))}
+        aliases = {
+            str(value).upper()
+            for value in (leader_aliases or {}).get(ticker, (ticker,))
+        }
         if ticker not in aliases:
             raise ValueError("leader alias map must include the reporting ticker")
         ticker_signals = _ticker_rows(signals, aliases, ticker_column="symbol")
         ticker_entries = _ticker_rows(transactions, aliases, ticker_column="Ticker")
         if not ticker_entries.empty:
             ticker_entries = ticker_entries.loc[ticker_entries["Action"].astype(str).str.upper() == "BUY"]
-        buy_rows = (
-            ticker_signals.loc[ticker_signals["buy_signal"].fillna(False).astype(bool)]
-            if not ticker_signals.empty
-            else ticker_signals
-        )
+        buy_rows = ticker_signals.loc[ticker_signals["buy_signal"].fillna(False).astype(bool)] if not ticker_signals.empty else ticker_signals
 
         def fail_numeric(column: str, threshold: float, rows: pd.DataFrame = ticker_signals) -> int:
             if column not in rows:
@@ -201,9 +195,7 @@ def build_leader_recall_frame(
                 "rank": leader.rank,
                 "total_return_pct": leader.total_return_pct,
                 "member_at_start": leader.member_at_start,
-                "first_membership_date": leader.first_membership_date.isoformat()
-                if leader.first_membership_date
-                else "",
+                "first_membership_date": leader.first_membership_date.isoformat() if leader.first_membership_date else "",
                 "first_eligible_date": first_eligible.isoformat(),
                 "first_buy_signal_date": buy_rows["signal_date"].min().date().isoformat() if not buy_rows.empty else "",
                 "first_entry_date": ticker_entries["Date"].min().date().isoformat() if not ticker_entries.empty else "",
@@ -217,15 +209,15 @@ def build_leader_recall_frame(
                 "breakout_fail_count": fail_bool("has_breakout"),
                 "volume_fail_count": fail_bool("has_volume_surge"),
                 "buy_zone_fail_count": fail_bool("in_buy_zone"),
-                "composite_fail_count": fail_numeric("entry_composite_score", MIN_COMPOSITE_SCORE),
+                "composite_fail_count": fail_numeric(
+                    "entry_composite_score", MIN_COMPOSITE_SCORE
+                ),
                 "missing_fundamentals_count": int(
                     (
                         pd.to_numeric(ticker_signals["current_growth"], errors="coerce").isna()
                         | pd.to_numeric(ticker_signals["annual_growth"], errors="coerce").isna()
                     ).sum()
-                )
-                if {"current_growth", "annual_growth"}.issubset(ticker_signals)
-                else 0,
+                ) if {"current_growth", "annual_growth"}.issubset(ticker_signals) else 0,
             }
         )
     return pd.DataFrame(rows, columns=LEADER_RECALL_COLUMNS).sort_values(
@@ -250,12 +242,16 @@ def _recall_population(
     result: dict[str, int | float] = {
         "denominator_count": denominator_count,
         "signaled_count": signaled_count,
-        "signal_recall_pct": (signaled_count / denominator_count * 100.0 if denominator_count else 0.0),
+        "signal_recall_pct": (
+            signaled_count / denominator_count * 100.0 if denominator_count else 0.0
+        ),
     }
     if include_execution:
         executed_count = int((pd.to_numeric(frame["entry_count"], errors="raise") > 0).sum())
         result["executed_count"] = executed_count
-        result["execution_recall_pct"] = executed_count / denominator_count * 100.0 if denominator_count else 0.0
+        result["execution_recall_pct"] = (
+            executed_count / denominator_count * 100.0 if denominator_count else 0.0
+        )
     return result
 
 
@@ -268,7 +264,9 @@ def five_year_leader_recall_summary(recall: pd.DataFrame) -> dict[str, dict[str,
     exposed = recall.loc[recall["member_at_start"].eq(True)]
     return {
         "raw_all": _recall_population(recall, include_execution=True),
-        "pit_exposed_member_at_start": _recall_population(exposed, include_execution=True),
+        "pit_exposed_member_at_start": _recall_population(
+            exposed, include_execution=True
+        ),
     }
 
 
@@ -323,20 +321,24 @@ def reconcile_signals_to_transactions(
     next_session = {current: following for current, following in zip(calendar, calendar[1:], strict=False)}
     signals = signal_log.copy()
     transactions = transaction_log.copy()
-    if not signals.empty and not {"symbol", "signal_date", "buy_signal", "pivot"}.issubset(signals):
+    if not signals.empty and not {
+        "symbol", "signal_date", "buy_signal", "pivot"
+    }.issubset(signals):
         raise ValueError("signal log lacks execution reconciliation fields")
-    if not transactions.empty and not {"Ticker", "Date", "Action", "Price"}.issubset(transactions):
+    if not transactions.empty and not {
+        "Ticker", "Date", "Action", "Price"
+    }.issubset(transactions):
         raise ValueError("transaction log lacks execution reconciliation fields")
-    buy_signals = (
-        signals.loc[signals.get("buy_signal", pd.Series(False, index=signals.index)).fillna(False).astype(bool)]
-        .copy()
-        .reset_index(drop=True)
-    )
+    buy_signals = signals.loc[
+        signals.get("buy_signal", pd.Series(False, index=signals.index)).fillna(False).astype(bool)
+    ].copy().reset_index(drop=True)
     entries = transactions.loc[
         transactions.get("Action", pd.Series("", index=transactions.index)).astype(str).str.upper() == "BUY"
     ].copy()
     if not buy_signals.empty:
-        buy_signals["signal_date"] = pd.to_datetime(buy_signals["signal_date"], errors="raise").dt.normalize()
+        buy_signals["signal_date"] = pd.to_datetime(
+            buy_signals["signal_date"], errors="raise"
+        ).dt.normalize()
         buy_signals["symbol"] = buy_signals["symbol"].map(
             lambda value: _normalized_symbol(value, field="qualifying signal")
         )
@@ -349,7 +351,9 @@ def reconcile_signals_to_transactions(
             raise ValueError("qualifying signal date is not a benchmark trading session")
     if not entries.empty:
         entries["Date"] = pd.to_datetime(entries["Date"], errors="raise").dt.normalize()
-        entries["Ticker"] = entries["Ticker"].map(lambda value: _normalized_symbol(value, field="entry transaction"))
+        entries["Ticker"] = entries["Ticker"].map(
+            lambda value: _normalized_symbol(value, field="entry transaction")
+        )
         entries["Price"] = entries["Price"].map(
             lambda value: _required_positive_number(value, field="BUY transaction Price")
         )
@@ -357,14 +361,8 @@ def reconcile_signals_to_transactions(
             raise ValueError("entry date is not a benchmark trading session")
 
     outcome_fields = (
-        "symbol",
-        "signal_date",
-        "entry_date",
-        "pivot",
-        "buy_zone_lower",
-        "buy_zone_upper",
-        "entry_open",
-        "outcome",
+        "symbol", "signal_date", "entry_date", "pivot", "buy_zone_lower",
+        "buy_zone_upper", "entry_open", "outcome",
     )
     outcome_records: list[dict[str, object]] = []
     for item in entry_outcomes:
@@ -387,11 +385,20 @@ def reconcile_signals_to_transactions(
         "entry_rejected_invalid_risk",
         "entry_rejected_no_cash",
     }
-    signal_pivots = {(row.symbol, row.signal_date): row.pivot for row in buy_signals.itertuples(index=False)}
+    signal_pivots = {
+        (row.symbol, row.signal_date): row.pivot
+        for row in buy_signals.itertuples(index=False)
+    }
     if not outcomes.empty:
-        outcomes["symbol"] = outcomes["symbol"].map(lambda value: _normalized_symbol(value, field="entry outcome"))
-        outcomes["signal_date"] = pd.to_datetime(outcomes["signal_date"], errors="raise").dt.normalize()
-        outcomes["entry_date"] = pd.to_datetime(outcomes["entry_date"], errors="raise").dt.normalize()
+        outcomes["symbol"] = outcomes["symbol"].map(
+            lambda value: _normalized_symbol(value, field="entry outcome")
+        )
+        outcomes["signal_date"] = pd.to_datetime(
+            outcomes["signal_date"], errors="raise"
+        ).dt.normalize()
+        outcomes["entry_date"] = pd.to_datetime(
+            outcomes["entry_date"], errors="raise"
+        ).dt.normalize()
         if outcomes.duplicated(["symbol", "signal_date"]).any():
             raise ValueError("entry outcomes are not unique by attempted symbol/session")
         if (~outcomes["outcome"].isin(valid_outcomes)).any():
@@ -402,7 +409,9 @@ def reconcile_signals_to_transactions(
             raise ValueError("entry outcome entry date is not a benchmark trading session")
         for field in ("pivot", "buy_zone_lower", "buy_zone_upper", "entry_open"):
             outcomes[field] = outcomes[field].map(
-                lambda value, name=field: _optional_positive_number(value, field=f"entry outcome {name}")
+                lambda value, name=field: _optional_positive_number(
+                    value, field=f"entry outcome {name}"
+                )
             )
 
         requires_entry_open = {
@@ -436,13 +445,13 @@ def reconcile_signals_to_transactions(
                 pivot = float(row.pivot)
                 if pd.isna(row.buy_zone_lower) or pd.isna(row.buy_zone_upper):
                     raise ValueError("entry outcome with a pivot lacks buy-zone bounds")
-                if not math.isclose(float(row.buy_zone_lower), pivot, rel_tol=1e-12, abs_tol=1e-12):
+                if not math.isclose(
+                    float(row.buy_zone_lower), pivot, rel_tol=1e-12, abs_tol=1e-12
+                ):
                     raise ValueError("entry outcome lower buy-zone bound disagrees with pivot")
                 if not math.isclose(
-                    float(row.buy_zone_upper),
-                    pivot * 1.05,
-                    rel_tol=1e-12,
-                    abs_tol=1e-12,
+                    float(row.buy_zone_upper), pivot * 1.05,
+                    rel_tol=1e-12, abs_tol=1e-12,
                 ):
                     raise ValueError("entry outcome upper buy-zone bound disagrees with pivot")
             elif pd.notna(row.buy_zone_lower) or pd.notna(row.buy_zone_upper):
@@ -453,39 +462,55 @@ def reconcile_signals_to_transactions(
             if row.outcome in forbids_entry_open and pd.notna(row.entry_open):
                 raise ValueError(f"{row.outcome} contains an impossible entry open")
 
-            if (
-                row.outcome == "entries_executed"
-                and pd.notna(row.pivot)
-                and not (float(row.buy_zone_lower) <= float(row.entry_open) <= float(row.buy_zone_upper))
+            if row.outcome == "entries_executed" and pd.notna(row.pivot) and not (
+                float(row.buy_zone_lower)
+                <= float(row.entry_open)
+                <= float(row.buy_zone_upper)
             ):
                 raise ValueError("successful entry outcome opened outside its buy zone")
             if row.outcome == "entry_rejected_next_open_buy_zone":
                 if pd.isna(row.pivot):
                     raise ValueError("next-open buy-zone rejection lacks pivot facts")
-                if float(row.buy_zone_lower) <= float(row.entry_open) <= float(row.buy_zone_upper):
+                if float(row.buy_zone_lower) <= float(row.entry_open) <= float(
+                    row.buy_zone_upper
+                ):
                     raise ValueError("next-open buy-zone rejection opened inside its buy zone")
 
     buy_keys = set(signal_pivots)
-    outcome_keys = {(row.symbol, row.signal_date) for row in outcomes.itertuples(index=False)}
+    outcome_keys = {
+        (row.symbol, row.signal_date)
+        for row in outcomes.itertuples(index=False)
+    }
     if not outcome_keys.issubset(buy_keys):
         raise ValueError("entry outcome has no unique qualifying signal")
 
-    entry_keys = Counter((row.Ticker, row.Date) for row in entries.itertuples(index=False))
+    entry_keys = Counter(
+        (row.Ticker, row.Date) for row in entries.itertuples(index=False)
+    )
     if any(count != 1 for count in entry_keys.values()):
         raise ValueError("entry transactions are not unique by symbol/session")
     executed = outcomes.loc[outcomes["outcome"] == "entries_executed"]
-    executed_keys = Counter((row.symbol, row.entry_date) for row in executed.itertuples(index=False))
+    executed_keys = Counter(
+        (row.symbol, row.entry_date) for row in executed.itertuples(index=False)
+    )
     if executed_keys != entry_keys:
         raise ValueError("successful entry outcomes do not match BUY transactions exactly")
-    entry_prices = {(row.Ticker, row.Date): float(row.Price) for row in entries.itertuples(index=False)}
+    entry_prices = {
+        (row.Ticker, row.Date): float(row.Price)
+        for row in entries.itertuples(index=False)
+    }
     for row in executed.itertuples(index=False):
         serialized_open = round(float(row.entry_open), 4)
         transaction_price = entry_prices[(row.symbol, row.entry_date)]
-        if not math.isclose(transaction_price, serialized_open, rel_tol=0, abs_tol=1e-12):
+        if not math.isclose(
+            transaction_price, serialized_open, rel_tol=0, abs_tol=1e-12
+        ):
             raise ValueError("successful entry outcome open disagrees with BUY Price")
     rejected_keys = {
         (row.symbol, row.entry_date)
-        for row in outcomes.loc[outcomes["outcome"] != "entries_executed"].itertuples(index=False)
+        for row in outcomes.loc[outcomes["outcome"] != "entries_executed"].itertuples(
+            index=False
+        )
     }
     if rejected_keys.intersection(entry_keys):
         raise ValueError("a rejected entry outcome has a matching BUY transaction")
@@ -495,7 +520,9 @@ def reconcile_signals_to_transactions(
         try:
             integer = int(raw)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"execution diagnostic must be a nonnegative integer: {name}") from exc
+            raise ValueError(
+                f"execution diagnostic must be a nonnegative integer: {name}"
+            ) from exc
         if isinstance(raw, bool) or integer != raw or integer < 0:
             raise ValueError(f"execution diagnostic must be a nonnegative integer: {name}")
         return integer
@@ -524,7 +551,9 @@ def reconcile_signals_to_transactions(
         if count != outcome_counts[name]:
             raise ValueError(f"outcome count does not match execution diagnostic: {name}")
     if attempts != len(outcomes) or attempts != entry_count + sum(rejection_counts.values()):
-        raise ValueError("entry attempts/outcomes do not equal executions plus mutually exclusive rejections")
+        raise ValueError(
+            "entry attempts/outcomes do not equal executions plus mutually exclusive rejections"
+        )
     blocked_market = sum(
         diagnostic(name)
         for name in (
@@ -545,9 +574,17 @@ def reconcile_signals_to_transactions(
         raise ValueError("final pending signal count exceeds last-session qualifying signals")
 
     rejected_total = sum(rejection_counts.values())
-    cash_by_symbol = Counter(outcomes.loc[outcomes["outcome"] == "entry_rejected_no_cash", "symbol"])
-    capacity_by_symbol = Counter(outcomes.loc[outcomes["outcome"] == "entry_rejected_capacity", "symbol"])
-    next_open_by_symbol = Counter(outcomes.loc[outcomes["outcome"] == "entry_rejected_next_open_buy_zone", "symbol"])
+    cash_by_symbol = Counter(
+        outcomes.loc[outcomes["outcome"] == "entry_rejected_no_cash", "symbol"]
+    )
+    capacity_by_symbol = Counter(
+        outcomes.loc[outcomes["outcome"] == "entry_rejected_capacity", "symbol"]
+    )
+    next_open_by_symbol = Counter(
+        outcomes.loc[
+            outcomes["outcome"] == "entry_rejected_next_open_buy_zone", "symbol"
+        ]
+    )
     cash_blocked = rejection_counts["entry_rejected_no_cash"]
     capacity_blocked = rejection_counts["entry_rejected_capacity"]
 
@@ -556,14 +593,18 @@ def reconcile_signals_to_transactions(
         "entry_count": entry_count,
         "entry_attempt_count": attempts,
         "entry_rejection_count": rejected_total,
-        "next_open_buy_zone_rejected_count": rejection_counts["entry_rejected_next_open_buy_zone"],
+        "next_open_buy_zone_rejected_count": rejection_counts[
+            "entry_rejected_next_open_buy_zone"
+        ],
         "cash_blocked_count": cash_blocked,
         "capacity_blocked_count": capacity_blocked,
         "capacity_truncated_count": capacity_truncated,
         "final_pending_count": final_pending,
         "unattributed_rejection_count": 0,
         "unattributed_cash_capacity_count": 0,
-        "blocked_for_next_open_buy_zone_by_symbol": dict(sorted(next_open_by_symbol.items())),
+        "blocked_for_next_open_buy_zone_by_symbol": dict(
+            sorted(next_open_by_symbol.items())
+        ),
         "blocked_for_cash_by_symbol": dict(sorted(cash_by_symbol.items())),
         "blocked_for_capacity_by_symbol": dict(sorted(capacity_by_symbol.items())),
         "rejection_counts": rejection_counts,
@@ -582,35 +623,6 @@ def rolling_label_recall_summary(
         raise ValueError("rolling recall lookback_days must be a nonnegative integer")
     if not isinstance(signal_log, pd.DataFrame):
         raise ValueError("rolling recall signal log must be a DataFrame")
-    signals = signal_log.copy()
-    required = {"buy_signal", "signal_date", "symbol"}
-    missing = sorted(required.difference(signals.columns))
-    if missing:
-        raise ValueError(f"signal log lacks rolling recall fields: {missing}")
-    signals = signals.loc[signals["buy_signal"].fillna(False).astype(bool)].copy()
-    if not signals.empty:
-        signals["signal_date"] = pd.to_datetime(signals["signal_date"], errors="raise").dt.date
-        signals["symbol"] = signals["symbol"].astype(str).str.upper()
-    raw_recalled = 0
-    exposed_recalled = 0
-    raw_denominator = 0
-    exposed_denominator = 0
-    for label in labels:
-        if not isinstance(label, RollingLeaderObservation):
-            raise ValueError("rolling labels contain the wrong model")
-        aliases = {str(value).upper() for value in (label_aliases or {}).get(label.ticker, (label.ticker,))}
-        if label.ticker not in aliases:
-            raise ValueError("rolling label alias map must include the reporting ticker")
-        floor = label.evaluation_date - timedelta(days=lookback_days)
-        recalled = any(
-            ticker in aliases and floor <= when <= label.evaluation_date
-            for when, ticker in zip(signals["signal_date"], signals["symbol"], strict=True)
-        )
-        raw_denominator += 1
-        raw_recalled += int(recalled)
-        if label.member_at_evaluation:
-            exposed_denominator += 1
-            exposed_recalled += int(recalled)
 
     def population(numerator: int, denominator: int) -> dict[str, int | float]:
         return {
@@ -619,9 +631,59 @@ def rolling_label_recall_summary(
             "signal_recall_pct": numerator / denominator * 100.0 if denominator else 0.0,
         }
 
+    signals = signal_log.copy()
+    if signals.empty:
+        if not labels:
+            return {
+                "raw_all": population(0, 0),
+                "pit_exposed_member_at_evaluation": population(0, 0),
+            }
+        exposed_denominator = sum(
+            int(label.member_at_evaluation) for label in labels
+        )
+        return {
+            "raw_all": population(0, len(labels)),
+            "pit_exposed_member_at_evaluation": population(0, exposed_denominator),
+        }
+    required = {"buy_signal", "signal_date", "symbol"}
+    missing = sorted(required.difference(signals.columns))
+    if missing:
+        raise ValueError(f"signal log lacks rolling recall fields: {missing}")
+    if not labels:
+        return {
+            "raw_all": population(0, 0),
+            "pit_exposed_member_at_evaluation": population(0, 0),
+        }
+    signals = signals.loc[signals["buy_signal"].fillna(False).astype(bool)]
+    signals["signal_date"] = pd.to_datetime(signals["signal_date"], errors="raise").dt.date
+    signals["symbol"] = signals["symbol"].astype(str).str.upper()
+    raw_recalled = 0
+    exposed_recalled = 0
+    exposed_denominator = 0
+    for label in labels:
+        if not isinstance(label, RollingLeaderObservation):
+            raise ValueError("rolling labels contain the wrong model")
+        aliases = {
+            str(value).upper()
+            for value in (label_aliases or {}).get(label.ticker, (label.ticker,))
+        }
+        if label.ticker not in aliases:
+            raise ValueError("rolling label alias map must include the reporting ticker")
+        floor = label.evaluation_date - timedelta(days=lookback_days)
+        if any(
+            ticker in aliases and floor <= when <= label.evaluation_date
+            for when, ticker in zip(signals["signal_date"], signals["symbol"], strict=True)
+        ):
+            raw_recalled += 1
+            if label.member_at_evaluation:
+                exposed_recalled += 1
+        if label.member_at_evaluation:
+            exposed_denominator += 1
     return {
-        "raw_all": population(raw_recalled, raw_denominator),
-        "pit_exposed_member_at_evaluation": population(exposed_recalled, exposed_denominator),
+        "raw_all": population(raw_recalled, len(labels)),
+        "pit_exposed_member_at_evaluation": population(
+            exposed_recalled, exposed_denominator
+        ),
     }
 
 
