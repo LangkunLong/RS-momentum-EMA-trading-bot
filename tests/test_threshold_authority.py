@@ -344,6 +344,10 @@ def _checkpoint_simulator(
     fetcher.fetch_price_data.return_value = price_data
     fetcher.fetch_rs_universe_closes.return_value = closes
     strategy = MagicMock()
+    strategy.checkpoint_identity = {
+        "name": "threshold-authority-no-signals",
+        "version": 1,
+    }
     strategy.evaluate_market.return_value = {"market_is_bullish": True}
     strategy.evaluate_symbol.return_value = None
     return PortfolioSimulator(

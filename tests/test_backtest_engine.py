@@ -45,6 +45,36 @@ def _make_ohlcv(
     )
 
 
+def _make_canonical_entry_ohlcv(event_close: float) -> pd.DataFrame:
+    pivot = event_close / 1.02
+    history = _make_ohlcv(n=60, close_value=pivot)
+    history.loc[history.index[-1], ["Open", "High", "Close", "Volume"]] = [
+        event_close,
+        event_close * 1.01,
+        event_close,
+        1_300_000,
+    ]
+    return history
+
+
+def _canonical_full_signal(
+    symbol: str,
+    *,
+    rs_score: float,
+    canslim_score: float,
+) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "current_growth": 0.30,
+        "annual_growth": 0.30,
+        "rs_score": rs_score,
+        "entry_composite_score": canslim_score,
+        "canslim_score": canslim_score,
+        "signal_reason": "Volume Breakout",
+        "buy_signal": True,
+    }
+
+
 def test_take_profit_scale_out_fires_all_three_tiers_on_gap_up() -> None:
     """When high clears all 3 tier thresholds in one bar, all 3 tiers fire."""
     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
@@ -487,15 +517,9 @@ def test_full_portfolio_signal_reaches_eviction_and_replaces_lower_rs_position()
     sim._regime_tracker = SimpleNamespace(allows_entries=True)
     sim._ticker_industry = {}
 
-    signal = {
-        "symbol": "GEV",
-        "rs_score": 90.0,
-        "canslim_score": 80.0,
-        "signal_reason": "Volume Breakout",
-        "buy_signal": True,
-    }
+    signal = _canonical_full_signal("GEV", rs_score=90.0, canslim_score=80.0)
     sim.strategy = SimpleNamespace(evaluate_symbol=lambda **_kwargs: signal)
-    ohlcv_map["GEV"] = _make_ohlcv(n=60, close_value=120.0)
+    ohlcv_map["GEV"] = _make_canonical_entry_ohlcv(120.0)
     entry_date = ohlcv_map["GEV"].index[-1]
 
     signals = sim._evaluate_signals(
@@ -521,13 +545,10 @@ def test_full_portfolio_without_eviction_returns_no_candidates() -> None:
     sim._ticker_industry = {}
     sim.strategy = SimpleNamespace(
         evaluate_symbol=lambda **_kwargs: {
-            "symbol": "GEV",
-            "rs_score": 90.0,
-            "canslim_score": 80.0,
-            "buy_signal": True,
+            **_canonical_full_signal("GEV", rs_score=90.0, canslim_score=80.0),
         }
     )
-    ohlcv_map["GEV"] = _make_ohlcv(n=60, close_value=120.0)
+    ohlcv_map["GEV"] = _make_canonical_entry_ohlcv(120.0)
 
     signals = sim._evaluate_signals(
         tickers=["GEV"],
@@ -548,12 +569,12 @@ def test_open_slot_returns_only_best_ranked_candidate() -> None:
     sim._regime_tracker = SimpleNamespace(allows_entries=True)
     sim._ticker_industry = {}
     rows = {
-        "LOW": {"symbol": "LOW", "rs_score": 99.0, "canslim_score": 70.0, "buy_signal": True},
-        "BEST": {"symbol": "BEST", "rs_score": 80.0, "canslim_score": 90.0, "buy_signal": True},
+        "LOW": _canonical_full_signal("LOW", rs_score=99.0, canslim_score=70.0),
+        "BEST": _canonical_full_signal("BEST", rs_score=80.0, canslim_score=90.0),
     }
     sim.strategy = SimpleNamespace(evaluate_symbol=lambda **kwargs: rows[kwargs["ticker"]])
-    ohlcv_map["LOW"] = _make_ohlcv(n=60, close_value=50.0)
-    ohlcv_map["BEST"] = _make_ohlcv(n=60, close_value=60.0)
+    ohlcv_map["LOW"] = _make_canonical_entry_ohlcv(50.0)
+    ohlcv_map["BEST"] = _make_canonical_entry_ohlcv(60.0)
     eval_date = ohlcv_map["BEST"].index[-1]
 
     signals = sim._evaluate_signals(

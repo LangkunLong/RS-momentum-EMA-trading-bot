@@ -30,6 +30,33 @@ def _ohlcv(
     )
 
 
+def _with_warmup_and_canonical_entry(
+    history: pd.DataFrame,
+    signal_date: pd.Timestamp | None,
+) -> pd.DataFrame:
+    first_session = pd.Timestamp(history.index[0])
+    warmup_dates = pd.bdate_range(
+        end=first_session - pd.offsets.BDay(1),
+        periods=51,
+    )
+    base_close = float(history["Close"].iloc[0])
+    warmup = _ohlcv(
+        warmup_dates,
+        opens=[base_close] * len(warmup_dates),
+        closes=[base_close] * len(warmup_dates),
+    )
+    combined = pd.concat([warmup, history])
+    if signal_date is not None:
+        event_close = base_close * 1.02
+        combined.loc[signal_date, "Close"] = event_close
+        combined.loc[signal_date, "High"] = max(
+            float(combined.loc[signal_date, "High"]),
+            event_close,
+        )
+        combined.loc[signal_date, "Volume"] = 1_300_000.0
+    return combined
+
+
 def _signal(symbol: str, signal_date: pd.Timestamp, *, rs_score: float = 90.0) -> dict:
     return {
         "symbol": symbol,
@@ -85,16 +112,25 @@ def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytes
     dates = pd.date_range("2026-01-02", periods=31, freq="B")
     old_lows = [99.0] * len(dates)
     old_lows[2] = 90.0
-    old = _ohlcv(
-        dates,
-        opens=[100.0] * len(dates),
-        closes=[100.0] * len(dates),
-        lows=old_lows,
+    old = _with_warmup_and_canonical_entry(
+        _ohlcv(
+            dates,
+            opens=[100.0] * len(dates),
+            closes=[100.0] * len(dates),
+            lows=old_lows,
+        ),
+        dates[0],
     )
-    new = _ohlcv(dates, opens=[50.0] * len(dates), closes=[50.0] * len(dates))
-    spy = _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates))
+    new = _with_warmup_and_canonical_entry(
+        _ohlcv(dates, opens=[50.0] * len(dates), closes=[50.0] * len(dates)),
+        dates[1],
+    )
+    spy = _with_warmup_and_canonical_entry(
+        _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates)),
+        None,
+    )
     prices = {"OLD": old, "NEW": new, "SPY": spy}
-    closes = pd.DataFrame({"OLD": old["Close"], "NEW": new["Close"]}, index=dates)
+    closes = pd.DataFrame({"OLD": old["Close"], "NEW": new["Close"]})
     strategy = _DatedSignals(
         {
             ("OLD", dates[0]): _signal("OLD", dates[0]),
@@ -134,13 +170,19 @@ def test_new_open_position_still_observes_same_day_stop(monkeypatch: pytest.Monk
     dates = pd.date_range("2026-01-02", periods=31, freq="B")
     lows = [49.0] * len(dates)
     lows[1] = 40.0
-    new = _ohlcv(
-        dates,
-        opens=[50.0] * len(dates),
-        closes=[50.0] * len(dates),
-        lows=lows,
+    new = _with_warmup_and_canonical_entry(
+        _ohlcv(
+            dates,
+            opens=[50.0] * len(dates),
+            closes=[50.0] * len(dates),
+            lows=lows,
+        ),
+        dates[0],
     )
-    spy = _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates))
+    spy = _with_warmup_and_canonical_entry(
+        _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates)),
+        None,
+    )
     prices = {"NEW": new, "SPY": spy}
     strategy = _DatedSignals({("NEW", dates[0]): _signal("NEW", dates[0])})
     simulator = PortfolioSimulator(

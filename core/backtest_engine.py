@@ -39,6 +39,7 @@ from core.canslim.entry_contract import (
     MIN_RS_SCORE,
     MIN_VOLUME_RATIO,
     CanslimEntryFacts,
+    build_entry_facts,
     evaluate_entry_contract,
 )
 from core.canslim.m_market_direction import MarketRegime, MarketRegimeTracker
@@ -914,6 +915,8 @@ def _new_execution_diagnostics() -> dict[str, int]:
 
 
 _PORTFOLIO_CHECKPOINT_SCHEMA = 3
+_BUILTIN_CANSLIM_STRATEGY_CHECKPOINT_VERSION = 1
+_MISSING_CHECKPOINT_IDENTITY = object()
 
 
 def _checkpoint_json_safe(value: Any) -> Any:
@@ -1004,6 +1007,66 @@ def _checkpoint_origin_advisory_request(
     return number
 
 
+def _strategy_checkpoint_identity(
+    simulator: "PortfolioSimulator",
+    *,
+    require_explicit_custom: bool,
+) -> dict[str, Any]:
+    """Return stable strategy provenance without serializing executable state."""
+
+    strategy = simulator.strategy
+    strategy_type = type(strategy)
+    module = str(strategy_type.__module__)
+    qualname = str(strategy_type.__qualname__)
+    if not simulator._strategy_was_injected and strategy_type is CanslimStrategy:
+        return {
+            "kind": "built_in",
+            "module": module,
+            "qualname": qualname,
+            "version": _BUILTIN_CANSLIM_STRATEGY_CHECKPOINT_VERSION,
+        }
+    if not require_explicit_custom:
+        return {
+            "kind": "custom",
+            "module": module,
+            "qualname": qualname,
+        }
+
+    explicit = getattr(strategy, "checkpoint_identity", _MISSING_CHECKPOINT_IDENTITY)
+    if explicit is not _MISSING_CHECKPOINT_IDENTITY and callable(explicit):
+        try:
+            explicit = explicit()
+        except Exception as exc:
+            raise ValueError(
+                "custom strategy checkpoint_identity could not be evaluated"
+            ) from exc
+    if explicit is _MISSING_CHECKPOINT_IDENTITY or explicit is None:
+        raise ValueError(
+            "custom strategy checkpointing requires an explicit JSON-safe "
+            "checkpoint_identity"
+        )
+    else:
+        try:
+            encoded = json.dumps(
+                explicit,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            normalized_identity = json.loads(encoded)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "custom strategy checkpoint_identity must be JSON-safe"
+            ) from exc
+
+    return {
+        "kind": "custom",
+        "module": module,
+        "qualname": qualname,
+        "checkpoint_identity": normalized_identity,
+    }
+
+
 def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():
         raise ValueError("portfolio state log is missing")
@@ -1061,11 +1124,20 @@ def _portfolio_checkpoint_fingerprint(
     benchmark: str,
     universe: Iterable[str],
     simulator: "PortfolioSimulator",
+    strategy_identity: Optional[dict[str, Any]] = None,
 ) -> str:
     config = {
         "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
         "bundle_sha256": bundle_sha256,
         "code_identity": code_identity,
+        "strategy_identity": (
+            strategy_identity
+            if strategy_identity is not None
+            else _strategy_checkpoint_identity(
+                simulator,
+                require_explicit_custom=False,
+            )
+        ),
         "identity_prices_provenance_sha256": (
             simulator.identity_transition_contract.prices_provenance_sha256
             if simulator.identity_transition_contract is not None else None
@@ -1211,6 +1283,7 @@ class PortfolioSimulator:
         self.stagnation_threshold_pct = stagnation_threshold_pct
         self.breakeven_trigger_pct = breakeven_trigger_pct
         self.data_fetcher = data_fetcher or DataFetcher()
+        self._strategy_was_injected = strategy is not None
         self.strategy = (
             strategy
             if strategy is not None
@@ -1304,6 +1377,10 @@ class PortfolioSimulator:
         checkpoint = Path(checkpoint_path).resolve() if checkpoint_path is not None else None
         progress = Path(progress_log_path).resolve() if progress_log_path is not None else None
         state_log = checkpoint.with_name("portfolio_state.jsonl") if checkpoint is not None else None
+        strategy_identity = _strategy_checkpoint_identity(
+            self,
+            require_explicit_custom=checkpoint is not None,
+        )
         fingerprint = _portfolio_checkpoint_fingerprint(
             bundle_sha256=self.pit_bundle.sha256 if self.pit_bundle is not None else None,
             code_identity=checkpoint_code_identity,
@@ -1312,6 +1389,7 @@ class PortfolioSimulator:
             benchmark=benchmark,
             universe=all_tickers,
             simulator=self,
+            strategy_identity=strategy_identity,
         )
         checkpoint_state: Optional[dict[str, Any]] = None
         origin_requested_min_rs_score = self.requested_min_rs_score
@@ -1327,6 +1405,10 @@ class PortfolioSimulator:
                 != ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION
             ):
                 raise ValueError("portfolio checkpoint entry outcome schema is unsupported")
+            if checkpoint_state.get("strategy_identity") != strategy_identity:
+                raise ValueError(
+                    "portfolio checkpoint was produced by a different strategy identity"
+                )
             if checkpoint_state.get("fingerprint") != fingerprint:
                 raise ValueError("portfolio checkpoint does not match the requested run")
             if checkpoint_state.get("code_identity") != checkpoint_code_identity:
@@ -1540,6 +1622,7 @@ class PortfolioSimulator:
                     checkpoint_payload = self._checkpoint_payload(
                         fingerprint=fingerprint,
                         code_identity=checkpoint_code_identity,
+                        strategy_identity=strategy_identity,
                         next_day_index=day_idx + 1,
                         total_days=total_days,
                         state_log_offset=offset,
@@ -1614,6 +1697,7 @@ class PortfolioSimulator:
                 self._checkpoint_payload(
                     fingerprint=fingerprint,
                     code_identity=checkpoint_code_identity,
+                    strategy_identity=strategy_identity,
                     next_day_index=total_days,
                     total_days=total_days,
                     state_log_offset=final_offset,
@@ -1710,6 +1794,7 @@ class PortfolioSimulator:
         *,
         fingerprint: str,
         code_identity: Optional[str],
+        strategy_identity: dict[str, Any],
         next_day_index: int,
         total_days: int,
         state_log_offset: int,
@@ -1725,6 +1810,7 @@ class PortfolioSimulator:
             "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
             "fingerprint": fingerprint,
             "code_identity": code_identity,
+            "strategy_identity": strategy_identity,
             "next_day_index": next_day_index,
             "total_days": total_days,
             "state_log_offset": state_log_offset,
@@ -1813,6 +1899,91 @@ class PortfolioSimulator:
             benchmark_symbol=benchmark,
         )
 
+    def _canonicalize_signal_row(
+        self,
+        *,
+        row: dict[str, Any],
+        ticker: str,
+        ticker_history: pd.DataFrame,
+        eval_date: pd.Timestamp,
+        market_allowed: bool,
+        market_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Rebuild the authoritative entry decision at the execution boundary."""
+
+        available = history_through_exact_session(ticker_history, eval_date)
+        if available is None:
+            closes: Iterable[object] = ()
+            volumes: Iterable[object] = ()
+        else:
+            closes = available["Close"] if "Close" in available.columns else ()
+            volumes = available["Volume"] if "Volume" in available.columns else ()
+        facts = build_entry_facts(closes, volumes)
+
+        canonical = dict(row)
+        if self.technical_only:
+            current_growth = _finite_signal_number(canonical.get("current_growth"))
+            annual_growth = _finite_signal_number(canonical.get("annual_growth"))
+            rs_score = _finite_signal_number(canonical.get("rs_score"))
+            composite_score = _finite_signal_number(
+                canonical.get("entry_composite_score")
+            )
+            entry_eligible = facts.eligible
+            entry_blocking_reasons = facts.blocking_reasons
+        else:
+            decision = evaluate_entry_contract(
+                facts,
+                current_growth=canonical.get("current_growth"),
+                annual_growth=canonical.get("annual_growth"),
+                rs_score=canonical.get("rs_score"),
+                composite_score=canonical.get("entry_composite_score"),
+            )
+            current_growth = decision.current_growth
+            annual_growth = decision.annual_growth
+            rs_score = decision.rs_score
+            composite_score = decision.composite_score
+            entry_eligible = decision.eligible
+            entry_blocking_reasons = decision.blocking_reasons
+
+        canonical.update(
+            {
+                "symbol": str(ticker).upper(),
+                "signal_date": str(eval_date.date()),
+                "close": _finite_signal_number(facts.event_close),
+                "current_growth": current_growth,
+                "annual_growth": annual_growth,
+                "rs_score": rs_score,
+                "entry_composite_score": composite_score,
+                "market_is_bullish": bool(market_allowed),
+                "market_regime_is_bullish": bool(
+                    market_state.get("market_is_bullish", False)
+                ),
+                "buy_signal_without_market": bool(entry_eligible),
+                "has_breakout": facts.in_buy_zone,
+                "has_volume_surge": facts.has_volume_surge,
+                "pivot": _finite_signal_number(facts.pivot),
+                "prior_close": _finite_signal_number(facts.prior_close),
+                "event_volume": _finite_signal_number(facts.event_volume),
+                "prior_average_volume_50": _finite_signal_number(
+                    facts.prior_average_volume_50
+                ),
+                "entry_volume_ratio": _finite_signal_number(facts.volume_ratio),
+                "entry_extension": _finite_signal_number(facts.extension),
+                "price_advanced": facts.price_advanced,
+                "in_buy_zone": facts.in_buy_zone,
+                "technical_setup_eligible": facts.eligible,
+                "technical_blocking_reasons": ",".join(facts.blocking_reasons),
+                "entry_contract_eligible": bool(entry_eligible),
+                "entry_blocking_reasons": ",".join(entry_blocking_reasons),
+                "buy_signal": bool(entry_eligible and market_allowed),
+                "technical_only": self.technical_only,
+            }
+        )
+        canonical["signal_reason"] = (
+            "Volume Breakout" if facts.eligible else "No Breakout"
+        )
+        return canonical
+
     def _evaluate_signals(
         self,
         *,
@@ -1876,6 +2047,14 @@ class PortfolioSimulator:
             )
             if row is None:
                 continue
+            row = self._canonicalize_signal_row(
+                row=row,
+                ticker=ticker,
+                ticker_history=ticker_ohlcv[ticker],
+                eval_date=eval_date,
+                market_allowed=market_allowed,
+                market_state=market_state,
+            )
             self._signal_rows.append(row)
             if row.get("buy_signal_without_market", row.get("buy_signal", False)):
                 self._execution_diagnostics["potential_buy_signal_rows"] += 1
@@ -1903,7 +2082,13 @@ class PortfolioSimulator:
         if not entries_allowed:
             return []
 
-        signals.sort(key=lambda item: (item["canslim_score"], item["rs_score"]), reverse=True)
+        signals.sort(
+            key=lambda item: (
+                _finite_signal_number(item.get("canslim_score")) or -math.inf,
+                _finite_signal_number(item.get("rs_score")) or -math.inf,
+            ),
+            reverse=True,
+        )
         if self.max_positions is None:
             candidate_limit = len(signals)
         else:
