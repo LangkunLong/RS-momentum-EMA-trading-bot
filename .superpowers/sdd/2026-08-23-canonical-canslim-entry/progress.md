@@ -215,3 +215,21 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
   with an unchanged bundle hash.
 - **Task 4 remains incomplete:** Step 4 regeneration is pending active replay
   completion and shared-machine resources.
+
+## Task 5 — raw and PIT-exposed leader recall
+
+- Added explicit five-year raw/all and `member_at_start=True` PIT-exposed
+  denominator, signal, execution, and true percentage populations.
+- Added rolling raw/all and `member_at_evaluation=True` PIT-exposed signal
+  recall only; no rolling execution attribution was introduced.
+- Same-issuer aliases remain grouped and successor-reset identities remain
+  separate. Summary, report, and manifest consume the same deterministic,
+  JSON-safe recall object; deprecated raw-count aliases are labeled as counts.
+- Initial independent review found one Important empty-input regression and
+  two Minor scope/evidence issues.
+- Task 5 fix round 1/5: all 3 findings addressed, 0 open; commits
+  `f7a7c103fc54e3e00bb5bd007f18b8a700fbc51c..95e7616decc856cb6dd9375b1ee519a6c242d5ef`.
+- Scoped re-review confirmed zero-input compatibility, removal of unrelated
+  formatting churn, reproducible focused probe evidence, and no new Critical
+  or Important breakage.
+- Task 5: complete (commits `75ddddbb5d794f7c09b5644bb94c6e126e06f0e9..95e7616decc856cb6dd9375b1ee519a6c242d5ef`, review clean).
