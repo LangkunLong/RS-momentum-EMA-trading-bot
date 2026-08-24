@@ -2819,6 +2819,31 @@ def _normalized_record_tuple(record: Mapping[str, Any], columns: Sequence[str]) 
     return tuple(_normalized_value(record.get(column)) for column in columns)
 
 
+def _normalized_values_equal(left: object, right: object) -> bool:
+    """Compare normalized values while allowing lossless CSV float formatting."""
+
+    if left == right:
+        return True
+    if (
+        isinstance(left, tuple)
+        and len(left) == 2
+        and left[0] == "number"
+        and isinstance(right, tuple)
+        and len(right) == 2
+        and right[0] == "number"
+    ):
+        try:
+            return math.isclose(
+                float(left[1]),
+                float(right[1]),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return False
+
+
 def _compare_record_sequence_to_frame(
     records: Sequence[Mapping[str, Any]],
     frame: pd.DataFrame,
@@ -2833,7 +2858,11 @@ def _compare_record_sequence_to_frame(
     ):
         if not isinstance(record, Mapping):
             _fail(f"{label} row {number} is not an object")
-        if _normalized_record_tuple(record, tuple(frame.columns)) != expected:
+        actual = _normalized_record_tuple(record, tuple(frame.columns))
+        if not all(
+            _normalized_values_equal(left, right)
+            for left, right in zip(actual, expected, strict=True)
+        ):
             _fail(f"{label} differs from CSV at row {number}")
 
 
@@ -2845,7 +2874,10 @@ def _compare_frames(actual: pd.DataFrame, expected: pd.DataFrame, *, label: str)
     for number, (actual_row, expected_row) in enumerate(
         zip(actual_rows, expected_rows, strict=True), start=1
     ):
-        if actual_row != expected_row:
+        if not all(
+            _normalized_values_equal(left, right)
+            for left, right in zip(actual_row, expected_row, strict=True)
+        ):
             _fail(f"{label} differs from regenerated artifact at row {number}")
 
 
@@ -3027,7 +3059,10 @@ def _audit_journals(
         except StopIteration as exc:
             raise AssertionError(f"state journal has excess {field} rows") from exc
         actual = _normalized_record_tuple(record, frame_columns[field])
-        if actual != expected:
+        if not all(
+            _normalized_values_equal(left, right)
+            for left, right in zip(actual, expected, strict=True)
+        ):
             _fail(f"state journal {field} differs from CSV at row {indices[field] + 1}")
         indices[field] += 1
 

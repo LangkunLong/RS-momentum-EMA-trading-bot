@@ -27,6 +27,19 @@ def _load_auditor():
     return module
 
 
+def test_normalized_numeric_comparison_allows_csv_float_roundtrip_only() -> None:
+    audit = _load_auditor()
+
+    assert audit._normalized_values_equal(
+        ("number", "400.23900000000003"),
+        ("number", "400.23899999999998"),
+    )
+    assert not audit._normalized_values_equal(
+        ("number", "400.239"),
+        ("number", "400.24"),
+    )
+
+
 def test_independent_quarter_match_accepts_28_days_but_rejects_29_and_ties() -> None:
     audit = _load_auditor()
 
