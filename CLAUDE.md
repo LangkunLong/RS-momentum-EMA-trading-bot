@@ -67,10 +67,14 @@ python backtest.py
 python quality_stocks.py
 ```
 
-In `enhanced_scanner.py`, configure at the top of the file:
+In `enhanced_scanner.py`, configure operational inputs at the top of the file:
 - `SECTORS` — `'sp500'`, `'nasdaq100'`, `'russell2000'`, `'large_cap'`, `'small_cap'`, `'all'`
 - `DEBUG` — verbose output
-- `MIN_RS_SCORE` — override minimum RS score filter
+
+The imported `MIN_RS_SCORE` / `MIN_COMPOSITE_SCORE` values are fixed canonical
+entry floors, not override knobs. `REQUESTED_MIN_RS_SCORE` and
+`REQUESTED_MIN_CANSLIM_SCORE` are deprecated advisory compatibility fields and
+are ignored for entry qualification.
 
 ## Architecture & Data Flow
 
@@ -80,7 +84,7 @@ Fetch tickers (iShares CSVs, cached 24h)
     → For each stock [parallel]: fetch OHLCV via Alpaca, fundamentals via FMP
         → Evaluate C, A, N, S, L, I, M independently
         → Combine into composite CANSLIM score (0–100)
-    → Filter by MIN_CANSLIM_SCORE (default 70)
+    → Apply the fixed canonical RS 80 / non-M composite 70 entry contract
     → Sort by total_score descending and output
 ```
 
@@ -104,11 +108,13 @@ Never call `fetch_company_info()` directly from `fetch_fundamental_data_as_of()`
 
 ## Configuration
 
-All tuneable parameters live in `config/settings.py`:
+Operational parameters live in `config/settings.py`. The compatibility names
+`MIN_RS_SCORE` and `MIN_CANSLIM_SCORE` mirror fixed entry-contract constants and
+must not be tuned through scanner/backtest callers:
 
 | Category | Key Parameters |
 |----------|---------------|
-| Scanner | `MIN_MARKET_CAP` (10B), `MIN_RS_SCORE` (5), `MIN_CANSLIM_SCORE` (70) |
+| Scanner | `MIN_MARKET_CAP` (10B), fixed `MIN_RS_SCORE` (80), fixed `MIN_CANSLIM_SCORE` (70) |
 | Performance | `MAX_WORKERS` (3), `CHUNK_SIZE` (50) |
 | Growth | `C_GROWTH_TARGET` (0.25), `A_GROWTH_TARGET` (0.25) |
 | RS Weights | `RS_Q1_WEIGHT` (0.4), `RS_Q2_WEIGHT`/`Q3`/`Q4` (0.2 each) |

@@ -14,6 +14,7 @@ so you need to know the market's direction."
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from enum import Enum
 from typing import Dict, Optional
 
@@ -27,6 +28,7 @@ from core.data_client import (
     fetch_ohlcv,
     normalize_price_dataframe,
 )
+from core.trading_sessions import latest_us_equity_session
 
 
 class MarketRegime(Enum):
@@ -200,6 +202,7 @@ class MarketTrend:
     indicators: Dict[str, float]
     distribution_days: int = 0
     follow_through: bool = False
+    as_of_session: date | None = None
 
 
 def _count_distribution_days(
@@ -379,6 +382,7 @@ def evaluate_m(
             is_bullish=False,
             latest_close=None,
             indicators={},
+            as_of_session=latest_us_equity_session(data),
         )
 
     data = normalize_price_dataframe(data)
@@ -453,4 +457,5 @@ def evaluate_m(
         },
         distribution_days=dist_days,
         follow_through=has_follow_through,
+        as_of_session=latest_us_equity_session(data),
     )

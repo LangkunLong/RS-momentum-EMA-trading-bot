@@ -37,8 +37,10 @@ def _make_annual_income(eps_values: list[float]) -> pd.DataFrame:
 
 
 def _make_revenue_income(rev_values: list[float]) -> pd.DataFrame:
-    """4-quarter revenue income statement DataFrame for N tests."""
-    dates = pd.date_range("2023-01-01", periods=len(rev_values), freq="QE")
+    """Sparse revenue frame whose latest period has a true prior-year match."""
+    dates = pd.to_datetime(["2023-03-31", "2023-06-30", "2023-09-30", "2024-03-31"])
+    if len(rev_values) != len(dates):
+        raise ValueError("N weight fixture requires four literal fiscal periods")
     return pd.DataFrame(
         {d: {"Total Revenue": v} for d, v in zip(dates, rev_values, strict=True)}
     )

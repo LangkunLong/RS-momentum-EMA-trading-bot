@@ -14,6 +14,7 @@ from typing import Iterable, Optional
 import pandas as pd
 
 from config import settings
+from core.canslim.entry_contract import MIN_COMPOSITE_SCORE, MIN_RS_SCORE
 from core.data_client import validate_ticker, validate_tickers_bulk
 from core.stock_screening import print_analysis_results, screen_stocks_canslim_detailed
 from quality_stocks import get_index_tickers, get_quality_stock_list
@@ -45,8 +46,8 @@ def scan_for_canslim_stocks(
     """Run the full CANSLIM scan and return qualifying opportunities.
 
     Args:
-        min_rs_score: Minimum relative strength score (overrides settings).
-        min_canslim_score: Minimum composite CANSLIM score (overrides settings).
+        min_rs_score: Deprecated advisory request; ignored for entry qualification.
+        min_canslim_score: Deprecated advisory request; ignored for entry qualification.
         sectors: Index/sector name to scan (e.g. 'nasdaq100', 'large_cap').
         custom_list: Explicit list of tickers to evaluate instead of an index.
         start_date: Start date for historical analysis (overrides settings).
@@ -56,9 +57,16 @@ def scan_for_canslim_stocks(
         Tuple of (actionable_buys, watchlist_candidates, market_trend).
 
     """
-    # Load defaults from configuration
+    # Preserve the legacy Python inputs for compatibility and reporting.  The
+    # stock-screening adapter deliberately ignores them for entry qualification.
+    requested_min_rs_score = min_rs_score
+    requested_min_canslim_score = min_canslim_score
     min_rs_score = min_rs_score if min_rs_score is not None else settings.MIN_RS_SCORE
-    min_canslim_score = min_canslim_score if min_canslim_score is not None else settings.MIN_CANSLIM_SCORE
+    min_canslim_score = (
+        min_canslim_score
+        if min_canslim_score is not None
+        else settings.MIN_CANSLIM_SCORE
+    )
     watchlist_min_score = (
         watchlist_min_score if watchlist_min_score is not None else settings.WATCHLIST_MIN_CANSLIM_SCORE
     )
@@ -103,8 +111,14 @@ def scan_for_canslim_stocks(
         symbols = list(dict.fromkeys(symbols + extra_symbols))  # deduplicate, preserve order
 
     print(f"Scanning {len(symbols)} stocks for CANSLIM opportunities...")
-    print(f"Minimum RS Score: {min_rs_score}")
-    print(f"Minimum CANSLIM Score: {min_canslim_score}")
+    print(f"Canonical RS Entry Floor: {MIN_RS_SCORE} (fixed)")
+    print(f"Canonical CANSLIM Entry Floor: {MIN_COMPOSITE_SCORE} (fixed)")
+    if requested_min_rs_score is not None or requested_min_canslim_score is not None:
+        print(
+            "Legacy entry-floor requests (deprecated advisory; ignored): "
+            f"RS={requested_min_rs_score!r}, "
+            f"CANSLIM={requested_min_canslim_score!r}"
+        )
     print(f"Watchlist CANSLIM Floor: {watchlist_min_score}")
     print(f"Require Bullish Market For Buys: {require_bullish_market_for_buys}")
     print(f"Require Strict Breakout For Buys: {strict_breakout_for_buys}")
@@ -252,6 +266,11 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the scanner CLI without starting provider work."""
     return argparse.ArgumentParser(
         description="Scan the configured universe for CANSLIM opportunities",
+        epilog=(
+            "Legacy min_rs_score/min_canslim_score Python inputs are deprecated "
+            "advisory values and are ignored for entry qualification; entry uses "
+            "fixed canonical 80/70 floors."
+        ),
     )
 
 
@@ -261,16 +280,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     # You can override default settings here or edit config/settings.py
 
-    # Example: Override specific settings (uncomment to use)
-    # MIN_RS_SCORE = 10
-    # MIN_CANSLIM_SCORE = 75
+    # The legacy requested floors below are accepted only as deprecated advisory
+    # metadata.  They never alter the fixed canonical RS 80 / composite 70 entry.
     # SECTORS = ['growth_high_beta', 'crypto_fintech']
     # CUSTOM_LIST = None
     # DEBUG = True
 
     # Or just use defaults from config/settings.py
-    MIN_RS_SCORE = None  # Uses settings.MIN_RS_SCORE
-    MIN_CANSLIM_SCORE = None  # Uses settings.MIN_CANSLIM_SCORE
+    REQUESTED_MIN_RS_SCORE = None
+    REQUESTED_MIN_CANSLIM_SCORE = None
     WATCHLIST_MIN_SCORE = None  # Uses settings.WATCHLIST_MIN_CANSLIM_SCORE
     REQUIRE_BULLISH_MARKET_FOR_BUYS = None  # Uses settings.REQUIRE_BULLISH_MARKET_FOR_BUYS
     MAX_TERMINAL_RESULTS = settings.MAX_TERMINAL_RESULTS
@@ -281,8 +299,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     DEBUG = True  # Override default
 
     print("CANSLIM Stock Scanner Configuration:")
-    print(f"- Min RS Score: {MIN_RS_SCORE or settings.MIN_RS_SCORE}")
-    print(f"- Min CANSLIM Score: {MIN_CANSLIM_SCORE or settings.MIN_CANSLIM_SCORE}")
+    print(f"- Canonical RS Entry Floor: {MIN_RS_SCORE} (fixed)")
+    print(f"- Canonical CANSLIM Entry Floor: {MIN_COMPOSITE_SCORE} (fixed)")
+    print(
+        "- Legacy Entry-Floor Requests: "
+        f"RS={REQUESTED_MIN_RS_SCORE!r}, "
+        f"CANSLIM={REQUESTED_MIN_CANSLIM_SCORE!r} "
+        "(deprecated advisory; ignored)"
+    )
     print(f"- Watchlist Min Score: {WATCHLIST_MIN_SCORE or settings.WATCHLIST_MIN_CANSLIM_SCORE}")
     print(
         "- Require Bullish Market For Buys: "
@@ -296,8 +320,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     # Run the scan
     actionable_buys, watchlist_candidates, market_trend = scan_for_canslim_stocks(
-        min_rs_score=MIN_RS_SCORE,
-        min_canslim_score=MIN_CANSLIM_SCORE,
+        min_rs_score=REQUESTED_MIN_RS_SCORE,
+        min_canslim_score=REQUESTED_MIN_CANSLIM_SCORE,
         sectors=SECTORS,
         custom_list=CUSTOM_LIST,
         debug=DEBUG,

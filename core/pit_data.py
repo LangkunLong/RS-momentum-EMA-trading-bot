@@ -34,6 +34,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
+from itertools import groupby
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
@@ -666,13 +667,95 @@ class PITDataBundle:
         for record in records:
             if record["statement_type"] not in _STATEMENT_TYPES:
                 raise ValueError("fundamentals statement_type is invalid")
-        result: dict[str, Any] = {
-            "quarterly_income": self._statement_frame(records, "quarterly"),
-            "annual_income": self._statement_frame(records, "annual"),
-            "balance_sheet": self._statement_frame(records, "balance"),
-            "company_info": self._company_info(records),
+        return self._fundamental_snapshot(records)
+
+    def iter_fundamental_state_boundaries(
+        self,
+        date_bounds: Mapping[
+            str,
+            tuple[
+                pd.Timestamp | datetime | date,
+                pd.Timestamp | datetime | date,
+            ],
+        ],
+    ) -> Iterable[tuple[str, date, dict[str, Any]]]:
+        """Yield exact as-of snapshots at each requested ticker's state boundaries.
+
+        The first boundary is the inclusive start-date snapshot with all earlier
+        filings folded into it. Later boundaries are distinct public dates, with
+        every row sharing a date applied atomically. A right-inclusive lookup can
+        therefore reproduce ``fundamentals_as_of`` anywhere inside each range
+        without evaluating unobservable pre-range intermediate states.
+        """
+
+        bounds: dict[str, tuple[date, date]] = {}
+        for raw_ticker, raw_bounds in date_bounds.items():
+            ticker = _canonical_ticker(raw_ticker)
+            if ticker in bounds or not isinstance(raw_bounds, tuple) or len(raw_bounds) != 2:
+                raise ValueError("fundamental state date bounds are invalid")
+            start = pd.Timestamp(raw_bounds[0]).date()
+            end = pd.Timestamp(raw_bounds[1]).date()
+            if start > end:
+                raise ValueError("fundamental state date bounds are invalid")
+            if pd.Timestamp(end) > self.data_cutoff:
+                raise ValueError("requested fundamental date exceeds point-in-time bundle cutoff")
+            bounds[ticker] = (start, end)
+        symbols = tuple(sorted(bounds))
+        if not symbols:
+            return
+        cutoff = max(end for _start, end in bounds.values()).isoformat()
+        placeholders = ",".join("?" for _ in symbols)
+        rows = self._connection.execute(
+            "SELECT ticker, statement_type, period_end, public_date, basic_eps, diluted_eps, "
+            "total_revenue, net_income, common_stock, total_stockholders_equity, "
+            "shares_outstanding, held_percent_institutions, institution_count, "
+            "prev_institution_count FROM fundamentals "
+            f"WHERE ticker IN ({placeholders}) AND public_date <= ? "
+            "ORDER BY ticker, public_date, period_end",
+            (*symbols, cutoff),
+        )
+        ticker_groups = iter(groupby(
+            rows,
+            key=lambda row: _canonical_ticker(row["ticker"]),
+        ))
+        next_group = next(ticker_groups, None)
+        for ticker in symbols:
+            ticker_rows: list[sqlite3.Row] = []
+            if next_group is not None and next_group[0] == ticker:
+                ticker_rows = list(next_group[1])
+                next_group = next(ticker_groups, None)
+            elif next_group is not None and next_group[0] < ticker:
+                raise ValueError("fundamental state stream order is invalid")
+            start, end = bounds[ticker]
+            history: list[dict[str, Any]] = []
+            baseline_emitted = False
+            for public_date, visible_rows in groupby(
+                ticker_rows,
+                key=lambda row: date.fromisoformat(str(row["public_date"])),
+            ):
+                if public_date > end:
+                    break
+                if public_date > start and not baseline_emitted:
+                    yield ticker, start, self._fundamental_snapshot(history)
+                    baseline_emitted = True
+                boundary_rows = [dict(row) for row in visible_rows]
+                for record in boundary_rows:
+                    if record["statement_type"] not in _STATEMENT_TYPES:
+                        raise ValueError("fundamentals statement_type is invalid")
+                history.extend(boundary_rows)
+                if public_date > start:
+                    yield ticker, public_date, self._fundamental_snapshot(history)
+            if not baseline_emitted:
+                yield ticker, start, self._fundamental_snapshot(history)
+
+    @classmethod
+    def _fundamental_snapshot(cls, records: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "quarterly_income": cls._statement_frame(records, "quarterly"),
+            "annual_income": cls._statement_frame(records, "annual"),
+            "balance_sheet": cls._statement_frame(records, "balance"),
+            "company_info": cls._company_info(records),
         }
-        return result
 
     @staticmethod
     def _statement_frame(records: list[dict[str, Any]], statement_type: str) -> pd.DataFrame:
@@ -698,11 +781,20 @@ class PITDataBundle:
             "institution_count": None,
             "prev_institution_count": None,
         }
+        institutional_pair_selected = False
         for record in reversed(records):
-            for key in result:
+            for key in ("shares_outstanding", "held_percent_institutions"):
                 value = record.get(key)
                 if result[key] is None and value is not None:
                     result[key] = value
+            institution_count = record.get("institution_count")
+            prev_institution_count = record.get("prev_institution_count")
+            if not institutional_pair_selected and (
+                institution_count is not None or prev_institution_count is not None
+            ):
+                result["institution_count"] = institution_count
+                result["prev_institution_count"] = prev_institution_count
+                institutional_pair_selected = True
         return result
 
     def fundamentals_provider(self, symbol: str, as_of_date: pd.Timestamp) -> dict[str, Any]:

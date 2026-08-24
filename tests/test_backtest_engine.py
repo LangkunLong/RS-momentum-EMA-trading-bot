@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from core.canslim.entry_contract import CanslimEntryFacts
 from core.backtest_engine import (
     CanslimStrategy,
     DataFetcher,
@@ -42,6 +43,54 @@ def _make_ohlcv(
             "Volume": [1_000_000] * n,
         },
         index=dates,
+    )
+
+
+def _make_canonical_entry_ohlcv(event_close: float) -> pd.DataFrame:
+    pivot = event_close / 1.02
+    history = _make_ohlcv(n=60, close_value=pivot)
+    history.loc[history.index[-1], ["Open", "High", "Close", "Volume"]] = [
+        event_close,
+        event_close * 1.01,
+        event_close,
+        1_300_000,
+    ]
+    return history
+
+
+def _canonical_full_signal(
+    symbol: str,
+    *,
+    rs_score: float,
+    canslim_score: float,
+) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "current_growth": 0.30,
+        "annual_growth": 0.30,
+        "rs_score": rs_score,
+        "entry_composite_score": canslim_score,
+        "canslim_score": canslim_score,
+        "signal_reason": "Volume Breakout",
+        "buy_signal": True,
+    }
+
+
+def _eligible_entry_facts() -> CanslimEntryFacts:
+    """Return a canonical completed-session setup for strategy mocks."""
+    return CanslimEntryFacts(
+        event_close=150.0,
+        prior_close=149.0,
+        event_volume=1_950_000.0,
+        prior_average_volume_50=1_500_000.0,
+        pivot=147.0,
+        volume_ratio=1.3,
+        extension=150.0 / 147.0 - 1.0,
+        price_advanced=True,
+        has_volume_surge=True,
+        in_buy_zone=True,
+        eligible=True,
+        blocking_reasons=(),
     )
 
 
@@ -273,7 +322,7 @@ def test_technical_only_mode_allows_buy_without_fundamentals() -> None:
         }),
         patch("core.backtest_engine._evaluate_technical_at_date", return_value={
             "n_score": 0.95, "s_score": 0.85, "close": 150.0, "is_breakout": True, "has_volume_surge": True,
-            "has_power_gap": False, "power_gap_details": {}
+            "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
         }),
     ):
         row = strategy.evaluate_symbol(
@@ -311,7 +360,7 @@ def test_technical_only_mode_skips_fundamental_fetch() -> None:
         patch("core.backtest_engine._evaluate_fundamentals_at_date") as mocked_fund,
         patch("core.backtest_engine._evaluate_technical_at_date", return_value={
             "n_score": 0.95, "s_score": 0.85, "close": 150.0, "is_breakout": True, "has_volume_surge": True,
-            "has_power_gap": False, "power_gap_details": {}
+            "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
         }),
     ):
         strategy.evaluate_symbol(
@@ -487,15 +536,9 @@ def test_full_portfolio_signal_reaches_eviction_and_replaces_lower_rs_position()
     sim._regime_tracker = SimpleNamespace(allows_entries=True)
     sim._ticker_industry = {}
 
-    signal = {
-        "symbol": "GEV",
-        "rs_score": 90.0,
-        "canslim_score": 80.0,
-        "signal_reason": "Volume Breakout",
-        "buy_signal": True,
-    }
+    signal = _canonical_full_signal("GEV", rs_score=90.0, canslim_score=80.0)
     sim.strategy = SimpleNamespace(evaluate_symbol=lambda **_kwargs: signal)
-    ohlcv_map["GEV"] = _make_ohlcv(n=60, close_value=120.0)
+    ohlcv_map["GEV"] = _make_canonical_entry_ohlcv(120.0)
     entry_date = ohlcv_map["GEV"].index[-1]
 
     signals = sim._evaluate_signals(
@@ -521,13 +564,10 @@ def test_full_portfolio_without_eviction_returns_no_candidates() -> None:
     sim._ticker_industry = {}
     sim.strategy = SimpleNamespace(
         evaluate_symbol=lambda **_kwargs: {
-            "symbol": "GEV",
-            "rs_score": 90.0,
-            "canslim_score": 80.0,
-            "buy_signal": True,
+            **_canonical_full_signal("GEV", rs_score=90.0, canslim_score=80.0),
         }
     )
-    ohlcv_map["GEV"] = _make_ohlcv(n=60, close_value=120.0)
+    ohlcv_map["GEV"] = _make_canonical_entry_ohlcv(120.0)
 
     signals = sim._evaluate_signals(
         tickers=["GEV"],
@@ -548,12 +588,12 @@ def test_open_slot_returns_only_best_ranked_candidate() -> None:
     sim._regime_tracker = SimpleNamespace(allows_entries=True)
     sim._ticker_industry = {}
     rows = {
-        "LOW": {"symbol": "LOW", "rs_score": 99.0, "canslim_score": 70.0, "buy_signal": True},
-        "BEST": {"symbol": "BEST", "rs_score": 80.0, "canslim_score": 90.0, "buy_signal": True},
+        "LOW": _canonical_full_signal("LOW", rs_score=99.0, canslim_score=70.0),
+        "BEST": _canonical_full_signal("BEST", rs_score=80.0, canslim_score=90.0),
     }
     sim.strategy = SimpleNamespace(evaluate_symbol=lambda **kwargs: rows[kwargs["ticker"]])
-    ohlcv_map["LOW"] = _make_ohlcv(n=60, close_value=50.0)
-    ohlcv_map["BEST"] = _make_ohlcv(n=60, close_value=60.0)
+    ohlcv_map["LOW"] = _make_canonical_entry_ohlcv(50.0)
+    ohlcv_map["BEST"] = _make_canonical_entry_ohlcv(60.0)
     eval_date = ohlcv_map["BEST"].index[-1]
 
     signals = sim._evaluate_signals(

@@ -399,6 +399,10 @@ def _create_bundle(output: Path, *, metadata: Mapping[str, str], membership: lis
         connection.executemany("INSERT INTO membership VALUES (?,?,?)", membership)
         connection.executemany("INSERT INTO price VALUES (?,?,?,?,?,?,?)", prices)
         connection.executemany("INSERT INTO fundamentals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", fundamentals)
+        connection.execute(
+            "CREATE INDEX fundamentals_ticker_public_date_period_end_idx "
+            "ON fundamentals(ticker, public_date, period_end)"
+        )
         connection.commit()
     finally:
         connection.close()

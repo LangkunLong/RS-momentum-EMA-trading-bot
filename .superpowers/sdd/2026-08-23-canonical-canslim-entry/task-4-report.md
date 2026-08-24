@@ -1,0 +1,93 @@
+# Task 4 — fundamental corrections (Steps 1–3)
+
+Status: production fixes and narrow probes complete; Task 4 is **not complete**.
+
+- `core/canslim/c_current_earnings.py` and
+  `core/canslim/a_annual_earnings.py` now reject `NaN`, `+inf`, and `-inf`
+  operands after float conversion. Existing EPS-first/Net-Income fallback and
+  row-selection policy are unchanged.
+- `core/sec_pit_fundamentals.py` adds the reviewed baseline mapping
+  `XOM -> 0000034088`; its existing reviewed-baseline override therefore
+  supersedes the current-ticker candidate before security-master emission.
+- The existing PIT engine finite normalization defense was retained. The
+  existing `pit_baseline.py` stale-holding comment remains factually accurate,
+  so no behavior or comment changed there.
+
+## Read-only real-data evidence
+
+- Immutable bundle
+  `five-year-public-pit/.artifacts/pit-baseline/pit_baseline.sqlite3` matched
+  SHA-256 `8ca8242dd67db30d456a2b1861f7e7399f8ca418079738ab150d4e44865763c5`
+  before and after an immutable SQLite URI query. CAH at `2021-05-13` returned
+  `(c_score=0.0, c_growth=None, a_score=0.1,
+  a_growth=-3.771428571428572, roe=-2.064804469273743)`: every available C/A
+  result was finite and the unavailable current growth was `None`.
+- Pinned SEC archives matched their recorded hashes before and after the
+  read-only probe: submissions
+  `928d67221c6e6183bc343e7234c1391448c15cd1dd644d36b425db2f99ba4350` and
+  companyfacts
+  `d7b4b3c5f2fe014a203bdaef2197d2cba5683f434e965fc9bced1023a43c82ca`.
+  The actual current-ticker XOM issuer `0002115436` advertised `XOM`, but the
+  resolver produced `0000034088:reviewed_baseline_cik`; the narrow extractor
+  emitted 209 normalized XOM rows.
+
+## Checks
+
+- `py_compile` and direct import/finite-growth/XOM-mapping probe passed.
+- Ruff passed for the three touched production files.
+- `git diff --check` passed.
+- No unit, broad, network, or normalized-regeneration run was started.
+
+## Concern — Step 4 pending active replay completion
+
+Do not begin immutable SEC-output/PIT-bundle regeneration until the active
+multi-hour replay has completed and shared-machine capacity is available.
+
+## Fix Round 1 — finite computed growth
+
+Independent review identified that finite extreme operands could overflow the
+growth numerator to infinity. Both C/A `_safe_growth` helpers now assign the
+computed quotient and return it only when `np.isfinite(growth)`; all existing
+input, negative-prior, near-zero-prior, EPS-first, and Net-Income fallback
+semantics are unchanged.
+
+Commands and output:
+
+- `python -m py_compile core/canslim/c_current_earnings.py
+  core/canslim/a_annual_earnings.py` — passed.
+- Direct helper probe covering
+  `(-sys.float_info.max, sys.float_info.max)`, `NaN`, `+inf`, `-inf`, and
+  `(1.25, 1.0)` for both C/A helpers —
+  `safe_growth_extreme_nan_inf_and_control_probe=passed`.
+- `python -m ruff check core/canslim/c_current_earnings.py
+  core/canslim/a_annual_earnings.py` — `All checks passed!`.
+- `git diff --check` — passed.
+- Immutable SQLite CAH probe at `2021-05-13` —
+  `cah_2021_05_13=(0.0, None, 0.09999999999999999,
+  -3.771428571428572, -2.064804469273743);
+  bundle_read_only_hash_unchanged=passed`.
+
+Task 4 remains incomplete: Step 4 regeneration is still pending active replay
+completion and shared-machine capacity.
+
+## Completion addendum — corrected regeneration
+
+The earlier sections document the pre-regeneration review state. Step 4 is now
+complete using the immutable corrected bundle produced at:
+
+```text
+.artifacts/task-4-regeneration-20260823T223000Z/pit-bundle/pit_baseline.sqlite3
+```
+
+The bundle SHA-256 is
+`1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb` and its
+producer commit is `d555f7f4c7727d9c6a440bba50cced0fbe9f3095`. The companion
+`bundle_manifest.json` and `task-4-regeneration-audit.json` bind the normalized
+row counts, source hashes, and corrected CAH/XOM facts to that exact database.
+The verifier and independent replay audit both passed. CAH has finite-or-missing
+fundamental values at 2021-05-13, and XOM uses the reviewed baseline CIK
+`0000034088` rather than the current-ticker-only candidate.
+
+The strict-PIT quarterly-plus-annual fundamentals coverage gate remains below
+90% and is the sole accepted exception under `--allow-incomplete-fundamentals`.
+This is a declared data-coverage limitation, not a strategy-threshold change.

@@ -13,9 +13,17 @@ from typing import Mapping, Sequence
 import pandas as pd
 
 from config import settings
+from core.canslim.entry_contract import (
+    CanslimEntryFacts,
+    MAX_BUY_ZONE_EXTENSION,
+    MIN_VOLUME_RATIO,
+    PIVOT_LOOKBACK_SESSIONS,
+    PRIOR_VOLUME_SESSIONS,
+    build_entry_facts,
+)
 from core.canslim.m_market_direction import MarketTrend
-from core.canslim.s_supply_demand import _detect_breakout, _detect_volume_surge
 from core.momentum_analysis import calculate_weighted_performance
+from core.trading_sessions import canonicalize_us_equity_history
 
 
 _ROW_FIELDS = (
@@ -58,12 +66,15 @@ def build_after_close_snapshot(
     expected_symbols: Sequence[str],
 ) -> AfterCloseSnapshot:
     """Build a deterministic, advisory snapshot from already-fetched OHLCV bars."""
-    spy_history = price_by_symbol.get("SPY")
+    normalized_prices = {
+        str(symbol).upper(): canonicalize_us_equity_history(history)
+        for symbol, history in price_by_symbol.items()
+    }
+    spy_history = normalized_prices.get("SPY")
     if spy_history is None or spy_history.empty:
         raise ValueError("SPY price history is required to determine the completed session")
 
     as_of_session = _session_date(spy_history)
-    normalized_prices = {str(symbol).upper(): history for symbol, history in price_by_symbol.items()}
     symbols = sorted({str(symbol).upper() for symbol in expected_symbols})
     preliminary = [_build_row(symbol, normalized_prices.get(symbol), as_of_session) for symbol in symbols]
 
@@ -84,7 +95,7 @@ def build_after_close_snapshot(
         score = rs_scores.get(str(row["symbol"]))
         row["weighted_performance"] = _safe_builtin(performances.get(str(row["symbol"])))
         row["rs_score"] = _safe_builtin(score)
-        _apply_rs_gate(row, market=market)
+        _apply_execution_gate(row, market=market)
         rows.append(_json_safe(row))
 
     rows.sort(key=_rank_key)
@@ -117,16 +128,21 @@ def write_after_close_snapshot(
         "summary": snapshot.summary,
         "market": _market_payload(snapshot.market),
         "rules": {
-            "min_rs_score": settings.MIN_RS_SCORE,
-            "breakout_proximity": settings.S_BREAKOUT_PROXIMITY,
-            "volume_surge_threshold": settings.S_VOLUME_SURGE_THRESHOLD,
-            "buy_zone_extension_pct": settings.BUY_ZONE_EXTENSION_PCT,
-            "buy_zone_undercut_tolerance_pct": settings.BUY_ZONE_UNDERCUT_TOLERANCE_PCT,
+            "prior_volume_sessions": PRIOR_VOLUME_SESSIONS,
+            "pivot_lookback_sessions": PIVOT_LOOKBACK_SESSIONS,
+            "volume_surge_threshold": MIN_VOLUME_RATIO,
+            "buy_zone_extension_pct": MAX_BUY_ZONE_EXTENSION,
+            "requires_close_above_prior_close": True,
         },
         "shortlist": [row for row in snapshot.rows if row["tomorrow_executable"]],
         "near_misses": [row for row in snapshot.rows if not row["tomorrow_executable"]],
         "rows": snapshot.rows,
-        "artifact_provenance": {"calculation": "completed_daily_bars", "advisory_only": True},
+        "artifact_provenance": {
+            "calculation": "completed_daily_bars",
+            "advisory_only": True,
+            "signal_scope": "technical_ranking_only",
+            "full_canslim_entry": False,
+        },
     }
     json_path.write_text(json.dumps(_json_safe(payload), allow_nan=False, sort_keys=True), encoding="utf-8")
     return csv_path, json_path
@@ -163,7 +179,7 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
     if len(history) < 30:
         _add_blocker(row, "insufficient_price_history")
         return row
-    if len(history) < 252:
+    if len(history) < PIVOT_LOOKBACK_SESSIONS + 1:
         _add_warning(row, "limited_price_history")
     if not {"High", "Low", "Close", "Volume"}.issubset(history.columns):
         _add_blocker(row, "invalid_price_history")
@@ -173,50 +189,37 @@ def _build_row(symbol: str, history: pd.DataFrame | None, as_of_session: date) -
     high = _float_series(history, "High")
     low = _float_series(history, "Low")
     volume = _float_series(history, "Volume")
-    latest_close = float(close.iloc[-1])
-    prior_close = float(close.iloc[-2])
-    prior_252_close_max = float(close.iloc[-253:-1].max()) if len(close) >= 253 else float(close.iloc[:-1].max())
-    pivot = prior_252_close_max
-    average_volume = float(volume.tail(50).mean())
-    price_up = latest_close > prior_close
-    has_volume_surge, volume_ratio = _detect_volume_surge(
-        float(volume.iloc[-1]), average_volume, settings.S_VOLUME_SURGE_THRESHOLD, price_up=price_up
+    facts = build_entry_facts(close, volume)
+    proximity = (
+        facts.event_close / facts.pivot
+        if facts.event_close is not None and facts.pivot is not None and facts.pivot > 0
+        else None
     )
-    near_high, proximity = _detect_breakout(latest_close, prior_252_close_max, settings.S_BREAKOUT_PROXIMITY)
-    extension = (latest_close / pivot) - 1 if pivot > 0 else None
+    prior_dollar_volume = (
+        (close.iloc[-51:-1] * volume.iloc[-51:-1]).mean() if len(close) >= 51 else None
+    )
 
     row.update(
         {
-            "close": latest_close,
-            "prior_close": prior_close,
-            "pivot": pivot,
-            "extension": extension,
+            "close": facts.event_close,
+            "prior_close": facts.prior_close,
+            "pivot": facts.pivot,
+            "extension": facts.extension,
             "proximity_to_52week_high": proximity,
-            "volume_ratio_50d": volume_ratio,
-            "average_dollar_volume_50d": float((close.tail(50) * volume.tail(50)).mean()),
+            "volume_ratio_50d": facts.volume_ratio,
+            "average_dollar_volume_50d": _safe_builtin(prior_dollar_volume),
             "atr_pct_20d": _atr_pct(high, low, close),
             "realized_volatility_20d": _realized_volatility(close),
+            "technical_eligible": facts.eligible,
         }
     )
-    gaps = []
-    if not near_high:
-        _add_blocker(row, "below_52week_proximity")
-        gaps.append((settings.S_BREAKOUT_PROXIMITY - proximity) / settings.S_BREAKOUT_PROXIMITY)
-    if not has_volume_surge:
-        _add_blocker(row, "no_up_day_volume_surge")
-        gaps.append(max((settings.S_VOLUME_SURGE_THRESHOLD - volume_ratio) / settings.S_VOLUME_SURGE_THRESHOLD, 0.0))
-    buy_zone_min = pivot * (1 - settings.BUY_ZONE_UNDERCUT_TOLERANCE_PCT)
-    if pivot <= 0 or latest_close < buy_zone_min:
-        _add_blocker(row, "below_pivot")
-        gaps.append((buy_zone_min - latest_close) / buy_zone_min if buy_zone_min > 0 else 1.0)
-    elif latest_close > pivot * (1 + settings.BUY_ZONE_EXTENSION_PCT):
-        _add_blocker(row, "beyond_buy_zone")
-        gaps.append((extension - settings.BUY_ZONE_EXTENSION_PCT) / settings.BUY_ZONE_EXTENSION_PCT)
-    row["normalized_trigger_gap"] = sum(gaps) if gaps else 0.0
+    for reason in facts.blocking_reasons:
+        _add_blocker(row, reason)
+    row["normalized_trigger_gap"] = _canonical_trigger_gap(facts)
     return row
 
 
-def _apply_rs_gate(row: dict[str, object], *, market: MarketTrend) -> None:
+def _apply_execution_gate(row: dict[str, object], *, market: MarketTrend) -> None:
     structural_blockers = {
         "missing_price_history",
         "stale_price_history",
@@ -226,20 +229,27 @@ def _apply_rs_gate(row: dict[str, object], *, market: MarketTrend) -> None:
     blockers = set(str(row["blocking_reasons"]).split(","))
     if blockers & structural_blockers:
         return
-    score = row["rs_score"]
-    if score is None:
-        _add_blocker(row, "rs_unavailable")
-    else:
-        score_float = float(score)
-        if score_float < settings.MIN_RS_SCORE:
-            _add_blocker(row, "rs_below_threshold")
-            gap = (settings.MIN_RS_SCORE - score_float) / settings.MIN_RS_SCORE
-            existing_gap = row["normalized_trigger_gap"]
-            row["normalized_trigger_gap"] = float(existing_gap or 0.0) + gap
     row["technical_eligible"] = not bool(row["blocking_reasons"])
     row["tomorrow_executable"] = bool(row["technical_eligible"]) and market.is_bullish
     if row["technical_eligible"] and not market.is_bullish:
         _add_execution_blocker(row, "market_not_bullish")
+
+
+def _canonical_trigger_gap(facts: CanslimEntryFacts) -> float:
+    gaps: list[float] = []
+    volume_ratio = facts.volume_ratio
+    if volume_ratio is not None and volume_ratio < MIN_VOLUME_RATIO:
+        gaps.append((MIN_VOLUME_RATIO - volume_ratio) / MIN_VOLUME_RATIO)
+    event_close = facts.event_close
+    pivot = facts.pivot
+    if event_close is not None and pivot is not None and pivot > 0:
+        if event_close < pivot:
+            gaps.append((pivot - event_close) / pivot)
+        elif event_close > pivot * (1 + MAX_BUY_ZONE_EXTENSION):
+            gaps.append((event_close / pivot - 1 - MAX_BUY_ZONE_EXTENSION) / MAX_BUY_ZONE_EXTENSION)
+    if "close_not_above_prior_close" in facts.blocking_reasons:
+        gaps.append(1.0)
+    return float(sum(gaps)) if gaps else 0.0
 
 
 def _is_current_and_sufficient(history: pd.DataFrame, as_of_session: date) -> bool:
@@ -275,7 +285,9 @@ def _realized_volatility(close: pd.Series) -> float | None:
 
 
 def _session_date(history: pd.DataFrame) -> date:
-    return pd.Timestamp(history.index[-1]).date()
+    if history.empty:
+        raise ValueError("price history has no completed session")
+    return history.index[-1].date()
 
 
 def _add_blocker(row: dict[str, object], reason: str) -> None:

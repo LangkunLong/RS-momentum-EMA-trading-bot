@@ -9,6 +9,12 @@ import pandas as pd
 from config import settings
 from core.data_client import fetch_bulk_close_prices
 from core.index_ticker_fetcher import get_sp500_tickers
+from core.trading_sessions import (
+    exact_session_row,
+    history_through_exact_session,
+    latest_us_equity_session,
+    normalize_us_equity_session,
+)
 
 
 def _cache_covers_requested_universe(cached_df: pd.DataFrame, requested_tickers: list[str]) -> bool:
@@ -90,6 +96,7 @@ def calculate_rs_scores_for_tickers(
     period: Optional[str] = None,
     percentile_multiplier: Optional[float] = None,
     percentile_min: Optional[float] = None,
+    as_of_session: object = None,
 ) -> pd.DataFrame:
     """Download price data and compute RS scores for a list of tickers.
 
@@ -130,7 +137,16 @@ def calculate_rs_scores_for_tickers(
             try:
                 print(f"Loading cached RS scores from {cache_file}...")
                 cached_df = pd.read_csv(cache_file)
-                if _cache_covers_requested_universe(cached_df, tickers):
+                cache_matches_session = as_of_session is None or (
+                    "As_Of_Session" in cached_df.columns
+                    and not cached_df.empty
+                    and {
+                        normalize_us_equity_session(value).date()
+                        for value in cached_df["As_Of_Session"].dropna()
+                    }
+                    == {normalize_us_equity_session(as_of_session).date()}
+                )
+                if cache_matches_session and _cache_covers_requested_universe(cached_df, tickers):
                     return cached_df
                 print("RS score cache does not match the requested universe, re-downloading...")
             except (pd.errors.ParserError, OSError) as exc:
@@ -147,6 +163,28 @@ def calculate_rs_scores_for_tickers(
     if full_data.empty:
         print("All downloads failed.")
         return pd.DataFrame()
+
+    resolved_session = as_of_session
+    if resolved_session is None:
+        resolved_session = latest_us_equity_session(full_data)
+    if resolved_session is not None:
+        sliced = history_through_exact_session(full_data, resolved_session)
+        event_row = exact_session_row(full_data, resolved_session)
+        if sliced is None or event_row is None:
+            return pd.DataFrame(columns=["Ticker", "Weighted_Perf", "RS_Score", "As_Of_Session"])
+        fresh_columns = []
+        for column in sliced.columns:
+            try:
+                value = float(event_row[column])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if pd.notna(value) and value not in (float("inf"), float("-inf")):
+                fresh_columns.append(column)
+        full_data = sliced.loc[:, fresh_columns]
+
+    if full_data.empty:
+        print("No symbols have an exact completed-session close.")
+        return pd.DataFrame(columns=["Ticker", "Weighted_Perf", "RS_Score", "As_Of_Session"])
 
     print("Calculating weighted performance...")
 
@@ -180,6 +218,8 @@ def calculate_rs_scores_for_tickers(
     rs_df = rs_df.dropna()
 
     rs_df["RS_Score"] = rs_df["Weighted_Perf"].rank(pct=True) * percentile_multiplier + percentile_min
+    if resolved_session is not None:
+        rs_df["As_Of_Session"] = normalize_us_equity_session(resolved_session).date().isoformat()
     rs_df = rs_df.sort_values(by="RS_Score", ascending=False).reset_index(drop=True)
 
     rs_df.to_csv(cache_file, index=False)

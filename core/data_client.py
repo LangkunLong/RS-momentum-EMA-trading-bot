@@ -933,6 +933,82 @@ _FMP_BALANCE_SHEET_FIELD_MAP = {
     "retainedEarnings": "Retained Earnings",
 }
 
+_FMP_FINANCIAL_FRAME_CACHE_VERSION = "fiscal-revision-v2"
+
+
+def _fmp_period_end(record: dict) -> pd.Timestamp | None:
+    """Normalize one fiscal period to its local, date-only representation."""
+    raw_period = record.get("date")
+    if not raw_period:
+        return None
+    try:
+        timestamp = pd.Timestamp(raw_period)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    return pd.Timestamp(timestamp.date())
+
+
+def _fmp_revision_timestamp(record: dict) -> pd.Timestamp | None:
+    """Return the best provider ordering timestamp for a visible revision."""
+    for field in ("acceptedDate", "filingDate", "fillingDate", "filedDate"):
+        raw_value = record.get(field)
+        if not raw_value:
+            continue
+        try:
+            timestamp = pd.Timestamp(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if pd.isna(timestamp):
+            continue
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+        return timestamp
+    return None
+
+
+def _fmp_mapped_values_equal(left: dict, right: dict, field_map: dict) -> bool:
+    """Compare only the financial values consumed by the target frame."""
+    for key in field_map:
+        left_value = left.get(key)
+        right_value = right.get(key)
+        try:
+            left_missing = bool(pd.isna(left_value))
+        except (TypeError, ValueError):
+            left_missing = False
+        try:
+            right_missing = bool(pd.isna(right_value))
+        except (TypeError, ValueError):
+            right_missing = False
+        if left_missing or right_missing:
+            if not (left_missing and right_missing):
+                return False
+            continue
+        try:
+            if not bool(left_value == right_value):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _select_fmp_visible_revision(records: List[dict], field_map: dict) -> dict | None:
+    """Choose one same-period amendment or fail closed when order is unknowable."""
+    if len(records) == 1:
+        return records[0]
+    if all(_fmp_mapped_values_equal(records[0], record, field_map) for record in records[1:]):
+        return records[0]
+
+    dated = [(_fmp_revision_timestamp(record), record) for record in records]
+    if any(timestamp is None for timestamp, _record in dated):
+        return None
+    latest_timestamp = max(timestamp for timestamp, _record in dated if timestamp is not None)
+    latest = [record for timestamp, record in dated if timestamp == latest_timestamp]
+    if not all(_fmp_mapped_values_equal(latest[0], record, field_map) for record in latest[1:]):
+        return None
+    return latest[0]
+
 
 def _fmp_records_to_financial_df(
     records: List[dict],
@@ -948,19 +1024,25 @@ def _fmp_records_to_financial_df(
     if not records:
         return pd.DataFrame()
 
-    data_by_date: Dict[pd.Timestamp, Dict[str, float]] = {}
+    records_by_date: Dict[pd.Timestamp, List[dict]] = {}
     for rec in records:
-        date_str = rec.get("date")
-        if not date_str:
+        period_end = _fmp_period_end(rec)
+        if period_end is None:
             continue
-        ts = pd.Timestamp(date_str)
+        records_by_date.setdefault(period_end, []).append(rec)
+
+    data_by_date: Dict[pd.Timestamp, Dict[str, float]] = {}
+    for period_end, revisions in records_by_date.items():
+        rec = _select_fmp_visible_revision(revisions, field_map)
+        if rec is None:
+            continue
         row_data = {}
         for fmp_key, label in field_map.items():
             val = rec.get(fmp_key)
             if val is not None:
                 row_data[label] = val
         if row_data:
-            data_by_date[ts] = row_data
+            data_by_date[period_end] = row_data
 
     if not data_by_date:
         return pd.DataFrame()
@@ -975,7 +1057,12 @@ def fetch_quarterly_income_statement(
     symbol: str, limit: int = settings.FMP_QUARTERLY_LIMIT
 ) -> pd.DataFrame:
     """Fetch quarterly income statement in yfinance-compatible format."""
-    cache_key = ("quarterly_income", symbol, limit)
+    cache_key = (
+        "quarterly_income",
+        _FMP_FINANCIAL_FRAME_CACHE_VERSION,
+        symbol,
+        limit,
+    )
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -999,7 +1086,12 @@ def fetch_annual_income_statement(
     symbol: str, limit: int = settings.FMP_ANNUAL_LIMIT
 ) -> pd.DataFrame:
     """Fetch annual income statement in yfinance-compatible format."""
-    cache_key = ("annual_income", symbol, limit)
+    cache_key = (
+        "annual_income",
+        _FMP_FINANCIAL_FRAME_CACHE_VERSION,
+        symbol,
+        limit,
+    )
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -1022,7 +1114,12 @@ def fetch_balance_sheet(
     symbol: str, limit: int = settings.FMP_BALANCE_SHEET_LIMIT
 ) -> pd.DataFrame:
     """Fetch annual balance sheet in yfinance-compatible format."""
-    cache_key = ("balance_sheet", symbol, limit)
+    cache_key = (
+        "balance_sheet",
+        _FMP_FINANCIAL_FRAME_CACHE_VERSION,
+        symbol,
+        limit,
+    )
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -1151,30 +1248,17 @@ def _fetch_fmp_raw_history(symbol: str) -> dict:
 
 
 def _filter_records_as_of(records: List[dict], as_of_date: datetime) -> List[dict]:
-    """Keep only records whose SEC-accepted date is on or before *as_of_date*.
+    """Keep only records publicly filed or accepted by *as_of_date*.
 
     Returns records sorted newest-first so that ``filtered[0]`` is always the
     most recent record available as of the cutoff date.
     """
-    cutoff = pd.Timestamp(as_of_date)
+    cutoff = pd.Timestamp(as_of_date).date()
     dated: list[tuple[pd.Timestamp, dict]] = []
     for rec in records:
-        # Safely catch both None and empty strings ""
-        accepted = rec.get("acceptedDate")
-        if not accepted:
-            accepted = rec.get("date")
-
-        if not accepted:
-            continue
-
-        # acceptedDate often looks like "2024-10-30 16:05:12"
-        try:
-            ts = pd.Timestamp(str(accepted).split(" ")[0])
-        except ValueError:
-            continue
-
-        if ts <= cutoff:
-            dated.append((ts, rec))
+        public_timestamp = _fmp_revision_timestamp(rec)
+        if public_timestamp is not None and public_timestamp.date() <= cutoff:
+            dated.append((public_timestamp, rec))
 
     # Sort newest-first so callers using [0] get the most recent record
     dated.sort(key=lambda x: x[0], reverse=True)
@@ -1265,7 +1349,12 @@ def fetch_fundamental_data_as_of(symbol: str, as_of_date: datetime) -> dict:
         }
 
     """
-    cache_key = ("fundamentals_as_of", symbol, as_of_date.strftime("%Y-%m-%d"))
+    cache_key = (
+        "fundamentals_as_of",
+        _FMP_FINANCIAL_FRAME_CACHE_VERSION,
+        symbol,
+        as_of_date.strftime("%Y-%m-%d"),
+    )
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached

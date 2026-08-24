@@ -52,17 +52,34 @@ class PortfolioSimulator(_engine.PortfolioSimulator):
     def run(self, *args, **kwargs):  # type: ignore[override]
         from core.index_ticker_fetcher import get_all_index_tickers as _get_all_index_tickers
 
-        _engine._download_price_data = _download_price_data
-        _engine._download_bulk_closes = _download_bulk_closes
-        _engine._calculate_rs_at_date = _calculate_rs_at_date
-        _engine._evaluate_market_at_date = _evaluate_market_at_date
-        _engine._evaluate_fundamentals_at_date = _evaluate_fundamentals_at_date
-        _engine._evaluate_technical_at_date = _evaluate_technical_at_date
-        _engine._compute_canslim_score = _compute_canslim_score
-        _engine.clear_session_cache = clear_session_cache
-        _engine.get_sp500_tickers = get_sp500_tickers
-        _engine.get_all_index_tickers = _get_all_index_tickers
-        return super().run(*args, **kwargs)
+        delegated_names = (
+            "_download_price_data",
+            "_download_bulk_closes",
+            "_calculate_rs_at_date",
+            "_evaluate_market_at_date",
+            "_evaluate_fundamentals_at_date",
+            "_evaluate_technical_at_date",
+            "_compute_canslim_score",
+            "clear_session_cache",
+            "get_sp500_tickers",
+            "get_all_index_tickers",
+        )
+        previous = {name: getattr(_engine, name) for name in delegated_names}
+        try:
+            _engine._download_price_data = _download_price_data
+            _engine._download_bulk_closes = _download_bulk_closes
+            _engine._calculate_rs_at_date = _calculate_rs_at_date
+            _engine._evaluate_market_at_date = _evaluate_market_at_date
+            _engine._evaluate_fundamentals_at_date = _evaluate_fundamentals_at_date
+            _engine._evaluate_technical_at_date = _evaluate_technical_at_date
+            _engine._compute_canslim_score = _compute_canslim_score
+            _engine.clear_session_cache = clear_session_cache
+            _engine.get_sp500_tickers = get_sp500_tickers
+            _engine.get_all_index_tickers = _get_all_index_tickers
+            return super().run(*args, **kwargs)
+        finally:
+            for name, value in previous.items():
+                setattr(_engine, name, value)
 
 
 if __name__ == "__main__":

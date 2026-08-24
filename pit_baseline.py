@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import inspect
 import json
 import math
+import os
+import stat
 import subprocess
 from dataclasses import asdict
 from datetime import date, datetime, timezone
@@ -14,9 +17,23 @@ from typing import Any, Callable, Mapping
 
 import pandas as pd
 
-from core.backtest_engine import DEFAULT_MIN_C_A_GROWTH, PortfolioSimulator, SimulationResult
+from core.backtest_engine import (
+    DEFAULT_MIN_C_A_GROWTH,
+    ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION,
+    EntryAttemptOutcome,
+    PortfolioSimulator,
+    SimulationResult,
+)
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
+from core.canslim.entry_contract import (
+    MAX_BUY_ZONE_EXTENSION,
+    MIN_ANNUAL_GROWTH,
+    MIN_COMPOSITE_SCORE,
+    MIN_CURRENT_GROWTH,
+    MIN_RS_SCORE,
+    MIN_VOLUME_RATIO,
+)
 from core.leader_basket import LeaderBasketConfig, LeaderBasketResult, LeaderBasketSimulator
 from core.leader_evaluation import (
     LeaderIdentityContract,
@@ -26,8 +43,9 @@ from core.leader_evaluation import (
 from core.pit_baseline_report import (
     build_leader_recall_frame,
     five_year_leaders_frame,
+    five_year_leader_recall_summary,
     reconcile_signals_to_transactions,
-    rolling_label_recall_pct,
+    rolling_label_recall_summary,
     rolling_leaders_frame,
 )
 from core.pit_data import PITDataBundle, PriceIdentityTransitionContract, sha256_file
@@ -58,6 +76,20 @@ _EXCLUSION_COLUMNS = (
 )
 
 
+def rolling_label_recall_pct(*args: Any, **kwargs: Any) -> float:
+    """Compatibility alias for callers that still import the old scalar helper."""
+    return float(
+        rolling_label_recall_summary(*args, **kwargs)["raw_all"]["signal_recall_pct"]
+    )
+
+
+_RESUME_JOURNAL_FILENAMES = frozenset({
+    "portfolio_checkpoint.json",
+    "portfolio_progress.jsonl",
+    "portfolio_state.jsonl",
+})
+
+
 class CoverageGateError(ValueError):
     """A complete coverage artifact was written, but publication is forbidden."""
 
@@ -78,6 +110,109 @@ def _regular_file(path: str | Path) -> Path:
     if not value.is_file() or value.is_symlink():
         raise ValueError(f"input must be a regular non-link file: {value}")
     return value.resolve()
+
+
+def _lexical_path(path: str | Path, *, field: str) -> Path:
+    """Return an absolute path after rejecting every lexical link boundary."""
+
+    value = Path(path).absolute()
+    current = Path(value.anchor)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    components = [current]
+    for part in value.parts[1:]:
+        current = current / part
+        components.append(current)
+    for current in components:
+        try:
+            metadata = os.lstat(current)
+        except OSError as exc:
+            raise ValueError(f"{field} path cannot be inspected: {current}") from exc
+        attributes = int(getattr(metadata, "st_file_attributes", 0) or 0)
+        if stat.S_ISLNK(metadata.st_mode) or (reparse_flag and attributes & reparse_flag):
+            raise ValueError(
+                f"{field} must not traverse a symlink or Windows reparse point: {current}"
+            )
+    return value
+
+
+def _lexical_regular_file(path: str | Path, *, field: str) -> Path:
+    value = _lexical_path(path, field=field)
+    if not value.is_file():
+        raise ValueError(f"{field} must be a regular non-link file: {value}")
+    return value
+
+
+def _lexical_regular_directory(path: str | Path, *, field: str) -> Path:
+    value = _lexical_path(path, field=field)
+    if not value.is_dir():
+        raise ValueError(f"{field} must be a regular non-link directory: {value}")
+    return value
+
+
+def _resume_run_paths(
+    *,
+    resume_checkpoint: str | Path,
+    output_root: str | Path,
+    expected_bundle_sha: str,
+) -> tuple[Path, Path, Path]:
+    """Validate and return the single run directory that owns a resume journal."""
+
+    lexical_output_root = _lexical_regular_directory(output_root, field="--output-root")
+    lexical_checkpoint = _lexical_regular_file(
+        resume_checkpoint, field="resume checkpoint"
+    )
+    lexical_run_dir = _lexical_regular_directory(
+        lexical_checkpoint.parent, field="resume checkpoint parent"
+    )
+    if lexical_checkpoint.name != "portfolio_checkpoint.json":
+        raise ValueError("resume checkpoint must be named portfolio_checkpoint.json")
+    if lexical_run_dir.parent != lexical_output_root:
+        raise ValueError("resume checkpoint must belong directly to --output-root")
+    expected_suffix = f"-{expected_bundle_sha[:12]}"
+    if not lexical_run_dir.name.endswith(expected_suffix):
+        raise ValueError("resume run directory name does not match the PIT bundle prefix")
+    run_name = lexical_run_dir.name[:-len(expected_suffix)]
+    try:
+        parsed_run_name = datetime.strptime(run_name, "run-%Y%m%dT%H%M%SZ")
+    except ValueError as exc:
+        raise ValueError("resume run directory name is not a canonical UTC run name") from exc
+    if parsed_run_name.strftime("run-%Y%m%dT%H%M%SZ") != run_name:
+        raise ValueError("resume run directory name is not a canonical UTC run name")
+    entries = {item.name: item for item in lexical_run_dir.iterdir()}
+    for name, item in entries.items():
+        _lexical_path(item, field=f"resume run entry {name!r}")
+    terminal_markers = tuple(
+        name for name in ("run_manifest.json", "run_failed.json") if name in entries
+    )
+    if terminal_markers:
+        raise ValueError(
+            "resume run is terminal; preserve its marker and start a fresh run: "
+            + ", ".join(terminal_markers)
+        )
+    if set(entries) != _RESUME_JOURNAL_FILENAMES:
+        missing = sorted(_RESUME_JOURNAL_FILENAMES.difference(entries))
+        extra = sorted(set(entries).difference(_RESUME_JOURNAL_FILENAMES))
+        raise ValueError(
+            "resume run directory must contain exactly the checkpoint/progress/state journals; "
+            f"missing={missing}, extra={extra}"
+        )
+    if any(not item.is_file() or item.is_symlink() for item in entries.values()):
+        raise ValueError("resume journals must be regular non-link files")
+    resolved_output_root = lexical_output_root.resolve()
+    resolved_run_dir = lexical_run_dir.resolve()
+    resolved_checkpoint = lexical_checkpoint.resolve()
+    resolved_entries = {name: item.resolve() for name, item in entries.items()}
+    if resolved_run_dir.parent != resolved_output_root:
+        raise ValueError("resume checkpoint resolves outside --output-root")
+    if resolved_checkpoint.parent != resolved_run_dir:
+        raise ValueError("resume checkpoint resolves outside its run directory")
+    if any(item.parent != resolved_run_dir for item in resolved_entries.values()):
+        raise ValueError("resume journal resolves outside its run directory")
+    return (
+        resolved_run_dir,
+        resolved_checkpoint,
+        resolved_entries["portfolio_progress.jsonl"],
+    )
 
 
 def _git_identity(worktree: Path, *, require_clean: bool) -> str:
@@ -173,6 +308,58 @@ def _average_cash_pct(result: SimulationResult) -> float:
     return _finite((cash / equity).mean() * 100.0, field="average cash")
 
 
+def _strict_boolean_series(frame: pd.DataFrame, field: str) -> pd.Series:
+    values: list[bool] = []
+    for value in frame[field]:
+        if isinstance(value, bool) or value.__class__.__name__ == "bool_":
+            values.append(bool(value))
+        else:
+            raise ValueError(f"CANSLIM signal field is not boolean: {field}")
+    return pd.Series(values, index=frame.index, dtype=bool)
+
+
+def _validated_signal_frame(
+    result: SimulationResult,
+    sessions: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    if not isinstance(result.signal_log, pd.DataFrame) or result.signal_log.empty:
+        raise ValueError("CANSLIM signal log is empty")
+    signals = result.signal_log.copy()
+    session_index = pd.DatetimeIndex(sessions).normalize()
+    if session_index.has_duplicates:
+        raise ValueError("benchmark sessions are not unique")
+    signals["signal_date"] = pd.to_datetime(
+        signals["signal_date"], errors="raise"
+    ).dt.normalize()
+    normalized_symbols: list[str] = []
+    for value in signals["symbol"]:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or value != value.upper()
+        ):
+            raise ValueError("CANSLIM signal symbol is not nonblank uppercase text")
+        normalized_symbols.append(value)
+    signals["symbol"] = normalized_symbols
+    if signals.duplicated(["symbol", "signal_date"]).any():
+        raise ValueError("CANSLIM signal evaluations are not unique by symbol/session")
+    if not set(signals["signal_date"]).issubset(set(session_index)):
+        raise ValueError("CANSLIM signal evaluation is off the benchmark calendar")
+    return signals
+
+
+def _nonnegative_diagnostic(result: SimulationResult, field: str) -> int:
+    raw = result.execution_diagnostics[field]
+    try:
+        number = int(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"CANSLIM execution diagnostic is invalid: {field}") from exc
+    if isinstance(raw, bool) or number != raw or number < 0:
+        raise ValueError(f"CANSLIM execution diagnostic is invalid: {field}")
+    return number
+
+
 def _validate_portfolio(
     result: SimulationResult, sessions: pd.DatetimeIndex, bundle_sha256: str,
 ) -> None:
@@ -183,11 +370,16 @@ def _validate_portfolio(
     required_signals = {
         "symbol", "signal_date", "buy_signal", "current_growth", "annual_growth",
         "rs_score", "has_breakout", "has_volume_surge", "in_buy_zone", "canslim_score",
+        "entry_composite_score", "entry_contract_eligible", "entry_blocking_reasons",
+        "pivot", "prior_close", "event_volume", "prior_average_volume_50",
+        "entry_volume_ratio", "entry_extension", "price_advanced",
+        "technical_setup_eligible", "technical_blocking_reasons",
     }
     if not isinstance(result.signal_log, pd.DataFrame) or result.signal_log.empty:
         raise ValueError("CANSLIM signal log is empty")
     if not required_signals.issubset(result.signal_log):
         raise ValueError("CANSLIM signal log lacks required baseline fields")
+    signals = _validated_signal_frame(result, sessions)
     _average_cash_pct(result)
     holding_dates = pd.DatetimeIndex(
         pd.to_datetime(result.weekly_holdings["Week_Ending"], errors="raise")
@@ -201,10 +393,35 @@ def _validate_portfolio(
         "data_mode": "point_in_time", "pit_bundle_sha256": bundle_sha256,
         "technical_only": False, "max_positions": None,
         "require_bullish_market": False, "use_stateful_regime_gate": False,
+        "signal_every_n_days": 1,
+        "entry_contract_min_current_growth": MIN_CURRENT_GROWTH,
+        "entry_contract_min_annual_growth": MIN_ANNUAL_GROWTH,
+        "entry_contract_min_rs_score": MIN_RS_SCORE,
+        "entry_contract_min_composite_score": MIN_COMPOSITE_SCORE,
+        "entry_contract_min_volume_ratio": MIN_VOLUME_RATIO,
+        "entry_contract_max_buy_zone_extension": MAX_BUY_ZONE_EXTENSION,
     }
     for key, value in expected.items():
         if result.config.get(key) != value:
             raise ValueError(f"CANSLIM result is not the fixed production baseline: {key}")
+
+    buy_signal = _strict_boolean_series(signals, "buy_signal")
+    entry_eligible = _strict_boolean_series(signals, "entry_contract_eligible")
+    technical_eligible = _strict_boolean_series(signals, "technical_setup_eligible")
+    if not buy_signal.equals(entry_eligible):
+        raise ValueError(
+            "fixed no-market-gate baseline buy signals disagree with entry eligibility"
+        )
+    if bool((entry_eligible & ~technical_eligible).any()):
+        raise ValueError("qualified CANSLIM signal lacks a technical setup")
+    qualifying_pivots = pd.to_numeric(
+        signals.loc[entry_eligible, "pivot"], errors="coerce"
+    )
+    if any(
+        not math.isfinite(float(value)) or float(value) <= 0
+        for value in qualifying_pivots
+    ):
+        raise ValueError("qualified CANSLIM signal lacks a finite positive pivot")
     required_diagnostics = {
         "signal_days", "entries_allowed_days", "blocked_by_regime_days",
         "blocked_by_market_days", "cash_deployment_override_days", "buy_signal_rows",
@@ -214,12 +431,84 @@ def _validate_portfolio(
         "buy_signal_rows_when_cash_override", "capacity_truncated_signals",
         "entry_attempts", "entries_executed", "entry_rejected_already_open",
         "entry_rejected_capacity", "entry_rejected_missing_data",
-        "entry_rejected_invalid_price", "entry_rejected_invalid_risk",
+        "entry_rejected_invalid_price", "entry_rejected_next_open_buy_zone",
+        "entry_rejected_invalid_risk",
         "entry_rejected_no_cash", "eviction_attempts", "evictions_executed",
         "eviction_rejections",
     }
     if not required_diagnostics.issubset(result.execution_diagnostics):
         raise ValueError("CANSLIM execution diagnostics schema is incomplete")
+    if not isinstance(result.entry_outcomes, tuple) or any(
+        not isinstance(outcome, EntryAttemptOutcome) for outcome in result.entry_outcomes
+    ):
+        raise ValueError("CANSLIM entry outcomes use an invalid immutable schema")
+    if result.execution_diagnostics["entry_attempts"] != len(result.entry_outcomes):
+        raise ValueError("CANSLIM entry outcomes do not cover every attempt")
+    _json_bytes([outcome.to_primitive() for outcome in result.entry_outcomes])
+
+    qualified_count = int(entry_eligible.sum())
+    attempted_count = _nonnegative_diagnostic(result, "entry_attempts")
+    executed_count = _nonnegative_diagnostic(result, "entries_executed")
+    capacity_truncated = _nonnegative_diagnostic(result, "capacity_truncated_signals")
+    capacity_rejected = _nonnegative_diagnostic(result, "entry_rejected_capacity")
+    if capacity_truncated != 0 or capacity_rejected != 0:
+        raise ValueError("fixed uncapped baseline reported an impossible capacity limit")
+    rejected_count = sum(
+        _nonnegative_diagnostic(result, field)
+        for field in (
+            "entry_rejected_already_open",
+            "entry_rejected_capacity",
+            "entry_rejected_missing_data",
+            "entry_rejected_invalid_price",
+            "entry_rejected_next_open_buy_zone",
+            "entry_rejected_invalid_risk",
+            "entry_rejected_no_cash",
+        )
+    )
+    if _nonnegative_diagnostic(result, "buy_signal_rows") != qualified_count:
+        raise ValueError("qualified count disagrees with buy-signal diagnostics")
+    if (
+        _nonnegative_diagnostic(result, "buy_signal_rows_when_entries_allowed")
+        != qualified_count
+    ):
+        raise ValueError("fixed baseline did not admit every qualifying signal")
+    if any(
+        _nonnegative_diagnostic(result, field) != 0
+        for field in (
+            "buy_signal_rows_blocked_by_regime",
+            "buy_signal_rows_blocked_by_market",
+            "buy_signal_rows_blocked_by_both",
+        )
+    ):
+        raise ValueError("fixed no-market-gate baseline blocked a qualifying signal")
+    if executed_count + rejected_count != attempted_count:
+        raise ValueError("entry attempts do not equal executions plus rejections")
+    final_pending = qualified_count - attempted_count
+    if final_pending < 0:
+        raise ValueError("attempted and truncated entries exceed qualifying signals")
+    last_session_qualified = int(
+        entry_eligible.loc[signals["signal_date"] == sessions[-1]].sum()
+    )
+    if final_pending > last_session_qualified:
+        raise ValueError("final pending entries exceed final-session qualifications")
+    qualifying_keys = set(
+        zip(
+            signals.loc[entry_eligible, "symbol"],
+            signals.loc[entry_eligible, "signal_date"],
+            strict=True,
+        )
+    )
+    expected_outcome_keys = {
+        key for key in qualifying_keys if key[1] != sessions[-1]
+    }
+    actual_outcome_keys = {
+        (outcome.symbol, pd.Timestamp(outcome.signal_date).normalize())
+        for outcome in result.entry_outcomes
+    }
+    if actual_outcome_keys != expected_outcome_keys:
+        raise ValueError(
+            "entry outcomes do not exactly cover every non-final qualifying signal"
+        )
 
 
 def _validate_basket(
@@ -276,6 +565,147 @@ def _basket_equity_frame(result: LeaderBasketResult) -> pd.DataFrame:
         "leader_basket": result.equity_curve.astype(float).values,
         "benchmark": benchmark.astype(float).values,
     })
+
+
+def _entry_outcomes_frame(result: SimulationResult) -> pd.DataFrame:
+    columns = (
+        "symbol", "signal_date", "entry_date", "pivot", "buy_zone_lower",
+        "buy_zone_upper", "entry_open", "outcome",
+    )
+    return pd.DataFrame(
+        [outcome.to_primitive() for outcome in result.entry_outcomes],
+        columns=columns,
+    )
+
+
+def _daily_entry_funnel_frame(
+    result: SimulationResult,
+    sessions: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    signals = _validated_signal_frame(result, sessions).reset_index(drop=True)
+    entry_eligible = _strict_boolean_series(signals, "entry_contract_eligible")
+    buy_signal = _strict_boolean_series(signals, "buy_signal")
+    if not buy_signal.equals(entry_eligible):
+        raise ValueError("daily funnel contains an unqualified buy signal")
+    qualified_keys = set(
+        zip(
+            signals.loc[entry_eligible, "symbol"],
+            signals.loc[entry_eligible, "signal_date"],
+            strict=True,
+        )
+    )
+    outcome_keys: set[tuple[str, pd.Timestamp]] = set()
+    outcomes = _entry_outcomes_frame(result)
+    if not outcomes.empty:
+        normalized_symbols: list[str] = []
+        for value in outcomes["symbol"]:
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or value != value.upper()
+            ):
+                raise ValueError("entry outcome symbol is not nonblank uppercase text")
+            normalized_symbols.append(value)
+        outcomes["symbol"] = normalized_symbols
+        outcomes["signal_date"] = pd.to_datetime(
+            outcomes["signal_date"], errors="raise"
+        ).dt.normalize()
+        if not set(outcomes["signal_date"]).issubset(set(sessions)):
+            raise ValueError("entry outcome signal date is off the benchmark calendar")
+        if outcomes.duplicated(["symbol", "signal_date"]).any():
+            raise ValueError("entry outcomes are not unique by symbol/session")
+        outcome_keys = set(
+            zip(outcomes["symbol"], outcomes["signal_date"], strict=True)
+        )
+        if not outcome_keys.issubset(qualified_keys):
+            raise ValueError("daily funnel contains an attempt for an unqualified signal")
+        valid_outcomes = {
+            "entries_executed",
+            "entry_rejected_already_open",
+            "entry_rejected_capacity",
+            "entry_rejected_missing_data",
+            "entry_rejected_invalid_price",
+            "entry_rejected_next_open_buy_zone",
+            "entry_rejected_invalid_risk",
+            "entry_rejected_no_cash",
+        }
+        if (~outcomes["outcome"].isin(valid_outcomes)).any():
+            raise ValueError("daily funnel contains an unsupported entry outcome")
+    session_index = pd.DatetimeIndex(sessions)
+    signal_counts = (
+        signals.assign(_entry_eligible=entry_eligible)
+        .groupby("signal_date", sort=False)
+        .agg(
+            evaluated_count=("symbol", "size"),
+            qualified_count=("_entry_eligible", "sum"),
+        )
+        .reindex(session_index, fill_value=0)
+        .astype(int)
+    )
+    if outcomes.empty:
+        outcome_counts = pd.DataFrame(
+            {"attempted_count": 0, "executed_count": 0},
+            index=session_index,
+        )
+    else:
+        outcome_counts = (
+            outcomes.assign(_executed=outcomes["outcome"] == "entries_executed")
+            .groupby("signal_date", sort=False)
+            .agg(
+                attempted_count=("outcome", "size"),
+                executed_count=("_executed", "sum"),
+            )
+            .reindex(session_index, fill_value=0)
+            .astype(int)
+        )
+    rejected = outcome_counts["attempted_count"] - outcome_counts["executed_count"]
+    if bool(
+        (
+            (outcome_counts["executed_count"] > outcome_counts["attempted_count"])
+            | (rejected > outcome_counts["attempted_count"])
+            | (outcome_counts["attempted_count"] > signal_counts["qualified_count"])
+        ).any()
+    ):
+        raise ValueError("daily entry funnel violates qualification/attempt bounds")
+    funnel = pd.DataFrame({
+        "signal_date": [str(session.date()) for session in session_index],
+        "evaluated_count": signal_counts["evaluated_count"].to_numpy(dtype=int),
+        "qualified_count": signal_counts["qualified_count"].to_numpy(dtype=int),
+        "attempted_count": outcome_counts["attempted_count"].to_numpy(dtype=int),
+        "executed_count": outcome_counts["executed_count"].to_numpy(dtype=int),
+        "rejected_count": rejected.to_numpy(dtype=int),
+    })
+    if int(funnel["evaluated_count"].sum()) != len(signals):
+        raise ValueError("daily funnel evaluated total disagrees with signal log")
+    qualified_total = int(funnel["qualified_count"].sum())
+    attempted_total = int(funnel["attempted_count"].sum())
+    if attempted_total != _nonnegative_diagnostic(result, "entry_attempts"):
+        raise ValueError("daily funnel attempted total disagrees with diagnostics")
+    if int(funnel["executed_count"].sum()) != _nonnegative_diagnostic(
+        result, "entries_executed"
+    ):
+        raise ValueError("daily funnel executed total disagrees with diagnostics")
+    capacity_truncated = _nonnegative_diagnostic(result, "capacity_truncated_signals")
+    capacity_rejected = _nonnegative_diagnostic(result, "entry_rejected_capacity")
+    if capacity_truncated != 0 or capacity_rejected != 0:
+        raise ValueError("daily funnel contains an impossible uncapped capacity limit")
+    expected_outcome_keys = {
+        key for key in qualified_keys if key[1] != session_index[-1]
+    }
+    if outcome_keys != expected_outcome_keys:
+        raise ValueError(
+            "daily funnel attempts do not cover every non-final qualification"
+        )
+    final_pending = qualified_total - attempted_total
+    if final_pending < 0:
+        raise ValueError("daily funnel attempts/truncation exceed qualifications")
+    final_qualified = int(funnel.iloc[-1]["qualified_count"])
+    if final_pending > final_qualified:
+        raise ValueError("daily funnel pending total exceeds final-session qualifications")
+    if qualified_total != attempted_total + final_pending:
+        raise ValueError("daily funnel qualification accounting is inconsistent")
+    return funnel
 
 
 def _validate_holding_identities(
@@ -506,19 +936,27 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
     required = ["symbol", "signal_date", "current_growth", "annual_growth"]
     if signal_log.empty or not set(required).issubset(signal_log):
         raise ValueError("signal log cannot support evaluated PIT fundamental coverage")
-    frame = signal_log[required].copy()
+    frame = signal_log[required].copy().reset_index(drop=True)
     frame["symbol"] = frame["symbol"].astype(str).str.upper()
     frame["signal_date"] = pd.to_datetime(frame["signal_date"], errors="raise").dt.date
     if frame.duplicated(["symbol", "signal_date"]).any():
         raise ValueError("evaluated PIT symbol-date rows are not unique")
+    membership_by_date: dict[date, frozenset[str]] = {}
+    for signal_date in frame["signal_date"]:
+        if signal_date not in membership_by_date:
+            membership_by_date[signal_date] = bundle.members_at(signal_date.isoformat())
     for row in frame.itertuples(index=False):
-        if row.symbol not in bundle.members_at(row.signal_date.isoformat()):
+        if row.symbol not in membership_by_date[row.signal_date]:
             raise ValueError("signal log contains a symbol outside strict PIT membership")
-    bundle_current_count = 0
-    bundle_annual_count = 0
-    bundle_both_count = 0
-    for row in frame.itertuples(index=False):
-        facts = bundle.fundamentals_as_of(row.symbol, pd.Timestamp(row.signal_date))
+    state_bounds = {
+        str(symbol): (min(group), max(group))
+        for symbol, group in frame.groupby("symbol", sort=False)["signal_date"]
+    }
+    state_dates: dict[str, list[date]] = {symbol: [] for symbol in state_bounds}
+    state_growth: dict[str, list[tuple[float | None, float | None]]] = {
+        symbol: [] for symbol in state_dates
+    }
+    for symbol, public_date, facts in bundle.iter_fundamental_state_boundaries(state_bounds):
         _c_score, bundle_current = evaluate_c(facts["quarterly_income"])
         _a_score, bundle_annual, _roe = evaluate_a(
             facts["annual_income"], balance_sheet=facts["balance_sheet"]
@@ -530,6 +968,17 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
             bundle_current = None
         if bundle_annual is not None and not math.isfinite(float(bundle_annual)):
             bundle_annual = None
+        state_dates[symbol].append(public_date)
+        state_growth[symbol].append((bundle_current, bundle_annual))
+    bundle_current_count = 0
+    bundle_annual_count = 0
+    bundle_both_count = 0
+    for row in frame.itertuples(index=False):
+        state_index = bisect_right(state_dates[row.symbol], row.signal_date) - 1
+        if state_index < 0:
+            bundle_current, bundle_annual = None, None
+        else:
+            bundle_current, bundle_annual = state_growth[row.symbol][state_index]
         current_ok = bundle_current is not None
         annual_ok = bundle_annual is not None
 
@@ -566,7 +1015,8 @@ def _evaluated_coverage(signal_log: pd.DataFrame, bundle: PITDataBundle) -> dict
         "current_quarterly_and_annual_pct": bundle_both_count / len(frame) * 100.0,
         "coverage_basis": (
             "unique strict-PIT signal-log symbol/date rows independently recomputed from "
-            "hash-bound as-of quarterly/annual frames with unchanged evaluate_c/evaluate_a"
+            "hash-bound as-of quarterly/annual frames with fiscal-date-matched "
+            "evaluate_c and unchanged evaluate_a"
         ),
     }
 
@@ -681,6 +1131,7 @@ def _report(
         "Source provenance": _source_summary(sources),
         "Active CANSLIM configuration": config,
         "Execution diagnostics": diagnostics,
+        "Daily entry funnel": summary["entry_contract"],
         "Aggregate failed gates": gate_totals,
     }
     lines = [
@@ -691,8 +1142,47 @@ def _report(
         f"- Leader basket return: {summary['leader_basket']['total_return_pct']:.2f}%",
         f"- SPY return: {summary['spy']['total_return_pct']:.2f}%", "",
         "## Recall", "",
-        f"- Top-100 signaled: {summary['leader_recall']['top100_signaled']}",
-        f"- Top-100 executed: {summary['leader_recall']['top100_executed']}", "",
+        (
+            "- Five-year raw/all: "
+            f"{summary['leader_recall']['five_year']['raw_all']['signaled_count']}"
+            f"/{summary['leader_recall']['five_year']['raw_all']['denominator_count']} "
+            "signaled "
+            f"({summary['leader_recall']['five_year']['raw_all']['signal_recall_pct']:.2f}%); "
+            f"{summary['leader_recall']['five_year']['raw_all']['executed_count']}"
+            f"/{summary['leader_recall']['five_year']['raw_all']['denominator_count']} "
+            "executed "
+            f"({summary['leader_recall']['five_year']['raw_all']['execution_recall_pct']:.2f}%)."
+        ),
+        (
+            "- Five-year PIT-exposed (`member_at_start=True`): "
+            f"{summary['leader_recall']['five_year']['pit_exposed_member_at_start']['signaled_count']}"
+            f"/{summary['leader_recall']['five_year']['pit_exposed_member_at_start']['denominator_count']} "
+            "signaled "
+            f"({summary['leader_recall']['five_year']['pit_exposed_member_at_start']['signal_recall_pct']:.2f}%); "
+            f"{summary['leader_recall']['five_year']['pit_exposed_member_at_start']['executed_count']}"
+            f"/{summary['leader_recall']['five_year']['pit_exposed_member_at_start']['denominator_count']} "
+            "executed "
+            f"({summary['leader_recall']['five_year']['pit_exposed_member_at_start']['execution_recall_pct']:.2f}%)."
+        ),
+        (
+            "- Rolling raw/all signal recall: "
+            f"{summary['leader_recall']['rolling']['raw_all']['signaled_count']}"
+            f"/{summary['leader_recall']['rolling']['raw_all']['denominator_count']} "
+            f"({summary['leader_recall']['rolling']['raw_all']['signal_recall_pct']:.2f}%)."
+        ),
+        (
+            "- Rolling PIT-exposed (`member_at_evaluation=True`) signal recall: "
+            f"{summary['leader_recall']['rolling']['pit_exposed_member_at_evaluation']['signaled_count']}"
+            f"/{summary['leader_recall']['rolling']['pit_exposed_member_at_evaluation']['denominator_count']} "
+            f"({summary['leader_recall']['rolling']['pit_exposed_member_at_evaluation']['signal_recall_pct']:.2f}%)."
+        ),
+        "- Deprecated raw-count aliases: `top100_signaled`, `top100_executed`.", "",
+        "## Canonical entry outcomes", "",
+        f"- Daily evaluated symbol-days: {summary['entry_contract']['evaluated_symbol_days']}",
+        f"- Contract-qualified signals: {summary['entry_contract']['qualified_signals']}",
+        f"- Next-open executions: {summary['entry_contract']['executed_attempts']}",
+        f"- Entry rejections: {summary['entry_contract']['rejected_attempts']}",
+        "- Immutable attempt ledger: `entry_attempt_outcomes.csv`", "",
     ]
     for title, value in blocks.items():
         lines.extend([f"## {title}", "", f"```json\n{json.dumps(value, sort_keys=True)}\n```", ""])
@@ -776,17 +1266,24 @@ def run_baseline(
         "prices": _read_json(paths["prices_provenance"]),
         "fundamentals": _read_json(paths["fundamentals_provenance"]),
     }
-    output_root = Path(args.output_root).resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
-    run_dir = output_root / (
-        datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ-") + expected_bundle_sha[:12]
-    )
-    run_dir.mkdir()
-    resume_checkpoint = (
-        Path(args.resume_checkpoint).resolve() if args.resume_checkpoint else None
-    )
-    portfolio_checkpoint = resume_checkpoint or (run_dir / "portfolio_checkpoint.json")
-    portfolio_progress = portfolio_checkpoint.with_name("portfolio_progress.jsonl")
+    output_root = Path(args.output_root)
+    resume = args.resume_checkpoint is not None
+    if resume:
+        run_dir, portfolio_checkpoint, portfolio_progress = _resume_run_paths(
+            resume_checkpoint=args.resume_checkpoint,
+            output_root=output_root,
+            expected_bundle_sha=expected_bundle_sha,
+        )
+    else:
+        output_root = output_root.resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+        run_dir = output_root / (
+            datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ-")
+            + expected_bundle_sha[:12]
+        )
+        run_dir.mkdir()
+        portfolio_checkpoint = run_dir / "portfolio_checkpoint.json"
+        portfolio_progress = run_dir / "portfolio_progress.jsonl"
     try:
         with PITDataBundle(paths["pit_bundle"], expected_sha256=expected_bundle_sha) as bundle:
             if bundle.metadata["evaluation_start"] != _START:
@@ -833,7 +1330,7 @@ def run_baseline(
             )
             if len(leaders) != 100 or len(rolling) != 4_800:
                 raise ValueError("fixed baseline leader labels are incomplete")
-            portfolio = portfolio_factory(pit_bundle=bundle)
+            portfolio = portfolio_factory(pit_bundle=bundle, signal_every_n_days=1)
             if hasattr(portfolio, "identity_transition_contract"):
                 portfolio.identity_transition_contract = transitions
             result = _run_portfolio(
@@ -841,7 +1338,7 @@ def run_baseline(
                 tickers,
                 checkpoint_path=portfolio_checkpoint,
                 progress_log_path=portfolio_progress,
-                resume=resume_checkpoint is not None,
+                resume=resume,
                 checkpoint_every_days=args.checkpoint_every_days,
                 code_identity=git_head,
             )
@@ -863,6 +1360,7 @@ def run_baseline(
             )
             reconciliation = reconcile_signals_to_transactions(
                 result.signal_log, result.transaction_log, result.execution_diagnostics,
+                entry_outcomes=result.entry_outcomes,
                 trading_days=sessions,
             )
             if reconciliation["capacity_blocked_count"] != 0:
@@ -907,8 +1405,14 @@ def run_baseline(
             else:
                 coverage["non_blocking_failed_gates"] = []
                 coverage["baseline_publishable"] = True
-            top_signaled = int((recall["buy_signal_count"] > 0).sum())
-            top_executed = int((recall["entry_count"] > 0).sum())
+            five_year_recall = five_year_leader_recall_summary(recall)
+            rolling_recall = rolling_label_recall_summary(
+                rolling, result.signal_log, label_aliases=aliases
+            )
+            top_signaled = int(five_year_recall["raw_all"]["signaled_count"])
+            top_executed = int(five_year_recall["raw_all"]["executed_count"])
+            daily_entry_funnel = _daily_entry_funnel_frame(result, sessions)
+            entry_outcomes = _entry_outcomes_frame(result)
             summary = {
                 "canslim": _metrics(result),
                 "leader_basket": _basket_metrics(basket),
@@ -916,13 +1420,32 @@ def run_baseline(
                     result.benchmark_return_pct, field="SPY total return"
                 )},
                 "leader_recall": {
+                    "five_year": five_year_recall,
+                    "rolling": rolling_recall,
                     "top100_signaled": top_signaled,
                     "top100_executed": top_executed,
-                    "signal_recall_pct": float(top_signaled),
-                    "execution_recall_pct": float(top_executed),
-                    "rolling_label_recall_pct": rolling_label_recall_pct(
-                        rolling, result.signal_log, label_aliases=aliases
-                    ),
+                    "signal_recall_pct": five_year_recall["raw_all"][
+                        "signal_recall_pct"
+                    ],
+                    "execution_recall_pct": five_year_recall["raw_all"][
+                        "execution_recall_pct"
+                    ],
+                    "rolling_label_recall_pct": rolling_recall["raw_all"][
+                        "signal_recall_pct"
+                    ],
+                    "deprecated_raw_count_aliases": {
+                        "top100_signaled": "five_year.raw_all.signaled_count",
+                        "top100_executed": "five_year.raw_all.executed_count",
+                    },
+                    "compatibility_aliases": {
+                        "signal_recall_pct": "five_year.raw_all.signal_recall_pct",
+                        "execution_recall_pct": (
+                            "five_year.raw_all.execution_recall_pct"
+                        ),
+                        "rolling_label_recall_pct": (
+                            "rolling.raw_all.signal_recall_pct"
+                        ),
+                    },
                 },
                 "coverage": {
                     "price_pct": coverage["prices"]["coverage_pct"],
@@ -933,6 +1456,19 @@ def run_baseline(
                     "all_gates_passed": coverage["all_gates_passed"],
                     "non_blocking_failed_gates": coverage["non_blocking_failed_gates"],
                 },
+                "entry_contract": {
+                    "outcome_schema_version": ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION,
+                    "daily_session_count": int(len(daily_entry_funnel)),
+                    "evaluated_symbol_days": int(daily_entry_funnel["evaluated_count"].sum()),
+                    "qualified_signals": int(daily_entry_funnel["qualified_count"].sum()),
+                    "attempted_signals": int(daily_entry_funnel["attempted_count"].sum()),
+                    "executed_attempts": int(daily_entry_funnel["executed_count"].sum()),
+                    "rejected_attempts": int(daily_entry_funnel["rejected_count"].sum()),
+                    "next_open_buy_zone_rejections": reconciliation[
+                        "next_open_buy_zone_rejected_count"
+                    ],
+                    "rejection_counts": reconciliation["rejection_counts"],
+                },
             }
             active_config = json.loads(json.dumps(result.config, allow_nan=False))
             diagnostics = json.loads(json.dumps(result.execution_diagnostics, allow_nan=False))
@@ -940,6 +1476,8 @@ def run_baseline(
                 "five_year_leaders.csv": five_year_leaders_frame(leaders),
                 "rolling_leader_labels.csv": rolling_leaders_frame(rolling),
                 "canslim_signals.csv": result.signal_log,
+                "entry_attempt_outcomes.csv": entry_outcomes,
+                "daily_entry_funnel.csv": daily_entry_funnel,
                 "transactions.csv": result.transaction_log,
                 "weekly_holdings.csv": result.weekly_holdings,
                 "equity_curve.csv": _equity_frame(result),
@@ -966,9 +1504,12 @@ def run_baseline(
                 raise ValueError("active CANSLIM configuration changed before publication")
             if _json_bytes(result.execution_diagnostics) != _json_bytes(diagnostics):
                 raise ValueError("execution diagnostics changed before publication")
-            artifact_hashes = {
-                item.name: sha256_file(item) for item in sorted(run_dir.iterdir()) if item.is_file()
-            }
+            artifact_items = tuple(sorted(run_dir.iterdir()))
+            if any(not item.is_file() or item.is_symlink() for item in artifact_items):
+                raise ValueError("run directory contains a non-regular artifact before manifest")
+            artifact_hashes = {item.name: sha256_file(item) for item in artifact_items}
+            if resume and not _RESUME_JOURNAL_FILENAMES.issubset(artifact_hashes):
+                raise ValueError("resumed baseline is missing an execution journal before manifest")
             manifest = {
                 "schema_version": 1, "status": "complete",
                 "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -986,6 +1527,10 @@ def run_baseline(
                 },
                 "canslim_config": active_config,
                 "execution_diagnostics": diagnostics,
+                "entry_attempt_outcome_schema_version": (
+                    ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION
+                ),
+                "entry_attempt_outcome_count": len(result.entry_outcomes),
                 "execution_reconciliation": reconciliation,
                 "coverage_status": {
                     "all_gates_passed": coverage["all_gates_passed"],
@@ -993,6 +1538,7 @@ def run_baseline(
                     "non_blocking_failed_gates": coverage["non_blocking_failed_gates"],
                 },
                 "leader_basket_config": asdict(basket_config),
+                "leader_recall": summary["leader_recall"],
                 "artifacts": artifact_hashes,
             }
             _write_bytes(run_dir / "run_manifest.json", _json_bytes(manifest))
@@ -1027,7 +1573,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
         "--resume-checkpoint",
-        help="resume a prior portfolio checkpoint instead of replaying its completed days",
+        help=(
+            "resume and publish the owning run in place; PATH must be "
+            "OUTPUT_ROOT/run-<UTC>-<bundle-prefix>/portfolio_checkpoint.json, and that "
+            "run directory must contain exactly portfolio_checkpoint.json, "
+            "portfolio_progress.jsonl, and portfolio_state.jsonl"
+        ),
     )
     parser.add_argument(
         "--checkpoint-every-days",

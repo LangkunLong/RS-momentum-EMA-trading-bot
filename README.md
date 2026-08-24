@@ -347,8 +347,15 @@ Backtest execution treats the market-direction score as diagnostics by default:
 an otherwise-valid signal is sized and entered whenever cash is available. Use
 `--require-bullish-market` only for an explicit conservative M-gated replay.
 
+The full CANSLIM entry floors are fixed at RS 80 and non-M composite 70. Legacy
+`min_rs_score` / `min_canslim_score` Python arguments and the backtest
+`--min-rs` / `--min-canslim` options remain accepted for compatibility, but are
+deprecated advisory metadata and do not alter entry qualification. Reports show
+the fixed effective values separately from any finite requested values.
+
 To select a cash-deployment threshold without fitting the full period, run the
-walk-forward optimizer against the approved local cache:
+walk-forward optimizer against the approved local cache. This tool varies only
+cash-deployment admission; it never tunes the fixed CANSLIM entry floors:
 
 ```powershell
 python cash_utilization_optimizer.py `
@@ -365,8 +372,9 @@ comparison against the bullish-only baseline, and emits a `promote` or
 holdout return/Sharpe deltas and no drawdown deterioration by default. It does
 not change the backtest execution default. Backtests execute otherwise-valid
 entries whenever cash is available; pass `--require-bullish-market` to opt into
-the M-gate for a conservative comparison. A threshold is an explicit backtest
-experiment; it is not a live or paper-trading setting.
+the M-gate for a conservative comparison. A cash-deployment threshold is an
+explicit backtest experiment; it is not a CANSLIM threshold or a live or
+paper-trading setting.
 
 Backtest reports also separate final buy signals from technically valid signals
 that were blocked by the M (market-direction) gate. This prevents idle cash from
@@ -468,3 +476,24 @@ succeeds.
 - If broker and SQLite state disagree, preserve broker/order ids, stop automated submission, and reconcile against Alpaca before retrying.
 
 The stabilization design and execution plans are under `docs/superpowers/`.
+
+## Canonical PIT CANSLIM baseline
+
+The current five-year point-in-time baseline is the immutable replay under
+`.artifacts/task-6-corrected-replay-20260824T100045Z/`. It uses the corrected
+bundle bound to SHA-256
+`1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb`, evaluates
+daily from 2021-01-01 through 2025-12-31, and keeps the exact completed-session
+entry facts separate from next-session open execution.
+
+The independent audit found 286 qualified entries, 225 executions, 61
+rejections (51 next-open buy-zone and 10 cash), and no capacity rejections.
+Average cash was 67.3136%; strategy return was -9.9947%, versus 65.0551% for
+the independent 100-leader basket and 84.7901% for SPY. These are diagnostic
+baseline results, not optimized parameters. Strict-PIT fundamental coverage is
+still below the 90% target and is explicitly reported as the only accepted
+`--allow-incomplete-fundamentals` exception.
+
+Detailed provenance and audit evidence are in
+`docs/pit-baseline-data-provenance.md` and
+`.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-6-report.md`.

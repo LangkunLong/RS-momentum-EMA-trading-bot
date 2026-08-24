@@ -11,7 +11,7 @@ import sys
 import pandas as pd
 import pytest
 
-from core.backtest_engine import SimulationResult
+from core.backtest_engine import EntryAttemptOutcome, SimulationResult
 from core.leader_basket import LeaderBasketResult
 from core.leader_evaluation import PointInTimeUniverse
 import pit_baseline
@@ -79,11 +79,30 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
             self.identity_transition_contract = None
 
         def run(self, _tickers, **_kwargs):
+            sessions = pd.to_datetime(["2021-01-01", "2021-01-04"])
+            signal = {
+                "symbol": "AAA", "signal_date": "2021-01-01", "buy_signal": True,
+                "current_growth": 0.30, "annual_growth": 0.30, "rs_score": 90.0,
+                "has_breakout": True, "has_volume_surge": True, "in_buy_zone": True,
+                "canslim_score": 80.0, "entry_composite_score": 80.0,
+                "entry_contract_eligible": True, "entry_blocking_reasons": "",
+                "pivot": 100.0, "prior_close": 99.0, "event_volume": 1_300_000.0,
+                "prior_average_volume_50": 1_000_000.0, "entry_volume_ratio": 1.3,
+                "entry_extension": 0.02, "price_advanced": True,
+                "technical_setup_eligible": True, "technical_blocking_reasons": "",
+            }
             return SimulationResult(
                 config={"min_rs_score": 80.0, "min_canslim_score": 75.0},
-                signal_log=pd.DataFrame([{"symbol": "AAA", "signal_date": "2021-01-01", "buy_signal": True}]),
-                transaction_log=pd.DataFrame([{"Ticker": "AAA", "Date": "2021-01-04", "Action": "BUY"}]),
-                weekly_holdings=pd.DataFrame(),
+                equity_curve=pd.Series([100_000.0, 100_000.0], index=sessions),
+                benchmark_curve=pd.Series([100_000.0, 101_000.0], index=sessions),
+                signal_log=pd.DataFrame([signal]),
+                transaction_log=pd.DataFrame([{"Ticker": "AAA", "Date": "2021-01-04", "Action": "BUY", "Price": 101.0}]),
+                weekly_holdings=pd.DataFrame([{"Week_Ending": "2021-01-04", "Cash": 0.0, "Total_Equity": 100_000.0}]),
+                entry_outcomes=(EntryAttemptOutcome(
+                    symbol="AAA", signal_date="2021-01-01", entry_date="2021-01-04",
+                    pivot=100.0, buy_zone_lower=100.0, buy_zone_upper=105.0,
+                    entry_open=101.0, outcome="entries_executed",
+                ),),
                 execution_diagnostics={
                     "buy_signal_rows": 1, "entries_executed": 1, "entry_attempts": 1,
                     "entry_rejected_already_open": 0, "entry_rejected_capacity": 0,
@@ -112,8 +131,12 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
     monkeypatch.setattr(pit_baseline, "five_year_leaders_frame", lambda _leaders: pd.DataFrame({"ticker": ["AAA"]}))
     monkeypatch.setattr(pit_baseline, "rolling_leaders_frame", lambda _labels: pd.DataFrame({"ticker": ["AAA"]}))
     monkeypatch.setattr(pit_baseline, "_alias_map", lambda _identities: {"AAA": ("AAA",)})
-    monkeypatch.setattr(pit_baseline, "build_leader_recall_frame", lambda *_args, **_kwargs: pd.DataFrame([{"ticker": "AAA", "rank": 1, "total_return_pct": 1.0, "buy_signal_count": 1, "entry_count": 1}]))
+    monkeypatch.setattr(pit_baseline, "build_leader_recall_frame", lambda *_args, **_kwargs: pd.DataFrame([{"ticker": "AAA", "rank": 1, "total_return_pct": 1.0, "member_at_start": True, "buy_signal_count": 1, "entry_count": 1}]))
     monkeypatch.setattr(pit_baseline, "rolling_label_recall_pct", lambda *_args, **_kwargs: 100.0)
+    monkeypatch.setattr(pit_baseline, "rolling_label_recall_summary", lambda *_args, **_kwargs: {
+        "raw_all": {"denominator_count": 4_800, "signaled_count": 100, "signal_recall_pct": 100.0 / 48.0},
+        "pit_exposed_member_at_evaluation": {"denominator_count": 4_800, "signaled_count": 100, "signal_recall_pct": 100.0 / 48.0},
+    })
     monkeypatch.setattr(pit_baseline, "_load_task2_audit", lambda **_kwargs: ({}, {"resolved_or_closed_exclusion_percentage": 100.0, "membership_union_symbol_count": 1}))
     monkeypatch.setattr(pit_baseline, "_coverage", lambda **_kwargs: {"all_gates_passed": True, "prices": {"coverage_pct": 100.0}, "cik_and_exclusions": {"resolved_cik_percentage": 100.0}, "evaluated_fundamentals": {"current_quarterly_and_annual_pct": 100.0}, "gates": {}})
     monkeypatch.setattr(pit_baseline, "_validate_portfolio", lambda *_args, **_kwargs: None)
@@ -140,7 +163,7 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
     monkeypatch.setattr(sys, "argv", argv)
     assert pit_baseline.main() == 0
     run_dir = tmp_path / "runs" / f"run-20260823T120000Z-{bundle_sha[:12]}"
-    required = {"five_year_leaders.csv", "rolling_leader_labels.csv", "canslim_signals.csv", "transactions.csv", "weekly_holdings.csv", "equity_curve.csv", "leader_basket_holdings.csv", "leader_basket_transactions.csv", "leader_basket_equity.csv", "leader_recall.csv", "coverage.json", "summary.json", "report.md", "run_manifest.json"}
+    required = {"five_year_leaders.csv", "rolling_leader_labels.csv", "canslim_signals.csv", "entry_attempt_outcomes.csv", "daily_entry_funnel.csv", "transactions.csv", "weekly_holdings.csv", "equity_curve.csv", "leader_basket_holdings.csv", "leader_basket_transactions.csv", "leader_basket_equity.csv", "leader_recall.csv", "coverage.json", "summary.json", "report.md", "run_manifest.json"}
     assert required == {path.name for path in run_dir.iterdir()}
     manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"

@@ -11,7 +11,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-from config import settings
 from config.settings import (
     MAX_WORKERS,
     MIN_CANSLIM_SCORE,
@@ -22,6 +21,11 @@ from config.settings import (
     WATCHLIST_MIN_CANSLIM_SCORE,
 )
 from core.canslim import MarketTrend, evaluate_canslim, evaluate_market_direction
+from core.canslim.entry_contract import (
+    MIN_COMPOSITE_SCORE as CANONICAL_MIN_COMPOSITE_SCORE,
+    MIN_RS_SCORE as CANONICAL_MIN_RS_SCORE,
+    CanslimEntryDecision,
+)
 from core.momentum_analysis import calculate_rs_scores_for_tickers
 
 
@@ -34,98 +38,45 @@ def _classify_canslim_candidate(
     require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
     strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
 ) -> tuple[str, List[str]]:
-    """Classify a scored stock into actionable buy, watchlist, or rejected."""
+    """Classify a canonical entry decision without duplicating its gates.
+
+    The legacy threshold, fundamental, and breakout arguments remain accepted
+    for API compatibility but are advisory-only and intentionally inert.  The
+    shared entry decision is the sole C/A/RS/composite/technical authority.
+    """
+    del min_rs_score, min_canslim_score, require_fundamentals, strict_breakout
     notes: List[str] = []
 
-    rs_score = float(canslim_view.get("rs_score", 0.0))
-    total_score = float(canslim_view.get("total_score", 0.0))
+    entry_decision = canslim_view.get("entry_decision")
+    if isinstance(entry_decision, CanslimEntryDecision):
+        entry_composite_score = float(entry_decision.composite_score or 0.0)
+    else:
+        entry_composite_score = float(canslim_view.get("entry_composite_score", 0.0))
     market = canslim_view.get("market_trend")
     metrics = canslim_view.get("metrics", {})
-
     market_is_bullish = bool(getattr(market, "is_bullish", False))
-    has_fundamentals = bool(metrics.get("has_fundamentals", False))
-    is_breakout = bool(canslim_view.get("is_breakout", False))
-    has_volume_surge = bool(canslim_view.get("has_volume_surge", False))
-    buy_point = canslim_view.get("buy_point")
-    latest_close_price = canslim_view.get("latest_close_price")
-
-    if rs_score < min_rs_score:
-        return "rejected", ["below_rs_threshold"]
 
     if bool(metrics.get("fmp_quota_deferred", False)):
         return "quota_deferred", ["quota_deferred"]
 
-    bullish_gate_ok = market_is_bullish if require_bullish_market else True
-    fundamentals_gate_ok = has_fundamentals if require_fundamentals else True
-    breakout_gate_ok = True
-    if strict_breakout:
-        breakout_gate_ok = _meets_breakout_entry_requirements(
-            is_breakout=is_breakout,
-            has_volume_surge=has_volume_surge,
-            buy_point=buy_point,
-            latest_close_price=latest_close_price,
-        )
-
-    if total_score >= min_canslim_score and bullish_gate_ok and fundamentals_gate_ok and breakout_gate_ok:
+    market_permission = market_is_bullish if require_bullish_market else True
+    contract_eligible = isinstance(entry_decision, CanslimEntryDecision) and entry_decision.eligible
+    if contract_eligible and market_permission:
         return "actionable_buy", []
 
-    if total_score < watchlist_min_score:
+    if entry_composite_score < watchlist_min_score:
         return "rejected", ["below_watchlist_score"]
 
-    if total_score < min_canslim_score:
-        notes.append("below_buy_score")
+    if isinstance(entry_decision, CanslimEntryDecision):
+        notes.extend(entry_decision.blocking_reasons)
+    else:
+        notes.append("entry_contract_unavailable")
     if require_bullish_market and not market_is_bullish:
         notes.append("market_not_bullish")
-    if not has_fundamentals:
-        notes.append("missing_fundamentals")
-    if strict_breakout and not is_breakout:
-        notes.append("not_in_breakout")
-    if strict_breakout and not has_volume_surge:
-        notes.append("no_volume_surge")
-    if strict_breakout and not _has_valid_buy_point(buy_point):
-        notes.append("missing_buy_point")
-    if strict_breakout and _has_valid_buy_point(buy_point) and latest_close_price is not None:
-        if float(latest_close_price) < float(buy_point):
-            notes.append("below_buy_point")
-        elif not _is_price_within_breakout_buy_zone(float(latest_close_price), float(buy_point)):
-            notes.append("beyond_buy_zone")
     if not notes:
         notes.append("monitor_setup")
 
     return "watchlist_candidate", notes
-
-
-def _has_valid_buy_point(buy_point: object) -> bool:
-    """Return True when the scanner produced a usable pivot price."""
-    try:
-        return buy_point is not None and float(buy_point) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _is_price_within_breakout_buy_zone(latest_close_price: float, buy_point: float) -> bool:
-    """Return True when the close is inside the actionable pivot-to-buy-zone window."""
-    buy_zone_max = buy_point * (1 + settings.BUY_ZONE_EXTENSION_PCT)
-    buy_zone_min = buy_point * (1 - settings.BUY_ZONE_UNDERCUT_TOLERANCE_PCT)
-    return buy_zone_min <= latest_close_price <= buy_zone_max
-
-
-def _meets_breakout_entry_requirements(
-    *,
-    is_breakout: bool,
-    has_volume_surge: bool,
-    buy_point: object,
-    latest_close_price: object,
-) -> bool:
-    """Return True when a stock is a real executable breakout setup."""
-    if not (is_breakout and has_volume_surge and _has_valid_buy_point(buy_point)):
-        return False
-    try:
-        if latest_close_price is None:
-            return False
-        return _is_price_within_breakout_buy_zone(float(latest_close_price), float(buy_point))
-    except (TypeError, ValueError):
-        return False
 
 
 def evaluate_stock_canslim(
@@ -139,13 +90,14 @@ def evaluate_stock_canslim(
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
     require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
     strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
+    as_of_session: object = None,
 ) -> Optional[Dict[str, object]]:
     """Evaluate a single stock against CANSLIM criteria.
 
     Args:
         symbol: Stock ticker symbol
-        min_rs_score: Minimum RS score threshold
-        min_canslim_score: Minimum CANSLIM composite score threshold
+        min_rs_score: Deprecated advisory request; ignored for entry qualification.
+        min_canslim_score: Deprecated advisory request; ignored for entry qualification.
         market_trend: Pre-calculated market trend
         rs_scores_df: DataFrame with pre-calculated RS scores
         debug: Enable verbose output
@@ -185,7 +137,12 @@ def evaluate_stock_canslim(
     _debug("\n" + "-" * 60)
     _debug(f"[DEBUG] Evaluating {symbol}")
 
-    canslim_view = evaluate_canslim(symbol, rs_scores_df=rs_scores_df, market_trend=market_trend)
+    canslim_view = evaluate_canslim(
+        symbol,
+        rs_scores_df=rs_scores_df,
+        market_trend=market_trend,
+        as_of_session=as_of_session,
+    )
     if not canslim_view:
         _debug("[DEBUG] CANSLIM evaluation unavailable.")
         _flush_logs()
@@ -234,14 +191,19 @@ def evaluate_stock_canslim(
         )
 
     rs_score = float(canslim_view["rs_score"])
-    _debug(f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | Minimum Required: {min_rs_score:.1f}")
-    if rs_score < min_rs_score:
-        _debug("[DEBUG] Fails RS score threshold.")
-        _flush_logs()
-        return None
-
+    _debug(
+        f"[DEBUG] CANSLIM RS Score: {rs_score:.1f} | "
+        f"Canonical Minimum: {CANONICAL_MIN_RS_SCORE:.1f} | "
+        f"Legacy Request (advisory only): {min_rs_score!r}"
+    )
     total_score = float(canslim_view["total_score"])
-    _debug(f"[DEBUG] CANSLIM Total Score: {total_score:.1f} | Minimum Required: {min_canslim_score:.1f}")
+    entry_score = float(canslim_view.get("entry_composite_score", 0.0))
+    _debug(
+        f"[DEBUG] Entry Composite (non-M): {entry_score:.1f} | "
+        f"Canonical Minimum: {CANONICAL_MIN_COMPOSITE_SCORE:.1f} | "
+        f"Legacy Request (advisory only): {min_canslim_score!r} | "
+        f"Legacy M-inclusive Total: {total_score:.1f}"
+    )
     category, notes = _classify_canslim_candidate(
         canslim_view,
         min_rs_score=min_rs_score,
@@ -265,21 +227,6 @@ def evaluate_stock_canslim(
         return None
 
     _debug(f"[DEBUG] {symbol} cleared the RS prefilter and was classified for scanner output.")
-
-    if strict_breakout:
-        if not market_trend.is_bullish:
-            _debug("[DEBUG] Fails strict entry: Market is not in confirmed uptrend (is_bullish=False).")
-            _flush_logs()
-            return None
-        if not canslim_view.get("is_breakout"):
-            _debug("[DEBUG] Fails strict entry: Not breaking out near 52-week high.")
-            _flush_logs()
-            return None
-        if not canslim_view.get("has_volume_surge"):
-            _debug("[DEBUG] Fails strict entry: No volume surge detected.")
-            _flush_logs()
-            return None
-        _debug(f"[DEBUG] ✓ {symbol} meets strict breakout criteria!")
 
     note_text = ", ".join(notes) if notes else "none"
     _debug(f"[DEBUG] Scanner category: {category} | Notes: {note_text}")
@@ -306,8 +253,8 @@ def screen_stocks_canslim_detailed(
         symbols: List of stock ticker symbols to screen
         start_date: Start date for analysis (unused but kept for compatibility)
         end_date: End date for analysis (unused but kept for compatibility)
-        min_rs_score: Minimum relative strength score threshold
-        min_canslim_score: Minimum composite CANSLIM score threshold
+        min_rs_score: Deprecated advisory request; ignored for entry qualification.
+        min_canslim_score: Deprecated advisory request; ignored for entry qualification.
         debug: Enable verbose output
 
     Returns:
@@ -319,7 +266,11 @@ def screen_stocks_canslim_detailed(
 
     # Calculate RS scores for all symbols at once
     symbols_list = list(symbols)
-    rs_scores_df = calculate_rs_scores_for_tickers(symbols_list)
+    as_of_session = getattr(market_trend, "as_of_session", None)
+    rs_scores_df = calculate_rs_scores_for_tickers(
+        symbols_list,
+        as_of_session=as_of_session,
+    )
 
     if debug and not rs_scores_df.empty:
         rs_series = rs_scores_df["RS_Score"].astype(float)
@@ -349,8 +300,9 @@ def screen_stocks_canslim_detailed(
                 "Only watchlist candidates will surface."
             )
 
-    # Pre-filter: discard symbols whose RS score is already below the threshold
-    # to avoid wasting API calls on weak stocks
+    # Pre-filter only below the fixed shared RS contract.  Legacy caller values
+    # cannot prevent a canonically eligible symbol from reaching evaluation.
+    effective_rs_floor = CANONICAL_MIN_RS_SCORE
     filtered_symbols = []
     rs_score_by_symbol: Dict[str, float] = {}
     rs_below_threshold = 0
@@ -367,17 +319,21 @@ def screen_stocks_canslim_detailed(
             rs_val = 0
             rs_not_found += 1
 
-        if rs_val >= min_rs_score:
+        if rs_val >= effective_rs_floor:
             filtered_symbols.append(symbol)
             rs_score_by_symbol[symbol] = rs_val
         else:
             rs_below_threshold += 1
             if debug:
-                print(f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < {min_rs_score}, skipped")
+                print(
+                    f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < "
+                    f"{effective_rs_floor:.1f}, skipped"
+                )
 
     if debug:
         print(
-            f"[DEBUG] Pre-filter: {rs_below_threshold} stocks below RS {min_rs_score} | "
+            f"[DEBUG] Pre-filter: {rs_below_threshold} stocks below RS "
+            f"{effective_rs_floor:.1f} | "
             f"{rs_not_found} not found in RS universe | "
             f"{len(filtered_symbols)}/{len(symbols_list)} passed"
         )
@@ -398,6 +354,7 @@ def screen_stocks_canslim_detailed(
                 require_bullish_market=require_bullish_market,
                 require_fundamentals=require_fundamentals,
                 strict_breakout=strict_breakout,
+                as_of_session=as_of_session,
             )
         except Exception as exc:
             print(f"Error analyzing {sym}: {exc}")
@@ -425,7 +382,12 @@ def screen_stocks_canslim_detailed(
         rejected_score = len(filtered_symbols) - passed
         classified = len(actionable_buys) + len(watchlist_candidates)
         market_blocked = sum(1 for r in results if "market_not_bullish" in set(r.get("scanner_notes", [])))
-        missing_fund = sum(1 for r in results if "missing_fundamentals" in set(r.get("scanner_notes", [])))
+        missing_fund = sum(
+            1
+            for result in results
+            if {"current_growth_unavailable", "annual_growth_unavailable"}
+            & set(result.get("scanner_notes", []))
+        )
         print(
             f"[DEBUG] Post-scan summary: {len(symbols_list)} total | "
             f"{rs_below_threshold} failed RS pre-filter | "

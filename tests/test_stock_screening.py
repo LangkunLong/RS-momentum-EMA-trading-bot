@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from core.canslim import evaluate_canslim
+from core.canslim.entry_contract import CanslimEntryFacts, evaluate_entry_contract
 from core.canslim.m_market_direction import MarketTrend
 from core.stock_screening import (
     _classify_canslim_candidate,
@@ -25,9 +26,44 @@ def _make_view(
     latest_close_price: float | None = 103.0,
     fmp_quota_deferred: bool = False,
 ) -> dict:
+    fact_reasons: list[str] = []
+    if not is_breakout:
+        fact_reasons.append("close_below_pivot")
+    if not has_volume_surge:
+        fact_reasons.append("volume_ratio_below_threshold")
+    if buy_point is None or latest_close_price is None:
+        fact_reasons.append("insufficient_close_history")
+    elif latest_close_price > buy_point * 1.05:
+        fact_reasons.append("close_above_buy_zone")
+    facts = CanslimEntryFacts(
+        event_close=latest_close_price,
+        prior_close=(latest_close_price - 1.0) if latest_close_price is not None else None,
+        event_volume=1_300_000.0,
+        prior_average_volume_50=1_000_000.0,
+        pivot=buy_point,
+        volume_ratio=1.3 if has_volume_surge else 1.29,
+        extension=(latest_close_price / buy_point - 1.0)
+        if latest_close_price is not None and buy_point
+        else None,
+        price_advanced=latest_close_price is not None,
+        has_volume_surge=has_volume_surge,
+        in_buy_zone=not fact_reasons,
+        eligible=not fact_reasons,
+        blocking_reasons=tuple(fact_reasons),
+    )
+    entry_decision = evaluate_entry_contract(
+        facts,
+        current_growth=0.30 if has_fundamentals else None,
+        annual_growth=0.30 if has_fundamentals else None,
+        rs_score=rs_score,
+        composite_score=total_score,
+    )
     return {
         "rs_score": rs_score,
         "total_score": total_score,
+        "entry_composite_score": total_score,
+        "entry_facts": facts,
+        "entry_decision": entry_decision,
         "metrics": {
             "has_fundamentals": has_fundamentals,
             "fmp_quota_deferred": fmp_quota_deferred,
@@ -72,7 +108,8 @@ def test_classifier_marks_bearish_market_name_as_watchlist() -> None:
 
     assert category == "watchlist_candidate"
     assert "market_not_bullish" in notes
-    assert "missing_fundamentals" in notes
+    assert "current_growth_unavailable" in notes
+    assert "annual_growth_unavailable" in notes
 
 
 def test_classifier_marks_bullish_missing_fundamentals_name_as_watchlist() -> None:
@@ -85,7 +122,8 @@ def test_classifier_marks_bullish_missing_fundamentals_name_as_watchlist() -> No
     )
 
     assert category == "watchlist_candidate"
-    assert "missing_fundamentals" in notes
+    assert "current_growth_unavailable" in notes
+    assert "annual_growth_unavailable" in notes
 
 
 def test_classifier_marks_budget_skipped_name_as_quota_deferred() -> None:
@@ -120,30 +158,30 @@ def test_classifier_rejects_name_below_watchlist_floor() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_rs_exactly_at_threshold_is_not_rejected() -> None:
-    """RS equal to the minimum threshold must pass the pre-filter."""
+def test_rs_exactly_at_canonical_threshold_is_not_rejected() -> None:
+    """RS equal to the fixed canonical threshold must pass."""
     category, notes = _classify_canslim_candidate(
-        _make_view(rs_score=75.0),
-        min_rs_score=75,
-        min_canslim_score=65,
+        _make_view(rs_score=80.0),
+        min_rs_score=99,
+        min_canslim_score=99,
         watchlist_min_score=30,
         require_bullish_market=False,
     )
     assert category == "actionable_buy"
-    assert "below_rs_threshold" not in notes
+    assert notes == []
 
 
-def test_rs_one_tenth_below_threshold_is_rejected() -> None:
-    """RS fractionally below the minimum must be rejected immediately."""
+def test_rs_one_tenth_below_canonical_threshold_is_watchlisted() -> None:
+    """RS fractionally below the fixed floor cannot become actionable."""
     category, notes = _classify_canslim_candidate(
-        _make_view(rs_score=74.9),
-        min_rs_score=75,
-        min_canslim_score=65,
+        _make_view(rs_score=79.9),
+        min_rs_score=0,
+        min_canslim_score=0,
         watchlist_min_score=30,
         require_bullish_market=False,
     )
-    assert category == "rejected"
-    assert notes == ["below_rs_threshold"]
+    assert category == "watchlist_candidate"
+    assert notes == ["rs_score_below_threshold"]
 
 
 def test_rs_well_above_threshold_passes() -> None:
@@ -168,7 +206,7 @@ def test_strict_breakout_blocks_non_breakout_name_from_actionable_buys() -> None
     )
 
     assert category == "watchlist_candidate"
-    assert "not_in_breakout" in notes
+    assert "close_below_pivot" in notes
 
 
 def test_strict_breakout_blocks_missing_pivot_from_actionable_buys() -> None:
@@ -181,7 +219,7 @@ def test_strict_breakout_blocks_missing_pivot_from_actionable_buys() -> None:
     )
 
     assert category == "watchlist_candidate"
-    assert "missing_buy_point" in notes
+    assert "insufficient_close_history" in notes
 
 
 def test_strict_breakout_blocks_price_above_buy_zone_from_actionable_buys() -> None:
@@ -194,7 +232,7 @@ def test_strict_breakout_blocks_price_above_buy_zone_from_actionable_buys() -> N
     )
 
     assert category == "watchlist_candidate"
-    assert "beyond_buy_zone" in notes
+    assert "close_above_buy_zone" in notes
 
 
 def test_quota_deferred_candidate_survives_strict_breakout_filter() -> None:

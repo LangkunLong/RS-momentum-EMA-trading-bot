@@ -30,8 +30,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import settings
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
+from core.canslim.entry_contract import (
+    CanslimEntryFacts,
+    build_entry_facts,
+    evaluate_entry_contract,
+)
 from core.canslim.i_institutional import evaluate_i
 from core.canslim.m_market_direction import evaluate_m
+from core.canslim.n_new_products import evaluate_n
 from core.canslim.s_supply_demand import evaluate_s
 from core.data_client import (
     clear_session_cache,
@@ -43,7 +49,7 @@ from core.data_client import (
 )
 from core.index_ticker_fetcher import get_sp500_tickers
 from core.momentum_analysis import calculate_weighted_performance
-from core.pivot_detector import find_pivot, is_in_buy_zone
+from core.trading_sessions import exact_session_row, history_through_exact_session
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -85,8 +91,19 @@ def _download_bulk_closes(tickers: List[str], period: str = "3y") -> pd.DataFram
 
 def _calculate_rs_at_date(all_closes: pd.DataFrame, ticker: str, eval_date: pd.Timestamp) -> float:
     """Calculate RS score for a ticker as-of a specific date."""
-    # Slice data up to eval_date
-    sliced = all_closes.loc[:eval_date].dropna(axis=1, how="all")
+    sliced = history_through_exact_session(all_closes, eval_date)
+    event_row = exact_session_row(all_closes, eval_date)
+    if sliced is None or event_row is None:
+        return 0.0
+    fresh_columns = []
+    for column in sliced.columns:
+        try:
+            value = float(event_row[column])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if np.isfinite(value):
+            fresh_columns.append(column)
+    sliced = sliced.loc[:, fresh_columns].dropna(axis=1, how="all")
     if ticker not in sliced.columns:
         return 0.0
 
@@ -135,10 +152,16 @@ def _evaluate_technical_at_date(
     ticker_data: pd.DataFrame,
     eval_date: pd.Timestamp,
     shares_outstanding: Optional[float],
-) -> Dict[str, object]:
+    *,
+    quarterly_income: Optional[pd.DataFrame] = None,
+) -> Optional[Dict[str, object]]:
     """Evaluate N and S technical criteria as-of a specific date."""
-    sliced = ticker_data.loc[:eval_date].copy()
+    sliced = history_through_exact_session(ticker_data, eval_date)
+    if sliced is None:
+        return None
     if len(sliced) < 60:
+        closes = extract_float_series(sliced, "Close") if "Close" in sliced else pd.Series(dtype=float)
+        volumes = extract_float_series(sliced, "Volume") if "Volume" in sliced else pd.Series(dtype=float)
         return {
             "n_score": 0.0,
             "s_score": 0.0,
@@ -146,7 +169,8 @@ def _evaluate_technical_at_date(
             "is_breakout": False,
             "has_volume_surge": False,
             "pivot": None,
-            "in_buy_zone": True,
+            "in_buy_zone": False,
+            "entry_facts": build_entry_facts(closes, volumes),
         }
 
     closes = extract_float_series(sliced, "Close")
@@ -157,41 +181,35 @@ def _evaluate_technical_at_date(
     lookback_252 = min(252, len(closes))
     high_52 = coerce_scalar(closes.iloc[-lookback_252:].max())
     proximity = latest_close / high_52 if high_52 else 0.0
-    avg_vol_50 = float(volumes.tail(50).mean()) if len(volumes) >= 50 else float(volumes.mean())
+    entry_facts = build_entry_facts(closes, volumes)
+    avg_vol_50 = entry_facts.prior_average_volume_50 or 0.0
 
-    # N score (proximity only — we don't have historical quarterly revenue)
-    if proximity >= 0.98:
-        proximity_score = 1.0
-    elif proximity >= 0.90:
-        proximity_score = (proximity - 0.90) / (0.98 - 0.90)
-    elif proximity >= 0.75:
-        proximity_score = (proximity - 0.75) / (0.90 - 0.75) * 0.3
-    else:
-        proximity_score = 0.0
-    # Use proximity as full N score since we can't get historical revenue
-    n_score = float(np.clip(proximity_score, 0, 1))
+    n_frame = quarterly_income if isinstance(quarterly_income, pd.DataFrame) else pd.DataFrame()
+    n_score, revenue_growth = evaluate_n(n_frame, proximity)
 
     # S score
     score_s, s_metrics = evaluate_s(
         sliced, avg_vol_50, latest_close, high_52, shares_outstanding, s_breakout_proximity=0.95
     )
 
-    pivot = find_pivot(closes)
-    in_buy_zone = is_in_buy_zone(latest_close, pivot) if pivot is not None else True
-
     return {
         "n_score": n_score,
+        "revenue_growth": revenue_growth,
         "s_score": score_s,
         "proximity": proximity,
         "close": latest_close,
         "high_52": high_52,
         "avg_vol_50": avg_vol_50,
-        "is_breakout": s_metrics.get("is_breakout", False),
-        "has_volume_surge": s_metrics.get("has_volume_surge", False),
+        "is_breakout": entry_facts.in_buy_zone,
+        "has_volume_surge": entry_facts.has_volume_surge,
+        "diagnostic_near_high": s_metrics.get("is_breakout", False),
         "has_power_gap": s_metrics.get("has_power_gap", False),
         "power_gap_details": s_metrics.get("power_gap_details", {}),
-        "pivot": pivot,
-        "in_buy_zone": in_buy_zone,
+        "pivot": entry_facts.pivot,
+        "in_buy_zone": entry_facts.in_buy_zone,
+        "technical_eligible": entry_facts.eligible,
+        "entry_blocking_reasons": entry_facts.blocking_reasons,
+        "entry_facts": entry_facts,
     }
 
 
@@ -213,9 +231,15 @@ def _evaluate_fundamentals_at_date(symbol: str, eval_date: pd.Timestamp) -> Dict
 
         held_pct = info.get("held_percent_institutions")
         num_holders = info.get("institution_count")
-        score_i = evaluate_i(held_pct, num_institutional_holders=num_holders)
+        prev_num_holders = info.get("prev_institution_count")
+        score_i = evaluate_i(
+            held_pct,
+            num_institutional_holders=num_holders,
+            prev_num_institutional_holders=prev_num_holders,
+        )
         shares = info.get("shares_outstanding")
-        institutional_data_available = held_pct is not None or num_holders is not None
+        institutional_trend_available = num_holders is not None and prev_num_holders is not None
+        institutional_data_available = held_pct is not None or institutional_trend_available
 
         return {
             "c_score": score_c,
@@ -226,6 +250,7 @@ def _evaluate_fundamentals_at_date(symbol: str, eval_date: pd.Timestamp) -> Dict
             "roe": roe,
             "shares_outstanding": shares,
             "institutional_data_available": institutional_data_available,
+            "quarterly_income": qi,
         }
     except Exception as e:
         print(f"    ERROR fetching fundamentals for {symbol} @ {eval_date.date()}: {e}")
@@ -252,6 +277,46 @@ def _compute_canslim_score(
     institutional_data_available: bool = True,
 ) -> float:
     """Compute weighted CANSLIM composite score (0-100)."""
+    weights = _active_canslim_weights(institutional_data_available)
+    score = (
+        weights["C"] * c
+        + weights["A"] * a
+        + weights["N"] * n
+        + weights["S"] * s
+        + weights["L"] * l_score
+        + weights["I"] * i
+        + weights["M"] * m
+    ) * 100
+    return float(score)
+
+
+def _compute_entry_composite_score(
+    c: float,
+    a: float,
+    n: float,
+    s: float,
+    l_score: float,
+    i: float,
+    institutional_data_available: bool = True,
+) -> float:
+    """Compute the non-M entry composite, renormalized to 100%."""
+    weights = _active_canslim_weights(institutional_data_available)
+    entry_weight = sum(weight for key, weight in weights.items() if key != "M")
+    if entry_weight <= 0:
+        return 0.0
+    score = (
+        weights["C"] * c
+        + weights["A"] * a
+        + weights["N"] * n
+        + weights["S"] * s
+        + weights["L"] * l_score
+        + weights["I"] * i
+    ) * 100 / entry_weight
+    return float(score)
+
+
+def _active_canslim_weights(institutional_data_available: bool) -> Dict[str, float]:
+    """Return the existing active component weights for one evaluation."""
     weights = {
         "C": settings.CANSLIM_WEIGHT_C,
         "A": settings.CANSLIM_WEIGHT_A,
@@ -270,39 +335,38 @@ def _compute_canslim_score(
                 if key != "I":
                     weights[key] = weights[key] / remaining_weight
 
-    score = (
-        weights["C"] * c
-        + weights["A"] * a
-        + weights["N"] * n
-        + weights["S"] * s
-        + weights["L"] * l_score
-        + weights["I"] * i
-        + weights["M"] * m
-    ) * 100
-    return float(score)
+    return weights
 
 
 def _should_emit_buy_signal(
     *,
-    total_score: float,
-    rs_score: float,
-    market_is_bullish: bool,
-    has_breakout: bool,
-    has_volume_surge: bool,
-    has_peg_today: bool,
+    entry_facts: CanslimEntryFacts | None = None,
+    current_growth: object = None,
+    annual_growth: object = None,
+    composite_score: object = None,
+    total_score: float | None = None,
+    rs_score: float | None = None,
+    market_is_bullish: bool | None = None,
+    has_breakout: bool | None = None,
+    has_volume_surge: bool | None = None,
+    has_peg_today: bool | None = None,
     in_buy_zone: bool = True,
 ) -> bool:
-    """Return True only for signals that satisfy the live-style buy gates.
+    """Return the full shared CANSLIM decision for the simple backtest.
 
-    Note: min score is 40 (not MIN_CANSLIM_SCORE=70) because the backtest runs
-    without FMP fundamentals (C, A, I score as 0/neutral), capping achievable scores at ~55.
-    The market bullish gate is intentionally omitted here to let all regime windows evaluate.
+    Market and the legacy technical/PEG keywords remain accepted for call
+    compatibility but are diagnostic only. ``total_score`` is M-inclusive and
+    therefore cannot substitute for the non-M ``composite_score``.
     """
-    return (
-        total_score >= 40  # Lowered from MIN_CANSLIM_SCORE — FMP unavailable in backtest
-        and rs_score >= settings.MIN_RS_SCORE
-        and ((has_breakout and has_volume_surge and in_buy_zone) or has_peg_today)
-    )
+    if entry_facts is None:
+        return False
+    return evaluate_entry_contract(
+        entry_facts,
+        current_growth=current_growth,
+        annual_growth=annual_growth,
+        rs_score=rs_score,
+        composite_score=composite_score,
+    ).eligible
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +428,8 @@ def run_backtest() -> pd.DataFrame:
 
             tdata = ticker_ohlcv[ticker]
             # Check if we have data at this date
-            available = tdata.loc[:eval_date]
-            if len(available) < 60:
+            available = history_through_exact_session(tdata, eval_date)
+            if available is None or len(available) < 60:
                 continue
 
             # RS score
@@ -378,7 +442,14 @@ def run_backtest() -> pd.DataFrame:
             fund = _evaluate_fundamentals_at_date(ticker, eval_date)
 
             # Technical scores (N, S)
-            tech = _evaluate_technical_at_date(tdata, eval_date, fund.get("shares_outstanding"))
+            tech = _evaluate_technical_at_date(
+                tdata,
+                eval_date,
+                fund.get("shares_outstanding"),
+                quarterly_income=fund.get("quarterly_income"),
+            )
+            if tech is None:
+                continue
 
             # Fundamental scores
             c_score = fund.get("c_score", 0.0)
@@ -395,24 +466,32 @@ def run_backtest() -> pd.DataFrame:
                 m=m_score,
                 institutional_data_available=bool(fund.get("institutional_data_available", False)),
             )
-
-            # --- UPDATED SIGNAL LOGIC ---
-            has_breakout = bool(tech.get("is_breakout", False))
-            has_surge = bool(tech.get("has_volume_surge", False))
+            entry_composite = _compute_entry_composite_score(
+                c=c_score,
+                a=a_score,
+                n=tech["n_score"],
+                s=tech["s_score"],
+                l_score=l_score,
+                i=i_score,
+                institutional_data_available=bool(fund.get("institutional_data_available", False)),
+            )
 
             # Only count the Power Earnings Gap if it happened exactly on this eval date (days_ago == 0)
             peg_details = tech.get("power_gap_details") or {}
             has_peg_today = bool(tech.get("has_power_gap", False)) and peg_details.get("days_ago") == 0
 
-            buy_signal = _should_emit_buy_signal(
-                total_score=total,
-                rs_score=rs_score,
-                market_is_bullish=bool(m_bullish),
-                has_breakout=has_breakout,
-                has_volume_surge=has_surge,
-                has_peg_today=has_peg_today,
-                in_buy_zone=bool(tech.get("in_buy_zone", True)),
+            entry_facts = tech.get("entry_facts")
+            technical_setup = bool(
+                isinstance(entry_facts, CanslimEntryFacts) and entry_facts.eligible
             )
+            entry_decision = evaluate_entry_contract(
+                entry_facts,
+                current_growth=fund.get("current_growth"),
+                annual_growth=fund.get("annual_growth"),
+                rs_score=rs_score,
+                composite_score=entry_composite,
+            )
+            buy_signal = entry_decision.eligible
             close_price = tech["close"]
 
             records.append(
@@ -422,6 +501,7 @@ def run_backtest() -> pd.DataFrame:
                     "Close": round(close_price, 2),
                     "RS_Score": round(rs_score, 1),
                     "CANSLIM_Score": round(total, 1),
+                    "Entry_Composite_Score": round(entry_composite, 1),
                     "C": round(c_score * 100, 0),
                     "A": round(a_score * 100, 0),
                     "N": round(tech["n_score"] * 100, 0),
@@ -436,6 +516,9 @@ def run_backtest() -> pd.DataFrame:
                     "Is_Breakout": tech.get("is_breakout", False),
                     "Has_Vol_Surge": tech.get("has_volume_surge", False),
                     "Has_PEG": has_peg_today,
+                    "Setup_Blockers": ",".join(tech.get("entry_blocking_reasons", ())),
+                    "Entry_Blockers": ",".join(entry_decision.blocking_reasons),
+                    "TECHNICAL_SETUP": technical_setup,
                     "BUY_SIGNAL": buy_signal,
                 }
             )
@@ -451,19 +534,21 @@ def print_results(df: pd.DataFrame) -> None:
         return
 
     print("\n" + "=" * 100)
-    print("BACKTEST RESULTS — BUY SIGNALS")
+    print("BACKTEST RESULTS — FULL CANSLIM BUY SIGNALS")
     print("=" * 100)
     print(
         "NOTE: C, A, I scores use point-in-time FMP data (filtered by SEC filing date).\n"
         "      N, S, L, M scores are calculated from historical price data.\n"
+        "      TECHNICAL_SETUP reports the shared completed-session price/volume setup.\n"
+        "      BUY_SIGNAL additionally requires PIT C/A, RS, and the non-M entry composite;\n"
+        "      market regime is reported separately and PEG remains diagnostic only.\n"
     )
 
     buys = df[df["BUY_SIGNAL"]]
     if buys.empty:
-        print("No buy signals were generated with the default thresholds")
-        print(f"(RS >= {settings.MIN_RS_SCORE}, CANSLIM >= {settings.MIN_CANSLIM_SCORE}).\n")
+        print("No full canonical CANSLIM buy signals were generated.\n")
     else:
-        print(f"Buy signals generated: {len(buys)}\n")
+        print(f"Full CANSLIM buy signals generated: {len(buys)}\n")
         print(
             f"{'Date':<12} {'Ticker':<7} {'Close':>8} {'RS':>5} {'CANSLIM':>8} "
             f"{'C':>4} {'A':>4} {'N':>4} {'S':>4} {'L':>4} {'I':>4} {'M':>4} "

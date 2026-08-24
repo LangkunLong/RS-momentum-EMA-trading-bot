@@ -56,8 +56,8 @@ def _rows(snapshot: object) -> dict[str, dict[str, object]]:
     return {row["symbol"]: row for row in snapshot.rows}  # type: ignore[attr-defined]
 
 
-def test_snapshot_catches_rs_and_missing_history_breaks() -> None:
-    """A regression that skips RS ranking or omits absent symbols must fail here."""
+def test_snapshot_ranks_rs_without_turning_it_into_a_full_entry_gate() -> None:
+    """After-close keeps RS ranking metadata but remains technical-only."""
     bullish_spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
     qualifying_leader = _history()
     low_rs = _history(anchors=(100.0, 100.0, 100.0, 100.0))
@@ -70,7 +70,9 @@ def test_snapshot_catches_rs_and_missing_history_breaks() -> None:
     rows = _rows(snapshot)
 
     assert rows["LEAD"]["technical_eligible"] is True
-    assert rows["LOW"]["blocking_reasons"] == "rs_below_threshold"
+    assert rows["LOW"]["technical_eligible"] is True
+    assert rows["LOW"]["blocking_reasons"] == ""
+    assert rows["LOW"]["rs_score"] < rows["LEAD"]["rs_score"]
     assert rows["MISSING"]["blocking_reasons"] == "missing_price_history"
 
 
@@ -84,6 +86,45 @@ def test_snapshot_catches_stale_session_break() -> None:
     assert _rows(snapshot)["STALE"]["blocking_reasons"] == "stale_price_history"
 
 
+def test_snapshot_uses_one_canonical_view_for_unsorted_history() -> None:
+    """Break caught: the session label was canonical but snapshot facts used raw order."""
+    spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
+    leader = _history()
+    expected = _rows(
+        build_after_close_snapshot(
+            {"SPY": spy, "LEAD": leader},
+            market=_market(),
+            expected_symbols=["LEAD"],
+        )
+    )["LEAD"]
+
+    actual = _rows(
+        build_after_close_snapshot(
+            {"SPY": spy.iloc[::-1], "LEAD": leader.iloc[::-1]},
+            market=_market(),
+            expected_symbols=["LEAD"],
+        )
+    )["LEAD"]
+
+    for field in (
+        "technical_eligible",
+        "blocking_reasons",
+        "close",
+        "prior_close",
+        "pivot",
+        "volume_ratio_50d",
+        "average_dollar_volume_50d",
+        "atr_pct_20d",
+        "realized_volatility_20d",
+        "weighted_performance",
+        "rs_score",
+    ):
+        if isinstance(expected[field], float):
+            assert actual[field] == pytest.approx(expected[field])
+        else:
+            assert actual[field] == expected[field]
+
+
 def test_snapshot_catches_no_up_day_volume_surge_break() -> None:
     """A regression that accepts below-threshold volume must fail here."""
     spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
@@ -94,11 +135,11 @@ def test_snapshot_catches_no_up_day_volume_surge_break() -> None:
         {"SPY": spy, "LEAD": leader, "QUIET": quiet}, market=_market(), expected_symbols=["QUIET"]
     )
 
-    assert _rows(snapshot)["QUIET"]["blocking_reasons"] == "no_up_day_volume_surge"
+    assert _rows(snapshot)["QUIET"]["blocking_reasons"] == "volume_ratio_below_threshold"
 
 
-def test_snapshot_volume_gate_matches_live_trailing_fifty_baseline() -> None:
-    """A regression that excludes the latest completed volume from the live baseline must fail here."""
+def test_snapshot_volume_gate_uses_the_prior_fifty_session_baseline() -> None:
+    """The event bar must not dilute its own fixed prior-50 volume baseline."""
     spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
     boundary = _history(latest_volume=1_300.0)
 
@@ -107,13 +148,14 @@ def test_snapshot_volume_gate_matches_live_trailing_fifty_baseline() -> None:
     )
     row = _rows(snapshot)["BOUNDARY"]
 
-    assert row["volume_ratio_50d"] == pytest.approx(1_300.0 / 1_006.0)
-    assert row["average_dollar_volume_50d"] == pytest.approx(16_052.0)
-    assert row["blocking_reasons"] == "no_up_day_volume_surge"
+    assert row["volume_ratio_50d"] == pytest.approx(1.3)
+    assert row["average_dollar_volume_50d"] == pytest.approx(13_600.0)
+    assert row["technical_eligible"] is True
+    assert row["blocking_reasons"] == ""
 
 
-def test_snapshot_accumulates_price_volume_and_rs_blockers_in_order() -> None:
-    """A regression that stops audit evaluation after the first technical blocker must fail here."""
+def test_snapshot_keeps_rs_as_ranking_metadata_when_volume_blocks() -> None:
+    """A weak RS rank cannot masquerade as a full-CANSLIM after-close gate."""
     spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
     leader = _history()
     low_and_quiet = _history(anchors=(100.0, 100.0, 100.0, 100.0), latest_volume=1_200.0)
@@ -125,8 +167,9 @@ def test_snapshot_accumulates_price_volume_and_rs_blockers_in_order() -> None:
     )
     row = _rows(snapshot)["LOW"]
 
-    assert row["blocking_reasons"] == "no_up_day_volume_surge,rs_below_threshold"
-    assert row["normalized_trigger_gap"] == pytest.approx(0.375 + (1.3 - 1_200.0 / 1_004.0) / 1.3)
+    assert row["blocking_reasons"] == "volume_ratio_below_threshold"
+    assert row["rs_score"] < _rows(snapshot)["LEAD"]["rs_score"]
+    assert row["normalized_trigger_gap"] == pytest.approx((1.3 - 1.2) / 1.3)
 
 
 def test_snapshot_catches_below_pivot_break() -> None:
@@ -139,7 +182,7 @@ def test_snapshot_catches_below_pivot_break() -> None:
         {"SPY": spy, "LEAD": leader, "BELOW": below}, market=_market(), expected_symbols=["BELOW"]
     )
 
-    assert _rows(snapshot)["BELOW"]["blocking_reasons"] == "below_pivot"
+    assert _rows(snapshot)["BELOW"]["blocking_reasons"] == "close_below_pivot"
 
 
 def test_snapshot_catches_beyond_buy_zone_break() -> None:
@@ -152,7 +195,7 @@ def test_snapshot_catches_beyond_buy_zone_break() -> None:
         {"SPY": spy, "LEAD": leader, "EXTENDED": extended}, market=_market(), expected_symbols=["EXTENDED"]
     )
 
-    assert _rows(snapshot)["EXTENDED"]["blocking_reasons"] == "beyond_buy_zone"
+    assert _rows(snapshot)["EXTENDED"]["blocking_reasons"] == "close_above_buy_zone"
 
 
 def test_snapshot_uses_prior_close_max_when_latest_high_is_intraday_spike() -> None:
@@ -182,8 +225,8 @@ def test_snapshot_normalizes_extended_gap_by_buy_zone_extension_threshold() -> N
     assert _rows(snapshot)["EXTENDED"]["normalized_trigger_gap"] == pytest.approx(0.2)
 
 
-def test_snapshot_honors_nonzero_buy_zone_undercut_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A regression that compares the lower buy-zone edge directly with pivot must fail here."""
+def test_snapshot_ignores_legacy_buy_zone_undercut_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy settings cannot loosen the fixed canonical pivot lower bound."""
     monkeypatch.setattr("core.after_close_snapshot.settings.BUY_ZONE_UNDERCUT_TOLERANCE_PCT", 0.02)
     spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
     edge = _history(previous_close=97.0, latest_close=98.0)
@@ -196,9 +239,10 @@ def test_snapshot_honors_nonzero_buy_zone_undercut_tolerance(monkeypatch: pytest
         {"SPY": spy, "BELOW": below}, market=_market(), expected_symbols=["BELOW"]
     )
 
-    assert _rows(edge_snapshot)["EDGE"]["technical_eligible"] is True
-    assert _rows(below_snapshot)["BELOW"]["blocking_reasons"] == "below_pivot"
-    assert _rows(below_snapshot)["BELOW"]["normalized_trigger_gap"] == pytest.approx(1.0 / 98.0)
+    assert _rows(edge_snapshot)["EDGE"]["technical_eligible"] is False
+    assert _rows(edge_snapshot)["EDGE"]["blocking_reasons"] == "close_below_pivot"
+    assert _rows(below_snapshot)["BELOW"]["blocking_reasons"] == "close_below_pivot"
+    assert _rows(below_snapshot)["BELOW"]["normalized_trigger_gap"] == pytest.approx(0.03)
 
 
 def test_snapshot_catches_under_thirty_bar_history_break() -> None:

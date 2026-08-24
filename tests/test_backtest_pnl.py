@@ -38,11 +38,30 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from core.canslim.entry_contract import CanslimEntryFacts
 from backtest_pnl import (
     PortfolioSimulator,
     SimulationResult,
     Trade,
 )
+
+
+def _eligible_entry_facts() -> CanslimEntryFacts:
+    """Return canonical facts for mocked technical evaluator responses."""
+    return CanslimEntryFacts(
+        event_close=110.0,
+        prior_close=109.0,
+        event_volume=2_600_000.0,
+        prior_average_volume_50=2_000_000.0,
+        pivot=108.0,
+        volume_ratio=1.3,
+        extension=110.0 / 108.0 - 1.0,
+        price_advanced=True,
+        has_volume_surge=True,
+        in_buy_zone=True,
+        eligible=True,
+        blocking_reasons=(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +74,14 @@ _FIXTURE_END = pd.Timestamp("2026-07-31")
 def _business_dates(periods: int) -> pd.DatetimeIndex:
     """Return an exact, wall-clock-independent number of business dates."""
     return pd.bdate_range(end=_FIXTURE_END, periods=periods)
+
+
+def _rs_universe(symbol: str, closes: list[float], index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Build a sufficiently large RS universe for the production percentile gate."""
+    data = {symbol: closes}
+    for ref_idx in range(9):
+        data[f"REF{ref_idx}"] = [100.0 * (0.99 ** i) for i in range(len(index))]
+    return pd.DataFrame(data, index=index)
 
 
 def _make_ohlcv(
@@ -543,21 +570,31 @@ class TestPortfolioSimulatorRun:
         closes = [100.0 * (1.001 ** i) for i in range(n)]
         lows = [c * 0.99 for c in closes]
         highs = [c * 1.01 for c in closes]
-        opens = [c * 0.995 for c in closes]
+        # Keep the next session open inside the prior pivot's buy zone so the
+        # execution-boundary check can exercise a valid synthetic entry.  A
+        # single late volume spike creates one causal completed-session setup.
+        opens = list(closes)
+        volumes = [2_000_000] * n
+        if n >= 2:
+            volumes[-2] = 3_000_000
         df = pd.DataFrame({
-            "Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": [2_000_000]*n
+            "Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": volumes
         }, index=dates)
         spy = df.copy()
         return {symbol: df, "SPY": spy}
 
     def test_run_returns_simulation_result(self) -> None:
-        sim = _make_simulator()
-
         # n=150 >> lookback_weeks=8 (40 business days) — generous padding
         ticker_ohlcv = self._make_full_signal_ticker_ohlcv("NVDA", n=150)
-        all_closes = pd.DataFrame({
-            "NVDA": [100.0 * (1.001**i) for i in range(150)],
-        }, index=ticker_ohlcv["NVDA"].index)
+        all_closes = _rs_universe(
+            "NVDA",
+            [100.0 * (1.001**i) for i in range(150)],
+            ticker_ohlcv["NVDA"].index,
+        )
+        fetcher = MagicMock()
+        fetcher.fetch_price_data.return_value = ticker_ohlcv
+        fetcher.fetch_rs_universe_closes.return_value = all_closes
+        sim = _make_simulator(data_fetcher=fetcher)
 
         with (
             patch("backtest_pnl._download_price_data", return_value=ticker_ohlcv),
@@ -573,7 +610,7 @@ class TestPortfolioSimulatorRun:
                 "n_score": 0.9, "s_score": 0.8, "proximity": 0.99, "close": 110.0,
                 "high_52": 112.0, "avg_vol_50": 2_000_000,
                 "is_breakout": True, "has_volume_surge": True,
-                "has_power_gap": False, "power_gap_details": {},
+                "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
             }),
             patch("backtest_pnl._compute_canslim_score", return_value=75.0),
             patch("backtest_pnl.clear_session_cache"),
@@ -626,9 +663,15 @@ class TestPortfolioSimulatorRun:
 
         # n=150 bars >> lookback_weeks=8 (40 business days)
         ticker_ohlcv = self._make_full_signal_ticker_ohlcv("NVDA", n=150)
-        all_closes = pd.DataFrame({
-            "NVDA": [100.0 * (1.001**i) for i in range(150)],
-        }, index=ticker_ohlcv["NVDA"].index)
+        all_closes = _rs_universe(
+            "NVDA",
+            [100.0 * (1.001**i) for i in range(150)],
+            ticker_ohlcv["NVDA"].index,
+        )
+        fetcher = MagicMock()
+        fetcher.fetch_price_data.return_value = ticker_ohlcv
+        fetcher.fetch_rs_universe_closes.return_value = all_closes
+        sim.data_fetcher = fetcher
 
         with (
             patch("backtest_pnl._download_price_data", return_value=ticker_ohlcv),
@@ -644,7 +687,7 @@ class TestPortfolioSimulatorRun:
                 "n_score": 0.9, "s_score": 0.8, "proximity": 0.99, "close": 110.0,
                 "high_52": 112.0, "avg_vol_50": 2_000_000,
                 "is_breakout": True, "has_volume_surge": True,
-                "has_power_gap": False, "power_gap_details": {},
+                "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
             }),
             patch("backtest_pnl._compute_canslim_score", return_value=75.0),
             patch("backtest_pnl.clear_session_cache"),
@@ -669,15 +712,17 @@ class TestPortfolioSimulatorRun:
         # then 30 bars crash to 80 (below stop of 105*0.93≈97.65 → stop triggers).
         n = 150
         dates = _business_dates(n)
-        closes = [100.0] * 110 + [105.0] * 10 + [80.0] * 30
+        closes = [100.0] * 110 + [100.5 + 0.5 * i for i in range(10)] + [80.0] * 30
         lows = [c * 0.99 for c in closes[:120]] + [c * 0.98 for c in closes[120:]]
         highs = [c * 1.01 for c in closes]
-        opens = [c * 0.995 for c in closes]
+        opens = list(closes)
+        volumes = [1_000_000] * n
+        volumes[118] = 2_000_000
         crash_df = pd.DataFrame({
-            "Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": [2_000_000] * n,
+            "Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": volumes,
         }, index=dates)
         ticker_ohlcv = {"NVDA": crash_df, "SPY": crash_df.copy()}
-        all_closes = pd.DataFrame({"NVDA": closes}, index=dates)
+        all_closes = _rs_universe("NVDA", closes, dates)
 
         # Inject a mock DataFetcher to bypass the SQLite cache, ensuring synthetic
         # data is used regardless of any cached real historical data.
@@ -705,7 +750,7 @@ class TestPortfolioSimulatorRun:
                 "n_score": 0.9, "s_score": 0.8, "proximity": 0.99, "close": 105.0,
                 "high_52": 107.0, "avg_vol_50": 2_000_000,
                 "is_breakout": True, "has_volume_surge": True,
-                "has_power_gap": False, "power_gap_details": {},
+                "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
             }),
             patch("backtest_pnl._compute_canslim_score", return_value=75.0),
             patch("backtest_pnl.clear_session_cache"),
