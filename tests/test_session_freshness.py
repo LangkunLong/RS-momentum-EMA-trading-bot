@@ -87,6 +87,47 @@ def test_session_helpers_sort_and_collapse_duplicate_daily_labels() -> None:
     assert latest_us_equity_session(history) == date(2026, 8, 24)
 
 
+def test_session_helpers_keep_latest_intraday_bar_when_duplicates_are_reversed() -> None:
+    """Break caught: normalizing before sorting retained an older same-session bar."""
+    history = pd.DataFrame(
+        {"Close": [301.0, 300.0, 100.0]},
+        index=pd.DatetimeIndex(
+            [
+                "2026-08-24 16:00:00",
+                "2026-08-24 10:00:00",
+                "2026-08-21 16:00:00",
+            ],
+            tz="America/New_York",
+        ),
+    )
+
+    canonical = history_through_exact_session(history, date(2026, 8, 24))
+    exact = exact_session_row(history, date(2026, 8, 24))
+
+    assert canonical is not None
+    assert canonical.index.tolist() == [pd.Timestamp("2026-08-21"), pd.Timestamp("2026-08-24")]
+    assert canonical["Close"].tolist() == [100.0, 301.0]
+    assert exact is not None and exact["Close"] == 301.0
+    assert history.index[0] == pd.Timestamp("2026-08-24 16:00:00", tz="America/New_York")
+
+
+def test_session_helpers_materialize_a_canonical_index_from_date_strings() -> None:
+    """A parsed fast path must not return the caller's non-DatetimeIndex unchanged."""
+    history = pd.DataFrame(
+        {"Close": [100.0, 101.0]},
+        index=pd.Index(["2026-08-21", "2026-08-24"]),
+    )
+
+    canonical = history_through_exact_session(history, date(2026, 8, 24))
+    exact = exact_session_row(history, date(2026, 8, 24))
+
+    assert canonical is not None
+    assert isinstance(canonical.index, pd.DatetimeIndex)
+    assert canonical.index.tolist() == [pd.Timestamp("2026-08-21"), pd.Timestamp("2026-08-24")]
+    assert exact is not None and exact["Close"] == 101.0
+    assert latest_us_equity_session(history) == date(2026, 8, 24)
+
+
 def test_pit_evaluation_skips_stale_eligible_bar_before_fundamentals() -> None:
     """Break caught: PIT reused Friday's eligible bar as Monday and queried fundamentals."""
     event_session = pd.Timestamp("2026-08-21")

@@ -25,7 +25,7 @@ def latest_us_equity_session(history: pd.DataFrame) -> date | None:
     """Return the session represented by the final row, if one exists."""
     if history.empty:
         return None
-    return _canonical_history(history).index[-1].date()
+    return canonicalize_us_equity_history(history).index[-1].date()
 
 
 def exact_session_row(
@@ -36,7 +36,7 @@ def exact_session_row(
     if history.empty:
         return None
     target = normalize_us_equity_session(session)
-    canonical = _canonical_history(history)
+    canonical = canonicalize_us_equity_history(history)
     if target not in canonical.index:
         return None
     return canonical.loc[target]
@@ -50,28 +50,50 @@ def history_through_exact_session(
     if history.empty:
         return None
     target = normalize_us_equity_session(session)
-    canonical = _canonical_history(history)
+    canonical = canonicalize_us_equity_history(history)
     if target not in canonical.index:
         return None
     return canonical.loc[canonical.index <= target].copy()
 
 
-def _canonical_history(history: pd.DataFrame) -> pd.DataFrame:
-    """Normalize, order, and collapse a daily history without mutating its caller."""
-    canonical = history.copy(deep=False)
-    canonical.index = _normalized_session_index(history.index)
-    if not canonical.index.is_monotonic_increasing:
-        canonical = canonical.sort_index(kind="stable")
+def canonicalize_us_equity_history(history: pd.DataFrame) -> pd.DataFrame:
+    """Return one ordered, timezone-naive row per US-equity session."""
+    if history.empty:
+        return history
+
+    timestamps = _timestamp_index(history.index)
+    normalized = _normalized_session_index(timestamps)
+    if (
+        isinstance(history.index, pd.DatetimeIndex)
+        and history.index.tz is None
+        and history.index.is_monotonic_increasing
+        and not history.index.has_duplicates
+        and history.index.equals(normalized)
+    ):
+        return history
+
+    order = timestamps.argsort(kind="stable")
+    canonical = history.iloc[order].copy(deep=False)
+    canonical.index = _normalized_session_index(timestamps.take(order))
     if canonical.index.has_duplicates:
         canonical = canonical.loc[~canonical.index.duplicated(keep="last")]
     return canonical
 
 
 def _normalized_session_index(index: pd.Index) -> pd.DatetimeIndex:
+    sessions = _timestamp_index(index)
+    if sessions.tz is not None:
+        sessions = sessions.tz_localize(None)
+    return sessions.normalize()
+
+
+def _timestamp_index(index: pd.Index) -> pd.DatetimeIndex:
     try:
         sessions = pd.DatetimeIndex(pd.to_datetime(index, errors="raise"))
-        if sessions.tz is not None:
-            sessions = sessions.tz_localize(None)
-        return sessions.normalize()
-    except (TypeError, ValueError):
-        return pd.DatetimeIndex([normalize_us_equity_session(value) for value in index])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "US-equity history index must contain parseable timestamps in one timezone"
+        ) from exc
+    if sessions.hasnans:
+        raise ValueError("US-equity session is missing")
+    return sessions

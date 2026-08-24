@@ -58,6 +58,50 @@ def test_prepare_writes_durable_snapshot_from_one_bulk_download(tmp_path, monkey
     assert calls == [(["LEAD", "MISS", "SPY"], command.settings.RS_CALCULATION_PERIOD, 100)]
 
 
+def test_prepare_uses_canonical_spy_for_as_of_market_and_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    """Break caught: preparation mixed a raw SPY tail with a canonical session label."""
+    import prepare_after_close as command
+    import core.after_close_snapshot as snapshots
+
+    unsorted = {
+        symbol: history.iloc[::-1]
+        for symbol, history in _price_data().items()
+    }
+    monkeypatch.setattr(
+        command,
+        "fetch_bulk_ohlcv",
+        lambda *_args, **_kwargs: unsorted,
+    )
+    spy_views: list[pd.DataFrame] = []
+    real_evaluate = command.evaluate_m
+    real_build = snapshots.build_after_close_snapshot
+
+    def recording_evaluate(*, price_data):
+        spy_views.append(price_data)
+        return real_evaluate(price_data=price_data)
+
+    def recording_build(price_by_symbol, **kwargs):
+        spy_views.append(price_by_symbol["SPY"])
+        return real_build(price_by_symbol, **kwargs)
+
+    monkeypatch.setattr(command, "evaluate_m", recording_evaluate)
+    monkeypatch.setattr(snapshots, "build_after_close_snapshot", recording_build)
+
+    _csv_path, json_path = command.prepare_after_close(
+        custom_symbols=["LEAD"],
+        as_of=date(2026, 8, 17),
+        output_dir=tmp_path,
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["as_of_session"] == "2026-08-17"
+    assert payload["market"]["latest_close"] == 102.0
+    assert payload["rows"][0]["close"] == 102.0
+    assert spy_views[0] is spy_views[1]
+
+
 def test_cli_rejects_mismatched_as_of_without_artifacts(tmp_path, monkeypatch) -> None:
     """A requested session mismatch must not leave misleading snapshot files."""
     import prepare_after_close as command

@@ -86,6 +86,45 @@ def test_snapshot_catches_stale_session_break() -> None:
     assert _rows(snapshot)["STALE"]["blocking_reasons"] == "stale_price_history"
 
 
+def test_snapshot_uses_one_canonical_view_for_unsorted_history() -> None:
+    """Break caught: the session label was canonical but snapshot facts used raw order."""
+    spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))
+    leader = _history()
+    expected = _rows(
+        build_after_close_snapshot(
+            {"SPY": spy, "LEAD": leader},
+            market=_market(),
+            expected_symbols=["LEAD"],
+        )
+    )["LEAD"]
+
+    actual = _rows(
+        build_after_close_snapshot(
+            {"SPY": spy.iloc[::-1], "LEAD": leader.iloc[::-1]},
+            market=_market(),
+            expected_symbols=["LEAD"],
+        )
+    )["LEAD"]
+
+    for field in (
+        "technical_eligible",
+        "blocking_reasons",
+        "close",
+        "prior_close",
+        "pivot",
+        "volume_ratio_50d",
+        "average_dollar_volume_50d",
+        "atr_pct_20d",
+        "realized_volatility_20d",
+        "weighted_performance",
+        "rs_score",
+    ):
+        if isinstance(expected[field], float):
+            assert actual[field] == pytest.approx(expected[field])
+        else:
+            assert actual[field] == expected[field]
+
+
 def test_snapshot_catches_no_up_day_volume_surge_break() -> None:
     """A regression that accepts below-threshold volume must fail here."""
     spy = _history(anchors=(50.0, 55.0, 60.0, 70.0))

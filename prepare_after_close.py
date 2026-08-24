@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from config import settings
+from core.trading_sessions import canonicalize_us_equity_history
 
 
 def fetch_bulk_ohlcv(symbols: list[str], *, period: str, chunk_size: int):
@@ -42,9 +43,12 @@ def prepare_after_close(
         period=settings.RS_CALCULATION_PERIOD,
         chunk_size=100,
     )
-    spy_history = price_by_symbol.get("SPY")
-    if spy_history is None or spy_history.empty:
+    raw_spy_history = price_by_symbol.get("SPY")
+    if raw_spy_history is None or raw_spy_history.empty:
         raise ValueError("SPY price history is required to determine the completed session")
+    spy_history = canonicalize_us_equity_history(raw_spy_history)
+    price_by_symbol = dict(price_by_symbol)
+    price_by_symbol["SPY"] = spy_history
     observed_as_of = date.fromisoformat(str(spy_history.index[-1].date()))
     if as_of is not None and as_of != observed_as_of:
         raise ValueError(f"--as-of {as_of.isoformat()} does not match completed SPY session {observed_as_of.isoformat()}")

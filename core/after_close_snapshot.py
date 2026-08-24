@@ -23,7 +23,7 @@ from core.canslim.entry_contract import (
 )
 from core.canslim.m_market_direction import MarketTrend
 from core.momentum_analysis import calculate_weighted_performance
-from core.trading_sessions import latest_us_equity_session
+from core.trading_sessions import canonicalize_us_equity_history
 
 
 _ROW_FIELDS = (
@@ -66,12 +66,15 @@ def build_after_close_snapshot(
     expected_symbols: Sequence[str],
 ) -> AfterCloseSnapshot:
     """Build a deterministic, advisory snapshot from already-fetched OHLCV bars."""
-    spy_history = price_by_symbol.get("SPY")
+    normalized_prices = {
+        str(symbol).upper(): canonicalize_us_equity_history(history)
+        for symbol, history in price_by_symbol.items()
+    }
+    spy_history = normalized_prices.get("SPY")
     if spy_history is None or spy_history.empty:
         raise ValueError("SPY price history is required to determine the completed session")
 
     as_of_session = _session_date(spy_history)
-    normalized_prices = {str(symbol).upper(): history for symbol, history in price_by_symbol.items()}
     symbols = sorted({str(symbol).upper() for symbol in expected_symbols})
     preliminary = [_build_row(symbol, normalized_prices.get(symbol), as_of_session) for symbol in symbols]
 
@@ -282,10 +285,9 @@ def _realized_volatility(close: pd.Series) -> float | None:
 
 
 def _session_date(history: pd.DataFrame) -> date:
-    session = latest_us_equity_session(history)
-    if session is None:
+    if history.empty:
         raise ValueError("price history has no completed session")
-    return session
+    return history.index[-1].date()
 
 
 def _add_blocker(row: dict[str, object], reason: str) -> None:
