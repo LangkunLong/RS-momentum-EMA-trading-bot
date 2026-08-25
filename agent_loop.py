@@ -4619,6 +4619,58 @@ class SandboxRunner:
             ("-m", "ruff", "check", "--no-cache", "."),
         }:
             return
+        if len(args) == 26 and args[:2] == ("pit_diagnosis.py", "run-experiment"):
+            # This is the only deterministic PIT execution grammar admitted to the
+            # Docker worker.  Paths are fixed container mounts; model/provider text
+            # cannot add flags, files, or a second experiment.
+            if (
+                args[2:6] != (
+                    "--pit-bundle",
+                    "/workspace/data/pit-bundle.sqlite3",
+                    "--pit-bundle-sha256",
+                    args[5],
+                )
+                or args[6:8] != ("--baseline-run", "/workspace/data/baseline-run")
+                or args[8:10] != ("--rulebook", "/workspace/data/rulebook.json")
+                or args[10:12]
+                != ("--experiment-catalog", "/workspace/data/experiment-catalog.json")
+                or args[12:14] != ("--fact-cache", "/workspace/data/fact-cache.sqlite3")
+                or args[14] != "--fact-cache-sha256"
+                or args[16] != "--source-commit"
+                or _SOURCE_COMMIT_RE.fullmatch(args[17]) is None
+                or args[18] != "--source-fingerprint-sha256"
+                or _SHA256_RE.fullmatch(args[19]) is None
+                or args[20] != "--experiment-id"
+                or args[22:24] != ("--partition", args[23])
+                or args[24:26] != ("--checkpoint-root", "/workspace/tmp/pit-checkpoints")
+                or _SHA256_RE.fullmatch(args[5]) is None
+                or _SHA256_RE.fullmatch(args[15]) is None
+                or _PIT_EXPERIMENT_ID_RE.fullmatch(args[21]) is None
+                or args[23] not in {"discovery", "validation"}
+            ):
+                raise SandboxError("PIT run-experiment argv violates the exact grammar")
+            if not (source / "pit_diagnosis.py").is_file():
+                raise SandboxError("PIT worker source lacks pit_diagnosis.py")
+            return
+        if len(args) == 20 and args[:2] == ("pit_diagnosis.py", "emit-evidence"):
+            if (
+                args[2:4] != ("--diagnosis-run", "/workspace/data/diagnosis-run")
+                or args[4] != "--diagnosis-manifest-sha256"
+                or args[6] != "--pit-bundle-sha256"
+                or args[8] != "--fact-cache-sha256"
+                or args[10:12] != ("--rulebook", "/workspace/data/rulebook.json")
+                or args[12] != "--rulebook-sha256"
+                or args[14:16]
+                != ("--experiment-catalog", "/workspace/data/experiment-catalog.json")
+                or args[16] != "--experiment-catalog-sha256"
+                or args[18:20] != ("--partition", args[19])
+                or any(_SHA256_RE.fullmatch(args[index]) is None for index in (5, 7, 9, 13, 17))
+                or args[19] not in {"discovery", "validation"}
+            ):
+                raise SandboxError("PIT emit-evidence argv violates the exact grammar")
+            if not (source / "pit_diagnosis.py").is_file():
+                raise SandboxError("PIT worker source lacks pit_diagnosis.py")
+            return
         if len(args) >= 16 and args[:3] == ("/workspace/gate/agent_loop.py", "--_hidden-backtest", "--tickers"):
             try:
                 benchmark_index = args.index("--benchmark", 3)
@@ -4995,6 +5047,11 @@ class SandboxRunner:
             "cleanup_verified": True,
             "gate_observation": process.returncode == 0 and not process.timed_out and not oom_killed,
             "worker_confined": self._run is _bounded_process,
+            # These fields are signed observation facts, emitted only after the
+            # container config and mounts have been inspected above.  PIT adapters
+            # must consume these values rather than assert their own policy.
+            "network_disabled": True,
+            "read_only": True,
             "source_modified": False,
             "security_attestation": False,
             "previous_hmac_sha256": self._previous_hmac,
@@ -5424,8 +5481,25 @@ def sandbox_compile_runner(sandbox: SandboxRunner) -> Callable[[WorkerLayout, tu
             return True
         environment = build_child_environment(os.environ, layout.home)
         observation = sandbox.run_worker(layout, ("-m", "py_compile", *python_paths), environment)
-        return observation.returncode == 0 and not observation.timed_out
+        payload = _pit_observation_payload(sandbox, observation)
+        return bool(
+            payload["returncode"] == 0
+            and payload["timed_out"] is False
+            and payload["oom_killed"] is False
+            and payload["gate_observation"] is True
+            and payload["network_disabled"] is True
+            and payload["read_only"] is True
+            and payload["worker_confined"] is True
+        )
 
+    # ``apply_candidate_patch`` intentionally retains its historical bool return
+    # contract.  The PIT gate additionally checks this marker before allowing a
+    # code experiment; only this controller-owned sandbox adapter may assert it.
+    compile_in_sandbox.__pit_worker_attestation__ = {
+        "network_disabled": True,
+        "read_only": True,
+        "worker_confined": True,
+    }
     return compile_in_sandbox
 
 
@@ -7700,7 +7774,16 @@ class LoopConfig:
         if not isinstance(self.gate, (TestGateConfig, BacktestGateConfig, *pit_gate_type)):
             raise ConfigurationError("gate must be a validated gate config")
         if pit_gate_type and isinstance(self.gate, pit_gate_type):
-            for name in ("diagnosis_run", "pit_bundle", "fact_cache", "rulebook", "experiment_catalog"):
+            for name in (
+                "diagnosis_run",
+                "baseline_run",
+                "pit_bundle",
+                "fact_cache",
+                "rulebook",
+                "experiment_catalog",
+            ):
+                if getattr(self.gate, name, None) is None:
+                    continue
                 if _configuration_paths_overlap(getattr(self.gate, name), runtime):
                     raise ConfigurationError("PIT diagnosis input must not overlap the permanent runtime")
         if not isinstance(self.models, ModelConfig) or not isinstance(self.limits, LoopLimits):
@@ -8418,6 +8501,7 @@ class AuditTrail:
                 "kind": "pit_diagnosis",
                 "diagnosis_run": config.gate.diagnosis_run,
                 "diagnosis_manifest_sha256": config.gate.diagnosis_manifest_sha256,
+                "baseline_run": config.gate.baseline_run,
                 "pit_bundle": config.gate.pit_bundle,
                 "pit_bundle_sha256": config.gate.pit_bundle_sha256,
                 "fact_cache": config.gate.fact_cache,
@@ -10920,6 +11004,13 @@ def _pit_digest_file(path: Path) -> str:
     return _file_sha256(path)
 
 
+# Catalog IDs cross both the controller and the hidden ``run-experiment`` grammar.
+# Keep this stricter than the provider's generic closed-ID rule: experiment IDs are
+# stable uppercase tokens with only dots, underscores, and hyphens as separators.
+_PIT_EXPERIMENT_ID_RE = re.compile(r"[A-Z][A-Z0-9_.-]{0,127}")
+_SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40,64}")
+
+
 def _pit_json(path: Path) -> Mapping[str, object]:
     try:
         value = json.loads(
@@ -10944,10 +11035,9 @@ def _pit_manifest_path(config: Any) -> Path:
 def _pit_snapshot_input_identities(config: Any, state: SourceState) -> tuple[Path, Mapping[str, str]]:
     """Seal identities under the controller temp root before any provider request.
 
-    The raw bundle and fact cache can be multi-gigabyte files; copying them would be both
-    wasteful and an unnecessary second mutable copy.  The worker receives their original
-    controller-owned paths through an injected worker boundary, while this sealed manifest
-    records the exact bytes and prevents a path/hash swap during the loop.
+    The worker receives a sealed manifest of the controller-owned inputs, while the
+    production adapter copies those inputs into a private read-only worker mount.
+    This records exact bytes and prevents a path/hash swap during the loop.
     """
     manifest_path = _pit_manifest_path(config)
     expected = {
@@ -10964,9 +11054,54 @@ def _pit_snapshot_input_identities(config: Any, state: SourceState) -> tuple[Pat
         "rulebook": config.rulebook,
         "experiment_catalog": config.experiment_catalog,
     }
+    baseline_manifest_path = None
+    if getattr(config, "baseline_run", None) is not None:
+        baseline_manifest_path = config.baseline_run / "run_manifest.json"
+        if (
+            not baseline_manifest_path.is_file()
+            or baseline_manifest_path.is_symlink()
+            or _has_reparse_point(baseline_manifest_path)
+        ):
+            raise ConfigurationError("PIT baseline run manifest is not a mountable regular file")
+        paths["baseline_manifest"] = baseline_manifest_path
     actual = {name: _pit_digest_file(path) for name, path in paths.items()}
-    if actual != expected:
+    if any(actual.get(name) != value for name, value in expected.items()):
         raise ConfigurationError("PIT diagnosis input identity does not match its declared hash")
+    # The controller's command-line hashes are not sufficient on their own: bind
+    # them to the canonical publication manifest before any agent call.  Otherwise
+    # a valid-looking manifest from one run could be paired with another run's
+    # bundle/cache/rulebook/catalog paths.
+    manifest = _pit_json(manifest_path)
+    # Publication source identity is authoritative when present.  A diagnosis
+    # directory produced from a different checkout may still have internally
+    # consistent artifact hashes, but it is not valid evidence for this controller
+    # candidate and must be rejected before any provider request.
+    for field, expected_value in (
+        ("source_commit", state.head),
+        (
+            "source_fingerprint_sha256",
+            state.fingerprint.sha256 if state.fingerprint is not None else None,
+        ),
+    ):
+        if field in manifest and manifest.get(field) != expected_value:
+            raise ConfigurationError(
+                f"PIT publication {field} does not match the preflight source identity"
+            )
+    publication_bindings = {
+        "pit_bundle": "bundle_sha256",
+        "fact_cache": "fact_cache_sha256",
+        "rulebook": "rulebook_sha256",
+        "experiment_catalog": "catalog_sha256",
+    }
+    for input_name, manifest_name in publication_bindings.items():
+        if manifest.get(manifest_name) != actual[input_name]:
+            raise ConfigurationError(
+                f"PIT publication manifest {manifest_name} does not match sealed {input_name}"
+            )
+    if manifest.get("status") != "complete" or manifest.get("schema_version") != 1:
+        raise ConfigurationError("PIT diagnosis publication manifest is not complete")
+    if baseline_manifest_path is not None and manifest.get("baseline_manifest_sha256") != actual["baseline_manifest"]:
+        raise ConfigurationError("PIT baseline run identity does not match the publication")
     if config.diagnosis_run.resolve() == state.root.resolve() or _configuration_paths_overlap(
         config.diagnosis_run.resolve(), state.root.resolve()
     ):
@@ -11001,14 +11136,11 @@ def _pit_recheck_input_identities(config: Any, identities: Mapping[str, str]) ->
         "rulebook": config.rulebook,
         "experiment_catalog": config.experiment_catalog,
     }
+    if getattr(config, "baseline_run", None) is not None:
+        paths["baseline_manifest"] = config.baseline_run / "run_manifest.json"
     actual = {name: _pit_digest_file(path) for name, path in paths.items()}
     if dict(actual) != dict(identities):
         raise ConfigurationError("PIT sealed input changed during diagnosis")
-
-
-def _pit_locked_metric_name(name: str) -> bool:
-    folded = name.casefold()
-    return any(token in folded for token in ("locked", "holdout", "unseen", "2025", "2026"))
 
 
 def _pit_validate_evidence(evidence: Any, config: Any) -> Any:
@@ -11024,8 +11156,15 @@ def _pit_validate_evidence(evidence: Any, config: Any) -> Any:
         or evidence.experiment_catalog_sha256 != config.experiment_catalog_sha256
     ):
         raise ProtocolValidationError("PIT evidence identity differs from the sealed inputs")
-    if any(_pit_locked_metric_name(name) for name in evidence.metrics):
-        raise ProtocolValidationError("locked-evaluation metrics cannot cross the PIT provider boundary")
+    # Partition is typed evidence, not a metric-name convention.  A metric called
+    # ``return_2025`` is not itself unsafe; evidence from the locked partition is.
+    if evidence.partition != config.partition:
+        raise ProtocolValidationError("PIT evidence partition differs from the sealed partition")
+    expected_partition_keys = {
+        f"{experiment_id}@{config.partition}" for experiment_id in evidence.experiment_ids
+    }
+    if not expected_partition_keys.issubset(evidence.experiment_partition_result_sha256s):
+        raise ProtocolValidationError("PIT evidence is missing selected partition result hashes")
     return evidence
 
 
@@ -11040,7 +11179,12 @@ def _pit_catalog_records(path: Path, rulebook_path: Path) -> Mapping[str, Mappin
         for item in records:
             if not isinstance(item, Mapping) or not isinstance(item.get("experiment_id"), str):
                 raise ValueError("experiment record is malformed")
-            values[str(item["experiment_id"])] = MappingProxyType(dict(item))
+            experiment_id = str(item["experiment_id"])
+            if _PIT_EXPERIMENT_ID_RE.fullmatch(experiment_id) is None:
+                raise ValueError("experiment ID is not canonical")
+            if experiment_id in values:
+                raise ValueError("experiment catalog contains duplicate IDs")
+            values[experiment_id] = MappingProxyType(dict(item))
         if not values:
             raise ValueError("experiment catalog is empty")
         # Parse through the canonical model as an additional schema/citation check.
@@ -11081,7 +11225,7 @@ def _pit_default_evidence(config: Any, manifest: Mapping[str, object], records: 
     """Construct a provider-safe aggregate envelope from publication identities."""
     from pit_diagnosis_agent import PitAgentEvidence
 
-    result_hashes: dict[str, str] = {}
+    result_hashes_by_partition: dict[str, str] = {}
     ablations = config.diagnosis_run / "ablation_results.csv"
     try:
         import csv
@@ -11091,12 +11235,28 @@ def _pit_default_evidence(config: Any, manifest: Mapping[str, object], records: 
                 partition = str(row.get("partition", ""))
                 experiment_id = str(row.get("experiment_id", ""))
                 result_hash = str(row.get("result_sha256", ""))
-                if partition in {"discovery", "validation"} and experiment_id in records and _SHA256_RE.fullmatch(result_hash):
-                    result_hashes[experiment_id] = result_hash
+                if (
+                    partition in {"discovery", "validation"}
+                    and experiment_id in records
+                    and _SHA256_RE.fullmatch(result_hash)
+                ):
+                    key = f"{experiment_id}@{partition}"
+                    if key in result_hashes_by_partition and result_hashes_by_partition[key] != result_hash:
+                        raise ConfigurationError("PIT publication contains conflicting experiment partition hashes")
+                    result_hashes_by_partition[key] = result_hash
     except (OSError, UnicodeError, csv.Error) as exc:
         raise ConfigurationError("PIT ablation evidence is malformed") from exc
-    if not result_hashes:
+    if not result_hashes_by_partition:
         raise ConfigurationError("PIT diagnosis has no discovery/validation experiment results")
+    selected_hashes: dict[str, str] = {}
+    for key, value in result_hashes_by_partition.items():
+        experiment_id, partition = key.rsplit("@", 1)
+        if partition == config.partition:
+            selected_hashes[experiment_id] = value
+    selected_hashes = dict(sorted(selected_hashes.items()))
+    result_hashes_by_partition = dict(sorted(result_hashes_by_partition.items()))
+    if not selected_hashes:
+        raise ConfigurationError("PIT diagnosis has no results for the selected partition")
     rule_ids: list[str] = []
     try:
         rulebook = _pit_json(config.rulebook)
@@ -11113,7 +11273,7 @@ def _pit_default_evidence(config: Any, manifest: Mapping[str, object], records: 
         import csv
 
         with (config.diagnosis_run / "entry_funnel.csv").open(encoding="utf-8", newline="") as handle:
-            rows = [row for row in csv.DictReader(handle) if row.get("partition") in {"discovery", "validation"}]
+            rows = [row for row in csv.DictReader(handle) if row.get("partition") == config.partition]
         for field in ("evaluated", "qualified", "attempted", "executed", "rejected"):
             metrics[f"funnel_{field}"] = sum(int(row.get(field, "0")) for row in rows)
     except (OSError, UnicodeError, ValueError, csv.Error) as exc:
@@ -11127,14 +11287,16 @@ def _pit_default_evidence(config: Any, manifest: Mapping[str, object], records: 
         fact_cache_sha256=config.fact_cache_sha256,
         rulebook_sha256=config.rulebook_sha256,
         experiment_catalog_sha256=config.experiment_catalog_sha256,
-        experiment_result_sha256s=result_hashes,
+        experiment_result_sha256s=selected_hashes,
+        experiment_partition_result_sha256s=result_hashes_by_partition,
         metrics=metrics,
         evidence_ids=tuple(sorted(evidence_ids)),
         rule_ids=tuple(sorted(rule_ids)),
         invariant_ids=("INV.D0_REPRODUCTION",),
-        experiment_ids=tuple(sorted(result_hashes)),
+        experiment_ids=tuple(sorted(selected_hashes)),
         fidelity_label=fidelity,
         promotion_eligible=False,
+        partition=config.partition,
     )
 
 
@@ -11154,9 +11316,113 @@ def _pit_call_gateway(
     if monotonic() >= deadline:
         raise BudgetExceededError("PIT diagnosis wall deadline reached")
     gateway = services.gateway
-    method = getattr(gateway, "request_pit_diagnosis_once", None) or getattr(gateway, "request", None)
-    if method is None:
-        raise ConfigurationError("PIT gateway has no request method")
+    method = getattr(gateway, "request_pit_diagnosis_once", None)
+    if not callable(method):
+        raise ConfigurationError("PIT gateway has no isolated request method")
+    ledger = getattr(gateway, "ledger", None)
+    if not isinstance(ledger, BudgetLedger):
+        raise ConfigurationError("PIT gateway ledger is not the bounded controller ledger")
+    prior_call_index = getattr(audit, "_pit_call_count", 0)
+    if type(prior_call_index) is not int or prior_call_index < 0:
+        raise AuditError("PIT provider call counter is invalid")
+    if prior_call_index != ledger.calls:
+        raise AuditError("PIT provider call counter and ledger are out of sync")
+
+    def ledger_snapshot() -> tuple[int, int, int, int, float, float, float, int, int, int, float]:
+        return (
+            ledger.calls,
+            ledger.prompt_tokens,
+            ledger.completion_tokens,
+            ledger.total_tokens,
+            ledger.spent_usd,
+            ledger.authoritative_usd,
+            ledger.reserved_usd,
+            ledger.reserved_tokens,
+            ledger.incomplete_accounting_calls,
+            ledger.retained_reservation_tokens,
+            ledger.retained_reservation_usd,
+        )
+
+    ledger_before = ledger_snapshot()
+
+    def complete_call_index(usage: Usage, *, facts_call_index: int | None = None) -> int:
+        if any(
+            value is None
+            for value in (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                usage.cost_usd,
+            )
+        ):
+            raise ConfigurationError("PIT provider accounting is incomplete")
+        assert usage.prompt_tokens is not None
+        assert usage.completion_tokens is not None
+        assert usage.total_tokens is not None
+        assert usage.cost_usd is not None
+        if usage.total_tokens != usage.prompt_tokens + usage.completion_tokens:
+            raise ConfigurationError("PIT provider token total is inconsistent")
+        after = ledger_snapshot()
+        reservation_tokens = usage.total_tokens - (after[7] - ledger_before[7])
+        reservation_usd = usage.cost_usd - (after[6] - ledger_before[6])
+        if (
+            after[0] != ledger_before[0] + 1
+            or after[1] - ledger_before[1] != usage.prompt_tokens
+            or after[2] - ledger_before[2] != usage.completion_tokens
+            or after[3] - ledger_before[3] != usage.total_tokens
+            or not math.isclose(
+                after[4] - ledger_before[4], usage.cost_usd, rel_tol=1e-12, abs_tol=1e-15
+            )
+            or not math.isclose(
+                after[5] - ledger_before[5], usage.cost_usd, rel_tol=1e-12, abs_tol=1e-15
+            )
+            or after[8] != ledger_before[8]
+            or after[9] != ledger_before[9]
+            or not math.isclose(
+                after[10] - ledger_before[10], 0.0, rel_tol=1e-12, abs_tol=1e-15
+            )
+            or type(reservation_tokens) is not int
+            # The provider may consume the exact reservation allowance.  In that
+            # case the replacement delta is zero; it is still a valid, fully
+            # reconciled paid call.
+            or reservation_tokens < 0
+            or type(reservation_usd) not in {int, float}
+            or not math.isfinite(reservation_usd)
+            or reservation_usd < 0
+        ):
+            raise ConfigurationError("PIT provider ledger does not reconcile the exact paid call")
+        call_index = after[0]
+        if facts_call_index is not None and facts_call_index != call_index:
+            raise ConfigurationError("PIT provider facts call index does not match the ledger")
+        return call_index
+
+    def append_unaccounted_failure(code: str, *, status_code: int | None = None) -> None:
+        after = ledger_snapshot()
+        delta_calls = after[0] - ledger_before[0]
+        if delta_calls not in {0, 1}:
+            raise AuditError("PIT provider ledger advanced by an invalid call count")
+        details: dict[str, object] = {
+            "accounting_complete": False,
+            "call_index": after[0] if delta_calls else ledger_before[0] + 1,
+            "role": role,
+            "code": code,
+            "calls_delta": delta_calls,
+            "total_tokens_delta": after[3] - ledger_before[3],
+            "reserved_tokens_delta": after[7] - ledger_before[7],
+            "incomplete_accounting_calls_delta": after[8] - ledger_before[8],
+        }
+        if status_code is not None:
+            details["status_code"] = status_code
+        audit.append_event(
+            {
+                "orchestrator": LoopState.CALL_ORCHESTRATOR,
+                "reasoner": LoopState.CALL_REASONER,
+                "coder": LoopState.CALL_CODER,
+            }[role],
+            "provider_call_rejected",
+            details,
+        )
+
     payload = _provider_dynamic_payload(dynamic, services.known_secrets)
     import inspect
 
@@ -11172,22 +11438,194 @@ def _pit_call_gateway(
             kwargs["monotonic"] = monotonic
     # Never retry after a provider-side TypeError: the request may already have
     # consumed a paid call.  Signature inspection only decides optional keywords.
-    completion = method(role, payload, parser, **kwargs)
-    if isinstance(completion, AgentCompletion):
-        value = completion.payload
-    else:
-        value = getattr(completion, "payload", completion)
+    try:
+        completion = method(role, payload, parser, **kwargs)
+    except AccountedCallError as exc:
+        facts = exc.facts
+        models = getattr(gateway, "_MODELS", {})
+        expected_model = models.get(role) if isinstance(models, Mapping) else None
+        if (
+            not isinstance(expected_model, str)
+            or facts.role != role
+            or facts.requested_model != expected_model
+        ):
+            raise ConfigurationError(
+                "PIT provider failure facts are bound to the wrong role or model"
+            ) from exc
+        usage = facts.usage
+        call_index = complete_call_index(usage, facts_call_index=facts.call_index)
+        audit._pit_call_count = call_index
+        rejected = ProviderCallRecord(
+            schema_version=1,
+            call_index=call_index,
+            iteration=1,
+            role=role,
+            api_backend="openrouter",
+            requested_model=facts.requested_model,
+            returned_model=facts.returned_model,
+            outcome=(
+                "budget_exceeded"
+                if isinstance(exc, AccountedBudgetExceededError)
+                else "protocol_invalid"
+            ),
+            finish_reason=facts.finish_reason,
+            response_schema_valid=False,
+            accounting_complete=True,
+            prompt_tokens=usage.prompt_tokens,
+            cached_tokens=usage.cached_tokens,
+            completion_tokens=usage.completion_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            total_tokens=usage.total_tokens,
+            cost_usd=usage.cost_usd,
+            accounting_source=usage.accounting_source,
+            protocol_failure_code=(
+                facts.protocol_failure_code
+                or ProtocolFailureCode.VALIDATOR_BOUNDARY_INVALID
+            ),
+        )
+        audit.write_provider_call(rejected)
+        raise
+    except IncompleteAccountingError as exc:
+        facts = exc.facts
+        after = ledger_snapshot()
+        # The snapshot above is taken before the gateway reserves its allowance.
+        # Reconcile(Usage()) retains that reservation; infer the post-reserve
+        # baseline from the closed facts and verify it is unchanged.
+        reserved_tokens_before_reconcile = (
+            after[7] - facts.retained_reservation_tokens
+        )
+        reserved_usd_before_reconcile = (
+            after[6] - facts.retained_reservation_usd
+        )
+        if (
+            facts.role != role
+            or facts.call_index != after[0]
+            or after[0] != ledger_before[0] + 1
+            or after[1] != ledger_before[1]
+            or after[2] != ledger_before[2]
+            or after[3] - ledger_before[3] != facts.retained_reservation_tokens
+            or reserved_tokens_before_reconcile != ledger_before[7]
+            or after[8] - ledger_before[8] != 1
+            or after[9] - ledger_before[9] != facts.retained_reservation_tokens
+            or not math.isclose(
+                after[4] - ledger_before[4],
+                facts.retained_reservation_usd,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            or not math.isclose(
+                after[5] - ledger_before[5], 0.0, rel_tol=1e-12, abs_tol=1e-15
+            )
+            or not math.isclose(
+                reserved_usd_before_reconcile,
+                ledger_before[6],
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            or not math.isclose(
+                after[10] - ledger_before[10],
+                facts.retained_reservation_usd,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+        ):
+            raise ConfigurationError(
+                "PIT incomplete-accounting diagnostic does not match the ledger"
+            ) from exc
+        audit._pit_call_count = after[0]
+        audit.append_event(
+            {
+                "orchestrator": LoopState.CALL_ORCHESTRATOR,
+                "reasoner": LoopState.CALL_REASONER,
+                "coder": LoopState.CALL_CODER,
+            }[role],
+            "provider_call_rejected",
+            {
+                "accounting_complete": False,
+                "call_index": facts.call_index,
+                "role": role,
+                "code": "accounting_invalid",
+                "accounting_failure": asdict(facts),
+            },
+        )
+        raise
+    except AccountingValidationError as exc:
+        append_unaccounted_failure("strict_gateway_contract_invalid")
+        raise ConfigurationError(
+            "strict PIT gateway raised accounting failure without closed facts"
+        ) from exc
+    except BudgetExceededError:
+        append_unaccounted_failure("budget_exceeded")
+        raise
+    except ResponseValidationError:
+        append_unaccounted_failure("provider_response_invalid")
+        raise
+    except GatewayError as exc:
+        status_code = (
+            exc.status_code
+            if type(exc.status_code) is int and 100 <= exc.status_code <= 599
+            else None
+        )
+        append_unaccounted_failure("provider_failed", status_code=status_code)
+        raise
+    if not isinstance(completion, AgentCompletion):
+        raise ResponseValidationError("PIT gateway did not return accounted completion facts")
+    value = completion.payload
     if not isinstance(value, (PitRoute, PitReasoningPlan, TypedCodingProposal)):
         raise ResponseValidationError("PIT gateway returned an invalid closed role payload")
-    # Provider payloads are retained under the private audit root only.  The hash is
-    # the sole linkage fact published to the derivative result.
+    usage = completion.usage
+    if any(
+        value is None
+        for value in (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+            usage.cost_usd,
+        )
+    ):
+        raise ResponseValidationError("PIT gateway omitted complete accounting")
+    assert usage.prompt_tokens is not None
+    assert usage.completion_tokens is not None
+    assert usage.total_tokens is not None
+    assert usage.cost_usd is not None
+    models = getattr(gateway, "_MODELS", {})
+    requested_model = models.get(role) if isinstance(models, Mapping) else None
+    if not isinstance(requested_model, str) or not isinstance(completion.model, str):
+        raise ResponseValidationError("PIT gateway omitted model identity")
+    if completion.model != requested_model or completion.finish_reason != "stop":
+        raise ResponseValidationError("PIT gateway completion identity is inconsistent")
+    # Provider payloads are retained under the private audit root only.  The provider
+    # call record carries bounded paid-call accounting; its artifact hash is the sole
+    # linkage fact published to the derivative result.
     primitive = asdict(value)
-    call_index = len(getattr(audit, "_pit_call_hashes", ())) + 1
-    path = audit.write_handoff_metadata(
+    call_index = complete_call_index(usage)
+    audit._pit_call_count = call_index
+    payload_path = audit.write_handoff_metadata(
         {"role": role, "payload": primitive},
-        name=f"pit-{role}-{call_index:03d}",
+        name=f"pit-payload-{role}-{call_index:03d}",
     )
-    digest = _file_sha256(path)
+    payload_sha256 = _file_sha256(payload_path)
+    record = ProviderCallRecord(
+        schema_version=1,
+        call_index=call_index,
+        iteration=1,
+        role=role,
+        api_backend="openrouter",
+        requested_model=requested_model,
+        returned_model=completion.model,
+        outcome="accepted",
+        finish_reason=completion.finish_reason,
+        response_schema_valid=True,
+        accounting_complete=True,
+        prompt_tokens=usage.prompt_tokens,
+        cached_tokens=usage.cached_tokens,
+        completion_tokens=usage.completion_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        total_tokens=usage.total_tokens,
+        cost_usd=usage.cost_usd,
+        accounting_source=usage.accounting_source,
+    )
+    _path, digest = audit.write_provider_call(record, payload_sha256=payload_sha256)
     return value, digest
 
 
@@ -11224,34 +11662,432 @@ def _pit_invoke_runner(runner: Callable[..., object], config: Any, candidate: Ca
 
 
 def _pit_result_digest(result: object) -> str:
-    digest = getattr(result, "result_sha256", None)
-    if isinstance(digest, str) and _SHA256_RE.fullmatch(digest):
-        return digest
-    if isinstance(result, Mapping):
-        digest = result.get("result_sha256")
-        if isinstance(digest, str) and _SHA256_RE.fullmatch(digest):
-            return digest
+    if not isinstance(result, Mapping):
+        raise ConfigurationError("PIT deterministic result is not a closed mapping")
+    digest = result.get("result_sha256")
+    if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+        raise ConfigurationError("PIT deterministic result hash is invalid")
+    return digest
+
+
+def _pit_callable_attestation(runner: object, field: str) -> None:
+    """Require an explicit isolation attestation on a direct controller callable."""
+    if not callable(runner):
+        raise QuarantineError(f"PIT {field} worker boundary is not callable")
+    attestation = getattr(runner, "__pit_worker_attestation__", None)
+    if not isinstance(attestation, Mapping):
+        raise QuarantineError(f"PIT {field} worker boundary is unattested")
+    for name in ("network_disabled", "read_only", "worker_confined"):
+        if attestation.get(name) is not True:
+            raise QuarantineError(f"PIT {field} worker {name} attestation failed")
+
+
+def _pit_validate_worker_result(
+    result: object,
+    *,
+    experiment_id: str,
+    partition: str,
+    expected_result_sha256: str | None,
+    quality: bool = False,
+) -> str:
+    """Require a typed, partition-bound worker observation and return its result hash."""
+    if not isinstance(result, Mapping):
+        raise QuarantineError("PIT worker result must be a closed mapping")
+    required = (
+        "experiment_id",
+        "partition",
+        "identity_sha256",
+        "result_sha256",
+        "network_disabled",
+        "read_only",
+        "worker_confined",
+    )
+    if any(field not in result for field in required):
+        raise QuarantineError("PIT worker result is missing an isolation or identity attestation")
+    if any(result[field] is not True for field in ("network_disabled", "read_only", "worker_confined")):
+        raise QuarantineError("PIT worker isolation attestation failed")
+    if result.get("experiment_id") != experiment_id or result.get("partition") != partition:
+        raise QuarantineError("PIT worker result is bound to the wrong experiment partition")
+    identity_sha256 = result.get("identity_sha256")
+    result_sha256 = result.get("result_sha256")
+    if not isinstance(identity_sha256, str) or _SHA256_RE.fullmatch(identity_sha256) is None:
+        raise QuarantineError("PIT worker identity hash is invalid")
+    if not isinstance(result_sha256, str) or _SHA256_RE.fullmatch(result_sha256) is None:
+        raise QuarantineError("PIT worker result hash is invalid")
+    if expected_result_sha256 is not None and result_sha256 != expected_result_sha256:
+        raise QuarantineError("PIT worker result hash is not bound to the selected evidence")
+    if quality and result.get("quality_passed") is not True:
+        raise QuarantineError("PIT quality worker did not attest a passing quality result")
+    return result_sha256
+
+
+def _run_pit_worker_with_setup(
+    candidate: Candidate,
+    setup: Callable[[WorkerLayout], None],
+    runner: Callable[[WorkerLayout], object],
+) -> object:
+    """Run one PIT worker after controller input setup and before read-only sealing."""
+    candidate_root = _require_candidate(candidate)
+    before = snapshot_tree(candidate_root)
+    parent = candidate.controller_temp_parent or Path(tempfile.gettempdir())
+    temporary = _new_controller_temp("agent-loop-pit-", parent, candidate.forbidden_temp_roots)
+    worker_error: BaseException | None = None
+    result: object | None = None
     try:
-        return hashlib.sha256(_canonical_json_bytes(result)).hexdigest()
-    except (TypeError, ValueError) as exc:
-        raise ConfigurationError("PIT deterministic result is not hashable closed data") from exc
+        try:
+            layout = _make_worker_layout(temporary)
+            exported = _export_candidate_worker(candidate_root, layout.source)
+            if tuple(exported) != tuple(candidate.tracked_files):
+                raise CandidateMutationError("PIT worker manifest differs from candidate tracked manifest")
+            _install_protected_gate(layout)
+            _prepare_worker_cache_directories(layout)
+            setup(layout)
+            # Inputs are immutable at the mount boundary; the setup callback is the
+            # only code allowed to populate the data directory.
+            _make_inputs_read_only(layout)
+            result = runner(layout)
+        finally:
+            _remove_private_tree(temporary)
+    except BaseException as exc:
+        worker_error = exc
+    after = snapshot_tree(candidate_root)
+    if after != before:
+        _restore_tree(candidate_root, before)
+        raise CandidateMutationError("PIT worker changed the disposable candidate")
+    if worker_error is not None:
+        raise worker_error
+    return result
 
 
-def _pit_validate_worker_result(result: object) -> None:
-    """Accept only worker observations that affirm the PIT isolation contract."""
-    if isinstance(result, Mapping):
-        for field in ("network_disabled", "read_only"):
-            if field in result and result[field] is not True:
-                raise QuarantineError(f"PIT worker {field} attestation failed")
+def _pit_stage_file(source: Path, destination: Path, expected_sha256: str | None = None) -> None:
+    """Stage one regular input without links and verify its bytes before mounting."""
+    try:
+        info = source.lstat()
+    except OSError as exc:
+        raise QuarantineError("PIT worker input disappeared before mounting") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or source.is_symlink()
+        or _has_reparse_point(source)
+        or destination.exists()
+        or destination.is_symlink()
+    ):
+        raise QuarantineError("PIT worker input is not a mountable regular file")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Copy rather than hard-link: ``_make_inputs_read_only`` seals the staged
+        # inode permissions on POSIX.  A hard link would chmod the controller's
+        # original input, so inability to copy is a deliberate fail-closed error.
+        shutil.copyfile(source, destination)
+    except OSError as exc:
+        raise QuarantineError("PIT worker input could not be staged for mounting") from exc
+    digest = _file_sha256(destination)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise QuarantineError("PIT worker staged input hash differs from its sealed identity")
+
+
+def _pit_stage_tree(source: Path, destination: Path) -> None:
+    """Stage a regular, link-free directory recursively for a read-only mount."""
+    try:
+        root_info = source.lstat()
+    except OSError as exc:
+        raise QuarantineError("PIT worker directory input disappeared") from exc
+    if not stat.S_ISDIR(root_info.st_mode) or source.is_symlink() or _has_reparse_point(source):
+        raise QuarantineError("PIT worker directory input is not mountable")
+    destination.mkdir(parents=True, exist_ok=False)
+    for path in sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix()):
+        relative = path.relative_to(source)
+        target = destination / relative
+        info = path.lstat()
+        if path.is_symlink() or _has_reparse_point(path):
+            raise QuarantineError("PIT worker directory input contains a link or reparse point")
+        if stat.S_ISDIR(info.st_mode):
+            target.mkdir(parents=True, exist_ok=False)
+        elif stat.S_ISREG(info.st_mode):
+            _pit_stage_file(path, target)
+        else:
+            raise QuarantineError("PIT worker directory input contains an unsupported entry")
+
+
+def _pit_stage_inputs(layout: WorkerLayout, config: Any, *, include_baseline: bool) -> None:
+    """Populate the fixed read-only data mount used by a PIT worker."""
+    data = layout.data
+    _pit_stage_file(config.pit_bundle, data / "pit-bundle.sqlite3", config.pit_bundle_sha256)
+    _pit_stage_file(config.fact_cache, data / "fact-cache.sqlite3", config.fact_cache_sha256)
+    _pit_stage_file(config.rulebook, data / "rulebook.json", config.rulebook_sha256)
+    _pit_stage_file(config.experiment_catalog, data / "experiment-catalog.json", config.experiment_catalog_sha256)
+    _pit_stage_tree(config.diagnosis_run, data / "diagnosis-run")
+    if include_baseline:
+        baseline = getattr(config, "baseline_run", None)
+        if baseline is None:
+            raise QuarantineError("PIT deterministic experiment requires an explicit baseline run")
+        _pit_stage_tree(baseline, data / "baseline-run")
+
+
+def _pit_observation_payload(sandbox: SandboxRunner, observation: object) -> Mapping[str, object]:
+    """Verify the signed SandboxRunner observation before deriving PIT facts."""
+    if not isinstance(observation, WorkerObservation):
+        raise QuarantineError("PIT sandbox returned no closed worker observation")
+    envelope = observation.completion_envelope
+    try:
+        envelope_valid = sandbox.verify_completion_envelope(envelope)
+    except Exception:
+        envelope_valid = False
+    if not envelope_valid or not isinstance(envelope.payload, Mapping):
+        raise QuarantineError("PIT sandbox observation signature is invalid")
+    payload = envelope.payload
+    required = (
+        "returncode",
+        "timed_out",
+        "oom_killed",
+        "stdout_sha256",
+        "stderr_sha256",
+        "cleanup_verified",
+        "gate_observation",
+        "worker_confined",
+        "network_disabled",
+        "read_only",
+    )
+    if any(field not in payload for field in required):
+        raise QuarantineError("PIT sandbox observation is missing a boundary fact")
+    if (
+        type(payload["returncode"]) is not int
+        or type(payload["timed_out"]) is not bool
+        or type(payload["oom_killed"]) is not bool
+        or type(payload["cleanup_verified"]) is not bool
+        or type(payload["gate_observation"]) is not bool
+        or not isinstance(payload["stdout_sha256"], str)
+        or _SHA256_RE.fullmatch(payload["stdout_sha256"]) is None
+        or not isinstance(payload["stderr_sha256"], str)
+        or _SHA256_RE.fullmatch(payload["stderr_sha256"]) is None
+        or payload["returncode"] != observation.returncode
+        or payload["timed_out"] is not observation.timed_out
+        or payload["stdout_sha256"] != observation.stdout_sha256
+        or payload["stderr_sha256"] != observation.stderr_sha256
+        or payload["cleanup_verified"] is not True
+        or type(payload["network_disabled"]) is not bool
+        or type(payload["read_only"]) is not bool
+        or type(payload["worker_confined"]) is not bool
+    ):
+        raise QuarantineError("PIT sandbox observation is inconsistent")
+    return payload
+
+
+def _pit_sandbox_evidence_runner(sandbox: SandboxRunner, config: Any, candidate: Candidate) -> Callable[..., object]:
+    """Build provider-safe evidence from a worker-emitted aggregate sentinel."""
+    def build_evidence(*, config: Any, candidate: Candidate, partition: str, **_kwargs: object) -> object:
+        from pit_diagnosis import parse_pit_diagnosis_evidence
+        from pit_diagnosis_agent import PitAgentEvidence
+
+        def execute(layout: WorkerLayout) -> object:
+            environment = build_child_environment(os.environ, layout.home)
+            argv = (
+                "pit_diagnosis.py",
+                "emit-evidence",
+                "--diagnosis-run",
+                "/workspace/data/diagnosis-run",
+                "--diagnosis-manifest-sha256",
+                config.diagnosis_manifest_sha256,
+                "--pit-bundle-sha256",
+                config.pit_bundle_sha256,
+                "--fact-cache-sha256",
+                config.fact_cache_sha256,
+                "--rulebook",
+                "/workspace/data/rulebook.json",
+                "--rulebook-sha256",
+                config.rulebook_sha256,
+                "--experiment-catalog",
+                "/workspace/data/experiment-catalog.json",
+                "--experiment-catalog-sha256",
+                config.experiment_catalog_sha256,
+                "--partition",
+                partition,
+            )
+            observation = sandbox.run_worker(layout, argv, environment)
+            observed = _pit_observation_payload(sandbox, observation)
+            if (
+                observation.returncode != 0
+                or observation.timed_out
+                or observed.get("gate_observation") is not True
+                or observed.get("network_disabled") is not True
+                or observed.get("read_only") is not True
+                or observed.get("worker_confined") is not True
+            ):
+                raise QuarantineError("PIT evidence worker did not complete successfully")
+            payload = parse_pit_diagnosis_evidence(observation.stdout)
+            return PitAgentEvidence.from_json(
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            )
+
+        return _run_pit_worker_with_setup(
+            candidate,
+            lambda layout: _pit_stage_inputs(layout, config, include_baseline=False),
+            execute,
+        )
+
+    build_evidence.__pit_worker_attestation__ = {
+        "network_disabled": True,
+        "read_only": True,
+        "worker_confined": True,
+    }
+    return build_evidence
+
+
+def _pit_sandbox_experiment_runner(sandbox: SandboxRunner, config: Any, candidate: Candidate) -> Callable[..., object]:
+    """Build the fixed one-experiment adapter around ``pit_diagnosis.py``."""
+    def run_experiment(*, config: Any, candidate: Candidate, experiment_id: str, partition: str, **_kwargs: object) -> object:
+        from pit_diagnosis import parse_pit_diagnosis_result
+
+        publication = _pit_json(_pit_manifest_path(config))
+        source_commit = publication.get("source_commit")
+        source_fingerprint = publication.get("source_fingerprint_sha256")
+        if (
+            not isinstance(source_commit, str)
+            or _SOURCE_COMMIT_RE.fullmatch(source_commit) is None
+            or not isinstance(source_fingerprint, str)
+            or _SHA256_RE.fullmatch(source_fingerprint) is None
+        ):
+            raise ConfigurationError(
+                "PIT publication must seal source_commit and source_fingerprint_sha256"
+            )
+
+        def execute(layout: WorkerLayout) -> object:
+            environment = build_child_environment(os.environ, layout.home)
+            argv = (
+                "pit_diagnosis.py",
+                "run-experiment",
+                "--pit-bundle",
+                "/workspace/data/pit-bundle.sqlite3",
+                "--pit-bundle-sha256",
+                config.pit_bundle_sha256,
+                "--baseline-run",
+                "/workspace/data/baseline-run",
+                "--rulebook",
+                "/workspace/data/rulebook.json",
+                "--experiment-catalog",
+                "/workspace/data/experiment-catalog.json",
+                "--fact-cache",
+                "/workspace/data/fact-cache.sqlite3",
+                "--fact-cache-sha256",
+                config.fact_cache_sha256,
+                "--source-commit",
+                source_commit,
+                "--source-fingerprint-sha256",
+                source_fingerprint,
+                "--experiment-id",
+                experiment_id,
+                "--partition",
+                partition,
+                "--checkpoint-root",
+                "/workspace/tmp/pit-checkpoints",
+            )
+            observation = sandbox.run_worker(layout, argv, environment)
+            observed = _pit_observation_payload(sandbox, observation)
+            if observation.returncode != 0 or observation.timed_out or observed.get("gate_observation") is not True:
+                raise QuarantineError("PIT deterministic worker did not complete successfully")
+            payload = parse_pit_diagnosis_result(observation.stdout)
+            if payload["experiment_id"] != experiment_id or payload["partition"] != partition:
+                raise QuarantineError("PIT worker result is bound to the wrong selection")
+            return {
+                **payload,
+                "network_disabled": observed["network_disabled"],
+                "read_only": observed["read_only"],
+                "worker_confined": observed["worker_confined"],
+            }
+
+        return _run_pit_worker_with_setup(
+            candidate,
+            lambda layout: _pit_stage_inputs(layout, config, include_baseline=True),
+            execute,
+        )
+
+    run_experiment.__pit_worker_attestation__ = {
+        "network_disabled": True,
+        "read_only": True,
+        "worker_confined": True,
+    }
+    return run_experiment
+
+
+def _pit_sandbox_quality_runner(sandbox: SandboxRunner, candidate: Candidate, audit: AuditTrail) -> Callable[..., object]:
+    """Run code-experiment quality gates and carry only signed worker attestations."""
+    def run_quality(*, candidate: Candidate, experiment_id: str, partition: str, **_kwargs: object) -> object:
+        checks = (
+            ("pytest", build_test_gate_argv(_require_candidate(candidate)), "pytest_failed"),
+            ("ruff", build_ruff_gate_argv(), "ruff_failed"),
+            ("compileall", build_compileall_gate_argv(), "compile_failed"),
+        )
+        observations: list[Mapping[str, object]] = []
+        functional: list[bool] = []
+        for label, argv, _failure in checks:
+            def execute(layout: WorkerLayout, argv: tuple[str, ...] = argv) -> object:
+                environment = build_child_environment(os.environ, layout.home)
+                return sandbox.run_worker(layout, argv, environment)
+
+            observation = _run_pit_worker_with_setup(candidate, lambda _layout: None, execute)
+            payload = _pit_observation_payload(sandbox, observation)
+            observations.append(
+                {
+                    "label": label,
+                    "returncode": payload["returncode"],
+                    "timed_out": payload["timed_out"],
+                    "oom_killed": payload["oom_killed"],
+                    "gate_observation": payload["gate_observation"],
+                    "worker_confined": payload["worker_confined"],
+                    "network_disabled": payload["network_disabled"],
+                    "read_only": payload["read_only"],
+                }
+            )
+            functional.append(
+                payload["returncode"] == 0
+                and payload["timed_out"] is False
+                and payload["oom_killed"] is False
+                and payload["gate_observation"] is True
+            )
+        try:
+            diff = _git(
+                _require_candidate(candidate),
+                "diff",
+                "--check",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+            )
+            diff_passed = not diff.stdout and not diff.stderr
+        except PreflightError:
+            diff_passed = False
+        all_confined = all(item["worker_confined"] is True for item in observations)
+        network_disabled = all(item["network_disabled"] is True for item in observations)
+        read_only = all(item["read_only"] is True for item in observations)
+        quality_passed = bool(all(functional) and diff_passed and all_confined and network_disabled and read_only)
+        identity = _canonical_json_sha256({"quality_schema_version": 1, "observations": observations, "diff_check_passed": diff_passed})
+        result_hash = _canonical_json_sha256({"identity_sha256": identity, "quality_passed": quality_passed})
+        return {
+            "experiment_id": experiment_id,
+            "partition": partition,
+            "identity_sha256": identity,
+            "result_sha256": result_hash,
+            "quality_passed": quality_passed,
+            "network_disabled": network_disabled,
+            "read_only": read_only,
+            "worker_confined": all_confined,
+        }
+
+    run_quality.__pit_worker_attestation__ = {
+        "network_disabled": True,
+        "read_only": True,
+        "worker_confined": True,
+    }
+    return run_quality
 
 
 def _pit_domain_matches(domain: Any, evidence_id: str) -> bool:
     prefix = evidence_id.split(".", 1)[0].casefold()
     return prefix in {
-        "data", "entry", "execution", "exit", "market", "portfolio", "fundamentals", "newness", "institutional", "leadership", "x", "e", "n", "s", "l", "i", "m"
+        "data", "entry", "execution", "exit", "market", "portfolio", "fundamentals", "newness", "institutional", "leadership", "x", "e", "n", "s", "l", "i", "m", "a", "c"
     } and (
         prefix == domain.value.casefold()
-        or (domain.value == "data" and prefix in {"fundamentals", "newness", "institutional", "leadership"})
+        or (domain.value == "data" and prefix in {"fundamentals", "newness", "institutional", "leadership", "a", "c"})
         or (domain.value == "entry" and prefix in {"e", "n", "s", "l", "i"})
         or (domain.value == "exit" and prefix == "x")
         or (domain.value == "market" and prefix == "m")
@@ -11327,6 +12163,14 @@ def run_pit_diagnosis_loop(
 
     if not isinstance(config, PitDiagnosisGateConfig) or not isinstance(source_state, SourceState) or not isinstance(audit, AuditTrail) or not isinstance(services, PitDiagnosisLoopServices):
         raise ConfigurationError("PIT diagnosis loop requires validated controller inputs")
+    ledger = getattr(services.gateway, "ledger", None)
+    if (
+        not isinstance(ledger, BudgetLedger)
+        or ledger.max_calls > config.max_api_calls
+        or ledger.max_tokens > config.max_tokens
+        or ledger.max_usd > config.max_usd
+    ):
+        raise ConfigurationError("PIT provider ledger exceeds the sealed diagnosis budget")
     _require_candidate(candidate)
     # Neither the private audit chain nor its sanitized derivative may be a
     # source-tree output.  This is checked before any worker or provider call.
@@ -11345,12 +12189,15 @@ def run_pit_diagnosis_loop(
     result_hash: str | None = None
     diff_hash: str | None = None
     coder_called = False
+    worker_confined = False
+    compile_confined = False
+    quality_confined = False
     sealed_root: Path | None = None
     cleanup: CleanupObservation | None = None
     status = "controller_error"
     failure = "controller_error"
     d0_passed = False
-    locked_excluded = True
+    locked_excluded = False
     derivative: Path | None = None
     sealed_cleanup_failed = False
 
@@ -11417,7 +12264,7 @@ def run_pit_diagnosis_loop(
             run_id=audit.run_id,
             call_record_sha256s=tuple(call_hashes),
             cleanup_complete=cleanup_observation.cleanup_complete and not sealed_cleanup_failed,
-            worker_confined=True,
+            worker_confined=worker_confined,
             locked_metrics_excluded=locked_excluded,
             d0_passed=d0_passed,
             failure_code=failure,
@@ -11459,10 +12306,12 @@ def run_pit_diagnosis_loop(
         else:
             evidence = _pit_default_evidence(config, manifest, records)
         evidence = _pit_validate_evidence(evidence, config)
-        locked_excluded = not any(_pit_locked_metric_name(name) for name in evidence.metrics)
-        if not locked_excluded:
-            failure = "locked_metrics"
-            return result("protocol_rejected")
+        locked_excluded = True
+        if services.run_experiment is None and services.run_deterministic_experiment is None:
+            # Do not spend provider budget selecting a plan that the production
+            # controller cannot execute in a confined deterministic worker.
+            failure = "worker_boundary_unavailable"
+            return result("worker_failed")
         if services.evidence_ids:
             if tuple(services.evidence_ids) != tuple(sorted(services.evidence_ids)):
                 raise ConfigurationError("PIT service evidence IDs must be sorted")
@@ -11521,6 +12370,12 @@ def run_pit_diagnosis_loop(
         bounded_evidence["experiment_result_sha256s"] = {
             item: evidence.experiment_result_sha256s[item] for item in domain_experiments
         }
+        bounded_evidence["experiment_partition_result_sha256s"] = {
+            f"{item}@{config.partition}": evidence.experiment_partition_result_sha256s[
+                f"{item}@{config.partition}"
+            ]
+            for item in domain_experiments
+        }
         reason_input = {
             "evidence": bounded_evidence,
             "domain": route.domain.value,
@@ -11574,6 +12429,12 @@ def run_pit_diagnosis_loop(
             # services object; the coder remains unreachable and this is a bad catalog.
             failure = "unexpected_controller_replacement"
             return result("protocol_rejected")
+        expected_result_sha256 = evidence.experiment_partition_result_sha256s.get(
+            f"{selected_id}@{config.partition}"
+        )
+        if not isinstance(expected_result_sha256, str):
+            failure = "missing_partition_result_hash"
+            return result("protocol_rejected")
         snapshots: tuple[SourceSnapshot, ...] = ()
         if requires_code:
             coder_called = True
@@ -11602,31 +12463,55 @@ def run_pit_diagnosis_loop(
             editable = tuple(sorted(set(services.editable_paths) | {item.path for item in replacements}))
             proposal = render_typed_coding_proposal(candidate, typed, snapshots)
             validate_unified_diff(candidate.root, proposal.unified_diff, proposal.files, editable_paths=editable, gate="test")
-            compile_runner = services.compile_runner or (lambda _layout, _paths: True)
+            compile_runner = services.compile_runner
+            if compile_runner is None:
+                failure = "compile_worker_unavailable"
+                return result("worker_failed")
+            _pit_callable_attestation(compile_runner, "compile")
             apply_candidate_patch(candidate, proposal, gate="test", editable_paths=editable, compile_runner=compile_runner)
-            if services.run_quality is not None:
-                quality = _pit_invoke_runner(services.run_quality, config, candidate, selected_id, config.partition, sealed_root)
-                _pit_validate_worker_result(quality)
-                if isinstance(quality, QualityObservation) and not quality.passed:
-                    failure = "quality_failed"
-                    return result("worker_failed")
-                if isinstance(quality, bool) and not quality:
-                    failure = "quality_failed"
-                    return result("worker_failed")
+            compile_confined = True
+            if services.run_quality is None:
+                failure = "quality_worker_unavailable"
+                return result("worker_failed")
+            _pit_callable_attestation(services.run_quality, "quality")
+            quality = _pit_invoke_runner(services.run_quality, config, candidate, selected_id, config.partition, sealed_root)
+            if isinstance(quality, Mapping) and quality.get("quality_passed") is False:
+                _pit_validate_worker_result(
+                    quality,
+                    experiment_id=selected_id,
+                    partition=config.partition,
+                    expected_result_sha256=None,
+                    quality=True,
+                )
+                failure = "quality_failed"
+                return result("worker_failed")
+            _pit_validate_worker_result(
+                quality,
+                experiment_id=selected_id,
+                partition=config.partition,
+                expected_result_sha256=None,
+                quality=True,
+            )
+            quality_confined = True
             handoff = export_inert_handoff(candidate, audit, gate="test", editable_paths=editable)
             diff_hash = handoff.diff_sha256
+        else:
+            compile_confined = True
+            quality_confined = True
         runner = services.run_experiment or services.run_deterministic_experiment
         if runner is None:
-            raise ConfigurationError("PIT deterministic experiment runner is not configured")
+            failure = "worker_boundary_unavailable"
+            return result("worker_failed")
+        _pit_callable_attestation(runner, "experiment")
         execution = _pit_invoke_runner(runner, config, candidate, selected_id, config.partition, sealed_root)
-        _pit_validate_worker_result(execution)
+        result_hash = _pit_validate_worker_result(
+            execution,
+            experiment_id=selected_id,
+            partition=config.partition,
+            expected_result_sha256=expected_result_sha256,
+        )
+        worker_confined = compile_confined and quality_confined and True
         _pit_recheck_input_identities(config, identities)
-        result_hash = _pit_result_digest(execution)
-        if result_hash not in evidence.experiment_result_sha256s.values() and not requires_code:
-            # A controller-owned fake may return a new in-memory deterministic result;
-            # bind it to the selected catalog identity rather than silently accepting an
-            # unrelated experiment result.
-            raise ProtocolValidationError("deterministic result is not bound to sealed experiment evidence")
         event("terminal", "controller", "completed", selected_id, call_hashes[-1] if call_hashes else "0" * 64, result_hash)
         failure = "none"
         return result("completed")
@@ -11854,6 +12739,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--historical-data-sha256")
     parser.add_argument("--diagnosis-run", type=Path)
     parser.add_argument("--diagnosis-manifest-sha256")
+    parser.add_argument("--baseline-run", type=Path)
     parser.add_argument("--pit-bundle", type=Path)
     parser.add_argument("--pit-bundle-sha256")
     parser.add_argument("--fact-cache", type=Path)
@@ -11870,7 +12756,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-closed-trades", type=int)
     parser.add_argument("--max-usd", type=float, required=True)
     parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
-    parser.add_argument("--max-api-calls", type=int, default=DEFAULT_MAX_CALLS)
+    parser.add_argument(
+        "--max-api-calls",
+        type=int,
+        default=None,
+        help="maximum paid calls (defaults to 3 for PIT diagnosis, otherwise the general limit)",
+    )
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument(
         "--proposal-samples",
@@ -11901,6 +12792,9 @@ def _absolute_cli_path(value: object, field: str) -> Path:
 def _build_cli_config(
     namespace: argparse.Namespace,
 ) -> tuple[LoopConfig, Path, str]:
+    max_api_calls = namespace.max_api_calls
+    if max_api_calls is None:
+        max_api_calls = 3 if namespace.gate == "pit_diagnosis" else DEFAULT_MAX_CALLS
     docker_executable = _absolute_cli_path(
         namespace.docker_executable, "docker executable"
     )
@@ -11932,6 +12826,7 @@ def _build_cli_config(
     pit_fields = (
         namespace.diagnosis_run,
         namespace.diagnosis_manifest_sha256,
+        namespace.baseline_run,
         namespace.pit_bundle,
         namespace.pit_bundle_sha256,
         namespace.fact_cache,
@@ -11991,6 +12886,7 @@ def _build_cli_config(
         if any(value is None for value in pit_fields):
             raise ConfigurationError("the PIT diagnosis gate requires all sealed input identities")
         assert namespace.diagnosis_run is not None
+        assert namespace.baseline_run is not None
         assert namespace.pit_bundle is not None
         assert namespace.fact_cache is not None
         assert namespace.rulebook is not None
@@ -11998,6 +12894,11 @@ def _build_cli_config(
         gate = PitDiagnosisGateConfig(
             diagnosis_run=_absolute_cli_path(namespace.diagnosis_run, "diagnosis run"),
             diagnosis_manifest_sha256=namespace.diagnosis_manifest_sha256,
+            baseline_run=(
+                _absolute_cli_path(namespace.baseline_run, "baseline run")
+                if namespace.baseline_run is not None
+                else None
+            ),
             pit_bundle=_absolute_cli_path(namespace.pit_bundle, "PIT bundle"),
             pit_bundle_sha256=namespace.pit_bundle_sha256,
             fact_cache=_absolute_cli_path(namespace.fact_cache, "fact cache"),
@@ -12008,7 +12909,7 @@ def _build_cli_config(
             experiment_catalog_sha256=namespace.experiment_catalog_sha256,
             partition=namespace.pit_partition,
             max_usd=namespace.max_usd,
-            max_api_calls=namespace.max_api_calls,
+            max_api_calls=max_api_calls,
             max_tokens=namespace.max_tokens,
             wall_timeout_seconds=namespace.wall_timeout_seconds,
             child_timeout_seconds=namespace.child_timeout_seconds,
@@ -12033,7 +12934,7 @@ def _build_cli_config(
         limits=LoopLimits(
             max_usd=namespace.max_usd,
             max_iterations=namespace.max_iterations,
-            max_api_calls=namespace.max_api_calls,
+            max_api_calls=max_api_calls,
             max_tokens=namespace.max_tokens,
             api_timeout_seconds=namespace.api_timeout_seconds,
             child_timeout_seconds=namespace.child_timeout_seconds,
@@ -12358,13 +13259,16 @@ def _execute_cli_run(
         from pit_diagnosis_agent import PitDiagnosisGateConfig, PitDiagnosisLoopServices
 
         if isinstance(config.gate, PitDiagnosisGateConfig):
-            # The production adapter is intentionally absent until the PIT worker image
-            # exposes the dedicated run-experiment grammar and its read-only mounts.  A
-            # publication row must never be treated as a deterministic execution result
-            # by reading diagnosis artifacts on the controller.  Injected fake services
-            # remain available for offline protocol tests; the production gate fails
-            # closed here rather than crossing the worker boundary.
+            # PIT evidence and deterministic execution both cross the same attested
+            # worker boundary.  In particular, the controller never reads publication
+            # CSVs to construct provider evidence; the worker emits one bounded,
+            # hash-bound envelope instead.
+            if config.gate.baseline_run is None:
+                raise ConfigurationError(
+                    "PIT production execution requires the explicit baseline run mount"
+                )
             stage = "controller_run"
+            pit_sandbox = sandbox
             result = run_pit_diagnosis_loop(
                 config.gate,
                 state,
@@ -12372,9 +13276,12 @@ def _execute_cli_run(
                 audit,
                 PitDiagnosisLoopServices(
                     gateway=gateway,
-                    run_quality=lambda *_args, **_kwargs: True,
-                    compile_runner=sandbox_compile_runner(sandbox),
+                    build_evidence=_pit_sandbox_evidence_runner(pit_sandbox, config.gate, candidate),
+                    run_experiment=_pit_sandbox_experiment_runner(pit_sandbox, config.gate, candidate),
+                    run_quality=_pit_sandbox_quality_runner(pit_sandbox, candidate, audit),
+                    compile_runner=sandbox_compile_runner(pit_sandbox),
                     known_secrets=known_secrets,
+                    editable_paths=tuple(sorted(DEFAULT_EDITABLE_PATHS)),
                 ),
             )
         elif isinstance(config.gate, TestGateConfig):

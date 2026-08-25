@@ -11,7 +11,20 @@ from typing import Any
 
 import pytest
 
-from agent_loop import BudgetLedger, ORCHESTRATOR_MODEL, OpenRouterGateway, ProtocolValidationError
+from agent_loop import (
+    AgentCompletion,
+    BudgetLedger,
+    CompletionEnvelope,
+    CODER_MODEL,
+    ConfigurationError,
+    ORCHESTRATOR_MODEL,
+    OpenRouterGateway,
+    ProcessResult,
+    ProtocolValidationError,
+    REASONER_MODEL,
+    Usage,
+    WorkerObservation,
+)
 from pit_diagnosis_agent import (
     PitAgentEvidence,
     PitDiagnosisGateConfig,
@@ -111,6 +124,9 @@ def test_direct_pit_evidence_construction_rejects_oversized_provider_payload() -
         replace(
             pit_agent_evidence(),
             experiment_result_sha256s={experiment_id: _sha("f") for experiment_id in experiment_ids},
+            experiment_partition_result_sha256s={
+                f"{experiment_id}@discovery": _sha("f") for experiment_id in experiment_ids
+            },
             evidence_ids=evidence_ids,
             rule_ids=rule_ids,
             invariant_ids=invariant_ids,
@@ -237,6 +253,63 @@ def test_pit_reasoner_gateway_uses_fixed_json_schema() -> None:
     assert response_format["json_schema"]["schema"]["additionalProperties"] is False
 
 
+def test_pit_gateway_audits_closed_incomplete_accounting_before_terminal_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_loop
+
+    class IncompleteGateway:
+        def __init__(self) -> None:
+            self.ledger = BudgetLedger(0.50, max_calls=3, max_tokens=32_768)
+
+        def request_pit_diagnosis_once(self, _role: str, _payload: str, _parser: object, **_kwargs: object) -> object:
+            reservation = self.ledger.reserve(
+                "sealed-prompt",
+                10,
+                agent_loop.Pricing(prompt_per_million=1000.0, completion_per_million=1000.0),
+            )
+            facts = agent_loop.IncompleteAccountingFacts(
+                schema_version=2,
+                call_index=self.ledger.calls,
+                role="orchestrator",
+                inline_failure_code=agent_loop.AccountingFailureCode.INLINE_USAGE_MISSING,
+                recovery_failure_code=agent_loop.AccountingFailureCode.RECOVERY_UNAVAILABLE,
+                recovery_usage_diagnostic=None,
+                generation_attempts=0,
+                response_id_safe=True,
+                accounting_complete=False,
+                budget_charge_basis="full_reservation",
+                retained_reservation_tokens=reservation.token_upper_bound,
+                retained_reservation_usd=reservation.amount_usd,
+            )
+            self.ledger.reconcile(reservation, Usage())
+            raise agent_loop.IncompleteAccountingError(facts)
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        agent_loop.AuditTrail,
+        "append_event",
+        lambda _self, _state, _event_type, details: events.append(dict(details)),
+    )
+    audit = agent_loop.AuditTrail(tmp_path / "audit", "run-20260825T020304Z")
+    gateway = IncompleteGateway()
+    services = SimpleNamespace(gateway=gateway, known_secrets=())
+    with pytest.raises(agent_loop.IncompleteAccountingError):
+        agent_loop._pit_call_gateway(
+            audit,
+            services,
+            "orchestrator",
+            {"sealed": True},
+            PitRoute.from_json,
+            deadline=10.0,
+            monotonic=lambda: 1.0,
+        )
+    assert audit._pit_call_count == 1
+    assert events
+    assert events[0]["accounting_complete"] is False
+    assert "accounting_failure" in events[0]
+
+
 def _controller_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -295,6 +368,19 @@ def _pit_controller_fixture(
         return path
 
     monkeypatch.setattr(agent_loop.AuditTrail, "write_handoff_metadata", write_handoff)
+
+    def write_provider_call(
+        _self: object,
+        record: object,
+        *,
+        payload_sha256: str | None = None,
+    ) -> tuple[Path, str]:
+        del payload_sha256
+        path = audit_shadow / f"provider-call-{len(list(audit_shadow.glob('provider-call-*.json'))) + 1:04d}.json"
+        path.write_bytes(agent_loop._canonical_json_bytes(agent_loop.asdict(record)) + b"\n")
+        return path, _controller_sha256(path)
+
+    monkeypatch.setattr(agent_loop.AuditTrail, "write_provider_call", write_provider_call)
     monkeypatch.setattr(
         agent_loop,
         "export_inert_handoff",
@@ -304,29 +390,6 @@ def _pit_controller_fixture(
     diagnosis_run = (tmp_path / "diagnosis-run").resolve()
     diagnosis_run.mkdir()
     baseline_identity = "1" * 64
-    manifest = {
-        "schema_version": 1,
-        "baseline_manifest_sha256": baseline_identity,
-        "fidelity_label": "fidelity_incomplete",
-    }
-    manifest_path = diagnosis_run / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8", newline="\n")
-    reproduced_identity = baseline_identity if baseline_match else "2" * 64
-    (diagnosis_run / "baseline_reproduction.json").write_text(
-        json.dumps(
-            {
-                "passed": True,
-                "authority_manifest_sha256": baseline_identity,
-                "reproduced_manifest_sha256": reproduced_identity,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-
     root = Path(__file__).parents[1]
     rulebook = (tmp_path / "rulebook.json").resolve()
     catalog = (tmp_path / "catalog.json").resolve()
@@ -352,6 +415,35 @@ def _pit_controller_fixture(
     fact_cache = (tmp_path / "fact-cache.bin").resolve()
     pit_bundle.write_bytes(b"sealed pit bundle")
     fact_cache.write_bytes(b"sealed fact cache")
+    manifest = {
+        "schema_version": 1,
+        "status": "complete",
+        "source_commit": state.head,
+        "source_fingerprint_sha256": state.fingerprint.sha256,
+        "baseline_manifest_sha256": baseline_identity,
+        "bundle_sha256": _controller_sha256(pit_bundle),
+        "fact_cache_sha256": _controller_sha256(fact_cache),
+        "rulebook_sha256": _controller_sha256(rulebook),
+        "catalog_sha256": _controller_sha256(catalog),
+        "fidelity_label": "fidelity_incomplete",
+    }
+    manifest_path = diagnosis_run / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8", newline="\n")
+    reproduced_identity = baseline_identity if baseline_match else "2" * 64
+    (diagnosis_run / "baseline_reproduction.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "authority_manifest_sha256": baseline_identity,
+                "reproduced_manifest_sha256": reproduced_identity,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
 
     gate = PitDiagnosisGateConfig(
         diagnosis_run=diagnosis_run,
@@ -397,15 +489,35 @@ def _pit_controller_fixture(
         def __init__(self) -> None:
             self.roles: list[str] = []
             self.payloads: dict[str, dict[str, object]] = {}
+            self.ledger = BudgetLedger(0.50, max_calls=3, max_tokens=32_768)
+            self._MODELS = {
+                "orchestrator": ORCHESTRATOR_MODEL,
+                "reasoner": REASONER_MODEL,
+                "coder": CODER_MODEL,
+            }
+
+        def _completion(self, role: str, value: object) -> AgentCompletion[object]:
+            return AgentCompletion(
+                payload=value,
+                usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2, cost_usd=0.0),
+                finish_reason="stop",
+                model=self._MODELS[role],
+            )
 
         def request_pit_diagnosis_once(self, role: str, payload: str, parser: object, **_kwargs: object) -> object:
             del parser
             self.roles.append(role)
             self.payloads[role] = json.loads(payload)
+            # Mirror the strict gateway's post-call ledger reconciliation for the
+            # controller's exact PIT call-index and token-delta checks.
+            self.ledger.calls += 1
+            self.ledger.prompt_tokens += 1
+            self.ledger.completion_tokens += 1
+            self.ledger.total_tokens += 2
             if role == "orchestrator":
-                return PitRoute("reason", domain, (evidence_id,))
+                return self._completion(role, PitRoute("reason", domain, (evidence_id,)))
             if role == "reasoner":
-                return PitReasoningPlan(
+                return self._completion(role, PitReasoningPlan(
                     causal_hypothesis="The selected causal dimension is measurable in the sealed run.",
                     evidence_ids=(evidence_id,),
                     rule_ids=(rule_id,),
@@ -413,34 +525,62 @@ def _pit_controller_fixture(
                     experiment_id=experiment_id,
                     skip=False,
                     skip_reason="",
-                )
+                ))
             replacement = agent_loop.ExactLineReplacement(
                 path="core/backtest_engine.py", old_lines=("VALUE = 1",), new_lines=("VALUE = 2",)
             )
-            return TypedCodingProposal(summary="Apply the controller-approved exact replacement.", replacements=(replacement,))
+            return self._completion(role, TypedCodingProposal(summary="Apply the controller-approved exact replacement.", replacements=(replacement,)))
 
     gateway = Gateway()
     replacement = agent_loop.ExactLineReplacement(
         path="core/backtest_engine.py", old_lines=("VALUE = 1",), new_lines=("VALUE = 2",)
     )
-    def run_experiment(*, sealed_input_root: Path, **_kwargs: object) -> dict[str, str]:
+    def run_experiment(*, sealed_input_root: Path, **_kwargs: object) -> dict[str, object]:
         sealed = json.loads((sealed_input_root / "sealed-inputs.json").read_text(encoding="utf-8"))
         assert sealed["read_only"] is True
         assert sealed["network"] == "none"
         return {
             "experiment_id": experiment_id,
+            "partition": "discovery",
+            "identity_sha256": _sha("1"),
             "result_sha256": result_sha,
             "network_disabled": True,
             "read_only": True,
+            "worker_confined": True,
         }
+
+    def run_quality(**_kwargs: object) -> dict[str, object]:
+        return {
+            "experiment_id": experiment_id,
+            "partition": "discovery",
+            "identity_sha256": _sha("2"),
+            "result_sha256": result_sha,
+            "quality_passed": True,
+            "network_disabled": True,
+            "read_only": True,
+            "worker_confined": True,
+        }
+
+    worker_attestation = {
+        "network_disabled": True,
+        "read_only": True,
+        "worker_confined": True,
+    }
+    run_experiment.__pit_worker_attestation__ = worker_attestation
+    run_quality.__pit_worker_attestation__ = worker_attestation
+
+    def compile_runner(_layout: object, _paths: tuple[str, ...]) -> bool:
+        return True
+
+    compile_runner.__pit_worker_attestation__ = worker_attestation
 
     services = PitDiagnosisLoopServices(
         gateway=gateway,
         verify_diagnosis_run=lambda _path: {"verified": True},
         build_evidence=evidence,
         run_experiment=run_experiment,
-        run_quality=lambda *_args, **_kwargs: True,
-        compile_runner=lambda *_args, **_kwargs: True,
+        run_quality=run_quality,
+        compile_runner=compile_runner,
         allowed_replacements={experiment_id: (replacement,)} if synthetic_code else (),
         editable_paths=("core/backtest_engine.py",),
     )
@@ -543,3 +683,253 @@ def test_pit_cli_adds_gate_and_rejects_proposal_samples(tmp_path: Path) -> None:
     assert parse_pit_diagnosis_result("PIT_DIAGNOSIS_RESULT=" + encoded) == payload
     with pytest.raises(ValueError, match="canonical"):
         parse_pit_diagnosis_result("PIT_DIAGNOSIS_RESULT=" + json.dumps(payload))
+    invalid_id = dict(payload, experiment_id="D3/NOT-CLOSED")
+    invalid_encoded = json.dumps(invalid_id, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(ValueError, match="identity"):
+        parse_pit_diagnosis_result("PIT_DIAGNOSIS_RESULT=" + invalid_encoded)
+
+
+def test_pit_result_hash_is_bound_to_selected_experiment_and_partition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_loop
+
+    gate, state, candidate, audit, services, _gateway, result_sha, _source_path, _evidence_id = _pit_controller_fixture(
+        tmp_path, monkeypatch
+    )
+
+    def wrong_result(**_kwargs: object) -> dict[str, object]:
+        return {
+            "experiment_id": "D3.M_CONFIRMED_UPTREND",
+            "partition": "validation",
+            "identity_sha256": "1" * 64,
+            "result_sha256": result_sha,
+            "network_disabled": True,
+            "read_only": True,
+            "worker_confined": True,
+        }
+
+    wrong_result.__pit_worker_attestation__ = {
+        "network_disabled": True,
+        "read_only": True,
+        "worker_confined": True,
+    }
+    services = replace(services, run_experiment=wrong_result)
+    result = agent_loop.run_pit_diagnosis_loop(gate, state, candidate, audit, services)
+    assert result.terminal_status == "controller_error"
+    assert result.worker_confined is False
+    assert result.deterministic_result_sha256 is None
+
+
+def test_pit_direct_worker_without_attestation_cannot_report_confined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_loop
+
+    gate, state, candidate, audit, services, _gateway, result_sha, _source_path, _evidence_id = _pit_controller_fixture(
+        tmp_path, monkeypatch
+    )
+
+    def unattested(**_kwargs: object) -> dict[str, object]:
+        return {
+            "experiment_id": "D3.M_CONFIRMED_UPTREND",
+            "partition": "discovery",
+            "identity_sha256": "1" * 64,
+            "result_sha256": result_sha,
+            "network_disabled": True,
+            "read_only": True,
+            "worker_confined": True,
+        }
+
+    services = replace(services, run_experiment=unattested)
+    result = agent_loop.run_pit_diagnosis_loop(gate, state, candidate, audit, services)
+    assert result.terminal_status == "controller_error"
+    assert result.worker_confined is False
+
+
+def test_pit_domain_routes_canslim_fundamental_rule_prefixes() -> None:
+    import agent_loop
+
+    assert agent_loop._pit_domain_matches(PitDomain.DATA, "A.EPS_MULTIYEAR")
+    assert agent_loop._pit_domain_matches(PitDomain.DATA, "C.EPS_YOY")
+    assert not agent_loop._pit_domain_matches(PitDomain.ENTRY, "A.EPS_MULTIYEAR")
+
+
+def test_pit_services_reject_legacy_gateway_fallback() -> None:
+    with pytest.raises(ConfigurationError, match="request_pit_diagnosis_once"):
+        PitDiagnosisLoopServices(gateway=SimpleNamespace(request=lambda *_args, **_kwargs: None))
+
+
+def test_pit_evidence_rejects_selected_hash_disagreement() -> None:
+    with pytest.raises(ProtocolValidationError, match="disagrees"):
+        replace(
+            pit_agent_evidence(),
+            experiment_partition_result_sha256s={
+                "D4.STRUCTURAL_SELL@discovery": _sha("0"),
+            },
+        )
+
+
+def test_pit_catalog_rejects_noncanonical_experiment_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent_loop
+
+    gate, _state, _candidate, _audit, _services, _gateway, _result_sha, _source_path, _evidence_id = _pit_controller_fixture(
+        tmp_path, monkeypatch
+    )
+    payload = json.loads(gate.experiment_catalog.read_text(encoding="utf-8"))
+    payload["experiments"][0]["experiment_id"] = "d0.not-canonical"
+    catalog = tmp_path / "catalog-invalid.json"
+    catalog.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="catalog"):
+        agent_loop._pit_catalog_records(catalog, gate.rulebook)
+
+
+def test_pit_publication_source_identity_is_bound_to_preflight_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_loop
+
+    gate, state, _candidate, _audit, _services, _gateway, _result_sha, _source_path, _evidence_id = _pit_controller_fixture(
+        tmp_path, monkeypatch
+    )
+    manifest_path = gate.diagnosis_run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_commit"] = "0" * 40
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    gate = replace(gate, diagnosis_manifest_sha256=_controller_sha256(manifest_path))
+    with pytest.raises(ConfigurationError, match="source_commit"):
+        agent_loop._pit_snapshot_input_identities(gate, state)
+
+
+def test_pit_production_experiment_adapter_parses_signed_worker_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_loop
+    from pit_diagnosis import PIT_DIAGNOSIS_SENTINEL
+
+    gate, state, candidate, _audit, _services, _gateway, result_sha, source_path, _evidence_id = _pit_controller_fixture(
+        tmp_path, monkeypatch
+    )
+    baseline = tmp_path / "baseline-run"
+    baseline.mkdir()
+    (baseline / "run_manifest.json").write_text("{}\n", encoding="utf-8")
+    gate = replace(gate, baseline_run=baseline)
+
+    selected = "D3.M_CONFIRMED_UPTREND"
+    encoded = json.dumps(
+        {
+            "experiment_id": selected,
+            "partition": "discovery",
+            "identity_sha256": "1" * 64,
+            "result_sha256": result_sha,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    stdout = PIT_DIAGNOSIS_SENTINEL + encoded
+
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.argv: tuple[str, ...] | None = None
+
+        def run_worker(self, _layout: object, argv: tuple[str, ...], _environment: object) -> WorkerObservation:
+            self.argv = argv
+            process = ProcessResult.ok(stdout)
+            payload = {
+                "returncode": process.returncode,
+                "timed_out": process.timed_out,
+                "oom_killed": False,
+                "stdout_sha256": process.stdout_sha256,
+                "stderr_sha256": process.stderr_sha256,
+                "cleanup_verified": True,
+                "gate_observation": True,
+                "worker_confined": True,
+                "network_disabled": True,
+                "read_only": True,
+            }
+            return WorkerObservation(process, CompletionEnvelope(payload, "test-signature"))
+
+        def verify_completion_envelope(self, _envelope: CompletionEnvelope) -> bool:
+            return True
+
+    fake = FakeSandbox()
+    runner = agent_loop._pit_sandbox_experiment_runner(fake, gate, candidate)
+    observed = runner(
+        config=gate,
+        candidate=candidate,
+        experiment_id=selected,
+        partition="discovery",
+        sealed_input_root=tmp_path / "sealed",
+    )
+    assert observed["experiment_id"] == selected
+    assert observed["partition"] == "discovery"
+    assert observed["result_sha256"] == result_sha
+    assert observed["network_disabled"] is True
+    assert fake.argv is not None
+    assert fake.argv[:2] == ("pit_diagnosis.py", "run-experiment")
+    assert "/workspace/data/baseline-run" in fake.argv
+    assert fake.argv[16:20] == (
+        "--source-commit",
+        state.head,
+        "--source-fingerprint-sha256",
+        state.fingerprint.sha256,
+    )
+    agent_loop.SandboxRunner._validate_python_args(Path(__file__).parents[1], fake.argv)
+    assert Path(source_path).read_bytes() == b"VALUE = 1\n"
+    agent_loop.dispose_candidate(candidate)
+    state.close()
+
+
+def test_pit_source_fingerprint_matches_controller_checkout_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_loop
+    import pit_diagnosis
+
+    _gate, state, candidate, _audit, _services, _gateway, _result_sha, _source_path, _evidence_id = _pit_controller_fixture(
+        tmp_path, monkeypatch
+    )
+    assert state.fingerprint is not None
+    assert pit_diagnosis._source_commit(state.root) == state.head
+    assert pit_diagnosis._source_fingerprint(state.root) == state.fingerprint.sha256
+    agent_loop.dispose_candidate(candidate)
+    state.close()
+
+
+def test_pit_compile_adapter_requires_signed_worker_boundary_facts(
+    tmp_path: Path,
+) -> None:
+    import agent_loop
+
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.network_disabled = True
+
+        def run_worker(self, _layout: object, _argv: tuple[str, ...], _environment: object) -> WorkerObservation:
+            process = ProcessResult.ok()
+            payload = {
+                "returncode": process.returncode,
+                "timed_out": process.timed_out,
+                "oom_killed": False,
+                "stdout_sha256": process.stdout_sha256,
+                "stderr_sha256": process.stderr_sha256,
+                "cleanup_verified": True,
+                "gate_observation": True,
+                "worker_confined": True,
+                "network_disabled": self.network_disabled,
+                "read_only": True,
+            }
+            return WorkerObservation(process, CompletionEnvelope(payload, "test-signature"))
+
+        def verify_completion_envelope(self, _envelope: CompletionEnvelope) -> bool:
+            return True
+
+    fake = FakeSandbox()
+    runner = agent_loop.sandbox_compile_runner(fake)
+    layout = SimpleNamespace(home=tmp_path)
+    assert runner(layout, ("pit_diagnosis.py",)) is True
+    fake.network_disabled = False
+    assert runner(layout, ("pit_diagnosis.py",)) is False

@@ -19,6 +19,7 @@ from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
 from agent_loop import (
+    BudgetLedger,
     ConfigurationError,
     ExactLineReplacement,
     PayloadFieldValidationError,
@@ -104,6 +105,10 @@ class PitDiagnosisGateConfig:
     rulebook_sha256: str
     experiment_catalog: Path
     experiment_catalog_sha256: str
+    # The baseline replay is deliberately separate from the published diagnosis
+    # directory.  Deterministic D1-D4 workers need the hash-bound authority snapshot
+    # but must receive it only as a read-only worker mount.
+    baseline_run: Path | None = None
     checkpoint_root: Path | None = None
     output_root: Path | None = None
     partition: str = "discovery"
@@ -125,6 +130,12 @@ class PitDiagnosisGateConfig:
         )
         for field, value, directory in paths:
             object.__setattr__(self, field, _absolute_regular_path(value, field, directory=directory))
+        if self.baseline_run is not None:
+            object.__setattr__(
+                self,
+                "baseline_run",
+                _absolute_regular_path(self.baseline_run, "baseline_run", directory=True),
+            )
         if self.checkpoint_root is not None:
             object.__setattr__(
                 self,
@@ -163,7 +174,14 @@ class PitDiagnosisGateConfig:
 
 @dataclass(frozen=True)
 class PitDiagnosisLoopServices:
-    """Injectable deterministic/worker boundaries for fake-only PIT gate verification."""
+    """Injectable deterministic/worker boundaries for PIT gate verification.
+
+    The PIT gate deliberately does not accept the legacy free-form gateway.  A service
+    must expose the isolated prompt-family method and the deterministic worker
+    boundaries must return explicit isolation attestations.  This keeps a convenient
+    fake useful for protocol tests without allowing an unconfined callable to look
+    like a production worker.
+    """
 
     gateway: object
     verify_diagnosis_run: Callable[[Path], Mapping[str, object]] | None = None
@@ -183,8 +201,10 @@ class PitDiagnosisLoopServices:
 
     def __post_init__(self) -> None:
         gateway = self.gateway
-        if not hasattr(gateway, "request_pit_diagnosis_once") and not hasattr(gateway, "request"):
-            raise ConfigurationError("PIT diagnosis gateway must expose a closed request method")
+        if not callable(getattr(gateway, "request_pit_diagnosis_once", None)):
+            raise ConfigurationError("PIT diagnosis gateway must expose request_pit_diagnosis_once")
+        if not isinstance(getattr(gateway, "ledger", None), BudgetLedger):
+            raise ConfigurationError("PIT diagnosis gateway must expose bounded accounting")
         if not isinstance(self.known_secrets, tuple) or any(not isinstance(value, str) for value in self.known_secrets):
             raise ConfigurationError("PIT diagnosis secrets must be an immutable string tuple")
         if not isinstance(self.editable_paths, tuple) or len(self.editable_paths) > 8:
@@ -232,9 +252,9 @@ class PitDiagnosisLoopResult:
     audit_path: Path | None = None
     run_id: str = "pit-diagnosis"
     call_record_sha256s: tuple[str, ...] = ()
-    cleanup_complete: bool = True
-    worker_confined: bool = True
-    locked_metrics_excluded: bool = True
+    cleanup_complete: bool = False
+    worker_confined: bool = False
+    locked_metrics_excluded: bool = False
     d0_passed: bool = False
     failure_code: str = "none"
 
@@ -266,6 +286,14 @@ class PitDiagnosisLoopResult:
             raise ConfigurationError("PIT derivative result path must be absolute")
         if self.audit_path is not None and (not isinstance(self.audit_path, Path) or not self.audit_path.is_absolute()):
             raise ConfigurationError("PIT audit path must be absolute")
+        if self.terminal_status == "completed" and (
+            not self.worker_confined
+            or not self.cleanup_complete
+            or self.source_modified
+            or not self.d0_passed
+            or not self.locked_metrics_excluded
+        ):
+            raise ConfigurationError("completed PIT result lacks required boundary attestations")
 
 
 class PitDomain(str, Enum):
@@ -486,6 +514,8 @@ class PitAgentEvidence:
     experiment_ids: tuple[str, ...]
     fidelity_label: str
     promotion_eligible: bool
+    partition: str = "discovery"
+    experiment_partition_result_sha256s: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -496,6 +526,8 @@ class PitAgentEvidence:
             "experiment_catalog_sha256",
         ):
             _sha256(getattr(self, field), field)
+        if self.partition not in {"discovery", "validation"}:
+            raise PayloadFieldValidationError("evidence partition is invalid")
         hashes = _mapping(self.experiment_result_sha256s, "experiment_result_sha256s")
         _reject_forbidden_evidence_keys(hashes)
         if tuple(hashes) != tuple(sorted(hashes)):
@@ -522,11 +554,68 @@ class PitAgentEvidence:
         experiment_ids = _closed_id_tuple(self.experiment_ids, "experiment_ids")
         if tuple(canonical_hashes) != experiment_ids:
             raise PayloadFieldValidationError("experiment IDs must exactly match experiment hashes")
+        partition_hashes_input = self.experiment_partition_result_sha256s
+        if partition_hashes_input is None:
+            partition_hashes_input = {
+                f"{experiment_id}@{self.partition}": value
+                for experiment_id, value in canonical_hashes.items()
+            }
+        partition_hashes = _mapping(
+            partition_hashes_input,
+            "experiment_partition_result_sha256s",
+        )
+        if tuple(partition_hashes) != tuple(sorted(partition_hashes)):
+            raise PayloadFieldValidationError(
+                "experiment_partition_result_sha256s must be canonically sorted"
+            )
+        canonical_partition_hashes: dict[str, str] = {}
+        for key, value in partition_hashes.items():
+            if not isinstance(key, str) or key.count("@") != 1:
+                raise PayloadFieldValidationError("experiment partition result key is invalid")
+            experiment_id, partition = key.rsplit("@", 1)
+            experiment_id = _closed_id(experiment_id, "experiment partition result ID")
+            if partition not in {"discovery", "validation"}:
+                raise PayloadFieldValidationError("experiment partition result partition is invalid")
+            if experiment_id not in experiment_ids:
+                raise PayloadFieldValidationError("experiment partition result ID is not selected")
+            canonical_key = f"{experiment_id}@{partition}"
+            if canonical_key != key:
+                raise PayloadFieldValidationError("experiment partition result key is not canonical")
+            canonical_partition_hashes[canonical_key] = _sha256(
+                value,
+                "experiment partition result SHA-256",
+            )
+        if not canonical_partition_hashes:
+            raise PayloadFieldValidationError("experiment partition result hashes cannot be empty")
+        selected_keys = {
+            f"{experiment_id}@{self.partition}" for experiment_id in experiment_ids
+        }
+        if not selected_keys.issubset(canonical_partition_hashes):
+            raise PayloadFieldValidationError(
+                "evidence is missing a result hash for its selected partition"
+            )
+        # ``experiment_result_sha256s`` is the selected-partition projection used
+        # by the provider envelope.  Keep the full partition map only as an audit
+        # cross-check; allowing these two views to disagree would let the reasoner
+        # cite one result while the controller later executes another.
+        for experiment_id, result_hash in canonical_hashes.items():
+            partition_hash = canonical_partition_hashes.get(
+                f"{experiment_id}@{self.partition}"
+            )
+            if partition_hash != result_hash:
+                raise PayloadFieldValidationError(
+                    "selected experiment result hash disagrees with its partition result hash"
+                )
         if self.fidelity_label not in _FIDELITY_LABELS:
             raise PayloadFieldValidationError("fidelity_label is invalid")
         if type(self.promotion_eligible) is not bool:
             raise PayloadFieldValidationError("promotion_eligible must be a boolean")
         object.__setattr__(self, "experiment_result_sha256s", MappingProxyType(canonical_hashes))
+        object.__setattr__(
+            self,
+            "experiment_partition_result_sha256s",
+            MappingProxyType(canonical_partition_hashes),
+        )
         object.__setattr__(self, "metrics", MappingProxyType(canonical_metrics))
         object.__setattr__(self, "evidence_ids", evidence_ids)
         object.__setattr__(self, "rule_ids", rule_ids)
@@ -545,6 +634,7 @@ class PitAgentEvidence:
                 "rulebook_sha256",
                 "experiment_catalog_sha256",
                 "experiment_result_sha256s",
+                "experiment_partition_result_sha256s",
                 "metrics",
                 "evidence_ids",
                 "rule_ids",
@@ -552,6 +642,7 @@ class PitAgentEvidence:
                 "experiment_ids",
                 "fidelity_label",
                 "promotion_eligible",
+                "partition",
             },
             max_bytes=_MAX_PROVIDER_EVIDENCE_BYTES,
         )
@@ -572,6 +663,11 @@ class PitAgentEvidence:
             experiment_ids=_closed_id_list(value["experiment_ids"], "experiment_ids"),
             fidelity_label=_required_text(value["fidelity_label"], "fidelity_label", max_bytes=128),
             promotion_eligible=value["promotion_eligible"],
+            partition=_required_text(value["partition"], "partition", max_bytes=32),
+            experiment_partition_result_sha256s=_mapping(
+                value["experiment_partition_result_sha256s"],
+                "experiment_partition_result_sha256s",
+            ),
         )
 
     def to_provider_payload(self) -> dict[str, object]:
@@ -583,6 +679,7 @@ class PitAgentEvidence:
             "rulebook_sha256": self.rulebook_sha256,
             "experiment_catalog_sha256": self.experiment_catalog_sha256,
             "experiment_result_sha256s": dict(self.experiment_result_sha256s),
+            "experiment_partition_result_sha256s": dict(self.experiment_partition_result_sha256s),
             "metrics": dict(self.metrics),
             "evidence_ids": list(self.evidence_ids),
             "rule_ids": list(self.rule_ids),
@@ -590,6 +687,7 @@ class PitAgentEvidence:
             "experiment_ids": list(self.experiment_ids),
             "fidelity_label": self.fidelity_label,
             "promotion_eligible": self.promotion_eligible,
+            "partition": self.partition,
         }
 
 
