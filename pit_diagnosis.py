@@ -371,6 +371,11 @@ def build_parser() -> argparse.ArgumentParser:
     facts.add_argument("--progress", required=True, type=_absolute_path)
     facts.add_argument("--supplemental-input", type=_absolute_path)
     facts.add_argument("--supplemental-sha256", type=_digest)
+    facts.add_argument(
+        "--strict-canslim",
+        action="store_true",
+        help="require non-empty PIT institutional and industry inputs before materialization",
+    )
     facts.add_argument("--resume", action="store_true")
 
     run = commands.add_parser("run", help="run D0-D4 discovery and validation diagnosis")
@@ -411,12 +416,19 @@ def _build_facts(args: argparse.Namespace) -> int:
     rulebook = load_rulebook(args.rulebook)
     if (args.supplemental_input is None) != (args.supplemental_sha256 is None):
         raise ValueError("--supplemental-input and --supplemental-sha256 must be supplied together")
+    if args.strict_canslim and args.supplemental_input is None:
+        raise ValueError("--strict-canslim build-facts requires --supplemental-input and --supplemental-sha256")
     supplemental = (
         SQLiteSupplementalPITProvider(args.supplemental_input, args.supplemental_sha256)
         if args.supplemental_input is not None
         else None
     )
     try:
+        if args.strict_canslim:
+            # The strict gate is intentionally before opening the potentially
+            # expensive bundle/materialization loop.
+            assert supplemental is not None
+            supplemental.require_strict_inputs()
         with PITDataBundle(args.pit_bundle, expected_sha256=args.pit_bundle_sha256) as bundle:
             result = build_fact_cache(
                 bundle=bundle, rulebook=rulebook, partitions=fixed_partitions(), output_path=args.output,

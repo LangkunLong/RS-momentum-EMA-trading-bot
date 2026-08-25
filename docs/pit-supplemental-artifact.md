@@ -154,6 +154,29 @@ SQLite `sha256` to `pit_diagnosis.py build-facts --supplemental-input ...
 artifact hash, so changing source rows or provenance creates a new cache
 identity rather than silently reusing prior facts.
 
+For a strict CANSLIM materialization, add the explicit preflight switch:
+
+```powershell
+python -B pit_diagnosis.py build-facts `
+  --pit-bundle <absolute-bundle> `
+  --pit-bundle-sha256 <bundle-sha256> `
+  --rulebook <absolute-rulebook> `
+  --output <absolute-fact-cache> `
+  --checkpoint <absolute-checkpoint> `
+  --progress <absolute-progress> `
+  --supplemental-input <absolute-supplemental.sqlite3> `
+  --supplemental-sha256 <supplemental-sha256> `
+  --strict-canslim
+```
+
+`--strict-canslim` fails before opening the PIT bundle/materialization loop if
+the supplemental artifact is absent, if its hash does not match, or if either
+the institutional or industry snapshot table is empty. It does not claim that
+non-empty tables provide complete universe coverage: each fact row still uses
+the causal as-of lookup, and missing row-level observations remain unavailable
+and fail closed in strict strategy evaluation. Omit the switch only for the
+explicit proxy/incomplete baseline path.
+
 ## Building the industry CSV from PIT prices
 
 When the classification source contains only dated symbol-to-group observations,

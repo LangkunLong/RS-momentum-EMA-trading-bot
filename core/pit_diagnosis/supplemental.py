@@ -242,6 +242,30 @@ class SQLiteSupplementalPITProvider:
             _json_strings(row["evidence_ids"], "industry evidence_ids"),
         )
 
+    def require_strict_inputs(self) -> None:
+        """Require both observed I/L source tables before strict materialization.
+
+        Row-level as-of availability is still evaluated causally while facts are
+        built; this preflight only prevents a strict build from accidentally
+        using an empty or one-sided supplemental artifact.  It deliberately
+        does not treat row counts as proof of complete PIT coverage: missing
+        observations remain unavailable and fail closed in the strict strategy.
+        """
+
+        connection = self._connection
+        if connection is None:
+            raise ValueError("supplemental provider is closed")
+        counts = {
+            table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in (_INSTITUTIONAL_TABLE, _INDUSTRY_TABLE)
+        }
+        missing = [table for table, count in counts.items() if count == 0]
+        if missing:
+            raise ValueError(
+                "strict CANSLIM requires non-empty institutional and industry PIT inputs; "
+                f"missing rows in {', '.join(missing)}"
+            )
+
     def _latest(self, table: str, symbol: str, session: str) -> sqlite3.Row | None:
         if table not in {_INSTITUTIONAL_TABLE, _INDUSTRY_TABLE}:
             raise ValueError("unrecognized supplemental table")

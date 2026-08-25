@@ -110,6 +110,37 @@ def test_sqlite_provider_is_hash_pinned_and_rejects_rows_after_cutoff(tmp_path: 
         SQLiteSupplementalPITProvider(future_path, future_digest)
 
 
+def test_strict_preflight_rejects_one_sided_supplemental_input(tmp_path: Path) -> None:
+    path = tmp_path / "supplemental.sqlite3"
+    digest = _build_input(path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DELETE FROM industry_group_snapshots")
+        connection.commit()
+    finally:
+        connection.close()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with SQLiteSupplementalPITProvider(path, digest) as provider:
+        with pytest.raises(ValueError, match="industry_group_snapshots"):
+            provider.require_strict_inputs()
+
+
+def test_build_facts_parser_exposes_strict_preflight_switch(tmp_path: Path) -> None:
+    args = build_parser().parse_args(
+        [
+            "build-facts",
+            "--pit-bundle", str(tmp_path / "bundle.sqlite3"),
+            "--pit-bundle-sha256", "a" * 64,
+            "--rulebook", str(tmp_path / "rulebook.json"),
+            "--output", str(tmp_path / "facts.sqlite3"),
+            "--checkpoint", str(tmp_path / "facts.checkpoint.json"),
+            "--progress", str(tmp_path / "facts.progress.jsonl"),
+            "--strict-canslim",
+        ]
+    )
+    assert args.strict_canslim is True
+
+
 def test_build_facts_accepts_supplemental_input_pair(tmp_path: Path) -> None:
     path = tmp_path / "supplemental.sqlite3"
     digest = _build_input(path)
