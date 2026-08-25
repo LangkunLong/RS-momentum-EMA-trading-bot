@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import subprocess
+import sys
 
 import pandas as pd
 import pytest
 
-from core.pit_diagnosis.fact_cache import FactCacheBuilder, build_fact_cache, open_fact_cache
+from core.pit_diagnosis.fact_cache import FactCacheBuilder, _number, build_fact_cache, open_fact_cache
 from core.pit_diagnosis.models import DatePartition, DatePartitions
 from core.pit_diagnosis.rulebook import load_rulebook
+from core.pit_diagnosis.supplemental import IndustryGroupSnapshot, InstitutionalSnapshot
 
 
 class _MiniPITBundle:
@@ -140,3 +143,74 @@ def test_resume_skips_completed_sessions_and_rejects_identity_change(
     assert resumed.reprocessed_sessions == 0
     with pytest.raises(ValueError, match="identity"):
         build_cache(mutated_bundle(mini_pit_bundle), paths, resume=True)
+
+
+def test_fact_cache_import_does_not_load_live_provider_dependencies() -> None:
+    command = (
+        "import sys; import core.pit_diagnosis.fact_cache; "
+        "assert 'core.data_client' not in sys.modules; "
+        "assert 'core.index_ticker_fetcher' not in sys.modules"
+    )
+
+    result = subprocess.run([sys.executable, "-c", command], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_resume_reconciles_progress_durable_after_checkpoint_window(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+    original = FactCacheBuilder._write_checkpoint
+    calls = 0
+
+    def interrupt_after_progress(builder: FactCacheBuilder, next_index: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise InterruptedError("between progress and checkpoint")
+        original(builder, next_index)
+
+    monkeypatch.setattr(FactCacheBuilder, "_write_checkpoint", interrupt_after_progress)
+    with pytest.raises(InterruptedError, match="between progress"):
+        build_cache(mini_pit_bundle, paths, resume=False)
+    monkeypatch.setattr(FactCacheBuilder, "_write_checkpoint", original)
+
+    resumed = build_cache(mini_pit_bundle, paths, resume=True)
+
+    assert resumed.resumed is True
+    assert resumed.reprocessed_sessions == 0
+
+
+def test_supplemental_snapshot_with_date_but_no_evidence_is_rejected() -> None:
+    with pytest.raises(ValueError, match="available"):
+        InstitutionalSnapshot("2024-01-05", None, None, None)
+    with pytest.raises(ValueError, match="available"):
+        IndustryGroupSnapshot("2024-01-05", None, None)
+
+
+def test_finalization_rejects_wrong_member_even_when_total_rows_match(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+    original = FactCacheBuilder._materialize_session
+    changed = False
+
+    def wrong_member(builder: FactCacheBuilder, session: str, states: object):
+        nonlocal changed
+        rows = original(builder, session, states)
+        if not changed:
+            rows[0] = {**rows[0], "symbol": "NOT_A_MEMBER"}
+            changed = True
+        return rows
+
+    monkeypatch.setattr(FactCacheBuilder, "_materialize_session", wrong_member)
+
+    with pytest.raises(ValueError, match="membership"):
+        build_cache(mini_pit_bundle, paths, resume=False)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_numbers_fail_closed(value: float) -> None:
+    with pytest.raises(ValueError, match="non-finite"):
+        _number(value)

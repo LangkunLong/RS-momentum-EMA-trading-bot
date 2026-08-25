@@ -45,6 +45,12 @@ class InstitutionalSnapshot:
                 raise ValueError(f"{field} must be a non-negative integer or None")
         if not isinstance(self.evidence_ids, tuple) or any(not isinstance(item, str) or not item for item in self.evidence_ids):
             raise ValueError("evidence_ids must be a tuple of non-empty strings")
+        values = (self.ownership_percent, self.holder_count, self.previous_holder_count)
+        if self.as_of_date is None:
+            if any(value is not None for value in values) or self.evidence_ids:
+                raise ValueError("unavailable institutional snapshots must not contain evidence")
+        elif any(value is None for value in values) or not self.evidence_ids:
+            raise ValueError("available institutional snapshots require ownership, holder counts, and evidence")
 
     @property
     def available(self) -> bool:
@@ -71,6 +77,11 @@ class IndustryGroupSnapshot:
             values = getattr(self, field)
             if not isinstance(values, tuple) or any(not isinstance(item, str) or not item for item in values):
                 raise ValueError(f"{field} must be a tuple of non-empty strings")
+        if self.as_of_date is None:
+            if self.group_id is not None or self.group_rank is not None or self.group_members or self.evidence_ids:
+                raise ValueError("unavailable industry snapshots must not contain evidence")
+        elif self.group_id is None or self.group_rank is None or not self.group_members or not self.evidence_ids:
+            raise ValueError("available industry snapshots require group membership, rank, and evidence")
 
     @property
     def available(self) -> bool:

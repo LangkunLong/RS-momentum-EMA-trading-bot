@@ -15,9 +15,10 @@ from typing import Any, Iterable, Mapping
 
 import pandas as pd
 
-from core.momentum_analysis import calculate_rs_snapshot
+from core.pit_data import PITDataBundle
 from .models import DatePartitions, Rulebook
 from .patterns import BasePolicy, detect_proper_base
+from .rs import calculate_pit_rs_snapshot
 from .rulebook import canonical_sha256
 from .supplemental import (
     IndustryGroupSnapshot,
@@ -120,7 +121,7 @@ class FactCache:
 
 def build_fact_cache(
     *,
-    bundle: Any,
+    bundle: PITDataBundle,
     rulebook: Rulebook,
     partitions: DatePartitions,
     output_path: Path,
@@ -145,7 +146,7 @@ def build_fact_cache(
 
 class FactCacheBuilder:
     def __init__(
-        self, *, bundle: Any, rulebook: Rulebook, partitions: DatePartitions, output_path: Path,
+        self, *, bundle: PITDataBundle, rulebook: Rulebook, partitions: DatePartitions, output_path: Path,
         checkpoint_path: Path, progress_path: Path, supplemental_provider: SupplementalPITProvider,
         checkpoint_every_sessions: int = 5,
     ) -> None:
@@ -178,21 +179,15 @@ class FactCacheBuilder:
         if partial_state and not resume:
             raise ValueError("fact cache partial state already exists; use resume=True")
         if resume and partial_state:
-            if not (self.partial_path.exists() and self.checkpoint_path.exists()):
+            if not self.partial_path.exists():
                 raise ValueError("fact cache partial state is incomplete")
-            checkpoint = _load_checkpoint(self.checkpoint_path)
-            checkpoint_identity = checkpoint.get("identity")
-            if (
-                checkpoint.get("identity_sha256") != self.identity.sha256
-                or not isinstance(checkpoint_identity, Mapping)
-                or canonical_sha256(checkpoint_identity) != canonical_sha256(dict(self.identity.fields))
-            ):
-                raise ValueError("fact cache identity mismatch")
-            next_index = checkpoint.get("next_session_index")
-            if type(next_index) is not int or not 0 <= next_index <= len(sessions):
-                raise ValueError("fact cache checkpoint index is invalid")
             conn = sqlite3.connect(self.partial_path)
             self._verify_partial_metadata(conn)
+            if self.checkpoint_path.exists():
+                self._validate_checkpoint(_load_checkpoint(self.checkpoint_path), sessions)
+            if self.progress_path.exists():
+                self._validate_progress(sessions)
+            next_index = self._reconcile_completed_sessions(conn, sessions)
             resumed = True
         else:
             for path in (self.partial_path, self.checkpoint_path, self.progress_path):
@@ -208,8 +203,9 @@ class FactCacheBuilder:
                 rows = self._materialize_session(session, fundamental_states)
                 self._insert_rows(conn, rows)
                 conn.commit()
-                self._write_progress(session, len(rows), rows[-1]["symbol"] if rows else "", index + 1)
-                self._write_checkpoint(index + 1)
+                if (index + 1) % self.checkpoint_every_sessions == 0 or index + 1 == len(sessions):
+                    self._write_progress(session, len(rows), rows[-1]["symbol"] if rows else "", index + 1)
+                    self._write_checkpoint(index + 1)
                 self._after_session(session)
             return self._finalize(conn, sessions, resumed=resumed)
         except Exception:
@@ -251,7 +247,7 @@ class FactCacheBuilder:
             return []
         warmup = str(getattr(self.bundle, "metadata", {}).get("warmup_start", session))
         closes = self.bundle.fetch_closes(members, pd.Timestamp(warmup), pd.Timestamp(session))
-        rs = calculate_rs_snapshot(closes, pd.Timestamp(session), eligible_tickers=members)
+        rs = calculate_pit_rs_snapshot(closes, pd.Timestamp(session), eligible_tickers=members)
         price_data = self.bundle.fetch_price_data(members, pd.Timestamp(warmup), pd.Timestamp(session))
         spy_data = self.bundle.fetch_price_data(("SPY",), pd.Timestamp(warmup), pd.Timestamp(session)).get("SPY")
         market = _market_facts(spy_data, session)
@@ -328,6 +324,45 @@ class FactCacheBuilder:
         if metadata.get("schema_sha256") != _SCHEMA_SHA256:
             raise ValueError("fact cache schema mismatch")
 
+    def _validate_checkpoint(self, checkpoint: Mapping[str, object], sessions: list[str]) -> None:
+        checkpoint_identity = checkpoint.get("identity")
+        next_index = checkpoint.get("next_session_index")
+        if (
+            checkpoint.get("identity_sha256") != self.identity.sha256
+            or not isinstance(checkpoint_identity, Mapping)
+            or canonical_sha256(checkpoint_identity) != canonical_sha256(dict(self.identity.fields))
+        ):
+            raise ValueError("fact cache identity mismatch")
+        if type(next_index) is not int or not 0 <= next_index <= len(sessions):
+            raise ValueError("fact cache checkpoint index is invalid")
+
+    def _validate_progress(self, sessions: list[str]) -> None:
+        records = _load_progress(self.progress_path)
+        previous_index = 0
+        for record in records:
+            next_index = record.get("next_session_index")
+            if record.get("identity_sha256") != self.identity.sha256:
+                raise ValueError("fact cache identity mismatch")
+            if type(next_index) is not int or not previous_index < next_index <= len(sessions):
+                raise ValueError("fact cache progress index is invalid")
+            if record.get("session") != sessions[next_index - 1]:
+                raise ValueError("fact cache progress session is invalid")
+            previous_index = next_index
+
+    def _reconcile_completed_sessions(self, conn: sqlite3.Connection, sessions: list[str]) -> int:
+        for index, session in enumerate(sessions):
+            expected_symbols = tuple(sorted(self.bundle.members_at(session)))
+            rows = conn.execute(
+                "SELECT symbol,member FROM session_facts WHERE bundle_sha256=? AND rulebook_schema_version=? AND session=? ORDER BY symbol",
+                (_bundle_digest(self.bundle), self.rulebook.version, session),
+            ).fetchall()
+            if not rows:
+                return index
+            actual_symbols = tuple(str(row[0]) for row in rows)
+            if actual_symbols != expected_symbols or any(int(row[1]) != 1 for row in rows):
+                raise ValueError("fact cache membership coverage mismatch")
+        return len(sessions)
+
     def _insert_rows(self, conn: sqlite3.Connection, rows: Iterable[Mapping[str, object]]) -> None:
         placeholders = ",".join("?" for _ in _FACT_COLUMNS)
         conn.executemany(f"INSERT INTO session_facts({','.join(_FACT_COLUMNS)}) VALUES ({placeholders})", ([row[column] for column in _FACT_COLUMNS] for row in rows))
@@ -354,10 +389,8 @@ class FactCacheBuilder:
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise ValueError("fact cache SQLite integrity check failed")
-        expected = sum(len(self.bundle.members_at(session)) for session in sessions)
-        actual = int(conn.execute("SELECT COUNT(*) FROM session_facts").fetchone()[0])
-        if actual != expected:
-            raise ValueError("fact cache row count does not match PIT membership")
+        if self._reconcile_completed_sessions(conn, sessions) != len(sessions):
+            raise ValueError("fact cache membership coverage mismatch")
         logical = hashlib.sha256("".join(row[0] for row in conn.execute("SELECT row_sha256 FROM session_facts ORDER BY session,symbol")).encode("ascii")).hexdigest()
         conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES ('content_sha256',?)", (logical,))
         conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES ('status','complete')")
@@ -437,6 +470,17 @@ def _load_checkpoint(path: Path) -> Mapping[str, object]:
     return value
 
 
+def _load_progress(path: Path) -> list[Mapping[str, object]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        records = [json.loads(line) for line in lines if line]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("fact cache progress is invalid") from exc
+    if not records or any(not isinstance(record, dict) for record in records):
+        raise ValueError("fact cache progress is invalid")
+    return records
+
+
 def _state_sha256(path: Path) -> str:
     return _sha256_file(path)
 
@@ -457,7 +501,9 @@ def _number(value: object) -> float | None:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    return number if math.isfinite(number) else None
+    if not math.isfinite(number):
+        raise ValueError("fact cache number is non-finite")
+    return number
 
 
 def _frame_values(snapshot: Mapping[str, Any] | None, name: str, row: str, count: int) -> list[float | None]:
