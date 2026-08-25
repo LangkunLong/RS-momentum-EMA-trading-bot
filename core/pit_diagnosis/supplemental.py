@@ -15,7 +15,9 @@ from typing import Protocol
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _ZERO_DIGEST = "0" * 64
 _SUPPLEMENTAL_SCHEMA_VERSION = "1"
-_SUPPLEMENTAL_METADATA_KEYS = frozenset({"schema_version", "source_kind", "data_cutoff", "provenance_sha256"})
+_SUPPLEMENTAL_BASE_METADATA_KEYS = frozenset({"schema_version", "source_kind", "data_cutoff", "provenance_sha256"})
+_SUPPLEMENTAL_COVERAGE_METADATA_KEYS = frozenset({"coverage_status", "coverage_manifest_sha256"})
+_SUPPLEMENTAL_METADATA_KEYS = _SUPPLEMENTAL_BASE_METADATA_KEYS | _SUPPLEMENTAL_COVERAGE_METADATA_KEYS
 _INSTITUTIONAL_TABLE = "institutional_snapshots"
 _INDUSTRY_TABLE = "industry_group_snapshots"
 _SUPPLEMENTAL_TABLES = frozenset({"metadata", _INSTITUTIONAL_TABLE, _INDUSTRY_TABLE})
@@ -247,9 +249,10 @@ class SQLiteSupplementalPITProvider:
 
         Row-level as-of availability is still evaluated causally while facts are
         built; this preflight only prevents a strict build from accidentally
-        using an empty or one-sided supplemental artifact.  It deliberately
-        does not treat row counts as proof of complete PIT coverage: missing
-        observations remain unavailable and fail closed in the strict strategy.
+        using an empty, one-sided, or unapproved supplemental artifact.  The
+        production coverage manifest is sealed into the artifact metadata by
+        ``tools.build_pit_supplemental``.  Missing observations can still be
+        unavailable at row level and fail closed in the strict strategy.
         """
 
         connection = self._connection
@@ -265,6 +268,15 @@ class SQLiteSupplementalPITProvider:
                 "strict CANSLIM requires non-empty institutional and industry PIT inputs; "
                 f"missing rows in {', '.join(missing)}"
             )
+        metadata = {
+            str(row[0]): str(row[1])
+            for row in connection.execute("SELECT key,value FROM metadata")
+        }
+        if metadata.get("coverage_status") != "production":
+            raise ValueError(
+                "strict CANSLIM requires a production supplemental coverage manifest"
+            )
+        _digest(metadata.get("coverage_manifest_sha256", ""), "supplemental coverage manifest SHA-256")
 
     def _latest(self, table: str, symbol: str, session: str) -> sqlite3.Row | None:
         if table not in {_INSTITUTIONAL_TABLE, _INDUSTRY_TABLE}:
@@ -304,7 +316,10 @@ class SQLiteSupplementalPITProvider:
         )
         metadata_rows = connection.execute("SELECT key,value FROM metadata").fetchall()
         metadata = {str(row[0]): str(row[1]) for row in metadata_rows}
-        if len(metadata) != len(metadata_rows) or set(metadata) != _SUPPLEMENTAL_METADATA_KEYS:
+        if len(metadata) != len(metadata_rows) or set(metadata) not in {
+            _SUPPLEMENTAL_BASE_METADATA_KEYS,
+            _SUPPLEMENTAL_METADATA_KEYS,
+        }:
             raise ValueError("supplemental metadata keys are invalid")
         if metadata["schema_version"] != _SUPPLEMENTAL_SCHEMA_VERSION:
             raise ValueError("supplemental schema version is unsupported")
@@ -312,6 +327,10 @@ class SQLiteSupplementalPITProvider:
             raise ValueError("supplemental source_kind is empty")
         _date(metadata["data_cutoff"], "supplemental data_cutoff")
         _digest(metadata["provenance_sha256"], "supplemental provenance_sha256")
+        if set(metadata) == _SUPPLEMENTAL_METADATA_KEYS:
+            if metadata["coverage_status"] != "production":
+                raise ValueError("supplemental coverage_status must be production")
+            _digest(metadata["coverage_manifest_sha256"], "supplemental coverage_manifest_sha256")
 
         self._validate_table(
             _INSTITUTIONAL_TABLE,

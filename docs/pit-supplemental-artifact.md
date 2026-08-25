@@ -185,6 +185,7 @@ python -m tools.build_pit_supplemental `
   --source-kind sec-13f-plus-dated-industry-export `
   --source-reference sec-13f-quarterly-2020q1-through-2025q4 `
   --source-reference industry-export:<immutable-id> `
+  --coverage-manifest coverage-manifest.json `
   --data-cutoff 2025-12-31 `
   --output supplemental.sqlite3 `
   --provenance-output supplemental.provenance.json
@@ -195,6 +196,25 @@ SQLite `sha256` to `pit_diagnosis.py build-facts --supplemental-input ...
 --supplemental-sha256 ...`. The resulting fact-cache identity includes that
 artifact hash, so changing source rows or provenance creates a new cache
 identity rather than silently reusing prior facts.
+
+The coverage manifest is a small JSON declaration sealed into the artifact:
+
+```json
+{
+  "schema_version": 1,
+  "status": "production",
+  "expected_institutional_symbols": ["AMZN", "MU", "NVDA"],
+  "expected_industry_symbols": ["AMZN", "MU", "NVDA"],
+  "expected_institutional_dates": ["2023-01-03"],
+  "expected_industry_dates": ["2024-09-26"]
+}
+```
+
+The example is illustrative only; a strict five-year artifact must declare the
+actual reviewed symbol/date coverage. The builder rejects declarations not
+present in the CSV rows, and strict preflight rejects artifacts without the
+sealed production declaration. Seed or smoke artifacts must not be marked
+`production`.
 
 For a strict CANSLIM materialization, add the explicit preflight switch:
 
@@ -212,7 +232,8 @@ python -B pit_diagnosis.py build-facts `
 ```
 
 `--strict-canslim` fails before opening the PIT bundle/materialization loop if
-the supplemental artifact is absent, if its hash does not match, or if either
+the supplemental artifact is absent, if its hash does not match, if it lacks a
+sealed production coverage manifest, or if either
 the institutional or industry snapshot table is empty. It does not claim that
 non-empty tables provide complete universe coverage: each fact row still uses
 the causal as-of lookup, and missing row-level observations remain unavailable

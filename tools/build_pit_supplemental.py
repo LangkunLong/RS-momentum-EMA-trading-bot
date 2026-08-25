@@ -61,6 +61,7 @@ _INDUSTRY_FIELDS = (
 )
 _INTEGER = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _MAX_CSV_FIELD_BYTES = 64 * 1024 * 1024
+_COVERAGE_SCHEMA_VERSION = 1
 
 csv.field_size_limit(max(csv.field_size_limit(), _MAX_CSV_FIELD_BYTES))
 
@@ -96,6 +97,18 @@ class BuildResult:
     data_cutoff: str
     institutional_rows: int
     industry_rows: int
+    coverage_manifest_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class _CoverageManifest:
+    """Validated coverage declaration required for strict promotion."""
+
+    sha256: str
+    expected_institutional_symbols: frozenset[str]
+    expected_industry_symbols: frozenset[str]
+    expected_institutional_dates: frozenset[str]
+    expected_industry_dates: frozenset[str]
 
 
 def _sha256_file(path: Path) -> str:
@@ -164,6 +177,64 @@ def _json_strings(value: str, field: str, *, sort_values: bool = True) -> tuple[
 
 def _json_array(values: tuple[str, ...]) -> str:
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+
+def _coverage_manifest(path: Path, institutional: list[_InstitutionalRow], industry: list[_IndustryRow]) -> _CoverageManifest:
+    """Validate a production coverage declaration against the parsed rows."""
+
+    manifest_path = _regular_file(path, "coverage_manifest")
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"), parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)))
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("coverage_manifest must be valid UTF-8 JSON") from exc
+    if not isinstance(raw, dict) or set(raw) != {
+        "schema_version",
+        "status",
+        "expected_institutional_symbols",
+        "expected_industry_symbols",
+        "expected_institutional_dates",
+        "expected_industry_dates",
+    }:
+        raise ValueError("coverage_manifest fields are invalid")
+    if raw["schema_version"] != _COVERAGE_SCHEMA_VERSION or raw["status"] != "production":
+        raise ValueError("coverage_manifest must declare schema_version 1 and status production")
+
+    def values(name: str, *, dates: bool = False) -> frozenset[str]:
+        value = raw[name]
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"coverage_manifest {name} must be a non-empty array")
+        if any(not isinstance(item, str) or not item.strip() or item.strip() != item for item in value):
+            raise ValueError(f"coverage_manifest {name} must contain trimmed strings")
+        parsed = frozenset(_iso_date(item, f"coverage_manifest {name}") if dates else _symbol(item, f"coverage_manifest {name}" ) for item in value)
+        if len(parsed) != len(value):
+            raise ValueError(f"coverage_manifest {name} must not contain duplicates")
+        return parsed
+
+    expected_institutional_symbols = values("expected_institutional_symbols")
+    expected_industry_symbols = values("expected_industry_symbols")
+    expected_institutional_dates = values("expected_institutional_dates", dates=True)
+    expected_industry_dates = values("expected_industry_dates", dates=True)
+    actual_institutional_symbols = {row.symbol for row in institutional}
+    actual_industry_symbols = {row.symbol for row in industry}
+    actual_institutional_dates = {row.as_of_date for row in institutional}
+    actual_industry_dates = {row.as_of_date for row in industry}
+    for label, expected, actual in (
+        ("institutional symbols", expected_institutional_symbols, actual_institutional_symbols),
+        ("industry symbols", expected_industry_symbols, actual_industry_symbols),
+        ("institutional dates", expected_institutional_dates, actual_institutional_dates),
+        ("industry dates", expected_industry_dates, actual_industry_dates),
+    ):
+        missing = sorted(expected - actual)
+        if missing:
+            raise ValueError(f"coverage_manifest is not satisfied for {label}: {missing[:5]}")
+    canonical = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _CoverageManifest(
+        sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        expected_institutional_symbols=expected_institutional_symbols,
+        expected_industry_symbols=expected_industry_symbols,
+        expected_institutional_dates=expected_institutional_dates,
+        expected_industry_dates=expected_industry_dates,
+    )
 
 
 def _read_csv(path: Path, fields: tuple[str, ...], *, max_rows: int, kind: str) -> list[dict[str, str]]:
@@ -265,11 +336,13 @@ def _provenance(
     institutional_rows: int,
     industry_rows: int,
     source_references: tuple[str, ...],
+    coverage_manifest_sha256: str | None,
 ) -> dict[str, Any]:
     """Return the canonical, path-independent provenance manifest."""
 
     return {
         "data_cutoff": data_cutoff,
+        "coverage_manifest_sha256": coverage_manifest_sha256,
         "inputs": [
             {
                 "kind": "institutional",
@@ -294,6 +367,7 @@ def _write_sqlite(
     source_kind: str,
     data_cutoff: str,
     provenance_sha256: str,
+    coverage_manifest_sha256: str | None,
     institutional: list[_InstitutionalRow],
     industry: list[_IndustryRow],
 ) -> None:
@@ -326,16 +400,22 @@ def _write_sqlite(
             );
             """
         )
+        metadata = {
+            "data_cutoff": data_cutoff,
+            "provenance_sha256": provenance_sha256,
+            "schema_version": _SCHEMA_VERSION,
+            "source_kind": source_kind,
+        }
+        if coverage_manifest_sha256 is not None:
+            metadata.update(
+                {
+                    "coverage_manifest_sha256": coverage_manifest_sha256,
+                    "coverage_status": "production",
+                }
+            )
         connection.executemany(
             "INSERT INTO metadata(key,value) VALUES (?,?)",
-            sorted(
-                (
-                    ("data_cutoff", data_cutoff),
-                    ("provenance_sha256", provenance_sha256),
-                    ("schema_version", _SCHEMA_VERSION),
-                    ("source_kind", source_kind),
-                )
-            ),
+            sorted(metadata.items()),
         )
         connection.executemany(
             "INSERT INTO institutional_snapshots VALUES (?,?,?,?,?,?)",
@@ -379,6 +459,7 @@ def build_artifact(
     data_cutoff: str,
     output: Path,
     provenance_output: Path | None = None,
+    coverage_manifest: Path | None = None,
     source_references: tuple[str, ...] = (),
     max_rows: int = _MAX_ROWS,
 ) -> BuildResult:
@@ -387,7 +468,9 @@ def build_artifact(
     ``source_kind`` describes the user-supplied source and is recorded as
     metadata; this function does not assert that the source is authoritative.
     Every row must carry its own evidence IDs and an as-of date at or before
-    ``data_cutoff``.  Existing outputs are never overwritten.
+    ``data_cutoff``.  A production coverage manifest is required for strict
+    CANSLIM use and is checked against the parsed rows. Existing outputs are
+    never overwritten.
     """
 
     if not isinstance(source_kind, str) or not source_kind or source_kind.strip() != source_kind:
@@ -427,6 +510,7 @@ def build_artifact(
     )
     if not institutional or not industry:
         raise ValueError("both CSV inputs must contain at least one validated row")
+    coverage = None if coverage_manifest is None else _coverage_manifest(coverage_manifest, institutional, industry)
 
     manifest = _provenance(
         source_kind=source_kind,
@@ -436,6 +520,7 @@ def build_artifact(
         institutional_rows=len(institutional),
         industry_rows=len(industry),
         source_references=tuple(sorted(source_references)),
+        coverage_manifest_sha256=None if coverage is None else coverage.sha256,
     )
     provenance_sha256 = canonical_sha256(manifest)
     partial = Path(f"{output_path}.partial")
@@ -451,6 +536,7 @@ def build_artifact(
             source_kind=source_kind,
             data_cutoff=cutoff,
             provenance_sha256=provenance_sha256,
+            coverage_manifest_sha256=None if coverage is None else coverage.sha256,
             institutional=institutional,
             industry=industry,
         )
@@ -475,6 +561,7 @@ def build_artifact(
             data_cutoff=cutoff,
             institutional_rows=len(institutional),
             industry_rows=len(industry),
+            coverage_manifest_sha256=None if coverage is None else coverage.sha256,
         )
     except Exception:
         partial.unlink(missing_ok=True)
@@ -501,6 +588,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--provenance-output", type=Path)
     parser.add_argument(
+        "--coverage-manifest",
+        type=Path,
+        help="Production coverage declaration; required before strict CANSLIM use.",
+    )
+    parser.add_argument(
         "--source-reference",
         action="append",
         default=[],
@@ -521,6 +613,7 @@ def main(argv: list[str] | None = None) -> int:
         data_cutoff=args.data_cutoff,
         output=args.output,
         provenance_output=args.provenance_output,
+        coverage_manifest=args.coverage_manifest,
         source_references=tuple(args.source_reference),
         max_rows=args.max_rows,
     )
@@ -533,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
                 "output": str(result.output),
                 "provenance_output": None if result.provenance_output is None else str(result.provenance_output),
                 "provenance_sha256": result.provenance_sha256,
+                "coverage_manifest_sha256": result.coverage_manifest_sha256,
                 "sha256": result.sha256,
             },
             sort_keys=True,

@@ -64,6 +64,35 @@ def test_builder_seals_provenance_and_provider_reads_as_of_rows(tmp_path: Path) 
         assert industry_snapshot.group_members == ("AAA", "BBB")
 
 
+def test_production_coverage_manifest_is_required_for_strict_preflight(tmp_path: Path) -> None:
+    institutional, industry = _write_inputs(tmp_path)
+    coverage = tmp_path / "coverage.json"
+    coverage.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "production",
+                "expected_institutional_symbols": ["AAA"],
+                "expected_industry_symbols": ["AAA"],
+                "expected_institutional_dates": ["2025-06-30", "2025-12-31"],
+                "expected_industry_dates": ["2025-06-30", "2025-12-31"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = build_artifact(
+        institutional_csv=institutional,
+        industry_csv=industry,
+        source_kind="sec-13f-plus-dated-industry-export",
+        data_cutoff="2025-12-31",
+        output=tmp_path / "production.sqlite3",
+        coverage_manifest=coverage,
+    )
+    with SQLiteSupplementalPITProvider(result.output, result.sha256) as provider:
+        provider.require_strict_inputs()
+    assert result.coverage_manifest_sha256
+
+
 def test_builder_is_byte_reproducible_for_identical_inputs(tmp_path: Path) -> None:
     institutional, industry = _write_inputs(tmp_path)
     first = build_artifact(
