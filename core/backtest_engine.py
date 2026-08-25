@@ -657,6 +657,28 @@ class CanslimStrategy:
         market_state: dict,
         rs_score: Optional[float] = None,
     ) -> Optional[dict]:
+        """Return the public, primitive-only signal payload."""
+
+        evaluated = self._evaluate_symbol_with_entry_facts(
+            ticker=ticker,
+            ticker_ohlcv=ticker_ohlcv,
+            all_closes=all_closes,
+            eval_date=eval_date,
+            market_state=market_state,
+            rs_score=rs_score,
+        )
+        return evaluated[0] if evaluated is not None else None
+
+    def _evaluate_symbol_with_entry_facts(
+        self,
+        *,
+        ticker: str,
+        ticker_ohlcv: Dict[str, pd.DataFrame],
+        all_closes: pd.DataFrame,
+        eval_date: pd.Timestamp,
+        market_state: dict,
+        rs_score: Optional[float] = None,
+    ) -> Optional[tuple[dict, CanslimEntryFacts]]:
         tdata = ticker_ohlcv.get(ticker)
         if tdata is None:
             return None
@@ -807,7 +829,7 @@ class CanslimStrategy:
         else:
             signal_reason = "No Breakout"
 
-        return {
+        signal = {
             "symbol": str(ticker).upper(),
             "signal_date": str(eval_date.date()),
             "close": _finite_signal_number(tech.get("close")),
@@ -847,6 +869,7 @@ class CanslimStrategy:
             "signal_reason": signal_reason,
             "technical_only": self.technical_only,
         }
+        return signal, entry_facts
 
 
 def _new_execution_diagnostics() -> dict[str, int]:
@@ -1263,6 +1286,9 @@ class PortfolioSimulator:
                 ),
                 require_proper_base=self.require_proper_base,
             )
+        )
+        self._owned_builtin_strategy = (
+            self.strategy if not self._strategy_was_injected else None
         )
         try:
             self.strategy.min_rs_score = MIN_RS_SCORE
@@ -1875,28 +1901,31 @@ class PortfolioSimulator:
         eval_date: pd.Timestamp,
         market_allowed: bool,
         market_state: dict[str, Any],
+        entry_facts: CanslimEntryFacts | None = None,
     ) -> dict[str, Any]:
         """Rebuild the authoritative entry decision at the execution boundary."""
 
-        available = history_through_exact_session(ticker_history, eval_date)
-        if available is None:
-            closes: Iterable[object] = ()
-            volumes: Iterable[object] = ()
-        else:
-            closes = available["Close"] if "Close" in available.columns else ()
-            volumes = available["Volume"] if "Volume" in available.columns else ()
-        if self.require_proper_base:
-            facts = build_entry_facts(
-                closes,
-                volumes,
-                history_before_event=available.iloc[:-1] if available is not None else None,
-                event_session=eval_date,
-                require_proper_base=True,
-            )
-        else:
-            facts = build_entry_facts(closes, volumes)
-
         canonical = dict(row)
+        if self.require_proper_base and isinstance(entry_facts, CanslimEntryFacts):
+            facts = entry_facts
+        else:
+            available = history_through_exact_session(ticker_history, eval_date)
+            if available is None:
+                closes: Iterable[object] = ()
+                volumes: Iterable[object] = ()
+            else:
+                closes = available["Close"] if "Close" in available.columns else ()
+                volumes = available["Volume"] if "Volume" in available.columns else ()
+            if self.require_proper_base:
+                facts = build_entry_facts(
+                    closes,
+                    volumes,
+                    history_before_event=available.iloc[:-1] if available is not None else None,
+                    event_session=eval_date,
+                    require_proper_base=True,
+                )
+            else:
+                facts = build_entry_facts(closes, volumes)
         if self.technical_only:
             current_growth = _finite_signal_number(canonical.get("current_growth"))
             annual_growth = _finite_signal_number(canonical.get("annual_growth"))
@@ -2013,14 +2042,33 @@ class PortfolioSimulator:
             if top_groups and ticker_group is not None and ticker_group not in top_groups:
                 continue
 
-            row = self.strategy.evaluate_symbol(
-                ticker=ticker,
-                ticker_ohlcv=ticker_ohlcv,
-                all_closes=all_closes,
-                eval_date=eval_date,
-                market_state=effective_market_state,
-                rs_score=rs_snapshot.get(ticker),
-            )
+            entry_facts = None
+            owned_strategy = self._owned_builtin_strategy
+            if (
+                self.require_proper_base
+                and owned_strategy is not None
+                and self.strategy is owned_strategy
+            ):
+                evaluated = owned_strategy._evaluate_symbol_with_entry_facts(
+                    ticker=ticker,
+                    ticker_ohlcv=ticker_ohlcv,
+                    all_closes=all_closes,
+                    eval_date=eval_date,
+                    market_state=effective_market_state,
+                    rs_score=rs_snapshot.get(ticker),
+                )
+                if evaluated is None:
+                    continue
+                row, entry_facts = evaluated
+            else:
+                row = self.strategy.evaluate_symbol(
+                    ticker=ticker,
+                    ticker_ohlcv=ticker_ohlcv,
+                    all_closes=all_closes,
+                    eval_date=eval_date,
+                    market_state=effective_market_state,
+                    rs_score=rs_snapshot.get(ticker),
+                )
             if row is None:
                 continue
             row = self._canonicalize_signal_row(
@@ -2030,6 +2078,7 @@ class PortfolioSimulator:
                 eval_date=eval_date,
                 market_allowed=market_allowed,
                 market_state=market_state,
+                entry_facts=entry_facts,
             )
             self._signal_rows.append(row)
             if row.get("buy_signal_without_market", row.get("buy_signal", False)):
