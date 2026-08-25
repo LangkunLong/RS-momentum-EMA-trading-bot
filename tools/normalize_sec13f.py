@@ -55,6 +55,9 @@ _CUSIP = re.compile(r"[A-Z0-9]{9}\Z")
 _ACCESSION = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}\Z")
 _QUARTER = re.compile(r"(?P<year>[0-9]{4})Q(?P<number>[1-4])\Z")
 _INTEGER = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_MAX_CSV_FIELD_BYTES = 64 * 1024 * 1024
+
+csv.field_size_limit(max(csv.field_size_limit(), _MAX_CSV_FIELD_BYTES))
 
 
 @dataclass(frozen=True)

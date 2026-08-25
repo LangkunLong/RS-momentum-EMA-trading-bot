@@ -60,6 +60,9 @@ _INDUSTRY_FIELDS = (
     "evidence_ids",
 )
 _INTEGER = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_MAX_CSV_FIELD_BYTES = 64 * 1024 * 1024
+
+csv.field_size_limit(max(csv.field_size_limit(), _MAX_CSV_FIELD_BYTES))
 
 
 @dataclass(frozen=True)
