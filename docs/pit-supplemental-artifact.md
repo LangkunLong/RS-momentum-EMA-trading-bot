@@ -34,8 +34,10 @@ cutoff, malformed rows, missing evidence IDs, and empty inputs are rejected.
 ## SEC Form 13F normalization boundary
 
 For an official SEC Form 13F extraction, the normalized institutional file may
-be derived from the SEC quarterly `SUBMISSION`, `COVERPAGE`, and `INFOTABLE`
-datasets (available from 2020 Q1 onward). The extraction job—not this builder—
+be derived from the SEC quarterly [`Form 13F Data Sets`](https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets)
+(`SUBMISSION`, `COVERPAGE`, and `INFOTABLE`; available from 2020 Q1 onward;
+see the [format specification](https://www.sec.gov/files/form_13f.pdf)). The
+extraction job—not this builder—
 must perform the following explicitly documented transformations:
 
 * use the filing's public filing/acceptance date as `as_of_date`; retain the
