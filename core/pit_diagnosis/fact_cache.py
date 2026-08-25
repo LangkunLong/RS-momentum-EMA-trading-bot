@@ -847,7 +847,10 @@ def _fundamental_values(snapshot: Mapping[str, Any] | None) -> dict[str, object]
     eps = _frame_values(snapshot, "quarterly_income", "Diluted EPS", 5)
     sales = _frame_values(snapshot, "quarterly_income", "Total Revenue", 5)
     annual = _frame_values(snapshot, "annual_income", "Diluted EPS", 4)
-    net_income = _frame_values(snapshot, "balance_sheet", "Net Income", 1)[0]
+    # Net income is an income-statement measure.  The PIT bundle keeps it in
+    # annual_income; looking for it in balance_sheet silently made ROE
+    # unavailable for every cached row and blocked the required A.ROE gate.
+    net_income = _frame_values(snapshot, "annual_income", "Net Income", 1)[0]
     equity = _frame_values(snapshot, "balance_sheet", "Total Stockholders Equity", 1)[0]
     info = {} if snapshot is None else snapshot.get("company_info", {})
     shares = _number(info.get("shares_outstanding")) if isinstance(info, Mapping) else None
