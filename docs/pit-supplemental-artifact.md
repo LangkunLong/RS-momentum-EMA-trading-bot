@@ -190,3 +190,60 @@ The resulting `industry.csv` can be supplied directly as the
 export must contain enough historical price for the existing PIT RS calculation
 to produce a rating for every classified group member; the ranker fails closed
 when a group cannot be ranked causally.
+
+## Offline normalization of an archived Wikipedia revision
+
+`tools/normalize_pit_industry.py` is the offline acquisition boundary for a
+pinned S&P 500 Wikipedia revision. It never fetches the network or consults a
+current classification map. Supply a local UTF-8 MediaWiki JSON/HTML export,
+and a local trading-session map with the exact header:
+
+The Wikipedia table is a community-maintained, GICS-like classification view;
+it is not an official S&P Global licensed GICS data feed. Treat the pinned
+revision and its evidence ID as an explicit research input, and replace it
+with a licensed or issuer-verified source if production classification
+fidelity requires that guarantee.
+
+```text
+trade_date
+```
+
+The compact JSON fixture contract is:
+
+```json
+{
+  "revid": 123456,
+  "timestamp": "2024-01-02T15:00:00Z",
+  "rows": [
+    {"Symbol": "AAA", "GICS Sub-Industry": "Application Software", "CIK": "0000123456"}
+  ]
+}
+```
+
+An API-shaped object containing exactly one page and revision is also accepted.
+HTML must contain exactly one numeric revision ID (a revision meta tag or a
+canonical `oldid` URL), one timezone-aware revision timestamp, and a table with
+`Symbol` and `GICS Sub-Industry` columns. Symbols and groups are canonicalized
+strictly; duplicate symbols, malformed fields, and unknown punctuation aliases
+are rejected.
+
+The normalizer assigns `as_of_date` to the first supplied `trade_date` strictly
+after the revision timestamp. A same-day session is therefore never used for a
+revision published later that day, and a missing later session is an error.
+Evidence is emitted as the JSON array `["wikipedia:revid:<id>"]` in the
+classification CSV contract. When a PIT membership CSV is supplied, the
+revision symbols must exactly equal the active members on the derived date;
+missing and extra symbols fail closed.
+
+```powershell
+python -m tools.normalize_pit_industry `
+  --revision-export wikipedia-revision.json `
+  --sessions-csv trading-sessions.csv `
+  --membership-csv pit-membership.csv `
+  --output classifications.csv
+```
+
+The resulting `classifications.csv` is the input to
+`tools/build_pit_industry.py`. Keep the immutable revision export, its revid,
+and the session/membership inputs alongside the generated artifact so the
+classification snapshot can be reproduced and audited.
