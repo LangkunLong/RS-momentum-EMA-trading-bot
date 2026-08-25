@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Mapping
 
 import pandas as pd
@@ -26,8 +27,16 @@ def _ids(value: object) -> tuple[str, ...]:
     return tuple(sorted(item for item in parsed if isinstance(item, str) and item)) if isinstance(parsed, list) else ()
 
 
-def evaluate_session_rules(fact: SessionFact, rulebook: Rulebook, experiment: ExperimentDefinition) -> tuple[RuleOutcome, ...]:
+def evaluate_session_rules(
+    fact: SessionFact,
+    rulebook: Rulebook,
+    experiment: ExperimentDefinition,
+    *,
+    strict_canslim: bool = False,
+) -> tuple[RuleOutcome, ...]:
     """Evaluate one immutable cache row; no history/provider access is permitted."""
+    if type(strict_canslim) is not bool:
+        raise ValueError("strict_canslim must be a bool")
     values = fact.values
     def passed(rule_id: str, condition: bool, *ids: str) -> RuleOutcome:
         return RuleOutcome.passed(rule_id, *ids) if condition else RuleOutcome.failed(rule_id, *ids)
@@ -58,6 +67,65 @@ def evaluate_session_rules(fact: SessionFact, rulebook: Rulebook, experiment: Ex
         market_uptrend = True
     group_ids = _ids(values.get("industry_evidence_ids"))
     institution_ids = _ids(values.get("institutional_evidence_ids"))
+    if strict_canslim:
+        industry_policy = rulebook.rules["L.INDUSTRY_GROUP"].parameter_policy
+        industry_max_rank = _number(industry_policy.get("maximum_rank"))
+        if industry_max_rank is None or not math.isfinite(industry_max_rank) or industry_max_rank <= 0.0:
+            raise ValueError("L.INDUSTRY_GROUP maximum_rank is required for strict CANSLIM")
+        institution_policy = rulebook.rules["I.SPONSORSHIP"].parameter_policy
+        ownership_floor = _number(institution_policy.get("ownership_floor"))
+        if ownership_floor is None or not math.isfinite(ownership_floor) or not 0.0 <= ownership_floor <= 1.0:
+            raise ValueError("I.SPONSORSHIP ownership_floor is required for strict CANSLIM")
+        require_increasing_holders = institution_policy.get("require_increasing_holders")
+        if type(require_increasing_holders) is not bool:
+            raise ValueError("I.SPONSORSHIP require_increasing_holders is required for strict CANSLIM")
+        industry_rank = _number(values.get("industry_rank"))
+        if industry_rank is None or not math.isfinite(industry_rank) or not group_ids:
+            industry_outcome = unavailable("L.INDUSTRY_GROUP", group_ids)
+        else:
+            industry_outcome = passed(
+                "L.INDUSTRY_GROUP",
+                industry_rank.is_integer() and 0.0 < industry_rank <= industry_max_rank,
+                *group_ids,
+            )
+        ownership = _number(values.get("institutional_ownership_percent"))
+        holder_count = _number(values.get("institutional_holder_count"))
+        previous_holder_count = _number(values.get("institutional_previous_holder_count"))
+        complete_sponsorship = (
+            bool(institution_ids)
+            and ownership is not None
+            and math.isfinite(ownership)
+            and holder_count is not None
+            and math.isfinite(holder_count)
+            and previous_holder_count is not None
+            and math.isfinite(previous_holder_count)
+        )
+        if not complete_sponsorship:
+            institution_outcome = unavailable("I.SPONSORSHIP", institution_ids)
+        else:
+            institution_outcome = passed(
+                "I.SPONSORSHIP",
+                0.0 <= ownership <= 1.0
+                and ownership >= ownership_floor
+                and holder_count.is_integer()
+                and previous_holder_count.is_integer()
+                and holder_count >= 0.0
+                and previous_holder_count >= 0.0
+                and (not require_increasing_holders or holder_count > previous_holder_count),
+                *institution_ids,
+            )
+    else:
+        industry_outcome = passed(
+            "L.INDUSTRY_GROUP",
+            _number(values.get("industry_rank")) is not None,
+            *group_ids,
+        ) if group_ids else unavailable("L.INDUSTRY_GROUP")
+        institution_outcome = passed(
+            "I.SPONSORSHIP",
+            _number(values.get("institutional_holder_count")) is not None
+            and _number(values.get("institutional_previous_holder_count")) is not None,
+            *institution_ids,
+        ) if institution_ids else unavailable("I.SPONSORSHIP")
     rs_floor = 85.0 if experiment.experiment_id == "D2.RS_85_CONFORMANCE" else 80.0
     outcomes: dict[str, RuleOutcome] = {
         "C.EPS_YOY": passed("C.EPS_YOY", (_number(values.get("current_eps_yoy")) or -1.0) >= 0.25),
@@ -71,8 +139,8 @@ def evaluate_session_rules(fact: SessionFact, rulebook: Rulebook, experiment: Ex
         "S.VOLUME_CONFIRMATION": passed("S.VOLUME_CONFIRMATION", (_number(values.get("event_volume_ratio")) or 0.0) >= 1.30),
         "S.SUPPLY": unavailable("S.SUPPLY"),
         "L.RS": passed("L.RS", (_number(values.get("rs_rating")) or -1.0) >= rs_floor),
-        "L.INDUSTRY_GROUP": passed("L.INDUSTRY_GROUP", _number(values.get("industry_rank")) is not None, *group_ids) if group_ids else unavailable("L.INDUSTRY_GROUP"),
-        "I.SPONSORSHIP": passed("I.SPONSORSHIP", _number(values.get("institutional_holder_count")) is not None and _number(values.get("institutional_previous_holder_count")) is not None, *institution_ids) if institution_ids else unavailable("I.SPONSORSHIP"),
+        "L.INDUSTRY_GROUP": industry_outcome,
+        "I.SPONSORSHIP": institution_outcome,
         "M.CONFIRMED_UPTREND": passed("M.CONFIRMED_UPTREND", market_uptrend),
         "M.DISTRIBUTION_EXPOSURE": passed("M.DISTRIBUTION_EXPOSURE", (_number(values.get("distribution_count")) or 0.0) < 5.0),
         "E.PROPER_BASE": passed("E.PROPER_BASE", base_ok),
@@ -90,9 +158,19 @@ def evaluate_session_rules(fact: SessionFact, rulebook: Rulebook, experiment: Ex
 class CachedDiagnosisStrategy(CanslimStrategy):
     """A strategy whose only data source is the read-only diagnosis fact cache."""
 
-    def __init__(self, fact_cache: FactCache, rulebook: Rulebook, experiment: ExperimentDefinition) -> None:
+    def __init__(
+        self,
+        fact_cache: FactCache,
+        rulebook: Rulebook,
+        experiment: ExperimentDefinition,
+        *,
+        strict_canslim: bool = False,
+    ) -> None:
+        if type(strict_canslim) is not bool:
+            raise ValueError("strict_canslim must be a bool")
         super().__init__(fundamental_provider=None, require_bullish_market=False)
         self.fact_cache, self.rulebook, self.experiment = fact_cache, rulebook, experiment
+        self.strict_canslim = strict_canslim
         self.fundamental_provider = None
 
     def evaluate_symbol(self, *, ticker: str, ticker_ohlcv: dict[str, pd.DataFrame], all_closes: pd.DataFrame, eval_date: pd.Timestamp, market_state: dict, rs_score: float | None = None) -> dict | None:
@@ -101,9 +179,19 @@ class CachedDiagnosisStrategy(CanslimStrategy):
             fact = self.fact_cache.session_fact(ticker, str(eval_date.date()))
         except KeyError:
             return None
-        outcomes = {outcome.rule_id: outcome for outcome in evaluate_session_rules(fact, self.rulebook, self.experiment)}
+        outcomes = {
+            outcome.rule_id: outcome
+            for outcome in evaluate_session_rules(
+                fact, self.rulebook, self.experiment, strict_canslim=self.strict_canslim,
+            )
+        }
         required = [rule_id for rule_id, rule in self.rulebook.rules.items() if rule.classification.value == "required"]
-        observed_eligible = all(outcomes[rule_id].status == "passed" for rule_id in required if rule_id not in {"I.SPONSORSHIP", "L.INDUSTRY_GROUP"})
+        proxy_exclusions = frozenset() if self.strict_canslim else frozenset({"I.SPONSORSHIP", "L.INDUSTRY_GROUP"})
+        observed_eligible = all(
+            outcomes[rule_id].status == "passed"
+            for rule_id in required
+            if rule_id not in proxy_exclusions
+        )
         market_ok = outcomes["M.CONFIRMED_UPTREND"].status == "passed"
         return {
             "symbol": str(fact.symbol), "signal_date": str(fact.session), "close": _number(fact.values.get("close")),

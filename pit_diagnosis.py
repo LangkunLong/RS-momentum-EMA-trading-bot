@@ -22,6 +22,7 @@ from core.pit_diagnosis.fact_cache import build_fact_cache, open_fact_cache
 from core.pit_diagnosis.models import PartitionName
 from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
 from core.pit_diagnosis.rulebook import load_rulebook
+from core.pit_diagnosis.supplemental import SQLiteSupplementalPITProvider
 
 
 PIT_DIAGNOSIS_SENTINEL = "PIT_DIAGNOSIS_RESULT="
@@ -330,6 +331,7 @@ def _context(args: argparse.Namespace) -> tuple[DiagnosisContext, PITDataBundle,
         ),
         strategy_identity="cached-diagnosis-v2-fidelity-cash",
         bundle_sha256=args.pit_bundle_sha256,
+        strict_canslim=bool(getattr(args, "strict_canslim", False)),
         baseline_snapshot=snapshot, reproduced_baseline=snapshot,
     )
     return context, bundle, cache
@@ -350,6 +352,11 @@ def _add_run_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--experiment-catalog", required=True, type=_absolute_path)
     parser.add_argument("--fact-cache", required=True, type=_absolute_path)
     parser.add_argument("--fact-cache-sha256", required=True, type=_digest)
+    parser.add_argument(
+        "--strict-canslim",
+        action="store_true",
+        help="require PIT I/L evidence for entry eligibility; unavailable evidence fails closed",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -362,6 +369,8 @@ def build_parser() -> argparse.ArgumentParser:
     facts.add_argument("--output", required=True, type=_absolute_path)
     facts.add_argument("--checkpoint", required=True, type=_absolute_path)
     facts.add_argument("--progress", required=True, type=_absolute_path)
+    facts.add_argument("--supplemental-input", type=_absolute_path)
+    facts.add_argument("--supplemental-sha256", type=_digest)
     facts.add_argument("--resume", action="store_true")
 
     run = commands.add_parser("run", help="run D0-D4 discovery and validation diagnosis")
@@ -400,12 +409,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _build_facts(args: argparse.Namespace) -> int:
     rulebook = load_rulebook(args.rulebook)
-    with PITDataBundle(args.pit_bundle, expected_sha256=args.pit_bundle_sha256) as bundle:
-        result = build_fact_cache(
-            bundle=bundle, rulebook=rulebook, partitions=fixed_partitions(), output_path=args.output,
-            checkpoint_path=args.checkpoint, progress_path=args.progress, resume=args.resume,
-        )
-    print(json.dumps({"path": str(result.path), "content_sha256": result.content_sha256, "schema_sha256": result.schema_sha256, "resumed": result.resumed}, sort_keys=True))
+    if (args.supplemental_input is None) != (args.supplemental_sha256 is None):
+        raise ValueError("--supplemental-input and --supplemental-sha256 must be supplied together")
+    supplemental = (
+        SQLiteSupplementalPITProvider(args.supplemental_input, args.supplemental_sha256)
+        if args.supplemental_input is not None
+        else None
+    )
+    try:
+        with PITDataBundle(args.pit_bundle, expected_sha256=args.pit_bundle_sha256) as bundle:
+            result = build_fact_cache(
+                bundle=bundle, rulebook=rulebook, partitions=fixed_partitions(), output_path=args.output,
+                checkpoint_path=args.checkpoint, progress_path=args.progress, resume=args.resume,
+                supplemental_provider=supplemental,
+            )
+    finally:
+        if supplemental is not None:
+            supplemental.close()
+    print(json.dumps({
+        "path": str(result.path), "content_sha256": result.content_sha256, "schema_sha256": result.schema_sha256,
+        "resumed": result.resumed,
+        "supplemental_content_identity_sha256": "0" * 64 if supplemental is None else supplemental.content_identity_sha256,
+    }, sort_keys=True))
     return 0
 
 

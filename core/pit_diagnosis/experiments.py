@@ -127,8 +127,14 @@ class DiagnosisContext:
     partition_baseline_recall: Mapping[PartitionName, LeaderRecallEvidence] = field(default_factory=dict)
     benchmark_identity: str = "SPY"
     universe_identity: str = "pit-members"
+    # The sealed run remains in quantitative proxy mode by default.  Strict I/L
+    # evaluation is an explicit context choice and must have a distinct
+    # checkpoint identity (see ``_identity`` below).
+    strict_canslim: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.strict_canslim) is not bool:
+            raise ValueError("strict_canslim must be a bool")
         if len(self.source_commit) != 40 or any(char not in "0123456789abcdef" for char in self.source_commit):
             raise ValueError("source_commit must be a lowercase Git SHA-1")
         for name in ("source_fingerprint_sha256",):
@@ -265,7 +271,9 @@ def _replay(context: DiagnosisContext, experiment: ExperimentDefinition, partiti
     selected = _partition(context, partition)
     facts = _facts(context.fact_cache, selected.start, selected.end)
     cache = _MaterializedFactCache(facts)
-    strategy = CachedDiagnosisStrategy(cache, context.rulebook, experiment)
+    strategy = CachedDiagnosisStrategy(
+        cache, context.rulebook, experiment, strict_canslim=context.strict_canslim,
+    )
     simulator = DiagnosisPortfolioSimulator(strategy=strategy, experiment_id=experiment.experiment_id, enable_eviction=False)
     frames = _frame_for_facts(facts)
     by_session: dict[str, list[SessionFact]] = {}
@@ -301,7 +309,21 @@ def _replay(context: DiagnosisContext, experiment: ExperimentDefinition, partiti
         for symbol in tuple(simulator._open_positions):
             simulator._close_trade(symbol, float(frames[symbol].loc[last, "Close"]), "end_of_test", str(last.date()))
         equity[-1] = simulator._mark_equity(frames, last)
-    outcomes = tuple(MappingProxyType(dict(zip(context.rulebook.rules, evaluate_session_rules(fact, context.rulebook, experiment), strict=True))) for fact in facts)
+    outcomes = tuple(
+        MappingProxyType(
+            dict(
+                zip(
+                    context.rulebook.rules,
+                    evaluate_session_rules(
+                        fact, context.rulebook, experiment,
+                        strict_canslim=context.strict_canslim,
+                    ),
+                    strict=True,
+                )
+            )
+        )
+        for fact in facts
+    )
     return _Replay(facts, outcomes, tuple(signals), simulator, tuple(equity), tuple(cash))
 
 
@@ -321,13 +343,16 @@ def _partition(context: DiagnosisContext, name: PartitionName):
 
 def _identity(context: DiagnosisContext, experiment: ExperimentDefinition, partition: PartitionName) -> str:
     baseline = context.baseline_snapshot
+    strategy_identity = context.strategy_identity
+    if context.strict_canslim:
+        strategy_identity = f"{strategy_identity}:strict-il-v1"
     return build_experiment_identity(
         source_commit=context.source_commit, source_fingerprint_sha256=context.source_fingerprint_sha256,
         bundle_sha256=(context.bundle_sha256 or (baseline.bundle_sha256 if baseline else "0" * 64)),
         baseline_manifest_sha256=(baseline.manifest_sha256 if baseline else "0" * 64),
         rulebook_sha256=context.rulebook.sha256, fact_cache_schema_sha256=_cache_digest(context.fact_cache, "schema_sha256"),
         fact_cache_content_sha256=_cache_digest(context.fact_cache, "content_sha256"), catalog_sha256=context.catalog.sha256,
-        experiment=experiment, partition=_partition(context, partition), strategy_identity=context.strategy_identity,
+        experiment=experiment, partition=_partition(context, partition), strategy_identity=strategy_identity,
         benchmark_identity=context.benchmark_identity, universe_identity=context.universe_identity,
         promotion_evidence_sha256=_promotion_evidence_sha256(context),
     ).sha256
@@ -351,8 +376,25 @@ def _promotion_evidence_sha256(context: DiagnosisContext) -> str:
     return canonical_sha256({"performance": performance, "recall": recall})
 
 
-def _outcomes(facts: Sequence[SessionFact], rulebook: Rulebook, experiment: ExperimentDefinition) -> list[dict[str, RuleOutcome]]:
-    return [dict(zip(rulebook.rules, evaluate_session_rules(fact, rulebook, experiment), strict=True)) for fact in facts]
+def _outcomes(
+    facts: Sequence[SessionFact],
+    rulebook: Rulebook,
+    experiment: ExperimentDefinition,
+    *,
+    strict_canslim: bool = False,
+) -> list[dict[str, RuleOutcome]]:
+    return [
+        dict(
+            zip(
+                rulebook.rules,
+                evaluate_session_rules(
+                    fact, rulebook, experiment, strict_canslim=strict_canslim,
+                ),
+                strict=True,
+            )
+        )
+        for fact in facts
+    ]
 
 
 def _fidelity(rulebook: Rulebook, rows: Sequence[Mapping[str, RuleOutcome]]) -> FidelityAssessment:
@@ -595,7 +637,7 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
     facts, rows = replay.facts, replay.outcomes
     fidelity = _fidelity(context.rulebook, rows)
     stages = _rule_stages(context.rulebook, rows)
-    observed_rules = {"I.SPONSORSHIP", "L.INDUSTRY_GROUP"}
+    observed_rules = frozenset() if context.strict_canslim else frozenset({"I.SPONSORSHIP", "L.INDUSTRY_GROUP"})
     qualified = sum(all(outcome.status == "passed" for rule_id, outcome in row.items() if context.rulebook.rules[rule_id].classification.value == "required" and rule_id not in observed_rules) for row in rows)
     outcome_counts: dict[str, int] = {}
     for outcome in replay.simulator._entry_outcomes:

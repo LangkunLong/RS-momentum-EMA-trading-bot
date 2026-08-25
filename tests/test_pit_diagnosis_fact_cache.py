@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -24,10 +25,12 @@ from core.pit_diagnosis.fact_cache import (
     build_fact_cache,
     open_fact_cache,
 )
-from core.pit_diagnosis.models import DatePartition, DatePartitions
+from core.pit_diagnosis.catalog import load_experiment_catalog
+from core.pit_diagnosis.models import DatePartition, DatePartitions, FidelityLabel, Observability, RuleOutcome
 from core.pit_diagnosis.patterns import BasePolicy, _history_sha256, detect_proper_base
-from core.pit_diagnosis.rulebook import canonical_sha256, load_rulebook
+from core.pit_diagnosis.rulebook import canonical_sha256, evaluate_fidelity, load_rulebook
 from core.pit_diagnosis.supplemental import IndustryGroupSnapshot, InstitutionalSnapshot, UnavailableSupplementalPITProvider
+from core.pit_diagnosis.strategy import evaluate_session_rules
 
 
 class _MiniPITBundle:
@@ -112,6 +115,38 @@ class _PriceFetchRecordingBundle(_MiniPITBundle):
         return super().fetch_price_data(tickers, start_date, end_date)
 
 
+class _AsOfSupplementalProvider:
+    """Small deterministic supplemental provider with explicit PIT snapshots."""
+
+    content_identity_sha256 = "f" * 64
+
+    def __init__(self, snapshots: tuple[tuple[str, int], ...], *, force_future: bool = False) -> None:
+        self.snapshots = snapshots
+        self.force_future = force_future
+
+    def _selected(self, session: str) -> tuple[str, int] | None:
+        if self.force_future:
+            return self.snapshots[0]
+        eligible = [snapshot for snapshot in self.snapshots if snapshot[0] <= session]
+        return eligible[-1] if eligible else None
+
+    def institutional_snapshot(self, symbol: str, session: str) -> InstitutionalSnapshot:
+        del symbol
+        selected = self._selected(session)
+        if selected is None:
+            return InstitutionalSnapshot(None, None, None, None)
+        as_of, marker = selected
+        return InstitutionalSnapshot(as_of, 0.25, 100 + marker, 90 + marker, (f"institutional:{marker}",))
+
+    def industry_group_snapshot(self, symbol: str, session: str) -> IndustryGroupSnapshot:
+        del symbol
+        selected = self._selected(session)
+        if selected is None:
+            return IndustryGroupSnapshot(None, None, None)
+        as_of, marker = selected
+        return IndustryGroupSnapshot(as_of, f"industry-{marker}", 10 + marker, ("S00",), (f"industry:{marker}",))
+
+
 @pytest.fixture
 def mini_pit_bundle() -> _MiniPITBundle:
     return _MiniPITBundle()
@@ -165,7 +200,13 @@ def make_interrupted_partial_v1(paths: tuple[Path, Path, Path], *, exact_v1_tabl
     paths[2].write_text("\n".join(json.dumps(record, sort_keys=True, separators=(",", ":")) for record in records) + "\n", encoding="utf-8")
 
 
-def build_cache(bundle: _MiniPITBundle, paths: tuple[Path, Path, Path], *, resume: bool):
+def build_cache(
+    bundle: _MiniPITBundle,
+    paths: tuple[Path, Path, Path],
+    *,
+    resume: bool,
+    supplemental_provider: object | None = None,
+):
     output_path, checkpoint_path, progress_path = paths
     return build_fact_cache(
         bundle=bundle,
@@ -175,6 +216,7 @@ def build_cache(bundle: _MiniPITBundle, paths: tuple[Path, Path, Path], *, resum
         checkpoint_path=checkpoint_path,
         progress_path=progress_path,
         resume=resume,
+        supplemental_provider=supplemental_provider,
         checkpoint_every_sessions=1,
     )
 
@@ -191,6 +233,94 @@ def test_fact_cache_contains_only_pit_session_inputs(mini_pit_bundle: _MiniPITBu
         assert row.session == "2024-01-05"
         assert row.latest_fundamental_public_date <= row.session
         assert "leader" not in set(cache.column_names)
+
+
+def test_supplemental_snapshots_are_selected_as_of_each_cached_session(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path,
+) -> None:
+    provider = _AsOfSupplementalProvider(
+        (("2023-12-20", 1), ("2024-01-08", 2), ("2024-01-10", 3)),
+    )
+    result = build_cache(
+        mini_pit_bundle,
+        cache_paths(tmp_path),
+        resume=False,
+        supplemental_provider=provider,
+    )
+
+    with open_fact_cache(result.path, result.content_sha256) as cache:
+        before_update = cache.session_fact("S00", "2024-01-05")
+        after_update = cache.session_fact("S00", "2024-01-08")
+        same_day = cache.session_fact("S00", "2024-01-10")
+
+    assert before_update.institutional_as_of_date == "2023-12-20"
+    assert json.loads(before_update.institutional_evidence_ids) == ["institutional:1"]
+    assert before_update.industry_as_of_date == "2023-12-20"
+    assert after_update.institutional_as_of_date == "2024-01-08"
+    assert json.loads(after_update.industry_evidence_ids) == ["industry:2"]
+    assert same_day.institutional_as_of_date == "2024-01-10"
+
+
+def test_future_supplemental_snapshot_is_rejected_before_cache_publication(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path,
+) -> None:
+    provider = _AsOfSupplementalProvider((("2024-01-03", 1),), force_future=True)
+
+    with pytest.raises(ValueError, match="supplemental snapshot is future-dated"):
+        build_cache(
+            mini_pit_bundle,
+            cache_paths(tmp_path),
+            resume=False,
+            supplemental_provider=provider,
+        )
+
+
+def test_unavailable_i_and_l_evidence_remains_a_strict_fidelity_blocker(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path,
+) -> None:
+    result = build_cache(mini_pit_bundle, cache_paths(tmp_path), resume=False)
+    rulebook = rulebook_v1()
+    catalog = load_experiment_catalog(Path("config/pit_diagnosis_experiments_v1.json"), rulebook)
+    with open_fact_cache(result.path, result.content_sha256) as cache:
+        fact = cache.session_fact("S00", "2024-01-05")
+
+    outcomes = dict(
+        zip(
+            rulebook.rules,
+            evaluate_session_rules(
+                fact,
+                rulebook,
+                catalog["D2.RULE_STAGE_FUNNEL"],
+                strict_canslim=True,
+            ),
+            strict=True,
+        )
+    )
+    assessment = evaluate_fidelity(rulebook, outcomes)
+
+    assert outcomes["I.SPONSORSHIP"].status == "unavailable"
+    assert outcomes["L.INDUSTRY_GROUP"].status == "unavailable"
+    assert assessment.label is FidelityLabel.FIDELITY_INCOMPLETE
+    assert {"I.SPONSORSHIP", "L.INDUSTRY_GROUP"} <= set(assessment.unavailable_required_rule_ids)
+
+
+def test_approved_proxy_rulebook_remains_compatible_with_strict_fidelity_evaluation() -> None:
+    book = rulebook_v1()
+    proxy_rules = dict(book.rules)
+    for rule_id in ("I.SPONSORSHIP", "L.INDUSTRY_GROUP"):
+        proxy_rules[rule_id] = replace(proxy_rules[rule_id], observability=Observability.PIT_PROXY)
+    proxy_book = replace(book, rules=proxy_rules)
+    outcomes = {rule_id: RuleOutcome.passed(rule_id) for rule_id in proxy_book.rules}
+
+    assessment = evaluate_fidelity(
+        proxy_book,
+        outcomes,
+        approved_proxy_rule_ids=frozenset({"I.SPONSORSHIP", "L.INDUSTRY_GROUP"}),
+    )
+
+    assert assessment.label is FidelityLabel.QUANTITATIVE_CANSLIM_PROXY
+    assert assessment.proxy_rule_ids == ("I.SPONSORSHIP", "L.INDUSTRY_GROUP")
+    assert assessment.promotion_eligible is True
 
 
 def test_fact_cache_prefetches_full_range_once_without_changing_session_facts(tmp_path: Path) -> None:

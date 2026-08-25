@@ -190,6 +190,34 @@ def test_rule_stage_funnel_is_monotone_and_missing_i_never_passes(
     assert result.promotion_eligible is False
 
 
+def test_strict_i_l_mode_has_a_distinct_experiment_identity(
+    diagnosis_context: DiagnosisContext,
+) -> None:
+    experiment = diagnosis_context.catalog["D2.RULE_STAGE_FUNNEL"]
+    proxy_identity = experiments_module._identity(
+        diagnosis_context, experiment, PartitionName.DISCOVERY,
+    )
+    strict_identity = experiments_module._identity(
+        replace(diagnosis_context, strict_canslim=True), experiment, PartitionName.DISCOVERY,
+    )
+
+    assert strict_identity != proxy_identity
+
+
+def test_strict_i_l_mode_is_applied_by_the_replay_path(
+    diagnosis_context: DiagnosisContext,
+) -> None:
+    strict_context = replace(diagnosis_context, strict_canslim=True)
+
+    result = run_experiment(
+        strict_context, "D2.RULE_STAGE_FUNNEL", PartitionName.DISCOVERY,
+    )
+
+    assert result.entry_funnel.qualified == 0
+    assert result.entry_funnel.executed == 0
+    assert "I.SPONSORSHIP" in result.fidelity.unavailable_required_rule_ids
+
+
 def test_d1_to_d4_require_a_verified_d0_reproduction(
     diagnosis_context: DiagnosisContext,
 ) -> None:
