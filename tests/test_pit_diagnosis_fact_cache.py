@@ -12,8 +12,20 @@ import pandas as pd
 import pytest
 
 from core.pit_data import PITDataBundle
-from core.pit_diagnosis.fact_cache import FactCacheBuilder, _FACT_COLUMNS, _V1_SCHEMA_SHA256, _V1_SESSION_FACTS_CREATE_SQL, _frame_values, _number, build_fact_cache, open_fact_cache
+from core.pit_diagnosis import fact_cache as fact_cache_module
+from core.pit_diagnosis.fact_cache import (
+    FactCacheBuilder,
+    _FACT_COLUMNS,
+    _V1_SCHEMA_SHA256,
+    _V1_SESSION_FACTS_CREATE_SQL,
+    _detect_prepared_base,
+    _frame_values,
+    _number,
+    build_fact_cache,
+    open_fact_cache,
+)
 from core.pit_diagnosis.models import DatePartition, DatePartitions
+from core.pit_diagnosis.patterns import BasePolicy, _history_sha256, detect_proper_base
 from core.pit_diagnosis.rulebook import canonical_sha256, load_rulebook
 from core.pit_diagnosis.supplemental import IndustryGroupSnapshot, InstitutionalSnapshot, UnavailableSupplementalPITProvider
 
@@ -543,3 +555,79 @@ def test_non_sqlite_nan_fundamental_cell_fails_closed() -> None:
 
     with pytest.raises(ValueError, match="non-finite"):
         _frame_values(snapshot, "quarterly_income", "Diluted EPS", 1)
+
+
+def test_cached_pattern_prefixes_and_detector_match_public_history(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path,
+) -> None:
+    paths = cache_paths(tmp_path)
+    builder = FactCacheBuilder(
+        bundle=mini_pit_bundle,
+        rulebook=rulebook_v1(),
+        partitions=mini_partitions(),
+        output_path=paths[0],
+        checkpoint_path=paths[1],
+        progress_path=paths[2],
+        supplemental_provider=UnavailableSupplementalPITProvider(),
+    )
+    prefetched = builder._prefetch_prices()
+    prepared = builder._prepared_pattern_histories["S00"]
+    policy = BasePolicy.canonical_v1()
+    prices = prefetched.prices["S00"]
+
+    sample_positions = sorted({1, policy.flat_min_sessions - 1, policy.flat_min_sessions, len(prepared.index)})
+    for position in sample_positions:
+        history = pd.DataFrame(
+            {
+                "High": prepared.highs[:position],
+                "Low": prepared.lows[:position],
+                "Close": prepared.closes[:position],
+            },
+            index=prepared.index[:position],
+        )
+        assert prepared.input_sha256_prefixes[position] == _history_sha256(history)
+
+    sample_sessions = ("2023-12-29", "2024-01-10", "2024-01-12")
+    for session in (pd.Timestamp(item) for item in sample_sessions):
+        session_text = session.date().isoformat()
+        position = prepared.positions[session_text]
+        if position < policy.flat_min_sessions:
+            continue
+        prior = prices.loc[:session].iloc[:-1]
+        expected = detect_proper_base(prior[["High", "Low", "Close"]], event_session=session_text, policy=policy)
+        actual = _detect_prepared_base(
+            prepared,
+            end_pos=position,
+            policy=policy,
+            input_sha256=prepared.input_sha256_prefixes[position],
+        )
+        assert actual == expected
+
+
+def test_materialization_uses_prepared_pattern_inputs_without_public_revalidation(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+    builder = FactCacheBuilder(
+        bundle=mini_pit_bundle,
+        rulebook=rulebook_v1(),
+        partitions=mini_partitions(),
+        output_path=paths[0],
+        checkpoint_path=paths[1],
+        progress_path=paths[2],
+        supplemental_provider=UnavailableSupplementalPITProvider(),
+    )
+    prefetched = builder._prefetch_prices()
+
+    def public_detector_must_not_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("public detector was called after pattern preparation")
+
+    monkeypatch.setattr(fact_cache_module, "detect_proper_base", public_detector_must_not_run)
+
+    rows = builder._materialize_session(
+        "2024-01-12",
+        builder._fundamental_states(["2024-01-12"]),
+        prefetched,
+    )
+
+    assert len(rows) == len(mini_pit_bundle._symbols)

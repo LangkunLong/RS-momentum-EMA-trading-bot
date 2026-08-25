@@ -13,11 +13,21 @@ import sqlite3
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
+import numpy as np
 import pandas as pd
 
 from core.pit_data import PITDataBundle
 from .models import DatePartitions, Rulebook
-from .patterns import BasePolicy, detect_proper_base
+from .patterns import (
+    BasePattern,
+    BasePolicy,
+    _RangeExtrema,
+    _REQUIRED_OHLC_COLUMNS,
+    _most_recent_cup_arrays,
+    _most_recent_flat_arrays,
+    _validate_pre_event_history,
+    detect_proper_base,
+)
 from .rs import calculate_pit_rs_snapshot
 from .rulebook import canonical_sha256
 from .supplemental import (
@@ -116,6 +126,97 @@ class _PrefetchedPrices:
 
 
 @dataclass(frozen=True)
+class _PreparedPatternHistory:
+    """Validated immutable OHLC arrays and causal evidence for one symbol."""
+
+    index: pd.DatetimeIndex
+    highs: np.ndarray
+    lows: np.ndarray
+    closes: np.ndarray
+    ranges: _RangeExtrema
+    positions: Mapping[str, int]
+    input_sha256_prefixes: tuple[str, ...]
+
+
+def _prepare_pattern_history(frame: pd.DataFrame) -> _PreparedPatternHistory:
+    """Validate one prefetched price frame and build reusable pattern inputs."""
+    try:
+        raw_index = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="raise"))
+        event = _session_text(raw_index.max() + pd.Timedelta(days=1))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("price history index must contain valid sessions") from exc
+    history = _validate_pre_event_history(frame, event_session=event)
+    values = history.loc[:, _REQUIRED_OHLC_COLUMNS].to_numpy(dtype=float, copy=True)
+    highs = np.ascontiguousarray(values[:, 0], dtype=float)
+    lows = np.ascontiguousarray(values[:, 1], dtype=float)
+    closes = np.ascontiguousarray(values[:, 2], dtype=float)
+    for values_array in (highs, lows, closes):
+        values_array.setflags(write=False)
+    positions = MappingProxyType({_session_text(session): position for position, session in enumerate(history.index)})
+    return _PreparedPatternHistory(
+        index=history.index,
+        highs=highs,
+        lows=lows,
+        closes=closes,
+        ranges=_RangeExtrema(highs, lows, closes),
+        positions=positions,
+        input_sha256_prefixes=_history_sha256_prefixes(history),
+    )
+
+
+def _history_sha256_prefixes(history: pd.DataFrame) -> tuple[str, ...]:
+    """Return v1-equivalent JSON-array hashes for every history prefix."""
+    session_texts = history.index.strftime("%Y-%m-%d")
+    values = history.loc[:, _REQUIRED_OHLC_COLUMNS].to_numpy(dtype=float, copy=False)
+    digest = hashlib.sha256(b"[")
+    prefixes: list[str] = []
+    for position, (session, (high, low, close)) in enumerate(zip(session_texts, values, strict=True)):
+        if position:
+            digest.update(b",")
+        row = json.dumps([session, float(high), float(low), float(close)], separators=(",", ":"), allow_nan=False).encode("utf-8")
+        digest.update(row)
+        closed = digest.copy()
+        closed.update(b"]")
+        prefixes.append(closed.hexdigest())
+    return (hashlib.sha256(b"[]").hexdigest(), *prefixes)
+
+
+def _detect_prepared_base(
+    prepared: _PreparedPatternHistory,
+    *,
+    end_pos: int,
+    policy: BasePolicy,
+    input_sha256: str,
+) -> BasePattern | None:
+    """Evaluate only ``prepared`` rows before ``end_pos`` using cached ranges."""
+    for candidate_end in range(end_pos, policy.flat_min_sessions - 1, -1):
+        cup = _most_recent_cup_arrays(
+            prepared.index,
+            prepared.highs,
+            prepared.lows,
+            prepared.closes,
+            candidate_end,
+            policy,
+            input_sha256,
+            ranges=prepared.ranges,
+        )
+        if cup is not None:
+            return cup
+        flat = _most_recent_flat_arrays(
+            prepared.index,
+            prepared.highs,
+            prepared.lows,
+            candidate_end,
+            policy,
+            input_sha256,
+            ranges=prepared.ranges,
+        )
+        if flat is not None:
+            return flat
+    return None
+
+
+@dataclass(frozen=True)
 class SessionFact:
     """A read-only normalized row, with column names available as attributes."""
 
@@ -194,6 +295,8 @@ class FactCacheBuilder:
         self.supplemental_provider = supplemental_provider
         self.checkpoint_every_sessions = checkpoint_every_sessions
         self.identity = FactCacheIdentity.from_inputs(bundle=bundle, rulebook=rulebook, partitions=partitions, supplemental_provider=supplemental_provider)
+        self._base_policy = BasePolicy.canonical_v1()
+        self._prepared_pattern_histories: Mapping[str, _PreparedPatternHistory] = MappingProxyType({})
 
     def build(self, *, resume: bool) -> FactCacheBuildResult:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,6 +378,12 @@ class FactCacheBuilder:
         symbols = tuple(sorted({str(symbol).upper() for symbol in self.bundle.symbols()}.union({"SPY"})))
         prices = self.bundle.fetch_price_data(symbols, pd.Timestamp(warmup), pd.Timestamp(self.partitions.locked_evaluation.end))
         normalized = MappingProxyType({str(symbol).upper(): frame for symbol, frame in prices.items()})
+        prepared = {
+            symbol: _prepare_pattern_history(frame)
+            for symbol, frame in normalized.items()
+            if symbol != "SPY" and not frame.empty
+        }
+        self._prepared_pattern_histories = MappingProxyType(prepared)
         closes = pd.DataFrame({symbol: frame["Close"] for symbol, frame in normalized.items() if symbol != "SPY"})
         return _PrefetchedPrices(closes=closes, prices=normalized, spy=normalized.get("SPY"))
 
@@ -341,8 +450,18 @@ class FactCacheBuilder:
         industry = self.supplemental_provider.industry_group_snapshot(symbol, session)
         _validate_supplemental(institutional, industry, session)
         base = None
-        if len(prior) >= BasePolicy.canonical_v1().flat_min_sessions:
-            base = detect_proper_base(prior[["High", "Low", "Close"]], event_session=session, policy=BasePolicy.canonical_v1())
+        if len(prior) >= self._base_policy.flat_min_sessions:
+            prepared = self._prepared_pattern_histories.get(symbol)
+            event_position = None if prepared is None else prepared.positions.get(_session_text(as_of))
+            if prepared is not None and event_position == len(prior):
+                base = _detect_prepared_base(
+                    prepared,
+                    end_pos=event_position,
+                    policy=self._base_policy,
+                    input_sha256=prepared.input_sha256_prefixes[event_position],
+                )
+            else:
+                base = detect_proper_base(prior[["High", "Low", "Close"]], event_session=session, policy=self._base_policy)
         pivot = None if base is None else _number(base.pivot)
         extension = _number((float(event["Close"]) / pivot) - 1.0) if pivot not in (None, 0.0) else None
         availability = _PRICE_EVIDENCE | (2 if state is not None else 0) | (4 if institutional.available else 0) | (8 if industry.available else 0) | (16 if rs_rating is not None else 0) | (32 if base is not None else 0)
