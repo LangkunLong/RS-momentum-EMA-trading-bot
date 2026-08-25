@@ -87,6 +87,18 @@ class _SuccessorWithoutAdmissionPriceBundle(_MiniPITBundle):
         return (*super().symbols(), "NEW")
 
 
+class _PriceFetchRecordingBundle(_MiniPITBundle):
+    """Record bundle price access while retaining the mini-bundle data contract."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.price_fetches: list[tuple[tuple[str, ...], pd.Timestamp, pd.Timestamp]] = []
+
+    def fetch_price_data(self, tickers: object, start_date: object, end_date: object) -> dict[str, pd.DataFrame]:
+        self.price_fetches.append((tuple(tickers), pd.Timestamp(start_date), pd.Timestamp(end_date)))
+        return super().fetch_price_data(tickers, start_date, end_date)
+
+
 @pytest.fixture
 def mini_pit_bundle() -> _MiniPITBundle:
     return _MiniPITBundle()
@@ -166,6 +178,22 @@ def test_fact_cache_contains_only_pit_session_inputs(mini_pit_bundle: _MiniPITBu
         assert row.session == "2024-01-05"
         assert row.latest_fundamental_public_date <= row.session
         assert "leader" not in set(cache.column_names)
+
+
+def test_fact_cache_prefetches_full_range_once_without_changing_session_facts(tmp_path: Path) -> None:
+    bundle = _PriceFetchRecordingBundle()
+    paths = cache_paths(tmp_path)
+
+    result = build_cache(bundle, paths, resume=False)
+
+    assert bundle.price_fetches == [
+        (bundle.symbols(), pd.Timestamp("2023-12-01"), pd.Timestamp("2024-01-12")),
+    ]
+    with open_fact_cache(result.path, result.content_sha256) as cache:
+        row = cache.session_fact("S00", "2024-01-05")
+        assert row.close == bundle._prices["S00"].loc[pd.Timestamp("2024-01-05"), "Close"]
+        assert row.prior_close == bundle._prices["S00"].loc[pd.Timestamp("2024-01-04"), "Close"]
+        assert row.market_regime == "unavailable"
 
 
 def test_successor_member_without_admission_price_is_cached_as_price_unavailable(tmp_path: Path) -> None:
@@ -435,9 +463,9 @@ def test_finalization_rejects_wrong_member_even_when_total_rows_match(
     original = FactCacheBuilder._materialize_session
     changed = False
 
-    def wrong_member(builder: FactCacheBuilder, session: str, states: object):
+    def wrong_member(builder: FactCacheBuilder, session: str, states: object, prefetched_prices: object):
         nonlocal changed
-        rows = original(builder, session, states)
+        rows = original(builder, session, states, prefetched_prices)
         if not changed:
             rows[0] = {**rows[0], "symbol": "NOT_A_MEMBER"}
             changed = True

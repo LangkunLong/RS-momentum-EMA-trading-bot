@@ -107,6 +107,15 @@ class FactCacheBuildResult:
 
 
 @dataclass(frozen=True)
+class _PrefetchedPrices:
+    """Immutable full-range price inputs, sliced causally at each session."""
+
+    closes: pd.DataFrame
+    prices: Mapping[str, pd.DataFrame]
+    spy: pd.DataFrame | None
+
+
+@dataclass(frozen=True)
 class SessionFact:
     """A read-only normalized row, with column names available as attributes."""
 
@@ -188,7 +197,8 @@ class FactCacheBuilder:
 
     def build(self, *, resume: bool) -> FactCacheBuildResult:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        sessions = self._sessions()
+        prefetched_prices = self._prefetch_prices()
+        sessions = self._sessions(prefetched_prices.spy)
         if not sessions:
             raise ValueError("PIT bundle has no exact SPY sessions in the requested partitions")
         if self.output_path.exists():
@@ -242,7 +252,7 @@ class FactCacheBuilder:
             fundamental_states = self._fundamental_states(sessions)
             for index in range(next_index, len(sessions)):
                 session = sessions[index]
-                rows = self._materialize_session(session, fundamental_states)
+                rows = self._materialize_session(session, fundamental_states, prefetched_prices)
                 self._insert_rows(conn, rows)
                 conn.commit()
                 if (index + 1) % self.checkpoint_every_sessions == 0 or index + 1 == len(sessions):
@@ -260,10 +270,15 @@ class FactCacheBuilder:
         """A narrow test seam after durable session state has been written."""
         del session
 
-    def _sessions(self) -> list[str]:
-        start = self.partitions.discovery.start
-        end = self.partitions.locked_evaluation.end
-        spy = self.bundle.fetch_price_data(("SPY",), pd.Timestamp(start), pd.Timestamp(end)).get("SPY")
+    def _prefetch_prices(self) -> _PrefetchedPrices:
+        warmup = str(getattr(self.bundle, "metadata", {}).get("warmup_start", self.partitions.discovery.start))
+        symbols = tuple(sorted({str(symbol).upper() for symbol in self.bundle.symbols()}.union({"SPY"})))
+        prices = self.bundle.fetch_price_data(symbols, pd.Timestamp(warmup), pd.Timestamp(self.partitions.locked_evaluation.end))
+        normalized = MappingProxyType({str(symbol).upper(): frame for symbol, frame in prices.items()})
+        closes = pd.DataFrame({symbol: frame["Close"] for symbol, frame in normalized.items() if symbol != "SPY"})
+        return _PrefetchedPrices(closes=closes, prices=normalized, spy=normalized.get("SPY"))
+
+    def _sessions(self, spy: pd.DataFrame | None) -> list[str]:
         if spy is None or spy.empty:
             return []
         all_sessions = [_session_text(item) for item in pd.DatetimeIndex(spy.index)]
@@ -283,15 +298,25 @@ class FactCacheBuilder:
             states.sort(key=lambda item: item[0])
         return result
 
-    def _materialize_session(self, session: str, states: Mapping[str, list[tuple[str, Mapping[str, Any]]]]) -> list[dict[str, object]]:
+    def _materialize_session(
+        self,
+        session: str,
+        states: Mapping[str, list[tuple[str, Mapping[str, Any]]]],
+        prefetched_prices: _PrefetchedPrices,
+    ) -> list[dict[str, object]]:
         members = tuple(sorted(self.bundle.members_at(session)))
         if not members:
             return []
-        warmup = str(getattr(self.bundle, "metadata", {}).get("warmup_start", session))
-        closes = self.bundle.fetch_closes(members, pd.Timestamp(warmup), pd.Timestamp(session))
-        rs = calculate_pit_rs_snapshot(closes, pd.Timestamp(session), eligible_tickers=members)
-        price_data = self.bundle.fetch_price_data(members, pd.Timestamp(warmup), pd.Timestamp(session))
-        spy_data = self.bundle.fetch_price_data(("SPY",), pd.Timestamp(warmup), pd.Timestamp(session)).get("SPY")
+        as_of = pd.Timestamp(session)
+        available_members = tuple(symbol for symbol in members if symbol in prefetched_prices.closes.columns)
+        closes = prefetched_prices.closes.loc[:as_of, available_members]
+        rs = calculate_pit_rs_snapshot(closes, as_of, eligible_tickers=members)
+        price_data = {
+            symbol: prefetched_prices.prices[symbol].loc[:as_of]
+            for symbol in members
+            if symbol in prefetched_prices.prices
+        }
+        spy_data = None if prefetched_prices.spy is None else prefetched_prices.spy.loc[:as_of]
         market = _market_facts(spy_data, session)
         rows: list[dict[str, object]] = []
         for symbol in members:
