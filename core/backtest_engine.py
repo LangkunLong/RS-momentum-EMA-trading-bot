@@ -1236,8 +1236,6 @@ class PortfolioSimulator:
             raise ValueError("cash_deployment_threshold_pct must be between 0 and 1")
         self.cash_deployment_threshold_pct = cash_deployment_threshold_pct
         self.technical_only = technical_only
-        if pit_bundle is not None and technical_only:
-            raise ValueError("point-in-time CANSLIM mode requires historical fundamentals")
         self.pit_bundle = pit_bundle
         self.identity_transition_contract = identity_transition_contract
         self.take_profit_pct = take_profit_pct
@@ -2904,7 +2902,7 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
     parser.add_argument(
         "--pit-bundle",
         default=None,
-        help="validated SQLite point-in-time bundle; enables true PIT CANSLIM mode",
+        help="validated SQLite point-in-time bundle for offline price data (and fundamentals when not technical-only)",
     )
     parser.add_argument(
         "--pit-bundle-sha256",
@@ -2919,8 +2917,6 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
 
     pit_bundle: Optional[PITDataBundle] = None
     if args.pit_bundle:
-        if args.technical_only:
-            parser.error("--pit-bundle requires full CANSLIM fundamentals; remove --technical-only")
         if not args.pit_bundle_sha256:
             parser.error("--pit-bundle-sha256 is required with --pit-bundle")
         pit_bundle = PITDataBundle(args.pit_bundle, expected_sha256=args.pit_bundle_sha256)
