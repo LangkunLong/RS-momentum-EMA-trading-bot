@@ -420,24 +420,70 @@ def _baseline_trades(snapshot: BaselineSnapshot, partition: PartitionName | None
     if not required.issubset(frame):
         raise ValueError("verified baseline transaction schema is incomplete")
     selected = _partition(context, partition) if partition is not None else None
-    open_positions: dict[str, dict[str, object]] = {}
+    # The execution ledger contains one BUY row per entry and can contain
+    # several SELL rows for a position (scale-outs followed by the terminal
+    # exit).  Keep lots instead of indexing by ticker alone: a ticker can be
+    # re-entered after a prior lot's final sell, and the quantities are rounded
+    # to a fixed precision in the CSV.  The old ticker -> position map could
+    # therefore overwrite an entry when its last scale-out was only a few
+    # floating-point units short, dropping otherwise authoritative trades.
+    open_positions: dict[str, list[dict[str, object]]] = {}
     completed: list[object] = []
+
+    def _quantity_tolerance(quantity: float) -> float:
+        # Transaction quantities are serialized at approximately six decimal
+        # places.  Use a small relative tolerance for the residual generated
+        # by summing rounded scale-outs, while keeping the minimum non-zero so
+        # very small lots are treated consistently.
+        return max(5e-6, abs(quantity) * 1e-8)
+
     for row in frame.itertuples(index=False):
         ticker, action, date = str(row.Ticker), str(row.Action).upper(), str(row.Date)
         if action == "BUY":
-            open_positions[ticker] = {"entry_date": date, "entry_price": float(row.Price), "qty": float(row.Quantity), "proceeds": 0.0, "sold": 0.0}
-        elif action == "SELL" and ticker in open_positions:
-            position = open_positions[ticker]
-            position["proceeds"] = float(position["proceeds"]) + float(row.Price) * float(row.Quantity)
-            position["sold"] = float(position["sold"]) + float(row.Quantity)
-            if float(position["sold"]) + 1e-9 >= float(position["qty"]):
-                entry = float(position["entry_price"])
-                result = type("BaselineTrade", (), {})()
-                result.entry_date, result.exit_date, result.days_held = str(position["entry_date"]), date, max((pd.Timestamp(date) - pd.Timestamp(position["entry_date"])).days, 0)
-                result.pnl_pct = float(position["proceeds"]) / (entry * float(position["qty"])) - 1.0
-                result.exit_reason = str(row.Reason)
-                if selected is None or selected.start <= date <= selected.end:
-                    completed.append(result)
+            quantity = float(row.Quantity)
+            if quantity <= 0.0:
+                raise ValueError("baseline transaction ledger contains a non-positive BUY quantity")
+            open_positions.setdefault(ticker, []).append(
+                {
+                    "entry_date": date,
+                    "entry_price": float(row.Price),
+                    "qty": quantity,
+                    "proceeds": 0.0,
+                    "sold": 0.0,
+                }
+            )
+        elif action == "SELL":
+            remaining = float(row.Quantity)
+            if remaining <= 0.0:
+                raise ValueError("baseline transaction ledger contains a non-positive SELL quantity")
+            lots = open_positions.get(ticker)
+            if not lots:
+                raise ValueError("baseline transaction ledger contains a SELL without an open BUY lot")
+            while remaining > 0.0 and lots:
+                position = lots[0]
+                quantity = float(position["qty"])
+                sold = float(position["sold"])
+                unsold = max(quantity - sold, 0.0)
+                if unsold <= _quantity_tolerance(quantity):
+                    raise ValueError("baseline transaction ledger contains a residual BUY lot before SELL")
+                sold_now = min(remaining, unsold)
+                position["proceeds"] = float(position["proceeds"]) + float(row.Price) * sold_now
+                position["sold"] = sold + sold_now
+                remaining -= sold_now
+                if float(position["qty"]) - float(position["sold"]) <= _quantity_tolerance(quantity):
+                    entry = float(position["entry_price"])
+                    result = type("BaselineTrade", (), {})()
+                    result.entry_date = str(position["entry_date"])
+                    result.exit_date = date
+                    result.days_held = max((pd.Timestamp(date) - pd.Timestamp(position["entry_date"])).days, 0)
+                    result.pnl_pct = float(position["proceeds"]) / (entry * quantity) - 1.0
+                    result.exit_reason = str(row.Reason)
+                    if selected is None or selected.start <= date <= selected.end:
+                        completed.append(result)
+                    lots.pop(0)
+            if remaining > _quantity_tolerance(float(row.Quantity)):
+                raise ValueError("baseline transaction ledger SELL quantity exceeds open BUY lots")
+            if not lots:
                 del open_positions[ticker]
     return tuple(completed)
 
