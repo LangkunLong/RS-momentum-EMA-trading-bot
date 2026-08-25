@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from statistics import mean, median
@@ -472,6 +473,7 @@ def _baseline_partition_performance(
     invalid_holdings = (
         holdings.empty
         or holdings[list(required_holdings)].isna().any().any()
+        or not holdings[["Cash", "Total_Equity"]].map(math.isfinite).all().all()
         or holdings["Week_Ending"].duplicated().any()
         or not holdings["Week_Ending"].is_monotonic_increasing
         or (holdings["Cash"] < 0.0).any()

@@ -263,7 +263,7 @@ def test_d4_computes_performance_from_the_actual_verified_equity_schema(
     assert result.promotion_eligible is False
 
 
-@pytest.mark.parametrize("malformation", ("missing", "invalid_cash"))
+@pytest.mark.parametrize("malformation", ("missing", "invalid_cash", "nonfinite_cash", "nonfinite_equity"))
 def test_d4_fails_closed_when_verified_partition_cash_evidence_is_malformed(
     diagnosis_context: DiagnosisContext,
     malformation: str,
@@ -273,9 +273,14 @@ def test_d4_fails_closed_when_verified_partition_cash_evidence_is_malformed(
     if malformation == "missing":
         path.unlink()
     else:
+        cash, equity = (
+            ("inf", "100") if malformation == "nonfinite_cash" else
+            ("50", "inf") if malformation == "nonfinite_equity" else
+            ("not-cash", "100")
+        )
         path.write_text(
             "Week_Ending,Holdings,Holding_Count,Cash,Market_Value,Total_Equity\n"
-            "2021-01-04,AAA,1,not-cash,50,100\n",
+            f"2021-01-04,AAA,1,{cash},50,{equity}\n",
             encoding="utf-8",
         )
         artifacts = dict(diagnosis_context.baseline_snapshot.artifact_sha256)
