@@ -20,6 +20,12 @@ from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_r
 from core.pit_diagnosis.rulebook import load_rulebook
 
 
+PIT_DIAGNOSIS_SENTINEL = "PIT_DIAGNOSIS_RESULT="
+_PIT_DIAGNOSIS_RESULT_KEYS = frozenset(
+    {"experiment_id", "partition", "identity_sha256", "result_sha256"}
+)
+
+
 def _absolute_path(value: str) -> Path:
     path = Path(value)
     if not path.is_absolute():
@@ -30,6 +36,35 @@ def _absolute_path(value: str) -> Path:
 def _digest(value: str) -> str:
     if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         raise argparse.ArgumentTypeError("SHA-256 must be 64 lowercase hexadecimal characters")
+    return value
+
+
+def parse_pit_diagnosis_result(output: str) -> dict[str, str]:
+    """Parse the one-line hidden-worker result without accepting free-form output."""
+    if not isinstance(output, str):
+        raise ValueError("PIT worker output must be text")
+    matches = [line for line in output.splitlines() if line.startswith(PIT_DIAGNOSIS_SENTINEL)]
+    if len(matches) != 1:
+        raise ValueError("PIT worker must emit exactly one result sentinel")
+    encoded = matches[0][len(PIT_DIAGNOSIS_SENTINEL) :]
+    try:
+        value = json.loads(encoded)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("PIT worker result sentinel is not valid JSON") from exc
+    if not isinstance(value, dict) or set(value) != _PIT_DIAGNOSIS_RESULT_KEYS:
+        raise ValueError("PIT worker result fields are not closed")
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if encoded != canonical:
+        raise ValueError("PIT worker result is not canonical JSON")
+    if (
+        not isinstance(value["experiment_id"], str)
+        or not isinstance(value["partition"], str)
+        or value["partition"] not in {"discovery", "validation"}
+        or not isinstance(value["identity_sha256"], str)
+        or not isinstance(value["result_sha256"], str)
+        or not all(len(value[name]) == 64 and set(value[name]) <= set("0123456789abcdef") for name in ("identity_sha256", "result_sha256"))
+    ):
+        raise ValueError("PIT worker result identity is invalid")
     return value
 
 
@@ -203,7 +238,16 @@ def _run_experiment(args: argparse.Namespace) -> int:
         if args.experiment_id != "D0.BASELINE_REPRODUCTION":
             context = context.with_verified_baseline_reproduction(compare_reproduction(context.baseline_snapshot, context.reproduced_baseline))
         results = run_catalog(context, (args.experiment_id,), (PartitionName(args.partition),), args.checkpoint_root, resume=args.resume)
-        print(json.dumps({"experiment_id": results[0].experiment_id, "partition": results[0].partition.value, "identity_sha256": results[0].identity_sha256, "result_sha256": results[0].result_sha256}, sort_keys=True))
+        payload = {
+            "experiment_id": results[0].experiment_id,
+            "partition": results[0].partition.value,
+            "identity_sha256": results[0].identity_sha256,
+            "result_sha256": results[0].result_sha256,
+        }
+        print(
+            PIT_DIAGNOSIS_SENTINEL
+            + json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        )
         return 0
     finally:
         _close(bundle, cache)

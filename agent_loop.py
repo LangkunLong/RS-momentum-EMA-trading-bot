@@ -7658,7 +7658,7 @@ class LoopConfig:
     controller_temp_parent: Path
     artifact_root: Path
     mode: ExecutionMode
-    gate: TestGateConfig | BacktestGateConfig
+    gate: TestGateConfig | BacktestGateConfig | Any
     models: ModelConfig
     limits: LoopLimits
 
@@ -7692,8 +7692,17 @@ class LoopConfig:
             )
         if not isinstance(self.mode, ExecutionMode):
             raise ConfigurationError("mode must be ExecutionMode")
-        if not isinstance(self.gate, (TestGateConfig, BacktestGateConfig)):
+        try:
+            from pit_diagnosis_agent import PitDiagnosisGateConfig
+            pit_gate_type: tuple[type[object], ...] = (PitDiagnosisGateConfig,)
+        except ImportError:
+            pit_gate_type = ()
+        if not isinstance(self.gate, (TestGateConfig, BacktestGateConfig, *pit_gate_type)):
             raise ConfigurationError("gate must be a validated gate config")
+        if pit_gate_type and isinstance(self.gate, pit_gate_type):
+            for name in ("diagnosis_run", "pit_bundle", "fact_cache", "rulebook", "experiment_catalog"):
+                if _configuration_paths_overlap(getattr(self.gate, name), runtime):
+                    raise ConfigurationError("PIT diagnosis input must not overlap the permanent runtime")
         if not isinstance(self.models, ModelConfig) or not isinstance(self.limits, LoopLimits):
             raise ConfigurationError("models and limits must be validated configs")
         object.__setattr__(self, "source_root", source)
@@ -8393,7 +8402,7 @@ class AuditTrail:
                 "kind": "test",
                 "selectors": config.gate.selectors,
             }
-        else:
+        elif isinstance(config.gate, BacktestGateConfig):
             gate = {
                 "kind": "backtest",
                 "tickers": config.gate.tickers,
@@ -8403,6 +8412,21 @@ class AuditTrail:
                 "historical_data_bundle": config.gate.historical_data_bundle,
                 "historical_data_sha256": config.gate.historical_data_sha256,
                 "thresholds": asdict(config.gate.thresholds),
+            }
+        else:
+            gate = {
+                "kind": "pit_diagnosis",
+                "diagnosis_run": config.gate.diagnosis_run,
+                "diagnosis_manifest_sha256": config.gate.diagnosis_manifest_sha256,
+                "pit_bundle": config.gate.pit_bundle,
+                "pit_bundle_sha256": config.gate.pit_bundle_sha256,
+                "fact_cache": config.gate.fact_cache,
+                "fact_cache_sha256": config.gate.fact_cache_sha256,
+                "rulebook": config.gate.rulebook,
+                "rulebook_sha256": config.gate.rulebook_sha256,
+                "experiment_catalog": config.gate.experiment_catalog,
+                "experiment_catalog_sha256": config.gate.experiment_catalog_sha256,
+                "partition": config.gate.partition,
             }
         policy = {
             "editable_paths": tuple(sorted(DEFAULT_EDITABLE_PATHS)),
@@ -10886,6 +10910,742 @@ def run_agent_loop(
     )
 
 
+# ---------------------------------------------------------------------------
+# Quarantined PIT diagnosis gate
+# ---------------------------------------------------------------------------
+
+
+def _pit_digest_file(path: Path) -> str:
+    """Hash one already validated regular file without exposing its contents."""
+    return _file_sha256(path)
+
+
+def _pit_json(path: Path) -> Mapping[str, object]:
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)),
+        )
+    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ConfigurationError("PIT input JSON is malformed") from exc
+    if not isinstance(value, Mapping):
+        raise ConfigurationError("PIT input JSON must be an object")
+    return value
+
+
+def _pit_manifest_path(config: Any) -> Path:
+    path = config.diagnosis_run / "manifest.json"
+    if not path.is_file() or path.is_symlink():
+        raise ConfigurationError("PIT diagnosis run manifest is missing")
+    return path
+
+
+def _pit_snapshot_input_identities(config: Any, state: SourceState) -> tuple[Path, Mapping[str, str]]:
+    """Seal identities under the controller temp root before any provider request.
+
+    The raw bundle and fact cache can be multi-gigabyte files; copying them would be both
+    wasteful and an unnecessary second mutable copy.  The worker receives their original
+    controller-owned paths through an injected worker boundary, while this sealed manifest
+    records the exact bytes and prevents a path/hash swap during the loop.
+    """
+    manifest_path = _pit_manifest_path(config)
+    expected = {
+        "diagnosis_manifest": config.diagnosis_manifest_sha256,
+        "pit_bundle": config.pit_bundle_sha256,
+        "fact_cache": config.fact_cache_sha256,
+        "rulebook": config.rulebook_sha256,
+        "experiment_catalog": config.experiment_catalog_sha256,
+    }
+    paths = {
+        "diagnosis_manifest": manifest_path,
+        "pit_bundle": config.pit_bundle,
+        "fact_cache": config.fact_cache,
+        "rulebook": config.rulebook,
+        "experiment_catalog": config.experiment_catalog,
+    }
+    actual = {name: _pit_digest_file(path) for name, path in paths.items()}
+    if actual != expected:
+        raise ConfigurationError("PIT diagnosis input identity does not match its declared hash")
+    if config.diagnosis_run.resolve() == state.root.resolve() or _configuration_paths_overlap(
+        config.diagnosis_run.resolve(), state.root.resolve()
+    ):
+        raise ConfigurationError("PIT diagnosis run must be outside the source checkout")
+    sealed_root = _new_controller_temp(
+        "pit-diagnosis-inputs-",
+        state.controller_temp_parent or Path(tempfile.gettempdir()),
+        _controller_forbidden_roots(state.root),
+    )
+    sealed_payload = {
+        "schema_version": 1,
+        "identities": dict(sorted(actual.items())),
+        "paths": {name: str(path) for name, path in sorted(paths.items())},
+        "read_only": True,
+        "network": "none",
+    }
+    sealed_file = sealed_root / "sealed-inputs.json"
+    sealed_file.write_bytes(_canonical_json_bytes(sealed_payload) + b"\n")
+    try:
+        sealed_file.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    except OSError:
+        pass
+    return sealed_root, MappingProxyType(actual)
+
+
+def _pit_recheck_input_identities(config: Any, identities: Mapping[str, str]) -> None:
+    """Prove sealed PIT inputs did not change between controller boundaries."""
+    paths = {
+        "diagnosis_manifest": _pit_manifest_path(config),
+        "pit_bundle": config.pit_bundle,
+        "fact_cache": config.fact_cache,
+        "rulebook": config.rulebook,
+        "experiment_catalog": config.experiment_catalog,
+    }
+    actual = {name: _pit_digest_file(path) for name, path in paths.items()}
+    if dict(actual) != dict(identities):
+        raise ConfigurationError("PIT sealed input changed during diagnosis")
+
+
+def _pit_locked_metric_name(name: str) -> bool:
+    folded = name.casefold()
+    return any(token in folded for token in ("locked", "holdout", "unseen", "2025", "2026"))
+
+
+def _pit_validate_evidence(evidence: Any, config: Any) -> Any:
+    from pit_diagnosis_agent import PitAgentEvidence
+
+    if not isinstance(evidence, PitAgentEvidence):
+        raise ProtocolValidationError("PIT evidence must be a closed PitAgentEvidence")
+    if (
+        evidence.diagnosis_run_sha256 != config.diagnosis_manifest_sha256
+        or evidence.pit_bundle_sha256 != config.pit_bundle_sha256
+        or evidence.fact_cache_sha256 != config.fact_cache_sha256
+        or evidence.rulebook_sha256 != config.rulebook_sha256
+        or evidence.experiment_catalog_sha256 != config.experiment_catalog_sha256
+    ):
+        raise ProtocolValidationError("PIT evidence identity differs from the sealed inputs")
+    if any(_pit_locked_metric_name(name) for name in evidence.metrics):
+        raise ProtocolValidationError("locked-evaluation metrics cannot cross the PIT provider boundary")
+    return evidence
+
+
+def _pit_catalog_records(path: Path, rulebook_path: Path) -> Mapping[str, Mapping[str, object]]:
+    """Read only the closed experiment declarations needed by the controller."""
+    try:
+        payload = _pit_json(path)
+        records = payload.get("experiments")
+        if not isinstance(records, list):
+            raise ValueError("experiments is not a list")
+        values: dict[str, Mapping[str, object]] = {}
+        for item in records:
+            if not isinstance(item, Mapping) or not isinstance(item.get("experiment_id"), str):
+                raise ValueError("experiment record is malformed")
+            values[str(item["experiment_id"])] = MappingProxyType(dict(item))
+        if not values:
+            raise ValueError("experiment catalog is empty")
+        # Parse through the canonical model as an additional schema/citation check.
+        from core.pit_diagnosis.catalog import load_experiment_catalog
+        from core.pit_diagnosis.rulebook import load_rulebook
+
+        book = load_rulebook(rulebook_path)
+        catalog = load_experiment_catalog(path, book)
+        if tuple(sorted(values)) != tuple(sorted(catalog.experiments)):
+            raise ValueError("catalog records differ from canonical catalog")
+        return MappingProxyType(values)
+    except Exception as exc:
+        if isinstance(exc, ConfigurationError):
+            raise
+        raise ConfigurationError("PIT experiment catalog is malformed") from exc
+
+
+def _pit_rule_records(path: Path) -> Mapping[str, Mapping[str, object]]:
+    """Load bounded rule records for the selected route domain only."""
+    try:
+        payload = _pit_json(path)
+        rules = payload.get("rules")
+        if not isinstance(rules, Mapping) or not rules:
+            raise ValueError("rules is not a non-empty object")
+        values: dict[str, Mapping[str, object]] = {}
+        for rule_id, record in rules.items():
+            if not isinstance(rule_id, str) or not isinstance(record, Mapping):
+                raise ValueError("rule record is malformed")
+            values[rule_id] = MappingProxyType({"rule_id": rule_id, **dict(record)})
+        return MappingProxyType(values)
+    except Exception as exc:
+        if isinstance(exc, ConfigurationError):
+            raise
+        raise ConfigurationError("PIT rulebook records are malformed") from exc
+
+
+def _pit_default_evidence(config: Any, manifest: Mapping[str, object], records: Mapping[str, Mapping[str, object]]) -> Any:
+    """Construct a provider-safe aggregate envelope from publication identities."""
+    from pit_diagnosis_agent import PitAgentEvidence
+
+    result_hashes: dict[str, str] = {}
+    ablations = config.diagnosis_run / "ablation_results.csv"
+    try:
+        import csv
+
+        with ablations.open(encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                partition = str(row.get("partition", ""))
+                experiment_id = str(row.get("experiment_id", ""))
+                result_hash = str(row.get("result_sha256", ""))
+                if partition in {"discovery", "validation"} and experiment_id in records and _SHA256_RE.fullmatch(result_hash):
+                    result_hashes[experiment_id] = result_hash
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ConfigurationError("PIT ablation evidence is malformed") from exc
+    if not result_hashes:
+        raise ConfigurationError("PIT diagnosis has no discovery/validation experiment results")
+    rule_ids: list[str] = []
+    try:
+        rulebook = _pit_json(config.rulebook)
+        rules = rulebook.get("rules")
+        if isinstance(rules, Mapping):
+            rule_ids = sorted(str(value) for value in rules)
+    except ConfigurationError:
+        raise
+    evidence_ids = tuple(rule_ids) or ("BASELINE.D0",)
+    metrics: dict[str, float | int] = {}
+    # Only aggregate, discovery/validation-safe counts are admitted.  The publication
+    # verifier has already rejected raw rows and locked artifacts.
+    try:
+        import csv
+
+        with (config.diagnosis_run / "entry_funnel.csv").open(encoding="utf-8", newline="") as handle:
+            rows = [row for row in csv.DictReader(handle) if row.get("partition") in {"discovery", "validation"}]
+        for field in ("evaluated", "qualified", "attempted", "executed", "rejected"):
+            metrics[f"funnel_{field}"] = sum(int(row.get(field, "0")) for row in rows)
+    except (OSError, UnicodeError, ValueError, csv.Error) as exc:
+        raise ConfigurationError("PIT funnel evidence is malformed") from exc
+    fidelity = str(manifest.get("fidelity_label", "fidelity_incomplete"))
+    if fidelity not in {"strict_canslim", "quantitative_canslim_proxy", "fidelity_incomplete"}:
+        raise ConfigurationError("PIT manifest fidelity label is invalid")
+    return PitAgentEvidence(
+        diagnosis_run_sha256=config.diagnosis_manifest_sha256,
+        pit_bundle_sha256=config.pit_bundle_sha256,
+        fact_cache_sha256=config.fact_cache_sha256,
+        rulebook_sha256=config.rulebook_sha256,
+        experiment_catalog_sha256=config.experiment_catalog_sha256,
+        experiment_result_sha256s=result_hashes,
+        metrics=metrics,
+        evidence_ids=tuple(sorted(evidence_ids)),
+        rule_ids=tuple(sorted(rule_ids)),
+        invariant_ids=("INV.D0_REPRODUCTION",),
+        experiment_ids=tuple(sorted(result_hashes)),
+        fidelity_label=fidelity,
+        promotion_eligible=False,
+    )
+
+
+def _pit_call_gateway(
+    audit: AuditTrail,
+    services: Any,
+    role: str,
+    dynamic: Mapping[str, object],
+    parser: Callable[[str], object],
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> tuple[object, str]:
+    """Issue one closed request and return its validated payload plus an audit hash."""
+    from pit_diagnosis_agent import PitReasoningPlan, PitRoute
+
+    if monotonic() >= deadline:
+        raise BudgetExceededError("PIT diagnosis wall deadline reached")
+    gateway = services.gateway
+    method = getattr(gateway, "request_pit_diagnosis_once", None) or getattr(gateway, "request", None)
+    if method is None:
+        raise ConfigurationError("PIT gateway has no request method")
+    payload = _provider_dynamic_payload(dynamic, services.known_secrets)
+    import inspect
+
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        signature = None
+    kwargs: dict[str, object] = {}
+    if signature is not None:
+        if "wall_deadline" in signature.parameters:
+            kwargs["wall_deadline"] = deadline
+        if "monotonic" in signature.parameters:
+            kwargs["monotonic"] = monotonic
+    # Never retry after a provider-side TypeError: the request may already have
+    # consumed a paid call.  Signature inspection only decides optional keywords.
+    completion = method(role, payload, parser, **kwargs)
+    if isinstance(completion, AgentCompletion):
+        value = completion.payload
+    else:
+        value = getattr(completion, "payload", completion)
+    if not isinstance(value, (PitRoute, PitReasoningPlan, TypedCodingProposal)):
+        raise ResponseValidationError("PIT gateway returned an invalid closed role payload")
+    # Provider payloads are retained under the private audit root only.  The hash is
+    # the sole linkage fact published to the derivative result.
+    primitive = asdict(value)
+    call_index = len(getattr(audit, "_pit_call_hashes", ())) + 1
+    path = audit.write_handoff_metadata(
+        {"role": role, "payload": primitive},
+        name=f"pit-{role}-{call_index:03d}",
+    )
+    digest = _file_sha256(path)
+    return value, digest
+
+
+def _pit_invoke_runner(runner: Callable[..., object], config: Any, candidate: Candidate, experiment_id: str, partition: str, sealed_root: Path) -> object:
+    """Call fake/production worker adapters while keeping the public boundary narrow."""
+    import inspect
+
+    values = {
+        "config": config,
+        "candidate": candidate,
+        "experiment_id": experiment_id,
+        "partition": partition,
+        "sealed_input_root": sealed_root,
+        "network_disabled": True,
+        "read_only": True,
+    }
+    try:
+        signature = inspect.signature(runner)
+    except (TypeError, ValueError):
+        return runner(config, candidate, experiment_id, partition, sealed_root)
+    positional: list[object] = []
+    keyword: dict[str, object] = {}
+    for parameter in signature.parameters.values():
+        if parameter.kind in {parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD}:
+            continue
+        if parameter.name in values:
+            if parameter.kind is parameter.POSITIONAL_ONLY:
+                positional.append(values[parameter.name])
+            else:
+                keyword[parameter.name] = values[parameter.name]
+        elif parameter.default is parameter.empty:
+            raise ConfigurationError("PIT deterministic worker requires an unsupported argument")
+    return runner(*positional, **keyword)
+
+
+def _pit_result_digest(result: object) -> str:
+    digest = getattr(result, "result_sha256", None)
+    if isinstance(digest, str) and _SHA256_RE.fullmatch(digest):
+        return digest
+    if isinstance(result, Mapping):
+        digest = result.get("result_sha256")
+        if isinstance(digest, str) and _SHA256_RE.fullmatch(digest):
+            return digest
+    try:
+        return hashlib.sha256(_canonical_json_bytes(result)).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError("PIT deterministic result is not hashable closed data") from exc
+
+
+def _pit_validate_worker_result(result: object) -> None:
+    """Accept only worker observations that affirm the PIT isolation contract."""
+    if isinstance(result, Mapping):
+        for field in ("network_disabled", "read_only"):
+            if field in result and result[field] is not True:
+                raise QuarantineError(f"PIT worker {field} attestation failed")
+
+
+def _pit_domain_matches(domain: Any, evidence_id: str) -> bool:
+    prefix = evidence_id.split(".", 1)[0].casefold()
+    return prefix in {
+        "data", "entry", "execution", "exit", "market", "portfolio", "fundamentals", "newness", "institutional", "leadership", "x", "e", "n", "s", "l", "i", "m"
+    } and (
+        prefix == domain.value.casefold()
+        or (domain.value == "data" and prefix in {"fundamentals", "newness", "institutional", "leadership"})
+        or (domain.value == "entry" and prefix in {"e", "n", "s", "l", "i"})
+        or (domain.value == "exit" and prefix == "x")
+        or (domain.value == "market" and prefix == "m")
+    )
+
+
+def _pit_write_derivative(
+    config: Any,
+    audit: AuditTrail,
+    events: Sequence[Mapping[str, object]],
+    *,
+    selected_experiment_id: str | None,
+    result_sha256: str | None,
+    exported_diff_sha256: str | None,
+    status: str,
+) -> Path:
+    root_parent = config.output_root or (audit.artifact_root / "pit-diagnosis")
+    root_parent.mkdir(parents=True, exist_ok=True)
+    root = root_parent / f"run-{audit.run_id}"
+    if root.exists():
+        raise ConfigurationError("PIT derivative result directory already exists")
+    root.mkdir()
+    link = {
+        "schema_version": 1,
+        "status": status,
+        "diagnosis_manifest_sha256": config.diagnosis_manifest_sha256,
+        "pit_bundle_sha256": config.pit_bundle_sha256,
+        "fact_cache_sha256": config.fact_cache_sha256,
+        "rulebook_sha256": config.rulebook_sha256,
+        "experiment_catalog_sha256": config.experiment_catalog_sha256,
+        "selected_experiment_id": selected_experiment_id,
+        "deterministic_result_sha256": result_sha256,
+        "exported_diff_sha256": exported_diff_sha256,
+    }
+    (root / "diagnosis_link.json").write_bytes(_canonical_json_bytes(link) + b"\n")
+    with (root / "agent_events.jsonl").open("x", encoding="utf-8", newline="\n") as handle:
+        for event in events:
+            handle.write(json.dumps(dict(event), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n")
+    (root / "selected_experiment.json").write_bytes(
+        _canonical_json_bytes({"experiment_id": selected_experiment_id, "result_sha256": result_sha256}) + b"\n"
+    )
+    (root / "summary.json").write_bytes(
+        _canonical_json_bytes({"schema_version": 1, "status": status, "selected_experiment_id": selected_experiment_id, "deterministic_result_sha256": result_sha256, "exported_diff_sha256": exported_diff_sha256}) + b"\n"
+    )
+    return root
+
+
+def run_pit_diagnosis_loop(
+    config: Any,
+    source_state: SourceState,
+    candidate: Candidate,
+    audit: AuditTrail,
+    services: Any,
+) -> Any:
+    """Run one closed PIT route/reason/optional-code diagnosis sample.
+
+    This loop intentionally has no fallback to the legacy free-form prompts.  A malformed
+    route or reasoner response is a protocol terminal result, and a coder is unreachable
+    unless the selected catalog record explicitly requires code and supplies an exact
+    controller-owned replacement.
+    """
+    from pit_diagnosis_agent import (
+        PitAgentEvidence,
+        PitAgentEvent,
+        PitDiagnosisGateConfig,
+        PitDiagnosisLoopResult,
+        PitDiagnosisLoopServices,
+        PitReasoningPlan,
+        PitRoute,
+        validate_pit_reasoning_plan,
+        validate_pit_route,
+    )
+
+    if not isinstance(config, PitDiagnosisGateConfig) or not isinstance(source_state, SourceState) or not isinstance(audit, AuditTrail) or not isinstance(services, PitDiagnosisLoopServices):
+        raise ConfigurationError("PIT diagnosis loop requires validated controller inputs")
+    _require_candidate(candidate)
+    # Neither the private audit chain nor its sanitized derivative may be a
+    # source-tree output.  This is checked before any worker or provider call.
+    if _configuration_paths_overlap(audit.artifact_root, source_state.root) or (
+        config.output_root is not None
+        and _configuration_paths_overlap(config.output_root, source_state.root)
+    ):
+        raise ConfigurationError("PIT output root overlaps source")
+    started = (services.monotonic or time.monotonic)()
+    if type(started) not in {int, float} or not math.isfinite(started):
+        raise ConfigurationError("PIT diagnosis monotonic clock is invalid")
+    deadline = float(started) + config.wall_timeout_seconds
+    events: list[dict[str, object]] = []
+    call_hashes: list[str] = []
+    selected_id: str | None = None
+    result_hash: str | None = None
+    diff_hash: str | None = None
+    coder_called = False
+    sealed_root: Path | None = None
+    cleanup: CleanupObservation | None = None
+    status = "controller_error"
+    failure = "controller_error"
+    d0_passed = False
+    locked_excluded = True
+    derivative: Path | None = None
+    sealed_cleanup_failed = False
+
+    def close_resources() -> None:
+        """Close the worker boundary before publishing terminal facts."""
+        nonlocal sealed_root, cleanup, sealed_cleanup_failed
+        if sealed_root is not None:
+            try:
+                _remove_private_tree(sealed_root)
+            except Exception:
+                # A failed private-root removal is reflected in cleanup_complete;
+                # never publish a result while leaving the worker boundary open.
+                sealed_cleanup_failed = True
+            finally:
+                sealed_root = None
+        if cleanup is None:
+            try:
+                cleanup = cleanup_run_resources(source_state, candidate, retain_candidate=False)
+            except Exception:
+                cleanup = CleanupObservation(False, False, True, False, False, ("candidate_cleanup_failed",))
+
+    def event(event_type: str, role: str, outcome: str, experiment_id: str, call_hash: str, deterministic_hash: str) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        record = PitAgentEvent(event_type, timestamp, role, experiment_id or "BASELINE.D0", outcome, call_hash, deterministic_hash).to_primitive()
+        events.append(record)
+        state_by_role = {"orchestrator": LoopState.CALL_ORCHESTRATOR, "reasoner": LoopState.CALL_REASONER, "coder": LoopState.CALL_CODER, "controller": LoopState.PREPARE}
+        audit.append_event(state_by_role[role], f"pit_{event_type}_{outcome}", {"role": role, "experiment_id": experiment_id or "BASELINE.D0", "call_record_sha256": call_hash, "deterministic_result_sha256": deterministic_hash})
+
+    def result(terminal: str) -> Any:
+        nonlocal derivative, status, failure
+        status = terminal
+        # The returned object must describe the already-closed run.  In particular,
+        # cleanup_complete must not depend on a finally block that runs after return.
+        close_resources()
+        cleanup_observation = cleanup
+        assert cleanup_observation is not None
+        try:
+            derivative = _pit_write_derivative(config, audit, events, selected_experiment_id=selected_id, result_sha256=result_hash, exported_diff_sha256=diff_hash, status=terminal)
+        except Exception:
+            derivative = None
+            if terminal == "completed":
+                terminal = "controller_error"
+                status = terminal
+                failure = "derivative_write_failed"
+        source_changed = cleanup_observation.source_modified or recheck_source_unchanged(source_state).source_modified
+        if source_changed:
+            terminal = "source_modified"
+            status = terminal
+            failure = "source_modified"
+        elif not cleanup_observation.cleanup_complete or sealed_cleanup_failed:
+            terminal = "controller_error"
+            status = terminal
+            failure = "cleanup_failed"
+        return PitDiagnosisLoopResult(
+            terminal_status=terminal,
+            selected_experiment_id=selected_id,
+            coder_called=coder_called,
+            source_modified=source_changed,
+            exported_diff_sha256=diff_hash,
+            deterministic_result_sha256=result_hash,
+            diagnosis_result_sha256=result_hash,
+            derivative_result_path=derivative,
+            audit_path=audit.run_root,
+            run_id=audit.run_id,
+            call_record_sha256s=tuple(call_hashes),
+            cleanup_complete=cleanup_observation.cleanup_complete and not sealed_cleanup_failed,
+            worker_confined=True,
+            locked_metrics_excluded=locked_excluded,
+            d0_passed=d0_passed,
+            failure_code=failure,
+        )
+
+    try:
+        audit.append_event(LoopState.PREPARE, "pit_diagnosis_prepared", {"partition": config.partition})
+        sealed_root, identities = _pit_snapshot_input_identities(config, source_state)
+        manifest = _pit_json(_pit_manifest_path(config))
+        verifier = services.verify_diagnosis_run
+        if verifier is None:
+            from core.pit_diagnosis.publication import verify_diagnosis_run
+
+            verifier = verify_diagnosis_run
+        verified = verifier(config.diagnosis_run)
+        if not isinstance(verified, Mapping):
+            raise ConfigurationError("PIT verifier returned invalid closed facts")
+        baseline_path = config.diagnosis_run / "baseline_reproduction.json"
+        baseline = _pit_json(baseline_path)
+        baseline_identity = manifest.get("baseline_manifest_sha256")
+        d0_passed = (
+            isinstance(baseline_identity, str)
+            and _SHA256_RE.fullmatch(baseline_identity) is not None
+            and baseline.get("passed") is True
+            and baseline.get("authority_manifest_sha256") == baseline_identity
+            and baseline.get("reproduced_manifest_sha256") == baseline_identity
+        )
+        if not d0_passed:
+            failure = "d0_failed"
+            return result("d0_failed")
+        _pit_recheck_input_identities(config, identities)
+        records = _pit_catalog_records(config.experiment_catalog, config.rulebook)
+        rule_records = _pit_rule_records(config.rulebook)
+        supplied = services.build_evidence
+        if isinstance(supplied, PitAgentEvidence):
+            evidence = supplied
+        elif callable(supplied):
+            evidence = _pit_invoke_runner(supplied, config, candidate, "", config.partition, sealed_root)
+        else:
+            evidence = _pit_default_evidence(config, manifest, records)
+        evidence = _pit_validate_evidence(evidence, config)
+        locked_excluded = not any(_pit_locked_metric_name(name) for name in evidence.metrics)
+        if not locked_excluded:
+            failure = "locked_metrics"
+            return result("protocol_rejected")
+        if services.evidence_ids:
+            if tuple(services.evidence_ids) != tuple(sorted(services.evidence_ids)):
+                raise ConfigurationError("PIT service evidence IDs must be sorted")
+            if not set(services.evidence_ids).issubset(evidence.evidence_ids):
+                raise ConfigurationError("PIT service evidence exceeds sealed evidence")
+        domains = tuple(item.value for item in __import__("pit_diagnosis_agent").PitDomain)
+        dynamic_evidence = evidence.to_provider_payload()
+        dynamic_evidence["domains"] = list(domains)
+        dynamic_evidence["rulebook_rules"] = list(evidence.rule_ids)
+        dynamic_evidence["invariants"] = list(evidence.invariant_ids)
+        dynamic_evidence["experiments"] = list(evidence.experiment_ids)
+        route, route_hash = _pit_call_gateway(audit, services, "orchestrator", dynamic_evidence, PitRoute.from_json, deadline=deadline, monotonic=services.monotonic or time.monotonic)
+        call_hashes.append(route_hash)
+        assert isinstance(route, PitRoute)
+        validate_pit_route(route, evidence)
+        if route.action == "abort":
+            event("route", "orchestrator", "aborted", "", route_hash, "0" * 64)
+            failure = "orchestrator_abort"
+            return result("aborted")
+        if not route.evidence_ids or any(not _pit_domain_matches(route.domain, item) for item in route.evidence_ids):
+            failure = "route_domain_mismatch"
+            return result("protocol_rejected")
+        event("route", "orchestrator", "accepted", "", route_hash, "0" * 64)
+        bounded_ids = tuple(item for item in evidence.evidence_ids if item in route.evidence_ids and _pit_domain_matches(route.domain, item))
+        def domain_id(value: str) -> bool:
+            return _pit_domain_matches(route.domain, value)
+
+        bounded_rules = tuple(item for item in evidence.rule_ids if domain_id(item))
+        bounded_invariants = tuple(
+            item
+            for item in evidence.invariant_ids
+            if item.casefold().startswith(f"inv.{route.domain.value.casefold()}")
+            or item.casefold() == "inv.d0_reproduction"
+        )
+        domain_experiments = tuple(
+            item
+            for item in evidence.experiment_ids
+            if item in records
+            and str(records[item].get("phase")) != "D5"
+            and (
+                str(records[item].get("domain", "")).casefold() == route.domain.value.casefold()
+                or route.domain.value == "entry"
+                and str(records[item].get("kind", "")).casefold() in {"entry", "interaction"}
+                or route.domain.value == "data"
+                and str(records[item].get("kind", "")).casefold() in {"data", "reproduction"}
+            )
+        )
+        # The reasoner receives a bounded projection.  The full immutable evidence
+        # envelope remains controller-owned and is used only for post-response
+        # grounding, never as a second unbounded prompt field.
+        bounded_evidence = evidence.to_provider_payload()
+        bounded_evidence["evidence_ids"] = list(bounded_ids)
+        bounded_evidence["rule_ids"] = list(bounded_rules)
+        bounded_evidence["invariant_ids"] = list(bounded_invariants)
+        bounded_evidence["experiment_ids"] = list(domain_experiments)
+        bounded_evidence["experiment_result_sha256s"] = {
+            item: evidence.experiment_result_sha256s[item] for item in domain_experiments
+        }
+        reason_input = {
+            "evidence": bounded_evidence,
+            "domain": route.domain.value,
+            "evidence_ids": list(bounded_ids),
+            "rule_ids": list(bounded_rules),
+            "invariant_ids": list(bounded_invariants),
+            "experiment_ids": list(domain_experiments),
+            "rules": [dict(rule_records[item]) for item in bounded_rules if item in rule_records],
+            "invariants": [
+                {"invariant_id": item, "domain": route.domain.value}
+                for item in bounded_invariants
+            ],
+            "experiments": [dict(records[item]) for item in domain_experiments],
+            "route": {"action": route.action, "domain": route.domain.value, "evidence_ids": list(route.evidence_ids)},
+        }
+        plan, plan_hash = _pit_call_gateway(audit, services, "reasoner", reason_input, PitReasoningPlan.from_json, deadline=deadline, monotonic=services.monotonic or time.monotonic)
+        call_hashes.append(plan_hash)
+        assert isinstance(plan, PitReasoningPlan)
+        validate_pit_reasoning_plan(plan, evidence)
+        if not set(plan.evidence_ids).issubset(set(bounded_ids)):
+            failure = "reasoner_evidence_scope"
+            return result("protocol_rejected")
+        if not set(plan.rule_ids).issubset(set(bounded_rules)):
+            failure = "reasoner_rule_scope"
+            return result("protocol_rejected")
+        if not set(plan.invariant_ids).issubset(set(bounded_invariants)):
+            failure = "reasoner_invariant_scope"
+            return result("protocol_rejected")
+        selected_id = plan.experiment_id if not plan.skip else None
+        event("reason", "reasoner", "skipped" if plan.skip else "accepted", selected_id or "", plan_hash, "0" * 64)
+        if plan.skip:
+            failure = "reasoner_skip"
+            return result("aborted")
+        if selected_id not in records:
+            failure = "unknown_experiment"
+            return result("protocol_rejected")
+        experiment = records[selected_id]
+        if selected_id not in domain_experiments:
+            failure = "experiment_domain_mismatch"
+            return result("protocol_rejected")
+        if str(experiment.get("phase")) == "D5" or bool(experiment.get("controller_composed")):
+            failure = "controller_composed_experiment"
+            return result("protocol_rejected")
+        requires_code = bool(experiment.get("requires_code"))
+        replacements = services.replacements_for(selected_id)
+        if requires_code and not replacements:
+            failure = "missing_controller_replacement"
+            return result("protocol_rejected")
+        if not requires_code and replacements:
+            # A configuration/data experiment cannot smuggle a source patch through the
+            # services object; the coder remains unreachable and this is a bad catalog.
+            failure = "unexpected_controller_replacement"
+            return result("protocol_rejected")
+        snapshots: tuple[SourceSnapshot, ...] = ()
+        if requires_code:
+            coder_called = True
+            paths = tuple(sorted({replacement.path for replacement in replacements}))
+            if services.read_snapshots is not None:
+                snapshots = services.read_snapshots(candidate, paths)
+            else:
+                snapshots = tuple(read_candidate_source_snapshot(candidate, path, approved_paths=paths, known_secrets=services.known_secrets) for path in paths)
+            if not isinstance(snapshots, tuple) or any(not isinstance(item, SourceSnapshot) for item in snapshots):
+                raise ConfigurationError("PIT coder snapshots are invalid")
+            coder_dynamic: dict[str, object] = {
+                "evidence": evidence.to_provider_payload(),
+                "plan": asdict(plan),
+                "source_snapshots": [_provider_editable_snapshot_payload(item) for item in snapshots],
+                "editable_source_paths": list(paths),
+            }
+            key = "controller_owned_allowed_replacement" if len(replacements) == 1 else "controller_owned_allowed_replacements"
+            coder_dynamic[key] = asdict(replacements[0]) if len(replacements) == 1 else [asdict(item) for item in replacements]
+            typed, coder_hash = _pit_call_gateway(audit, services, "coder", coder_dynamic, TypedCodingProposal.from_json, deadline=deadline, monotonic=services.monotonic or time.monotonic)
+            call_hashes.append(coder_hash)
+            assert isinstance(typed, TypedCodingProposal)
+            if len(typed.replacements) != 1 or typed.replacements not in tuple((item,) for item in replacements):
+                failure = "coder_replacement_mismatch"
+                return result("protocol_rejected")
+            event("coder", "coder", "accepted", selected_id, coder_hash, "0" * 64)
+            editable = tuple(sorted(set(services.editable_paths) | {item.path for item in replacements}))
+            proposal = render_typed_coding_proposal(candidate, typed, snapshots)
+            validate_unified_diff(candidate.root, proposal.unified_diff, proposal.files, editable_paths=editable, gate="test")
+            compile_runner = services.compile_runner or (lambda _layout, _paths: True)
+            apply_candidate_patch(candidate, proposal, gate="test", editable_paths=editable, compile_runner=compile_runner)
+            if services.run_quality is not None:
+                quality = _pit_invoke_runner(services.run_quality, config, candidate, selected_id, config.partition, sealed_root)
+                _pit_validate_worker_result(quality)
+                if isinstance(quality, QualityObservation) and not quality.passed:
+                    failure = "quality_failed"
+                    return result("worker_failed")
+                if isinstance(quality, bool) and not quality:
+                    failure = "quality_failed"
+                    return result("worker_failed")
+            handoff = export_inert_handoff(candidate, audit, gate="test", editable_paths=editable)
+            diff_hash = handoff.diff_sha256
+        runner = services.run_experiment or services.run_deterministic_experiment
+        if runner is None:
+            raise ConfigurationError("PIT deterministic experiment runner is not configured")
+        execution = _pit_invoke_runner(runner, config, candidate, selected_id, config.partition, sealed_root)
+        _pit_validate_worker_result(execution)
+        _pit_recheck_input_identities(config, identities)
+        result_hash = _pit_result_digest(execution)
+        if result_hash not in evidence.experiment_result_sha256s.values() and not requires_code:
+            # A controller-owned fake may return a new in-memory deterministic result;
+            # bind it to the selected catalog identity rather than silently accepting an
+            # unrelated experiment result.
+            raise ProtocolValidationError("deterministic result is not bound to sealed experiment evidence")
+        event("terminal", "controller", "completed", selected_id, call_hashes[-1] if call_hashes else "0" * 64, result_hash)
+        failure = "none"
+        return result("completed")
+    except (BudgetExceededError, AccountedBudgetExceededError):
+        failure = "budget_exceeded"
+        return result("budget_exceeded")
+    except (ProtocolValidationError, ResponseValidationError):
+        failure = "protocol_rejected"
+        return result("protocol_rejected")
+    except (CandidateMutationError, PreflightError, QuarantineError, AuditError):
+        failure = "controller_boundary"
+        return result("controller_error")
+    except Exception:
+        failure = "controller_error"
+        return result("controller_error")
+    finally:
+        close_resources()
+
+
 def _watchdog_requires_pid_one() -> bool:
     """Return whether this runtime must provide the container PID-1 supervisor invariant."""
     return os.name != "nt"
@@ -11077,7 +11837,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--docker-executable", type=Path, required=True)
     parser.add_argument("--sandbox-image", required=True)
-    parser.add_argument("--gate", choices=("test", "backtest"), required=True)
+    parser.add_argument("--gate", choices=("test", "backtest", "pit_diagnosis"), required=True)
     parser.add_argument(
         "--test-path",
         action="append",
@@ -11092,6 +11852,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--holdout-end-date")
     parser.add_argument("--historical-data-bundle", type=Path)
     parser.add_argument("--historical-data-sha256")
+    parser.add_argument("--diagnosis-run", type=Path)
+    parser.add_argument("--diagnosis-manifest-sha256")
+    parser.add_argument("--pit-bundle", type=Path)
+    parser.add_argument("--pit-bundle-sha256")
+    parser.add_argument("--fact-cache", type=Path)
+    parser.add_argument("--fact-cache-sha256")
+    parser.add_argument("--rulebook", type=Path)
+    parser.add_argument("--rulebook-sha256")
+    parser.add_argument("--experiment-catalog", type=Path)
+    parser.add_argument("--experiment-catalog-sha256")
+    parser.add_argument("--pit-partition", choices=("discovery", "validation"), default="discovery")
     parser.add_argument("--minimum-total-return", type=float)
     parser.add_argument("--minimum-annualized-return", type=float)
     parser.add_argument("--minimum-sharpe-ratio", type=float)
@@ -11141,6 +11912,8 @@ def _build_cli_config(
         raise ConfigurationError(
             "sandbox image must be an exact repository@sha256 digest"
         )
+    from pit_diagnosis_agent import PitDiagnosisGateConfig
+
     backtest_fields = (
         namespace.tickers,
         namespace.benchmark,
@@ -11156,15 +11929,29 @@ def _build_cli_config(
         namespace.maximum_drawdown_magnitude,
         namespace.minimum_closed_trades,
     )
+    pit_fields = (
+        namespace.diagnosis_run,
+        namespace.diagnosis_manifest_sha256,
+        namespace.pit_bundle,
+        namespace.pit_bundle_sha256,
+        namespace.fact_cache,
+        namespace.fact_cache_sha256,
+        namespace.rulebook,
+        namespace.rulebook_sha256,
+        namespace.experiment_catalog,
+        namespace.experiment_catalog_sha256,
+    )
     if namespace.gate == "test":
         if any(value is not None for value in backtest_fields):
             raise ConfigurationError(
                 "backtest-only options cannot be supplied to the test gate"
             )
-        gate: TestGateConfig | BacktestGateConfig = TestGateConfig(
+        if any(value is not None for value in pit_fields):
+            raise ConfigurationError("PIT diagnosis options cannot be supplied to the test gate")
+        gate: Any = TestGateConfig(
             tuple(namespace.test_path)
         )
-    else:
+    elif namespace.gate == "backtest":
         if namespace.test_path:
             raise ConfigurationError(
                 "test paths cannot be supplied to the backtest gate"
@@ -11193,6 +11980,40 @@ def _build_cli_config(
             ),
             holdout_start_date=namespace.holdout_start_date,
             holdout_end_date=namespace.holdout_end_date,
+        )
+        if any(value is not None for value in pit_fields):
+            raise ConfigurationError("PIT diagnosis options cannot be supplied to the backtest gate")
+    else:
+        if namespace.test_path or any(value is not None for value in backtest_fields):
+            raise ConfigurationError("test/backtest options cannot be supplied to the PIT diagnosis gate")
+        if namespace.proposal_samples is not None or namespace.canary_max_usd is not None:
+            raise ConfigurationError("proposal samples are not supported by the PIT diagnosis gate")
+        if any(value is None for value in pit_fields):
+            raise ConfigurationError("the PIT diagnosis gate requires all sealed input identities")
+        assert namespace.diagnosis_run is not None
+        assert namespace.pit_bundle is not None
+        assert namespace.fact_cache is not None
+        assert namespace.rulebook is not None
+        assert namespace.experiment_catalog is not None
+        gate = PitDiagnosisGateConfig(
+            diagnosis_run=_absolute_cli_path(namespace.diagnosis_run, "diagnosis run"),
+            diagnosis_manifest_sha256=namespace.diagnosis_manifest_sha256,
+            pit_bundle=_absolute_cli_path(namespace.pit_bundle, "PIT bundle"),
+            pit_bundle_sha256=namespace.pit_bundle_sha256,
+            fact_cache=_absolute_cli_path(namespace.fact_cache, "fact cache"),
+            fact_cache_sha256=namespace.fact_cache_sha256,
+            rulebook=_absolute_cli_path(namespace.rulebook, "rulebook"),
+            rulebook_sha256=namespace.rulebook_sha256,
+            experiment_catalog=_absolute_cli_path(namespace.experiment_catalog, "experiment catalog"),
+            experiment_catalog_sha256=namespace.experiment_catalog_sha256,
+            partition=namespace.pit_partition,
+            max_usd=namespace.max_usd,
+            max_api_calls=namespace.max_api_calls,
+            max_tokens=namespace.max_tokens,
+            wall_timeout_seconds=namespace.wall_timeout_seconds,
+            child_timeout_seconds=namespace.child_timeout_seconds,
+            output_limit_bytes=namespace.output_limit_bytes,
+            apply=namespace.apply,
         )
     config = LoopConfig(
         source_root=_absolute_cli_path(namespace.repo_root, "repository root"),
@@ -11534,7 +12355,29 @@ def _execute_cli_run(
             source_fingerprint_sha256=state.fingerprint.sha256,
         )
 
-        if isinstance(config.gate, TestGateConfig):
+        from pit_diagnosis_agent import PitDiagnosisGateConfig, PitDiagnosisLoopServices
+
+        if isinstance(config.gate, PitDiagnosisGateConfig):
+            # The production adapter is intentionally absent until the PIT worker image
+            # exposes the dedicated run-experiment grammar and its read-only mounts.  A
+            # publication row must never be treated as a deterministic execution result
+            # by reading diagnosis artifacts on the controller.  Injected fake services
+            # remain available for offline protocol tests; the production gate fails
+            # closed here rather than crossing the worker boundary.
+            stage = "controller_run"
+            result = run_pit_diagnosis_loop(
+                config.gate,
+                state,
+                candidate,
+                audit,
+                PitDiagnosisLoopServices(
+                    gateway=gateway,
+                    run_quality=lambda *_args, **_kwargs: True,
+                    compile_runner=sandbox_compile_runner(sandbox),
+                    known_secrets=known_secrets,
+                ),
+            )
+        elif isinstance(config.gate, TestGateConfig):
             primary_gate = lambda current, _iteration: _test_provider_evidence(
                 current, sandbox, config.gate.selectors
             )
@@ -11559,8 +12402,9 @@ def _execute_cli_run(
                 for path in paths
             )
 
-        stage = "controller_run"
-        if batch_limits is not None:
+        if isinstance(config.gate, PitDiagnosisGateConfig):
+            pass
+        elif batch_limits is not None:
             if not isinstance(config.gate, BacktestGateConfig) or bundle is None:
                 raise ConfigurationError("proposal batch backtest inputs are absent")
             proposal_compile_runner = sandbox_compile_runner(sandbox)
@@ -11757,6 +12601,33 @@ def _proposal_batch_summary(result: ProposalBatchResult) -> dict[str, object]:
     }
 
 
+def _pit_diagnosis_summary(result: Any) -> dict[str, object]:
+    """Serialize only the closed PIT controller result for the CLI boundary."""
+    from pit_diagnosis_agent import PitDiagnosisLoopResult
+
+    if not isinstance(result, PitDiagnosisLoopResult):
+        raise ConfigurationError("CLI execution did not return a PitDiagnosisLoopResult")
+    return {
+        "schema_version": 1,
+        "terminal_status": result.terminal_status,
+        "run_id": result.run_id,
+        "selected_experiment_id": result.selected_experiment_id,
+        "coder_called": result.coder_called,
+        "source_modified": result.source_modified,
+        "exported_diff_sha256": result.exported_diff_sha256,
+        "deterministic_result_sha256": result.deterministic_result_sha256,
+        "diagnosis_result_sha256": result.diagnosis_result_sha256,
+        "derivative_result_path": str(result.derivative_result_path) if result.derivative_result_path else None,
+        "audit_path": str(result.audit_path) if result.audit_path else None,
+        "call_record_sha256s": list(result.call_record_sha256s),
+        "cleanup_complete": result.cleanup_complete,
+        "worker_confined": result.worker_confined,
+        "locked_metrics_excluded": result.locked_metrics_excluded,
+        "d0_passed": result.d0_passed,
+        "failure_code": result.failure_code,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the protected child dispatcher or one production controller invocation."""
     arguments = tuple(sys.argv[1:] if argv is None else argv)
@@ -11780,9 +12651,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_id=run_id,
             batch_limits=batch_limits,
         )
+        from pit_diagnosis_agent import PitDiagnosisLoopResult
+
         summary = (
             _proposal_batch_summary(result)
             if isinstance(result, ProposalBatchResult)
+            else _pit_diagnosis_summary(result)
+            if isinstance(result, PitDiagnosisLoopResult)
             else _loop_result_summary(result)
         )
     except ControllerInitializationError as exc:

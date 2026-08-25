@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping, Sequence
 
 from agent_loop import (
+    ConfigurationError,
+    ExactLineReplacement,
     PayloadFieldValidationError,
     PayloadKeysValidationError,
     ProtocolValidationError,
@@ -48,6 +52,220 @@ _FORBIDDEN_EVIDENCE_KEYS = frozenset(
         "source_text",
     }
 )
+
+
+def _absolute_regular_path(value: object, field: str, *, directory: bool = False) -> Path:
+    """Validate a controller input path without following a user supplied link."""
+    if not isinstance(value, Path) or not value.is_absolute():
+        raise ConfigurationError(f"{field} must be an absolute Path")
+    try:
+        info = value.lstat()
+    except OSError as exc:
+        raise ConfigurationError(f"{field} must exist") from exc
+    if value.is_symlink() or not value.exists():
+        raise ConfigurationError(f"{field} must be a regular non-symlink path")
+    if directory and not value.is_dir():
+        raise ConfigurationError(f"{field} must be a regular directory")
+    if not directory and not value.is_file():
+        raise ConfigurationError(f"{field} must be a regular file")
+    if not directory and not os.path.isfile(value):
+        raise ConfigurationError(f"{field} must be a regular file")
+    if directory and not os.path.isdir(value):
+        raise ConfigurationError(f"{field} must be a regular directory")
+    if getattr(info, "st_file_attributes", 0) & 0x400:
+        raise ConfigurationError(f"{field} must not be a reparse point")
+    return value.resolve()
+
+
+def _absolute_output_path(value: object, field: str) -> Path:
+    if not isinstance(value, Path) or not value.is_absolute():
+        raise ConfigurationError(f"{field} must be an absolute Path")
+    if value.exists() and (value.is_symlink() or not value.is_dir()):
+        raise ConfigurationError(f"{field} must be a regular directory when present")
+    return value.resolve(strict=False)
+
+
+@dataclass(frozen=True)
+class PitDiagnosisGateConfig:
+    """Sealed identities and hard limits for one quarantined PIT diagnosis sample.
+
+    The five immutable input files are deliberately separate from ``SourceState``.  A
+    diagnosis worker may read their controller-owned snapshots, but it cannot resolve a
+    path supplied by a model or use the live checkout as its data source.
+    """
+
+    diagnosis_run: Path
+    diagnosis_manifest_sha256: str
+    pit_bundle: Path
+    pit_bundle_sha256: str
+    fact_cache: Path
+    fact_cache_sha256: str
+    rulebook: Path
+    rulebook_sha256: str
+    experiment_catalog: Path
+    experiment_catalog_sha256: str
+    checkpoint_root: Path | None = None
+    output_root: Path | None = None
+    partition: str = "discovery"
+    max_usd: float = 0.50
+    max_api_calls: int = 3
+    max_tokens: int = 32_768
+    wall_timeout_seconds: float = 3_600.0
+    child_timeout_seconds: float = 300.0
+    output_limit_bytes: int = 1_048_576
+    apply: bool = False
+
+    def __post_init__(self) -> None:
+        paths = (
+            ("diagnosis_run", self.diagnosis_run, True),
+            ("pit_bundle", self.pit_bundle, False),
+            ("fact_cache", self.fact_cache, False),
+            ("rulebook", self.rulebook, False),
+            ("experiment_catalog", self.experiment_catalog, False),
+        )
+        for field, value, directory in paths:
+            object.__setattr__(self, field, _absolute_regular_path(value, field, directory=directory))
+        if self.checkpoint_root is not None:
+            object.__setattr__(
+                self,
+                "checkpoint_root",
+                _absolute_output_path(self.checkpoint_root, "checkpoint_root"),
+            )
+        if self.output_root is not None:
+            object.__setattr__(self, "output_root", _absolute_output_path(self.output_root, "output_root"))
+        for field in (
+            "diagnosis_manifest_sha256",
+            "pit_bundle_sha256",
+            "fact_cache_sha256",
+            "rulebook_sha256",
+            "experiment_catalog_sha256",
+        ):
+            value = getattr(self, field)
+            if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+                raise ConfigurationError(f"{field} must be a lowercase SHA-256")
+        if self.partition not in {"discovery", "validation"}:
+            raise ConfigurationError("PIT diagnosis partition must be discovery or validation")
+        if type(self.max_api_calls) is not int or not 1 <= self.max_api_calls <= 3:
+            raise ConfigurationError("PIT diagnosis permits at most three provider calls")
+        if type(self.max_tokens) is not int or not 1 <= self.max_tokens <= 131_072:
+            raise ConfigurationError("PIT diagnosis token limit is invalid")
+        if type(self.max_usd) not in {int, float} or not math.isfinite(self.max_usd) or not 0 < self.max_usd <= 0.50:
+            raise ConfigurationError("PIT diagnosis USD limit must be finite and at most 0.50")
+        for field in ("wall_timeout_seconds", "child_timeout_seconds"):
+            value = getattr(self, field)
+            if type(value) not in {int, float} or not math.isfinite(value) or value <= 0:
+                raise ConfigurationError(f"{field} must be finite and positive")
+        if type(self.output_limit_bytes) is not int or not 1 <= self.output_limit_bytes <= 4 * 1024 * 1024:
+            raise ConfigurationError("output_limit_bytes is invalid")
+        if type(self.apply) is not bool or self.apply:
+            raise ConfigurationError("PIT diagnosis cannot apply patches outside its disposable candidate")
+
+
+@dataclass(frozen=True)
+class PitDiagnosisLoopServices:
+    """Injectable deterministic/worker boundaries for fake-only PIT gate verification."""
+
+    gateway: object
+    verify_diagnosis_run: Callable[[Path], Mapping[str, object]] | None = None
+    build_evidence: Callable[..., "PitAgentEvidence"] | "PitAgentEvidence" | None = None
+    run_experiment: Callable[..., object] | None = None
+    run_deterministic_experiment: Callable[..., object] | None = None
+    run_quality: Callable[..., object] | None = None
+    read_snapshots: Callable[..., tuple[object, ...]] | None = None
+    compile_runner: Callable[..., bool] | None = None
+    allowed_replacements: Mapping[str, Sequence[ExactLineReplacement]] | Sequence[ExactLineReplacement] = ()
+    editable_paths: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+    rule_ids: tuple[str, ...] = ()
+    invariant_ids: tuple[str, ...] = ()
+    monotonic: Callable[[], float] | None = None
+    known_secrets: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        gateway = self.gateway
+        if not hasattr(gateway, "request_pit_diagnosis_once") and not hasattr(gateway, "request"):
+            raise ConfigurationError("PIT diagnosis gateway must expose a closed request method")
+        if not isinstance(self.known_secrets, tuple) or any(not isinstance(value, str) for value in self.known_secrets):
+            raise ConfigurationError("PIT diagnosis secrets must be an immutable string tuple")
+        if not isinstance(self.editable_paths, tuple) or len(self.editable_paths) > 8:
+            raise ConfigurationError("PIT diagnosis editable paths must be a bounded tuple")
+        if any(not isinstance(value, str) or not value for value in self.editable_paths):
+            raise ConfigurationError("PIT diagnosis editable paths must be non-empty strings")
+        for name, values in (("evidence_ids", self.evidence_ids), ("rule_ids", self.rule_ids), ("invariant_ids", self.invariant_ids)):
+            if not isinstance(values, tuple) or len(values) > _MAX_LIST_ITEMS or any(not isinstance(value, str) or not value for value in values):
+                raise ConfigurationError(f"{name} must be a bounded immutable tuple")
+        if self.monotonic is not None and not callable(self.monotonic):
+            raise ConfigurationError("PIT diagnosis monotonic service must be callable")
+        replacements = self.allowed_replacements
+        if isinstance(replacements, Mapping):
+            normalized: dict[str, tuple[ExactLineReplacement, ...]] = {}
+            for key, values in replacements.items():
+                if not isinstance(key, str) or not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                    raise ConfigurationError("PIT allowed replacements are malformed")
+                normalized[key] = tuple(values)
+        else:
+            if not isinstance(replacements, Sequence) or isinstance(replacements, (str, bytes)):
+                raise ConfigurationError("PIT allowed replacements are malformed")
+            normalized = {"*": tuple(replacements)}
+        if any(not isinstance(value, ExactLineReplacement) for values in normalized.values() for value in values):
+            raise ConfigurationError("PIT allowed replacements must be exact line replacements")
+        object.__setattr__(self, "allowed_replacements", MappingProxyType(normalized))
+
+    def replacements_for(self, experiment_id: str) -> tuple[ExactLineReplacement, ...]:
+        values = self.allowed_replacements
+        assert isinstance(values, Mapping)
+        return tuple(values.get(experiment_id, values.get("*", ())))
+
+
+@dataclass(frozen=True)
+class PitDiagnosisLoopResult:
+    """Closed, aggregate-only terminal facts from one PIT diagnosis controller run."""
+
+    terminal_status: str
+    selected_experiment_id: str | None = None
+    coder_called: bool = False
+    source_modified: bool = False
+    exported_diff_sha256: str | None = None
+    deterministic_result_sha256: str | None = None
+    diagnosis_result_sha256: str | None = None
+    derivative_result_path: Path | None = None
+    audit_path: Path | None = None
+    run_id: str = "pit-diagnosis"
+    call_record_sha256s: tuple[str, ...] = ()
+    cleanup_complete: bool = True
+    worker_confined: bool = True
+    locked_metrics_excluded: bool = True
+    d0_passed: bool = False
+    failure_code: str = "none"
+
+    def __post_init__(self) -> None:
+        allowed = {
+            "completed",
+            "protocol_rejected",
+            "d0_failed",
+            "aborted",
+            "budget_exceeded",
+            "worker_failed",
+            "source_modified",
+            "controller_error",
+        }
+        if self.terminal_status not in allowed:
+            raise ConfigurationError("PIT diagnosis terminal status is invalid")
+        if self.selected_experiment_id is not None and (not isinstance(self.selected_experiment_id, str) or not self.selected_experiment_id):
+            raise ConfigurationError("PIT selected experiment ID is invalid")
+        for field in ("coder_called", "source_modified", "cleanup_complete", "worker_confined", "locked_metrics_excluded", "d0_passed"):
+            if type(getattr(self, field)) is not bool:
+                raise ConfigurationError(f"PIT result {field} must be boolean")
+        for field in ("exported_diff_sha256", "deterministic_result_sha256", "diagnosis_result_sha256"):
+            value = getattr(self, field)
+            if value is not None and _SHA256_RE.fullmatch(value) is None:
+                raise ConfigurationError(f"PIT result {field} must be lowercase SHA-256")
+        if not isinstance(self.call_record_sha256s, tuple) or len(self.call_record_sha256s) > 3 or any(_SHA256_RE.fullmatch(value or "") is None for value in self.call_record_sha256s):
+            raise ConfigurationError("PIT call record hashes are invalid")
+        if self.derivative_result_path is not None and (not isinstance(self.derivative_result_path, Path) or not self.derivative_result_path.is_absolute()):
+            raise ConfigurationError("PIT derivative result path must be absolute")
+        if self.audit_path is not None and (not isinstance(self.audit_path, Path) or not self.audit_path.is_absolute()):
+            raise ConfigurationError("PIT audit path must be absolute")
 
 
 class PitDomain(str, Enum):
@@ -552,3 +770,21 @@ def pit_diagnosis_response_format(role: str) -> dict[str, object]:
             "schema": json.loads(json.dumps(_plain_json_schema(schema), separators=(",", ":"))),
         },
     }
+
+
+def run_pit_diagnosis_loop(
+    config: PitDiagnosisGateConfig,
+    source_state: object,
+    candidate: object,
+    audit: object,
+    services: PitDiagnosisLoopServices,
+) -> PitDiagnosisLoopResult:
+    """Public import location for the controller implementation.
+
+    The implementation lives beside the existing quarantine state machine in ``agent_loop``
+    so it can reuse source/candidate/audit capabilities without importing those capabilities
+    into the provider protocol module during gateway initialization.
+    """
+    from agent_loop import run_pit_diagnosis_loop as _run
+
+    return _run(config, source_state, candidate, audit, services)
