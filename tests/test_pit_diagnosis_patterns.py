@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
+import numpy as np
 import pandas as pd
 import pytest
 
 from core.pit_diagnosis.patterns import (
     BaseKind,
     BasePolicy,
+    _RangeExtrema,
     _detect_proper_base_reference,
+    _history_sha256,
     detect_proper_base,
     evaluate_new_high_entry,
 )
@@ -179,3 +185,65 @@ def test_array_detector_matches_reference_for_flat_cup_and_no_pattern(history_fa
     )
 
     assert actual == expected
+
+
+def _legacy_history_sha256(history: pd.DataFrame) -> str:
+    rows = [
+        [
+            pd.Timestamp(index).date().isoformat(),
+            float(row.High),
+            float(row.Low),
+            float(row.Close),
+        ]
+        for index, row in history.iterrows()
+    ]
+    payload = json.dumps(rows, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def test_history_hash_is_byte_identical_to_v1_iterrows_encoding() -> None:
+    """Break caught: the faster hash serializer changed canonical evidence IDs."""
+    index = pd.date_range("2024-01-02", periods=17, freq="B", tz="America/New_York")
+    values = np.array(
+        [
+            [100.25, 99.75, 100.0],
+            [101.125, 99.5, 100.75],
+            [100.5, 98.25, 99.0],
+        ]
+        * 6,
+        dtype=float,
+    )[: len(index)]
+    history = pd.DataFrame(values, columns=["High", "Low", "Close"], index=index)
+    history["unused"] = 1
+
+    assert _history_sha256(history) == _legacy_history_sha256(history)
+
+    malformed = history.copy()
+    malformed.iloc[2, 0] = np.nan
+    with pytest.raises(ValueError, match="Out of range float values"):
+        _history_sha256(malformed)
+    with pytest.raises(ValueError, match="Out of range float values"):
+        _legacy_history_sha256(malformed)
+
+
+def test_sparse_range_extrema_preserves_first_arg_position_on_ties() -> None:
+    """Break caught: range caching changed v1 argmin/argmax tie precedence."""
+    highs = np.array([4.0, 7.0, 7.0, 2.0, 7.0, 3.0, 3.0, 9.0])
+    lows = np.array([5.0, 1.0, 1.0, 2.0, 1.0, 0.0, 0.0, 4.0])
+    closes = np.array([4.0, 6.0, 6.0, 2.0, 6.0, 2.0, 2.0, 8.0])
+    ranges = _RangeExtrema(highs, lows, closes)
+
+    for start in range(len(highs)):
+        for end in range(start + 1, len(highs) + 1):
+            high_slice = highs[start:end]
+            low_slice = lows[start:end]
+            close_slice = closes[start:end]
+            high, high_pos = ranges.high_max(start, end)
+            low, low_pos = ranges.low_min(start, end)
+            close, close_pos = ranges.close_min(start, end)
+            assert high == float(high_slice.max())
+            assert high_pos == start + int(high_slice.argmax())
+            assert low == float(low_slice.min())
+            assert low_pos == start + int(low_slice.argmin())
+            assert close == float(close_slice.min())
+            assert close_pos == start + int(close_slice.argmin())

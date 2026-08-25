@@ -76,6 +76,104 @@ _ENTRY_EVIDENCE_IDS = (
 )
 
 
+class _RangeExtrema:
+    """Sparse range extrema used by the array-backed production detector.
+
+    The detector evaluates many overlapping windows.  Calling NumPy reductions
+    for every one of those windows repeatedly allocates slices and rescans the
+    same values.  These sparse tables answer each contiguous min/max query in
+    constant time while retaining the first-position tie behavior of
+    ``numpy.argmin`` and ``numpy.argmax``.
+
+    This is an internal optimization for already validated finite arrays.  The
+    public detector still validates the original DataFrame before constructing
+    this cache, and the private DataFrame implementation remains the parity
+    oracle.
+    """
+
+    __slots__ = (
+        "_high_max_values",
+        "_high_max_positions",
+        "_low_min_values",
+        "_low_min_positions",
+        "_close_min_values",
+        "_close_min_positions",
+    )
+
+    def __init__(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> None:
+        self._high_max_values, self._high_max_positions = _build_range_table(highs, find_min=False)
+        self._low_min_values, self._low_min_positions = _build_range_table(lows, find_min=True)
+        self._close_min_values, self._close_min_positions = _build_range_table(closes, find_min=True)
+
+    def high_max(self, start_pos: int, end_pos: int) -> tuple[float, int]:
+        return _query_range(
+            self._high_max_values,
+            self._high_max_positions,
+            start_pos,
+            end_pos,
+            find_min=False,
+        )
+
+    def low_min(self, start_pos: int, end_pos: int) -> tuple[float, int]:
+        return _query_range(
+            self._low_min_values,
+            self._low_min_positions,
+            start_pos,
+            end_pos,
+            find_min=True,
+        )
+
+    def close_min(self, start_pos: int, end_pos: int) -> tuple[float, int]:
+        return _query_range(
+            self._close_min_values,
+            self._close_min_positions,
+            start_pos,
+            end_pos,
+            find_min=True,
+        )
+
+
+def _build_range_table(values: np.ndarray, *, find_min: bool) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Build sparse value and absolute-position tables for one input array."""
+    values = np.asarray(values)
+    value_levels = [values]
+    position_levels = [np.arange(len(values), dtype=np.int32)]
+    level = 1
+    while (1 << level) <= len(values):
+        offset = 1 << (level - 1)
+        left_values = value_levels[-1][:-offset]
+        right_values = value_levels[-1][offset:]
+        if find_min:
+            choose_left = left_values <= right_values
+        else:
+            choose_left = left_values >= right_values
+        value_levels.append(np.where(choose_left, left_values, right_values))
+        left_positions = position_levels[-1][:-offset]
+        right_positions = position_levels[-1][offset:]
+        position_levels.append(np.where(choose_left, left_positions, right_positions))
+        level += 1
+    return value_levels, position_levels
+
+
+def _query_range(
+    value_levels: list[np.ndarray],
+    position_levels: list[np.ndarray],
+    start_pos: int,
+    end_pos: int,
+    *,
+    find_min: bool,
+) -> tuple[float, int]:
+    """Return an inclusive value/first absolute position for ``[start:end)``."""
+    length = end_pos - start_pos
+    level = length.bit_length() - 1
+    right_start = end_pos - (1 << level)
+    left_value = value_levels[level][start_pos]
+    right_value = value_levels[level][right_start]
+    if (find_min and left_value <= right_value) or (not find_min and left_value >= right_value):
+        return float(left_value), int(position_levels[level][start_pos])
+    return float(right_value), int(position_levels[level][right_start])
+
+
 def detect_proper_base(
     history_before_event: pd.DataFrame,
     *,
@@ -147,11 +245,12 @@ def _detect_proper_base_arrays(
     latest end-session first, then cup-with-handle before flat base, and the
     shortest qualifying duration within each kind.
     """
+    ranges = _RangeExtrema(highs, lows, closes)
     for end_pos in range(len(index), policy.flat_min_sessions - 1, -1):
-        cup = _most_recent_cup_arrays(index, highs, lows, closes, end_pos, policy, input_sha256)
+        cup = _most_recent_cup_arrays(index, highs, lows, closes, end_pos, policy, input_sha256, ranges=ranges)
         if cup is not None:
             return cup
-        flat = _most_recent_flat_arrays(index, highs, lows, end_pos, policy, input_sha256)
+        flat = _most_recent_flat_arrays(index, highs, lows, end_pos, policy, input_sha256, ranges=ranges)
         if flat is not None:
             return flat
     return None
@@ -164,22 +263,31 @@ def _most_recent_flat_arrays(
     end_pos: int,
     policy: BasePolicy,
     input_sha256: str,
+    *,
+    ranges: _RangeExtrema | None = None,
 ) -> BasePattern | None:
     max_sessions = min(policy.flat_max_sessions, end_pos)
     for duration in range(policy.flat_min_sessions, max_sessions + 1):
         start_pos = end_pos - duration
-        base_highs = highs[start_pos:end_pos]
-        base_lows = lows[start_pos:end_pos]
-        pivot = float(base_highs.max())
-        low = float(base_lows.min())
+        if ranges is None:
+            base_highs = highs[start_pos:end_pos]
+            base_lows = lows[start_pos:end_pos]
+            pivot = float(base_highs.max())
+            low = float(base_lows.min())
+            high_pos = start_pos + int(base_highs.argmax())
+            low_pos = start_pos + int(base_lows.argmin())
+        else:
+            pivot, high_pos = ranges.high_max(start_pos, end_pos)
+            low, low_pos = ranges.low_min(start_pos, end_pos)
         depth_pct = (pivot - low) / pivot
         if depth_pct > policy.flat_max_depth_pct:
             continue
-        high_pos = int(base_highs.argmax())
-        low_pos = int(base_lows.argmin())
-        if high_pos >= low_pos or low_pos >= duration - 1:
+        if high_pos >= low_pos or low_pos >= end_pos - 1:
             continue
-        post_low_high = float(base_highs[low_pos + 1 :].max())
+        if ranges is None:
+            post_low_high = float(base_highs[low_pos - start_pos + 1 :].max())
+        else:
+            post_low_high = ranges.high_max(low_pos + 1, end_pos)[0]
         if post_low_high < low + (pivot - low) * 0.5:
             continue
         return _pattern_from_positions(
@@ -203,6 +311,8 @@ def _most_recent_cup_arrays(
     end_pos: int,
     policy: BasePolicy,
     input_sha256: str,
+    *,
+    ranges: _RangeExtrema | None = None,
 ) -> BasePattern | None:
     max_sessions = min(policy.cup_max_sessions, end_pos)
     for duration in range(policy.cup_min_sessions, max_sessions + 1):
@@ -216,6 +326,7 @@ def _most_recent_cup_arrays(
             end_pos=end_pos,
             policy=policy,
             input_sha256=input_sha256,
+            ranges=ranges,
         )
         if pattern is not None:
             return pattern
@@ -232,11 +343,16 @@ def _cup_pattern_arrays(
     end_pos: int,
     policy: BasePolicy,
     input_sha256: str,
+    ranges: _RangeExtrema | None = None,
 ) -> BasePattern | None:
-    base_lows = lows[start_pos:end_pos]
     left_lip = float(highs[start_pos])
-    low = float(base_lows.min())
-    low_pos = int(base_lows.argmin())
+    if ranges is None:
+        base_lows = lows[start_pos:end_pos]
+        low = float(base_lows.min())
+        low_pos = int(base_lows.argmin())
+    else:
+        low, low_pos_absolute = ranges.low_min(start_pos, end_pos)
+        low_pos = low_pos_absolute - start_pos
     duration = end_pos - start_pos
     if left_lip <= 0 or low_pos == 0:
         return None
@@ -248,26 +364,40 @@ def _cup_pattern_arrays(
     max_handle_sessions = min(15, duration - low_pos - 1)
     for handle_sessions in range(3, max_handle_sessions + 1):
         handle_start = end_pos - handle_sessions
-        handle_lows = lows[handle_start:end_pos]
-        if float(handle_lows.min()) <= midpoint:
+        if ranges is None:
+            handle_lows = lows[handle_start:end_pos]
+            handle_low = float(handle_lows.min())
+        else:
+            handle_low = ranges.low_min(handle_start, end_pos)[0]
+        if handle_low <= midpoint:
             continue
         pre_handle_start = start_pos + low_pos + 1
         if pre_handle_start >= handle_start:
             continue
-        pre_handle_highs = highs[pre_handle_start:handle_start]
-        right_lip = float(pre_handle_highs.max())
+        if ranges is None:
+            pre_handle_highs = highs[pre_handle_start:handle_start]
+            right_lip = float(pre_handle_highs.max())
+            right_lip_pos = int(pre_handle_highs.argmax())
+        else:
+            right_lip, right_lip_absolute = ranges.high_max(pre_handle_start, handle_start)
+            right_lip_pos = right_lip_absolute - pre_handle_start
         if not left_lip * (1.0 - policy.right_lip_max_distance_pct) <= right_lip <= left_lip * (
             1.0 + policy.right_lip_max_distance_pct
         ):
             continue
-        right_lip_pos = int(pre_handle_highs.argmax())
         right_lip_close = float(closes[pre_handle_start + right_lip_pos])
-        handle_closes = closes[handle_start:end_pos]
-        if float(handle_closes.min()) >= right_lip_close:
+        if ranges is None:
+            handle_closes = closes[handle_start:end_pos]
+            handle_close_low = float(handle_closes.min())
+        else:
+            handle_close_low = ranges.close_min(handle_start, end_pos)[0]
+        if handle_close_low >= right_lip_close:
             continue
-        handle_highs = highs[handle_start:end_pos]
-        pivot = float(handle_highs.max())
-        handle_low = float(handle_lows.min())
+        if ranges is None:
+            handle_highs = highs[handle_start:end_pos]
+            pivot = float(handle_highs.max())
+        else:
+            pivot = ranges.high_max(handle_start, end_pos)[0]
         if (pivot - handle_low) / pivot > policy.handle_max_depth_pct:
             continue
         return _pattern_from_positions(
@@ -488,15 +618,26 @@ def _validate_pre_event_history(history_before_event: pd.DataFrame, event_sessio
 
 
 def _history_sha256(history: pd.DataFrame) -> str:
-    rows = [
-        [
-            _session_text(index),
-            float(row.High),
-            float(row.Low),
-            float(row.Close),
+    # ``iterrows`` materializes a Series for every session.  The validated
+    # production history is a DatetimeIndex with three numeric columns, so
+    # retain the exact v1 JSON row representation while extracting the values
+    # from one NumPy block instead.  ``float`` conversion is intentional: it
+    # preserves Python's canonical JSON number formatting used by v1.
+    if isinstance(history.index, pd.DatetimeIndex):
+        session_texts = history.index.strftime("%Y-%m-%d")
+        values = history.loc[:, _REQUIRED_OHLC_COLUMNS].to_numpy(dtype=float, copy=False)
+        rows = [
+            [session, float(high), float(low), float(close)]
+            for session, (high, low, close) in zip(session_texts, values, strict=True)
         ]
-        for index, row in history.iterrows()
-    ]
+    else:
+        # Keep the private helper compatible for callers outside the validated
+        # public path, whose original implementation accepted any index that
+        # ``_session_text`` could parse.
+        rows = [
+            [_session_text(index), float(row.High), float(row.Low), float(row.Close)]
+            for index, row in history.iterrows()
+        ]
     payload = json.dumps(rows, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
