@@ -101,12 +101,41 @@ def _baseline_snapshot(root: Path) -> BaselineSnapshot:
     baseline_result = SimulationResult(
         equity_curve=pd.Series((100.0, 105.0, 110.0), index=sessions),
         benchmark_curve=pd.Series((100.0, 103.0, 106.0), index=sessions),
+        weekly_holdings=pd.DataFrame(
+            (
+                {
+                    "Week_Ending": "2021-01-04",
+                    "Holdings": "AAA",
+                    "Holding_Count": 1,
+                    "Cash": 50.0,
+                    "Market_Value": 50.0,
+                    "Total_Equity": 100.0,
+                },
+                {
+                    "Week_Ending": "2021-06-30",
+                    "Holdings": "AAA",
+                    "Holding_Count": 1,
+                    "Cash": 21.0,
+                    "Market_Value": 84.0,
+                    "Total_Equity": 105.0,
+                },
+                {
+                    "Week_Ending": "2021-12-31",
+                    "Holdings": "AAA",
+                    "Holding_Count": 1,
+                    "Cash": 11.0,
+                    "Market_Value": 99.0,
+                    "Total_Equity": 110.0,
+                },
+            )
+        ),
     )
     _equity_frame(baseline_result).to_csv(root / "equity_curve.csv", index=False)
+    baseline_result.weekly_holdings.to_csv(root / "weekly_holdings.csv", index=False)
     (root / "leader_recall.csv").write_text("ticker,buy_signal_count,entry_count\n", encoding="utf-8")
     (root / "summary.json").write_text("{}\n", encoding="utf-8")
     frame = pd.read_csv(root / "transactions.csv", keep_default_na=False)
-    return BaselineSnapshot(root, "a" * 64, "b" * 40, "c" * 40, "d" * 64, {"transactions.csv": hashlib.sha256((root / "transactions.csv").read_bytes()).hexdigest(), "equity_curve.csv": hashlib.sha256((root / "equity_curve.csv").read_bytes()).hexdigest()}, "e" * 64, "f" * 64, baseline_module._normalized_ordered_row_sha256(frame), -9.99, -2.0, -0.2, -13.0, 225, 39.11, 67.0, 286, 225, 51, 10)
+    return BaselineSnapshot(root, "a" * 64, "b" * 40, "c" * 40, "d" * 64, {"transactions.csv": hashlib.sha256((root / "transactions.csv").read_bytes()).hexdigest(), "equity_curve.csv": hashlib.sha256((root / "equity_curve.csv").read_bytes()).hexdigest(), "weekly_holdings.csv": hashlib.sha256((root / "weekly_holdings.csv").read_bytes()).hexdigest()}, "e" * 64, "f" * 64, baseline_module._normalized_ordered_row_sha256(frame), -9.99, -2.0, -0.2, -13.0, 225, 39.11, 26.6666666667, 286, 225, 51, 10)
 
 
 @pytest.fixture
@@ -202,6 +231,17 @@ def test_d4_computes_performance_from_the_actual_verified_equity_schema(
         diagnosis_context.baseline_snapshot.run_dir / "equity_curve.csv"
     )
     assert tuple(frame.columns) == ("date", "portfolio", "benchmark")
+    holdings = pd.read_csv(
+        diagnosis_context.baseline_snapshot.run_dir / "weekly_holdings.csv"
+    )
+    assert tuple(holdings.columns) == (
+        "Week_Ending",
+        "Holdings",
+        "Holding_Count",
+        "Cash",
+        "Market_Value",
+        "Total_Equity",
+    )
 
     result = run_experiment(
         diagnosis_context,
@@ -218,10 +258,64 @@ def test_d4_computes_performance_from_the_actual_verified_equity_schema(
     assert result.performance.benchmark_annualized_return_delta_pct == pytest.approx(
         4.0507572519
     )
-    assert result.performance.average_cash_pct is None
+    assert result.performance.average_cash_pct == pytest.approx(26.6666666667)
     assert result.promotion_checks["performance_complete"] is True
-    assert result.promotion_checks["average_cash_available"] is False
     assert result.promotion_eligible is False
+
+
+@pytest.mark.parametrize("malformation", ("missing", "invalid_cash"))
+def test_d4_fails_closed_when_verified_partition_cash_evidence_is_malformed(
+    diagnosis_context: DiagnosisContext,
+    malformation: str,
+) -> None:
+    path = diagnosis_context.baseline_snapshot.run_dir / "weekly_holdings.csv"
+    context = diagnosis_context
+    if malformation == "missing":
+        path.unlink()
+    else:
+        path.write_text(
+            "Week_Ending,Holdings,Holding_Count,Cash,Market_Value,Total_Equity\n"
+            "2021-01-04,AAA,1,not-cash,50,100\n",
+            encoding="utf-8",
+        )
+        artifacts = dict(diagnosis_context.baseline_snapshot.artifact_sha256)
+        artifacts["weekly_holdings.csv"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        snapshot = replace(
+            diagnosis_context.baseline_snapshot,
+            artifact_sha256=artifacts,
+        )
+        context = replace(
+            diagnosis_context,
+            baseline_snapshot=snapshot,
+            reproduced_baseline=replace(snapshot),
+        )
+
+    result = run_experiment(
+        context,
+        "D4.CURRENT_EXIT_PACKAGE",
+        PartitionName.DISCOVERY,
+    )
+
+    assert result.performance is None
+    assert result.promotion_checks["performance_complete"] is False
+    assert result.promotion_eligible is False
+
+
+def test_current_exit_rejects_a_weekly_holdings_hash_mismatch(
+    diagnosis_context: DiagnosisContext,
+) -> None:
+    path = diagnosis_context.baseline_snapshot.run_dir / "weekly_holdings.csv"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("50.0,50.0", "49.0,51.0", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="weekly holdings hash"):
+        run_experiment(
+            diagnosis_context,
+            "D4.CURRENT_EXIT_PACKAGE",
+            PartitionName.DISCOVERY,
+        )
 
 
 def test_rs_85_variant_changes_the_materialized_entry_evidence(

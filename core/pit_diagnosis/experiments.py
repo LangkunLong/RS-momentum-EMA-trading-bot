@@ -450,7 +450,45 @@ def _baseline_partition_performance(
     snapshot: BaselineSnapshot, partition: PartitionName, context: DiagnosisContext,
     closed_positions: int,
 ) -> PerformanceEvidence | None:
-    """Compute portfolio metrics only from a hash-bound partition equity series."""
+    """Compute portfolio metrics only from hash-bound partition ledgers."""
+    holdings_path = snapshot.run_dir / "weekly_holdings.csv"
+    expected_holdings_sha = snapshot.artifact_sha256.get("weekly_holdings.csv")
+    if not holdings_path.is_file() or expected_holdings_sha is None:
+        return None
+    if hashlib.sha256(holdings_path.read_bytes()).hexdigest() != expected_holdings_sha:
+        raise ValueError("baseline weekly holdings hash does not match snapshot artifact")
+    try:
+        holdings = pd.read_csv(holdings_path, keep_default_na=False)
+    except (OSError, ValueError, pd.errors.ParserError):
+        return None
+    required_holdings = ("Week_Ending", "Cash", "Total_Equity")
+    if not set(required_holdings).issubset(holdings):
+        return None
+    holdings["Week_Ending"] = pd.to_datetime(
+        holdings["Week_Ending"], errors="coerce"
+    )
+    for column in ("Cash", "Total_Equity"):
+        holdings[column] = pd.to_numeric(holdings[column], errors="coerce")
+    invalid_holdings = (
+        holdings.empty
+        or holdings[list(required_holdings)].isna().any().any()
+        or holdings["Week_Ending"].duplicated().any()
+        or not holdings["Week_Ending"].is_monotonic_increasing
+        or (holdings["Cash"] < 0.0).any()
+        or (holdings["Total_Equity"] <= 0.0).any()
+        or (holdings["Cash"] > holdings["Total_Equity"]).any()
+    )
+    if invalid_holdings:
+        return None
+    selected = _partition(context, partition)
+    holdings = holdings.loc[
+        (holdings["Week_Ending"] >= selected.start)
+        & (holdings["Week_Ending"] <= selected.end)
+    ]
+    if holdings.empty:
+        return None
+    average_cash = float((holdings["Cash"] / holdings["Total_Equity"]).mean() * 100.0)
+
     path = snapshot.run_dir / "equity_curve.csv"
     expected_sha = snapshot.artifact_sha256.get("equity_curve.csv")
     if not path.is_file() or expected_sha is None:
@@ -466,9 +504,6 @@ def _baseline_partition_performance(
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     for column in ("portfolio", "benchmark"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    if "cash" in frame:
-        frame["cash"] = pd.to_numeric(frame["cash"], errors="coerce")
-    selected = _partition(context, partition)
     frame = frame.loc[(frame["date"] >= selected.start) & (frame["date"] <= selected.end)].sort_values("date")
     if len(frame) < 2 or frame[["date", "portfolio", "benchmark"]].isna().any().any() or (frame[["portfolio", "benchmark"]] <= 0.0).any().any():
         return None
@@ -482,9 +517,6 @@ def _baseline_partition_performance(
     volatility = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
     sharpe = 0.0 if volatility == 0.0 else float(returns.mean() / volatility * (252.0 ** 0.5))
     drawdown = float((frame["portfolio"] / frame["portfolio"].cummax() - 1.0).min() * 100.0)
-    average_cash = None
-    if "cash" in frame and not frame["cash"].isna().any() and (frame["cash"] >= 0.0).all():
-        average_cash = float(frame["cash"].mean())
     return PerformanceEvidence(partition, total_return, annualized, sharpe, drawdown, average_cash, closed_positions, total_return - benchmark_return, annualized - benchmark_annualized)
 
 
@@ -534,7 +566,6 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
         "validation_floor": statistics.completed_positions >= 20 if partition is PartitionName.VALIDATION else True,
         "positive_expectancy": statistics.expectancy_pct > 0.0,
         "performance_complete": performance is not None,
-        "average_cash_available": performance is not None and performance.average_cash_pct is not None,
         "partition_baseline_performance_available": reference_performance is not None,
         "partition_baseline_recall_available": reference_recall is not None,
         "non_worse_return": performance is not None and reference_performance is not None and performance.total_return_pct >= reference_performance.total_return_pct,

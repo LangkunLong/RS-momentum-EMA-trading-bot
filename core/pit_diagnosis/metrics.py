@@ -160,7 +160,7 @@ class PerformanceEvidence:
     annualized_return_pct: float
     sharpe_ratio: float
     max_drawdown_pct: float
-    average_cash_pct: float | None
+    average_cash_pct: float
     closed_positions: int
     benchmark_total_return_delta_pct: float
     benchmark_annualized_return_delta_pct: float
@@ -169,8 +169,7 @@ class PerformanceEvidence:
         object.__setattr__(self, "partition", PartitionName(self.partition))
         for name in ("total_return_pct", "annualized_return_pct", "max_drawdown_pct", "benchmark_total_return_delta_pct", "benchmark_annualized_return_delta_pct"):
             _pct(getattr(self, name), name)
-        if self.average_cash_pct is not None:
-            _pct(self.average_cash_pct, "average_cash_pct", lower=0.0)
+        _pct(self.average_cash_pct, "average_cash_pct", lower=0.0)
         _finite(self.sharpe_ratio, "sharpe_ratio")
         _count(self.closed_positions, "closed_positions")
 
