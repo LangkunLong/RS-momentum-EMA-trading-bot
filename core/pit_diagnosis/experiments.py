@@ -702,3 +702,47 @@ def run_catalog(context: DiagnosisContext, experiment_ids: Sequence[str], partit
             store.write(result)
             results.append(result)
     return tuple(results)
+
+
+def run_locked_catalog(
+    context: DiagnosisContext,
+    experiment_ids: Sequence[str],
+    checkpoint_root: Path,
+    *,
+    human_selection_id: str,
+    research_generation_id: str,
+    resume: bool,
+) -> tuple[ExperimentResult, ...]:
+    """Run explicitly selected locked evidence without weakening default lock guards."""
+    if not isinstance(human_selection_id, str) or not human_selection_id:
+        raise ValueError("locked evaluation requires a human selection ID")
+    if not isinstance(research_generation_id, str) or not research_generation_id:
+        raise ValueError("locked evaluation requires a research generation ID")
+    selection_sha256 = canonical_sha256({
+        "human_selection_id": human_selection_id,
+        "research_generation_id": research_generation_id,
+    })
+    locked_context = replace(
+        context,
+        strategy_identity=f"{context.strategy_identity}:locked:{selection_sha256}",
+    )
+    store, results = ExperimentCheckpointStore(checkpoint_root), []
+    for experiment_id in experiment_ids:
+        experiment = locked_context.catalog[experiment_id]
+        if experiment.phase in {"D0", "D5"}:
+            raise ValueError("locked evaluation accepts exactly approved D1-D4 experiments")
+        _require_verified_d0(locked_context)
+        identity = _identity(locked_context, experiment, PartitionName.LOCKED_EVALUATION)
+        existing = store.load(identity)
+        if existing is not None and resume:
+            results.append(_result_from_primitive(existing["result"]))
+            continue
+        if existing is not None:
+            raise ValueError("experiment checkpoint already exists; use resume=True")
+        runner = _RUNNERS.get(experiment_id)
+        if runner is None:
+            raise ValueError("experiment has no approved deterministic runner")
+        result = runner(locked_context, experiment, PartitionName.LOCKED_EVALUATION)
+        store.write(result)
+        results.append(result)
+    return tuple(results)

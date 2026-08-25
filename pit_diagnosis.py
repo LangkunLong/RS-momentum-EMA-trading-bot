@@ -13,7 +13,7 @@ from typing import Sequence
 from core.pit_data import PITDataBundle, sha256_file
 from core.pit_diagnosis.baseline import canonical_authority, compare_reproduction, verify_baseline_run
 from core.pit_diagnosis.catalog import fixed_partitions, load_experiment_catalog
-from core.pit_diagnosis.experiments import DiagnosisContext, run_catalog, run_experiment
+from core.pit_diagnosis.experiments import DiagnosisContext, run_catalog, run_experiment, run_locked_catalog
 from core.pit_diagnosis.fact_cache import build_fact_cache, open_fact_cache
 from core.pit_diagnosis.models import PartitionName
 from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
@@ -145,21 +145,35 @@ def _run(args: argparse.Namespace) -> int:
     if "locked_evaluation" in selected:
         if not args.human_selection_id or not args.research_generation_id:
             raise ValueError("locked_evaluation requires --human-selection-id and --research-generation-id")
-        raise ValueError("locked_evaluation requires the separately approved locked worker API")
+        if selected != ("locked_evaluation",):
+            raise ValueError("locked_evaluation must be published separately from discovery and validation")
     context: DiagnosisContext | None = None
     bundle: PITDataBundle | None = None
     cache: object | None = None
     try:
         context, bundle, cache = _context(args)
-        d0 = run_experiment(context, "D0.BASELINE_REPRODUCTION", PartitionName.DISCOVERY)
         reproduction = compare_reproduction(context.baseline_snapshot, context.reproduced_baseline)
         context = context.with_verified_baseline_reproduction(reproduction)
         experiment_ids = tuple(item.experiment_id for item in context.catalog.experiments.values() if item.phase in {"D1", "D2", "D3", "D4"})
-        results = (d0, *run_catalog(context, experiment_ids, tuple(PartitionName(item) for item in selected), args.checkpoint_root, resume=args.resume))
+        if selected == ("locked_evaluation",):
+            locked_identity = hashlib.sha256(
+                f"{args.human_selection_id}\0{args.research_generation_id}".encode("utf-8")
+            ).hexdigest()
+            results = run_locked_catalog(
+                context, experiment_ids, args.checkpoint_root / "locked" / locked_identity,
+                human_selection_id=args.human_selection_id,
+                research_generation_id=args.research_generation_id,
+                resume=args.resume,
+            )
+            output_root = args.output_root / "locked_evaluation" / locked_identity
+        else:
+            d0 = tuple(run_experiment(context, "D0.BASELINE_REPRODUCTION", PartitionName(item)) for item in selected)
+            results = (*d0, *run_catalog(context, experiment_ids, tuple(PartitionName(item) for item in selected), args.checkpoint_root, resume=args.resume))
+            output_root = args.output_root
         source_before = context.source_fingerprint_sha256
         if _source_fingerprint() != source_before or sha256_file(args.pit_bundle) != args.pit_bundle_sha256 or sha256_file(args.fact_cache) != args.fact_cache_sha256:
             raise ValueError("source, bundle, or fact-cache identity changed during diagnosis")
-        run_dir = publish_diagnosis(context, results, args.output_root)
+        run_dir = publish_diagnosis(context, results, output_root)
         print(json.dumps(verify_diagnosis_run(run_dir), sort_keys=True))
         return 0
     finally:
