@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import csv
+import hashlib
 from pathlib import Path
 from types import MappingProxyType
 
@@ -10,10 +11,12 @@ import pandas as pd
 
 from core.pit_diagnosis.catalog import fixed_partitions, load_experiment_catalog
 from core.pit_diagnosis.baseline import BaselineReproduction, BaselineSnapshot
+import core.pit_diagnosis.baseline as baseline_module
 import core.pit_diagnosis.experiments as experiments_module
 from core.pit_diagnosis.experiments import DiagnosisContext, run_catalog, run_experiment
 from core.pit_diagnosis.fact_cache import SessionFact
 from core.pit_diagnosis.models import FidelityLabel, PartitionName
+from core.pit_diagnosis.metrics import LeaderRecallEvidence, PerformanceEvidence
 from core.pit_diagnosis.rulebook import load_rulebook
 from core.pit_diagnosis.strategy import DiagnosisPortfolioSimulator
 from core.backtest_engine import Trade
@@ -91,7 +94,12 @@ def _baseline_snapshot(root: Path) -> BaselineSnapshot:
         writer = csv.DictWriter(stream, fieldnames=("Ticker", "Date", "Action", "Price", "Quantity", "Reason"))
         writer.writeheader()
         writer.writerows(rows)
-    return BaselineSnapshot(root, "a" * 64, "b" * 40, "c" * 40, "d" * 64, {}, "e" * 64, "f" * 64, "0" * 64, -9.99, -2.0, -0.2, -13.0, 225, 39.11, 67.0, 286, 225, 51, 10)
+    (root / "entry_attempt_outcomes.csv").write_text("symbol,signal_date,entry_date,pivot,buy_zone_lower,buy_zone_upper,entry_open,outcome\n", encoding="utf-8")
+    (root / "equity_curve.csv").write_text("date,portfolio,benchmark\n", encoding="utf-8")
+    (root / "leader_recall.csv").write_text("ticker,buy_signal_count,entry_count\n", encoding="utf-8")
+    (root / "summary.json").write_text("{}\n", encoding="utf-8")
+    frame = pd.read_csv(root / "transactions.csv", keep_default_na=False)
+    return BaselineSnapshot(root, "a" * 64, "b" * 40, "c" * 40, "d" * 64, {"transactions.csv": hashlib.sha256((root / "transactions.csv").read_bytes()).hexdigest()}, "e" * 64, "f" * 64, baseline_module._normalized_ordered_row_sha256(frame), -9.99, -2.0, -0.2, -13.0, 225, 39.11, 67.0, 286, 225, 51, 10)
 
 
 @pytest.fixture
@@ -115,7 +123,7 @@ def diagnosis_context(tmp_path: Path) -> DiagnosisContext:
         source_fingerprint_sha256="e" * 64,
         strategy_identity="cached-diagnosis-v1",
         baseline_snapshot=snapshot,
-        reproduced_baseline=snapshot,
+        reproduced_baseline=replace(snapshot),
         baseline_reproduction=BaselineReproduction(True, (), "a" * 64, "a" * 64),
     )
 
@@ -157,6 +165,17 @@ def test_d1_to_d4_require_a_verified_d0_reproduction(
     assert run_experiment(after_d0, "D2.RULE_STAGE_FUNNEL", PartitionName.DISCOVERY)
 
 
+def test_dispatch_rejects_a_forged_passed_d0_reproduction(
+    diagnosis_context: DiagnosisContext,
+) -> None:
+    forged = replace(
+        diagnosis_context,
+        baseline_reproduction=BaselineReproduction(True, (), "f" * 64, "f" * 64),
+    )
+    with pytest.raises(ValueError, match="verified D0"):
+        run_experiment(forged, "D2.RULE_STAGE_FUNNEL", PartitionName.DISCOVERY)
+
+
 def test_current_exit_package_explains_the_known_ma_loss_cluster(
     diagnosis_context: DiagnosisContext,
 ) -> None:
@@ -165,6 +184,8 @@ def test_current_exit_package_explains_the_known_ma_loss_cluster(
     assert ma.closed_positions > 0
     assert ma.win_rate_pct < result.trade_statistics.win_rate_pct
     assert ma.average_completed_position_return_pct < 0.0
+    assert result.performance.closed_positions == result.trade_statistics.completed_positions
+    assert result.performance.total_return_pct == result.trade_statistics.mean_return_pct
 
 
 def test_rs_85_variant_changes_the_materialized_entry_evidence(
@@ -183,7 +204,16 @@ def test_current_exit_attribution_is_partitioned_and_rejects_tampering(
     path = diagnosis_context.baseline_snapshot.run_dir / "transactions.csv"
     text = path.read_text(encoding="utf-8").replace("ma_violation", "tampered_exit", 1)
     path.write_text(text, encoding="utf-8")
-    with pytest.raises(ValueError, match="exit counts"):
+    with pytest.raises(ValueError, match="transaction ledger hash"):
+        run_experiment(diagnosis_context, "D4.CURRENT_EXIT_PACKAGE", PartitionName.DISCOVERY)
+
+
+def test_current_exit_rejects_a_ledger_hash_mismatch_before_metrics(
+    diagnosis_context: DiagnosisContext,
+) -> None:
+    path = diagnosis_context.baseline_snapshot.run_dir / "transactions.csv"
+    path.write_text(path.read_text(encoding="utf-8").replace("110.0", "110.1", 1), encoding="utf-8")
+    with pytest.raises(ValueError, match="transaction ledger hash"):
         run_experiment(diagnosis_context, "D4.CURRENT_EXIT_PACKAGE", PartitionName.DISCOVERY)
 
 
@@ -202,6 +232,22 @@ def test_promotion_checks_require_all_predeclared_comparisons(
 ) -> None:
     result = run_experiment(diagnosis_context, "D3.M_CONFIRMED_UPTREND", PartitionName.VALIDATION)
     assert {"non_worse_return", "non_worse_annualized_return", "non_worse_sharpe", "non_worse_drawdown", "non_worse_pit_recall", "strict_improvement", "fidelity_complete", "reproduction_exact"} <= set(result.promotion_checks)
+    assert result.promotion_eligible is False
+
+
+def test_worse_partition_performance_and_recall_fail_promotion_evidence(
+    diagnosis_context: DiagnosisContext,
+) -> None:
+    reference = PerformanceEvidence(PartitionName.DISCOVERY, 10.0, 10.0, 1.0, -1.0, 0.0, 1, 0.0, 0.0)
+    recall = LeaderRecallEvidence(1, 1, 1, 100.0, ("leader:AAA",))
+    context = replace(
+        diagnosis_context.with_replaced_diagnostic_leader_labels(("ZZZ",)),
+        partition_baseline_performance={PartitionName.DISCOVERY: reference},
+        partition_baseline_recall={PartitionName.DISCOVERY: recall},
+    )
+    result = run_experiment(context, "D2.RULE_STAGE_FUNNEL", PartitionName.DISCOVERY)
+    assert result.promotion_checks["non_worse_return"] is False
+    assert result.promotion_checks["non_worse_pit_recall"] is False
     assert result.promotion_eligible is False
 
 

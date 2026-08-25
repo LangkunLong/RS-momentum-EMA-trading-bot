@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -13,6 +13,7 @@ from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 import pandas as pd
 
+from . import baseline as baseline_module
 from .baseline import BaselineReproduction, BaselineSnapshot, compare_reproduction
 from .catalog import build_experiment_identity
 from .fact_cache import FactCache, SessionFact
@@ -90,6 +91,8 @@ class DiagnosisContext:
     baseline_snapshot: BaselineSnapshot | None = None
     reproduced_baseline: BaselineSnapshot | None = None
     baseline_reproduction: BaselineReproduction | None = None
+    partition_baseline_performance: Mapping[PartitionName, PerformanceEvidence] = field(default_factory=dict)
+    partition_baseline_recall: Mapping[PartitionName, LeaderRecallEvidence] = field(default_factory=dict)
     benchmark_identity: str = "SPY"
     universe_identity: str = "pit-members"
 
@@ -104,6 +107,20 @@ class DiagnosisContext:
         if labels != tuple(sorted(labels)) or len(set(labels)) != len(labels):
             raise ValueError("diagnostic leader labels must be sorted and unique")
         object.__setattr__(self, "diagnostic_leader_labels", labels)
+        performance: dict[PartitionName, PerformanceEvidence] = {}
+        for key, value in self.partition_baseline_performance.items():
+            name = PartitionName(key)
+            if not isinstance(value, PerformanceEvidence) or value.partition is not name:
+                raise ValueError("partition baseline performance must match its partition")
+            performance[name] = value
+        recall: dict[PartitionName, LeaderRecallEvidence] = {}
+        for key, value in self.partition_baseline_recall.items():
+            name = PartitionName(key)
+            if not isinstance(value, LeaderRecallEvidence):
+                raise ValueError("partition baseline recall must contain LeaderRecallEvidence")
+            recall[name] = value
+        object.__setattr__(self, "partition_baseline_performance", MappingProxyType(performance))
+        object.__setattr__(self, "partition_baseline_recall", MappingProxyType(recall))
 
     def with_replaced_diagnostic_leader_labels(self, labels: Iterable[str]) -> "DiagnosisContext":
         return replace(self, diagnostic_leader_labels=tuple(sorted({str(label).upper() for label in labels})))
@@ -120,14 +137,28 @@ class DiagnosisContext:
             or reproduction.reproduced_manifest_sha256 != self.reproduced_baseline.manifest_sha256
         ):
             raise ValueError("verified D0 reproduction does not match the supplied baseline snapshots")
-        if self.baseline_snapshot is not self.reproduced_baseline and not compare_reproduction(
-            self.baseline_snapshot, self.reproduced_baseline
-        ).passed:
+        if not compare_reproduction(self.baseline_snapshot, self.reproduced_baseline).passed:
             raise ValueError("verified D0 reproduction does not exactly reproduce the baseline")
         return replace(self, baseline_reproduction=reproduction)
 
 
 ExperimentRunner = Callable[[DiagnosisContext, ExperimentDefinition, PartitionName], ExperimentResult]
+
+
+def _require_verified_d0(context: DiagnosisContext) -> None:
+    reproduction = context.baseline_reproduction
+    authority, reproduced = context.baseline_snapshot, context.reproduced_baseline
+    if not isinstance(reproduction, BaselineReproduction) or not reproduction.passed:
+        raise ValueError("D1-D4 require a verified D0 baseline reproduction")
+    if authority is None or reproduced is None:
+        raise ValueError("D1-D4 require a verified D0 baseline reproduction")
+    if (
+        reproduction.authority_manifest_sha256 != authority.manifest_sha256
+        or reproduction.reproduced_manifest_sha256 != reproduced.manifest_sha256
+    ):
+        raise ValueError("D1-D4 require a verified D0 baseline reproduction")
+    if not compare_reproduction(authority, reproduced).passed:
+        raise ValueError("D1-D4 require a verified D0 baseline reproduction")
 
 
 def _facts(cache: FactCache | _FactReader, start: str, end: str) -> tuple[SessionFact, ...]:
@@ -322,7 +353,13 @@ def _baseline_trades(snapshot: BaselineSnapshot, partition: PartitionName | None
     path = snapshot.run_dir / "transactions.csv"
     if not path.is_file():
         raise ValueError("verified baseline snapshot lacks transactions.csv for exit attribution")
+    raw_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    artifact_sha = snapshot.artifact_sha256.get("transactions.csv")
+    if artifact_sha is not None and raw_sha != artifact_sha:
+        raise ValueError("baseline transaction ledger hash does not match snapshot artifact")
     frame = pd.read_csv(path, keep_default_na=False)
+    if baseline_module._normalized_ordered_row_sha256(frame) != snapshot.transaction_row_sha256:
+        raise ValueError("baseline transaction ledger hash does not match snapshot row identity")
     required = {"Ticker", "Date", "Action", "Price", "Quantity", "Reason"}
     if not required.issubset(frame):
         raise ValueError("verified baseline transaction schema is incomplete")
@@ -363,6 +400,14 @@ def _verify_known_current_exit_cluster(snapshot: BaselineSnapshot, context: Diag
         raise ValueError("verified baseline MA exit cluster does not match immutable authority")
 
 
+def _ledger_performance(partition: PartitionName, statistics: TradeStatistics) -> PerformanceEvidence:
+    return PerformanceEvidence(
+        partition, statistics.mean_return_pct, statistics.mean_return_pct, 0.0,
+        min(0.0, statistics.mean_return_pct), 0.0, statistics.completed_positions,
+        0.0, 0.0,
+    )
+
+
 def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, partition: PartitionName, *, current_exit: bool = False, reproduction_ok: bool | None = None) -> ExperimentResult:
     replay = _replay(context, experiment, partition)
     facts, rows = replay.facts, replay.outcomes
@@ -384,11 +429,14 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
         trades = tuple(replay.simulator._trades)
     statistics = _trade_stats(trades)
     exits = _exit_attribution(trades, evidence_prefix="baseline" if current_exit else "replay")
-    start_equity, end_equity = (replay.equity[0], replay.equity[-1]) if replay.equity else (1.0, 1.0)
-    total_return = (end_equity / start_equity - 1.0) * 100.0 if start_equity else 0.0
-    benchmark = [float(fact.values.get("close") or 0.0) for fact in facts if str(fact.symbol).upper() == "SPY"]
-    benchmark_return = (benchmark[-1] / benchmark[0] - 1.0) * 100.0 if len(benchmark) > 1 and benchmark[0] else 0.0
-    performance = PerformanceEvidence(partition, total_return, total_return, 0.0, min(0.0, total_return), 100.0 if not replay.equity else max(0.0, min(100.0, replay.simulator._equity / end_equity * 100.0 if end_equity else 100.0)), statistics.completed_positions, total_return - benchmark_return, total_return - benchmark_return)
+    if current_exit:
+        performance = _ledger_performance(partition, statistics)
+    else:
+        start_equity, end_equity = (replay.equity[0], replay.equity[-1]) if replay.equity else (1.0, 1.0)
+        total_return = (end_equity / start_equity - 1.0) * 100.0 if start_equity else 0.0
+        benchmark = [float(fact.values.get("close") or 0.0) for fact in facts if str(fact.symbol).upper() == "SPY"]
+        benchmark_return = (benchmark[-1] / benchmark[0] - 1.0) * 100.0 if len(benchmark) > 1 and benchmark[0] else 0.0
+        performance = PerformanceEvidence(partition, total_return, total_return, 0.0, min(0.0, total_return), 100.0 if not replay.equity else max(0.0, min(100.0, replay.simulator._equity / end_equity * 100.0 if end_equity else 100.0)), statistics.completed_positions, total_return - benchmark_return, total_return - benchmark_return)
     fact_symbols = {str(fact.symbol).upper() for fact in facts}
     labels = set(context.diagnostic_leader_labels)
     exposed = len(labels & fact_symbols)
@@ -397,19 +445,23 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
     recall = LeaderRecallEvidence(len(labels), exposed, recalled, 0.0 if not exposed else recalled * 100.0 / exposed, tuple(f"leader:{label}" for label in sorted(labels)))
     path_payload = {"experiment_id": experiment.experiment_id, "partition": partition.value, "signals": list(sorted((str(signal["symbol"]), str(signal["signal_date"])) for signal in replay.signals if bool(signal["buy_signal"]))), "outcomes": [outcome.to_primitive() for outcome in replay.simulator._entry_outcomes], "transactions": replay.simulator._transactions}
     trade_path = canonical_sha256(path_payload)
+    reference_performance = context.partition_baseline_performance.get(partition)
+    reference_recall = context.partition_baseline_recall.get(partition)
     checks = {
         "not_locked_evaluation": partition is not PartitionName.LOCKED_EVALUATION,
         "fidelity_complete": fidelity.promotion_eligible,
         "discovery_floor": statistics.completed_positions >= 60 if partition is PartitionName.DISCOVERY else True,
         "validation_floor": statistics.completed_positions >= 20 if partition is PartitionName.VALIDATION else True,
         "positive_expectancy": statistics.expectancy_pct > 0.0,
-        "non_worse_return": snapshot is None or performance.total_return_pct >= snapshot.total_return_pct,
-        "non_worse_annualized_return": snapshot is None or performance.annualized_return_pct >= snapshot.annualized_return_pct,
-        "non_worse_sharpe": snapshot is None or performance.sharpe_ratio >= snapshot.sharpe_ratio,
-        "non_worse_drawdown": snapshot is None or performance.max_drawdown_pct >= snapshot.max_drawdown_pct,
-        "non_worse_pit_recall": recall.recall_pct >= 0.0,
-        "strict_improvement": snapshot is not None and (performance.total_return_pct > snapshot.total_return_pct or performance.annualized_return_pct > snapshot.annualized_return_pct or performance.sharpe_ratio > snapshot.sharpe_ratio or performance.max_drawdown_pct > snapshot.max_drawdown_pct),
-        "reproduction_exact": reproduction_ok is not False,
+        "partition_baseline_performance_available": reference_performance is not None,
+        "partition_baseline_recall_available": reference_recall is not None,
+        "non_worse_return": reference_performance is not None and performance.total_return_pct >= reference_performance.total_return_pct,
+        "non_worse_annualized_return": reference_performance is not None and performance.annualized_return_pct >= reference_performance.annualized_return_pct,
+        "non_worse_sharpe": reference_performance is not None and performance.sharpe_ratio >= reference_performance.sharpe_ratio,
+        "non_worse_drawdown": reference_performance is not None and performance.max_drawdown_pct >= reference_performance.max_drawdown_pct,
+        "non_worse_pit_recall": reference_recall is not None and recall.recall_pct >= reference_recall.recall_pct,
+        "strict_improvement": reference_performance is not None and (performance.total_return_pct > reference_performance.total_return_pct or performance.annualized_return_pct > reference_performance.annualized_return_pct or performance.sharpe_ratio > reference_performance.sharpe_ratio or performance.max_drawdown_pct > reference_performance.max_drawdown_pct),
+        "reproduction_exact": (context.baseline_reproduction is not None and context.baseline_reproduction.passed) if reproduction_ok is None else reproduction_ok,
     }
     promotable = experiment.promotion_eligible and all(checks.values())
     payload = {"experiment_id": experiment.experiment_id, "partition": partition.value, "trade_path": trade_path, "fidelity": fidelity.label.value, "stages": [(stage.rule_id, stage.survivors) for stage in stages], "promotion": promotable}
@@ -419,7 +471,7 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
 def run_baseline_reproduction(context: DiagnosisContext, experiment: ExperimentDefinition, partition: PartitionName) -> ExperimentResult:
     if context.baseline_snapshot is None or context.reproduced_baseline is None:
         raise ValueError("D0 requires verified authority and reproduced baseline snapshots")
-    exact = context.baseline_snapshot is context.reproduced_baseline or compare_reproduction(context.baseline_snapshot, context.reproduced_baseline).passed
+    exact = compare_reproduction(context.baseline_snapshot, context.reproduced_baseline).passed
     return _build_result(context, experiment, partition, reproduction_ok=exact)
 
 
@@ -456,10 +508,8 @@ def run_experiment(context: DiagnosisContext, experiment_id: str, partition: Par
     experiment = context.catalog[experiment_id]
     if experiment.phase == "D5":
         raise ValueError("D5 requires a controller-composed in-memory interaction definition")
-    if experiment.phase != "D0" and (
-        context.baseline_reproduction is None or not context.baseline_reproduction.passed
-    ):
-        raise ValueError("D1-D4 require a verified D0 baseline reproduction")
+    if experiment.phase != "D0":
+        _require_verified_d0(context)
     runner = _RUNNERS.get(experiment_id)
     if runner is None:
         raise ValueError("experiment has no approved deterministic runner")
@@ -506,8 +556,8 @@ def run_catalog(context: DiagnosisContext, experiment_ids: Sequence[str], partit
                 raise ValueError("locked evaluation cannot run through the default diagnosis API")
             if experiment.phase == "D5":
                 raise ValueError("D5 requires a controller-composed in-memory interaction definition")
-            if experiment.phase != "D0" and (context.baseline_reproduction is None or not context.baseline_reproduction.passed):
-                raise ValueError("D1-D4 require a verified D0 baseline reproduction")
+            if experiment.phase != "D0":
+                _require_verified_d0(context)
             identity = _identity(context, experiment, name)
             existing = store.load(identity)
             if existing is not None and resume:
