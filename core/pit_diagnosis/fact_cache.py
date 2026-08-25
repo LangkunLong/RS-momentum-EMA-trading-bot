@@ -42,7 +42,9 @@ _FACT_COLUMNS = (
 )
 _HASHED_ROW_COLUMNS = tuple(column for column in _FACT_COLUMNS if column != "row_sha256")
 _SCHEMA_SHA256 = canonical_sha256({"schema_version": _SCHEMA_VERSION, "columns": _FACT_COLUMNS, "primary_key": ["bundle_sha256", "rulebook_schema_version", "symbol", "session"]})
+_V1_SCHEMA_SHA256 = canonical_sha256({"schema_version": "1", "columns": _FACT_COLUMNS, "primary_key": ["bundle_sha256", "rulebook_schema_version", "symbol", "session"]})
 _PRICE_EVIDENCE = 1
+_SCHEMA_IDENTITY_FIELDS = frozenset({"fact_cache_schema_version", "fact_cache_schema_sha256"})
 
 
 @dataclass(frozen=True)
@@ -185,19 +187,14 @@ class FactCacheBuilder:
             conn = sqlite3.connect(self.partial_path)
             try:
                 self._verify_partial_metadata(conn)
-            except ValueError:
+            except ValueError as verification_error:
                 conn.close()
                 # A building v1 cache cannot represent a PIT member with no
                 # exact price bar because OHLCV was NOT NULL.  It is not a
                 # usable immutable artifact, so restart it under v2 rather
                 # than carry stale, structurally incompatible checkpoints.
-                old = sqlite3.connect(self.partial_path)
-                try:
-                    metadata = _metadata(old)
-                finally:
-                    old.close()
-                if metadata.get("status") != "building" or metadata.get("schema_version") != "1":
-                    raise
+                if not self._is_migratable_v1_partial():
+                    raise verification_error
                 for path in (self.partial_path, self.checkpoint_path, self.progress_path):
                     path.unlink(missing_ok=True)
                 conn = sqlite3.connect(self.partial_path)
@@ -368,6 +365,44 @@ class FactCacheBuilder:
             raise ValueError("fact cache identity mismatch")
         if metadata.get("schema_sha256") != _SCHEMA_SHA256:
             raise ValueError("fact cache schema mismatch")
+
+    def _is_migratable_v1_partial(self) -> bool:
+        """Accept only a same-input v1 builder state for destructive migration.
+
+        The v1-to-v2 restart deletes resumable state, so the old metadata must
+        authenticate every immutable input rather than merely advertise its
+        historical schema version.
+        """
+        old = sqlite3.connect(self.partial_path)
+        try:
+            metadata = _metadata(old)
+        except Exception:
+            return False
+        finally:
+            old.close()
+        if set(metadata) != {"status", "identity_sha256", "identity", "schema_version", "schema_sha256"}:
+            return False
+        if metadata.get("status") != "building" or metadata.get("schema_version") != "1":
+            return False
+        identity_sha256 = metadata.get("identity_sha256")
+        schema_sha256 = metadata.get("schema_sha256")
+        if not isinstance(identity_sha256, str) or not _DIGEST.fullmatch(identity_sha256):
+            return False
+        if schema_sha256 != _V1_SCHEMA_SHA256:
+            return False
+        try:
+            identity = json.loads(str(metadata["identity"]), parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(identity, Mapping) or set(identity) != set(self.identity.fields):
+            return False
+        if canonical_sha256(identity) != identity_sha256:
+            return False
+        if identity.get("fact_cache_schema_version") != "1" or identity.get("fact_cache_schema_sha256") != _V1_SCHEMA_SHA256:
+            return False
+        expected = {key: value for key, value in self.identity.fields.items() if key not in _SCHEMA_IDENTITY_FIELDS}
+        observed = {key: value for key, value in identity.items() if key not in _SCHEMA_IDENTITY_FIELDS}
+        return canonical_sha256(observed) == canonical_sha256(expected)
 
     def _validate_checkpoint(self, checkpoint: Mapping[str, object], sessions: list[str]) -> None:
         checkpoint_identity = checkpoint.get("identity")

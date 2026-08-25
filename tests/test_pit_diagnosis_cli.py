@@ -12,8 +12,8 @@ import pytest
 from core.pit_diagnosis.baseline import BaselineReproduction
 from core.pit_diagnosis.catalog import fixed_partitions, load_experiment_catalog
 from core.pit_diagnosis.experiments import DiagnosisContext, run_experiment
-from core.pit_diagnosis.fact_cache import SessionFact
-from core.pit_diagnosis.rulebook import load_rulebook
+from core.pit_diagnosis.fact_cache import _HASHED_ROW_COLUMNS, SessionFact
+from core.pit_diagnosis.rulebook import canonical_sha256, load_rulebook
 
 
 class _Facts:
@@ -131,6 +131,35 @@ def _rehash_manifest(run_dir: Path, artifact: str) -> None:
     manifest_path = run_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["artifact_sha256"][artifact] = hashlib.sha256((run_dir / artifact).read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def _rehash_fact_cache_rows(path: Path) -> None:
+    """Model an attacker who can rehash SQLite rows and the logical digest."""
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        records = tuple(connection.execute("SELECT rowid,* FROM session_facts ORDER BY session,symbol"))
+        row_hashes: list[str] = []
+        for record in records:
+            row = dict(record)
+            row_sha = canonical_sha256({field: row[field] for field in _HASHED_ROW_COLUMNS})
+            connection.execute("UPDATE session_facts SET row_sha256=? WHERE rowid=?", (row_sha, row["rowid"]))
+            row_hashes.append(row_sha)
+        logical = hashlib.sha256("".join(row_hashes).encode("ascii")).hexdigest()
+        connection.execute("UPDATE metadata SET value=? WHERE key='content_sha256'", (logical,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _rehash_fact_cache_artifact(run_dir: Path) -> None:
+    facts = run_dir / "diagnosis_facts.sqlite3"
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    facts_sha = hashlib.sha256(facts.read_bytes()).hexdigest()
+    manifest["fact_cache_sha256"] = facts_sha
+    manifest["artifact_sha256"][facts.name] = facts_sha
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
@@ -322,5 +351,37 @@ def test_publication_verifier_rejects_rehashed_sqlite_stale_logical_integrity(
     manifest["fact_cache_sha256"] = facts_sha
     manifest["artifact_sha256"]["diagnosis_facts.sqlite3"] = facts_sha
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="fact-cache"):
+        verify_diagnosis_run(run_dir)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "UPDATE session_facts SET availability_bitset=64",
+        "UPDATE session_facts SET availability_bitset=availability_bitset & ~2",
+        "UPDATE session_facts SET availability_bitset=availability_bitset | 4",
+        "UPDATE session_facts SET availability_bitset=availability_bitset | 8",
+        "UPDATE session_facts SET availability_bitset=availability_bitset | 16, rs_rating=NULL",
+        "UPDATE session_facts SET availability_bitset=availability_bitset | 32, base_kind=NULL, base_start_session=NULL, base_end_session=NULL, base_duration_sessions=NULL, base_low=NULL, base_depth_pct=NULL, base_input_sha256=NULL, pivot=NULL, extension_pct=NULL",
+    ),
+)
+def test_publication_verifier_rejects_rehashed_inconsistent_availability_evidence(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path, mutation: str,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    facts = run_dir / "diagnosis_facts.sqlite3"
+    connection = sqlite3.connect(facts)
+    try:
+        connection.execute(mutation)
+        connection.commit()
+    finally:
+        connection.close()
+    _rehash_fact_cache_rows(facts)
+    _rehash_fact_cache_artifact(run_dir)
+
     with pytest.raises(ValueError, match="fact-cache"):
         verify_diagnosis_run(run_dir)

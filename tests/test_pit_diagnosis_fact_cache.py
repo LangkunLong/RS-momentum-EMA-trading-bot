@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -10,9 +11,9 @@ import pandas as pd
 import pytest
 
 from core.pit_data import PITDataBundle
-from core.pit_diagnosis.fact_cache import FactCacheBuilder, _frame_values, _number, build_fact_cache, open_fact_cache
+from core.pit_diagnosis.fact_cache import FactCacheBuilder, _V1_SCHEMA_SHA256, _frame_values, _number, build_fact_cache, open_fact_cache
 from core.pit_diagnosis.models import DatePartition, DatePartitions
-from core.pit_diagnosis.rulebook import load_rulebook
+from core.pit_diagnosis.rulebook import canonical_sha256, load_rulebook
 from core.pit_diagnosis.supplemental import IndustryGroupSnapshot, InstitutionalSnapshot
 
 
@@ -226,8 +227,13 @@ def test_resume_rebuilds_only_incomplete_v1_price_schema(
     partial = Path(f"{paths[0]}.partial")
     connection = sqlite3.connect(partial)
     try:
+        identity = json.loads(connection.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
+        identity["fact_cache_schema_version"] = "1"
+        identity["fact_cache_schema_sha256"] = _V1_SCHEMA_SHA256
         connection.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
-        connection.execute("UPDATE metadata SET value=? WHERE key='schema_sha256'", ("0" * 64,))
+        connection.execute("UPDATE metadata SET value=? WHERE key='schema_sha256'", (_V1_SCHEMA_SHA256,))
+        connection.execute("UPDATE metadata SET value=? WHERE key='identity'", (json.dumps(identity, sort_keys=True, separators=(",", ":")),))
+        connection.execute("UPDATE metadata SET value=? WHERE key='identity_sha256'", (canonical_sha256(identity),))
         connection.commit()
     finally:
         connection.close()
@@ -236,6 +242,41 @@ def test_resume_rebuilds_only_incomplete_v1_price_schema(
     rebuilt = build_cache(mini_pit_bundle, paths, resume=True)
 
     assert rebuilt.resumed is False
+
+
+def test_resume_refuses_foreign_v1_partial_before_destructive_migration(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+
+    def interrupt_after_first_session(_builder: FactCacheBuilder, _session: str) -> None:
+        raise InterruptedError("leave foreign v1 partial")
+
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", interrupt_after_first_session)
+    with pytest.raises(InterruptedError, match="leave foreign v1"):
+        build_cache(mini_pit_bundle, paths, resume=False)
+    partial = Path(f"{paths[0]}.partial")
+    connection = sqlite3.connect(partial)
+    try:
+        identity = json.loads(connection.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
+        identity["fact_cache_schema_version"] = "1"
+        identity["fact_cache_schema_sha256"] = _V1_SCHEMA_SHA256
+        identity["bundle_sha256"] = "b" * 64
+        connection.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+        connection.execute("UPDATE metadata SET value=? WHERE key='schema_sha256'", (_V1_SCHEMA_SHA256,))
+        connection.execute("UPDATE metadata SET value=? WHERE key='identity'", (json.dumps(identity, sort_keys=True, separators=(",", ":")),))
+        connection.execute("UPDATE metadata SET value=? WHERE key='identity_sha256'", (canonical_sha256(identity),))
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="identity|schema"):
+        build_cache(mini_pit_bundle, paths, resume=True)
+
+    assert partial.exists()
+    assert paths[1].exists()
+    assert paths[2].exists()
 
 
 def test_supplemental_snapshot_with_date_but_no_evidence_is_rejected() -> None:

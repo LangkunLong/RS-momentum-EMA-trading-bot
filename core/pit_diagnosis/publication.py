@@ -49,6 +49,13 @@ _FACT_INTEGER_COLUMNS = frozenset({"member", "institutional_holder_count", "inst
 _FACT_REAL_COLUMNS = frozenset({"open", "high", "low", "close", "volume", "prior_close", "prior_average_volume_50", "event_volume_ratio", "current_eps", "prior_year_eps", "current_sales", "prior_year_sales", "annual_eps_1", "annual_eps_2", "annual_eps_3", "annual_eps_4", "net_income", "total_stockholders_equity", "current_eps_yoy", "sales_yoy", "roe", "shares_outstanding", "institutional_ownership_percent", "rs_rating", "base_low", "base_depth_pct", "pivot", "extension_pct"})
 _PRICE_COLUMNS = frozenset({"open", "high", "low", "close", "volume"})
 _PRICE_DERIVED_COLUMNS = frozenset({"prior_close", "prior_average_volume_50", "event_volume_ratio", "rs_rating", "base_kind", "base_start_session", "base_end_session", "base_duration_sessions", "base_low", "base_depth_pct", "base_handle_start_session", "base_handle_end_session", "base_input_sha256", "pivot", "extension_pct"})
+_AVAILABILITY_BITS = frozenset({1, 2, 4, 8, 16, 32})
+_AVAILABILITY_MASK = sum(_AVAILABILITY_BITS)
+_FUNDAMENTAL_COLUMNS = frozenset({"current_eps", "prior_year_eps", "current_sales", "prior_year_sales", "annual_eps_1", "annual_eps_2", "annual_eps_3", "annual_eps_4", "net_income", "total_stockholders_equity", "current_eps_yoy", "sales_yoy", "roe", "shares_outstanding"})
+_INSTITUTIONAL_COLUMNS = frozenset({"institutional_ownership_percent", "institutional_holder_count", "institutional_previous_holder_count", "institutional_as_of_date"})
+_INDUSTRY_COLUMNS = frozenset({"industry_group_id", "industry_rank", "industry_as_of_date"})
+_BASE_REQUIRED_COLUMNS = frozenset({"base_kind", "base_start_session", "base_end_session", "base_duration_sessions", "base_low", "base_depth_pct", "base_input_sha256", "pivot", "extension_pct"})
+_BASE_HANDLE_COLUMNS = frozenset({"base_handle_start_session", "base_handle_end_session"})
 _FACT_TYPES = {column: ("INTEGER" if column in _FACT_INTEGER_COLUMNS else "REAL" if column in _FACT_REAL_COLUMNS else "TEXT") for column in _FACT_COLUMNS}
 _FACT_IDENTITY_KEYS = frozenset({"bundle_sha256", "bundle_schema_version", "bundle_metadata", "rulebook_version", "rulebook_sha256", "partitions", "supplemental_content_identity_sha256", "fact_cache_schema_version", "fact_cache_schema_sha256"})
 
@@ -365,6 +372,73 @@ def _json_object(value: object, field: str) -> Mapping[str, object]:
     return value
 
 
+def _evidence_ids(value: object, field: str) -> list[str]:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be JSON")
+    try:
+        parsed = json.loads(value, parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{field} must be JSON") from exc
+    if not isinstance(parsed, list) or any(not isinstance(item, str) or not item for item in parsed):
+        raise ValueError(f"{field} is invalid")
+    return parsed
+
+
+def _availability_evidence(row: Mapping[str, object]) -> None:
+    """Validate the bitset as a complete, bidirectional evidence contract."""
+    bitset = row["availability_bitset"]
+    if type(bitset) is not int or bitset < 0 or bitset & ~_AVAILABILITY_MASK:
+        raise ValueError("fact-cache availability is invalid")
+
+    def has(bit: int) -> bool:
+        return bitset & bit == bit
+
+    price_available = has(1)
+    if price_available != all(row[field] is not None for field in _PRICE_COLUMNS):
+        raise ValueError("fact-cache price evidence is incomplete")
+    if not price_available and any(row[field] is not None for field in _PRICE_DERIVED_COLUMNS):
+        raise ValueError("fact-cache unavailable price evidence is not explicit")
+    if not price_available and (has(16) or has(32)):
+        raise ValueError("fact-cache price-derived availability is invalid")
+
+    fundamentals_available = has(2)
+    fundamental_represented = row["latest_fundamental_public_date"] is not None
+    if fundamentals_available != fundamental_represented:
+        raise ValueError("fact-cache fundamental availability is inconsistent")
+    if not fundamentals_available and any(row[field] is not None for field in _FUNDAMENTAL_COLUMNS):
+        raise ValueError("fact-cache unavailable fundamentals are not explicit")
+
+    institutional_available = has(4)
+    institutional_represented = all(row[field] is not None for field in _INSTITUTIONAL_COLUMNS)
+    institutional_ids = _evidence_ids(row["institutional_evidence_ids"], "institutional evidence")
+    if institutional_available != (institutional_represented and bool(institutional_ids)):
+        raise ValueError("fact-cache institutional availability is inconsistent")
+    if not institutional_available and (any(row[field] is not None for field in _INSTITUTIONAL_COLUMNS) or institutional_ids):
+        raise ValueError("fact-cache unavailable institutional evidence is not explicit")
+
+    industry_available = has(8)
+    industry_represented = all(row[field] is not None for field in _INDUSTRY_COLUMNS)
+    industry_members = _evidence_ids(row["industry_members"], "industry members")
+    industry_ids = _evidence_ids(row["industry_evidence_ids"], "industry evidence")
+    if industry_available != (industry_represented and bool(industry_members) and bool(industry_ids)):
+        raise ValueError("fact-cache industry availability is inconsistent")
+    if not industry_available and (any(row[field] is not None for field in _INDUSTRY_COLUMNS) or industry_members or industry_ids):
+        raise ValueError("fact-cache unavailable industry evidence is not explicit")
+
+    if has(16) != (row["rs_rating"] is not None):
+        raise ValueError("fact-cache RS availability is inconsistent")
+
+    base_available = has(32)
+    base_represented = all(row[field] is not None for field in _BASE_REQUIRED_COLUMNS)
+    handle_present = [row[field] is not None for field in _BASE_HANDLE_COLUMNS]
+    if handle_present[0] != handle_present[1]:
+        raise ValueError("fact-cache base handle evidence is incomplete")
+    if base_available != base_represented:
+        raise ValueError("fact-cache base availability is inconsistent")
+    if not base_available and any(row[field] is not None for field in _BASE_REQUIRED_COLUMNS | _BASE_HANDLE_COLUMNS):
+        raise ValueError("fact-cache unavailable base evidence is not explicit")
+
+
 def _csv_json_object(value: object, field: str) -> Mapping[str, object]:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be JSON")
@@ -482,13 +556,7 @@ def _verify_fact_cache(path: Path, manifest: Mapping[str, object]) -> None:
                 row_hashes.append(row["row_sha256"])
                 if not all(isinstance(row[field], str) and row[field] for field in ("rulebook_schema_version", "symbol", "session", "market_regime")):
                     raise ValueError("fact-cache text row value is invalid")
-                if type(row["availability_bitset"]) is not int:
-                    raise ValueError("fact-cache availability is invalid")
-                price_available = row["availability_bitset"] & 1 == 1
-                if price_available and any(row[field] is None for field in _PRICE_COLUMNS):
-                    raise ValueError("fact-cache price evidence is incomplete")
-                if not price_available and any(row[field] is not None for field in _PRICE_COLUMNS | _PRICE_DERIVED_COLUMNS):
-                    raise ValueError("fact-cache unavailable price evidence is not explicit")
+                _availability_evidence(row)
                 for field in _FACT_REAL_COLUMNS:
                     if row[field] is not None:
                         _finite_number(row[field], f"fact-cache {field}")
