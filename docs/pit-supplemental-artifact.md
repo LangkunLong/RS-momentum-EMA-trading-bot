@@ -82,13 +82,17 @@ symbol,as_of_date,shares_outstanding,evidence_ids
 ```
 
 The normalizer selects the latest filing/amendment per manager and reporting
-period inside that ZIP, maps filing dates to the first supplied trading session
-strictly afterward, aggregates common-stock (`SH`) positions by manager, and
-derives ownership only when a prior PIT denominator exists. Unmapped CUSIPs,
+period inside that ZIP, maps each filing to the first supplied trading session
+strictly afterward, and consolidates all selected managers for a report period
+at the latest of those public sessions. This conservative alignment prevents
+partial/staggered holdings and prevents an amendment from rewriting an earlier
+snapshot. It aggregates common-stock (`SH`) positions by manager and derives
+ownership only when a prior PIT denominator exists. Unmapped CUSIPs,
 options/principal positions, ambiguous mappings, future denominators, and
-missing dates are excluded or rejected fail-closed. Its isolated-quarter output
-sets `previous_holder_count` to zero; a multi-quarter assembly step must replace
-that field with the prior quarter's holder count before strict I-gating.
+missing dates are excluded or rejected fail-closed. Its isolated report-period
+output sets `previous_holder_count` to zero; the multi-quarter assembly step
+replaces that field with the prior snapshot's holder count before strict
+I-gating.
 
 ### Multi-quarter assembly
 

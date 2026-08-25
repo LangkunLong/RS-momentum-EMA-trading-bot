@@ -11,10 +11,15 @@ The effective mapping date is the public ``as_of_date`` (the first supplied
 trading day strictly after the filing date).  Rows whose CUSIP is not declared
 in the mapping are ignored.  Overlapping mappings for a CUSIP are rejected.
 
-The output of the single-quarter path is an isolated-quarter observation and
-sets ``previous_holder_count`` to zero by design.  The manifest path assembles
-those immutable quarter outputs without reopening SEC data: it computes the
-prior available holder count strictly by symbol and public snapshot date.
+The output of the single-quarter path is an isolated report-period observation
+and sets ``previous_holder_count`` to zero by design.  When a ZIP contains
+staggered manager filing dates, all selected managers for a report period are
+consolidated at the latest selected filing-visible session.  This is
+deliberately conservative: the snapshot is not exposed until every included
+manager's selected filing is public, and amendments cannot rewrite an earlier
+snapshot.  The manifest path assembles those immutable quarter outputs without
+reopening SEC data: it computes the prior available holder count strictly by
+symbol and public snapshot date.
 """
 
 from __future__ import annotations
@@ -355,8 +360,15 @@ def normalize_13f(
         selected_accessions = set(selected)
         info_rows = _tsv_rows(zf, members["INFOTABLE.TSV"], ("ACCESSION_NUMBER", "INFOTABLE_SK", "CUSIP", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL"))
 
-    positions: dict[tuple[str, date, str], Decimal] = defaultdict(Decimal)
-    evidence: dict[tuple[str, date, str], set[str]] = defaultdict(set)
+    report_period_as_of: dict[date, date] = {}
+    for filing in selected.values():
+        report_period_as_of[filing.report_period] = max(
+            report_period_as_of.get(filing.report_period, filing.as_of_date),
+            filing.as_of_date,
+        )
+
+    positions: dict[tuple[str, date, date, str], Decimal] = defaultdict(Decimal)
+    evidence: dict[tuple[str, date, date, str], set[str]] = defaultdict(set)
     ignored = 0
     seen_info_keys: set[tuple[str, str]] = set()
     for row in info_rows:
@@ -373,7 +385,8 @@ def normalize_13f(
             ignored += 1
             continue
         filing = selected[accession]
-        mapped = _mapping_for(mapping, cusip, filing.as_of_date)
+        as_of = report_period_as_of[filing.report_period]
+        mapped = _mapping_for(mapping, cusip, as_of)
         if mapped is None:
             ignored += 1
             continue
@@ -384,19 +397,24 @@ def normalize_13f(
         if quantity == 0:
             ignored += 1
             continue
-        key = (mapped.symbol, filing.as_of_date, filing.cik)
+        key = (mapped.symbol, as_of, filing.report_period, filing.cik)
         positions[key] += quantity
         evidence[key].update((f"sec13f:{accession}:coverpage", f"sec13f:{accession}:infotable:{row_id}"))
 
-    grouped: dict[tuple[str, date], dict[str, Decimal]] = defaultdict(dict)
-    grouped_evidence: dict[tuple[str, date], set[str]] = defaultdict(set)
-    for (symbol, as_of, cik), quantity in positions.items():
-        grouped[(symbol, as_of)][cik] = quantity
-        grouped_evidence[(symbol, as_of)].update(evidence[(symbol, as_of, cik)])
+    grouped: dict[tuple[str, date, date], dict[str, Decimal]] = defaultdict(dict)
+    grouped_evidence: dict[tuple[str, date, date], set[str]] = defaultdict(set)
+    for (symbol, as_of, report_period, cik), quantity in positions.items():
+        grouped[(symbol, as_of, report_period)][cik] = quantity
+        grouped_evidence[(symbol, as_of, report_period)].update(evidence[(symbol, as_of, report_period, cik)])
 
     output_rows: list[tuple[str, str, str, str, str, str]] = []
+    emitted_keys: set[tuple[str, date]] = set()
     skipped_missing = 0
-    for (symbol, as_of), manager_positions in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
+    for (symbol, as_of, report_period), manager_positions in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])):
+        if (symbol, as_of) in emitted_keys:
+            raise ValueError(
+                f"multiple report periods produce the same symbol snapshot: {symbol} {as_of.isoformat()}"
+            )
         available = shares.get(symbol, ())
         index = bisect.bisect_right([entry.as_of for entry in available], as_of) - 1
         if index < 0:
@@ -406,8 +424,9 @@ def normalize_13f(
         ownership = sum(manager_positions.values(), Decimal(0)) / denominator.shares
         if ownership > 1:
             raise ValueError(f"derived ownership exceeds 100% for {symbol} at {as_of.isoformat()}")
-        evidence_ids = sorted({*grouped_evidence[(symbol, as_of)], *denominator.evidence_ids})
+        evidence_ids = sorted({*grouped_evidence[(symbol, as_of, report_period)], *denominator.evidence_ids})
         output_rows.append((symbol, as_of.isoformat(), _fmt_decimal(ownership), str(len(manager_positions)), "0", json.dumps(evidence_ids, separators=(",", ":"))))
+        emitted_keys.add((symbol, as_of))
 
     output = Path(output).resolve()
     if output.exists() or output.is_symlink():

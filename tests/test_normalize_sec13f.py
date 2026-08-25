@@ -83,17 +83,17 @@ def test_normalizer_selects_latest_amendment_and_emits_pit_contract(tmp_path: Pa
     )
 
     assert result.selected_filings == 2
-    assert result.output_rows == 2
+    assert result.output_rows == 1
     with output.open(encoding="utf-8", newline="") as stream:
         rows = list(csv.DictReader(stream))
-    # The managers filed on different dates.  Each row is an isolated-quarter
-    # event snapshot; the amendment's 300 shares are not mixed with the
-    # superseded initial filing.
+    # The managers filed on different dates.  The normalizer exposes a single
+    # conservative report-period snapshot at the latest selected filing date,
+    # so all selected managers are public and the amendment replaces the
+    # superseded initial filing without rewriting an earlier snapshot.
     assert [(row["symbol"], row["as_of_date"], row["ownership_percent"], row["holder_count"]) for row in rows] == [
-        ("AAA", "2024-05-01", "0.1", "1"),
-        ("AAA", "2024-05-13", "0.3", "1"),
+        ("AAA", "2024-05-13", "0.4", "2"),
     ]
-    evidence = set(json.loads(rows[1]["evidence_ids"]))
+    evidence = set(json.loads(rows[0]["evidence_ids"]))
     assert "sec13f:0000000001-24-000002:coverpage" in evidence
     assert "sec13f:0000000001-24-000002:infotable:2" in evidence
     assert "shares:aaa" in evidence
@@ -116,7 +116,7 @@ def test_future_denominator_is_never_used(tmp_path: Path) -> None:
     output = tmp_path / "institutional.csv"
     result = normalize_13f(thirteenf_zip=zip_path, cusip_mapping_csv=mapping, shares_csv=shares, trading_days_csv=trading, output=output)
     assert result.output_rows == 0
-    assert result.skipped_missing_denominator == 2
+    assert result.skipped_missing_denominator == 1
     assert output.read_text(encoding="utf-8") == "symbol,as_of_date,ownership_percent,holder_count,previous_holder_count,evidence_ids\n"
 
 
