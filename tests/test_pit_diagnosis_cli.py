@@ -113,6 +113,20 @@ def test_publication_is_complete_hash_bound_and_refuses_reuse(
         publish_diagnosis(context, results, run_dir)
 
 
+def test_publication_verifier_permits_only_explicitly_unavailable_member_prices(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+    from tests.test_pit_diagnosis_fact_cache import _SuccessorWithoutAdmissionPriceBundle, build_cache
+
+    context, results = mini_completed_context
+    facts_path = tmp_path / "successor_facts.sqlite3"
+    build_cache(_SuccessorWithoutAdmissionPriceBundle(), (facts_path, tmp_path / "successor.checkpoint.json", tmp_path / "successor.progress.jsonl"), resume=False)
+    published = publish_diagnosis(replace(context, fact_cache=_Facts(facts_path)), results, tmp_path)
+
+    assert verify_diagnosis_run(published)["status"] == "complete"
+
+
 def _rehash_manifest(run_dir: Path, artifact: str) -> None:
     manifest_path = run_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

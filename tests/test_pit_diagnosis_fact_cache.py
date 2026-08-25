@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -71,6 +72,20 @@ class _MiniPITBundle:
             }
 
 
+class _SuccessorWithoutAdmissionPriceBundle(_MiniPITBundle):
+    """A PIT member whose first observed bar follows its effective date."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._prices["NEW"] = self._prices["S00"].loc["2024-01-04":].copy()
+
+    def members_at(self, when: object) -> frozenset[str]:
+        return super().members_at(when) | {"NEW"}
+
+    def symbols(self) -> tuple[str, ...]:
+        return (*super().symbols(), "NEW")
+
+
 @pytest.fixture
 def mini_pit_bundle() -> _MiniPITBundle:
     return _MiniPITBundle()
@@ -118,6 +133,20 @@ def test_fact_cache_contains_only_pit_session_inputs(mini_pit_bundle: _MiniPITBu
         assert row.session == "2024-01-05"
         assert row.latest_fundamental_public_date <= row.session
         assert "leader" not in set(cache.column_names)
+
+
+def test_successor_member_without_admission_price_is_cached_as_price_unavailable(tmp_path: Path) -> None:
+    paths = cache_paths(tmp_path)
+    result = build_cache(_SuccessorWithoutAdmissionPriceBundle(), paths, resume=False)
+
+    with open_fact_cache(result.path, result.content_sha256) as cache:
+        unavailable = cache.session_fact("NEW", "2024-01-02")
+        assert unavailable.member == 1
+        assert unavailable.availability_bitset & 1 == 0
+        assert all(unavailable[column] is None for column in ("open", "high", "low", "close", "volume"))
+        admitted = cache.session_fact("NEW", "2024-01-04")
+        assert admitted.availability_bitset & 1 == 1
+        assert all(admitted[column] is not None for column in ("open", "high", "low", "close", "volume"))
         assert "agent" not in set(cache.column_names)
 
 
@@ -181,6 +210,32 @@ def test_resume_reconciles_progress_durable_after_checkpoint_window(
 
     assert resumed.resumed is True
     assert resumed.reprocessed_sessions == 0
+
+
+def test_resume_rebuilds_only_incomplete_v1_price_schema(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+
+    def interrupt_after_first_session(_builder: FactCacheBuilder, _session: str) -> None:
+        raise InterruptedError("leave v1 partial")
+
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", interrupt_after_first_session)
+    with pytest.raises(InterruptedError, match="leave v1"):
+        build_cache(mini_pit_bundle, paths, resume=False)
+    partial = Path(f"{paths[0]}.partial")
+    connection = sqlite3.connect(partial)
+    try:
+        connection.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+        connection.execute("UPDATE metadata SET value=? WHERE key='schema_sha256'", ("0" * 64,))
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", lambda *_args: None)
+
+    rebuilt = build_cache(mini_pit_bundle, paths, resume=True)
+
+    assert rebuilt.resumed is False
 
 
 def test_supplemental_snapshot_with_date_but_no_evidence_is_rejected() -> None:

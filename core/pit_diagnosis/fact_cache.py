@@ -27,7 +27,7 @@ from .supplemental import (
     UnavailableSupplementalPITProvider,
 )
 
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _ZERO_DIGEST = "0" * 64
 _FACT_COLUMNS = (
@@ -42,6 +42,7 @@ _FACT_COLUMNS = (
 )
 _HASHED_ROW_COLUMNS = tuple(column for column in _FACT_COLUMNS if column != "row_sha256")
 _SCHEMA_SHA256 = canonical_sha256({"schema_version": _SCHEMA_VERSION, "columns": _FACT_COLUMNS, "primary_key": ["bundle_sha256", "rulebook_schema_version", "symbol", "session"]})
+_PRICE_EVIDENCE = 1
 
 
 @dataclass(frozen=True)
@@ -182,13 +183,33 @@ class FactCacheBuilder:
             if not self.partial_path.exists():
                 raise ValueError("fact cache partial state is incomplete")
             conn = sqlite3.connect(self.partial_path)
-            self._verify_partial_metadata(conn)
-            if self.checkpoint_path.exists():
-                self._validate_checkpoint(_load_checkpoint(self.checkpoint_path), sessions)
-            if self.progress_path.exists():
-                self._validate_progress(sessions)
-            next_index = self._reconcile_completed_sessions(conn, sessions)
-            resumed = True
+            try:
+                self._verify_partial_metadata(conn)
+            except ValueError:
+                conn.close()
+                # A building v1 cache cannot represent a PIT member with no
+                # exact price bar because OHLCV was NOT NULL.  It is not a
+                # usable immutable artifact, so restart it under v2 rather
+                # than carry stale, structurally incompatible checkpoints.
+                old = sqlite3.connect(self.partial_path)
+                try:
+                    metadata = _metadata(old)
+                finally:
+                    old.close()
+                if metadata.get("status") != "building" or metadata.get("schema_version") != "1":
+                    raise
+                for path in (self.partial_path, self.checkpoint_path, self.progress_path):
+                    path.unlink(missing_ok=True)
+                conn = sqlite3.connect(self.partial_path)
+                self._create_schema(conn)
+                next_index, resumed = 0, False
+            else:
+                if self.checkpoint_path.exists():
+                    self._validate_checkpoint(_load_checkpoint(self.checkpoint_path), sessions)
+                if self.progress_path.exists():
+                    self._validate_progress(sessions)
+                next_index = self._reconcile_completed_sessions(conn, sessions)
+                resumed = True
         else:
             for path in (self.partial_path, self.checkpoint_path, self.progress_path):
                 if path.exists():
@@ -254,14 +275,14 @@ class FactCacheBuilder:
         rows: list[dict[str, object]] = []
         for symbol in members:
             prices = price_data.get(symbol)
-            if prices is None or pd.Timestamp(session) not in prices.index:
-                raise ValueError(f"active PIT member has no exact price bar: {symbol} {session}")
             state, state_date = _state_at(states.get(symbol, []), session)
             row = self._row(symbol, session, prices, state, state_date, rs.get(symbol), market)
             rows.append(row)
         return rows
 
-    def _row(self, symbol: str, session: str, prices: pd.DataFrame, state: Mapping[str, Any] | None, state_date: str | None, rs_rating: float | None, market: Mapping[str, object]) -> dict[str, object]:
+    def _row(self, symbol: str, session: str, prices: pd.DataFrame | None, state: Mapping[str, Any] | None, state_date: str | None, rs_rating: float | None, market: Mapping[str, object]) -> dict[str, object]:
+        if prices is None or pd.Timestamp(session) not in prices.index:
+            return self._unpriced_row(symbol, session, state, state_date, market)
         history = prices.loc[prices.index <= pd.Timestamp(session)].copy()
         event = history.loc[pd.Timestamp(session)]
         prior = history.iloc[:-1]
@@ -277,7 +298,7 @@ class FactCacheBuilder:
             base = detect_proper_base(prior[["High", "Low", "Close"]], event_session=session, policy=BasePolicy.canonical_v1())
         pivot = None if base is None else _number(base.pivot)
         extension = _number((float(event["Close"]) / pivot) - 1.0) if pivot not in (None, 0.0) else None
-        availability = 1 | (2 if state is not None else 0) | (4 if institutional.available else 0) | (8 if industry.available else 0) | (16 if rs_rating is not None else 0) | (32 if base is not None else 0)
+        availability = _PRICE_EVIDENCE | (2 if state is not None else 0) | (4 if institutional.available else 0) | (8 if industry.available else 0) | (16 if rs_rating is not None else 0) | (32 if base is not None else 0)
         row: dict[str, object] = {
             "bundle_sha256": _bundle_digest(self.bundle), "rulebook_schema_version": self.rulebook.version, "symbol": symbol, "session": session, "member": 1,
             "open": _number(event["Open"]), "high": _number(event["High"]), "low": _number(event["Low"]), "close": _number(event["Close"]), "volume": _number(event["Volume"]),
@@ -297,12 +318,36 @@ class FactCacheBuilder:
         row["row_sha256"] = canonical_sha256({column: row[column] for column in _HASHED_ROW_COLUMNS})
         return row
 
+    def _unpriced_row(self, symbol: str, session: str, state: Mapping[str, Any] | None, state_date: str | None, market: Mapping[str, object]) -> dict[str, object]:
+        """Keep a PIT member visible when no exact as-of bar exists; invent nothing."""
+        fundamentals = _fundamental_values(state)
+        institutional = self.supplemental_provider.institutional_snapshot(symbol, session)
+        industry = self.supplemental_provider.industry_group_snapshot(symbol, session)
+        _validate_supplemental(institutional, industry, session)
+        availability = (2 if state is not None else 0) | (4 if institutional.available else 0) | (8 if industry.available else 0)
+        row: dict[str, object] = {
+            "bundle_sha256": _bundle_digest(self.bundle), "rulebook_schema_version": self.rulebook.version, "symbol": symbol, "session": session, "member": 1,
+            "open": None, "high": None, "low": None, "close": None, "volume": None,
+            "prior_close": None, "prior_average_volume_50": None, "event_volume_ratio": None,
+            **fundamentals,
+            "institutional_ownership_percent": institutional.ownership_percent, "institutional_holder_count": institutional.holder_count, "institutional_previous_holder_count": institutional.previous_holder_count,
+            "institutional_as_of_date": institutional.as_of_date, "institutional_evidence_ids": _json_tuple(institutional.evidence_ids),
+            "rs_rating": None, "industry_group_id": industry.group_id, "industry_rank": industry.group_rank, "industry_as_of_date": industry.as_of_date,
+            "industry_members": _json_tuple(industry.group_members), "industry_evidence_ids": _json_tuple(industry.evidence_ids),
+            "base_kind": None, "base_start_session": None, "base_end_session": None, "base_duration_sessions": None, "base_low": None, "base_depth_pct": None,
+            "base_handle_start_session": None, "base_handle_end_session": None, "base_input_sha256": None, "pivot": None, "extension_pct": None,
+            **market, "latest_fundamental_public_date": state_date, "availability_bitset": availability,
+        }
+        _ensure_finite_row(row)
+        row["row_sha256"] = canonical_sha256({column: row[column] for column in _HASHED_ROW_COLUMNS})
+        return row
+
     def _create_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         definitions = {
             "bundle_sha256": "TEXT NOT NULL", "rulebook_schema_version": "TEXT NOT NULL", "symbol": "TEXT NOT NULL", "session": "TEXT NOT NULL", "member": "INTEGER NOT NULL CHECK(member IN (0,1))",
-            "open": "REAL NOT NULL", "high": "REAL NOT NULL", "low": "REAL NOT NULL", "close": "REAL NOT NULL", "volume": "REAL NOT NULL",
+            "open": "REAL", "high": "REAL", "low": "REAL", "close": "REAL", "volume": "REAL",
             "prior_close": "REAL", "prior_average_volume_50": "REAL", "event_volume_ratio": "REAL",
             "current_eps": "REAL", "prior_year_eps": "REAL", "current_sales": "REAL", "prior_year_sales": "REAL", "annual_eps_1": "REAL", "annual_eps_2": "REAL", "annual_eps_3": "REAL", "annual_eps_4": "REAL",
             "net_income": "REAL", "total_stockholders_equity": "REAL", "current_eps_yoy": "REAL", "sales_yoy": "REAL", "roe": "REAL", "shares_outstanding": "REAL",

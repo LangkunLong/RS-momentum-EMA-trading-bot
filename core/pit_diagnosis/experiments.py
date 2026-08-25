@@ -192,12 +192,21 @@ def _require_verified_d0(context: DiagnosisContext) -> None:
 def _facts(cache: FactCache | _FactReader, start: str, end: str) -> tuple[SessionFact, ...]:
     reader = getattr(cache, "session_facts", None)
     if callable(reader):
-        return tuple(reader(start, end))
+        return tuple(fact for fact in reader(start, end) if _has_price_evidence(fact))
     connection = getattr(cache, "_connection", None)
     if connection is None:
         raise ValueError("fact cache does not expose a read-only scalar-fact reader")
     rows = connection.execute("SELECT * FROM session_facts WHERE session>=? AND session<=? ORDER BY session,symbol", (start, end)).fetchall()
-    return tuple(SessionFact(MappingProxyType({key: row[key] for key in row.keys()})) for row in rows)
+    return tuple(
+        fact for row in rows
+        if _has_price_evidence(fact := SessionFact(MappingProxyType({key: row[key] for key in row.keys()})))
+    )
+
+
+def _has_price_evidence(fact: SessionFact) -> bool:
+    availability = fact.values.get("availability_bitset")
+    # Legacy test readers predate the bitset; finalized cache rows always have it.
+    return availability is None or type(availability) is int and availability & 1 == 1
 
 
 class _MaterializedFactCache:

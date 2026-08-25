@@ -47,6 +47,52 @@ git diff --check
 exit 0
 ```
 
+## PIT successor admission-price handling
+
+The real v1 cache build stopped after approximately 24 minutes at:
+
+```text
+active PIT member has no exact price bar: BBWI 2021-01-04
+```
+
+The PIT bundle marks BBWI active from 2021-01-01, while its first available
+bar is 2021-08-03.  This is consistent with a successor/new-issuer admission,
+not evidence that the dated membership is invalid.  Cache schema v2 preserves
+the member/session row but marks bit 0 (exact-price evidence) unavailable and
+stores OHLCV plus all price-derived evidence as NULL.  It does not fabricate a
+bar, backfill a predecessor, or drop PIT membership.  Replay filters these rows
+before frames/signals/exits, and publication accepts only that exact null/bit
+combination.  A resumable v1 partial cache is structurally incompatible with
+nullable OHLCV; only an unfinished v1 build state is discarded and rebuilt as
+v2 on `--resume`.
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_fact_cache.py tests/test_pit_diagnosis_experiments.py
+39 passed, 2 warnings
+
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_cli.py -k "help or publication_is_complete or explicitly_unavailable or raw_or_malformed or sqlite_extra or exact_manifest or incomplete_or_nonfinite"
+12 passed, 11 deselected, 2 warnings
+
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_cli.py -k "manifest_type or native_json or manifest_numeric or sqlite_nonfinite or stale_logical"
+11 passed, 12 deselected, 2 warnings
+
+python -m ruff check core/pit_diagnosis/fact_cache.py core/pit_diagnosis/experiments.py core/pit_diagnosis/publication.py tests/test_pit_diagnosis_fact_cache.py tests/test_pit_diagnosis_experiments.py tests/test_pit_diagnosis_cli.py
+All checks passed!
+```
+
+The full real cache has not been rerun after this source-only change, so no
+new generated cache, run directory, manifest hash, or diagnosis metrics are
+recorded here.
+
+One grouped CLI subset again saw the known transient Windows `os.replace`
+denial beneath `.artifacts/pytest` after 10 passing cases; the two affected
+promotion-count parameter cases passed on immediate isolated retry:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_cli.py -k "promotion_eligible_candidates and manifest_type"
+2 passed, 21 deselected, 2 warnings
+```
+
 ## Review fix round 3
 
 - JSON and manifest metrics/counts are now native JSON numbers only: strings

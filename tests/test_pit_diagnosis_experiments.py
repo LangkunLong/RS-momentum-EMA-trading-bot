@@ -65,6 +65,17 @@ def _fact(symbol: str, session: str, *, market: str = "uptrend", rs: float = 90.
     )
 
 
+def test_replay_fact_reader_skips_members_without_explicit_price_evidence() -> None:
+    unavailable_values = dict(_fact("NEW", "2024-01-02").values)
+    unavailable_values.update({"open": None, "high": None, "low": None, "close": None, "volume": None, "availability_bitset": 0})
+    unavailable = SessionFact(MappingProxyType(unavailable_values))
+    priced_values = dict(_fact("AAA", "2024-01-02").values)
+    priced_values["availability_bitset"] = 1
+    priced = SessionFact(MappingProxyType(priced_values))
+
+    assert experiments_module._facts(_Facts((unavailable, priced)), "2024-01-02", "2024-01-02") == (priced,)
+
+
 def _baseline_snapshot(root: Path) -> BaselineSnapshot:
     rows: list[dict[str, object]] = []
     reasons = [*("stop_loss",) * 97, *("ma_violation",) * 92, *("time_stop",) * 30, *("end_of_test",) * 6]

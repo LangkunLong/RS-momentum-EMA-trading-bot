@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
 from .experiments import DiagnosisContext, ExperimentResult, _result_payload_sha256
-from .fact_cache import _FACT_COLUMNS, _HASHED_ROW_COLUMNS, _SCHEMA_SHA256, open_fact_cache
+from .fact_cache import _FACT_COLUMNS, _HASHED_ROW_COLUMNS, _SCHEMA_SHA256, _SCHEMA_VERSION, open_fact_cache
 from .models import ExperimentCatalog, Rulebook
 from .catalog import load_experiment_catalog
 from .rulebook import canonical_sha256, load_rulebook
@@ -47,6 +47,8 @@ _FIDELITY_LABELS = frozenset({"strict_canslim", "quantitative_canslim_proxy", "f
 _EXIT_REASONS = frozenset({"stop_loss", "ma_violation", "time_stop", "end_of_test", "profit_zone", "structural_sell", "eight_week_hold"})
 _FACT_INTEGER_COLUMNS = frozenset({"member", "institutional_holder_count", "institutional_previous_holder_count", "industry_rank", "base_duration_sessions", "distribution_count", "availability_bitset"})
 _FACT_REAL_COLUMNS = frozenset({"open", "high", "low", "close", "volume", "prior_close", "prior_average_volume_50", "event_volume_ratio", "current_eps", "prior_year_eps", "current_sales", "prior_year_sales", "annual_eps_1", "annual_eps_2", "annual_eps_3", "annual_eps_4", "net_income", "total_stockholders_equity", "current_eps_yoy", "sales_yoy", "roe", "shares_outstanding", "institutional_ownership_percent", "rs_rating", "base_low", "base_depth_pct", "pivot", "extension_pct"})
+_PRICE_COLUMNS = frozenset({"open", "high", "low", "close", "volume"})
+_PRICE_DERIVED_COLUMNS = frozenset({"prior_close", "prior_average_volume_50", "event_volume_ratio", "rs_rating", "base_kind", "base_start_session", "base_end_session", "base_duration_sessions", "base_low", "base_depth_pct", "base_handle_start_session", "base_handle_end_session", "base_input_sha256", "pivot", "extension_pct"})
 _FACT_TYPES = {column: ("INTEGER" if column in _FACT_INTEGER_COLUMNS else "REAL" if column in _FACT_REAL_COLUMNS else "TEXT") for column in _FACT_COLUMNS}
 _FACT_IDENTITY_KEYS = frozenset({"bundle_sha256", "bundle_schema_version", "bundle_metadata", "rulebook_version", "rulebook_sha256", "partitions", "supplemental_content_identity_sha256", "fact_cache_schema_version", "fact_cache_schema_sha256"})
 
@@ -451,7 +453,7 @@ def _verify_fact_cache(path: Path, manifest: Mapping[str, object]) -> None:
             if table_info != tuple((column, _FACT_TYPES[column]) for column in _FACT_COLUMNS):
                 raise ValueError("fact-cache column types are invalid")
             metadata = {str(row[0]): str(row[1]) for row in connection.execute("SELECT key,value FROM metadata")}
-            if set(metadata) != {"status", "identity_sha256", "identity", "schema_version", "schema_sha256", "content_sha256"} or metadata.get("status") != "complete" or metadata.get("schema_version") != "1" or metadata.get("schema_sha256") != _SCHEMA_SHA256:
+            if set(metadata) != {"status", "identity_sha256", "identity", "schema_version", "schema_sha256", "content_sha256"} or metadata.get("status") != "complete" or metadata.get("schema_version") != _SCHEMA_VERSION or metadata.get("schema_sha256") != _SCHEMA_SHA256:
                 raise ValueError("fact-cache metadata is invalid")
             _digest_value(metadata.get("identity_sha256"), "fact-cache identity")
             _digest_value(metadata.get("content_sha256"), "fact-cache logical content")
@@ -480,6 +482,13 @@ def _verify_fact_cache(path: Path, manifest: Mapping[str, object]) -> None:
                 row_hashes.append(row["row_sha256"])
                 if not all(isinstance(row[field], str) and row[field] for field in ("rulebook_schema_version", "symbol", "session", "market_regime")):
                     raise ValueError("fact-cache text row value is invalid")
+                if type(row["availability_bitset"]) is not int:
+                    raise ValueError("fact-cache availability is invalid")
+                price_available = row["availability_bitset"] & 1 == 1
+                if price_available and any(row[field] is None for field in _PRICE_COLUMNS):
+                    raise ValueError("fact-cache price evidence is incomplete")
+                if not price_available and any(row[field] is not None for field in _PRICE_COLUMNS | _PRICE_DERIVED_COLUMNS):
+                    raise ValueError("fact-cache unavailable price evidence is not explicit")
                 for field in _FACT_REAL_COLUMNS:
                     if row[field] is not None:
                         _finite_number(row[field], f"fact-cache {field}")
