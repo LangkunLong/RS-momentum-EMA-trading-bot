@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from config import settings
 from core.backtest_engine import CanslimStrategy, PortfolioSimulator
 
 from .fact_cache import FactCache, SessionFact
@@ -132,6 +133,21 @@ class DiagnosisPortfolioSimulator(PortfolioSimulator):
                 self._record_exit("X.PROFIT_ZONE", symbol, eval_date)
                 self._close_trade(symbol, trade.entry_price * 1.20, "profit_zone", str(eval_date.date()))
                 return
+        if self.experiment_id == "D4.REMOVE_UNVERIFIED_EXITS":
+            # Keep the production defensive package intact: only the uncited
+            # stagnation time stop and 21-day EMA exit are removed.
+            if not trade.eight_week_hold and (trade.remaining_qty or 0.0) > 0:
+                while trade.scale_out_tier < len(settings.SCALE_OUT_TIERS):
+                    gain_target, fraction = settings.SCALE_OUT_TIERS[trade.scale_out_tier]
+                    tier_price = trade.entry_price * (1 + gain_target)
+                    if high < tier_price:
+                        break
+                    sell_qty = trade.qty * fraction
+                    if sell_qty > 0.0 and (trade.remaining_qty or 0.0) >= sell_qty:
+                        self._scale_out_trade(symbol, tier_price, str(eval_date.date()), "take_profit_scale_out", sell_qty=sell_qty)
+                    trade.scale_out_tier += 1
+            self._update_protective_stop(trade, ohlcv.loc[:eval_date], high)
+            return
         if self.experiment_id == "D4.EIGHT_WEEK_HOLD" and trade.days_held <= 15 and gain >= 0.20:
             trade.eight_week_hold = True
             self._record_exit("X.EIGHT_WEEK_HOLD", symbol, eval_date)
