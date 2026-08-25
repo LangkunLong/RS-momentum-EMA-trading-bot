@@ -82,3 +82,44 @@ SQLite `sha256` to `pit_diagnosis.py build-facts --supplemental-input ...
 --supplemental-sha256 ...`. The resulting fact-cache identity includes that
 artifact hash, so changing source rows or provenance creates a new cache
 identity rather than silently reusing prior facts.
+
+## Building the industry CSV from PIT prices
+
+When the classification source contains only dated symbol-to-group observations,
+`tools/build_pit_industry.py` derives the remaining fields without consulting a
+current profile provider. Its input contract is the exact UTF-8 header:
+
+```text
+symbol,as_of_date,group_id,evidence_ids
+```
+
+`as_of_date` is the public/available date of the classification observation. It
+must be no later than the PIT bundle cutoff and must be an exact completed SPY
+price session; no adjacent-session fallback is permitted. Every symbol must be
+present in the bundle and active in the bundle's historical membership state on
+that date, and every active PIT member must have exactly one classification row
+at each snapshot date. Duplicate `(symbol, as_of_date)` rows, unknown symbols,
+inactive symbols, incomplete snapshots, empty evidence, and future-dated rows
+are rejected.
+
+For every snapshot date, the utility groups the supplied classifications and
+computes each group's score as the mean of member ratings from the repository's
+causal PIT RS implementation. The input prices passed to each RS calculation
+end at the classification session. Groups are ranked by descending score with
+a canonical `group_id` tie-break, and one output row is emitted for every input
+symbol snapshot. `group_members` is the sorted, dated classified member set
+and `evidence_ids` is carried through from the classification source.
+
+```powershell
+python -m tools.build_pit_industry `
+  --pit-bundle pit.sqlite3 `
+  --bundle-sha256 <bundle-sha256> `
+  --classification-csv classifications.csv `
+  --output industry.csv
+```
+
+The resulting `industry.csv` can be supplied directly as the
+`--industry-csv` input to `tools.build_pit_supplemental.py`. The classification
+export must contain enough historical price for the existing PIT RS calculation
+to produce a rating for every classified group member; the ranker fails closed
+when a group cannot be ranked causally.
