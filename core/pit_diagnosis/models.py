@@ -5,6 +5,9 @@ from enum import Enum
 import re
 from types import MappingProxyType
 from typing import Mapping
+from datetime import date
+import hashlib
+import json
 
 
 class _Closed(str, Enum):
@@ -35,6 +38,21 @@ class ImplementationStatus(_Closed):
     IMPLEMENTED = "implemented"
     PARTIAL = "partial"
     UNIMPLEMENTED = "unimplemented"
+
+
+class PartitionName(_Closed):
+    DISCOVERY = "discovery"
+    VALIDATION = "validation"
+    LOCKED_EVALUATION = "locked_evaluation"
+
+
+class ExperimentKind(_Closed):
+    REPRODUCTION = "reproduction"
+    DATA = "data"
+    ENTRY = "entry"
+    MARKET = "market"
+    EXIT = "exit"
+    INTERACTION = "interaction"
 
 
 def _text(value: object, field: str) -> str:
@@ -165,3 +183,132 @@ class FidelityAssessment:
                 raise ValueError(f"{name} must be a tuple of strings")
         if not isinstance(self.promotion_eligible, bool):
             raise ValueError("promotion_eligible must be bool")
+
+
+@dataclass(frozen=True)
+class DatePartition:
+    name: PartitionName | str
+    start: str
+    end: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", PartitionName(self.name))
+        for field in ("start", "end"):
+            value = getattr(self, field)
+            try:
+                parsed = date.fromisoformat(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field} must be an ISO date") from exc
+            if parsed.isoformat() != value:
+                raise ValueError(f"{field} must be YYYY-MM-DD")
+        if self.start > self.end:
+            raise ValueError("partition start must not be after end")
+
+    def as_tuple(self) -> tuple[str, str]:
+        return self.start, self.end
+
+
+@dataclass(frozen=True)
+class DatePartitions:
+    discovery: DatePartition
+    validation: DatePartition
+    locked_evaluation: DatePartition
+
+    def __post_init__(self) -> None:
+        expected = ("discovery", "validation", "locked_evaluation")
+        actual = tuple(item.name.value for item in (self.discovery, self.validation, self.locked_evaluation))
+        if actual != expected:
+            raise ValueError("date partitions must be discovery, validation, locked_evaluation")
+        if self.discovery.end >= self.validation.start or self.validation.end >= self.locked_evaluation.start:
+            raise ValueError("date partitions must be chronological and non-overlapping")
+
+
+@dataclass(frozen=True)
+class ExperimentDefinition:
+    experiment_id: str
+    phase: str
+    domain: str
+    kind: ExperimentKind | str
+    changed_dimensions: tuple[str, ...]
+    rule_ids: tuple[str, ...]
+    promotion_eligible: bool
+    controller_composed: bool
+    requires_code: bool
+    allowed_variant_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("experiment_id", "phase", "domain"):
+            _text(getattr(self, name), name)
+        object.__setattr__(self, "kind", ExperimentKind(self.kind))
+        for name in ("changed_dimensions", "rule_ids", "allowed_variant_ids"):
+            value = getattr(self, name)
+            if not isinstance(value, tuple) or any(not isinstance(x, str) or not x.strip() for x in value):
+                raise ValueError(f"{name} must be a tuple of non-empty strings")
+            if len(set(value)) != len(value):
+                raise ValueError(f"{name} must not contain duplicates")
+        for name in ("promotion_eligible", "controller_composed", "requires_code"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be bool")
+
+    @classmethod
+    def from_mapping(cls, item: Mapping[str, object], rulebook: Rulebook) -> "ExperimentDefinition":
+        expected = {"experiment_id", "phase", "domain", "kind", "changed_dimensions", "rule_ids", "promotion_eligible", "controller_composed", "requires_code", "allowed_variant_ids"}
+        if not isinstance(item, Mapping) or set(item) != expected:
+            raise ValueError("experiment record has unexpected fields")
+        values = dict(item)
+        for field in ("changed_dimensions", "rule_ids", "allowed_variant_ids"):
+            if not isinstance(values[field], list):
+                raise ValueError(f"{field} must be a JSON array")
+            values[field] = tuple(values[field])
+        result = cls(**values)
+        if result.phase != "D5" and len(result.changed_dimensions) != 1:
+            raise ValueError("D0-D4 experiments must change exactly one causal dimension")
+        missing = set(result.rule_ids) - set(rulebook.rules)
+        if missing:
+            raise ValueError(f"experiment cites absent rule IDs: {sorted(missing)}")
+        if any(rulebook.rules[rid].classification is RuleClassification.DIAGNOSTIC_ONLY for rid in result.rule_ids) and result.promotion_eligible:
+            raise ValueError("diagnostic_only rule cannot be promotable")
+        if result.phase == "D5" and not result.controller_composed:
+            raise ValueError("D5 experiments must be controller composed")
+        if result.controller_composed and result.phase != "D5":
+            raise ValueError("only D5 experiments may be controller composed")
+        return result
+
+
+@dataclass(frozen=True)
+class ExperimentCatalog:
+    version: str
+    _experiments: Mapping[str, ExperimentDefinition]
+    sha256: str
+
+    @classmethod
+    def from_records(cls, version: str, records: tuple[ExperimentDefinition, ...], sha256: str) -> "ExperimentCatalog":
+        if not records or len({record.experiment_id for record in records}) != len(records):
+            raise ValueError("experiment IDs must be unique and non-empty")
+        return cls(version, MappingProxyType({record.experiment_id: record for record in records}), sha256)
+
+    @property
+    def experiments(self) -> Mapping[str, ExperimentDefinition]:
+        return self._experiments
+
+    def __getitem__(self, key: str) -> ExperimentDefinition:
+        return self._experiments[key]
+
+
+@dataclass(frozen=True)
+class ExperimentIdentity:
+    fields: Mapping[str, object]
+    sha256: str
+
+    @classmethod
+    def from_fields(cls, fields: Mapping[str, object]) -> "ExperimentIdentity":
+        def normalize(value):
+            if isinstance(value, Enum): return value.value
+            if isinstance(value, DatePartition): return {"name": value.name.value, "start": value.start, "end": value.end}
+            if isinstance(value, ExperimentDefinition): return value.experiment_id
+            if isinstance(value, Mapping): return {str(k): normalize(v) for k, v in value.items() if k != "fields"}
+            if isinstance(value, (tuple, list)): return [normalize(v) for v in value]
+            return value
+        normalized = normalize(dict(fields))
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return cls(MappingProxyType(normalized), hashlib.sha256(encoded).hexdigest())

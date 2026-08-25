@@ -1,0 +1,341 @@
+{
+  "version": "pit-diagnosis-experiments-v1",
+  "experiments": [
+    {
+      "experiment_id": "D0.BASELINE_REPRODUCTION",
+      "phase": "D0",
+      "domain": "baseline",
+      "kind": "reproduction",
+      "changed_dimensions": [
+        "baseline"
+      ],
+      "rule_ids": [],
+      "promotion_eligible": true,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D1.FULL_FUNDAMENTAL_COHORT",
+      "phase": "D1",
+      "domain": "fundamentals",
+      "kind": "data",
+      "changed_dimensions": [
+        "fundamental_completeness"
+      ],
+      "rule_ids": [
+        "C.EPS_YOY",
+        "C.SALES_YOY",
+        "A.EPS_MULTIYEAR",
+        "A.ROE"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D1.N_CATALYST_GAP",
+      "phase": "D1",
+      "domain": "newness",
+      "kind": "data",
+      "changed_dimensions": [
+        "newness_observability"
+      ],
+      "rule_ids": [
+        "N.NEWNESS",
+        "N.CATALYST",
+        "N.NEW_HIGH"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D1.I_SPONSORSHIP_GAP",
+      "phase": "D1",
+      "domain": "institutional",
+      "kind": "data",
+      "changed_dimensions": [
+        "sponsorship_observability"
+      ],
+      "rule_ids": [
+        "I.SPONSORSHIP"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D1.INDUSTRY_GROUP_GAP",
+      "phase": "D1",
+      "domain": "leadership",
+      "kind": "data",
+      "changed_dimensions": [
+        "industry_group_observability"
+      ],
+      "rule_ids": [
+        "L.INDUSTRY_GROUP"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D2.RULE_STAGE_FUNNEL",
+      "phase": "D2",
+      "domain": "entry",
+      "kind": "entry",
+      "changed_dimensions": [
+        "rule_stage_attribution"
+      ],
+      "rule_ids": [],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D2.PROPER_BASE_COUNTERFACTUAL",
+      "phase": "D2",
+      "domain": "entry",
+      "kind": "entry",
+      "changed_dimensions": [
+        "proper_base_definition"
+      ],
+      "rule_ids": [
+        "E.PROPER_BASE",
+        "E.PIVOT"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D2.RS_85_CONFORMANCE",
+      "phase": "D2",
+      "domain": "entry",
+      "kind": "entry",
+      "changed_dimensions": [
+        "relative_strength_threshold"
+      ],
+      "rule_ids": [
+        "L.RS"
+      ],
+      "promotion_eligible": true,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D2.LEADING_GROUP_CONFORMANCE",
+      "phase": "D2",
+      "domain": "entry",
+      "kind": "entry",
+      "changed_dimensions": [
+        "industry_group_requirement"
+      ],
+      "rule_ids": [
+        "L.INDUSTRY_GROUP"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D2.BUY_ZONE_ATTRIBUTION",
+      "phase": "D2",
+      "domain": "entry",
+      "kind": "entry",
+      "changed_dimensions": [
+        "buy_zone_attribution"
+      ],
+      "rule_ids": [
+        "E.BUY_ZONE",
+        "E.NEXT_OPEN"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D2.LEADER_RANK_BENCHMARK",
+      "phase": "D2",
+      "domain": "entry",
+      "kind": "entry",
+      "changed_dimensions": [
+        "leader_rank_benchmark"
+      ],
+      "rule_ids": [
+        "L.RS"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D3.M_CONFIRMED_UPTREND",
+      "phase": "D3",
+      "domain": "market",
+      "kind": "market",
+      "changed_dimensions": [
+        "confirmed_uptrend_gate"
+      ],
+      "rule_ids": [
+        "M.CONFIRMED_UPTREND"
+      ],
+      "promotion_eligible": true,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D3.M_DISTRIBUTION_EXPOSURE",
+      "phase": "D3",
+      "domain": "market",
+      "kind": "market",
+      "changed_dimensions": [
+        "distribution_exposure"
+      ],
+      "rule_ids": [
+        "M.DISTRIBUTION_EXPOSURE"
+      ],
+      "promotion_eligible": true,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D3.M_BASELINE_OFF",
+      "phase": "D3",
+      "domain": "market",
+      "kind": "market",
+      "changed_dimensions": [
+        "market_gate_disabled"
+      ],
+      "rule_ids": [
+        "M.CONFIRMED_UPTREND"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D4.CURRENT_EXIT_PACKAGE",
+      "phase": "D4",
+      "domain": "exit",
+      "kind": "exit",
+      "changed_dimensions": [
+        "exit_package_baseline"
+      ],
+      "rule_ids": [
+        "X.LOSS_LIMIT"
+      ],
+      "promotion_eligible": true,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D4.LOSS_LIMIT_ONLY",
+      "phase": "D4",
+      "domain": "exit",
+      "kind": "exit",
+      "changed_dimensions": [
+        "loss_limit"
+      ],
+      "rule_ids": [
+        "X.LOSS_LIMIT"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D4.PROFIT_ZONE",
+      "phase": "D4",
+      "domain": "exit",
+      "kind": "exit",
+      "changed_dimensions": [
+        "profit_zone"
+      ],
+      "rule_ids": [
+        "X.PROFIT_ZONE"
+      ],
+      "promotion_eligible": true,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D4.EIGHT_WEEK_HOLD",
+      "phase": "D4",
+      "domain": "exit",
+      "kind": "exit",
+      "changed_dimensions": [
+        "eight_week_hold"
+      ],
+      "rule_ids": [
+        "X.EIGHT_WEEK_HOLD"
+      ],
+      "promotion_eligible": true,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D4.STRUCTURAL_SELL",
+      "phase": "D4",
+      "domain": "exit",
+      "kind": "exit",
+      "changed_dimensions": [
+        "structural_sell"
+      ],
+      "rule_ids": [
+        "X.STRUCTURAL_SELL"
+      ],
+      "promotion_eligible": true,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D4.REMOVE_UNVERIFIED_EXITS",
+      "phase": "D4",
+      "domain": "exit",
+      "kind": "exit",
+      "changed_dimensions": [
+        "unverified_exit_removal"
+      ],
+      "rule_ids": [
+        "X.PROFIT_ZONE",
+        "X.STRUCTURAL_SELL"
+      ],
+      "promotion_eligible": false,
+      "controller_composed": false,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    },
+    {
+      "experiment_id": "D5.BOUNDED_PAIR",
+      "phase": "D5",
+      "domain": "interaction",
+      "kind": "interaction",
+      "changed_dimensions": [],
+      "rule_ids": [],
+      "promotion_eligible": false,
+      "controller_composed": true,
+      "requires_code": false,
+      "allowed_variant_ids": []
+    }
+  ]
+}
