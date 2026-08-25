@@ -127,6 +127,22 @@ def _plain_json_schema(value: object) -> object:
     return value
 
 
+def _validate_provider_evidence_payload(payload: Mapping[str, object]) -> None:
+    """Reject unsafe or oversized data before it can reach a provider client."""
+    _reject_forbidden_evidence_keys(payload)
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise PayloadFieldValidationError("PIT evidence must be JSON serializable") from exc
+    if len(encoded) > _MAX_PROVIDER_EVIDENCE_BYTES:
+        raise PayloadFieldValidationError("PIT evidence exceeds the provider byte limit")
+
+
 @dataclass(frozen=True)
 class PitRoute:
     """A route-only response; it intentionally has no free-text reasoning fields."""
@@ -191,8 +207,12 @@ class PitReasoningPlan:
             if not skip_reason.strip():
                 raise PayloadFieldValidationError("skip_reason must not be blank when skip is true")
         else:
-            if not evidence_ids:
-                raise PayloadFieldValidationError("non-skip plans require evidence_ids")
+            if len(evidence_ids) != 1:
+                raise PayloadFieldValidationError("non-skip plans require exactly one evidence ID")
+            if len(rule_ids) != 1:
+                raise PayloadFieldValidationError("non-skip plans require exactly one rule ID")
+            if len(invariant_ids) != 1:
+                raise PayloadFieldValidationError("non-skip plans require exactly one invariant ID")
             if not experiment_id:
                 raise PayloadFieldValidationError("non-skip plans require an experiment")
             if skip_reason:
@@ -259,6 +279,7 @@ class PitAgentEvidence:
         ):
             _sha256(getattr(self, field), field)
         hashes = _mapping(self.experiment_result_sha256s, "experiment_result_sha256s")
+        _reject_forbidden_evidence_keys(hashes)
         if tuple(hashes) != tuple(sorted(hashes)):
             raise PayloadFieldValidationError("experiment_result_sha256s must be canonically sorted")
         canonical_hashes: dict[str, str] = {}
@@ -267,6 +288,7 @@ class PitAgentEvidence:
                 value, "experiment result SHA-256"
             )
         metrics = _mapping(self.metrics, "metrics", maximum=64)
+        _reject_forbidden_evidence_keys(metrics)
         if tuple(metrics) != tuple(sorted(metrics)):
             raise PayloadFieldValidationError("metrics must be canonically sorted")
         canonical_metrics: dict[str, float | int] = {}
@@ -292,6 +314,7 @@ class PitAgentEvidence:
         object.__setattr__(self, "rule_ids", rule_ids)
         object.__setattr__(self, "invariant_ids", invariant_ids)
         object.__setattr__(self, "experiment_ids", experiment_ids)
+        _validate_provider_evidence_payload(self.to_provider_payload())
 
     @classmethod
     def from_json(cls, raw: str) -> "PitAgentEvidence":
@@ -431,8 +454,9 @@ PIT_DIAGNOSIS_SYSTEM_PROMPTS = MappingProxyType(
             "You are the PIT Diagnosis Reasoner. Return exactly one JSON object with exactly these keys: "
             '"causal_hypothesis", "evidence_ids", "rule_ids", "invariant_ids", "experiment_id", "skip", '
             '"skip_reason". Return one concise falsifiable hypothesis supported only by supplied closed metrics and '
-            "cited IDs. For skip=false, cite sorted unique supplied IDs and choose exactly one supplied experiment_id; "
-            "skip_reason must be empty. For skip=true, experiment_id must be empty and skip_reason must be nonblank. "
+            "cited IDs. For skip=false, cite exactly one sorted supplied evidence ID, rule ID, and invariant ID, "
+            "and choose exactly one supplied experiment_id; skip_reason must be empty. For skip=true, "
+            "experiment_id must be empty and skip_reason must be nonblank. "
             "Do not invent facts, rules, thresholds, files, commands, experiments, retrieval, external knowledge, "
             "or chain-of-thought. Do not recommend a diagnostic-only experiment for promotion. Return JSON only."
         ),
@@ -520,10 +544,6 @@ def pit_diagnosis_response_format(role: str) -> dict[str, object]:
         schema = PIT_DIAGNOSIS_RESPONSE_SCHEMAS[role]
     except KeyError as exc:
         raise ProtocolValidationError("unknown PIT diagnosis role") from exc
-    # The same reasoner model is used as the legacy path and has provider routes that only
-    # support json_object. Controller-side strict parsing remains the security authority.
-    if role == "reasoner":
-        return {"type": "json_object"}
     return {
         "type": "json_schema",
         "json_schema": {

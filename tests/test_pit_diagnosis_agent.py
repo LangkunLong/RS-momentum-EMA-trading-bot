@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -83,6 +83,71 @@ def test_pit_evidence_rejects_raw_data_bearing_keys() -> None:
         PitAgentEvidence.from_json(json.dumps(payload))
 
 
+@pytest.mark.parametrize(
+    "forbidden_key",
+    ("raw", "rows", "transactions", "prices", "fundamentals", "payload", "secret", "path", "source_text"),
+)
+def test_direct_pit_evidence_construction_rejects_forbidden_keys(forbidden_key: str) -> None:
+    with pytest.raises(ProtocolValidationError, match="forbids key"):
+        replace(pit_agent_evidence(), metrics={forbidden_key: 1})
+
+
+def test_direct_pit_evidence_construction_rejects_oversized_provider_payload() -> None:
+    def long_ids(prefix: str) -> tuple[str, ...]:
+        return tuple(f"{prefix}{index:03d}{'A' * 124}" for index in range(16))
+
+    evidence_ids = long_ids("E")
+    rule_ids = long_ids("R")
+    invariant_ids = long_ids("I")
+    experiment_ids = long_ids("D")
+    with pytest.raises(ProtocolValidationError, match="provider byte limit"):
+        replace(
+            pit_agent_evidence(),
+            experiment_result_sha256s={experiment_id: _sha("f") for experiment_id in experiment_ids},
+            evidence_ids=evidence_ids,
+            rule_ids=rule_ids,
+            invariant_ids=invariant_ids,
+            experiment_ids=experiment_ids,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("evidence_ids", []),
+        ("evidence_ids", ["EXIT.A", "EXIT.MA_001"]),
+        ("rule_ids", []),
+        ("rule_ids", ["X.A", "X.STRUCTURAL_SELL"]),
+        ("invariant_ids", []),
+        ("invariant_ids", ["INV.A", "INV.LOSS_LIMIT"]),
+    ),
+)
+def test_non_skip_reasoning_plan_requires_exactly_one_grounding_id(
+    field: str, value: list[str]
+) -> None:
+    payload = json.loads(valid_pit_plan_json("D4.STRUCTURAL_SELL"))
+    payload[field] = value
+    with pytest.raises(ProtocolValidationError, match="exactly one"):
+        PitReasoningPlan.from_json(json.dumps(payload))
+
+
+def test_skip_reasoning_plan_remains_explicit() -> None:
+    plan = PitReasoningPlan.from_json(
+        json.dumps(
+            {
+                "causal_hypothesis": "The supplied evidence is insufficient for a falsifiable experiment.",
+                "evidence_ids": [],
+                "rule_ids": [],
+                "invariant_ids": [],
+                "experiment_id": "",
+                "skip": True,
+                "skip_reason": "Insufficient closed evidence.",
+            }
+        )
+    )
+    assert plan.skip is True
+
+
 @dataclass
 class _FakeResponse:
     content: str
@@ -145,3 +210,21 @@ def test_pit_gateway_uses_same_models_with_distinct_closed_prompts() -> None:
     assert "failure_summary" not in request["messages"][0]["content"]
     assert '"domain"' in request["messages"][0]["content"]
     assert request["messages"][1]["content"] == OpenRouterGateway.STATIC_CONTEXT
+
+
+def test_pit_reasoner_gateway_uses_fixed_json_schema() -> None:
+    response = _FakeResponse(valid_pit_plan_json("D4.STRUCTURAL_SELL"), model="deepseek/deepseek-r1")
+    fake_client = _FakeClient([response])
+    gateway = OpenRouterGateway(
+        client=fake_client,
+        pricing_loader=lambda _model: {"prompt": 1.0, "completion": 1.0},
+        ledger=BudgetLedger(max_usd=1.0),
+    )
+
+    gateway.request_pit_diagnosis_once("reasoner", "{}", PitReasoningPlan.from_json)
+
+    response_format = fake_client.chat.completions.calls[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == "pit_diagnosis_reasoner_v1"
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"]["additionalProperties"] is False
