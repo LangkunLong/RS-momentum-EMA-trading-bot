@@ -2639,6 +2639,18 @@ def print_pnl_report(result: SimulationResult) -> None:
             f"{execution.get('entry_rejected_invalid_risk', 0)}"
         )
 
+    entry_outcome_counts: dict[str, int] = {}
+    for entry_outcome in result.entry_outcomes:
+        entry_outcome_counts[entry_outcome.outcome] = (
+            entry_outcome_counts.get(entry_outcome.outcome, 0) + 1
+        )
+    print("\n--- Entry Attempt Outcomes ---")
+    if entry_outcome_counts:
+        for outcome, count in sorted(entry_outcome_counts.items()):
+            print(f"{outcome}: {count}")
+    else:
+        print("No entry attempts recorded.")
+
     warnings: list[str] = []
     if result.signal_log.empty:
         warnings.append("No signal rows were evaluated; check universe and benchmark data availability.")
