@@ -147,7 +147,9 @@ class TradeStatistics:
         if not math.isclose(self.win_rate_pct, expected, abs_tol=0.005):
             raise ValueError("trade win rate is inconsistent")
         for name in ("mean_return_pct", "median_return_pct", "mean_winner_pct", "mean_loser_pct", "expectancy_pct"):
-            _pct(getattr(self, name), name)
+            # Position returns are finite percentages but are not bounded at
+            # +100%: a multi-bagger can legitimately exceed that value.
+            _finite(getattr(self, name), name)
         for name in ("mean_calendar_hold_days", "median_calendar_hold_days", "mean_trading_session_hold_days", "median_trading_session_hold_days"):
             if _finite(getattr(self, name), name) < 0.0:
                 raise ValueError(f"{name} must be non-negative")
