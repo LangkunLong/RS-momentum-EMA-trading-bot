@@ -75,6 +75,26 @@ The mapping input must be dated and explicit:
 cusip,symbol,effective_start,effective_end,evidence_ids
 ```
 
+Before creating that production mapping, generate a review-only candidate
+queue from an as-filed archive:
+
+```powershell
+python -m tools.audit_sec13f_mapping `
+  --13f-zip 2022q4_form13f.zip `
+  --security-master-csv .artifacts/sec-pit-roe2/security_master.csv `
+  --shares-csv pit_shares.csv `
+  --report-period 2022-09-30 `
+  --output mapping-review.csv `
+  --summary-output mapping-review.json
+```
+
+This queue uses normalized issuer names only to propose candidates. It is not
+accepted by `normalize_sec13f`, and `candidate_unique` still requires dated
+instrument evidence and review before it can become a mapping row. Unresolved
+historical names, multiple CUSIPs/classes, and non-common-stock instruments
+remain quarantined. The SEC archive does not provide a ticker crosswalk, so
+current ticker files or an undated lookup must not be promoted to PIT evidence.
+
 The shares input must contain PIT denominators:
 
 ```text
