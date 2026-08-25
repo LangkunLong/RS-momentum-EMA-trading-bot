@@ -79,6 +79,9 @@ def evaluate_fidelity(
     unknown = supplied - declared
     if unknown:
         raise ValueError(f"unknown outcome rule IDs: {sorted(unknown)}")
+    mismatched = sorted(key for key, outcome in outcomes.items() if not isinstance(outcome, RuleOutcome) or outcome.rule_id != key)
+    if mismatched:
+        raise ValueError(f"outcome rule_id does not match mapping key: {mismatched}")
     proxy_declared = {rid for rid, rule in rulebook.rules.items() if rule.observability is Observability.PIT_PROXY}
     approved = set(approved_proxy_rule_ids)
     if not approved <= proxy_declared:
@@ -96,7 +99,7 @@ def evaluate_fidelity(
         children = [resolved.get(rid) for rid in child_ids]
         if any(item is not None and item.status == "passed" for item in children):
             resolved["N.NEWNESS"] = RuleOutcome.passed("N.NEWNESS")
-        elif any(item is not None and item.status == "failed" for item in children):
+        elif all(item is not None and item.status == "failed" for item in children):
             resolved["N.NEWNESS"] = RuleOutcome.failed("N.NEWNESS")
         elif any(item is not None and item.status == "unavailable" for item in children):
             resolved["N.NEWNESS"] = RuleOutcome.unavailable("N.NEWNESS")

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from types import MappingProxyType
 from typing import Mapping
 
@@ -129,12 +130,18 @@ class Rulebook:
         _text(self.version, "version")
         if not isinstance(self.sources, Mapping) or not isinstance(self.rules, Mapping):
             raise ValueError("sources and rules must be mappings")
+        if not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ValueError("sha256 must be a lowercase 64-character SHA-256 hex digest")
         object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
         object.__setattr__(self, "rules", MappingProxyType(dict(self.rules)))
         for key, source in self.sources.items():
+            if not isinstance(key, str) or not isinstance(source, RuleSource):
+                raise ValueError("sources must map string IDs to RuleSource values")
             if key != source.source_id:
                 raise ValueError("source key does not match source_id")
         for key, rule in self.rules.items():
+            if not isinstance(key, str) or not isinstance(rule, RuleRecord):
+                raise ValueError("rules must map string IDs to RuleRecord values")
             if key != rule.rule_id:
                 raise ValueError("rule key does not match rule_id")
             if rule.source_id not in self.sources:

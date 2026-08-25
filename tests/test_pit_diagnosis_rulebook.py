@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from core.pit_diagnosis.models import RuleOutcome
+from core.pit_diagnosis.models import RuleOutcome, Rulebook
 from core.pit_diagnosis.rulebook import canonical_sha256, evaluate_fidelity, load_canonical_json, load_rulebook
 
 
@@ -52,3 +52,29 @@ def test_proxy_must_be_declared() -> None:
     book = load_rulebook(RULEBOOK)
     with pytest.raises(ValueError, match="proxy"):
         evaluate_fidelity(book, {}, approved_proxy_rule_ids=frozenset({"C.EPS_YOY"}))
+
+
+def test_outcome_embedded_rule_id_must_match_mapping_key() -> None:
+    book = load_rulebook(RULEBOOK)
+    outcomes = {rule_id: RuleOutcome.passed(rule_id) for rule_id in book.rules}
+    outcomes["C.EPS_YOY"] = RuleOutcome.passed("C.SALES_YOY")
+    with pytest.raises(ValueError, match="mapping key"):
+        evaluate_fidelity(book, outcomes)
+
+
+def test_rulebook_rejects_malformed_sha_and_nested_values() -> None:
+    book = load_rulebook(RULEBOOK)
+    with pytest.raises(ValueError, match="sha256"):
+        Rulebook(book.version, book.sources, book.rules, "bad")
+    with pytest.raises(ValueError, match="RuleSource"):
+        Rulebook(book.version, {"IBD20": object()}, book.rules, book.sha256)
+
+
+def test_newness_mixed_failed_and_unavailable_is_not_failed() -> None:
+    book = load_rulebook(RULEBOOK)
+    outcomes = {rule_id: RuleOutcome.passed(rule_id) for rule_id in book.rules}
+    outcomes["N.CATALYST"] = RuleOutcome.failed("N.CATALYST")
+    outcomes["N.NEW_HIGH"] = RuleOutcome.unavailable("N.NEW_HIGH")
+    assessment = evaluate_fidelity(book, outcomes)
+    assert "N.NEWNESS" in assessment.unavailable_required_rule_ids
+    assert "N.NEWNESS" not in assessment.failed_required_rule_ids
