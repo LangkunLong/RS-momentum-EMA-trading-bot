@@ -434,6 +434,8 @@ class FactCacheBuilder:
                     return False
         except ValueError:
             return False
+        if not self.checkpoint_path.exists() and not self.progress_path.exists():
+            return _v1_session_fact_count(self.partial_path) == 0
         return True
 
     def _validate_checkpoint(self, checkpoint: Mapping[str, object], sessions: list[str]) -> None:
@@ -581,6 +583,18 @@ def _has_exact_v1_partial_schema(conn: sqlite3.Connection) -> bool:
         integrity is not None and integrity[0] == "ok"
         and objects == (("table", "metadata", _METADATA_CREATE_SQL), ("table", "session_facts", _V1_SESSION_FACTS_CREATE_SQL))
     )
+
+
+def _v1_session_fact_count(path: Path) -> int | None:
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM session_facts").fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row is not None else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
 
 
 def _valid_v1_checkpoint(checkpoint: Mapping[str, object], identity: Mapping[str, object], identity_sha256: str, sessions: list[str]) -> bool:

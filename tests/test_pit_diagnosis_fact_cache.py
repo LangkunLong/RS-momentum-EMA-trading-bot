@@ -361,6 +361,66 @@ def test_resume_refuses_v1_metadata_copied_onto_v2_table(
     assert Path(f"{paths[0]}.partial").exists()
 
 
+def test_resume_refuses_populated_v1_partial_without_sidecars(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+
+    def interrupt_after_first_session(_builder: FactCacheBuilder, _session: str) -> None:
+        raise InterruptedError("leave populated v1 without sidecars")
+
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", interrupt_after_first_session)
+    with pytest.raises(InterruptedError, match="leave populated v1"):
+        build_cache(mini_pit_bundle, paths, resume=False)
+    make_interrupted_partial_v1(paths)
+    partial = Path(f"{paths[0]}.partial")
+    connection = sqlite3.connect(partial)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM session_facts").fetchone()[0] == 10
+    finally:
+        connection.close()
+    paths[1].unlink()
+    paths[2].unlink()
+    before = hashlib.sha256(partial.read_bytes()).hexdigest()
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="fact cache"):
+        build_cache(mini_pit_bundle, paths, resume=True)
+
+    assert partial.exists()
+    assert hashlib.sha256(partial.read_bytes()).hexdigest() == before
+    assert not paths[1].exists()
+    assert not paths[2].exists()
+
+
+def test_resume_migrates_empty_v1_partial_without_sidecars(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+
+    def interrupt_after_first_session(_builder: FactCacheBuilder, _session: str) -> None:
+        raise InterruptedError("leave empty v1 without sidecars")
+
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", interrupt_after_first_session)
+    with pytest.raises(InterruptedError, match="leave empty v1"):
+        build_cache(mini_pit_bundle, paths, resume=False)
+    make_interrupted_partial_v1(paths)
+    partial = Path(f"{paths[0]}.partial")
+    connection = sqlite3.connect(partial)
+    try:
+        connection.execute("DELETE FROM session_facts")
+        connection.commit()
+    finally:
+        connection.close()
+    paths[1].unlink()
+    paths[2].unlink()
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", lambda *_args: None)
+
+    rebuilt = build_cache(mini_pit_bundle, paths, resume=True)
+
+    assert rebuilt.resumed is False
+
+
 def test_supplemental_snapshot_with_date_but_no_evidence_is_rejected() -> None:
     with pytest.raises(ValueError, match="available"):
         InstitutionalSnapshot("2024-01-05", None, None, None)
