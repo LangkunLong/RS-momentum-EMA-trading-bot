@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import pandas as pd
 import pytest
 
-from core.backtest_engine import PortfolioSimulator, Trade
+from core.backtest_engine import PortfolioSimulator, Trade, _calculate_rs_snapshot
+from core.momentum_analysis import calculate_rs_snapshot
 
 
 def _ohlcv(
@@ -105,6 +106,25 @@ class _DatedSignals:
         **_kwargs: object,
     ) -> dict | None:
         return self.signals.get((ticker, eval_date))
+
+
+def _causal_rs_fixture() -> pd.DataFrame:
+    dates = pd.bdate_range("2024-01-02", periods=80)
+    return pd.DataFrame(
+        {
+            f"T{number:02d}": [100.0 * (1.0 + (number + 1) * 0.0005) ** day for day in range(len(dates))]
+            for number in range(10)
+        },
+        index=dates,
+    )
+
+
+def test_public_rs_snapshot_matches_backtest_compatibility_delegate() -> None:
+    """Break caught: the public PIT RS snapshot diverged from the legacy engine checkpoint."""
+    closes = _causal_rs_fixture()
+    day = closes.index[-1]
+
+    assert calculate_rs_snapshot(closes, day) == _calculate_rs_snapshot(closes, day)
 
 
 def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:

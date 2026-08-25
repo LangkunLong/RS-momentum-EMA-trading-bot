@@ -49,7 +49,7 @@ from core.canslim.i_institutional import evaluate_i
 from core.industry_group import get_top_groups, load_industry_map
 from core.data_client import clear_session_cache, fetch_bulk_ohlcv
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
-from core.momentum_analysis import calculate_weighted_performance
+from core.momentum_analysis import calculate_rs_snapshot
 from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
 from core.trading_sessions import exact_session_row, history_through_exact_session
 
@@ -123,45 +123,8 @@ def _calculate_rs_snapshot(
     eval_date: pd.Timestamp,
     eligible_tickers: Optional[Iterable[str]] = None,
 ) -> Dict[str, float]:
-    """Calculate RS scores for the full universe once as-of a specific date."""
-    sliced = history_through_exact_session(all_closes, eval_date)
-    event_row = exact_session_row(all_closes, eval_date)
-    if sliced is None or event_row is None:
-        return {}
-    fresh_columns = [
-        column
-        for column in sliced.columns
-        if _finite_signal_number(event_row[column]) is not None
-    ]
-    sliced = sliced.loc[:, fresh_columns].dropna(axis=1, how="all")
-    if eligible_tickers is not None:
-        eligible = {str(ticker).upper() for ticker in eligible_tickers}
-        sliced = sliced.loc[:, [column for column in sliced.columns if str(column).upper() in eligible]]
-    if sliced.empty:
-        return {}
-
-    perfs: dict[str, float] = {}
-    for ticker in sliced.columns:
-        series = sliced[ticker].dropna()
-        if len(series) < 60:
-            continue
-
-        wp = calculate_weighted_performance(series)
-        if wp is None and len(series) >= 60:
-            raw_return = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
-            trading_days = len(series)
-            wp = (1 + raw_return) ** (252 / trading_days) - 1
-
-        if wp is not None:
-            perfs[str(ticker)] = float(wp)
-
-    if len(perfs) < 10:
-        return {}
-
-    perf_series = pd.Series(perfs)
-    ranks = perf_series.rank(pct=True)
-    rs_scores = ranks * settings.RS_PERCENTILE_MULTIPLIER + settings.RS_PERCENTILE_MIN
-    return {str(symbol): float(score) for symbol, score in rs_scores.items()}
+    """Compatibility delegate for the public causal RS snapshot."""
+    return calculate_rs_snapshot(all_closes, eval_date, eligible_tickers)
 
 
 @dataclass

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import math
 from datetime import datetime
-from typing import Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 
@@ -87,6 +88,63 @@ def calculate_weighted_performance(
         return weighted_performance
     except (IndexError, TypeError, ZeroDivisionError):
         return None
+
+
+def _finite_snapshot_number(value: object) -> float | None:
+    """Return a finite float suitable for an as-of RS snapshot."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def calculate_rs_snapshot(
+    all_closes: pd.DataFrame,
+    eval_date: pd.Timestamp,
+    eligible_tickers: Iterable[str] | None = None,
+) -> dict[str, float]:
+    """Calculate full-universe RS scores using only an exact completed session."""
+    sliced = history_through_exact_session(all_closes, eval_date)
+    event_row = exact_session_row(all_closes, eval_date)
+    if sliced is None or event_row is None:
+        return {}
+    fresh_columns = [
+        column
+        for column in sliced.columns
+        if _finite_snapshot_number(event_row[column]) is not None
+    ]
+    sliced = sliced.loc[:, fresh_columns].dropna(axis=1, how="all")
+    if eligible_tickers is not None:
+        eligible = {str(ticker).upper() for ticker in eligible_tickers}
+        sliced = sliced.loc[:, [column for column in sliced.columns if str(column).upper() in eligible]]
+    if sliced.empty:
+        return {}
+
+    perfs: dict[str, float] = {}
+    for ticker in sliced.columns:
+        series = sliced[ticker].dropna()
+        if len(series) < 60:
+            continue
+
+        wp = calculate_weighted_performance(series)
+        if wp is None and len(series) >= 60:
+            raw_return = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
+            trading_days = len(series)
+            wp = (1 + raw_return) ** (252 / trading_days) - 1
+
+        if wp is not None:
+            perfs[str(ticker)] = float(wp)
+
+    if len(perfs) < 10:
+        return {}
+
+    perf_series = pd.Series(perfs)
+    ranks = perf_series.rank(pct=True)
+    rs_scores = ranks * settings.RS_PERCENTILE_MULTIPLIER + settings.RS_PERCENTILE_MIN
+    return {str(symbol): float(score) for symbol, score in rs_scores.items()}
 
 
 def calculate_rs_scores_for_tickers(
