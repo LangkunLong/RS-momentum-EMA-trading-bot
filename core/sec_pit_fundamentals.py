@@ -95,9 +95,19 @@ _ACCESSION = re.compile(r"^\d{18}$")
 _TICKER = re.compile(r"^[A-Z][A-Z0-9.-]{0,7}$")
 _KNOWN_SEC_ALIASES = {"BF.B": "BF-B", "BRK.B": "BRK-B"}
 _INCOME_CONCEPTS = {
-    "basic_eps": ("us-gaap", "EarningsPerShareBasic", "USD/shares"),
-    "diluted_eps": ("us-gaap", "EarningsPerShareDiluted", "USD/shares"),
-    "net_income": ("us-gaap", "NetIncomeLoss", "USD"),
+    "basic_eps": (("us-gaap", "EarningsPerShareBasic", "USD/shares"),),
+    "diluted_eps": (("us-gaap", "EarningsPerShareDiluted", "USD/shares"),),
+    # NetIncomeLoss is the preferred canonical fact.  A number of otherwise
+    # valid issuers publish annual profit under ProfitLoss (or, less ideally,
+    # the available-to-common variant) without ever publishing
+    # NetIncomeLoss.  Keep these as an ordered fallback set; candidate scoring
+    # below always prefers the first concept that is present for a filing
+    # context, while preserving the selected source concept in the audit row.
+    "net_income": (
+        ("us-gaap", "NetIncomeLoss", "USD"),
+        ("us-gaap", "ProfitLoss", "USD"),
+        ("us-gaap", "NetIncomeLossAvailableToCommonStockholdersBasic", "USD"),
+    ),
 }
 _REVENUE_PRIORITY = (
     ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
@@ -1096,7 +1106,11 @@ def _candidates_for_cik(
     )
 
     definitions: list[tuple[str, str, str, str, int, bool]] = []
-    definitions.extend((metric, ns, concept, unit, 0, False) for metric, (ns, concept, unit) in _INCOME_CONCEPTS.items())
+    definitions.extend(
+        (metric, ns, concept, unit, rank, False)
+        for metric, concepts in _INCOME_CONCEPTS.items()
+        for rank, (ns, concept, unit) in enumerate(concepts)
+    )
     definitions.extend(
         ("total_revenue", ns, concept, unit, rank, False)
         for rank, (ns, concept, unit) in enumerate(_REVENUE_PRIORITY)

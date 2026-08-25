@@ -839,6 +839,53 @@ def _frame_values(snapshot: Mapping[str, Any] | None, name: str, row: str, count
     return (values + [None] * count)[:count]
 
 
+def _frame_period_values(
+    snapshot: Mapping[str, Any] | None,
+    name: str,
+    row: str,
+) -> list[tuple[pd.Timestamp, float]]:
+    """Return non-null statement facts with their period ends, newest first.
+
+    Statement frames can contain a newer period-end column whose value for a
+    particular metric is NULL (for example, a shares-only balance filing).
+    Selecting that column position would incorrectly hide an older, valid
+    fact.  Keeping the period alongside the value lets PIT consumers align
+    annual income and equity instead of relying on column position.
+    """
+    if snapshot is None or not isinstance(snapshot.get(name), pd.DataFrame):
+        return []
+    frame = snapshot[name]
+    if row not in frame.index:
+        return []
+    result: list[tuple[pd.Timestamp, float]] = []
+    for period, raw_value in frame.loc[row].sort_index(ascending=False).items():
+        value = _number(raw_value)
+        if value is not None:
+            result.append((pd.Timestamp(period), value))
+    return result
+
+
+def _pit_roe_values(snapshot: Mapping[str, Any] | None) -> tuple[float | None, float | None, float | None]:
+    """Select a PIT-safe annual net-income/equity pair for ROE.
+
+    Net income is the newest non-null annual fact visible in the snapshot.
+    Equity is reported independently as the newest non-null visible balance
+    fact for diagnostics, but ROE is calculated only when equity exists for
+    the exact annual period and is strictly positive.  Failing closed on a
+    mismatched or negative denominator preserves CANSLIM's meaning and avoids
+    cross-period or sign-inverted rankings.
+    """
+    annual = _frame_period_values(snapshot, "annual_income", "Net Income")
+    equity_values = _frame_period_values(snapshot, "balance_sheet", "Total Stockholders Equity")
+    latest_equity = equity_values[0][1] if equity_values else None
+    if not annual:
+        return None, latest_equity, None
+    income_period, net_income = annual[0]
+    matched_equity = next((value for period, value in equity_values if period == income_period), None)
+    roe = _number(net_income / matched_equity) if matched_equity is not None and matched_equity > 0.0 else None
+    return net_income, latest_equity, roe
+
+
 def _ratio(numerator: float | None, denominator: float | None) -> float | None:
     return _number((numerator / denominator) - 1.0) if numerator is not None and denominator not in (None, 0.0) else None
 
@@ -850,15 +897,14 @@ def _fundamental_values(snapshot: Mapping[str, Any] | None) -> dict[str, object]
     # Net income is an income-statement measure.  The PIT bundle keeps it in
     # annual_income; looking for it in balance_sheet silently made ROE
     # unavailable for every cached row and blocked the required A.ROE gate.
-    net_income = _frame_values(snapshot, "annual_income", "Net Income", 1)[0]
-    equity = _frame_values(snapshot, "balance_sheet", "Total Stockholders Equity", 1)[0]
+    net_income, equity, roe = _pit_roe_values(snapshot)
     info = {} if snapshot is None else snapshot.get("company_info", {})
     shares = _number(info.get("shares_outstanding")) if isinstance(info, Mapping) else None
     return {
         "current_eps": eps[0], "prior_year_eps": eps[4], "current_sales": sales[0], "prior_year_sales": sales[4],
         "annual_eps_1": annual[0], "annual_eps_2": annual[1], "annual_eps_3": annual[2], "annual_eps_4": annual[3],
         "net_income": net_income, "total_stockholders_equity": equity, "current_eps_yoy": _ratio(eps[0], eps[4]), "sales_yoy": _ratio(sales[0], sales[4]),
-        "roe": _number(net_income / equity) if net_income is not None and equity not in (None, 0.0) else None, "shares_outstanding": shares,
+        "roe": roe, "shares_outstanding": shares,
     }
 
 

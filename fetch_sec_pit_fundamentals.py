@@ -498,6 +498,11 @@ def publish_normalized_outputs(
                 "RevenueFromContractWithCustomerExcludingAssessedTax",
                 "Revenues",
             ],
+            "net_income_concept_priority": [
+                "NetIncomeLoss",
+                "ProfitLoss",
+                "NetIncomeLossAvailableToCommonStockholdersBasic",
+            ],
             "institutional_fields": "omitted_blank",
             "security_master_row_count": len(security_master.rows),
             "security_master_exclusion_row_count": len(security_master.exclusions),
