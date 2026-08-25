@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+from typing import Any, Mapping
 
 import pandas as pd
 import pytest
@@ -14,7 +15,7 @@ from core.pit_data import PITDataBundle
 from core.pit_diagnosis.fact_cache import FactCacheBuilder, _FACT_COLUMNS, _V1_SCHEMA_SHA256, _V1_SESSION_FACTS_CREATE_SQL, _frame_values, _number, build_fact_cache, open_fact_cache
 from core.pit_diagnosis.models import DatePartition, DatePartitions
 from core.pit_diagnosis.rulebook import canonical_sha256, load_rulebook
-from core.pit_diagnosis.supplemental import IndustryGroupSnapshot, InstitutionalSnapshot
+from core.pit_diagnosis.supplemental import IndustryGroupSnapshot, InstitutionalSnapshot, UnavailableSupplementalPITProvider
 
 
 class _MiniPITBundle:
@@ -194,6 +195,44 @@ def test_fact_cache_prefetches_full_range_once_without_changing_session_facts(tm
         assert row.close == bundle._prices["S00"].loc[pd.Timestamp("2024-01-05"), "Close"]
         assert row.prior_close == bundle._prices["S00"].loc[pd.Timestamp("2024-01-04"), "Close"]
         assert row.market_regime == "unavailable"
+
+
+def test_session_materialization_passes_full_prefetched_price_frames_to_rows(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+    builder = FactCacheBuilder(
+        bundle=mini_pit_bundle,
+        rulebook=rulebook_v1(),
+        partitions=mini_partitions(),
+        output_path=paths[0],
+        checkpoint_path=paths[1],
+        progress_path=paths[2],
+        supplemental_provider=UnavailableSupplementalPITProvider(),
+    )
+    prefetched = builder._prefetch_prices()
+    session = "2024-01-05"
+    seen: dict[str, pd.DataFrame | None] = {}
+    original = builder._row
+
+    def capture(
+        symbol: str,
+        row_session: str,
+        prices: pd.DataFrame | None,
+        state: Mapping[str, Any] | None,
+        state_date: str | None,
+        rs_rating: float | None,
+        market: Mapping[str, object],
+    ) -> dict[str, object]:
+        seen[symbol] = prices
+        return original(symbol, row_session, prices, state, state_date, rs_rating, market)
+
+    monkeypatch.setattr(builder, "_row", capture)
+    builder._materialize_session(session, builder._fundamental_states([session]), prefetched)
+
+    assert seen
+    assert all(seen[symbol] is prefetched.prices[symbol] for symbol in seen)
+    assert all(pd.Timestamp("2024-01-08") in prices.index for prices in seen.values() if prices is not None)
 
 
 def test_successor_member_without_admission_price_is_cached_as_price_unavailable(tmp_path: Path) -> None:

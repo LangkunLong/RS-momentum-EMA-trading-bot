@@ -312,7 +312,7 @@ class FactCacheBuilder:
         closes = prefetched_prices.closes.loc[:as_of, available_members]
         rs = calculate_pit_rs_snapshot(closes, as_of, eligible_tickers=members)
         price_data = {
-            symbol: prefetched_prices.prices[symbol].loc[:as_of]
+            symbol: prefetched_prices.prices[symbol]
             for symbol in members
             if symbol in prefetched_prices.prices
         }
@@ -329,8 +329,9 @@ class FactCacheBuilder:
     def _row(self, symbol: str, session: str, prices: pd.DataFrame | None, state: Mapping[str, Any] | None, state_date: str | None, rs_rating: float | None, market: Mapping[str, object]) -> dict[str, object]:
         if prices is None or pd.Timestamp(session) not in prices.index:
             return self._unpriced_row(symbol, session, state, state_date, market)
-        history = prices.loc[prices.index <= pd.Timestamp(session)].copy()
-        event = history.loc[pd.Timestamp(session)]
+        as_of = pd.Timestamp(session)
+        history = prices.loc[:as_of]
+        event = history.loc[as_of]
         prior = history.iloc[:-1]
         prior_close = _number(prior["Close"].iloc[-1]) if not prior.empty else None
         prior_avg = _number(prior["Volume"].tail(50).mean()) if not prior.empty else None
