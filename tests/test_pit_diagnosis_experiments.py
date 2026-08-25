@@ -14,7 +14,7 @@ from core.pit_diagnosis.catalog import fixed_partitions, load_experiment_catalog
 from core.pit_diagnosis.baseline import BaselineReproduction, BaselineSnapshot
 import core.pit_diagnosis.baseline as baseline_module
 import core.pit_diagnosis.experiments as experiments_module
-from core.pit_diagnosis.experiments import DiagnosisContext, run_catalog, run_experiment
+from core.pit_diagnosis.experiments import DiagnosisContext, run_catalog, run_experiment, run_locked_catalog
 from core.pit_diagnosis.fact_cache import SessionFact
 from core.pit_diagnosis.models import FidelityLabel, PartitionName
 from core.pit_diagnosis.metrics import LeaderRecallEvidence, PerformanceEvidence
@@ -466,3 +466,16 @@ def test_ex_post_leader_labels_cannot_change_a_trade_path(
     )
     assert first.trade_path_sha256 == second.trade_path_sha256
     assert first.leader_recall != second.leader_recall
+
+
+def test_locked_catalog_requires_identifiers_and_isolates_checkpoint_identity(
+    diagnosis_context: DiagnosisContext, tmp_path: Path,
+) -> None:
+    context = diagnosis_context.with_verified_baseline_reproduction(
+        diagnosis_context.baseline_reproduction
+    )
+    with pytest.raises(ValueError, match="human selection"):
+        run_locked_catalog(context, ("D2.RULE_STAGE_FUNNEL",), tmp_path, human_selection_id="", research_generation_id="generation", resume=False)
+    first = run_locked_catalog(context, ("D2.RULE_STAGE_FUNNEL",), tmp_path, human_selection_id="selection-a", research_generation_id="generation", resume=False)
+    second = run_locked_catalog(context, ("D2.RULE_STAGE_FUNNEL",), tmp_path, human_selection_id="selection-b", research_generation_id="generation", resume=False)
+    assert first[0].identity_sha256 != second[0].identity_sha256

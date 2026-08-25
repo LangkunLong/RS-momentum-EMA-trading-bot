@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
+import sqlite3
 from types import MappingProxyType
 
 import pytest
@@ -49,8 +51,10 @@ class _Facts:
 def mini_completed_context(tmp_path: Path) -> tuple[DiagnosisContext, tuple[object, ...]]:
     from tests.test_pit_diagnosis_experiments import _baseline_snapshot
 
+    from tests.test_pit_diagnosis_fact_cache import _MiniPITBundle, build_cache
+
     facts_path = tmp_path / "diagnosis_facts.sqlite3"
-    facts_path.write_bytes(b"offline deterministic fact cache")
+    build_cache(_MiniPITBundle(), (facts_path, tmp_path / "facts.checkpoint.json", tmp_path / "facts.progress.jsonl"), resume=False)
     rulebook = load_rulebook(Path("config/pit_canslim_rulebook_v1.json"))
     catalog = load_experiment_catalog(Path("config/pit_diagnosis_experiments_v1.json"), rulebook)
     baseline_root = tmp_path / "baseline"
@@ -106,3 +110,70 @@ def test_publication_is_complete_hash_bound_and_refuses_reuse(
     }
     with pytest.raises(FileExistsError):
         publish_diagnosis(context, results, run_dir)
+
+
+def _rehash_manifest(run_dir: Path, artifact: str) -> None:
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_sha256"][artifact] = hashlib.sha256((run_dir / artifact).read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def _inject_nan(path: Path) -> None:
+    rows = path.read_text(encoding="utf-8").splitlines()
+    values = rows[1].split(",")
+    values[4] = "nan"
+    path.write_text("\n".join((rows[0], ",".join(values))) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("artifact", "mutate", "message"),
+    (
+        ("rule_attribution.csv", lambda path: path.write_text("Ticker\nAAA\n", encoding="utf-8"), "schema"),
+        ("entry_funnel.csv", _inject_nan, "non-finite"),
+        ("report.md", lambda path: path.write_text("transaction price provider payload\n", encoding="utf-8"), "raw"),
+    ),
+)
+def test_publication_verifier_rejects_rehashed_raw_or_malformed_text_artifacts(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path, artifact: str, mutate: object, message: str,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    mutate(run_dir / artifact)
+    _rehash_manifest(run_dir, artifact)
+    with pytest.raises(ValueError, match=message):
+        verify_diagnosis_run(run_dir)
+
+
+def test_publication_verifier_rejects_rehashed_sqlite_extra_raw_field(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    path = run_dir / "diagnosis_facts.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("ALTER TABLE session_facts ADD COLUMN provider_payload TEXT")
+    connection.commit()
+    connection.close()
+    _rehash_manifest(run_dir, "diagnosis_facts.sqlite3")
+    with pytest.raises(ValueError, match="schema|raw"):
+        verify_diagnosis_run(run_dir)
+
+
+def test_publication_verifier_requires_exact_manifest_schema(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    path = run_dir / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["undeclared"] = True
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest schema"):
+        verify_diagnosis_run(run_dir)

@@ -152,6 +152,10 @@ def _run(args: argparse.Namespace) -> int:
     cache: object | None = None
     try:
         context, bundle, cache = _context(args)
+        input_identities = {
+            "rulebook": sha256_file(args.rulebook), "catalog": sha256_file(args.experiment_catalog),
+            "baseline_manifest": sha256_file(args.baseline_run / "run_manifest.json"),
+        }
         reproduction = compare_reproduction(context.baseline_snapshot, context.reproduced_baseline)
         context = context.with_verified_baseline_reproduction(reproduction)
         experiment_ids = tuple(item.experiment_id for item in context.catalog.experiments.values() if item.phase in {"D1", "D2", "D3", "D4"})
@@ -171,8 +175,16 @@ def _run(args: argparse.Namespace) -> int:
             results = (*d0, *run_catalog(context, experiment_ids, tuple(PartitionName(item) for item in selected), args.checkpoint_root, resume=args.resume))
             output_root = args.output_root
         source_before = context.source_fingerprint_sha256
-        if _source_fingerprint() != source_before or sha256_file(args.pit_bundle) != args.pit_bundle_sha256 or sha256_file(args.fact_cache) != args.fact_cache_sha256:
-            raise ValueError("source, bundle, or fact-cache identity changed during diagnosis")
+        if (
+            _source_fingerprint() != source_before
+            or sha256_file(args.pit_bundle) != args.pit_bundle_sha256
+            or sha256_file(args.fact_cache) != args.fact_cache_sha256
+            or sha256_file(args.rulebook) != input_identities["rulebook"]
+            or sha256_file(args.experiment_catalog) != input_identities["catalog"]
+            or sha256_file(args.baseline_run / "run_manifest.json") != input_identities["baseline_manifest"]
+            or verify_baseline_run(args.baseline_run, canonical_authority()).manifest_sha256 != context.baseline_snapshot.manifest_sha256
+        ):
+            raise ValueError("source, bundle, rulebook, catalog, fact-cache, or baseline identity changed during diagnosis")
         run_dir = publish_diagnosis(context, results, output_root)
         print(json.dumps(verify_diagnosis_run(run_dir), sort_keys=True))
         return 0

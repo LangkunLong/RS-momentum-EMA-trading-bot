@@ -770,6 +770,9 @@ class PITDataBundle:
         )
         frame = frame.set_index("period_end")[list(_FUNDAMENTAL_COLUMN_MAP)]
         frame = frame.rename(columns=_FUNDAMENTAL_COLUMN_MAP).transpose()
+        # Preserve SQLite NULL distinctly from a numeric NaN so downstream PIT
+        # consumers can record unavailable fields without accepting non-finite data.
+        frame = frame.astype(object).where(frame.notna(), None)
         frame = frame.dropna(axis="index", how="all").sort_index(axis="columns")
         return frame
 

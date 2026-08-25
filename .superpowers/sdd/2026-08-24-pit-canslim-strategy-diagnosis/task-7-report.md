@@ -81,3 +81,23 @@ metrics exist yet.  Consequently `run` and `verify-result` were not executed.
 - No agent event, raw provider data, transaction rows, price rows, secrets, or
   ex-post leader labels were published.  The first completed run still needs
   its manifest hash and causal metrics recorded here.
+
+## Review fix round 1
+
+- Hardened the verifier with an exact manifest schema, digest/type checks,
+  canonical rulebook/catalog reconstruction, exact CSV/JSON schemas,
+  non-finite/raw-field rejection, fact-cache reopening, and report screening.
+- Publication and the CLI final guard now reconcile source, bundle, rulebook,
+  catalog, fact-cache, and baseline identities.
+- Preserved SQLite NULL at the PIT-data frame boundary; genuine supplied NaN
+  remains fail-closed.
+- Added regression coverage for rehashed malformed/non-finite/raw CSV/report
+  and SQLite artifacts, manifest completeness, SQL NULL versus NaN, and locked
+  checkpoint isolation.
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q \
+  tests/test_pit_diagnosis_cli.py tests/test_pit_diagnosis_fact_cache.py \
+  tests/test_pit_diagnosis_experiments.py
+43 passed, 2 warnings
+```

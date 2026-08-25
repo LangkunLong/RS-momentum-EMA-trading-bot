@@ -8,6 +8,7 @@ import sys
 import pandas as pd
 import pytest
 
+from core.pit_data import PITDataBundle
 from core.pit_diagnosis.fact_cache import FactCacheBuilder, _frame_values, _number, build_fact_cache, open_fact_cache
 from core.pit_diagnosis.models import DatePartition, DatePartitions
 from core.pit_diagnosis.rulebook import load_rulebook
@@ -216,7 +217,19 @@ def test_non_finite_numbers_fail_closed(value: float) -> None:
         _number(value)
 
 
-def test_missing_fundamental_cells_are_explicitly_unavailable() -> None:
-    snapshot = {"quarterly_income": pd.DataFrame([[float("nan"), 1.0]], index=["Diluted EPS"])}
+def test_sqlite_null_fundamental_cells_are_explicitly_unavailable() -> None:
+    frame = PITDataBundle._statement_frame([{
+        "statement_type": "quarterly", "period_end": "2023-12-31", "public_date": "2024-02-01",
+        "basic_eps": None, "diluted_eps": None, "total_revenue": 1.0, "net_income": None,
+        "common_stock": None, "total_stockholders_equity": None,
+    }], "quarterly")
+    snapshot = {"quarterly_income": frame}
 
-    assert _frame_values(snapshot, "quarterly_income", "Diluted EPS", 3) == [1.0, None, None]
+    assert _frame_values(snapshot, "quarterly_income", "Diluted EPS", 3) == [None, None, None]
+
+
+def test_non_sqlite_nan_fundamental_cell_fails_closed() -> None:
+    snapshot = {"quarterly_income": pd.DataFrame([[float("nan")]], index=["Diluted EPS"])}
+
+    with pytest.raises(ValueError, match="non-finite"):
+        _frame_values(snapshot, "quarterly_income", "Diluted EPS", 1)
