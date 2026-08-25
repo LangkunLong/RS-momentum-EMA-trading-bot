@@ -290,6 +290,24 @@ def _html_metadata(raw: str) -> RevisionMetadata:
         raise ValueError("revision HTML metadata is malformed") from exc
     ids = tuple(dict.fromkeys(parser.revision_ids))
     timestamps = tuple(dict.fromkeys(parser.timestamps))
+    # Immutable Wikipedia pages also expose the revision in the bootstrap
+    # configuration and the human-readable old-revision banner, rather than
+    # as standard metadata tags.  These fallbacks remain pinned to the page's
+    # own revision marker and are not inferred from retrieval time.
+    if not ids:
+        ids = tuple(dict.fromkeys(re.findall(r'"wgRevisionId"\s*:\s*([0-9]+)', raw)))
+    if not timestamps:
+        match = re.search(
+            r'id=["\']mw-revision-date["\'][^>]*>\s*([^<]+?)\s*</',
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            try:
+                parsed = datetime.strptime(match.group(1).strip(), "%H:%M, %d %B %Y")
+            except ValueError as exc:
+                raise ValueError("revision HTML date banner is invalid") from exc
+            timestamps = (parsed.replace(tzinfo=timezone.utc).isoformat(),)
     if len(ids) != 1 or len(timestamps) != 1:
         raise ValueError("revision HTML must contain exactly one revid and timestamp")
     return RevisionMetadata(_parse_revid(ids[0]), _parse_timestamp(timestamps[0]))

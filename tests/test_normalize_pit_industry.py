@@ -97,6 +97,30 @@ def test_html_revision_reads_metadata_and_table(tmp_path: Path) -> None:
     ]
 
 
+def test_html_revision_reads_mediawiki_banner_metadata_fallback(tmp_path: Path) -> None:
+    revision = tmp_path / "revision.html"
+    revision.write_text(
+        """
+        <html><head><script>var cfg = {"wgRevisionId": 789};</script></head>
+        <body><span id="mw-revision-date">19:55, 31 December 2020</span>
+          <table><tr><th>Symbol</th><th>GICS Sub-Industry</th></tr>
+          <tr><td>AAA</td><td>Semiconductors</td></tr></table>
+        </body></html>
+        """,
+        encoding="utf-8",
+    )
+    output = tmp_path / "classification.csv"
+    result = normalize_revision(
+        revision_export=revision,
+        sessions=("2020-12-31", "2021-01-04"),
+        output=output,
+    )
+
+    assert result.revid == 789
+    assert result.revision_timestamp == "2020-12-31T19:55:00Z"
+    assert result.as_of_date == "2021-01-04"
+
+
 def test_pit_membership_is_an_exact_active_set_gate(tmp_path: Path) -> None:
     revision = tmp_path / "revision.json"
     sessions = tmp_path / "sessions.csv"
