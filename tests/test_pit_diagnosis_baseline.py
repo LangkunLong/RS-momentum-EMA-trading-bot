@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import core.pit_diagnosis.baseline as baseline_module
 from core.pit_diagnosis.baseline import (
     BaselineAuthority,
     canonical_authority,
@@ -24,6 +25,18 @@ def _sha256(path: Path) -> str:
 
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, sort_keys=True, allow_nan=False), encoding="utf-8")
+
+
+def _replace_artifact_identity(
+    run_dir: Path, authority: BaselineAuthority, name: str
+) -> BaselineAuthority:
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifacts = dict(authority.artifact_sha256)
+    artifacts[name] = _sha256(run_dir / name)
+    manifest["artifacts"] = artifacts
+    _write_json(manifest_path, manifest)
+    return replace(authority, artifact_sha256=artifacts)
 
 
 @pytest.fixture
@@ -138,6 +151,12 @@ def mini_verified_run(tmp_path: Path) -> tuple[Path, BaselineAuthority]:
         replay_git_head=canonical_authority().replay_git_head,
         bundle_sha256="a" * 64,
         artifact_sha256=artifacts,
+        entry_outcome_row_sha256=baseline_module._normalized_ordered_row_sha256(
+            pd.read_csv(run_dir / "entry_attempt_outcomes.csv", keep_default_na=False)
+        ),
+        transaction_row_sha256=baseline_module._normalized_ordered_row_sha256(
+            pd.read_csv(run_dir / "transactions.csv", keep_default_na=False)
+        ),
         total_return_pct=-10.0,
         annualized_return_pct=-10.0,
         sharpe_ratio=-1.0,
@@ -162,6 +181,12 @@ def test_corrected_baseline_authority_is_exact() -> None:
     assert authority.executed_entries == 225
     assert authority.next_open_buy_zone_rejections == 51
     assert authority.average_cash_pct == pytest.approx(67.31359377429541)
+    assert authority.entry_outcome_row_sha256 == (
+        "8b479ef13e693a2fc101dc3c8b1bdb0204e71122c6701fc5a7e23cd67cf3f3aa"
+    )
+    assert authority.transaction_row_sha256 == (
+        "603ccc01141cf55447412d1caa40e9942c5f59745c73183644be8d9b65ab72c5"
+    )
 
 
 def test_baseline_verifier_rejects_one_changed_transaction(
@@ -186,6 +211,57 @@ def test_baseline_verifier_reconciles_ledgers_and_reproduction_is_exact(
     assert snapshot.transaction_row_sha256
     assert reproduction.passed is True
     assert reproduction.mismatch_codes == ()
+
+
+def test_reproduction_rejects_different_replay_and_manifest_identity(
+    mini_verified_run: tuple[Path, BaselineAuthority],
+) -> None:
+    run_dir, authority = mini_verified_run
+    snapshot = verify_baseline_run(run_dir, authority)
+    reproduced = replace(
+        snapshot,
+        replay_git_head="b" * 40,
+        manifest_sha256="c" * 64,
+    )
+
+    result = compare_reproduction(snapshot, reproduced)
+
+    assert result.passed is False
+    assert result.mismatch_codes == (
+        "identity.replay_git_head",
+        "identity.manifest_sha256",
+    )
+
+
+def test_baseline_verifier_rejects_changed_transaction_row_after_artifact_rehash(
+    mini_verified_run: tuple[Path, BaselineAuthority],
+) -> None:
+    run_dir, authority = mini_verified_run
+    frame = pd.read_csv(run_dir / "transactions.csv")
+    frame.loc[0, "Price"] += 0.01
+    frame.to_csv(run_dir / "transactions.csv", index=False)
+    rehashed_authority = _replace_artifact_identity(
+        run_dir, authority, "transactions.csv"
+    )
+
+    with pytest.raises(ValueError, match="transaction row hash"):
+        verify_baseline_run(run_dir, rehashed_authority)
+
+
+def test_baseline_verifier_rejects_daily_qualified_count_shift(
+    mini_verified_run: tuple[Path, BaselineAuthority],
+) -> None:
+    run_dir, authority = mini_verified_run
+    funnel = pd.read_csv(run_dir / "daily_entry_funnel.csv")
+    funnel.loc[0, "qualified_count"] += 1
+    funnel.loc[1, "qualified_count"] -= 1
+    funnel.to_csv(run_dir / "daily_entry_funnel.csv", index=False)
+    rehashed_authority = _replace_artifact_identity(
+        run_dir, authority, "daily_entry_funnel.csv"
+    )
+
+    with pytest.raises(ValueError, match="daily funnel qualified_count"):
+        verify_baseline_run(run_dir, rehashed_authority)
 
 
 def test_baseline_verifier_rejects_nonfinite_summary_value(

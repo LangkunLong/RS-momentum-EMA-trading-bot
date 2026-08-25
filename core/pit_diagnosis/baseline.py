@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+from numbers import Real
 import os
 from pathlib import Path
 import stat
@@ -84,6 +85,8 @@ class BaselineAuthority:
     bundle_sha256: str
     manifest_sha256: str
     artifact_sha256: Mapping[str, str]
+    entry_outcome_row_sha256: str
+    transaction_row_sha256: str
     total_return_pct: float
     annualized_return_pct: float
     sharpe_ratio: float
@@ -104,7 +107,12 @@ class BaselineAuthority:
                 character not in "0123456789abcdef" for character in value
             ):
                 raise ValueError(f"{name} must be a lowercase Git SHA-1")
-        for name in ("bundle_sha256", "manifest_sha256"):
+        for name in (
+            "bundle_sha256",
+            "manifest_sha256",
+            "entry_outcome_row_sha256",
+            "transaction_row_sha256",
+        ):
             _require_digest(getattr(self, name), name)
         if not isinstance(self.artifact_sha256, Mapping) or not self.artifact_sha256:
             raise ValueError("artifact_sha256 must be a non-empty mapping")
@@ -146,6 +154,7 @@ class BaselineSnapshot:
     run_dir: Path
     manifest_sha256: str
     source_commit: str
+    replay_git_head: str
     bundle_sha256: str
     artifact_sha256: Mapping[str, str]
     signal_row_sha256: str
@@ -169,6 +178,10 @@ class BaselineSnapshot:
             character not in "0123456789abcdef" for character in self.source_commit
         ):
             raise ValueError("source_commit must be a lowercase Git SHA-1")
+        if not isinstance(self.replay_git_head, str) or len(self.replay_git_head) != 40 or any(
+            character not in "0123456789abcdef" for character in self.replay_git_head
+        ):
+            raise ValueError("replay_git_head must be a lowercase Git SHA-1")
         for name in (
             "manifest_sha256",
             "bundle_sha256",
@@ -252,6 +265,8 @@ def canonical_authority() -> BaselineAuthority:
             "transactions.csv": "b80d420864149c128d16cf2f6d19e77944618d900928c8135e980852091eda80",
             "weekly_holdings.csv": "e76e450a959029c5e300cc9848960ffa3e13bac2e8f6d382fea10168a8508cf7",
         },
+        entry_outcome_row_sha256="8b479ef13e693a2fc101dc3c8b1bdb0204e71122c6701fc5a7e23cd67cf3f3aa",
+        transaction_row_sha256="603ccc01141cf55447412d1caa40e9942c5f59745c73183644be8d9b65ab72c5",
         total_return_pct=-9.994717769465932,
         annualized_return_pct=-2.0874097904821753,
         sharpe_ratio=-0.2082076838233648,
@@ -311,6 +326,12 @@ def verify_baseline_run(run_dir: Path, authority: BaselineAuthority) -> Baseline
     _reject_nonfinite_frame(funnel, "daily funnel")
     _reject_nonfinite_frame(equity, "equity curve")
     _reject_nonfinite_frame(recall, "leader recall")
+    entry_outcome_row_sha256 = _normalized_ordered_row_sha256(outcomes)
+    transaction_row_sha256 = _normalized_ordered_row_sha256(transactions)
+    if entry_outcome_row_sha256 != authority.entry_outcome_row_sha256:
+        raise ValueError("entry-outcome row hash differs from corrected authority")
+    if transaction_row_sha256 != authority.transaction_row_sha256:
+        raise ValueError("transaction row hash differs from corrected authority")
     _verify_summary(summary, authority)
     _verify_ledgers(outcomes, transactions, funnel, authority)
     _verify_equity(equity)
@@ -318,11 +339,12 @@ def verify_baseline_run(run_dir: Path, authority: BaselineAuthority) -> Baseline
         run_dir=directory,
         manifest_sha256=_sha256_file(manifest_path),
         source_commit=authority.source_commit,
+        replay_git_head=authority.replay_git_head,
         bundle_sha256=authority.bundle_sha256,
         artifact_sha256={str(key): str(value) for key, value in artifacts.items()},
         signal_row_sha256=authority.artifact_sha256["canslim_signals.csv"],
-        entry_outcome_row_sha256=_ordered_row_sha256(_read_csv_text(directory / "entry_attempt_outcomes.csv")),
-        transaction_row_sha256=_ordered_row_sha256(_read_csv_text(directory / "transactions.csv")),
+        entry_outcome_row_sha256=entry_outcome_row_sha256,
+        transaction_row_sha256=transaction_row_sha256,
         total_return_pct=authority.total_return_pct,
         annualized_return_pct=authority.annualized_return_pct,
         sharpe_ratio=authority.sharpe_ratio,
@@ -345,9 +367,12 @@ def compare_reproduction(
     if not isinstance(authority, BaselineSnapshot) or not isinstance(reproduced, BaselineSnapshot):
         raise ValueError("authority and reproduced must be BaselineSnapshot values")
     mismatches: list[str] = []
-    for name in ("source_commit", "bundle_sha256"):
+    for name in ("source_commit", "replay_git_head", "bundle_sha256", "manifest_sha256"):
         if getattr(authority, name) != getattr(reproduced, name):
             mismatches.append(f"identity.{name}")
+    for name in ("entry_outcome_row_sha256", "transaction_row_sha256"):
+        if getattr(authority, name) != getattr(reproduced, name):
+            mismatches.append(f"rows.{name}")
     for name in (
         "total_return_pct", "annualized_return_pct", "sharpe_ratio", "max_drawdown_pct",
         "closed_trades", "win_rate_pct", "average_cash_pct", "qualified_entries",
@@ -428,15 +453,6 @@ def _read_csv(path: Path) -> pd.DataFrame:
     try:
         return pd.read_csv(
             _regular_file(path, f"artifact {path.name}"), keep_default_na=False
-        )
-    except (OSError, ValueError, pd.errors.ParserError) as exc:
-        raise ValueError(f"artifact {path.name} is not a valid CSV") from exc
-
-
-def _read_csv_text(path: Path) -> pd.DataFrame:
-    try:
-        return pd.read_csv(
-            _regular_file(path, f"artifact {path.name}"), dtype=str, keep_default_na=False
         )
     except (OSError, ValueError, pd.errors.ParserError) as exc:
         raise ValueError(f"artifact {path.name} is not a valid CSV") from exc
@@ -550,6 +566,8 @@ def _verify_ledgers(
         expected = outcome_daily[name].reindex(funnel_daily.index, fill_value=0).astype(int)
         if not (funnel_daily[name].astype(int) == expected).all():
             raise ValueError(f"daily funnel {name} does not reconcile with outcomes")
+    if (funnel_daily["attempted_count"].astype(int) > funnel_daily["qualified_count"].astype(int)).any():
+        raise ValueError("daily funnel qualified_count does not cover entry attempts")
     buy_actions = transactions["Action"].astype(str).str.upper().eq("BUY")
     if int(buy_actions.sum()) != authority.executed_entries:
         raise ValueError("BUY transactions do not reconcile with executed entries")
@@ -575,10 +593,33 @@ def _verify_equity(equity: pd.DataFrame) -> None:
         raise ValueError("equity curve contains invalid values")
 
 
-def _ordered_row_sha256(frame: pd.DataFrame) -> str:
-    payload = {"columns": list(frame.columns), "rows": frame.astype(str).values.tolist()}
+def _normalized_ordered_row_sha256(frame: pd.DataFrame) -> str:
+    payload = {
+        "columns": list(frame.columns),
+        "rows": [
+            [_normalized_row_value(value) for value in row]
+            for row in frame.itertuples(index=False, name=None)
+        ],
+    }
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalized_row_value(value: object) -> object:
+    if value is None or value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, str):
+        return None if value == "" else value
+    if isinstance(value, bool) or value.__class__.__name__ == "bool_":
+        return ("bool", bool(value))
+    if isinstance(value, Real):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        return ("number", format(number, ".17g"))
+    if pd.isna(value):
+        return None
+    return str(value)
 
 
 def _csv_frames_equal(left_path: Path, right_path: Path) -> bool:
