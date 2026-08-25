@@ -90,6 +90,39 @@ missing dates are excluded or rejected fail-closed. Its isolated-quarter output
 sets `previous_holder_count` to zero; a multi-quarter assembly step must replace
 that field with the prior quarter's holder count before strict I-gating.
 
+### Multi-quarter assembly
+
+Use an explicit ordered manifest to combine the isolated-quarter outputs. The
+manifest is either a UTF-8 CSV with this exact header:
+
+```text
+quarter,institutional_csv,source_reference,evidence_ids
+```
+
+or a JSON object with `schema_version: 1` and a `quarters` array containing
+those same four fields. Paths are relative to the manifest file. `quarter`
+must be strictly increasing `YYYYQn`; `source_reference` is a stable archive
+or evidence reference, and `evidence_ids` is a JSON array of strings.
+
+```powershell
+python -m tools.normalize_sec13f `
+  --quarter-manifest quarters.csv `
+  --data-cutoff 2025-12-31 `
+  --output institutional.csv
+```
+
+The assembler is deliberately limited to post-quarter consolidated snapshots:
+each listed CSV must contain exactly one distinct `as_of_date`. Staggered
+filing-event rows are rejected because the isolated CSV does not retain
+manager-level state needed to reconstruct a complete as-of snapshot; use a
+manager-level extraction for that event-time analysis. Quarter date ranges must
+be strictly chronological, and duplicate `(symbol, as_of_date)` rows are
+rejected. For each symbol, `previous_holder_count` is taken from the latest
+available earlier quarter snapshot, strictly before the current date, and is
+zero only for that symbol's first observation. Existing ownership, holder
+count, and row evidence are preserved; manifest evidence and the source
+reference are unioned into the row evidence array in canonical order.
+
 Pass stable archive identifiers or URLs with one or more repeated
 `--source-reference` options. References are stored in a separate canonical
 provenance manifest (not in raw fact rows); its SHA-256 is sealed in the
