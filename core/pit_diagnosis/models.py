@@ -239,6 +239,8 @@ class ExperimentDefinition:
     def __post_init__(self) -> None:
         for name in ("experiment_id", "phase", "domain"):
             _text(getattr(self, name), name)
+        if self.phase not in {"D0", "D1", "D2", "D3", "D4", "D5"}:
+            raise ValueError("phase must be one of D0-D5")
         object.__setattr__(self, "kind", ExperimentKind(self.kind))
         for name in ("changed_dimensions", "rule_ids", "allowed_variant_ids"):
             value = getattr(self, name)
@@ -249,6 +251,10 @@ class ExperimentDefinition:
         for name in ("promotion_eligible", "controller_composed", "requires_code"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be bool")
+        if self.phase != "D5" and len(self.changed_dimensions) != 1:
+            raise ValueError("D0-D4 experiments must change exactly one causal dimension")
+        if self.phase == "D5" and (self.changed_dimensions or self.allowed_variant_ids):
+            raise ValueError("D5 experiments cannot contain pre-composed dimensions or variants")
 
     @classmethod
     def from_mapping(cls, item: Mapping[str, object], rulebook: Rulebook) -> "ExperimentDefinition":
@@ -261,8 +267,6 @@ class ExperimentDefinition:
                 raise ValueError(f"{field} must be a JSON array")
             values[field] = tuple(values[field])
         result = cls(**values)
-        if result.phase != "D5" and len(result.changed_dimensions) != 1:
-            raise ValueError("D0-D4 experiments must change exactly one causal dimension")
         missing = set(result.rule_ids) - set(rulebook.rules)
         if missing:
             raise ValueError(f"experiment cites absent rule IDs: {sorted(missing)}")
@@ -281,8 +285,18 @@ class ExperimentCatalog:
     _experiments: Mapping[str, ExperimentDefinition]
     sha256: str
 
+    def __post_init__(self) -> None:
+        _text(self.version, "version")
+        if not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ValueError("sha256 must be a lowercase 64-character SHA-256 hex digest")
+        if not isinstance(self._experiments, Mapping):
+            raise ValueError("experiments must be a mapping")
+        object.__setattr__(self, "_experiments", MappingProxyType(dict(self._experiments)))
+
     @classmethod
     def from_records(cls, version: str, records: tuple[ExperimentDefinition, ...], sha256: str) -> "ExperimentCatalog":
+        if not isinstance(records, tuple) or any(not isinstance(record, ExperimentDefinition) for record in records):
+            raise ValueError("records must be a tuple of ExperimentDefinition values")
         if not records or len({record.experiment_id for record in records}) != len(records):
             raise ValueError("experiment IDs must be unique and non-empty")
         return cls(version, MappingProxyType({record.experiment_id: record for record in records}), sha256)
@@ -305,10 +319,16 @@ class ExperimentIdentity:
         def normalize(value):
             if isinstance(value, Enum): return value.value
             if isinstance(value, DatePartition): return {"name": value.name.value, "start": value.start, "end": value.end}
-            if isinstance(value, ExperimentDefinition): return value.experiment_id
+            if isinstance(value, ExperimentDefinition):
+                return {name: normalize(getattr(value, name)) for name in (
+                    "experiment_id", "phase", "domain", "kind", "changed_dimensions", "rule_ids",
+                    "promotion_eligible", "controller_composed", "requires_code", "allowed_variant_ids",
+                )}
             if isinstance(value, Mapping): return {str(k): normalize(v) for k, v in value.items() if k != "fields"}
             if isinstance(value, (tuple, list)): return [normalize(v) for v in value]
             return value
+        if not isinstance(fields, Mapping):
+            raise ValueError("identity fields must be a mapping")
         normalized = normalize(dict(fields))
         encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        return cls(MappingProxyType(normalized), hashlib.sha256(encoded).hexdigest())
+        return cls(_freeze(normalized), hashlib.sha256(encoded).hexdigest())
