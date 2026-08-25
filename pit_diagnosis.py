@@ -328,7 +328,7 @@ def _context(args: argparse.Namespace) -> tuple[DiagnosisContext, PITDataBundle,
             if sealed_source_fingerprint is not None
             else _source_fingerprint()
         ),
-        strategy_identity="cached-diagnosis-v1",
+        strategy_identity="cached-diagnosis-v2-fidelity-cash",
         bundle_sha256=args.pit_bundle_sha256,
         baseline_snapshot=snapshot, reproduced_baseline=snapshot,
     )

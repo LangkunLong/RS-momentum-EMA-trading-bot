@@ -242,6 +242,7 @@ class _Replay:
     signals: tuple[Mapping[str, object], ...]
     simulator: DiagnosisPortfolioSimulator
     equity: tuple[float, ...]
+    cash: tuple[float, ...]
 
 
 def _frame_for_facts(facts: Sequence[SessionFact]) -> dict[str, pd.DataFrame]:
@@ -274,6 +275,7 @@ def _replay(context: DiagnosisContext, experiment: ExperimentDefinition, partiti
     pending: list[dict[str, object]] = []
     signals: list[Mapping[str, object]] = []
     equity: list[float] = []
+    cash: list[float] = []
     for session in sessions:
         eval_date = pd.Timestamp(session)
         for symbol in tuple(simulator._open_positions):
@@ -293,13 +295,14 @@ def _replay(context: DiagnosisContext, experiment: ExperimentDefinition, partiti
                 if bool(signal["buy_signal"]):
                     pending.append(signal)
         equity.append(simulator._mark_equity(frames, eval_date))
+        cash.append(float(simulator._equity))
     if sessions:
         last = pd.Timestamp(sessions[-1])
         for symbol in tuple(simulator._open_positions):
             simulator._close_trade(symbol, float(frames[symbol].loc[last, "Close"]), "end_of_test", str(last.date()))
         equity[-1] = simulator._mark_equity(frames, last)
     outcomes = tuple(MappingProxyType(dict(zip(context.rulebook.rules, evaluate_session_rules(fact, context.rulebook, experiment), strict=True))) for fact in facts)
-    return _Replay(facts, outcomes, tuple(signals), simulator, tuple(equity))
+    return _Replay(facts, outcomes, tuple(signals), simulator, tuple(equity), tuple(cash))
 
 
 def _cache_digest(cache: object, name: str) -> str:
@@ -615,7 +618,14 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
         total_return = (end_equity / start_equity - 1.0) * 100.0 if start_equity else 0.0
         benchmark = [float(fact.values.get("close") or 0.0) for fact in facts if str(fact.symbol).upper() == "SPY"]
         benchmark_return = (benchmark[-1] / benchmark[0] - 1.0) * 100.0 if len(benchmark) > 1 and benchmark[0] else 0.0
-        performance = PerformanceEvidence(partition, total_return, total_return, 0.0, min(0.0, total_return), 100.0 if not replay.equity else max(0.0, min(100.0, replay.simulator._equity / end_equity * 100.0 if end_equity else 100.0)), statistics.completed_positions, total_return - benchmark_return, total_return - benchmark_return)
+        cash_ratios_list: list[float] = []
+        for cash, equity in zip(replay.cash, replay.equity, strict=True):
+            if not math.isfinite(cash) or not math.isfinite(equity) or equity <= 0.0 or cash < 0.0 or cash > equity + max(1e-9, abs(equity) * 1e-9):
+                raise ValueError("replay cash/equity accounting is invalid")
+            cash_ratios_list.append(cash / equity * 100.0)
+        cash_ratios = tuple(cash_ratios_list)
+        average_cash = mean(cash_ratios) if cash_ratios else 100.0
+        performance = PerformanceEvidence(partition, total_return, total_return, 0.0, min(0.0, total_return), average_cash, statistics.completed_positions, total_return - benchmark_return, total_return - benchmark_return)
     fact_symbols = {str(fact.symbol).upper() for fact in facts}
     labels = set(context.diagnostic_leader_labels)
     exposed = len(labels & fact_symbols)

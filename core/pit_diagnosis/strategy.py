@@ -36,6 +36,23 @@ def evaluate_session_rules(fact: SessionFact, rulebook: Rulebook, experiment: Ex
     annual = [_number(values.get(f"annual_eps_{index}")) for index in range(1, 5)]
     annual_ok = all(value is not None and value > 0.0 for value in annual) and bool(annual[0] and annual[-1] and annual[0] / annual[-1] - 1.0 >= 0.25)
     base_ok = bool(values.get("base_kind")) and _number(values.get("pivot")) is not None
+    extension = _number(values.get("extension_pct"))
+    new_high_observed = base_ok and extension is not None
+    new_high_outcome = (
+        passed("N.NEW_HIGH", extension >= 0.0)
+        if new_high_observed
+        else unavailable("N.NEW_HIGH")
+    )
+    catalyst_outcome = unavailable("N.CATALYST")
+    if catalyst_outcome.status == "passed" or new_high_outcome.status == "passed":
+        newness_outcome = RuleOutcome.passed("N.NEWNESS")
+    elif catalyst_outcome.status == "failed" and new_high_outcome.status == "failed":
+        newness_outcome = RuleOutcome.failed("N.NEWNESS")
+    else:
+        newness_outcome = RuleOutcome.unavailable("N.NEWNESS")
+    roe_floor = _number(rulebook.rules["A.ROE"].parameter_policy.get("minimum"))
+    if roe_floor is None:
+        raise ValueError("A.ROE rulebook minimum is required")
     market_uptrend = values.get("market_regime") == "uptrend"
     if experiment.experiment_id == "D3.M_BASELINE_OFF":
         market_uptrend = True
@@ -47,10 +64,10 @@ def evaluate_session_rules(fact: SessionFact, rulebook: Rulebook, experiment: Ex
         "C.SALES_YOY": passed("C.SALES_YOY", (_number(values.get("sales_yoy")) or -1.0) >= 0.25),
         "C.ACCELERATION": unavailable("C.ACCELERATION"),
         "A.EPS_MULTIYEAR": passed("A.EPS_MULTIYEAR", annual_ok),
-        "A.ROE": passed("A.ROE", (_number(values.get("roe")) or 0.0) > 0.0),
-        "N.CATALYST": unavailable("N.CATALYST"),
-        "N.NEW_HIGH": passed("N.NEW_HIGH", base_ok),
-        "N.NEWNESS": passed("N.NEWNESS", base_ok),
+        "A.ROE": passed("A.ROE", (_number(values.get("roe")) or 0.0) >= roe_floor),
+        "N.CATALYST": catalyst_outcome,
+        "N.NEW_HIGH": new_high_outcome,
+        "N.NEWNESS": newness_outcome,
         "S.VOLUME_CONFIRMATION": passed("S.VOLUME_CONFIRMATION", (_number(values.get("event_volume_ratio")) or 0.0) >= 1.30),
         "S.SUPPLY": unavailable("S.SUPPLY"),
         "L.RS": passed("L.RS", (_number(values.get("rs_rating")) or -1.0) >= rs_floor),
