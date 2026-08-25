@@ -136,7 +136,7 @@ def _most_recent_flat(history: pd.DataFrame, policy: BasePolicy, input_sha256: s
         pivot = float(base["High"].max())
         low = float(base["Low"].min())
         depth_pct = (pivot - low) / pivot
-        if depth_pct <= policy.flat_max_depth_pct:
+        if depth_pct <= policy.flat_max_depth_pct and _is_flat_consolidation(base, pivot, low):
             return _pattern(
                 BaseKind.FLAT_BASE,
                 base,
@@ -146,6 +146,16 @@ def _most_recent_flat(history: pd.DataFrame, policy: BasePolicy, input_sha256: s
                 input_sha256=input_sha256,
             )
     return None
+
+
+def _is_flat_consolidation(base: pd.DataFrame, pivot: float, low: float) -> bool:
+    """Require a prior peak, pullback, and recovery instead of a directional trend."""
+    high_pos = int(base["High"].to_numpy().argmax())
+    low_pos = int(base["Low"].to_numpy().argmin())
+    if high_pos >= low_pos or low_pos >= len(base) - 1:
+        return False
+    post_low_high = float(base["High"].iloc[low_pos + 1 :].max())
+    return post_low_high >= low + (pivot - low) * 0.5
 
 
 def _most_recent_cup(history: pd.DataFrame, policy: BasePolicy, input_sha256: str) -> BasePattern | None:
@@ -181,6 +191,10 @@ def _cup_pattern(base: pd.DataFrame, policy: BasePolicy, input_sha256: str) -> B
         if not left_lip * (1.0 - policy.right_lip_max_distance_pct) <= right_lip <= left_lip * (
             1.0 + policy.right_lip_max_distance_pct
         ):
+            continue
+        right_lip_pos = int(pre_handle["High"].to_numpy().argmax())
+        right_lip_close = float(pre_handle["Close"].iloc[right_lip_pos])
+        if float(handle["Close"].min()) >= right_lip_close:
             continue
         pivot = float(handle["High"].max())
         handle_low = float(handle["Low"].min())
