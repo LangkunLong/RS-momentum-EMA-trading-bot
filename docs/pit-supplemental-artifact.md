@@ -101,12 +101,15 @@ filled from prices or current-provider data. This is a denominator input only,
 not institutional sponsorship evidence.
 
 The normalizer selects the latest filing/amendment per manager and reporting
-period inside that ZIP, maps each filing to the first supplied trading session
-strictly afterward, and consolidates all selected managers for a report period
-at the latest of those public sessions. This conservative alignment prevents
-partial/staggered holdings and prevents an amendment from rewriting an earlier
-snapshot. It aggregates common-stock (`SH`) positions by manager and derives
-ownership only when a prior PIT denominator exists. Unmapped CUSIPs,
+period inside that ZIP, then retains the latest report period represented by
+the filing-window archive. SEC quarterly ZIPs can include delinquent filings
+from older periods; retaining them would create duplicate symbol/public-date
+snapshots. It maps each selected filing to the first supplied trading session
+strictly afterward, and consolidates all selected managers for the retained
+report period at the latest of those public sessions. This conservative
+alignment prevents partial/staggered holdings and prevents an amendment from
+rewriting an earlier snapshot. It aggregates common-stock (`SH`) positions by
+manager and derives ownership only when a prior PIT denominator exists. Unmapped CUSIPs,
 options/principal positions, ambiguous mappings, future denominators, and
 missing dates are excluded or rejected fail-closed. Its isolated report-period
 output sets `previous_holder_count` to zero; the multi-quarter assembly step

@@ -325,6 +325,26 @@ def _select_filings(
     return {filing.accession: filing for _, filing in candidates.values()}
 
 
+def _latest_report_period_filings(selected: Mapping[str, _Filing]) -> dict[str, _Filing]:
+    """Keep the latest report period represented by a filing-window archive.
+
+    SEC quarterly data sets are filing-window archives, so a late amendment or
+    delinquent filing can carry an older report period alongside the primary
+    quarter.  The single-quarter output contract is one consolidated report
+    period; retaining older periods would create duplicate symbol/as-of rows
+    when their filing dates share a public session with the primary quarter.
+    """
+
+    if not selected:
+        return {}
+    latest = max(filing.report_period for filing in selected.values())
+    return {
+        accession: filing
+        for accession, filing in selected.items()
+        if filing.report_period == latest
+    }
+
+
 def _mapping_for(mapping: Mapping[str, tuple[_Mapping, ...]], cusip: str, as_of: date) -> _Mapping | None:
     for entry in mapping.get(cusip, ()):
         if entry.start <= as_of <= entry.end:
@@ -356,7 +376,7 @@ def normalize_13f(
         members = _members(zf)
         submissions = _tsv_rows(zf, members["SUBMISSION.TSV"], ("ACCESSION_NUMBER", "FILING_DATE", "SUBMISSIONTYPE", "CIK", "PERIODOFREPORT"))
         covers = _tsv_rows(zf, members["COVERPAGE.TSV"], ("ACCESSION_NUMBER", "REPORTCALENDARORQUARTER", "AMENDMENTNO"))
-        selected = _select_filings(submissions, covers, trading_days)
+        selected = _latest_report_period_filings(_select_filings(submissions, covers, trading_days))
         selected_accessions = set(selected)
         info_rows = _tsv_rows(zf, members["INFOTABLE.TSV"], ("ACCESSION_NUMBER", "INFOTABLE_SK", "CUSIP", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL"))
 

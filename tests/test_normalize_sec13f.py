@@ -100,6 +100,47 @@ def test_normalizer_selects_latest_amendment_and_emits_pit_contract(tmp_path: Pa
     assert rows[0]["previous_holder_count"] == "0"
 
 
+def test_normalizer_discards_older_report_periods_in_filing_window(tmp_path: Path) -> None:
+    zip_path = tmp_path / "2024q2_13f.zip"
+    latest = "0000000001-24-000001"
+    older = "0000000009-24-000001"
+    _zip(
+        zip_path,
+        [
+            {"ACCESSION_NUMBER": latest, "FILING_DATE": "30-APR-2024", "SUBMISSIONTYPE": "13F-HR", "CIK": "0000000001", "PERIODOFREPORT": "31-MAR-2024"},
+            {"ACCESSION_NUMBER": older, "FILING_DATE": "30-APR-2024", "SUBMISSIONTYPE": "13F-HR", "CIK": "0000000009", "PERIODOFREPORT": "31-DEC-2023"},
+        ],
+        [
+            {"ACCESSION_NUMBER": latest, "REPORTCALENDARORQUARTER": "31-MAR-2024", "ISAMENDMENT": "N", "AMENDMENTNO": "", "FILINGMANAGER_NAME": "Latest"},
+            {"ACCESSION_NUMBER": older, "REPORTCALENDARORQUARTER": "31-DEC-2023", "ISAMENDMENT": "N", "AMENDMENTNO": "", "FILINGMANAGER_NAME": "Older"},
+        ],
+        [
+            {"ACCESSION_NUMBER": latest, "INFOTABLE_SK": "1", "CUSIP": "000000001", "SSHPRNAMT": "200", "SSHPRNAMTTYPE": "SH", "PUTCALL": ""},
+            {"ACCESSION_NUMBER": older, "INFOTABLE_SK": "1", "CUSIP": "000000001", "SSHPRNAMT": "900", "SSHPRNAMTTYPE": "SH", "PUTCALL": ""},
+        ],
+    )
+    mapping = tmp_path / "mapping.csv"
+    _csv(mapping, ("cusip", "symbol", "effective_start", "effective_end", "evidence_ids"), [("000000001", "AAA", "2024-01-01", "2024-12-31", '["map:aaa"]')])
+    shares = tmp_path / "shares.csv"
+    _csv(shares, ("symbol", "as_of_date", "shares_outstanding", "evidence_ids"), [("AAA", "2024-04-01", "1000", '["shares:aaa"]')])
+    trading = tmp_path / "trading.csv"
+    _csv(trading, ("trade_date",), [("2024-04-30",), ("2024-05-01",)])
+
+    output = tmp_path / "institutional.csv"
+    result = normalize_13f(
+        thirteenf_zip=zip_path,
+        cusip_mapping_csv=mapping,
+        shares_csv=shares,
+        trading_days_csv=trading,
+        output=output,
+    )
+
+    assert result.selected_filings == 1
+    with output.open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [(row["symbol"], row["ownership_percent"], row["holder_count"]) for row in rows] == [("AAA", "0.2", "1")]
+
+
 def test_overlapping_target_cusip_mapping_fails_closed(tmp_path: Path) -> None:
     zip_path, mapping, shares, trading = _inputs(tmp_path)
     _csv(mapping, ("cusip", "symbol", "effective_start", "effective_end", "evidence_ids"), [
