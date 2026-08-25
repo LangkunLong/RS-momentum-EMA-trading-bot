@@ -600,6 +600,7 @@ class CanslimStrategy:
         require_bullish_market: bool = False,
         technical_only: bool = False,
         fundamental_provider: Optional[Callable[[str, pd.Timestamp], dict[str, Any]]] = None,
+        require_proper_base: bool = False,
     ) -> None:
         self.min_c_a_growth = min_c_a_growth
         self.requested_min_rs_score = _finite_signal_number(min_rs_score)
@@ -611,6 +612,7 @@ class CanslimStrategy:
         self.require_bullish_market = require_bullish_market
         self.technical_only = technical_only
         self.fundamental_provider = fundamental_provider
+        self.require_proper_base = require_proper_base
 
     @staticmethod
     def _compute_technical_score(
@@ -723,6 +725,7 @@ class CanslimStrategy:
             eval_date,
             fund.get("shares_outstanding"),
             quarterly_income=fund.get("quarterly_income"),
+            require_proper_base=self.require_proper_base,
         )
         if tech is None:
             return None
@@ -1237,6 +1240,7 @@ class PortfolioSimulator:
         self.cash_deployment_threshold_pct = cash_deployment_threshold_pct
         self.technical_only = technical_only
         self.pit_bundle = pit_bundle
+        self.require_proper_base = bool(pit_bundle is not None and not technical_only)
         self.identity_transition_contract = identity_transition_contract
         self.take_profit_pct = take_profit_pct
         self.scale_out_fraction = scale_out_fraction
@@ -1257,12 +1261,14 @@ class PortfolioSimulator:
                 fundamental_provider=(
                     pit_bundle.fundamentals_provider if pit_bundle is not None else None
                 ),
+                require_proper_base=self.require_proper_base,
             )
         )
         try:
             self.strategy.min_rs_score = MIN_RS_SCORE
             self.strategy.min_canslim_score = MIN_COMPOSITE_SCORE
             self.strategy.entry_threshold_requests_advisory_only = True
+            self.strategy.require_proper_base = self.require_proper_base
         except Exception as exc:
             raise ValueError(
                 "supplied strategy cannot honor the fixed canonical entry thresholds"
@@ -1879,7 +1885,16 @@ class PortfolioSimulator:
         else:
             closes = available["Close"] if "Close" in available.columns else ()
             volumes = available["Volume"] if "Volume" in available.columns else ()
-        facts = build_entry_facts(closes, volumes)
+        if self.require_proper_base:
+            facts = build_entry_facts(
+                closes,
+                volumes,
+                history_before_event=available.iloc[:-1] if available is not None else None,
+                event_session=eval_date,
+                require_proper_base=True,
+            )
+        else:
+            facts = build_entry_facts(closes, volumes)
 
         canonical = dict(row)
         if self.technical_only:

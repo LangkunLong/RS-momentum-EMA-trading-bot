@@ -6,6 +6,10 @@ import math
 from dataclasses import dataclass
 from typing import Iterable
 
+import pandas as pd
+
+from core.pit_diagnosis.patterns import BasePolicy, detect_proper_base
+
 
 PRIOR_VOLUME_SESSIONS = 50
 PIVOT_LOOKBACK_SESSIONS = 252
@@ -73,12 +77,21 @@ class CanslimEntryDecision:
         return self.facts.eligible
 
 
-def build_entry_facts(closes: Iterable[object], volumes: Iterable[object]) -> CanslimEntryFacts:
+def build_entry_facts(
+    closes: Iterable[object],
+    volumes: Iterable[object],
+    *,
+    history_before_event: pd.DataFrame | None = None,
+    event_session: object | None = None,
+    require_proper_base: bool = False,
+) -> CanslimEntryFacts:
     """Build canonical facts for the final event bar in aligned history.
 
     Only observations used by the contract are inspected: the event and prior
     close, up to 252 closes before the event, and exactly 50 volumes before the
-    event plus the event volume itself.
+    event plus the event volume itself.  Strict PIT callers additionally supply
+    pre-event OHLC history and the event session so the canonical proper-base
+    detector, rather than a rolling-close high, supplies the pivot.
     """
     reasons: list[str] = []
     close_index = _explicit_index(closes)
@@ -111,9 +124,26 @@ def build_entry_facts(closes: Iterable[object], volumes: Iterable[object]) -> Ca
         if converted_closes is None:
             reasons.append("non_finite_close_input")
         else:
-            pivot = max(converted_closes[:-1])
             event_close = converted_closes[-1]
             prior_close = converted_closes[-2]
+            if not require_proper_base:
+                pivot = max(converted_closes[:-1])
+                if pivot <= 0:
+                    reasons.append("non_positive_pivot")
+
+    if require_proper_base:
+        try:
+            pattern = detect_proper_base(
+                history_before_event,
+                event_session=event_session,
+                policy=BasePolicy.canonical_v1(),
+            )
+        except Exception:
+            pattern = None
+        if pattern is None:
+            reasons.append("proper_base_unavailable")
+        else:
+            pivot = pattern.pivot
             if pivot <= 0:
                 reasons.append("non_positive_pivot")
 
