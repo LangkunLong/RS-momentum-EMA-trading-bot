@@ -204,6 +204,17 @@ class PriceIdentityTransitionContract:
         return symbol
 
 
+@dataclass
+class _FundamentalsProviderState:
+    """Chronological, per-ticker state for the hot PIT provider path."""
+
+    boundaries: tuple[tuple[str, tuple[dict[str, Any], ...]], ...]
+    next_boundary_index: int
+    visible_records: list[dict[str, Any]]
+    snapshot: dict[str, Any]
+    latest_as_of: date
+
+
 def sha256_file(path: Path) -> str:
     """Return the SHA-256 of a regular file without modifying it."""
 
@@ -269,12 +280,18 @@ class PITDataBundle:
             self.membership = self._load_membership()
             self._symbols = self._load_symbols()
             self._validate_integrity()
+            self._fundamentals_provider_cache: dict[str, _FundamentalsProviderState] = {}
         except Exception:
             self._connection.close()
             raise
 
     def close(self) -> None:
-        self._connection.close()
+        try:
+            self._connection.close()
+        finally:
+            cache = getattr(self, "_fundamentals_provider_cache", None)
+            if cache is not None:
+                cache.clear()
 
     def __enter__(self) -> "PITDataBundle":
         return self
@@ -819,5 +836,84 @@ class PITDataBundle:
                 institutional_pair_selected = True
         return result
 
+    def _fundamentals_provider_state(
+        self,
+        ticker: str,
+        as_of: date,
+    ) -> _FundamentalsProviderState:
+        """Load one ticker's immutable history for chronological provider use."""
+
+        cache = getattr(self, "_fundamentals_provider_cache", None)
+        if cache is None:
+            cache = {}
+            self._fundamentals_provider_cache = cache
+        state = cache.get(ticker)
+        if state is not None:
+            return state
+
+        rows = self._connection.execute(
+            "SELECT ticker, statement_type, period_end, public_date, basic_eps, diluted_eps, "
+            "total_revenue, net_income, common_stock, total_stockholders_equity, "
+            "shares_outstanding, held_percent_institutions, institution_count, "
+            "prev_institution_count FROM fundamentals "
+            "WHERE ticker = ? ORDER BY public_date, period_end",
+            (ticker,),
+        ).fetchall()
+        boundaries = tuple(
+            (
+                public_date,
+                tuple(dict(row) for row in boundary_rows),
+            )
+            for public_date, boundary_rows in groupby(
+                rows,
+                key=lambda row: str(row["public_date"]),
+            )
+        )
+        state = _FundamentalsProviderState(
+            boundaries=boundaries,
+            next_boundary_index=0,
+            visible_records=[],
+            snapshot=self._fundamental_snapshot([]),
+            latest_as_of=as_of,
+        )
+        cache[ticker] = state
+        return state
+
     def fundamentals_provider(self, symbol: str, as_of_date: pd.Timestamp) -> dict[str, Any]:
-        return self.fundamentals_as_of(symbol, as_of_date)
+        """Return strict as-of facts while reusing forward-only ticker state.
+
+        A portfolio evaluates a ticker in chronological order far more often than
+        its public fundamental state changes.  Cache the immutable history once,
+        then advance only across complete public-date boundaries.  Out-of-order
+        callers deliberately use the authoritative point-query path instead of
+        mutating the forward cache backwards.
+        """
+
+        ticker = _canonical_ticker(symbol)
+        timestamp = pd.Timestamp(as_of_date)
+        if timestamp > self.data_cutoff:
+            raise ValueError("requested fundamental date exceeds point-in-time bundle cutoff")
+        as_of = timestamp.date()
+        state = self._fundamentals_provider_state(ticker, as_of)
+        if as_of < state.latest_as_of:
+            return self.fundamentals_as_of(ticker, as_of_date)
+
+        cutoff = as_of.isoformat()
+        candidate_records = list(state.visible_records)
+        candidate_next_boundary_index = state.next_boundary_index
+        while candidate_next_boundary_index < len(state.boundaries):
+            public_date, boundary_rows = state.boundaries[candidate_next_boundary_index]
+            if public_date > cutoff:
+                break
+            for record in boundary_rows:
+                if record["statement_type"] not in _STATEMENT_TYPES:
+                    raise ValueError("fundamentals statement_type is invalid")
+            candidate_records.extend(boundary_rows)
+            candidate_next_boundary_index += 1
+        if candidate_next_boundary_index != state.next_boundary_index:
+            candidate_snapshot = self._fundamental_snapshot(candidate_records)
+            state.visible_records = candidate_records
+            state.next_boundary_index = candidate_next_boundary_index
+            state.snapshot = candidate_snapshot
+        state.latest_as_of = as_of
+        return state.snapshot
