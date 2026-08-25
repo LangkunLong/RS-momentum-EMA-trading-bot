@@ -78,6 +78,7 @@ _FUNDAMENTAL_COLUMN_MAP = {
     "common_stock": "Common Stock",
     "total_stockholders_equity": "Total Stockholders Equity",
 }
+_SQLITE_NULL = object()
 _STATEMENT_TYPES = {"quarterly", "annual", "balance", "institutional"}
 _REQUIRED_METADATA = {
     "bundle_kind",
@@ -762,6 +763,19 @@ class PITDataBundle:
         selected = [record for record in records if record["statement_type"] == statement_type]
         if not selected:
             return pd.DataFrame()
+        # ``DataFrame`` otherwise turns both a SQLite NULL and a supplied NaN
+        # into NaN.  Preserve the former only: NULL means unavailable; a NaN
+        # must reach the fact-cache numeric validator and fail closed.
+        selected = [
+            {
+                **record,
+                **{
+                    column: _SQLITE_NULL if record.get(column) is None else record.get(column)
+                    for column in _FUNDAMENTAL_COLUMN_MAP
+                },
+            }
+            for record in selected
+        ]
         frame = pd.DataFrame(selected)
         frame["period_end"] = pd.to_datetime(frame["period_end"], errors="raise")
         frame["public_date"] = pd.to_datetime(frame["public_date"], errors="raise")
@@ -770,10 +784,15 @@ class PITDataBundle:
         )
         frame = frame.set_index("period_end")[list(_FUNDAMENTAL_COLUMN_MAP)]
         frame = frame.rename(columns=_FUNDAMENTAL_COLUMN_MAP).transpose()
-        # Preserve SQLite NULL distinctly from a numeric NaN so downstream PIT
-        # consumers can record unavailable fields without accepting non-finite data.
-        frame = frame.astype(object).where(frame.notna(), None)
-        frame = frame.dropna(axis="index", how="all").sort_index(axis="columns")
+        frame = frame.astype(object)
+        for index in frame.index:
+            for column in frame.columns:
+                if frame.at[index, column] is _SQLITE_NULL:
+                    frame.at[index, column] = None
+        # Keep all-NaN rows: they are malformed numeric inputs, not unavailable
+        # SQLite NULLs, and must be rejected by downstream validation.
+        frame = frame.loc[~frame.apply(lambda row: all(value is None for value in row), axis=1)]
+        frame = frame.sort_index(axis="columns")
         return frame
 
     @staticmethod

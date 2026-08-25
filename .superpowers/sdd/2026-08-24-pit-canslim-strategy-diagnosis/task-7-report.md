@@ -101,3 +101,71 @@ python -m pytest -p no:cacheprovider --no-cov -q \
   tests/test_pit_diagnosis_experiments.py
 43 passed, 2 warnings
 ```
+
+## Review fix round 2
+
+- The publication verifier now validates every CSV and JSON row against its
+  exact schema, finite numeric domains, count relationships, closed enums, and
+  forbidden raw/provider/transaction/leader terms.  Missing trailing CSV cells,
+  numeric strings that overflow to infinity, and incorrect JSON value types are
+  rejected after a manifest rehash.
+- Reopened fact caches now require SQLite `integrity_check=ok`, exact metadata,
+  identity and partition schema, exact column order/type affinities, finite
+  numeric row values, and no forbidden labels.  The cache bundle/rulebook
+  identities are reconciled to the publication manifest.
+- SQLite NULL masking is now explicitly limited to original `None` values
+  before pandas construction.  A genuine NaN entering the real
+  `_statement_frame` path remains NaN and is rejected by `_number`.
+- Manifest `result_count` and promotion count must be non-boolean,
+  non-negative integers; fidelity is a closed enum and promotion candidates
+  must be zero.
+
+Focused verification (all source-only; generated pytest artifacts remain
+uncommitted):
+
+```text
+python -m pytest tests/test_pit_diagnosis_fact_cache.py -q
+11 passed, 1 warning
+
+python -m pytest tests/test_pit_diagnosis_cli.py -k "publication_is_complete or incomplete_or_nonfinite" -q
+4 passed, 14 deselected, 2 warnings
+
+python -m pytest tests/test_pit_diagnosis_cli.py -k manifest_type -q
+5 passed, 13 deselected, 2 warnings
+
+python -m pytest tests/test_pit_diagnosis_cli.py -k "entry_funnel and raw_or_malformed" -q
+1 passed, 17 deselected, 2 warnings
+
+python -m ruff check core/pit_diagnosis/publication.py core/pit_data.py tests/test_pit_diagnosis_cli.py tests/test_pit_diagnosis_fact_cache.py
+All checks passed.
+
+python -m compileall -q core/pit_diagnosis/publication.py core/pit_data.py
+exit 0
+
+git diff --check
+exit 0
+```
+
+One grouped retry encountered a transient Windows `os.replace` access denial
+inside the repository-owned pytest artifact directory; the identical isolated
+publication test immediately passed.  The cache/run/manifest deliverable is
+still pending the previously noted real cache completion.
+
+Final rerun after the report update:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_fact_cache.py
+11 passed, 1 warning
+
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_cli.py
+18 passed, 2 warnings
+
+python -m ruff check core/pit_diagnosis/publication.py core/pit_data.py tests/test_pit_diagnosis_cli.py tests/test_pit_diagnosis_fact_cache.py
+All checks passed!
+
+python -m compileall -q core/pit_diagnosis/publication.py core/pit_data.py
+exit 0
+
+git diff --check
+exit 0
+```

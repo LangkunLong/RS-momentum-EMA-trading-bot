@@ -8,12 +8,13 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
 from .experiments import DiagnosisContext, ExperimentResult, _result_payload_sha256
-from .fact_cache import open_fact_cache
+from .fact_cache import _FACT_COLUMNS, _SCHEMA_SHA256, open_fact_cache
 from .models import ExperimentCatalog, Rulebook
 from .catalog import load_experiment_catalog
 from .rulebook import load_rulebook
@@ -41,6 +42,13 @@ _CSV_COLUMNS = {
     "ablation_results.csv": ("experiment_id", "partition", "identity_sha256", "result_sha256", "fidelity_label", "promotion_eligible", "promotion_checks", "trade_path_sha256"),
 }
 _RAW_TERMS = frozenset({"ticker", "transaction", "price", "quantity", "action", "provider", "payload", "leader_label", "raw"})
+_PARTITIONS = frozenset({"discovery", "validation", "locked_evaluation"})
+_FIDELITY_LABELS = frozenset({"strict_canslim", "quantitative_canslim_proxy", "fidelity_incomplete"})
+_EXIT_REASONS = frozenset({"stop_loss", "ma_violation", "time_stop", "end_of_test", "profit_zone", "structural_sell", "eight_week_hold"})
+_FACT_INTEGER_COLUMNS = frozenset({"member", "institutional_holder_count", "institutional_previous_holder_count", "industry_rank", "base_duration_sessions", "distribution_count", "availability_bitset"})
+_FACT_REAL_COLUMNS = frozenset({"open", "high", "low", "close", "volume", "prior_close", "prior_average_volume_50", "event_volume_ratio", "current_eps", "prior_year_eps", "current_sales", "prior_year_sales", "annual_eps_1", "annual_eps_2", "annual_eps_3", "annual_eps_4", "net_income", "total_stockholders_equity", "current_eps_yoy", "sales_yoy", "roe", "shares_outstanding", "institutional_ownership_percent", "rs_rating", "base_low", "base_depth_pct", "pivot", "extension_pct"})
+_FACT_TYPES = {column: ("INTEGER" if column in _FACT_INTEGER_COLUMNS else "REAL" if column in _FACT_REAL_COLUMNS else "TEXT") for column in _FACT_COLUMNS}
+_FACT_IDENTITY_KEYS = frozenset({"bundle_sha256", "bundle_schema_version", "bundle_metadata", "rulebook_version", "rulebook_sha256", "partitions", "supplemental_content_identity_sha256", "fact_cache_schema_version", "fact_cache_schema_sha256"})
 
 
 def _sha256(path: Path) -> str:
@@ -299,6 +307,8 @@ def _reject_text(value: object) -> None:
             raise ValueError("diagnosis artifact contains a non-finite value")
         if normalized in _RAW_TERMS:
             raise ValueError("diagnosis artifact contains a raw field")
+        if set(re.findall(r"[a-z]+", normalized)) & _RAW_TERMS:
+            raise ValueError("diagnosis artifact contains a raw field")
     if isinstance(value, Mapping):
         for key, item in value.items():
             if str(key).lower() in _RAW_TERMS:
@@ -307,6 +317,92 @@ def _reject_text(value: object) -> None:
     elif isinstance(value, list):
         for item in value:
             _reject_text(item)
+
+
+def _integer(value: object, field: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
+        number = int(value)
+    else:
+        raise ValueError(f"{field} must be an integer")
+    if number < minimum:
+        raise ValueError(f"{field} is out of range")
+    return number
+
+
+def _finite_number(value: object, field: str, *, lower: float | None = None, upper: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{field} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be a finite number")
+    if lower is not None and number < lower or upper is not None and number > upper:
+        raise ValueError(f"{field} is out of range")
+    return number
+
+
+def _identity_row(row: Mapping[str, object]) -> None:
+    if not isinstance(row.get("experiment_id"), str) or not row["experiment_id"]:
+        raise ValueError("diagnosis artifact experiment id is invalid")
+    if row.get("partition") not in _PARTITIONS:
+        raise ValueError("diagnosis artifact partition is invalid")
+    _digest_value(row.get("identity_sha256"), "diagnosis artifact identity")
+    _digest_value(row.get("result_sha256"), "diagnosis artifact result")
+
+
+def _json_object(value: object, field: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field} must be an object")
+    _reject_nonfinite(value); _reject_text(value)
+    return value
+
+
+def _csv_json_object(value: object, field: str) -> Mapping[str, object]:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be JSON")
+    try:
+        return _json_object(json.loads(value, parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item))), field)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{field} must be JSON") from exc
+
+
+def _verify_csv_row(name: str, row: Mapping[str, str]) -> None:
+    _identity_row(row)
+    if name == "rule_attribution.csv":
+        if not row["rule_id"]:
+            raise ValueError("rule attribution rule id is invalid")
+        evaluated, survivors, passed, failed, unavailable = (_integer(row[key], key) for key in ("evaluated", "survivors", "passed", "failed", "unavailable"))
+        if survivors > evaluated or passed + failed + unavailable != evaluated:
+            raise ValueError("rule attribution counts are inconsistent")
+    elif name in {"entry_funnel.csv", "execution_outcomes.csv"}:
+        evaluated, qualified, attempted, executed, rejected = (_integer(row[key], key) for key in ("evaluated", "qualified", "attempted", "executed", "rejected"))
+        if not evaluated >= qualified >= attempted >= executed or rejected != attempted - executed:
+            raise ValueError("entry funnel counts are inconsistent")
+        if name == "execution_outcomes.csv":
+            counts = _csv_json_object(row["rejection_counts"], "rejection_counts")
+            if any(not isinstance(key, str) or not key or _integer(value, "rejection_counts") < 0 for key, value in counts.items()) or sum(_integer(value, "rejection_counts") for value in counts.values()) != rejected:
+                raise ValueError("execution rejection counts are inconsistent")
+    elif name == "exit_attribution.csv":
+        if row["reason"] not in _EXIT_REASONS:
+            raise ValueError("exit attribution reason is invalid")
+        closed, wins = (_integer(row[key], key) for key in ("closed_positions", "wins"))
+        if wins > closed:
+            raise ValueError("exit attribution wins are inconsistent")
+        _finite_number(row["win_rate_pct"], "win_rate_pct", lower=0, upper=100)
+        _finite_number(row["average_completed_position_return_pct"], "average_completed_position_return_pct", lower=-100, upper=100)
+    else:
+        if row["fidelity_label"] not in _FIDELITY_LABELS or row["promotion_eligible"] not in {"True", "False"}:
+            raise ValueError("ablation domain is invalid")
+        checks = _csv_json_object(row["promotion_checks"], "promotion_checks")
+        if not checks or any(not isinstance(key, str) or type(value) is not bool for key, value in checks.items()):
+            raise ValueError("promotion checks are invalid")
+        _digest_value(row["trade_path_sha256"], "trade path")
 
 
 def _csv_rows(path: Path, expected: tuple[str, ...]) -> list[dict[str, str]]:
@@ -319,13 +415,14 @@ def _csv_rows(path: Path, expected: tuple[str, ...]) -> list[dict[str, str]]:
     except (OSError, UnicodeError, csv.Error) as exc:
         raise ValueError("diagnosis CSV is invalid") from exc
     for row in rows:
-        if set(row) != set(expected) or any(key.lower() in _RAW_TERMS for key in row):
+        if set(row) != set(expected) or any(value is None for value in row.values()) or any(key.lower() in _RAW_TERMS for key in row):
             raise ValueError("diagnosis CSV contains a raw field or malformed schema")
         _reject_text(row)
+        _verify_csv_row(path.name, row)
     return rows
 
 
-def _verify_json_rows(path: Path, expected: frozenset[str]) -> list[Mapping[str, object]]:
+def _verify_json_rows(path: Path, expected: frozenset[str], numeric: frozenset[str], counts: frozenset[str]) -> list[Mapping[str, object]]:
     payload = _load_json(path)
     if not isinstance(payload, dict) or set(payload) != {"results"} or not isinstance(payload["results"], list):
         raise ValueError("diagnosis JSON schema is invalid")
@@ -334,7 +431,57 @@ def _verify_json_rows(path: Path, expected: frozenset[str]) -> list[Mapping[str,
         if not isinstance(row, Mapping) or set(row) != expected:
             raise ValueError("diagnosis JSON row schema is invalid")
         _reject_nonfinite(row); _reject_text(row)
+        _identity_row(row)
+        for field in numeric:
+            bounded = field in {"win_rate_pct", "recall_pct", "average_cash_pct"}
+            _finite_number(row.get(field), field, lower=0 if bounded else None, upper=100 if bounded else None)
+        for field in counts:
+            _integer(row.get(field), field)
     return rows
+
+
+def _verify_fact_cache(path: Path, manifest: Mapping[str, object]) -> None:
+    try:
+        with open_fact_cache(path, str(manifest["fact_cache_sha256"])) as cache:
+            connection = cache._connection
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or integrity[0] != "ok":
+                raise ValueError("fact-cache integrity check failed")
+            table_info = tuple((str(row[1]), str(row[2]).upper()) for row in connection.execute("PRAGMA table_info(session_facts)"))
+            if table_info != tuple((column, _FACT_TYPES[column]) for column in _FACT_COLUMNS):
+                raise ValueError("fact-cache column types are invalid")
+            metadata = {str(row[0]): str(row[1]) for row in connection.execute("SELECT key,value FROM metadata")}
+            if set(metadata) != {"status", "identity_sha256", "identity", "schema_version", "schema_sha256", "content_sha256"} or metadata.get("status") != "complete" or metadata.get("schema_version") != "1" or metadata.get("schema_sha256") != _SCHEMA_SHA256:
+                raise ValueError("fact-cache metadata is invalid")
+            _digest_value(metadata.get("identity_sha256"), "fact-cache identity")
+            _digest_value(metadata.get("content_sha256"), "fact-cache logical content")
+            identity = _json_object(json.loads(metadata["identity"], parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item))), "fact-cache identity")
+            if set(identity) != _FACT_IDENTITY_KEYS or not isinstance(identity.get("bundle_schema_version"), str) or not isinstance(identity.get("rulebook_version"), str) or not isinstance(identity.get("fact_cache_schema_version"), str) or not isinstance(identity.get("bundle_metadata"), Mapping) or not isinstance(identity.get("partitions"), Mapping):
+                raise ValueError("fact-cache identity schema is invalid")
+            for field in ("bundle_sha256", "rulebook_sha256", "supplemental_content_identity_sha256", "fact_cache_schema_sha256"):
+                _digest_value(identity.get(field), f"fact-cache {field}")
+            partitions = identity["partitions"]
+            if set(partitions) != _PARTITIONS or any(not isinstance(value, list) or len(value) != 2 or not all(isinstance(item, str) for item in value) for value in partitions.values()):
+                raise ValueError("fact-cache partition identity is invalid")
+            if identity.get("bundle_sha256") != manifest["bundle_sha256"] or identity.get("rulebook_sha256") != manifest["rulebook_sha256"]:
+                raise ValueError("fact-cache identities are inconsistent")
+            for record in connection.execute("SELECT * FROM session_facts"):
+                row = dict(record)
+                _reject_text(row)
+                if row["bundle_sha256"] != manifest["bundle_sha256"] or row["member"] != 1:
+                    raise ValueError("fact-cache row identity or membership is invalid")
+                _digest_value(row["bundle_sha256"], "fact-cache bundle")
+                _digest_value(row["row_sha256"], "fact-cache row")
+                if not all(isinstance(row[field], str) and row[field] for field in ("rulebook_schema_version", "symbol", "session", "market_regime")):
+                    raise ValueError("fact-cache text row value is invalid")
+                for field in _FACT_REAL_COLUMNS:
+                    if row[field] is not None:
+                        _finite_number(row[field], f"fact-cache {field}")
+                for field in _FACT_INTEGER_COLUMNS:
+                    if row[field] is not None:
+                        _integer(row[field], f"fact-cache {field}")
+    except Exception as exc:
+        raise ValueError("diagnosis fact-cache schema, content, or identity is invalid") from exc
 
 
 def verify_diagnosis_run(run_dir: Path) -> Mapping[str, object]:
@@ -360,6 +507,12 @@ def verify_diagnosis_run(run_dir: Path) -> Mapping[str, object]:
     for name, digest in hashes.items():
         if not isinstance(digest, str) or len(digest) != 64 or set(digest) - _DIGEST or _sha256(directory / name) != digest:
             raise ValueError(f"diagnosis artifact hash mismatch: {name}")
+    result_count = _integer(manifest.get("result_count"), "manifest result_count")
+    if manifest.get("fidelity_label") not in _FIDELITY_LABELS:
+        raise ValueError("diagnosis manifest fidelity label is invalid")
+    promotion_candidates = _integer(manifest.get("promotion_eligible_candidates"), "manifest promotion candidates")
+    if promotion_candidates != 0:
+        raise ValueError("diagnosis publication promotion candidates must be zero")
     if (directory / "agent_events.jsonl").read_bytes() != b"":
         raise ValueError("agent events must be the empty hash-chained genesis log")
     rulebook = load_rulebook(directory / "rulebook.json")
@@ -368,28 +521,38 @@ def verify_diagnosis_run(run_dir: Path) -> Mapping[str, object]:
     catalog = load_experiment_catalog(directory / "experiment_catalog.json", rulebook)
     if catalog.sha256 != manifest["catalog_sha256"]:
         raise ValueError("diagnosis catalog identity is invalid")
-    try:
-        with open_fact_cache(directory / "diagnosis_facts.sqlite3", manifest["fact_cache_sha256"]):
-            pass
-    except Exception as exc:
-        raise ValueError("diagnosis fact-cache schema or identity is invalid") from exc
+    _verify_fact_cache(directory / "diagnosis_facts.sqlite3", manifest)
     baseline = _load_json(directory / "baseline_reproduction.json")
-    if not isinstance(baseline, dict) or set(baseline) != {"passed", "authority_manifest_sha256", "reproduced_manifest_sha256", "mismatch_codes"} or baseline.get("passed") is not True or baseline.get("authority_manifest_sha256") != manifest["baseline_manifest_sha256"] or not isinstance(baseline.get("mismatch_codes"), list):
+    if not isinstance(baseline, dict) or set(baseline) != {"passed", "authority_manifest_sha256", "reproduced_manifest_sha256", "mismatch_codes"} or baseline.get("passed") is not True or baseline.get("authority_manifest_sha256") != manifest["baseline_manifest_sha256"] or baseline.get("reproduced_manifest_sha256") != manifest["baseline_manifest_sha256"] or not isinstance(baseline.get("mismatch_codes"), list) or baseline["mismatch_codes"]:
         raise ValueError("diagnosis baseline identity is invalid")
+    _digest_value(baseline["authority_manifest_sha256"], "baseline authority manifest")
+    _digest_value(baseline["reproduced_manifest_sha256"], "baseline reproduced manifest")
     _reject_nonfinite(baseline); _reject_text(baseline)
     for name, columns in _CSV_COLUMNS.items():
         _csv_rows(directory / name, columns)
-    _verify_json_rows(directory / "trade_statistics.json", frozenset({"experiment_id", "partition", "identity_sha256", "result_sha256", "completed_positions", "wins", "losses", "win_rate_pct", "mean_return_pct", "median_return_pct", "mean_winner_pct", "mean_loser_pct", "expectancy_pct", "mean_calendar_hold_days", "median_calendar_hold_days", "mean_trading_session_hold_days", "median_trading_session_hold_days"}))
-    _verify_json_rows(directory / "leader_recall.json", frozenset({"experiment_id", "partition", "identity_sha256", "result_sha256", "labelled_leaders", "pit_exposed_leaders", "recalled_leaders", "recall_pct"}))
-    _verify_json_rows(directory / "performance.json", frozenset({"experiment_id", "partition", "identity_sha256", "result_sha256", "total_return_pct", "annualized_return_pct", "sharpe_ratio", "max_drawdown_pct", "average_cash_pct", "closed_positions", "benchmark_total_return_delta_pct", "benchmark_annualized_return_delta_pct"}))
+    trade_rows = _verify_json_rows(directory / "trade_statistics.json", frozenset({"experiment_id", "partition", "identity_sha256", "result_sha256", "completed_positions", "wins", "losses", "win_rate_pct", "mean_return_pct", "median_return_pct", "mean_winner_pct", "mean_loser_pct", "expectancy_pct", "mean_calendar_hold_days", "median_calendar_hold_days", "mean_trading_session_hold_days", "median_trading_session_hold_days"}), frozenset({"win_rate_pct", "mean_return_pct", "median_return_pct", "mean_winner_pct", "mean_loser_pct", "expectancy_pct", "mean_calendar_hold_days", "median_calendar_hold_days", "mean_trading_session_hold_days", "median_trading_session_hold_days"}), frozenset({"completed_positions", "wins", "losses"}))
+    for row in trade_rows:
+        if _integer(row["wins"], "wins") + _integer(row["losses"], "losses") != _integer(row["completed_positions"], "completed_positions"):
+            raise ValueError("trade statistic counts are inconsistent")
+    leader_rows = _verify_json_rows(directory / "leader_recall.json", frozenset({"experiment_id", "partition", "identity_sha256", "result_sha256", "labelled_leaders", "pit_exposed_leaders", "recalled_leaders", "recall_pct"}), frozenset({"recall_pct"}), frozenset({"labelled_leaders", "pit_exposed_leaders", "recalled_leaders"}))
+    for row in leader_rows:
+        if _integer(row["pit_exposed_leaders"], "pit exposed leaders") > _integer(row["labelled_leaders"], "labelled leaders") or _integer(row["recalled_leaders"], "recalled leaders") > _integer(row["pit_exposed_leaders"], "pit exposed leaders"):
+            raise ValueError("leader recall counts are inconsistent")
+    _verify_json_rows(directory / "performance.json", frozenset({"experiment_id", "partition", "identity_sha256", "result_sha256", "total_return_pct", "annualized_return_pct", "sharpe_ratio", "max_drawdown_pct", "average_cash_pct", "closed_positions", "benchmark_total_return_delta_pct", "benchmark_annualized_return_delta_pct"}), frozenset({"total_return_pct", "annualized_return_pct", "sharpe_ratio", "max_drawdown_pct", "average_cash_pct", "benchmark_total_return_delta_pct", "benchmark_annualized_return_delta_pct"}), frozenset({"closed_positions"}))
     report = (directory / "report.md").read_text(encoding="utf-8")
     _reject_text(report.split())
     checkpoint = _load_json(directory / "checkpoint.json")
-    if not isinstance(checkpoint, dict) or set(checkpoint) != {"schema_version", "result_count", "results"} or checkpoint.get("schema_version") != 1 or type(checkpoint.get("result_count")) is not int or not isinstance(checkpoint.get("results"), list) or checkpoint.get("result_count") != len(checkpoint["results"]):
+    if not isinstance(checkpoint, dict) or set(checkpoint) != {"schema_version", "result_count", "results"} or checkpoint.get("schema_version") != 1 or not isinstance(checkpoint.get("results"), list) or _integer(checkpoint.get("result_count"), "checkpoint result_count") != len(checkpoint["results"]):
         raise ValueError("diagnosis checkpoint is stale or inconsistent")
+    checkpoint_ids: set[tuple[str, str, str, str]] = set()
+    for row in checkpoint["results"]:
+        if not isinstance(row, Mapping) or set(row) != {"experiment_id", "partition", "identity_sha256", "result_sha256"}:
+            raise ValueError("diagnosis checkpoint result is invalid")
+        _identity_row(row)
+        checkpoint_ids.add((str(row["experiment_id"]), str(row["partition"]), str(row["identity_sha256"]), str(row["result_sha256"])))
+    if len(checkpoint_ids) != len(checkpoint["results"]):
+        raise ValueError("diagnosis checkpoint has duplicate results")
     ablation_count = len(_csv_rows(directory / "ablation_results.csv", _CSV_COLUMNS["ablation_results.csv"]))
-    if ablation_count != checkpoint["result_count"] or manifest.get("result_count") != ablation_count:
+    if ablation_count != checkpoint["result_count"] or result_count != ablation_count:
         raise ValueError("diagnosis result counts are inconsistent")
-    if manifest.get("promotion_eligible_candidates") != 0:
-        raise ValueError("diagnosis publication cannot declare promotable candidates")
-    return {"status": manifest["status"], "fidelity_label": manifest["fidelity_label"], "artifact_sha256": dict(hashes), "result_count": manifest["result_count"], "run_dir": str(directory.resolve())}
+    return {"status": manifest["status"], "fidelity_label": manifest["fidelity_label"], "artifact_sha256": dict(hashes), "result_count": result_count, "run_dir": str(directory.resolve())}

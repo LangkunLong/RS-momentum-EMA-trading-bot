@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import sqlite3
 from types import MappingProxyType
@@ -59,7 +60,7 @@ def mini_completed_context(tmp_path: Path) -> tuple[DiagnosisContext, tuple[obje
     catalog = load_experiment_catalog(Path("config/pit_diagnosis_experiments_v1.json"), rulebook)
     baseline_root = tmp_path / "baseline"
     baseline_root.mkdir()
-    snapshot = _baseline_snapshot(baseline_root)
+    snapshot = replace(_baseline_snapshot(baseline_root), bundle_sha256="a" * 64)
     context = DiagnosisContext(
         rulebook=rulebook, catalog=catalog, fact_cache=_Facts(facts_path),
         partitions=fixed_partitions(), diagnostic_leader_labels=("AAA",),
@@ -183,4 +184,68 @@ def test_publication_verifier_requires_exact_manifest_schema(
     manifest["undeclared"] = True
     path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="manifest schema"):
+        verify_diagnosis_run(run_dir)
+
+
+@pytest.mark.parametrize(
+    ("artifact", "mutate"),
+    (
+        ("entry_funnel.csv", lambda path: path.write_text(path.read_text(encoding="utf-8").splitlines()[0] + "\nD0.BASELINE_REPRODUCTION,discovery\n", encoding="utf-8")),
+        ("entry_funnel.csv", lambda path: path.write_text(path.read_text(encoding="utf-8").replace(",0,", ",1e309,", 1), encoding="utf-8")),
+        ("trade_statistics.json", lambda path: path.write_text(json.dumps({"results": [{**json.loads(path.read_text(encoding="utf-8"))["results"][0], "mean_return_pct": "1e309"}]}), encoding="utf-8")),
+    ),
+)
+def test_publication_verifier_rejects_rehashed_incomplete_or_nonfinite_typed_artifacts(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path, artifact: str, mutate: object,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    mutate(run_dir / artifact)
+    _rehash_manifest(run_dir, artifact)
+    with pytest.raises(ValueError, match="CSV|finite|integer"):
+        verify_diagnosis_run(run_dir)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (("result_count", True), ("result_count", -1), ("fidelity_label", "anything_goes"), ("promotion_eligible_candidates", True), ("promotion_eligible_candidates", 1)),
+)
+def test_publication_verifier_rejects_manifest_type_and_domain_tampering(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path, key: str, value: object,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    path = run_dir / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest[key] = value
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="result_count|fidelity|promotion"):
+        verify_diagnosis_run(run_dir)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "UPDATE session_facts SET close='inf'",
+        "UPDATE metadata SET value='provider_payload' WHERE key='identity'",
+    ),
+)
+def test_publication_verifier_rejects_rehashed_sqlite_nonfinite_and_raw_content(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path, mutation: str,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    path = run_dir / "diagnosis_facts.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(mutation)
+    connection.commit()
+    connection.close()
+    _rehash_manifest(run_dir, "diagnosis_facts.sqlite3")
+    with pytest.raises(ValueError, match="fact-cache"):
         verify_diagnosis_run(run_dir)

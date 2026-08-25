@@ -229,7 +229,12 @@ def test_sqlite_null_fundamental_cells_are_explicitly_unavailable() -> None:
 
 
 def test_non_sqlite_nan_fundamental_cell_fails_closed() -> None:
-    snapshot = {"quarterly_income": pd.DataFrame([[float("nan")]], index=["Diluted EPS"])}
+    frame = PITDataBundle._statement_frame([{
+        "statement_type": "quarterly", "period_end": "2023-12-31", "public_date": "2024-02-01",
+        "basic_eps": None, "diluted_eps": float("nan"), "total_revenue": 1.0, "net_income": None,
+        "common_stock": None, "total_stockholders_equity": None,
+    }], "quarterly")
+    snapshot = {"quarterly_income": frame}
 
     with pytest.raises(ValueError, match="non-finite"):
         _frame_values(snapshot, "quarterly_income", "Diluted EPS", 1)
