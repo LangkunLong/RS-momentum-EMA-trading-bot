@@ -116,6 +116,10 @@ class DiagnosisContext:
     source_commit: str
     source_fingerprint_sha256: str
     strategy_identity: str
+    # The bundle used by the current diagnosis run.  ``baseline_snapshot`` is
+    # intentionally kept separate: it identifies the frozen authority replay,
+    # while this digest identifies the PIT data actually evaluated.
+    bundle_sha256: str | None = None
     baseline_snapshot: BaselineSnapshot | None = None
     reproduced_baseline: BaselineSnapshot | None = None
     baseline_reproduction: BaselineReproduction | None = None
@@ -131,6 +135,12 @@ class DiagnosisContext:
             value = getattr(self, name)
             if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
                 raise ValueError(f"{name} must be a SHA-256")
+        if self.bundle_sha256 is not None and (
+            not isinstance(self.bundle_sha256, str)
+            or len(self.bundle_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.bundle_sha256)
+        ):
+            raise ValueError("bundle_sha256 must be a lowercase SHA-256")
         labels = tuple(str(label).upper() for label in self.diagnostic_leader_labels)
         if labels != tuple(sorted(labels)) or len(set(labels)) != len(labels):
             raise ValueError("diagnostic leader labels must be sorted and unique")
@@ -310,7 +320,7 @@ def _identity(context: DiagnosisContext, experiment: ExperimentDefinition, parti
     baseline = context.baseline_snapshot
     return build_experiment_identity(
         source_commit=context.source_commit, source_fingerprint_sha256=context.source_fingerprint_sha256,
-        bundle_sha256=(baseline.bundle_sha256 if baseline else "0" * 64),
+        bundle_sha256=(context.bundle_sha256 or (baseline.bundle_sha256 if baseline else "0" * 64)),
         baseline_manifest_sha256=(baseline.manifest_sha256 if baseline else "0" * 64),
         rulebook_sha256=context.rulebook.sha256, fact_cache_schema_sha256=_cache_digest(context.fact_cache, "schema_sha256"),
         fact_cache_content_sha256=_cache_digest(context.fact_cache, "content_sha256"), catalog_sha256=context.catalog.sha256,

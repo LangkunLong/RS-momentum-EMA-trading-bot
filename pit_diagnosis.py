@@ -287,6 +287,20 @@ def _context(args: argparse.Namespace) -> tuple[DiagnosisContext, PITDataBundle,
         bundle.close()
         raise
     metadata = dict(cache._connection.execute("SELECT key,value FROM metadata").fetchall())
+    try:
+        cache_identity = json.loads(metadata["identity"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        cache.close()
+        bundle.close()
+        raise ValueError("fact cache identity is malformed") from exc
+    if not isinstance(cache_identity, dict) or cache_identity.get("bundle_sha256") != args.pit_bundle_sha256:
+        cache.close()
+        bundle.close()
+        raise ValueError("fact cache bundle identity does not match the supplied PIT bundle")
+    if cache_identity.get("rulebook_sha256") != rulebook.sha256:
+        cache.close()
+        bundle.close()
+        raise ValueError("fact cache rulebook identity does not match the supplied rulebook")
     cache.content_sha256 = args.fact_cache_sha256
     cache.schema_sha256 = str(metadata["schema_sha256"])
     try:
@@ -315,6 +329,7 @@ def _context(args: argparse.Namespace) -> tuple[DiagnosisContext, PITDataBundle,
             else _source_fingerprint()
         ),
         strategy_identity="cached-diagnosis-v1",
+        bundle_sha256=args.pit_bundle_sha256,
         baseline_snapshot=snapshot, reproduced_baseline=snapshot,
     )
     return context, bundle, cache

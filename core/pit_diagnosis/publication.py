@@ -175,7 +175,10 @@ def _context_identities(context: DiagnosisContext, facts: Path) -> dict[str, str
         raise ValueError("baseline reproduction identity is stale")
     return {
         "source_fingerprint_sha256": _digest_value(context.source_fingerprint_sha256, "source fingerprint"),
-        "bundle_sha256": _digest_value(snapshot.bundle_sha256, "bundle"),
+        # The authority replay may be backed by an older immutable bundle.  A
+        # diagnosis publication must identify the current PIT bundle used by
+        # the fact cache; the baseline manifest remains separately bound below.
+        "bundle_sha256": _digest_value(context.bundle_sha256 or snapshot.bundle_sha256, "bundle"),
         "baseline_manifest_sha256": _digest_value(snapshot.manifest_sha256, "baseline manifest"),
         "rulebook_sha256": _digest_value(context.rulebook.sha256, "rulebook"),
         "catalog_sha256": _digest_value(context.catalog.sha256, "catalog"),
@@ -242,7 +245,7 @@ def publish_diagnosis(context: DiagnosisContext, results: Sequence[ExperimentRes
     declared_fact_sha = getattr(context.fact_cache, "content_sha256", None)
     if isinstance(declared_fact_sha, str) and declared_fact_sha != fact_sha:
         raise ValueError("fact cache content SHA-256 changed before publication")
-    name = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{context.baseline_snapshot.bundle_sha256[:12] if context.baseline_snapshot else fact_sha[:12]}"
+    name = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{identities['bundle_sha256'][:12]}"
     destination = root / name
     if destination.exists():
         raise FileExistsError("diagnosis run directory already exists")
