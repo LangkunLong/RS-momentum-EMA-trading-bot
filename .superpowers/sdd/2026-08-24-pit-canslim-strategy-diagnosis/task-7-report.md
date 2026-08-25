@@ -92,8 +92,8 @@ metrics exist yet.  Consequently `run` and `verify-result` were not executed.
 - Preserved SQLite NULL at the PIT-data frame boundary; genuine supplied NaN
   remains fail-closed.
 - Added regression coverage for rehashed malformed/non-finite/raw CSV/report
-  and SQLite artifacts, manifest completeness, SQL NULL versus NaN, and locked
-  checkpoint isolation.
+  and SQLite artifacts, ex-post leader-label injection, manifest completeness,
+  SQL NULL versus NaN, and locked checkpoint isolation.
 
 ```text
 python -m pytest -p no:cacheprovider --no-cov -q \

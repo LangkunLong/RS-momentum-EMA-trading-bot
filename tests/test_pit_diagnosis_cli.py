@@ -126,12 +126,19 @@ def _inject_nan(path: Path) -> None:
     path.write_text("\n".join((rows[0], ",".join(values))) + "\n", encoding="utf-8")
 
 
+def _inject_leader_label(path: Path) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["results"][0]["leader_label"] = "ex-post"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("artifact", "mutate", "message"),
     (
         ("rule_attribution.csv", lambda path: path.write_text("Ticker\nAAA\n", encoding="utf-8"), "schema"),
         ("entry_funnel.csv", _inject_nan, "non-finite"),
         ("report.md", lambda path: path.write_text("transaction price provider payload\n", encoding="utf-8"), "raw"),
+        ("leader_recall.json", _inject_leader_label, "schema|raw"),
     ),
 )
 def test_publication_verifier_rejects_rehashed_raw_or_malformed_text_artifacts(
