@@ -2173,6 +2173,53 @@ class OpenRouterGateway:
         except Exception as exc:
             raise GatewayError("OpenRouter request failed", status_code=_status_code(exc)) from exc
 
+    def request_pit_diagnosis_once(
+        self,
+        role: str,
+        dynamic_input: str,
+        parser: Callable[[str], PayloadT],
+        *,
+        budget_window: BudgetWindow | None = None,
+        wall_deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> AgentCompletion[PayloadT]:
+        """Make one accounted request through the isolated closed PIT prompt family."""
+        if role not in self._MODELS:
+            raise ConfigurationError(f"unknown gateway role: {role}")
+        if not isinstance(dynamic_input, str):
+            raise ConfigurationError("dynamic input must be a string")
+        if wall_deadline is not None:
+            if (
+                type(wall_deadline) not in {int, float}
+                or not math.isfinite(wall_deadline)
+                or not callable(monotonic)
+            ):
+                raise ConfigurationError("gateway wall deadline is invalid")
+            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+                raise BudgetExceededError("proposal batch wall deadline reached")
+        from pit_diagnosis_agent import (
+            PIT_DIAGNOSIS_SYSTEM_PROMPTS,
+            pit_diagnosis_response_format,
+        )
+
+        dynamic = f"<dynamic-input>\n{dynamic_input}\n</dynamic-input>"
+        try:
+            return self._request_attempt(
+                role,
+                dynamic,
+                parser,
+                require_complete_accounting=True,
+                budget_window=budget_window,
+                wall_deadline=None if wall_deadline is None else float(wall_deadline),
+                monotonic=monotonic,
+                system_prompts=PIT_DIAGNOSIS_SYSTEM_PROMPTS,
+                response_format=pit_diagnosis_response_format(role),
+            )
+        except (ResponseValidationError, BudgetExceededError, GatewayError):
+            raise
+        except Exception as exc:
+            raise GatewayError("OpenRouter request failed", status_code=_status_code(exc)) from exc
+
     def preload_pricing(
         self,
         roles: Sequence[str] = ("orchestrator", "reasoner", "coder"),
@@ -2436,10 +2483,17 @@ class OpenRouterGateway:
         budget_window: BudgetWindow | None,
         wall_deadline: float | None,
         monotonic: Callable[[], float],
+        system_prompts: Mapping[str, str] | None = None,
+        response_format: Mapping[str, object] | None = None,
     ) -> AgentCompletion[PayloadT]:
         model = self._MODELS[role]
+        prompts = self.SYSTEM_PROMPTS if system_prompts is None else system_prompts
+        try:
+            system_prompt = prompts[role]
+        except KeyError as exc:
+            raise ConfigurationError("unknown gateway role") from exc
         messages = [
-            {"role": "system", "content": self.SYSTEM_PROMPTS[role]},
+            {"role": "system", "content": system_prompt},
             {"role": "system", "content": self.STATIC_CONTEXT},
             {"role": "user", "content": dynamic},
         ]
@@ -2486,7 +2540,11 @@ class OpenRouterGateway:
             response = self._get_client().chat.completions.create(
                 model=model,
                 messages=messages,
-                response_format=self._response_format_for_role(role),
+                response_format=(
+                    self._response_format_for_role(role)
+                    if response_format is None
+                    else dict(response_format)
+                ),
                 stream=False,
                 max_tokens=self._TOKEN_CAPS[role],
                 timeout=request_timeout,
