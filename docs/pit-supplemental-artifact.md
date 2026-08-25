@@ -81,6 +81,25 @@ The shares input must contain PIT denominators:
 symbol,as_of_date,shares_outstanding,evidence_ids
 ```
 
+The existing SEC fundamentals export can be prepared offline with:
+
+```powershell
+python -m tools.export_pit_shares `
+  --fundamentals-csv .artifacts/sec-pit-roe2/fundamentals.csv `
+  --fundamentals-audit-csv .artifacts/sec-pit-roe2/fundamentals_audit.csv `
+  --data-cutoff 2025-12-31 `
+  --metadata-output pit-shares.metadata.json `
+  --output pit_shares.csv
+```
+
+This exporter joins every fundamentals row to its SEC audit row, preserves
+accession/acceptance evidence, and chooses the latest period-end shares
+observation on each public date. Unresolved same-date conflicts fail closed.
+When target symbols are supplied, the metadata records uncovered symbols and
+the output is explicitly marked `partial`; missing denominators are never
+filled from prices or current-provider data. This is a denominator input only,
+not institutional sponsorship evidence.
+
 The normalizer selects the latest filing/amendment per manager and reporting
 period inside that ZIP, maps each filing to the first supplied trading session
 strictly afterward, and consolidates all selected managers for a report period
