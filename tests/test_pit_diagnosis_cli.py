@@ -228,6 +228,45 @@ def test_publication_verifier_rejects_manifest_type_and_domain_tampering(
 
 
 @pytest.mark.parametrize(
+    ("artifact", "field", "value"),
+    (
+        ("trade_statistics.json", "completed_positions", "1"),
+        ("trade_statistics.json", "mean_return_pct", "1.0"),
+    ),
+)
+def test_publication_verifier_rejects_native_json_metric_strings(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path,
+    artifact: str, field: str, value: str,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    path = run_dir / artifact
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["results"][0][field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    _rehash_manifest(run_dir, artifact)
+    with pytest.raises(ValueError, match="integer|finite"):
+        verify_diagnosis_run(run_dir)
+
+
+def test_publication_verifier_rejects_manifest_numeric_string(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    path = run_dir / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["result_count"] = "3"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="result_count.*integer"):
+        verify_diagnosis_run(run_dir)
+
+
+@pytest.mark.parametrize(
     "mutation",
     (
         "UPDATE session_facts SET close='inf'",
@@ -247,5 +286,27 @@ def test_publication_verifier_rejects_rehashed_sqlite_nonfinite_and_raw_content(
     connection.commit()
     connection.close()
     _rehash_manifest(run_dir, "diagnosis_facts.sqlite3")
+    with pytest.raises(ValueError, match="fact-cache"):
+        verify_diagnosis_run(run_dir)
+
+
+def test_publication_verifier_rejects_rehashed_sqlite_stale_logical_integrity(
+    mini_completed_context: tuple[DiagnosisContext, tuple[object, ...]], tmp_path: Path,
+) -> None:
+    from core.pit_diagnosis.publication import publish_diagnosis, verify_diagnosis_run
+
+    context, results = mini_completed_context
+    run_dir = publish_diagnosis(context, results, tmp_path)
+    facts = run_dir / "diagnosis_facts.sqlite3"
+    connection = sqlite3.connect(facts)
+    connection.execute("UPDATE session_facts SET close=close+1.0")
+    connection.commit()
+    connection.close()
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    facts_sha = hashlib.sha256(facts.read_bytes()).hexdigest()
+    manifest["fact_cache_sha256"] = facts_sha
+    manifest["artifact_sha256"]["diagnosis_facts.sqlite3"] = facts_sha
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="fact-cache"):
         verify_diagnosis_run(run_dir)

@@ -14,10 +14,10 @@ from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
 from .experiments import DiagnosisContext, ExperimentResult, _result_payload_sha256
-from .fact_cache import _FACT_COLUMNS, _SCHEMA_SHA256, open_fact_cache
+from .fact_cache import _FACT_COLUMNS, _HASHED_ROW_COLUMNS, _SCHEMA_SHA256, open_fact_cache
 from .models import ExperimentCatalog, Rulebook
 from .catalog import load_experiment_catalog
-from .rulebook import load_rulebook
+from .rulebook import canonical_sha256, load_rulebook
 
 
 _ARTIFACTS = frozenset({
@@ -319,12 +319,12 @@ def _reject_text(value: object) -> None:
             _reject_text(item)
 
 
-def _integer(value: object, field: str, *, minimum: int = 0) -> int:
+def _integer(value: object, field: str, *, minimum: int = 0, allow_text: bool = False) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{field} must be an integer")
     if isinstance(value, int):
         number = value
-    elif isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
+    elif allow_text and isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
         number = int(value)
     else:
         raise ValueError(f"{field} must be an integer")
@@ -333,8 +333,8 @@ def _integer(value: object, field: str, *, minimum: int = 0) -> int:
     return number
 
 
-def _finite_number(value: object, field: str, *, lower: float | None = None, upper: float | None = None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+def _finite_number(value: object, field: str, *, lower: float | None = None, upper: float | None = None, allow_text: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) and not (allow_text and isinstance(value, str)):
         raise ValueError(f"{field} must be a finite number")
     try:
         number = float(value)
@@ -377,11 +377,11 @@ def _verify_csv_row(name: str, row: Mapping[str, str]) -> None:
     if name == "rule_attribution.csv":
         if not row["rule_id"]:
             raise ValueError("rule attribution rule id is invalid")
-        evaluated, survivors, passed, failed, unavailable = (_integer(row[key], key) for key in ("evaluated", "survivors", "passed", "failed", "unavailable"))
+        evaluated, survivors, passed, failed, unavailable = (_integer(row[key], key, allow_text=True) for key in ("evaluated", "survivors", "passed", "failed", "unavailable"))
         if survivors > evaluated or passed + failed + unavailable != evaluated:
             raise ValueError("rule attribution counts are inconsistent")
     elif name in {"entry_funnel.csv", "execution_outcomes.csv"}:
-        evaluated, qualified, attempted, executed, rejected = (_integer(row[key], key) for key in ("evaluated", "qualified", "attempted", "executed", "rejected"))
+        evaluated, qualified, attempted, executed, rejected = (_integer(row[key], key, allow_text=True) for key in ("evaluated", "qualified", "attempted", "executed", "rejected"))
         if not evaluated >= qualified >= attempted >= executed or rejected != attempted - executed:
             raise ValueError("entry funnel counts are inconsistent")
         if name == "execution_outcomes.csv":
@@ -391,11 +391,11 @@ def _verify_csv_row(name: str, row: Mapping[str, str]) -> None:
     elif name == "exit_attribution.csv":
         if row["reason"] not in _EXIT_REASONS:
             raise ValueError("exit attribution reason is invalid")
-        closed, wins = (_integer(row[key], key) for key in ("closed_positions", "wins"))
+        closed, wins = (_integer(row[key], key, allow_text=True) for key in ("closed_positions", "wins"))
         if wins > closed:
             raise ValueError("exit attribution wins are inconsistent")
-        _finite_number(row["win_rate_pct"], "win_rate_pct", lower=0, upper=100)
-        _finite_number(row["average_completed_position_return_pct"], "average_completed_position_return_pct", lower=-100, upper=100)
+        _finite_number(row["win_rate_pct"], "win_rate_pct", lower=0, upper=100, allow_text=True)
+        _finite_number(row["average_completed_position_return_pct"], "average_completed_position_return_pct", lower=-100, upper=100, allow_text=True)
     else:
         if row["fidelity_label"] not in _FIDELITY_LABELS or row["promotion_eligible"] not in {"True", "False"}:
             raise ValueError("ablation domain is invalid")
@@ -458,6 +458,8 @@ def _verify_fact_cache(path: Path, manifest: Mapping[str, object]) -> None:
             identity = _json_object(json.loads(metadata["identity"], parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item))), "fact-cache identity")
             if set(identity) != _FACT_IDENTITY_KEYS or not isinstance(identity.get("bundle_schema_version"), str) or not isinstance(identity.get("rulebook_version"), str) or not isinstance(identity.get("fact_cache_schema_version"), str) or not isinstance(identity.get("bundle_metadata"), Mapping) or not isinstance(identity.get("partitions"), Mapping):
                 raise ValueError("fact-cache identity schema is invalid")
+            if canonical_sha256(identity) != metadata["identity_sha256"]:
+                raise ValueError("fact-cache identity digest is stale")
             for field in ("bundle_sha256", "rulebook_sha256", "supplemental_content_identity_sha256", "fact_cache_schema_sha256"):
                 _digest_value(identity.get(field), f"fact-cache {field}")
             partitions = identity["partitions"]
@@ -465,13 +467,17 @@ def _verify_fact_cache(path: Path, manifest: Mapping[str, object]) -> None:
                 raise ValueError("fact-cache partition identity is invalid")
             if identity.get("bundle_sha256") != manifest["bundle_sha256"] or identity.get("rulebook_sha256") != manifest["rulebook_sha256"]:
                 raise ValueError("fact-cache identities are inconsistent")
-            for record in connection.execute("SELECT * FROM session_facts"):
+            row_hashes: list[str] = []
+            for record in connection.execute("SELECT * FROM session_facts ORDER BY session,symbol"):
                 row = dict(record)
                 _reject_text(row)
                 if row["bundle_sha256"] != manifest["bundle_sha256"] or row["member"] != 1:
                     raise ValueError("fact-cache row identity or membership is invalid")
                 _digest_value(row["bundle_sha256"], "fact-cache bundle")
                 _digest_value(row["row_sha256"], "fact-cache row")
+                if canonical_sha256({field: row[field] for field in _HASHED_ROW_COLUMNS}) != row["row_sha256"]:
+                    raise ValueError("fact-cache row digest is stale")
+                row_hashes.append(row["row_sha256"])
                 if not all(isinstance(row[field], str) and row[field] for field in ("rulebook_schema_version", "symbol", "session", "market_regime")):
                     raise ValueError("fact-cache text row value is invalid")
                 for field in _FACT_REAL_COLUMNS:
@@ -480,6 +486,9 @@ def _verify_fact_cache(path: Path, manifest: Mapping[str, object]) -> None:
                 for field in _FACT_INTEGER_COLUMNS:
                     if row[field] is not None:
                         _integer(row[field], f"fact-cache {field}")
+            logical = hashlib.sha256("".join(row_hashes).encode("ascii")).hexdigest()
+            if logical != metadata["content_sha256"]:
+                raise ValueError("fact-cache logical content digest is stale")
     except Exception as exc:
         raise ValueError("diagnosis fact-cache schema, content, or identity is invalid") from exc
 

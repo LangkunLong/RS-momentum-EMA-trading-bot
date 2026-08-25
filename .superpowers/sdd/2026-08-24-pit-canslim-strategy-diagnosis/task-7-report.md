@@ -47,6 +47,58 @@ git diff --check
 exit 0
 ```
 
+## Review fix round 3
+
+- JSON and manifest metrics/counts are now native JSON numbers only: strings
+  are rejected, while CSV text is parsed separately under its exact CSV schema.
+- Fact-cache verification recomputes canonical `row_sha256` values in
+  `session,symbol` order, recomputes the logical cache content hash, and checks
+  the canonical metadata identity digest.  A rehashed outer SQLite file cannot
+  hide a finite row mutation without rebuilding all cache integrity evidence.
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_cli.py -k "native_json_metric_strings or manifest_numeric_string or stale_logical_integrity"
+4 passed, 18 deselected, 2 warnings
+
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_cli.py -k publication_is_complete
+1 passed, 21 deselected, 2 warnings
+
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_fact_cache.py
+11 passed, 1 warning
+
+python -m ruff check core/pit_diagnosis/publication.py core/pit_data.py tests/test_pit_diagnosis_cli.py tests/test_pit_diagnosis_fact_cache.py
+All checks passed!
+
+python -m compileall -q core/pit_diagnosis/publication.py core/pit_data.py
+exit 0
+
+git diff --check
+exit 0
+```
+
+A full 22-test CLI run reported a transient Windows `os.replace` access denial
+under `.artifacts/pytest`; the affected
+isolated publication test passed on immediate rerun.  No generated artifact
+was committed.  The real cache/run/manifest deliverable remains pending.
+
+The final full CLI retry again reached 21 passing tests and hit the same
+environmental `os.replace` denial for a different test directory; its isolated
+leader-recall tamper test passed immediately:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_cli.py -k leader_recall
+1 passed, 21 deselected, 2 warnings
+
+python -m ruff check core/pit_diagnosis/publication.py core/pit_data.py tests/test_pit_diagnosis_cli.py tests/test_pit_diagnosis_fact_cache.py
+All checks passed!
+
+python -m compileall -q core/pit_diagnosis/publication.py core/pit_data.py
+exit 0
+
+git diff --check
+exit 0
+```
+
 The only warnings were the repository's existing pytest configuration warning
 for `cache_dir` and a third-party `websockets.legacy` deprecation warning.
 
