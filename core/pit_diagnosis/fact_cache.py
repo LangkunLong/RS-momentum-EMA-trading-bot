@@ -512,7 +512,9 @@ def _frame_values(snapshot: Mapping[str, Any] | None, name: str, row: str, count
     frame = snapshot[name]
     if row not in frame.index:
         return [None] * count
-    values = [_number(value) for value in frame.loc[row].sort_index(ascending=False).tolist()]
+    # SQLite NULLs become pandas NaN on frame construction.  Preserve that missing
+    # input as an unavailable fact; _number still rejects actual non-finite values.
+    values = [None if pd.isna(value) else _number(value) for value in frame.loc[row].sort_index(ascending=False).tolist()]
     return (values + [None] * count)[:count]
 
 

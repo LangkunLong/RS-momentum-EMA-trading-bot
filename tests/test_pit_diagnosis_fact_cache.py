@@ -8,7 +8,7 @@ import sys
 import pandas as pd
 import pytest
 
-from core.pit_diagnosis.fact_cache import FactCacheBuilder, _number, build_fact_cache, open_fact_cache
+from core.pit_diagnosis.fact_cache import FactCacheBuilder, _frame_values, _number, build_fact_cache, open_fact_cache
 from core.pit_diagnosis.models import DatePartition, DatePartitions
 from core.pit_diagnosis.rulebook import load_rulebook
 from core.pit_diagnosis.supplemental import IndustryGroupSnapshot, InstitutionalSnapshot
@@ -214,3 +214,9 @@ def test_finalization_rejects_wrong_member_even_when_total_rows_match(
 def test_non_finite_numbers_fail_closed(value: float) -> None:
     with pytest.raises(ValueError, match="non-finite"):
         _number(value)
+
+
+def test_missing_fundamental_cells_are_explicitly_unavailable() -> None:
+    snapshot = {"quarterly_income": pd.DataFrame([[float("nan"), 1.0]], index=["Diluted EPS"])}
+
+    assert _frame_values(snapshot, "quarterly_income", "Diluted EPS", 3) == [1.0, None, None]
