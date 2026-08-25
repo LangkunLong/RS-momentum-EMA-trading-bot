@@ -60,9 +60,15 @@ evaluated signal rows across 24 candidate signal days, zero entry attempts,
 zero executions, and zero entry rejections.  It completed normally with no
 `proper_base_unavailable` crash.
 
+Completed strict-PIT replay (coordinating task): one symbol (`NVDA`),
+2023-01-01 through 2025-12-31, daily signals, using the corrected PIT bundle.
+The process completed successfully with 666 evaluated rows, three buy signals,
+three entry attempts, two executions, and one next-open buy-zone rejection.
+There were zero cash, capacity, and risk rejections.  Total return was +0.3%
+versus SPY at +79.0%, and there was no `proper_base_unavailable` crash.
+
 ## Concern
 
-The requested six-symbol, 2023--2025 replay was not rerun because the prior
-attempt was CPU-bound for about ten minutes without artifacts and was stopped
-by the coordinating task.  Per the updated bounded-verification direction,
-this report records the smaller one-symbol 2024 strict-PIT slice instead.
+The completed long-window verification is intentionally limited to one symbol;
+the six-symbol attempt was previously CPU-bound for about ten minutes without
+artifacts and was stopped by the coordinating task.
