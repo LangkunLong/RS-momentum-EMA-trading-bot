@@ -95,11 +95,11 @@ def _baseline_snapshot(root: Path) -> BaselineSnapshot:
         writer.writeheader()
         writer.writerows(rows)
     (root / "entry_attempt_outcomes.csv").write_text("symbol,signal_date,entry_date,pivot,buy_zone_lower,buy_zone_upper,entry_open,outcome\n", encoding="utf-8")
-    (root / "equity_curve.csv").write_text("date,portfolio,benchmark\n", encoding="utf-8")
+    (root / "equity_curve.csv").write_text("date,portfolio,benchmark,cash\n2021-01-04,100,100,50\n2021-06-30,105,103,55\n2021-12-31,110,106,60\n", encoding="utf-8")
     (root / "leader_recall.csv").write_text("ticker,buy_signal_count,entry_count\n", encoding="utf-8")
     (root / "summary.json").write_text("{}\n", encoding="utf-8")
     frame = pd.read_csv(root / "transactions.csv", keep_default_na=False)
-    return BaselineSnapshot(root, "a" * 64, "b" * 40, "c" * 40, "d" * 64, {"transactions.csv": hashlib.sha256((root / "transactions.csv").read_bytes()).hexdigest()}, "e" * 64, "f" * 64, baseline_module._normalized_ordered_row_sha256(frame), -9.99, -2.0, -0.2, -13.0, 225, 39.11, 67.0, 286, 225, 51, 10)
+    return BaselineSnapshot(root, "a" * 64, "b" * 40, "c" * 40, "d" * 64, {"transactions.csv": hashlib.sha256((root / "transactions.csv").read_bytes()).hexdigest(), "equity_curve.csv": hashlib.sha256((root / "equity_curve.csv").read_bytes()).hexdigest()}, "e" * 64, "f" * 64, baseline_module._normalized_ordered_row_sha256(frame), -9.99, -2.0, -0.2, -13.0, 225, 39.11, 67.0, 286, 225, 51, 10)
 
 
 @pytest.fixture
@@ -185,7 +185,22 @@ def test_current_exit_package_explains_the_known_ma_loss_cluster(
     assert ma.win_rate_pct < result.trade_statistics.win_rate_pct
     assert ma.average_completed_position_return_pct < 0.0
     assert result.performance.closed_positions == result.trade_statistics.completed_positions
-    assert result.performance.total_return_pct == result.trade_statistics.mean_return_pct
+    assert result.performance.total_return_pct != result.trade_statistics.mean_return_pct
+
+
+def test_d4_fails_closed_when_verified_partition_equity_series_is_missing(
+    diagnosis_context: DiagnosisContext,
+) -> None:
+    path = diagnosis_context.baseline_snapshot.run_dir / "equity_curve.csv"
+    path.write_text("date,portfolio,benchmark\n2021-01-04,100,100\n2021-12-31,110,106\n", encoding="utf-8")
+    artifacts = dict(diagnosis_context.baseline_snapshot.artifact_sha256)
+    artifacts["equity_curve.csv"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    snapshot = replace(diagnosis_context.baseline_snapshot, artifact_sha256=artifacts)
+    context = replace(diagnosis_context, baseline_snapshot=snapshot, reproduced_baseline=replace(snapshot))
+    result = run_experiment(context, "D4.CURRENT_EXIT_PACKAGE", PartitionName.DISCOVERY)
+    assert result.performance is None
+    assert result.promotion_checks["performance_complete"] is False
+    assert result.promotion_eligible is False
 
 
 def test_rs_85_variant_changes_the_materialized_entry_evidence(
@@ -262,6 +277,19 @@ def test_catalog_resume_loads_completed_result_before_invoking_runner(
     monkeypatch.setattr(experiments_module, "run_experiment", runner_must_not_execute)
     resumed = run_catalog(diagnosis_context, ("D2.RULE_STAGE_FUNNEL",), (PartitionName.DISCOVERY,), tmp_path / "checkpoints", resume=True)
     assert resumed[0].result_sha256 == first[0].result_sha256
+
+
+def test_catalog_identity_changes_when_partition_promotion_evidence_changes(
+    diagnosis_context: DiagnosisContext, tmp_path: Path,
+) -> None:
+    first_reference = PerformanceEvidence(PartitionName.DISCOVERY, -1.0, -1.0, 0.0, -1.0, 0.0, 1, 0.0, 0.0)
+    second_reference = PerformanceEvidence(PartitionName.DISCOVERY, 1.0, 1.0, 0.0, -1.0, 0.0, 1, 0.0, 0.0)
+    first_context = replace(diagnosis_context, partition_baseline_performance={PartitionName.DISCOVERY: first_reference})
+    second_context = replace(diagnosis_context, partition_baseline_performance={PartitionName.DISCOVERY: second_reference})
+    root = tmp_path / "checkpoints"
+    first = run_catalog(first_context, ("D2.RULE_STAGE_FUNNEL",), (PartitionName.DISCOVERY,), root, resume=False)
+    resumed = run_catalog(second_context, ("D2.RULE_STAGE_FUNNEL",), (PartitionName.DISCOVERY,), root, resume=True)
+    assert resumed[0].identity_sha256 != first[0].identity_sha256
 
 
 def test_ex_post_leader_labels_cannot_change_a_trade_path(

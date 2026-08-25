@@ -45,5 +45,6 @@ def build_experiment_identity(
     strategy_identity: str,
     benchmark_identity: str,
     universe_identity: str,
+    promotion_evidence_sha256: str = "",
 ) -> ExperimentIdentity:
     return ExperimentIdentity.from_fields(locals())

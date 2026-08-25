@@ -41,7 +41,7 @@ class ExperimentResult:
     entry_funnel: EntryFunnel
     exit_attribution: ExitAttribution
     trade_statistics: TradeStatistics
-    performance: PerformanceEvidence
+    performance: PerformanceEvidence | None
     leader_recall: LeaderRecallEvidence
     promotion_eligible: bool
     promotion_checks: Mapping[str, bool]
@@ -57,7 +57,7 @@ def _result_primitive(result: ExperimentResult) -> dict[str, object]:
         "entry_funnel": {"evaluated": result.entry_funnel.evaluated, "qualified": result.entry_funnel.qualified, "attempted": result.entry_funnel.attempted, "executed": result.entry_funnel.executed, "rejections": dict(result.entry_funnel.rejections)},
         "exit_attribution": {reason: record.__dict__ for reason, record in result.exit_attribution.by_reason.items()},
         "trade_statistics": result.trade_statistics.__dict__,
-        "performance": {**result.performance.__dict__, "partition": result.performance.partition.value},
+        "performance": None if result.performance is None else {**result.performance.__dict__, "partition": result.performance.partition.value},
         "leader_recall": result.leader_recall.__dict__, "promotion_eligible": result.promotion_eligible,
         "promotion_checks": dict(result.promotion_checks),
     }
@@ -71,8 +71,7 @@ def _result_from_primitive(value: Mapping[str, object]) -> ExperimentResult:
     rules = tuple(RuleAttribution(**{**record, "evidence_ids": tuple(record["evidence_ids"])}) for record in value["rule_attribution"])
     funnel = EntryFunnel(**value["entry_funnel"])
     exits = ExitAttribution({reason: ExitReasonAttribution(**{**record, "evidence_ids": tuple(record["evidence_ids"])}) for reason, record in value["exit_attribution"].items()})
-    performance_value = dict(value["performance"])
-    performance = PerformanceEvidence(**performance_value)
+    performance = None if value["performance"] is None else PerformanceEvidence(**dict(value["performance"]))
     leader = dict(value["leader_recall"])
     leader["evidence_ids"] = tuple(leader["evidence_ids"])
     return ExperimentResult(str(value["experiment_id"]), PartitionName(value["partition"]), str(value["identity_sha256"]), str(value["result_sha256"]), str(value["trade_path_sha256"]), fidelity, rules, funnel, exits, TradeStatistics(**value["trade_statistics"]), performance, LeaderRecallEvidence(**leader), bool(value["promotion_eligible"]), MappingProxyType(dict(value["promotion_checks"])))
@@ -279,7 +278,26 @@ def _identity(context: DiagnosisContext, experiment: ExperimentDefinition, parti
         fact_cache_content_sha256=_cache_digest(context.fact_cache, "content_sha256"), catalog_sha256=context.catalog.sha256,
         experiment=experiment, partition=_partition(context, partition), strategy_identity=context.strategy_identity,
         benchmark_identity=context.benchmark_identity, universe_identity=context.universe_identity,
+        promotion_evidence_sha256=_promotion_evidence_sha256(context),
     ).sha256
+
+
+def _promotion_evidence_sha256(context: DiagnosisContext) -> str:
+    performance = {
+        name.value: {
+            "total_return_pct": value.total_return_pct, "annualized_return_pct": value.annualized_return_pct,
+            "sharpe_ratio": value.sharpe_ratio, "max_drawdown_pct": value.max_drawdown_pct,
+            "average_cash_pct": value.average_cash_pct, "closed_positions": value.closed_positions,
+            "benchmark_total_return_delta_pct": value.benchmark_total_return_delta_pct,
+            "benchmark_annualized_return_delta_pct": value.benchmark_annualized_return_delta_pct,
+        }
+        for name, value in sorted(context.partition_baseline_performance.items(), key=lambda item: item[0].value)
+    }
+    recall = {
+        name.value: {"labelled_leaders": value.labelled_leaders, "pit_exposed_leaders": value.pit_exposed_leaders, "recalled_leaders": value.recalled_leaders, "recall_pct": value.recall_pct, "evidence_ids": value.evidence_ids}
+        for name, value in sorted(context.partition_baseline_recall.items(), key=lambda item: item[0].value)
+    }
+    return canonical_sha256({"performance": performance, "recall": recall})
 
 
 def _outcomes(facts: Sequence[SessionFact], rulebook: Rulebook, experiment: ExperimentDefinition) -> list[dict[str, RuleOutcome]]:
@@ -400,12 +418,41 @@ def _verify_known_current_exit_cluster(snapshot: BaselineSnapshot, context: Diag
         raise ValueError("verified baseline MA exit cluster does not match immutable authority")
 
 
-def _ledger_performance(partition: PartitionName, statistics: TradeStatistics) -> PerformanceEvidence:
-    return PerformanceEvidence(
-        partition, statistics.mean_return_pct, statistics.mean_return_pct, 0.0,
-        min(0.0, statistics.mean_return_pct), 0.0, statistics.completed_positions,
-        0.0, 0.0,
-    )
+def _baseline_partition_performance(
+    snapshot: BaselineSnapshot, partition: PartitionName, context: DiagnosisContext,
+    closed_positions: int,
+) -> PerformanceEvidence | None:
+    """Compute portfolio metrics only from a hash-bound partition equity series."""
+    path = snapshot.run_dir / "equity_curve.csv"
+    expected_sha = snapshot.artifact_sha256.get("equity_curve.csv")
+    if not path.is_file() or expected_sha is None:
+        return None
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha:
+        raise ValueError("baseline equity ledger hash does not match snapshot artifact")
+    try:
+        frame = pd.read_csv(path, keep_default_na=False)
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        raise ValueError("baseline equity ledger is invalid") from exc
+    if not {"date", "portfolio", "benchmark", "cash"}.issubset(frame):
+        return None
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    for column in ("portfolio", "benchmark", "cash"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    selected = _partition(context, partition)
+    frame = frame.loc[(frame["date"] >= selected.start) & (frame["date"] <= selected.end)].sort_values("date")
+    if len(frame) < 2 or frame[["date", "portfolio", "benchmark", "cash"]].isna().any().any() or (frame[["portfolio", "benchmark"]] <= 0.0).any().any() or (frame["cash"] < 0.0).any():
+        return None
+    first, last = frame.iloc[0], frame.iloc[-1]
+    total_return = (float(last.portfolio) / float(first.portfolio) - 1.0) * 100.0
+    benchmark_return = (float(last.benchmark) / float(first.benchmark) - 1.0) * 100.0
+    elapsed_days = max((last.date - first.date).days, 0)
+    annualized = total_return if elapsed_days == 0 else ((float(last.portfolio) / float(first.portfolio)) ** (365.25 / elapsed_days) - 1.0) * 100.0
+    benchmark_annualized = benchmark_return if elapsed_days == 0 else ((float(last.benchmark) / float(first.benchmark)) ** (365.25 / elapsed_days) - 1.0) * 100.0
+    returns = frame["portfolio"].pct_change().dropna()
+    volatility = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
+    sharpe = 0.0 if volatility == 0.0 else float(returns.mean() / volatility * (252.0 ** 0.5))
+    drawdown = float((frame["portfolio"] / frame["portfolio"].cummax() - 1.0).min() * 100.0)
+    return PerformanceEvidence(partition, total_return, annualized, sharpe, drawdown, float(frame["cash"].mean()), closed_positions, total_return - benchmark_return, annualized - benchmark_annualized)
 
 
 def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, partition: PartitionName, *, current_exit: bool = False, reproduction_ok: bool | None = None) -> ExperimentResult:
@@ -430,7 +477,7 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
     statistics = _trade_stats(trades)
     exits = _exit_attribution(trades, evidence_prefix="baseline" if current_exit else "replay")
     if current_exit:
-        performance = _ledger_performance(partition, statistics)
+        performance = _baseline_partition_performance(snapshot, partition, context, statistics.completed_positions) if snapshot is not None else None
     else:
         start_equity, end_equity = (replay.equity[0], replay.equity[-1]) if replay.equity else (1.0, 1.0)
         total_return = (end_equity / start_equity - 1.0) * 100.0 if start_equity else 0.0
@@ -453,14 +500,15 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
         "discovery_floor": statistics.completed_positions >= 60 if partition is PartitionName.DISCOVERY else True,
         "validation_floor": statistics.completed_positions >= 20 if partition is PartitionName.VALIDATION else True,
         "positive_expectancy": statistics.expectancy_pct > 0.0,
+        "performance_complete": performance is not None,
         "partition_baseline_performance_available": reference_performance is not None,
         "partition_baseline_recall_available": reference_recall is not None,
-        "non_worse_return": reference_performance is not None and performance.total_return_pct >= reference_performance.total_return_pct,
-        "non_worse_annualized_return": reference_performance is not None and performance.annualized_return_pct >= reference_performance.annualized_return_pct,
-        "non_worse_sharpe": reference_performance is not None and performance.sharpe_ratio >= reference_performance.sharpe_ratio,
-        "non_worse_drawdown": reference_performance is not None and performance.max_drawdown_pct >= reference_performance.max_drawdown_pct,
+        "non_worse_return": performance is not None and reference_performance is not None and performance.total_return_pct >= reference_performance.total_return_pct,
+        "non_worse_annualized_return": performance is not None and reference_performance is not None and performance.annualized_return_pct >= reference_performance.annualized_return_pct,
+        "non_worse_sharpe": performance is not None and reference_performance is not None and performance.sharpe_ratio >= reference_performance.sharpe_ratio,
+        "non_worse_drawdown": performance is not None and reference_performance is not None and performance.max_drawdown_pct >= reference_performance.max_drawdown_pct,
         "non_worse_pit_recall": reference_recall is not None and recall.recall_pct >= reference_recall.recall_pct,
-        "strict_improvement": reference_performance is not None and (performance.total_return_pct > reference_performance.total_return_pct or performance.annualized_return_pct > reference_performance.annualized_return_pct or performance.sharpe_ratio > reference_performance.sharpe_ratio or performance.max_drawdown_pct > reference_performance.max_drawdown_pct),
+        "strict_improvement": performance is not None and reference_performance is not None and (performance.total_return_pct > reference_performance.total_return_pct or performance.annualized_return_pct > reference_performance.annualized_return_pct or performance.sharpe_ratio > reference_performance.sharpe_ratio or performance.max_drawdown_pct > reference_performance.max_drawdown_pct),
         "reproduction_exact": (context.baseline_reproduction is not None and context.baseline_reproduction.passed) if reproduction_ok is None else reproduction_ok,
     }
     promotable = experiment.promotion_eligible and all(checks.values())
