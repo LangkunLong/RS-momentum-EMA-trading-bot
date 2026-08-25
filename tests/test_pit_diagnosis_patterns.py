@@ -6,6 +6,7 @@ import pytest
 from core.pit_diagnosis.patterns import (
     BaseKind,
     BasePolicy,
+    _detect_proper_base_reference,
     detect_proper_base,
     evaluate_new_high_entry,
 )
@@ -128,3 +129,53 @@ def test_new_high_entry_requires_pivot_buy_zone_and_volume_confirmation() -> Non
         "S.VOLUME_CONFIRMATION",
         "N.NEW_HIGH",
     )
+
+
+@pytest.mark.parametrize(
+    "history_factory",
+    (
+        _flat_base_before_event,
+        lambda: pd.DataFrame(
+            {
+                "High": [100.25, 98.25, 96.25, 94.25, 92.25, 90.25, 88.25, 86.25, 84.25, 82.25, 80.25]
+                + [value + 0.25 for value in [82.0, 84.0, 86.0, 88.0, 90.0, 92.0, 94.0, 96.0, 98.0, 99.0]]
+                + [99.25] * 15
+                + [98.25, 97.25, 98.25, 99.25],
+                "Low": [99.75, 97.75, 95.75, 93.75, 91.75, 89.75, 87.75, 85.75, 83.75, 81.75, 79.75]
+                + [value - 0.25 for value in [82.0, 84.0, 86.0, 88.0, 90.0, 92.0, 94.0, 96.0, 98.0, 99.0]]
+                + [98.75] * 15
+                + [97.75, 96.75, 97.75, 98.75],
+                "Close": [100.0, 98.0, 96.0, 94.0, 92.0, 90.0, 88.0, 86.0, 84.0, 82.0, 80.0]
+                + [82.0, 84.0, 86.0, 88.0, 90.0, 92.0, 94.0, 96.0, 98.0, 99.0]
+                + [99.0] * 15
+                + [98.0, 97.0, 98.0, 99.0],
+            },
+            index=pd.bdate_range("2024-01-02", periods=40),
+        ),
+        lambda: pd.DataFrame(
+            {
+                "High": [100.25 * (1.005**day) for day in range(131)],
+                "Low": [99.75 * (1.005**day) for day in range(131)],
+                "Close": [100.0 * (1.005**day) for day in range(131)],
+            },
+            index=pd.bdate_range("2024-01-02", periods=131),
+        ),
+    ),
+)
+def test_array_detector_matches_reference_for_flat_cup_and_no_pattern(history_factory) -> None:
+    """Break caught: array fast path changed canonical pattern precedence or fields."""
+    history = history_factory()
+    event_session = (history.index[-1] + pd.offsets.BDay()).date().isoformat()
+
+    expected = _detect_proper_base_reference(
+        history,
+        event_session=event_session,
+        policy=BasePolicy.canonical_v1(),
+    )
+    actual = detect_proper_base(
+        history,
+        event_session=event_session,
+        policy=BasePolicy.canonical_v1(),
+    )
+
+    assert actual == expected

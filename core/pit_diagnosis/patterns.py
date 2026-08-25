@@ -8,6 +8,7 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 
+import numpy as np
 import pandas as pd
 
 from .models import RuleOutcome
@@ -92,6 +93,34 @@ def detect_proper_base(
         raise ValueError(f"history must contain at least {policy.flat_min_sessions} sessions")
     input_sha256 = _history_sha256(history)
 
+    values = history.to_numpy(dtype=float, copy=False)
+    return _detect_proper_base_arrays(
+        index=history.index,
+        highs=values[:, 0],
+        lows=values[:, 1],
+        closes=values[:, 2],
+        policy=policy,
+        input_sha256=input_sha256,
+    )
+
+
+def _detect_proper_base_reference(
+    history_before_event: pd.DataFrame,
+    *,
+    event_session: str,
+    policy: BasePolicy,
+) -> BasePattern | None:
+    """Retain the original DataFrame implementation as a parity oracle.
+
+    This is intentionally private and exercised only by regression tests.  It
+    establishes that the production array path preserves the reviewed v1
+    candidate ordering and every returned field.
+    """
+    history = _validate_pre_event_history(history_before_event, event_session)
+    if len(history) < policy.flat_min_sessions:
+        raise ValueError(f"history must contain at least {policy.flat_min_sessions} sessions")
+    input_sha256 = _history_sha256(history)
+
     for end_pos in range(len(history), policy.flat_min_sessions - 1, -1):
         candidate_end = history.iloc[:end_pos]
         cup = _most_recent_cup(candidate_end, policy, input_sha256)
@@ -101,6 +130,184 @@ def detect_proper_base(
         if flat is not None:
             return flat
     return None
+
+
+def _detect_proper_base_arrays(
+    *,
+    index: pd.DatetimeIndex,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    policy: BasePolicy,
+    input_sha256: str,
+) -> BasePattern | None:
+    """Evaluate canonical candidates without creating pandas slices per window.
+
+    Candidate ordering deliberately matches ``_detect_proper_base_reference``:
+    latest end-session first, then cup-with-handle before flat base, and the
+    shortest qualifying duration within each kind.
+    """
+    for end_pos in range(len(index), policy.flat_min_sessions - 1, -1):
+        cup = _most_recent_cup_arrays(index, highs, lows, closes, end_pos, policy, input_sha256)
+        if cup is not None:
+            return cup
+        flat = _most_recent_flat_arrays(index, highs, lows, end_pos, policy, input_sha256)
+        if flat is not None:
+            return flat
+    return None
+
+
+def _most_recent_flat_arrays(
+    index: pd.DatetimeIndex,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    end_pos: int,
+    policy: BasePolicy,
+    input_sha256: str,
+) -> BasePattern | None:
+    max_sessions = min(policy.flat_max_sessions, end_pos)
+    for duration in range(policy.flat_min_sessions, max_sessions + 1):
+        start_pos = end_pos - duration
+        base_highs = highs[start_pos:end_pos]
+        base_lows = lows[start_pos:end_pos]
+        pivot = float(base_highs.max())
+        low = float(base_lows.min())
+        depth_pct = (pivot - low) / pivot
+        if depth_pct > policy.flat_max_depth_pct:
+            continue
+        high_pos = int(base_highs.argmax())
+        low_pos = int(base_lows.argmin())
+        if high_pos >= low_pos or low_pos >= duration - 1:
+            continue
+        post_low_high = float(base_highs[low_pos + 1 :].max())
+        if post_low_high < low + (pivot - low) * 0.5:
+            continue
+        return _pattern_from_positions(
+            BaseKind.FLAT_BASE,
+            index=index,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            pivot=pivot,
+            low=low,
+            depth_pct=depth_pct,
+            input_sha256=input_sha256,
+        )
+    return None
+
+
+def _most_recent_cup_arrays(
+    index: pd.DatetimeIndex,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    end_pos: int,
+    policy: BasePolicy,
+    input_sha256: str,
+) -> BasePattern | None:
+    max_sessions = min(policy.cup_max_sessions, end_pos)
+    for duration in range(policy.cup_min_sessions, max_sessions + 1):
+        start_pos = end_pos - duration
+        pattern = _cup_pattern_arrays(
+            index=index,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            policy=policy,
+            input_sha256=input_sha256,
+        )
+        if pattern is not None:
+            return pattern
+    return None
+
+
+def _cup_pattern_arrays(
+    *,
+    index: pd.DatetimeIndex,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    start_pos: int,
+    end_pos: int,
+    policy: BasePolicy,
+    input_sha256: str,
+) -> BasePattern | None:
+    base_lows = lows[start_pos:end_pos]
+    left_lip = float(highs[start_pos])
+    low = float(base_lows.min())
+    low_pos = int(base_lows.argmin())
+    duration = end_pos - start_pos
+    if left_lip <= 0 or low_pos == 0:
+        return None
+    depth_pct = (left_lip - low) / left_lip
+    if not policy.cup_min_depth_pct <= depth_pct <= policy.cup_max_depth_pct:
+        return None
+
+    midpoint = low + (left_lip - low) * 0.5
+    max_handle_sessions = min(15, duration - low_pos - 1)
+    for handle_sessions in range(3, max_handle_sessions + 1):
+        handle_start = end_pos - handle_sessions
+        handle_lows = lows[handle_start:end_pos]
+        if float(handle_lows.min()) <= midpoint:
+            continue
+        pre_handle_start = start_pos + low_pos + 1
+        if pre_handle_start >= handle_start:
+            continue
+        pre_handle_highs = highs[pre_handle_start:handle_start]
+        right_lip = float(pre_handle_highs.max())
+        if not left_lip * (1.0 - policy.right_lip_max_distance_pct) <= right_lip <= left_lip * (
+            1.0 + policy.right_lip_max_distance_pct
+        ):
+            continue
+        right_lip_pos = int(pre_handle_highs.argmax())
+        right_lip_close = float(closes[pre_handle_start + right_lip_pos])
+        handle_closes = closes[handle_start:end_pos]
+        if float(handle_closes.min()) >= right_lip_close:
+            continue
+        handle_highs = highs[handle_start:end_pos]
+        pivot = float(handle_highs.max())
+        handle_low = float(handle_lows.min())
+        if (pivot - handle_low) / pivot > policy.handle_max_depth_pct:
+            continue
+        return _pattern_from_positions(
+            BaseKind.CUP_WITH_HANDLE,
+            index=index,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            pivot=pivot,
+            low=low,
+            depth_pct=depth_pct,
+            input_sha256=input_sha256,
+            handle_start_pos=handle_start,
+        )
+    return None
+
+
+def _pattern_from_positions(
+    kind: BaseKind,
+    *,
+    index: pd.DatetimeIndex,
+    start_pos: int,
+    end_pos: int,
+    pivot: float,
+    low: float,
+    depth_pct: float,
+    input_sha256: str,
+    handle_start_pos: int | None = None,
+) -> BasePattern:
+    return BasePattern(
+        kind=kind,
+        start_session=_session_text(index[start_pos]),
+        end_session=_session_text(index[end_pos - 1]),
+        pivot=pivot,
+        low=low,
+        depth_pct=depth_pct,
+        duration_sessions=end_pos - start_pos,
+        handle_start_session=None if handle_start_pos is None else _session_text(index[handle_start_pos]),
+        handle_end_session=None if handle_start_pos is None else _session_text(index[end_pos - 1]),
+        input_sha256=input_sha256,
+    )
 
 
 def evaluate_new_high_entry(
