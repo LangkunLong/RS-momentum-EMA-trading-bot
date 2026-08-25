@@ -71,8 +71,15 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
     labels = df.index.astype(str)
     for pattern in (r"Diluted EPS", r"Basic EPS", r"Net Income"):
         matches = labels.str.contains(pattern, case=False, regex=True)
-        if matches.any():
-            return df.index[matches][0]
+        for row_label in df.index[matches]:
+            earnings = df.loc[row_label]
+            if isinstance(earnings, pd.DataFrame):
+                earnings = earnings.iloc[0]
+            ordered = earnings.sort_index()
+            if len(ordered) >= 2 and not pd.isna(ordered.iloc[-1]):
+                preceding = ordered.iloc[:-1].dropna()
+                if not preceding.empty:
+                    return row_label
 
     return None
 
@@ -187,7 +194,7 @@ def evaluate_a(
             return 0.0, None, None
 
         # Sort columns by date oldest→newest so iloc[-1] is most recent
-        earnings = annual_income.loc[row_label].sort_index()
+        earnings = annual_income.loc[row_label].sort_index().dropna()
 
         if len(earnings) < 2:
             return 0.0, None, None

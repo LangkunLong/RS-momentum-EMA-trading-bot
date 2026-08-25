@@ -63,8 +63,15 @@ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
     labels = df.index.astype(str)
     for pattern in (r"Diluted EPS", r"Basic EPS", r"Net Income"):
         matches = labels.str.contains(pattern, case=False, regex=True)
-        if matches.any():
-            return df.index[matches][0]
+        for row_label in df.index[matches]:
+            earnings = df.loc[row_label]
+            if isinstance(earnings, pd.DataFrame):
+                earnings = earnings.iloc[0]
+            comparisons = match_fiscal_year_over_year_periods(earnings)
+            if comparisons and comparisons[0].matched:
+                latest = comparisons[0]
+                if not pd.isna(latest.current_value) and not pd.isna(latest.prior_value):
+                    return row_label
 
     return None
 
