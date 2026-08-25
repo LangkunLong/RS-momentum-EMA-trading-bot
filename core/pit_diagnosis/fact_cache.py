@@ -47,6 +47,30 @@ _PRICE_EVIDENCE = 1
 _SCHEMA_IDENTITY_FIELDS = frozenset({"fact_cache_schema_version", "fact_cache_schema_sha256"})
 
 
+def _session_facts_create_sql(schema_version: str) -> str:
+    if schema_version not in {"1", _SCHEMA_VERSION}:
+        raise ValueError("unrecognized fact-cache schema version")
+    prices = "REAL NOT NULL" if schema_version == "1" else "REAL"
+    definitions = {
+        "bundle_sha256": "TEXT NOT NULL", "rulebook_schema_version": "TEXT NOT NULL", "symbol": "TEXT NOT NULL", "session": "TEXT NOT NULL", "member": "INTEGER NOT NULL CHECK(member IN (0,1))",
+        "open": prices, "high": prices, "low": prices, "close": prices, "volume": prices,
+        "prior_close": "REAL", "prior_average_volume_50": "REAL", "event_volume_ratio": "REAL",
+        "current_eps": "REAL", "prior_year_eps": "REAL", "current_sales": "REAL", "prior_year_sales": "REAL", "annual_eps_1": "REAL", "annual_eps_2": "REAL", "annual_eps_3": "REAL", "annual_eps_4": "REAL",
+        "net_income": "REAL", "total_stockholders_equity": "REAL", "current_eps_yoy": "REAL", "sales_yoy": "REAL", "roe": "REAL", "shares_outstanding": "REAL",
+        "institutional_ownership_percent": "REAL", "institutional_holder_count": "INTEGER", "institutional_previous_holder_count": "INTEGER", "institutional_as_of_date": "TEXT", "institutional_evidence_ids": "TEXT NOT NULL",
+        "rs_rating": "REAL", "industry_group_id": "TEXT", "industry_rank": "INTEGER", "industry_as_of_date": "TEXT", "industry_members": "TEXT NOT NULL", "industry_evidence_ids": "TEXT NOT NULL",
+        "base_kind": "TEXT", "base_start_session": "TEXT", "base_end_session": "TEXT", "base_duration_sessions": "INTEGER", "base_low": "REAL", "base_depth_pct": "REAL", "base_handle_start_session": "TEXT", "base_handle_end_session": "TEXT", "base_input_sha256": "TEXT", "pivot": "REAL", "extension_pct": "REAL",
+        "market_regime": "TEXT NOT NULL", "distribution_count": "INTEGER", "follow_through_session": "TEXT", "latest_fundamental_public_date": "TEXT", "availability_bitset": "INTEGER NOT NULL", "row_sha256": "TEXT NOT NULL",
+    }
+    columns = ", ".join(f"{name} {definitions[name]}" for name in _FACT_COLUMNS)
+    return f"CREATE TABLE session_facts({columns}, PRIMARY KEY(bundle_sha256, rulebook_schema_version, symbol, session))"
+
+
+_METADATA_CREATE_SQL = "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+_V1_SESSION_FACTS_CREATE_SQL = _session_facts_create_sql("1")
+_SESSION_FACTS_CREATE_SQL = _session_facts_create_sql(_SCHEMA_VERSION)
+
+
 @dataclass(frozen=True)
 class FactCacheIdentity:
     fields: Mapping[str, object]
@@ -193,7 +217,7 @@ class FactCacheBuilder:
                 # exact price bar because OHLCV was NOT NULL.  It is not a
                 # usable immutable artifact, so restart it under v2 rather
                 # than carry stale, structurally incompatible checkpoints.
-                if not self._is_migratable_v1_partial():
+                if not self._is_migratable_v1_partial(sessions):
                     raise verification_error
                 for path in (self.partial_path, self.checkpoint_path, self.progress_path):
                     path.unlink(missing_ok=True)
@@ -341,20 +365,8 @@ class FactCacheBuilder:
 
     def _create_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA journal_mode=DELETE")
-        conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        definitions = {
-            "bundle_sha256": "TEXT NOT NULL", "rulebook_schema_version": "TEXT NOT NULL", "symbol": "TEXT NOT NULL", "session": "TEXT NOT NULL", "member": "INTEGER NOT NULL CHECK(member IN (0,1))",
-            "open": "REAL", "high": "REAL", "low": "REAL", "close": "REAL", "volume": "REAL",
-            "prior_close": "REAL", "prior_average_volume_50": "REAL", "event_volume_ratio": "REAL",
-            "current_eps": "REAL", "prior_year_eps": "REAL", "current_sales": "REAL", "prior_year_sales": "REAL", "annual_eps_1": "REAL", "annual_eps_2": "REAL", "annual_eps_3": "REAL", "annual_eps_4": "REAL",
-            "net_income": "REAL", "total_stockholders_equity": "REAL", "current_eps_yoy": "REAL", "sales_yoy": "REAL", "roe": "REAL", "shares_outstanding": "REAL",
-            "institutional_ownership_percent": "REAL", "institutional_holder_count": "INTEGER", "institutional_previous_holder_count": "INTEGER", "institutional_as_of_date": "TEXT", "institutional_evidence_ids": "TEXT NOT NULL",
-            "rs_rating": "REAL", "industry_group_id": "TEXT", "industry_rank": "INTEGER", "industry_as_of_date": "TEXT", "industry_members": "TEXT NOT NULL", "industry_evidence_ids": "TEXT NOT NULL",
-            "base_kind": "TEXT", "base_start_session": "TEXT", "base_end_session": "TEXT", "base_duration_sessions": "INTEGER", "base_low": "REAL", "base_depth_pct": "REAL", "base_handle_start_session": "TEXT", "base_handle_end_session": "TEXT", "base_input_sha256": "TEXT", "pivot": "REAL", "extension_pct": "REAL",
-            "market_regime": "TEXT NOT NULL", "distribution_count": "INTEGER", "follow_through_session": "TEXT", "latest_fundamental_public_date": "TEXT", "availability_bitset": "INTEGER NOT NULL", "row_sha256": "TEXT NOT NULL",
-        }
-        columns = ", ".join(f"{name} {definitions[name]}" for name in _FACT_COLUMNS)
-        conn.execute(f"CREATE TABLE session_facts({columns}, PRIMARY KEY(bundle_sha256, rulebook_schema_version, symbol, session))")
+        conn.execute(_METADATA_CREATE_SQL)
+        conn.execute(_SESSION_FACTS_CREATE_SQL)
         metadata = {"status": "building", "identity_sha256": self.identity.sha256, "identity": json.dumps(dict(self.identity.fields), sort_keys=True, separators=(",", ":")), "schema_version": _SCHEMA_VERSION, "schema_sha256": _SCHEMA_SHA256}
         conn.executemany("INSERT INTO metadata(key,value) VALUES (?,?)", metadata.items())
         conn.commit()
@@ -366,7 +378,7 @@ class FactCacheBuilder:
         if metadata.get("schema_sha256") != _SCHEMA_SHA256:
             raise ValueError("fact cache schema mismatch")
 
-    def _is_migratable_v1_partial(self) -> bool:
+    def _is_migratable_v1_partial(self, sessions: list[str]) -> bool:
         """Accept only a same-input v1 builder state for destructive migration.
 
         The v1-to-v2 restart deletes resumable state, so the old metadata must
@@ -375,6 +387,8 @@ class FactCacheBuilder:
         """
         old = sqlite3.connect(self.partial_path)
         try:
+            if not _has_exact_v1_partial_schema(old):
+                return False
             metadata = _metadata(old)
         except Exception:
             return False
@@ -402,7 +416,13 @@ class FactCacheBuilder:
             return False
         expected = {key: value for key, value in self.identity.fields.items() if key not in _SCHEMA_IDENTITY_FIELDS}
         observed = {key: value for key, value in identity.items() if key not in _SCHEMA_IDENTITY_FIELDS}
-        return canonical_sha256(observed) == canonical_sha256(expected)
+        if canonical_sha256(observed) != canonical_sha256(expected):
+            return False
+        if self.checkpoint_path.exists() and not _valid_v1_checkpoint(_load_checkpoint(self.checkpoint_path), identity, identity_sha256, sessions):
+            return False
+        if self.progress_path.exists() and not _valid_v1_progress(_load_progress(self.progress_path), identity_sha256, sessions):
+            return False
+        return True
 
     def _validate_checkpoint(self, checkpoint: Mapping[str, object], sessions: list[str]) -> None:
         checkpoint_identity = checkpoint.get("identity")
@@ -534,6 +554,58 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _has_exact_v1_partial_schema(conn: sqlite3.Connection) -> bool:
+    try:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        objects = tuple(
+            (str(row[0]), str(row[1]), row[2])
+            for row in conn.execute("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")
+        )
+    except sqlite3.Error:
+        return False
+    return (
+        integrity is not None and integrity[0] == "ok"
+        and objects == (("table", "metadata", _METADATA_CREATE_SQL), ("table", "session_facts", _V1_SESSION_FACTS_CREATE_SQL))
+    )
+
+
+def _valid_v1_checkpoint(checkpoint: Mapping[str, object], identity: Mapping[str, object], identity_sha256: str, sessions: list[str]) -> bool:
+    if set(checkpoint) != {"identity_sha256", "identity", "next_session_index"}:
+        return False
+    checkpoint_identity = checkpoint.get("identity")
+    next_index = checkpoint.get("next_session_index")
+    return (
+        checkpoint.get("identity_sha256") == identity_sha256
+        and isinstance(checkpoint_identity, Mapping)
+        and canonical_sha256(checkpoint_identity) == canonical_sha256(identity)
+        and type(next_index) is int
+        and 0 <= next_index <= len(sessions)
+    )
+
+
+def _valid_v1_progress(records: list[Mapping[str, object]], identity_sha256: str, sessions: list[str]) -> bool:
+    previous_index = 0
+    for record in records:
+        if set(record) != {"phase", "session", "rows", "last_symbol", "identity_sha256", "state_sha256", "next_session_index"}:
+            return False
+        next_index = record.get("next_session_index")
+        if (
+            record.get("phase") != "session_complete"
+            or record.get("identity_sha256") != identity_sha256
+            or not isinstance(record.get("state_sha256"), str)
+            or not _DIGEST.fullmatch(record["state_sha256"])
+            or type(next_index) is not int
+            or not previous_index < next_index <= len(sessions)
+            or record.get("session") != sessions[next_index - 1]
+            or type(record.get("rows")) is not int
+            or record["rows"] < 0
+            or not isinstance(record.get("last_symbol"), str)
+        ):
+            return False
+        previous_index = next_index
+    return True
 
 
 def _metadata(conn: sqlite3.Connection) -> dict[str, str]:

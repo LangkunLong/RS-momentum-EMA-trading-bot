@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 from core.pit_data import PITDataBundle
-from core.pit_diagnosis.fact_cache import FactCacheBuilder, _V1_SCHEMA_SHA256, _frame_values, _number, build_fact_cache, open_fact_cache
+from core.pit_diagnosis.fact_cache import FactCacheBuilder, _FACT_COLUMNS, _V1_SCHEMA_SHA256, _V1_SESSION_FACTS_CREATE_SQL, _frame_values, _number, build_fact_cache, open_fact_cache
 from core.pit_diagnosis.models import DatePartition, DatePartitions
 from core.pit_diagnosis.rulebook import canonical_sha256, load_rulebook
 from core.pit_diagnosis.supplemental import IndustryGroupSnapshot, InstitutionalSnapshot
@@ -106,6 +106,37 @@ def mini_partitions() -> DatePartitions:
 
 def cache_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     return tmp_path / "facts.sqlite3", tmp_path / "facts.checkpoint.json", tmp_path / "facts.progress.jsonl"
+
+
+def make_interrupted_partial_v1(paths: tuple[Path, Path, Path], *, exact_v1_table: bool = True) -> None:
+    """Convert a priced interrupted fixture to the exact historical v1 shape."""
+    partial = Path(f"{paths[0]}.partial")
+    connection = sqlite3.connect(partial)
+    try:
+        identity = json.loads(connection.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
+        identity["fact_cache_schema_version"] = "1"
+        identity["fact_cache_schema_sha256"] = _V1_SCHEMA_SHA256
+        if exact_v1_table:
+            connection.execute("ALTER TABLE session_facts RENAME TO session_facts_v2")
+            connection.execute(_V1_SESSION_FACTS_CREATE_SQL)
+            columns = ",".join(_FACT_COLUMNS)
+            connection.execute(f"INSERT INTO session_facts({columns}) SELECT {columns} FROM session_facts_v2")
+            connection.execute("DROP TABLE session_facts_v2")
+        connection.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+        connection.execute("UPDATE metadata SET value=? WHERE key='schema_sha256'", (_V1_SCHEMA_SHA256,))
+        connection.execute("UPDATE metadata SET value=? WHERE key='identity'", (json.dumps(identity, sort_keys=True, separators=(",", ":")),))
+        connection.execute("UPDATE metadata SET value=? WHERE key='identity_sha256'", (canonical_sha256(identity),))
+        connection.commit()
+    finally:
+        connection.close()
+    checkpoint = json.loads(paths[1].read_text(encoding="utf-8"))
+    checkpoint["identity"] = identity
+    checkpoint["identity_sha256"] = canonical_sha256(identity)
+    paths[1].write_text(json.dumps(checkpoint, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    records = [json.loads(line) for line in paths[2].read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        record["identity_sha256"] = canonical_sha256(identity)
+    paths[2].write_text("\n".join(json.dumps(record, sort_keys=True, separators=(",", ":")) for record in records) + "\n", encoding="utf-8")
 
 
 def build_cache(bundle: _MiniPITBundle, paths: tuple[Path, Path, Path], *, resume: bool):
@@ -224,19 +255,7 @@ def test_resume_rebuilds_only_incomplete_v1_price_schema(
     monkeypatch.setattr(FactCacheBuilder, "_after_session", interrupt_after_first_session)
     with pytest.raises(InterruptedError, match="leave v1"):
         build_cache(mini_pit_bundle, paths, resume=False)
-    partial = Path(f"{paths[0]}.partial")
-    connection = sqlite3.connect(partial)
-    try:
-        identity = json.loads(connection.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
-        identity["fact_cache_schema_version"] = "1"
-        identity["fact_cache_schema_sha256"] = _V1_SCHEMA_SHA256
-        connection.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
-        connection.execute("UPDATE metadata SET value=? WHERE key='schema_sha256'", (_V1_SCHEMA_SHA256,))
-        connection.execute("UPDATE metadata SET value=? WHERE key='identity'", (json.dumps(identity, sort_keys=True, separators=(",", ":")),))
-        connection.execute("UPDATE metadata SET value=? WHERE key='identity_sha256'", (canonical_sha256(identity),))
-        connection.commit()
-    finally:
-        connection.close()
+    make_interrupted_partial_v1(paths)
     monkeypatch.setattr(FactCacheBuilder, "_after_session", lambda *_args: None)
 
     rebuilt = build_cache(mini_pit_bundle, paths, resume=True)
@@ -255,15 +274,12 @@ def test_resume_refuses_foreign_v1_partial_before_destructive_migration(
     monkeypatch.setattr(FactCacheBuilder, "_after_session", interrupt_after_first_session)
     with pytest.raises(InterruptedError, match="leave foreign v1"):
         build_cache(mini_pit_bundle, paths, resume=False)
+    make_interrupted_partial_v1(paths)
     partial = Path(f"{paths[0]}.partial")
     connection = sqlite3.connect(partial)
     try:
         identity = json.loads(connection.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
-        identity["fact_cache_schema_version"] = "1"
-        identity["fact_cache_schema_sha256"] = _V1_SCHEMA_SHA256
         identity["bundle_sha256"] = "b" * 64
-        connection.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
-        connection.execute("UPDATE metadata SET value=? WHERE key='schema_sha256'", (_V1_SCHEMA_SHA256,))
         connection.execute("UPDATE metadata SET value=? WHERE key='identity'", (json.dumps(identity, sort_keys=True, separators=(",", ":")),))
         connection.execute("UPDATE metadata SET value=? WHERE key='identity_sha256'", (canonical_sha256(identity),))
         connection.commit()
@@ -271,12 +287,67 @@ def test_resume_refuses_foreign_v1_partial_before_destructive_migration(
         connection.close()
     monkeypatch.setattr(FactCacheBuilder, "_after_session", lambda *_args: None)
 
-    with pytest.raises(ValueError, match="identity|schema"):
+    with pytest.raises(ValueError, match="fact cache"):
         build_cache(mini_pit_bundle, paths, resume=True)
 
     assert partial.exists()
     assert paths[1].exists()
     assert paths[2].exists()
+
+
+@pytest.mark.parametrize("sidecar", ("checkpoint_foreign", "checkpoint_malformed", "progress_foreign", "progress_malformed"))
+def test_resume_refuses_untrusted_v1_migration_sidecars(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: str,
+) -> None:
+    paths = cache_paths(tmp_path)
+
+    def interrupt_after_first_session(_builder: FactCacheBuilder, _session: str) -> None:
+        raise InterruptedError("leave v1 sidecars")
+
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", interrupt_after_first_session)
+    with pytest.raises(InterruptedError, match="leave v1 sidecars"):
+        build_cache(mini_pit_bundle, paths, resume=False)
+    make_interrupted_partial_v1(paths)
+    if sidecar == "checkpoint_foreign":
+        checkpoint = json.loads(paths[1].read_text(encoding="utf-8"))
+        checkpoint["identity_sha256"] = "b" * 64
+        paths[1].write_text(json.dumps(checkpoint), encoding="utf-8")
+    elif sidecar == "checkpoint_malformed":
+        paths[1].write_text("{}", encoding="utf-8")
+    elif sidecar == "progress_foreign":
+        record = json.loads(paths[2].read_text(encoding="utf-8").splitlines()[0])
+        record["identity_sha256"] = "b" * 64
+        paths[2].write_text(json.dumps(record) + "\n", encoding="utf-8")
+    else:
+        paths[2].write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="fact cache"):
+        build_cache(mini_pit_bundle, paths, resume=True)
+
+    assert Path(f"{paths[0]}.partial").exists()
+    assert paths[1].exists()
+    assert paths[2].exists()
+
+
+def test_resume_refuses_v1_metadata_copied_onto_v2_table(
+    mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = cache_paths(tmp_path)
+
+    def interrupt_after_first_session(_builder: FactCacheBuilder, _session: str) -> None:
+        raise InterruptedError("leave copied metadata table")
+
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", interrupt_after_first_session)
+    with pytest.raises(InterruptedError, match="leave copied metadata table"):
+        build_cache(mini_pit_bundle, paths, resume=False)
+    make_interrupted_partial_v1(paths, exact_v1_table=False)
+    monkeypatch.setattr(FactCacheBuilder, "_after_session", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="identity|schema"):
+        build_cache(mini_pit_bundle, paths, resume=True)
+
+    assert Path(f"{paths[0]}.partial").exists()
 
 
 def test_supplemental_snapshot_with_date_but_no_evidence_is_rejected() -> None:
