@@ -47,6 +47,10 @@ class ExperimentResult:
     promotion_checks: Mapping[str, bool]
 
 
+_RESULT_FIELDS = frozenset(ExperimentResult.__dataclass_fields__)
+_CHECKPOINT_SCHEMA_VERSION = 1
+
+
 def _result_primitive(result: ExperimentResult) -> dict[str, object]:
     return {
         "experiment_id": result.experiment_id, "partition": result.partition.value,
@@ -61,6 +65,30 @@ def _result_primitive(result: ExperimentResult) -> dict[str, object]:
         "leader_recall": result.leader_recall.__dict__, "promotion_eligible": result.promotion_eligible,
         "promotion_checks": dict(result.promotion_checks),
     }
+
+
+def _result_payload_sha256(value: ExperimentResult | Mapping[str, object]) -> str:
+    primitive = _result_primitive(value) if isinstance(value, ExperimentResult) else dict(value)
+    if set(primitive) != _RESULT_FIELDS:
+        raise ValueError("experiment result payload is malformed")
+    primitive.pop("result_sha256")
+    return canonical_sha256(
+        {"result_schema_version": 1, "result": primitive}
+    )
+
+
+def _checkpoint_payload(
+    result: ExperimentResult,
+) -> dict[str, object]:
+    primitive = _result_primitive(result)
+    payload: dict[str, object] = {
+        "checkpoint_schema_version": _CHECKPOINT_SCHEMA_VERSION,
+        "identity_sha256": result.identity_sha256,
+        "result_sha256": result.result_sha256,
+        "result": primitive,
+    }
+    payload["artifact_sha256"] = canonical_sha256(payload)
+    return payload
 
 
 def _result_from_primitive(value: Mapping[str, object]) -> ExperimentResult:
@@ -433,14 +461,16 @@ def _baseline_partition_performance(
         frame = pd.read_csv(path, keep_default_na=False)
     except (OSError, ValueError, pd.errors.ParserError) as exc:
         raise ValueError("baseline equity ledger is invalid") from exc
-    if not {"date", "portfolio", "benchmark", "cash"}.issubset(frame):
+    if not {"date", "portfolio", "benchmark"}.issubset(frame):
         return None
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    for column in ("portfolio", "benchmark", "cash"):
+    for column in ("portfolio", "benchmark"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if "cash" in frame:
+        frame["cash"] = pd.to_numeric(frame["cash"], errors="coerce")
     selected = _partition(context, partition)
     frame = frame.loc[(frame["date"] >= selected.start) & (frame["date"] <= selected.end)].sort_values("date")
-    if len(frame) < 2 or frame[["date", "portfolio", "benchmark", "cash"]].isna().any().any() or (frame[["portfolio", "benchmark"]] <= 0.0).any().any() or (frame["cash"] < 0.0).any():
+    if len(frame) < 2 or frame[["date", "portfolio", "benchmark"]].isna().any().any() or (frame[["portfolio", "benchmark"]] <= 0.0).any().any():
         return None
     first, last = frame.iloc[0], frame.iloc[-1]
     total_return = (float(last.portfolio) / float(first.portfolio) - 1.0) * 100.0
@@ -452,7 +482,10 @@ def _baseline_partition_performance(
     volatility = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
     sharpe = 0.0 if volatility == 0.0 else float(returns.mean() / volatility * (252.0 ** 0.5))
     drawdown = float((frame["portfolio"] / frame["portfolio"].cummax() - 1.0).min() * 100.0)
-    return PerformanceEvidence(partition, total_return, annualized, sharpe, drawdown, float(frame["cash"].mean()), closed_positions, total_return - benchmark_return, annualized - benchmark_annualized)
+    average_cash = None
+    if "cash" in frame and not frame["cash"].isna().any() and (frame["cash"] >= 0.0).all():
+        average_cash = float(frame["cash"].mean())
+    return PerformanceEvidence(partition, total_return, annualized, sharpe, drawdown, average_cash, closed_positions, total_return - benchmark_return, annualized - benchmark_annualized)
 
 
 def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, partition: PartitionName, *, current_exit: bool = False, reproduction_ok: bool | None = None) -> ExperimentResult:
@@ -501,6 +534,7 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
         "validation_floor": statistics.completed_positions >= 20 if partition is PartitionName.VALIDATION else True,
         "positive_expectancy": statistics.expectancy_pct > 0.0,
         "performance_complete": performance is not None,
+        "average_cash_available": performance is not None and performance.average_cash_pct is not None,
         "partition_baseline_performance_available": reference_performance is not None,
         "partition_baseline_recall_available": reference_recall is not None,
         "non_worse_return": performance is not None and reference_performance is not None and performance.total_return_pct >= reference_performance.total_return_pct,
@@ -512,8 +546,8 @@ def _build_result(context: DiagnosisContext, experiment: ExperimentDefinition, p
         "reproduction_exact": (context.baseline_reproduction is not None and context.baseline_reproduction.passed) if reproduction_ok is None else reproduction_ok,
     }
     promotable = experiment.promotion_eligible and all(checks.values())
-    payload = {"experiment_id": experiment.experiment_id, "partition": partition.value, "trade_path": trade_path, "fidelity": fidelity.label.value, "stages": [(stage.rule_id, stage.survivors) for stage in stages], "promotion": promotable}
-    return ExperimentResult(experiment.experiment_id, partition, _identity(context, experiment, partition), canonical_sha256(payload), trade_path, fidelity, stages, funnel, exits, statistics, performance, recall, promotable, MappingProxyType(checks))
+    result = ExperimentResult(experiment.experiment_id, partition, _identity(context, experiment, partition), "0" * 64, trade_path, fidelity, stages, funnel, exits, statistics, performance, recall, promotable, MappingProxyType(checks))
+    return replace(result, result_sha256=_result_payload_sha256(result))
 
 
 def run_baseline_reproduction(context: DiagnosisContext, experiment: ExperimentDefinition, partition: PartitionName) -> ExperimentResult:
@@ -575,16 +609,25 @@ class ExperimentCheckpointStore:
         path = self.path_for(identity_sha256)
         if not path.exists(): return None
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("identity_sha256") != identity_sha256 or not isinstance(payload.get("result_sha256"), str) or not isinstance(payload.get("artifact_sha256"), str) or not isinstance(payload.get("result"), Mapping):
+        required = {"checkpoint_schema_version", "identity_sha256", "result_sha256", "result", "artifact_sha256"}
+        if not isinstance(payload, Mapping) or set(payload) != required or payload.get("checkpoint_schema_version") != _CHECKPOINT_SCHEMA_VERSION or payload.get("identity_sha256") != identity_sha256 or not isinstance(payload.get("result_sha256"), str) or not isinstance(payload.get("artifact_sha256"), str) or not isinstance(payload.get("result"), Mapping):
             raise ValueError("experiment checkpoint is stale or malformed")
-        expected = canonical_sha256({"result": payload["result_sha256"], "trade_path": payload["result"].get("trade_path_sha256")})
-        if payload["artifact_sha256"] != expected:
+        artifact_payload = dict(payload)
+        artifact_sha256 = artifact_payload.pop("artifact_sha256")
+        if artifact_sha256 != canonical_sha256(artifact_payload):
             raise ValueError("experiment checkpoint artifact hash is stale")
+        result = payload["result"]
+        if set(result) != _RESULT_FIELDS or result.get("identity_sha256") != identity_sha256 or result.get("result_sha256") != payload["result_sha256"]:
+            raise ValueError("experiment checkpoint result is stale")
+        if payload["result_sha256"] != _result_payload_sha256(result):
+            raise ValueError("experiment checkpoint result hash is stale")
         return MappingProxyType(payload)
 
     def write(self, result: ExperimentResult) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
-        payload = {"identity_sha256": result.identity_sha256, "result_sha256": result.result_sha256, "result": _result_primitive(result), "artifact_sha256": canonical_sha256({"result": result.result_sha256, "trade_path": result.trade_path_sha256})}
+        if result.result_sha256 != _result_payload_sha256(result):
+            raise ValueError("experiment result hash is stale")
+        payload = _checkpoint_payload(result)
         path, temp = self.path_for(result.identity_sha256), self.path_for(result.identity_sha256).with_suffix(".tmp")
         with temp.open("w", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)

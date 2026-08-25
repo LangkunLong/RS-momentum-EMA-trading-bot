@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import csv
 import hashlib
+import json
 from pathlib import Path
 from types import MappingProxyType
 
@@ -19,7 +20,8 @@ from core.pit_diagnosis.models import FidelityLabel, PartitionName
 from core.pit_diagnosis.metrics import LeaderRecallEvidence, PerformanceEvidence
 from core.pit_diagnosis.rulebook import load_rulebook
 from core.pit_diagnosis.strategy import DiagnosisPortfolioSimulator
-from core.backtest_engine import Trade
+from core.backtest_engine import SimulationResult, Trade
+from pit_baseline import _equity_frame
 
 
 class _Facts:
@@ -95,7 +97,12 @@ def _baseline_snapshot(root: Path) -> BaselineSnapshot:
         writer.writeheader()
         writer.writerows(rows)
     (root / "entry_attempt_outcomes.csv").write_text("symbol,signal_date,entry_date,pivot,buy_zone_lower,buy_zone_upper,entry_open,outcome\n", encoding="utf-8")
-    (root / "equity_curve.csv").write_text("date,portfolio,benchmark,cash\n2021-01-04,100,100,50\n2021-06-30,105,103,55\n2021-12-31,110,106,60\n", encoding="utf-8")
+    sessions = pd.to_datetime(("2021-01-04", "2021-06-30", "2021-12-31"))
+    baseline_result = SimulationResult(
+        equity_curve=pd.Series((100.0, 105.0, 110.0), index=sessions),
+        benchmark_curve=pd.Series((100.0, 103.0, 106.0), index=sessions),
+    )
+    _equity_frame(baseline_result).to_csv(root / "equity_curve.csv", index=False)
     (root / "leader_recall.csv").write_text("ticker,buy_signal_count,entry_count\n", encoding="utf-8")
     (root / "summary.json").write_text("{}\n", encoding="utf-8")
     frame = pd.read_csv(root / "transactions.csv", keep_default_na=False)
@@ -188,18 +195,32 @@ def test_current_exit_package_explains_the_known_ma_loss_cluster(
     assert result.performance.total_return_pct != result.trade_statistics.mean_return_pct
 
 
-def test_d4_fails_closed_when_verified_partition_equity_series_is_missing(
+def test_d4_computes_performance_from_the_actual_verified_equity_schema(
     diagnosis_context: DiagnosisContext,
 ) -> None:
-    path = diagnosis_context.baseline_snapshot.run_dir / "equity_curve.csv"
-    path.write_text("date,portfolio,benchmark\n2021-01-04,100,100\n2021-12-31,110,106\n", encoding="utf-8")
-    artifacts = dict(diagnosis_context.baseline_snapshot.artifact_sha256)
-    artifacts["equity_curve.csv"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    snapshot = replace(diagnosis_context.baseline_snapshot, artifact_sha256=artifacts)
-    context = replace(diagnosis_context, baseline_snapshot=snapshot, reproduced_baseline=replace(snapshot))
-    result = run_experiment(context, "D4.CURRENT_EXIT_PACKAGE", PartitionName.DISCOVERY)
-    assert result.performance is None
-    assert result.promotion_checks["performance_complete"] is False
+    frame = pd.read_csv(
+        diagnosis_context.baseline_snapshot.run_dir / "equity_curve.csv"
+    )
+    assert tuple(frame.columns) == ("date", "portfolio", "benchmark")
+
+    result = run_experiment(
+        diagnosis_context,
+        "D4.CURRENT_EXIT_PACKAGE",
+        PartitionName.DISCOVERY,
+    )
+
+    assert result.performance is not None
+    assert result.performance.total_return_pct == pytest.approx(10.0)
+    assert result.performance.annualized_return_pct == pytest.approx(10.1234972764)
+    assert result.performance.sharpe_ratio == pytest.approx(460.2238585732)
+    assert result.performance.max_drawdown_pct == pytest.approx(0.0)
+    assert result.performance.benchmark_total_return_delta_pct == pytest.approx(4.0)
+    assert result.performance.benchmark_annualized_return_delta_pct == pytest.approx(
+        4.0507572519
+    )
+    assert result.performance.average_cash_pct is None
+    assert result.promotion_checks["performance_complete"] is True
+    assert result.promotion_checks["average_cash_available"] is False
     assert result.promotion_eligible is False
 
 
@@ -277,6 +298,49 @@ def test_catalog_resume_loads_completed_result_before_invoking_runner(
     monkeypatch.setattr(experiments_module, "run_experiment", runner_must_not_execute)
     resumed = run_catalog(diagnosis_context, ("D2.RULE_STAGE_FUNNEL",), (PartitionName.DISCOVERY,), tmp_path / "checkpoints", resume=True)
     assert resumed[0].result_sha256 == first[0].result_sha256
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "replacement"),
+    (
+        ("performance", "total_return_pct", 1.0),
+        ("leader_recall", "evidence_ids", ["leader:ZZZ"]),
+        ("promotion_checks", "reproduction_exact", False),
+        ("trade_statistics", "mean_return_pct", 1.0),
+        ("exit_attribution", "average_completed_position_return_pct", 1.0),
+    ),
+)
+def test_catalog_resume_rejects_tampered_full_result_evidence(
+    diagnosis_context: DiagnosisContext,
+    tmp_path: Path,
+    section: str,
+    field: str,
+    replacement: object,
+) -> None:
+    root = tmp_path / f"checkpoints-{section}-{field}"
+    first = run_catalog(
+        diagnosis_context,
+        ("D4.CURRENT_EXIT_PACKAGE",),
+        (PartitionName.DISCOVERY,),
+        root,
+        resume=False,
+    )[0]
+    path = root / f"{first.identity_sha256}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if section == "exit_attribution":
+        payload["result"][section]["ma_violation"][field] = replacement
+    else:
+        payload["result"][section][field] = replacement
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="hash|stale"):
+        run_catalog(
+            diagnosis_context,
+            ("D4.CURRENT_EXIT_PACKAGE",),
+            (PartitionName.DISCOVERY,),
+            root,
+            resume=True,
+        )
 
 
 def test_catalog_identity_changes_when_partition_promotion_evidence_changes(
