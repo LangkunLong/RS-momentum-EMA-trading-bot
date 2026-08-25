@@ -58,6 +58,38 @@ its own dated source evidence and source reference; the builder will not derive
 industry labels from ticker names, current classifications, or future
 membership lists.
 
+For a single quarterly 13F ZIP, the offline normalizer is:
+
+```powershell
+python -m tools.normalize_sec13f `
+  --13f-zip 2021q1_form13f.zip `
+  --cusip-mapping-csv cusip_mapping.csv `
+  --shares-csv pit_shares.csv `
+  --trading-days-csv spy_trading_days.csv `
+  --output institutional.csv
+```
+
+The mapping input must be dated and explicit:
+
+```text
+cusip,symbol,effective_start,effective_end,evidence_ids
+```
+
+The shares input must contain PIT denominators:
+
+```text
+symbol,as_of_date,shares_outstanding,evidence_ids
+```
+
+The normalizer selects the latest filing/amendment per manager and reporting
+period inside that ZIP, maps filing dates to the first supplied trading session
+strictly afterward, aggregates common-stock (`SH`) positions by manager, and
+derives ownership only when a prior PIT denominator exists. Unmapped CUSIPs,
+options/principal positions, ambiguous mappings, future denominators, and
+missing dates are excluded or rejected fail-closed. Its isolated-quarter output
+sets `previous_holder_count` to zero; a multi-quarter assembly step must replace
+that field with the prior quarter's holder count before strict I-gating.
+
 Pass stable archive identifiers or URLs with one or more repeated
 `--source-reference` options. References are stored in a separate canonical
 provenance manifest (not in raw fact rows); its SHA-256 is sealed in the
