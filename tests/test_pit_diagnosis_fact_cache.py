@@ -136,6 +136,7 @@ def make_interrupted_partial_v1(paths: tuple[Path, Path, Path], *, exact_v1_tabl
     records = [json.loads(line) for line in paths[2].read_text(encoding="utf-8").splitlines()]
     for record in records:
         record["identity_sha256"] = canonical_sha256(identity)
+    records[-1]["state_sha256"] = hashlib.sha256(partial.read_bytes()).hexdigest()
     paths[2].write_text("\n".join(json.dumps(record, sort_keys=True, separators=(",", ":")) for record in records) + "\n", encoding="utf-8")
 
 
@@ -295,7 +296,7 @@ def test_resume_refuses_foreign_v1_partial_before_destructive_migration(
     assert paths[2].exists()
 
 
-@pytest.mark.parametrize("sidecar", ("checkpoint_foreign", "checkpoint_malformed", "progress_foreign", "progress_malformed"))
+@pytest.mark.parametrize("sidecar", ("checkpoint_foreign", "checkpoint_malformed", "checkpoint_only", "checkpoint_arbitrary_index", "progress_foreign", "progress_malformed", "progress_state_mismatch"))
 def test_resume_refuses_untrusted_v1_migration_sidecars(
     mini_pit_bundle: _MiniPITBundle, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: str,
 ) -> None:
@@ -314,9 +315,19 @@ def test_resume_refuses_untrusted_v1_migration_sidecars(
         paths[1].write_text(json.dumps(checkpoint), encoding="utf-8")
     elif sidecar == "checkpoint_malformed":
         paths[1].write_text("{}", encoding="utf-8")
+    elif sidecar == "checkpoint_only":
+        paths[2].unlink()
+    elif sidecar == "checkpoint_arbitrary_index":
+        checkpoint = json.loads(paths[1].read_text(encoding="utf-8"))
+        checkpoint["next_session_index"] = 0
+        paths[1].write_text(json.dumps(checkpoint), encoding="utf-8")
     elif sidecar == "progress_foreign":
         record = json.loads(paths[2].read_text(encoding="utf-8").splitlines()[0])
         record["identity_sha256"] = "b" * 64
+        paths[2].write_text(json.dumps(record) + "\n", encoding="utf-8")
+    elif sidecar == "progress_state_mismatch":
+        record = json.loads(paths[2].read_text(encoding="utf-8").splitlines()[0])
+        record["state_sha256"] = "b" * 64
         paths[2].write_text(json.dumps(record) + "\n", encoding="utf-8")
     else:
         paths[2].write_text("{}\n", encoding="utf-8")
@@ -327,7 +338,7 @@ def test_resume_refuses_untrusted_v1_migration_sidecars(
 
     assert Path(f"{paths[0]}.partial").exists()
     assert paths[1].exists()
-    assert paths[2].exists()
+    assert paths[2].exists() is (sidecar != "checkpoint_only")
 
 
 def test_resume_refuses_v1_metadata_copied_onto_v2_table(

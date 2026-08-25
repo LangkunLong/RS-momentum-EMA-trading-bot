@@ -418,9 +418,21 @@ class FactCacheBuilder:
         observed = {key: value for key, value in identity.items() if key not in _SCHEMA_IDENTITY_FIELDS}
         if canonical_sha256(observed) != canonical_sha256(expected):
             return False
-        if self.checkpoint_path.exists() and not _valid_v1_checkpoint(_load_checkpoint(self.checkpoint_path), identity, identity_sha256, sessions):
+        if self.checkpoint_path.exists() and not self.progress_path.exists():
             return False
-        if self.progress_path.exists() and not _valid_v1_progress(_load_progress(self.progress_path), identity_sha256, sessions):
+        try:
+            records = _load_progress(self.progress_path) if self.progress_path.exists() else []
+            if records and not _valid_v1_progress(records, identity_sha256, sessions, self.checkpoint_every_sessions):
+                return False
+            if records and records[-1].get("state_sha256") != _state_sha256(self.partial_path):
+                return False
+            if self.checkpoint_path.exists():
+                checkpoint = _load_checkpoint(self.checkpoint_path)
+                if not _valid_v1_checkpoint(checkpoint, identity, identity_sha256, sessions):
+                    return False
+                if checkpoint["next_session_index"] != records[-1]["next_session_index"]:
+                    return False
+        except ValueError:
             return False
         return True
 
@@ -585,7 +597,7 @@ def _valid_v1_checkpoint(checkpoint: Mapping[str, object], identity: Mapping[str
     )
 
 
-def _valid_v1_progress(records: list[Mapping[str, object]], identity_sha256: str, sessions: list[str]) -> bool:
+def _valid_v1_progress(records: list[Mapping[str, object]], identity_sha256: str, sessions: list[str], checkpoint_every_sessions: int) -> bool:
     previous_index = 0
     for record in records:
         if set(record) != {"phase", "session", "rows", "last_symbol", "identity_sha256", "state_sha256", "next_session_index"}:
@@ -597,7 +609,7 @@ def _valid_v1_progress(records: list[Mapping[str, object]], identity_sha256: str
             or not isinstance(record.get("state_sha256"), str)
             or not _DIGEST.fullmatch(record["state_sha256"])
             or type(next_index) is not int
-            or not previous_index < next_index <= len(sessions)
+            or next_index != min(previous_index + checkpoint_every_sessions, len(sessions))
             or record.get("session") != sessions[next_index - 1]
             or type(record.get("rows")) is not int
             or record["rows"] < 0
