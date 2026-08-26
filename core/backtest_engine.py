@@ -57,7 +57,11 @@ from core.pit_diagnosis.fact_cache import (
     _prepare_pattern_history,
 )
 from core.pit_diagnosis.patterns import BasePolicy
-from core.trading_sessions import exact_session_row, history_through_exact_session
+from core.trading_sessions import (
+    exact_session_row,
+    history_through_exact_session,
+    normalize_us_equity_session,
+)
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -622,6 +626,9 @@ class CanslimStrategy:
         self._strict_pit_entry_facts_provider: Optional[
             Callable[[str, pd.DataFrame, pd.Timestamp], Optional[CanslimEntryFacts]]
         ] = None
+        self._strict_pit_history_provider: Optional[
+            Callable[[str, pd.DataFrame, pd.Timestamp], Optional[pd.DataFrame]]
+        ] = None
 
     @staticmethod
     def _compute_technical_score(
@@ -692,7 +699,14 @@ class CanslimStrategy:
         if tdata is None:
             return None
 
-        available = history_through_exact_session(tdata, eval_date)
+        available = None
+        if (
+            self.require_proper_base
+            and self._strict_pit_history_provider is not None
+        ):
+            available = self._strict_pit_history_provider(ticker, tdata, eval_date)
+        if available is None:
+            available = history_through_exact_session(tdata, eval_date)
         if available is None or len(available) < 60:
             return None
 
@@ -1338,6 +1352,7 @@ class PortfolioSimulator:
         self._execution_diagnostics = _new_execution_diagnostics()
         self._pending_entries_remaining = 0
         self._strict_pit_pattern_histories: dict[str, _PreparedPatternHistory] = {}
+        self._strict_pit_history_frames: dict[str, pd.DataFrame] = {}
         self._strict_pit_base_policy = BasePolicy.canonical_v1()
 
     def run(
@@ -1749,9 +1764,11 @@ class PortfolioSimulator:
         """Clear the built-in strict-PIT acceleration state before each run."""
 
         self._strict_pit_pattern_histories = {}
+        self._strict_pit_history_frames = {}
         owned_strategy = self._owned_builtin_strategy
         if owned_strategy is not None:
             owned_strategy._strict_pit_entry_facts_provider = None
+            owned_strategy._strict_pit_history_provider = None
 
     def _configure_strict_pit_pattern_cache(
         self,
@@ -1773,21 +1790,63 @@ class PortfolioSimulator:
             return
 
         prepared_histories: dict[str, _PreparedPatternHistory] = {}
+        history_frames: dict[str, pd.DataFrame] = {}
         for ticker, frame in ticker_ohlcv.items():
             if frame.empty:
                 continue
             try:
-                prepared_histories[str(ticker).upper()] = _prepare_pattern_history(
-                    frame
-                )
+                prepared = _prepare_pattern_history(frame)
             except Exception:
                 # The uncached detector validates only the event's historical
                 # prefix.  Do not let an invalid future bar change that result.
                 continue
+            symbol = str(ticker).upper()
+            prepared_histories[symbol] = prepared
+            if (
+                isinstance(frame.index, pd.DatetimeIndex)
+                and frame.index.equals(prepared.index)
+            ):
+                # The original bundle frame is already one ordered, naive row
+                # per session, so an iloc prefix exactly matches the helper.
+                history_frames[symbol] = frame
         self._strict_pit_pattern_histories = prepared_histories
+        self._strict_pit_history_frames = history_frames
         owned_strategy._strict_pit_entry_facts_provider = (
             self._strict_pit_entry_facts_from_cache
         )
+        owned_strategy._strict_pit_history_provider = (
+            self._strict_pit_history_from_cache
+        )
+
+    def _strict_pit_history_from_cache(
+        self,
+        ticker: str,
+        ticker_data: pd.DataFrame,
+        eval_date: pd.Timestamp,
+    ) -> Optional[pd.DataFrame]:
+        """Return a proven exact causal prefix without canonicalizing or copying.
+
+        The provider is installed only for the simulator-owned strict-PIT
+        strategy.  It accepts only the exact frame registered with a successful
+        prepared-history validation; every other shape or session falls back to
+        ``history_through_exact_session`` in the strategy.
+        """
+
+        symbol = str(ticker).upper()
+        source = self._strict_pit_history_frames.get(symbol)
+        prepared = self._strict_pit_pattern_histories.get(symbol)
+        if source is None or source is not ticker_data or prepared is None:
+            return None
+        try:
+            target = normalize_us_equity_session(eval_date)
+            event_position = prepared.positions.get(target.date().isoformat())
+            if event_position is None or event_position >= len(source):
+                return None
+            if source.index[event_position] != target:
+                return None
+            return source.iloc[: event_position + 1]
+        except Exception:
+            return None
 
     def _strict_pit_entry_facts_from_cache(
         self,
