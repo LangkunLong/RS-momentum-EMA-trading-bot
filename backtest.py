@@ -155,9 +155,15 @@ def _evaluate_technical_at_date(
     *,
     quarterly_income: Optional[pd.DataFrame] = None,
     require_proper_base: bool = False,
+    entry_facts: CanslimEntryFacts | None = None,
+    history_is_exact: bool = False,
 ) -> Optional[Dict[str, object]]:
     """Evaluate N and S technical criteria as-of a specific date."""
-    sliced = history_through_exact_session(ticker_data, eval_date)
+    sliced = (
+        ticker_data
+        if history_is_exact
+        else history_through_exact_session(ticker_data, eval_date)
+    )
     if sliced is None:
         return None
     entry_kwargs: dict[str, object] = {}
@@ -178,7 +184,11 @@ def _evaluate_technical_at_date(
             "has_volume_surge": False,
             "pivot": None,
             "in_buy_zone": False,
-            "entry_facts": build_entry_facts(closes, volumes, **entry_kwargs),
+            "entry_facts": (
+                entry_facts
+                if entry_facts is not None
+                else build_entry_facts(closes, volumes, **entry_kwargs)
+            ),
         }
 
     closes = extract_float_series(sliced, "Close")
@@ -189,7 +199,11 @@ def _evaluate_technical_at_date(
     lookback_252 = min(252, len(closes))
     high_52 = coerce_scalar(closes.iloc[-lookback_252:].max())
     proximity = latest_close / high_52 if high_52 else 0.0
-    entry_facts = build_entry_facts(closes, volumes, **entry_kwargs)
+    entry_facts = (
+        entry_facts
+        if entry_facts is not None
+        else build_entry_facts(closes, volumes, **entry_kwargs)
+    )
     avg_vol_50 = entry_facts.prior_average_volume_50 or 0.0
 
     n_frame = quarterly_income if isinstance(quarterly_income, pd.DataFrame) else pd.DataFrame()

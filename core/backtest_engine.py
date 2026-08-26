@@ -51,6 +51,12 @@ from core.data_client import clear_session_cache, fetch_bulk_ohlcv
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
 from core.momentum_analysis import calculate_rs_snapshot
 from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
+from core.pit_diagnosis.fact_cache import (
+    _PreparedPatternHistory,
+    _detect_prepared_base,
+    _prepare_pattern_history,
+)
+from core.pit_diagnosis.patterns import BasePolicy
 from core.trading_sessions import exact_session_row, history_through_exact_session
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -613,6 +619,9 @@ class CanslimStrategy:
         self.technical_only = technical_only
         self.fundamental_provider = fundamental_provider
         self.require_proper_base = require_proper_base
+        self._strict_pit_entry_facts_provider: Optional[
+            Callable[[str, pd.DataFrame, pd.Timestamp], Optional[CanslimEntryFacts]]
+        ] = None
 
     @staticmethod
     def _compute_technical_score(
@@ -742,12 +751,24 @@ class CanslimStrategy:
                 or (holder_count is not None and prev_holder_count is not None),
                 "quarterly_income": qi,
             }
+        entry_facts = None
+        if (
+            self.require_proper_base
+            and self._strict_pit_entry_facts_provider is not None
+        ):
+            entry_facts = self._strict_pit_entry_facts_provider(
+                ticker,
+                available,
+                eval_date,
+            )
         tech = _evaluate_technical_at_date(
             available,
             eval_date,
             fund.get("shares_outstanding"),
             quarterly_income=fund.get("quarterly_income"),
             require_proper_base=self.require_proper_base,
+            entry_facts=entry_facts,
+            history_is_exact=True,
         )
         if tech is None:
             return None
@@ -1316,6 +1337,8 @@ class PortfolioSimulator:
         self._ticker_industry: Dict[str, str] = {}
         self._execution_diagnostics = _new_execution_diagnostics()
         self._pending_entries_remaining = 0
+        self._strict_pit_pattern_histories: dict[str, _PreparedPatternHistory] = {}
+        self._strict_pit_base_policy = BasePolicy.canonical_v1()
 
     def run(
         self,
@@ -1344,6 +1367,7 @@ class PortfolioSimulator:
         self._entry_outcomes = []
         self._execution_diagnostics = _new_execution_diagnostics()
         self._pending_entries_remaining = 0
+        self._reset_strict_pit_pattern_cache()
 
         clear_session_cache()
         benchmark = str(benchmark_symbol or self.benchmark_symbol).upper()
@@ -1475,6 +1499,7 @@ class PortfolioSimulator:
             print("ERROR: Not enough trading days in range.")
             return SimulationResult()
 
+        self._configure_strict_pit_pattern_cache(ticker_ohlcv)
         self._ticker_industry = {} if self.technical_only or self.pit_bundle is not None else load_industry_map(tickers)
         if checkpoint_state is not None:
             next_day_index = int(checkpoint_state["next_day_index"])
@@ -1719,6 +1744,93 @@ class PortfolioSimulator:
         if state_stream is not None:
             state_stream.close()
         return result
+
+    def _reset_strict_pit_pattern_cache(self) -> None:
+        """Clear the built-in strict-PIT acceleration state before each run."""
+
+        self._strict_pit_pattern_histories = {}
+        owned_strategy = self._owned_builtin_strategy
+        if owned_strategy is not None:
+            owned_strategy._strict_pit_entry_facts_provider = None
+
+    def _configure_strict_pit_pattern_cache(
+        self,
+        ticker_ohlcv: Dict[str, pd.DataFrame],
+    ) -> None:
+        """Prepare immutable causal-base inputs for the owned strict-PIT strategy.
+
+        A failed preparation deliberately leaves that symbol on the existing
+        exact detector path.  This preserves the detector's fail-closed
+        behavior for malformed data at every event date.
+        """
+
+        owned_strategy = self._owned_builtin_strategy
+        if (
+            not self.require_proper_base
+            or owned_strategy is None
+            or self.strategy is not owned_strategy
+        ):
+            return
+
+        prepared_histories: dict[str, _PreparedPatternHistory] = {}
+        for ticker, frame in ticker_ohlcv.items():
+            if frame.empty:
+                continue
+            try:
+                prepared_histories[str(ticker).upper()] = _prepare_pattern_history(
+                    frame
+                )
+            except Exception:
+                # The uncached detector validates only the event's historical
+                # prefix.  Do not let an invalid future bar change that result.
+                continue
+        self._strict_pit_pattern_histories = prepared_histories
+        owned_strategy._strict_pit_entry_facts_provider = (
+            self._strict_pit_entry_facts_from_cache
+        )
+
+    def _strict_pit_entry_facts_from_cache(
+        self,
+        ticker: str,
+        history: pd.DataFrame,
+        eval_date: pd.Timestamp,
+    ) -> Optional[CanslimEntryFacts]:
+        """Return immutable facts from a causal prepared-price prefix, if safe."""
+
+        prepared = self._strict_pit_pattern_histories.get(str(ticker).upper())
+        if prepared is None:
+            return None
+        try:
+            event_position = prepared.positions.get(
+                pd.Timestamp(eval_date).date().isoformat()
+            )
+            if event_position is None or event_position != len(history) - 1:
+                return None
+            if event_position < self._strict_pit_base_policy.flat_min_sessions:
+                pattern = None
+            else:
+                pattern = _detect_prepared_base(
+                    prepared,
+                    end_pos=event_position,
+                    policy=self._strict_pit_base_policy,
+                    input_sha256=prepared.input_sha256_prefixes[event_position],
+                )
+            closes: Iterable[object] = (
+                history["Close"] if "Close" in history.columns else ()
+            )
+            volumes: Iterable[object] = (
+                history["Volume"] if "Volume" in history.columns else ()
+            )
+            return build_entry_facts(
+                closes,
+                volumes,
+                require_proper_base=True,
+                precomputed_proper_base=pattern,
+                proper_base_precomputed=True,
+            )
+        except Exception:
+            # Returning None activates the unmodified exact detector path.
+            return None
 
     def _result_config(
         self,

@@ -8,7 +8,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from core.pit_diagnosis.patterns import BasePolicy, detect_proper_base
+from core.pit_diagnosis.patterns import BasePattern, BasePolicy, detect_proper_base
 
 
 PRIOR_VOLUME_SESSIONS = 50
@@ -84,6 +84,8 @@ def build_entry_facts(
     history_before_event: pd.DataFrame | None = None,
     event_session: object | None = None,
     require_proper_base: bool = False,
+    precomputed_proper_base: BasePattern | None = None,
+    proper_base_precomputed: bool = False,
 ) -> CanslimEntryFacts:
     """Build canonical facts for the final event bar in aligned history.
 
@@ -91,7 +93,9 @@ def build_entry_facts(
     close, up to 252 closes before the event, and exactly 50 volumes before the
     event plus the event volume itself.  Strict PIT callers additionally supply
     pre-event OHLC history and the event session so the canonical proper-base
-    detector, rather than a rolling-close high, supplies the pivot.
+    detector, rather than a rolling-close high, supplies the pivot.  A caller
+    that has already evaluated that exact causal prefix can pass its immutable
+    result with ``proper_base_precomputed=True`` (including ``None``).
     """
     reasons: list[str] = []
     close_index = _explicit_index(closes)
@@ -132,14 +136,17 @@ def build_entry_facts(
                     reasons.append("non_positive_pivot")
 
     if require_proper_base:
-        try:
-            pattern = detect_proper_base(
-                history_before_event,
-                event_session=event_session,
-                policy=BasePolicy.canonical_v1(),
-            )
-        except Exception:
-            pattern = None
+        if proper_base_precomputed:
+            pattern = precomputed_proper_base
+        else:
+            try:
+                pattern = detect_proper_base(
+                    history_before_event,
+                    event_session=event_session,
+                    policy=BasePolicy.canonical_v1(),
+                )
+            except Exception:
+                pattern = None
         if pattern is None:
             reasons.append("proper_base_unavailable")
         else:
