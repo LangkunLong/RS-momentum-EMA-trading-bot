@@ -76,7 +76,11 @@ def test_replay_fact_reader_skips_members_without_explicit_price_evidence() -> N
     assert experiments_module._facts(_Facts((unavailable, priced)), "2024-01-02", "2024-01-02") == (priced,)
 
 
-def _baseline_snapshot(root: Path) -> BaselineSnapshot:
+def _baseline_snapshot(
+    root: Path,
+    *,
+    bundle_sha256: str = "d" * 64,
+) -> BaselineSnapshot:
     rows: list[dict[str, object]] = []
     reasons = [*("stop_loss",) * 97, *("ma_violation",) * 92, *("time_stop",) * 30, *("end_of_test",) * 6]
     ma_losses = 0
@@ -145,8 +149,55 @@ def _baseline_snapshot(root: Path) -> BaselineSnapshot:
     baseline_result.weekly_holdings.to_csv(root / "weekly_holdings.csv", index=False)
     (root / "leader_recall.csv").write_text("ticker,buy_signal_count,entry_count\n", encoding="utf-8")
     (root / "summary.json").write_text("{}\n", encoding="utf-8")
-    frame = pd.read_csv(root / "transactions.csv", keep_default_na=False)
-    return BaselineSnapshot(root, "a" * 64, "b" * 40, "c" * 40, "d" * 64, {"transactions.csv": hashlib.sha256((root / "transactions.csv").read_bytes()).hexdigest(), "equity_curve.csv": hashlib.sha256((root / "equity_curve.csv").read_bytes()).hexdigest(), "weekly_holdings.csv": hashlib.sha256((root / "weekly_holdings.csv").read_bytes()).hexdigest()}, "e" * 64, "f" * 64, baseline_module._normalized_ordered_row_sha256(frame), -9.99, -2.0, -0.2, -13.0, 225, 39.11, 26.6666666667, 286, 225, 51, 10)
+    artifact_names = (
+        "entry_attempt_outcomes.csv",
+        "transactions.csv",
+        "equity_curve.csv",
+        "weekly_holdings.csv",
+        "leader_recall.csv",
+        "summary.json",
+    )
+    artifact_sha256 = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in artifact_names
+    }
+    replay_git_head = "c" * 40
+    manifest = {
+        "schema_version": 1,
+        "status": "complete",
+        "git_head": replay_git_head,
+        "bundle_sha256": bundle_sha256,
+        "artifacts": artifact_sha256,
+    }
+    manifest_path = root / "run_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False),
+        encoding="utf-8",
+    )
+    outcomes = pd.read_csv(root / "entry_attempt_outcomes.csv", keep_default_na=False)
+    transactions = pd.read_csv(root / "transactions.csv", keep_default_na=False)
+    return BaselineSnapshot(
+        run_dir=root,
+        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        source_commit="b" * 40,
+        replay_git_head=replay_git_head,
+        bundle_sha256=bundle_sha256,
+        artifact_sha256=artifact_sha256,
+        signal_row_sha256="e" * 64,
+        entry_outcome_row_sha256=baseline_module._normalized_ordered_row_sha256(outcomes),
+        transaction_row_sha256=baseline_module._normalized_ordered_row_sha256(transactions),
+        total_return_pct=-9.99,
+        annualized_return_pct=-2.0,
+        sharpe_ratio=-0.2,
+        max_drawdown_pct=-13.0,
+        closed_trades=225,
+        win_rate_pct=39.11,
+        average_cash_pct=26.6666666667,
+        qualified_entries=286,
+        executed_entries=225,
+        next_open_buy_zone_rejections=51,
+        cash_rejections=10,
+    )
 
 
 @pytest.fixture
@@ -171,7 +222,12 @@ def diagnosis_context(tmp_path: Path) -> DiagnosisContext:
         strategy_identity="cached-diagnosis-v1",
         baseline_snapshot=snapshot,
         reproduced_baseline=replace(snapshot),
-        baseline_reproduction=BaselineReproduction(True, (), "a" * 64, "a" * 64),
+        baseline_reproduction=BaselineReproduction(
+            True,
+            (),
+            snapshot.manifest_sha256,
+            snapshot.manifest_sha256,
+        ),
     )
 
 
@@ -235,7 +291,7 @@ def test_d1_to_d4_require_a_verified_d0_reproduction(
             BaselineReproduction(True, (), "f" * 64, "f" * 64)
         )
     after_d0 = before_d0.with_verified_baseline_reproduction(
-        BaselineReproduction(True, (), "a" * 64, "a" * 64)
+        diagnosis_context.baseline_reproduction
     )
     assert run_experiment(after_d0, "D2.RULE_STAGE_FUNNEL", PartitionName.DISCOVERY)
 
@@ -378,7 +434,7 @@ def test_current_exit_attribution_is_partitioned_and_rejects_tampering(
     path = diagnosis_context.baseline_snapshot.run_dir / "transactions.csv"
     text = path.read_text(encoding="utf-8").replace("ma_violation", "tampered_exit", 1)
     path.write_text(text, encoding="utf-8")
-    with pytest.raises(ValueError, match="transaction ledger hash"):
+    with pytest.raises(ValueError, match="verified D0"):
         run_experiment(diagnosis_context, "D4.CURRENT_EXIT_PACKAGE", PartitionName.DISCOVERY)
 
 
@@ -387,7 +443,7 @@ def test_current_exit_rejects_a_ledger_hash_mismatch_before_metrics(
 ) -> None:
     path = diagnosis_context.baseline_snapshot.run_dir / "transactions.csv"
     path.write_text(path.read_text(encoding="utf-8").replace("110.0", "110.1", 1), encoding="utf-8")
-    with pytest.raises(ValueError, match="transaction ledger hash"):
+    with pytest.raises(ValueError, match="verified D0"):
         run_experiment(diagnosis_context, "D4.CURRENT_EXIT_PACKAGE", PartitionName.DISCOVERY)
 
 

@@ -17,6 +17,7 @@ from core.backtest_engine import (
     PortfolioSimulator,
     SimulationResult,
     _portfolio_checkpoint_fingerprint,
+    print_pnl_report,
     run_cli,
 )
 from core.canslim.entry_contract import (
@@ -143,38 +144,24 @@ def test_bulk_scanner_prefilter_uses_canonical_rs_despite_tighter_request() -> N
     assert evaluated == ["ELIGIBLE"]
 
 
-def test_simulator_config_separates_effective_and_requested_entry_floors() -> None:
-    """Break caught: result metadata reports an ignored request as effective policy."""
-    simulator = PortfolioSimulator(
-        min_rs_score=99.0,
-        min_canslim_score=90.0,
-        data_fetcher=object(),  # type: ignore[arg-type]
-    )
-
-    config = _result_config(simulator)
-
-    assert config["min_rs_score"] == 80.0
-    assert config["min_canslim_score"] == 70.0
-    assert config["requested_min_rs_score"] == 99.0
-    assert config["requested_min_canslim_score"] == 90.0
-    assert config["entry_threshold_requests_advisory_only"] is True
+def test_simulator_rejects_noncanonical_entry_floor_requests() -> None:
+    """Break caught: an inert non-default request is silently accepted."""
+    with pytest.raises(ValueError, match="min_rs_score"):
+        PortfolioSimulator(
+            min_rs_score=99.0,
+            min_canslim_score=70.0,
+            data_fetcher=object(),  # type: ignore[arg-type]
+        )
 
 
-def test_nonfinite_advisory_requests_are_inert_and_strict_json_safe() -> None:
-    """Break caught: NaN/Infinity advisory values poison result/checkpoint JSON."""
-    simulator = PortfolioSimulator(
-        min_rs_score=float("nan"),
-        min_canslim_score=float("inf"),
-        data_fetcher=object(),  # type: ignore[arg-type]
-    )
-
-    config = _result_config(simulator)
-
-    assert config["min_rs_score"] == 80.0
-    assert config["min_canslim_score"] == 70.0
-    assert config["requested_min_rs_score"] is None
-    assert config["requested_min_canslim_score"] is None
-    json.dumps(config, allow_nan=False)
+def test_nonfinite_inert_requests_fail_closed() -> None:
+    """Break caught: NaN/Infinity bypasses inert-request validation."""
+    with pytest.raises(ValueError, match="min_rs_score"):
+        PortfolioSimulator(
+            min_rs_score=float("nan"),
+            min_canslim_score=70.0,
+            data_fetcher=object(),  # type: ignore[arg-type]
+        )
 
 
 def _strategy_signal(simulator: PortfolioSimulator) -> dict[str, object] | None:
@@ -222,37 +209,14 @@ def _strategy_signal(simulator: PortfolioSimulator) -> dict[str, object] | None:
         )
 
 
-def test_requested_entry_floors_do_not_change_fingerprint_or_signals() -> None:
-    """Break caught: an advisory request forks resume identity or signal output."""
-    canonical_request = PortfolioSimulator(
-        min_rs_score=80.0,
-        min_canslim_score=70.0,
-        data_fetcher=object(),  # type: ignore[arg-type]
-    )
-    tighter_request = PortfolioSimulator(
-        min_rs_score=99.0,
-        min_canslim_score=99.0,
-        data_fetcher=object(),  # type: ignore[arg-type]
-    )
-    fingerprint_args = {
-        "bundle_sha256": None,
-        "code_identity": "fixed-code",
-        "start_date": pd.Timestamp("2024-01-02"),
-        "end_date": pd.Timestamp("2024-01-31"),
-        "benchmark": "SPY",
-        "universe": ["AAA"],
-    }
-
-    canonical_fingerprint = _portfolio_checkpoint_fingerprint(
-        simulator=canonical_request, **fingerprint_args
-    )
-    tighter_fingerprint = _portfolio_checkpoint_fingerprint(
-        simulator=tighter_request, **fingerprint_args
-    )
-
-    assert canonical_fingerprint == tighter_fingerprint
-    assert _strategy_signal(canonical_request) == _strategy_signal(tighter_request)
-    assert _strategy_signal(tighter_request)["buy_signal"] is True  # type: ignore[index]
+def test_noncanonical_entry_floors_fail_before_fingerprint_or_signals() -> None:
+    """Break caught: a rejected request reaches checkpoint or signal work."""
+    with pytest.raises(ValueError, match="min_canslim_score"):
+        PortfolioSimulator(
+            min_rs_score=80.0,
+            min_canslim_score=99.0,
+            data_fetcher=object(),  # type: ignore[arg-type]
+        )
 
 
 class _ConventionalThresholdStrategy:
@@ -288,8 +252,8 @@ def test_supplied_strategy_is_bound_to_canonical_entry_floors() -> None:
         strategy=canonical_strategy,  # type: ignore[arg-type]
     )
     tighter_request = PortfolioSimulator(
-        min_rs_score=99.0,
-        min_canslim_score=99.0,
+        min_rs_score=80.0,
+        min_canslim_score=70.0,
         data_fetcher=object(),  # type: ignore[arg-type]
         strategy=tighter_strategy,  # type: ignore[arg-type]
     )
@@ -348,6 +312,7 @@ def _checkpoint_simulator(
         "name": "threshold-authority-no-signals",
         "version": 1,
     }
+    strategy.effective_policy_identity = dict(strategy.checkpoint_identity)
     strategy.evaluate_market.return_value = {"market_is_bullish": True}
     strategy.evaluate_symbol.return_value = None
     return PortfolioSimulator(
@@ -360,13 +325,18 @@ def _checkpoint_simulator(
     )
 
 
-def test_partial_resume_preserves_origin_advisory_request_metadata(tmp_path: Path) -> None:
-    """Break caught: partial resume rewrites origin provenance with inert requests."""
+def test_partial_resume_preserves_canonical_request_metadata(tmp_path: Path) -> None:
+    """Break caught: partial resume rewrites the canonical request provenance."""
     prices, closes = _checkpoint_fixture()
     checkpoint = tmp_path / "portfolio_checkpoint.json"
+    origin_rs = 80.0 + 5e-13
+    origin_composite = 70.0 + 5e-13
+    resumer_rs = 80.0 - 5e-13
+    resumer_composite = 70.0 - 5e-13
+    assert (origin_rs, origin_composite) != (resumer_rs, resumer_composite)
     origin = _checkpoint_simulator(
-        min_rs_score=91.0,
-        min_canslim_score=92.0,
+        min_rs_score=origin_rs,
+        min_canslim_score=origin_composite,
         price_data=prices,
         closes=closes,
     )
@@ -397,8 +367,8 @@ def test_partial_resume_preserves_origin_advisory_request_metadata(tmp_path: Pat
         origin.run(**run_args)
 
     resumer = _checkpoint_simulator(
-        min_rs_score=1.0,
-        min_canslim_score=2.0,
+        min_rs_score=resumer_rs,
+        min_canslim_score=resumer_composite,
         price_data=prices,
         closes=closes,
     )
@@ -420,14 +390,14 @@ def test_partial_resume_preserves_origin_advisory_request_metadata(tmp_path: Pat
 
     final_checkpoint = resumed_checkpoints[-1]
     assert all(
-        payload["origin_requested_min_rs_score"] == 91.0
-        and payload["origin_requested_min_canslim_score"] == 92.0
+        payload["origin_requested_min_rs_score"] == origin_rs
+        and payload["origin_requested_min_canslim_score"] == origin_composite
         for payload in resumed_checkpoints
     )
-    assert final_checkpoint["origin_requested_min_rs_score"] == 91.0
-    assert final_checkpoint["origin_requested_min_canslim_score"] == 92.0
-    assert result.config["requested_min_rs_score"] == 91.0
-    assert result.config["requested_min_canslim_score"] == 92.0
+    assert final_checkpoint["origin_requested_min_rs_score"] == origin_rs
+    assert final_checkpoint["origin_requested_min_canslim_score"] == origin_composite
+    assert result.config["requested_min_rs_score"] == origin_rs
+    assert result.config["requested_min_canslim_score"] == origin_composite
 
 
 def test_signal_funnel_rs_pass_is_canonical_despite_legacy_config() -> None:
@@ -522,17 +492,113 @@ def test_after_close_artifact_declares_technical_ranking_only(tmp_path: Path) ->
     }
 
 
-def test_backtest_help_labels_legacy_entry_floor_options_as_ignored(capsys) -> None:
-    """Break caught: CLI help presents fixed entry floors as tunable strategy knobs."""
+@pytest.mark.parametrize(
+    ("option", "value"),
+    (
+        ("--min-technical-score", "71"),
+        ("--position-size-pct", "0.13"),
+        ("--take-profit", "0.41"),
+        ("--scale-out-fraction", "0.51"),
+        ("--min-rs", "81"),
+        ("--min-canslim", "71"),
+    ),
+)
+def test_run_cli_rejects_inert_options_before_universe_or_pit_access(
+    option: str, value: str,
+) -> None:
+    """A rejected inert CLI request must fail before any data boundary."""
+    with (
+        patch("core.backtest_engine.PITDataBundle") as pit_bundle,
+        patch("core.backtest_engine._resolve_universe") as resolve_universe,
+        pytest.raises(ValueError),
+    ):
+        run_cli([option, value, "--no-csv"])
+
+    pit_bundle.assert_not_called()
+    resolve_universe.assert_not_called()
+
+
+def test_run_cli_rejects_inert_option_before_pit_bundle_construction() -> None:
+    """Even an explicitly requested PIT bundle stays unopened on invalid policy."""
+    with (
+        patch("core.backtest_engine.PITDataBundle") as pit_bundle,
+        patch("core.backtest_engine._resolve_universe") as resolve_universe,
+        pytest.raises(ValueError),
+    ):
+        run_cli(
+            [
+                "--pit-bundle",
+                "unused.sqlite3",
+                "--pit-bundle-sha256",
+                "a" * 64,
+                "--min-rs",
+                "81",
+                "--no-csv",
+            ]
+        )
+
+    pit_bundle.assert_not_called()
+    resolve_universe.assert_not_called()
+
+
+def test_run_cli_closes_pit_bundle_when_simulator_construction_fails() -> None:
+    """A validated PIT bundle must close if later simulator setup fails."""
+    bundle = MagicMock()
+    bundle.symbols.return_value = ("AAA", "SPY")
+    with (
+        patch("core.backtest_engine.PITDataBundle", return_value=bundle),
+        patch(
+            "core.backtest_engine.PortfolioSimulator",
+            side_effect=ValueError("simulator construction failed"),
+        ),
+        patch("core.backtest_engine._resolve_universe") as resolve_universe,
+        pytest.raises(ValueError, match="simulator construction failed"),
+    ):
+        run_cli(
+            [
+                "--pit-bundle",
+                "unused.sqlite3",
+                "--pit-bundle-sha256",
+                "a" * 64,
+                "--no-csv",
+            ]
+        )
+
+    bundle.close.assert_called_once_with()
+    resolve_universe.assert_not_called()
+
+
+def test_backtest_help_labels_all_inert_options_as_fail_closed(capsys) -> None:
+    """Every retained inert CLI option must disclose its fixed policy source."""
     with pytest.raises(SystemExit) as exc_info:
         run_cli(["--help"])
 
-    help_text = capsys.readouterr().out.lower()
+    help_text = " ".join(capsys.readouterr().out.lower().split())
     assert exc_info.value.code == 0
-    assert "--min-rs" in help_text
-    assert "deprecated advisory" in help_text
-    assert "fixed canonical rs 80" in help_text
-    assert "fixed canonical composite 70" in help_text
+    expected_policy_descriptions = {
+        "--min-technical-score": "fixed canonical technical 70",
+        "--position-size-pct": "fixed risk-based position sizing",
+        "--take-profit": "fixed scale-out gain tiers",
+        "--scale-out-fraction": "fixed scale-out sale fractions",
+        "--min-rs": "fixed canonical rs 80",
+        "--min-canslim": "fixed canonical composite 70",
+    }
+    for option, policy_description in expected_policy_descriptions.items():
+        assert option in help_text
+        assert policy_description in help_text
+    assert help_text.count("compatibility-only; non-default values are rejected") == 6
+
+
+def test_backtest_report_describes_actual_scale_out_tiers(capsys) -> None:
+    """The report must not present the inert take-profit request as active."""
+    print_pnl_report(SimulationResult(config={"tickers": []}))
+
+    report = capsys.readouterr().out.lower()
+    assert "take-profit:" not in report
+    assert "scale-out tiers:" in report
+    assert "10% gain: sell 25%" in report
+    assert "15% gain: sell 25%" in report
+    assert "20% gain: sell 25%" in report
 
 
 def test_scanner_help_labels_python_threshold_inputs_as_advisory() -> None:

@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from core.backtest_engine import EntryAttemptOutcome, SimulationResult
+from core.engine_policy import effective_engine_policy_sha256
 from core.leader_basket import LeaderBasketResult
 from core.leader_evaluation import PointInTimeUniverse
 import pit_baseline
@@ -37,6 +38,8 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
     membership = PointInTimeUniverse.from_rows([
         {"effective_date": "2021-01-01", "ticker": "AAA", "member": True},
     ])
+    effective_policy = {"schema_version": 1, "fixture_policy": "offline"}
+    effective_policy_digest = effective_engine_policy_sha256(effective_policy)
 
     class FakeBundle:
         sha256 = bundle_sha
@@ -78,6 +81,9 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
         def __init__(self, **_kwargs) -> None:
             self.identity_transition_contract = None
 
+        def _verify_effective_engine_policy(self) -> str:
+            return effective_policy_digest
+
         def run(self, _tickers, **_kwargs):
             sessions = pd.to_datetime(["2021-01-01", "2021-01-04"])
             signal = {
@@ -92,7 +98,12 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
                 "technical_setup_eligible": True, "technical_blocking_reasons": "",
             }
             return SimulationResult(
-                config={"min_rs_score": 80.0, "min_canslim_score": 75.0},
+                config={
+                    "min_rs_score": 80.0,
+                    "min_canslim_score": 70.0,
+                    "effective_engine_policy": effective_policy,
+                    "effective_engine_policy_sha256": effective_policy_digest,
+                },
                 equity_curve=pd.Series([100_000.0, 100_000.0], index=sessions),
                 benchmark_curve=pd.Series([100_000.0, 101_000.0], index=sessions),
                 signal_log=pd.DataFrame([signal]),
@@ -166,7 +177,12 @@ def test_main_publishes_hashed_artifacts_and_refuses_same_run_directory(
     required = {"five_year_leaders.csv", "rolling_leader_labels.csv", "canslim_signals.csv", "entry_attempt_outcomes.csv", "daily_entry_funnel.csv", "transactions.csv", "weekly_holdings.csv", "equity_curve.csv", "leader_basket_holdings.csv", "leader_basket_transactions.csv", "leader_basket_equity.csv", "leader_recall.csv", "coverage.json", "summary.json", "report.md", "run_manifest.json"}
     assert required == {path.name for path in run_dir.iterdir()}
     manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
+    assert manifest["effective_engine_policy"] == effective_policy
+    assert manifest["effective_engine_policy_sha256"] == effective_policy_digest
+    assert summary["effective_engine_policy"] == effective_policy
+    assert summary["effective_engine_policy_sha256"] == effective_policy_digest
     assert set(manifest["artifacts"]) == required - {"run_manifest.json"}
     assert {name: hashlib.sha256((run_dir / name).read_bytes()).hexdigest() for name in manifest["artifacts"]} == manifest["artifacts"]
     before_collision = {path.name: path.read_bytes() for path in run_dir.iterdir()}

@@ -153,7 +153,6 @@ def test_scale_out_remaining_qty_is_25_pct_of_original_after_tier3() -> None:
 def test_time_stop_exits_stagnant_position() -> None:
     sim = PortfolioSimulator(
         initial_capital=100_000.0,
-        take_profit_pct=0.50,
         stagnation_days=20,
         stagnation_threshold_pct=0.05,
     )
@@ -299,7 +298,7 @@ def test_performance_report_computes_annualized_return() -> None:
 
 
 def test_technical_only_mode_allows_buy_without_fundamentals() -> None:
-    strategy = CanslimStrategy(technical_only=True, min_rs_score=87.0, min_technical_score=70.0)
+    strategy = CanslimStrategy(technical_only=True, min_technical_score=70.0)
     dates = pd.date_range("2026-01-01", periods=80, freq="B")
     ticker_ohlcv = {
         "NVDA": pd.DataFrame(

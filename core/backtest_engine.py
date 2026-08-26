@@ -10,6 +10,7 @@ import os
 import pickle
 import sqlite3
 import sys
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -48,6 +49,11 @@ from core.canslim.c_current_earnings import evaluate_c
 from core.canslim.i_institutional import evaluate_i
 from core.industry_group import get_top_groups, load_industry_map
 from core.data_client import clear_session_cache, fetch_bulk_ohlcv
+from core.engine_policy import (
+    build_effective_engine_policy,
+    effective_engine_policy_sha256,
+    validate_inert_request_compatibility,
+)
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
 from core.momentum_analysis import calculate_rs_snapshot
 from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
@@ -87,6 +93,19 @@ DEFAULT_MIN_C_A_GROWTH = 0.25
 DEFAULT_MIN_TECHNICAL_SCORE = 70.0
 DEFAULT_BULK_PRICE_FETCH_THRESHOLD = 25
 BENCHMARK = "SPY"
+
+
+_INERT_REQUEST_POLICY_SOURCES = {
+    "min_rs_score": "core.canslim.entry_contract.MIN_RS_SCORE",
+    "min_canslim_score": "core.canslim.entry_contract.MIN_COMPOSITE_SCORE",
+    "min_technical_score": "core.canslim.entry_contract.evaluate_entry_contract",
+    "position_size_pct": "core.backtest_engine.PortfolioSimulator._enter_position",
+    "take_profit_pct": "config.settings.SCALE_OUT_TIERS",
+    "scale_out_fraction": "config.settings.SCALE_OUT_TIERS",
+    "min_c_a_growth": (
+        "core.canslim.entry_contract.MIN_CURRENT_GROWTH_and_MIN_ANNUAL_GROWTH"
+    ),
+}
 
 
 def _period_for_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp, buffer_days: int = 120) -> str:
@@ -612,6 +631,29 @@ class CanslimStrategy:
         fundamental_provider: Optional[Callable[[str, pd.Timestamp], dict[str, Any]]] = None,
         require_proper_base: bool = False,
     ) -> None:
+        validate_inert_request_compatibility(
+            {
+                "min_rs_score": min_rs_score,
+                "min_canslim_score": min_canslim_score,
+                "min_technical_score": min_technical_score,
+                "min_c_a_growth": min_c_a_growth,
+            },
+            {
+                "min_rs_score": MIN_RS_SCORE,
+                "min_canslim_score": MIN_COMPOSITE_SCORE,
+                "min_technical_score": DEFAULT_MIN_TECHNICAL_SCORE,
+                "min_c_a_growth": DEFAULT_MIN_C_A_GROWTH,
+            },
+            {
+                name: _INERT_REQUEST_POLICY_SOURCES[name]
+                for name in (
+                    "min_rs_score",
+                    "min_canslim_score",
+                    "min_technical_score",
+                    "min_c_a_growth",
+                )
+            },
+        )
         self.min_c_a_growth = min_c_a_growth
         self.requested_min_rs_score = _finite_signal_number(min_rs_score)
         self.requested_min_canslim_score = _finite_signal_number(min_canslim_score)
@@ -1150,6 +1192,7 @@ def _portfolio_checkpoint_fingerprint(
     simulator: "PortfolioSimulator",
     strategy_identity: Optional[dict[str, Any]] = None,
 ) -> str:
+    simulator._verify_effective_engine_policy()
     config = {
         "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
         "bundle_sha256": bundle_sha256,
@@ -1195,6 +1238,7 @@ def _portfolio_checkpoint_fingerprint(
         "stagnation_threshold_pct": simulator.stagnation_threshold_pct,
         "breakeven_trigger_pct": simulator.breakeven_trigger_pct,
         "enable_eviction": simulator.enable_eviction,
+        "effective_engine_policy_sha256": simulator._effective_engine_policy_sha256,
     }
     return hashlib.sha256(_checkpoint_bytes(config)).hexdigest()
 
@@ -1277,6 +1321,35 @@ class PortfolioSimulator:
         pit_bundle: Optional[PITDataBundle] = None,
         identity_transition_contract: Optional[PriceIdentityTransitionContract] = None,
     ) -> None:
+        validate_inert_request_compatibility(
+            {
+                "min_rs_score": min_rs_score,
+                "min_canslim_score": min_canslim_score,
+                "min_technical_score": min_technical_score,
+                "position_size_pct": position_size_pct,
+                "take_profit_pct": take_profit_pct,
+                "scale_out_fraction": scale_out_fraction,
+            },
+            {
+                "min_rs_score": MIN_RS_SCORE,
+                "min_canslim_score": MIN_COMPOSITE_SCORE,
+                "min_technical_score": DEFAULT_MIN_TECHNICAL_SCORE,
+                "position_size_pct": DEFAULT_POSITION_SIZE_PCT,
+                "take_profit_pct": DEFAULT_TAKE_PROFIT_PCT,
+                "scale_out_fraction": DEFAULT_SCALE_OUT_FRACTION,
+            },
+            {
+                name: _INERT_REQUEST_POLICY_SOURCES[name]
+                for name in (
+                    "min_rs_score",
+                    "min_canslim_score",
+                    "min_technical_score",
+                    "position_size_pct",
+                    "take_profit_pct",
+                    "scale_out_fraction",
+                )
+            },
+        )
         self.initial_capital = initial_capital
         self.max_positions = max_positions
         self.position_size_pct = position_size_pct
@@ -1305,7 +1378,6 @@ class PortfolioSimulator:
         self.stagnation_days = stagnation_days
         self.stagnation_threshold_pct = stagnation_threshold_pct
         self.breakeven_trigger_pct = breakeven_trigger_pct
-        self.data_fetcher = data_fetcher or DataFetcher()
         self._strategy_was_injected = strategy is not None
         self.strategy = (
             strategy
@@ -1340,6 +1412,14 @@ class PortfolioSimulator:
             self.strategy.fundamental_provider = pit_bundle.fundamentals_provider
         self.benchmark_symbol = benchmark_symbol
         self.enable_eviction = enable_eviction
+        group_defaults = get_top_groups.__defaults__
+        if group_defaults is None or len(group_defaults) != 2:
+            raise ValueError("industry group policy defaults are unavailable")
+        self.industry_group_top_n = group_defaults[0]
+        self.industry_group_min_size = group_defaults[1]
+        self.industry_group_filter_enabled = bool(
+            not technical_only and pit_bundle is None
+        )
 
         self._equity: float = initial_capital
         self._open_positions: Dict[str, Trade] = {}
@@ -1354,6 +1434,84 @@ class PortfolioSimulator:
         self._strict_pit_pattern_histories: dict[str, _PreparedPatternHistory] = {}
         self._strict_pit_history_frames: dict[str, pd.DataFrame] = {}
         self._strict_pit_base_policy = BasePolicy.canonical_v1()
+        self._capture_effective_engine_policy()
+        self.data_fetcher = data_fetcher or DataFetcher()
+
+    def _synchronize_owned_builtin_policy(self) -> None:
+        """Bind the owned strategy to simulator policy before a fresh capture."""
+
+        if self._strategy_was_injected:
+            return
+        strategy = self._owned_builtin_strategy
+        if strategy is None or self.strategy is not strategy:
+            raise ValueError("owned built-in strategy binding changed before capture")
+        try:
+            strategy.technical_only = self.technical_only
+            strategy.require_bullish_market = self.require_bullish_market
+            strategy.require_proper_base = self.require_proper_base
+            strategy.fundamental_provider = (
+                self.pit_bundle.fundamentals_provider
+                if self.pit_bundle is not None
+                else None
+            )
+        except Exception as exc:
+            raise ValueError("owned built-in strategy policy synchronization failed") from exc
+
+    def _live_inert_request_contract(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, str]]:
+        requests: dict[str, object] = {
+            "min_rs_score": self.min_rs_score,
+            "min_canslim_score": self.min_canslim_score,
+            "min_technical_score": self.min_technical_score,
+            "position_size_pct": self.position_size_pct,
+            "take_profit_pct": self.take_profit_pct,
+            "scale_out_fraction": self.scale_out_fraction,
+        }
+        compatibility_values: dict[str, object] = {
+            "min_rs_score": MIN_RS_SCORE,
+            "min_canslim_score": MIN_COMPOSITE_SCORE,
+            "min_technical_score": DEFAULT_MIN_TECHNICAL_SCORE,
+            "position_size_pct": DEFAULT_POSITION_SIZE_PCT,
+            "take_profit_pct": DEFAULT_TAKE_PROFIT_PCT,
+            "scale_out_fraction": DEFAULT_SCALE_OUT_FRACTION,
+        }
+        if not self._strategy_was_injected:
+            requests["min_c_a_growth"] = getattr(
+                self.strategy, "min_c_a_growth", None
+            )
+            compatibility_values["min_c_a_growth"] = DEFAULT_MIN_C_A_GROWTH
+        sources = {
+            name: _INERT_REQUEST_POLICY_SOURCES[name]
+            for name in requests
+        }
+        return requests, compatibility_values, sources
+
+    def _capture_effective_engine_policy(self) -> None:
+        """Capture the complete live policy at an official execution boundary."""
+
+        self._synchronize_owned_builtin_policy()
+        validate_inert_request_compatibility(*self._live_inert_request_contract())
+        policy = build_effective_engine_policy(self)
+        digest = effective_engine_policy_sha256(policy)
+        self._effective_engine_policy = policy
+        self._effective_engine_policy_sha256 = digest
+
+    def _verify_effective_engine_policy(self) -> str:
+        """Fail closed if live execution policy diverged from the run snapshot."""
+
+        validate_inert_request_compatibility(*self._live_inert_request_contract())
+        live_policy = build_effective_engine_policy(self)
+        live_digest = effective_engine_policy_sha256(live_policy)
+        stored_policy = self._effective_engine_policy
+        stored_digest = self._effective_engine_policy_sha256
+        if (
+            live_policy != stored_policy
+            or live_digest != stored_digest
+            or effective_engine_policy_sha256(stored_policy) != stored_digest
+        ):
+            raise ValueError("effective engine policy changed after run start")
+        return live_digest
 
     def run(
         self,
@@ -1373,6 +1531,7 @@ class PortfolioSimulator:
             raise ValueError("checkpoint_every_days must be positive")
         if resume and checkpoint_path is None:
             raise ValueError("resume requires checkpoint_path")
+        self._capture_effective_engine_policy()
         self._equity = self.initial_capital
         self._open_positions = {}
         self._trades = []
@@ -1515,7 +1674,11 @@ class PortfolioSimulator:
             return SimulationResult()
 
         self._configure_strict_pit_pattern_cache(ticker_ohlcv)
-        self._ticker_industry = {} if self.technical_only or self.pit_bundle is not None else load_industry_map(tickers)
+        self._ticker_industry = (
+            load_industry_map(tickers)
+            if self.industry_group_filter_enabled
+            else {}
+        )
         if checkpoint_state is not None:
             next_day_index = int(checkpoint_state["next_day_index"])
             if next_day_index < 0 or next_day_index > len(trading_days):
@@ -1571,6 +1734,7 @@ class PortfolioSimulator:
 
         total_days = len(trading_days)
         for day_idx, eval_date in enumerate(trading_days[next_day_index:], start=next_day_index):
+            self._verify_effective_engine_policy()
             signal_start = len(self._signal_rows)
             outcome_start = len(self._entry_outcomes)
             transaction_start = len(self._transactions)
@@ -1901,6 +2065,7 @@ class PortfolioSimulator:
         end_ts: pd.Timestamp,
         requested_entry_floors: tuple[float | None, float | None] | None = None,
     ) -> dict[str, Any]:
+        self._verify_effective_engine_policy()
         requested_min_rs_score, requested_min_canslim_score = (
             requested_entry_floors
             if requested_entry_floors is not None
@@ -1948,7 +2113,11 @@ class PortfolioSimulator:
             "stagnation_days": self.stagnation_days,
             "stagnation_threshold_pct": self.stagnation_threshold_pct,
             "breakeven_trigger_pct": self.breakeven_trigger_pct,
-            "industry_group_top_n": settings.INDUSTRY_GROUP_TOP_N,
+            "industry_group_filter_enabled": self.industry_group_filter_enabled,
+            "industry_group_top_n": self.industry_group_top_n,
+            "industry_group_min_size": self.industry_group_min_size,
+            "effective_engine_policy": self._effective_engine_policy,
+            "effective_engine_policy_sha256": self._effective_engine_policy_sha256,
             "start_date": str(start_ts.date()),
             "end_date": str(end_ts.date()),
         }
@@ -1970,6 +2139,7 @@ class PortfolioSimulator:
         completed: bool = False,
         result_config: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        self._verify_effective_engine_policy()
         payload: dict[str, Any] = {
             "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
             "fingerprint": fingerprint,
@@ -2006,17 +2176,49 @@ class PortfolioSimulator:
         outputs: dict[str, list[Any]],
         benchmark: str,
     ) -> SimulationResult:
+        live_policy_digest = self._verify_effective_engine_policy()
         if not checkpoint.get("completed") or "result_config" not in checkpoint:
             raise ValueError("portfolio checkpoint does not contain a completed result")
         if checkpoint.get("entry_outcome_schema_version") != ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION:
             raise ValueError("portfolio checkpoint entry outcome schema is unsupported")
+        raw_result_config = checkpoint["result_config"]
+        if not isinstance(raw_result_config, Mapping):
+            raise ValueError("completed checkpoint result config must be a mapping")
+        result_config = dict(raw_result_config)
+        embedded_policy = result_config.get("effective_engine_policy")
+        embedded_policy_digest = result_config.get(
+            "effective_engine_policy_sha256"
+        )
+        if not isinstance(embedded_policy, Mapping) or not isinstance(
+            embedded_policy_digest, str
+        ):
+            raise ValueError(
+                "completed checkpoint result config has no valid effective policy binding"
+            )
+        normalized_embedded_policy = dict(embedded_policy)
+        try:
+            recomputed_embedded_digest = effective_engine_policy_sha256(
+                normalized_embedded_policy
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "completed checkpoint result config effective policy is invalid"
+            ) from exc
+        if (
+            recomputed_embedded_digest != embedded_policy_digest
+            or embedded_policy_digest != live_policy_digest
+            or normalized_embedded_policy != self._effective_engine_policy
+        ):
+            raise ValueError(
+                "completed checkpoint result config effective policy disagrees "
+                "with the live verified policy"
+            )
         origin_requested_min_rs_score = _checkpoint_origin_advisory_request(
             checkpoint, "origin_requested_min_rs_score"
         )
         origin_requested_min_canslim_score = _checkpoint_origin_advisory_request(
             checkpoint, "origin_requested_min_canslim_score"
         )
-        result_config = checkpoint["result_config"]
         if (
             result_config.get("requested_min_rs_score")
             != origin_requested_min_rs_score
@@ -2205,12 +2407,22 @@ class PortfolioSimulator:
         if self.pit_bundle is not None:
             rs_eligible = self.pit_bundle.members_at(eval_date) - {self.benchmark_symbol.upper()}
         rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date, eligible_tickers=rs_eligible)
-        top_groups = get_top_groups(rs_snapshot, self._ticker_industry)
+        top_groups = get_top_groups(
+            rs_snapshot,
+            self._ticker_industry,
+            top_n=self.industry_group_top_n,
+            min_size=self.industry_group_min_size,
+        )
         for ticker in tickers:
             if ticker in self._open_positions or ticker not in ticker_ohlcv:
                 continue
             ticker_group = self._ticker_industry.get(ticker)
-            if top_groups and ticker_group is not None and ticker_group not in top_groups:
+            if (
+                self.industry_group_filter_enabled
+                and top_groups
+                and ticker_group is not None
+                and ticker_group not in top_groups
+            ):
                 continue
 
             entry_facts = None
@@ -2774,7 +2986,17 @@ def print_pnl_report(result: SimulationResult) -> None:
         + ("required" if cfg.get("require_bullish_market", False) else "diagnostic only")
     )
     print(f"Stop-loss:        {cfg.get('stop_loss_pct', settings.STOP_LOSS_PCT) * 100:.1f}%")
-    print(f"Take-profit:      {cfg.get('take_profit_pct', DEFAULT_TAKE_PROFIT_PCT) * 100:.1f}%")
+    scale_out_tiers = ", ".join(
+        f"{gain_target * 100:g}% gain: sell {sale_fraction * 100:g}%"
+        for gain_target, sale_fraction in settings.SCALE_OUT_TIERS
+    )
+    remaining_fraction = 1.0 - sum(
+        sale_fraction for _gain_target, sale_fraction in settings.SCALE_OUT_TIERS
+    )
+    print(
+        f"Scale-out tiers:  {scale_out_tiers}; "
+        f"{remaining_fraction * 100:g}% remains for trailing exits"
+    )
     print(f"Time stop:        {cfg.get('stagnation_days', DEFAULT_STAGNATION_DAYS)} days")
     print(f"Breakeven trigger:{cfg.get('breakeven_trigger_pct', DEFAULT_BREAKEVEN_TRIGGER_PCT) * 100:>11.1f}%")
     print(f"RS floor (fixed): {cfg.get('min_rs_score', MIN_RS_SCORE)}")
@@ -3096,10 +3318,34 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
         help="maximum simultaneous positions; omit for uncapped backtests",
     )
     parser.add_argument("--stop", type=float, default=settings.STOP_LOSS_PCT)
-    parser.add_argument("--position-size-pct", type=float, default=DEFAULT_POSITION_SIZE_PCT)
+    parser.add_argument(
+        "--position-size-pct",
+        type=float,
+        default=DEFAULT_POSITION_SIZE_PCT,
+        help=(
+            "compatibility-only; non-default values are rejected; execution "
+            "uses fixed risk-based position sizing"
+        ),
+    )
     parser.add_argument("--position-risk-pct", type=float, default=DEFAULT_POSITION_RISK_PCT)
-    parser.add_argument("--take-profit", type=float, default=DEFAULT_TAKE_PROFIT_PCT)
-    parser.add_argument("--scale-out-fraction", type=float, default=DEFAULT_SCALE_OUT_FRACTION)
+    parser.add_argument(
+        "--take-profit",
+        type=float,
+        default=DEFAULT_TAKE_PROFIT_PCT,
+        help=(
+            "compatibility-only; non-default values are rejected; exits use "
+            "fixed scale-out gain tiers"
+        ),
+    )
+    parser.add_argument(
+        "--scale-out-fraction",
+        type=float,
+        default=DEFAULT_SCALE_OUT_FRACTION,
+        help=(
+            "compatibility-only; non-default values are rejected; exits use "
+            "fixed scale-out sale fractions"
+        ),
+    )
     parser.add_argument("--stagnation-days", type=int, default=DEFAULT_STAGNATION_DAYS)
     parser.add_argument("--stagnation-threshold", type=float, default=DEFAULT_STAGNATION_THRESHOLD_PCT)
     parser.add_argument("--breakeven-trigger", type=float, default=DEFAULT_BREAKEVEN_TRIGGER_PCT)
@@ -3130,8 +3376,8 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
         type=float,
         default=DEFAULT_MIN_CANSLIM_SCORE,
         help=(
-            "deprecated advisory; ignored for entry qualification, which uses "
-            "fixed canonical composite 70"
+            "compatibility-only; non-default values are rejected; entry "
+            "qualification uses fixed canonical composite 70"
         ),
     )
     parser.add_argument(
@@ -3139,11 +3385,19 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
         type=float,
         default=DEFAULT_MIN_RS_SCORE,
         help=(
-            "deprecated advisory; ignored for entry qualification, which uses "
-            "fixed canonical RS 80"
+            "compatibility-only; non-default values are rejected; entry "
+            "qualification uses fixed canonical RS 80"
         ),
     )
-    parser.add_argument("--min-technical-score", type=float, default=DEFAULT_MIN_TECHNICAL_SCORE)
+    parser.add_argument(
+        "--min-technical-score",
+        type=float,
+        default=DEFAULT_MIN_TECHNICAL_SCORE,
+        help=(
+            "compatibility-only; non-default values are rejected; entry "
+            "qualification uses fixed canonical technical 70"
+        ),
+    )
     parser.add_argument("--benchmark", default=BENCHMARK)
     parser.add_argument("--technical-only", action="store_true")
     parser.add_argument(
@@ -3162,42 +3416,76 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
     parser.add_argument("--export-charts", action="store_true")
     args = parser.parse_args(argv)
 
-    pit_bundle: Optional[PITDataBundle] = None
-    if args.pit_bundle:
-        if not args.pit_bundle_sha256:
-            parser.error("--pit-bundle-sha256 is required with --pit-bundle")
-        pit_bundle = PITDataBundle(args.pit_bundle, expected_sha256=args.pit_bundle_sha256)
-        tickers = list(args.tickers or pit_bundle.symbols())
-    else:
-        tickers = _resolve_universe(args.universe, args.tickers)
-        extra = [s for s in settings.EXTRA_SYMBOLS if s not in tickers]
-        if extra:
-            tickers.extend(extra)
-
-    simulator = PortfolioSimulator(
-        initial_capital=args.capital,
-        max_positions=args.max_positions,
-        position_size_pct=args.position_size_pct,
-        position_risk_pct=args.position_risk_pct,
-        stop_loss_pct=args.stop,
-        signal_every_n_days=args.signal_days,
-        min_canslim_score=args.min_canslim,
-        min_rs_score=args.min_rs,
-        min_technical_score=args.min_technical_score,
-        require_bullish_market=args.require_bullish_market and not args.allow_non_bullish_entries,
-        use_stateful_regime_gate=args.stateful_regime_gate,
-        cash_deployment_threshold_pct=args.cash_deployment_threshold,
-        technical_only=args.technical_only,
-        take_profit_pct=args.take_profit,
-        scale_out_fraction=args.scale_out_fraction,
-        stagnation_days=args.stagnation_days,
-        stagnation_threshold_pct=args.stagnation_threshold,
-        breakeven_trigger_pct=args.breakeven_trigger,
-        benchmark_symbol=args.benchmark,
-        pit_bundle=pit_bundle,
+    validate_inert_request_compatibility(
+        {
+            "min_rs_score": args.min_rs,
+            "min_canslim_score": args.min_canslim,
+            "min_technical_score": args.min_technical_score,
+            "position_size_pct": args.position_size_pct,
+            "take_profit_pct": args.take_profit,
+            "scale_out_fraction": args.scale_out_fraction,
+        },
+        {
+            "min_rs_score": DEFAULT_MIN_RS_SCORE,
+            "min_canslim_score": DEFAULT_MIN_CANSLIM_SCORE,
+            "min_technical_score": DEFAULT_MIN_TECHNICAL_SCORE,
+            "position_size_pct": DEFAULT_POSITION_SIZE_PCT,
+            "take_profit_pct": DEFAULT_TAKE_PROFIT_PCT,
+            "scale_out_fraction": DEFAULT_SCALE_OUT_FRACTION,
+        },
+        {
+            name: _INERT_REQUEST_POLICY_SOURCES[name]
+            for name in (
+                "min_rs_score",
+                "min_canslim_score",
+                "min_technical_score",
+                "position_size_pct",
+                "take_profit_pct",
+                "scale_out_fraction",
+            )
+        },
     )
 
+    pit_bundle: Optional[PITDataBundle] = None
     try:
+        if args.pit_bundle:
+            if not args.pit_bundle_sha256:
+                parser.error("--pit-bundle-sha256 is required with --pit-bundle")
+            pit_bundle = PITDataBundle(
+                args.pit_bundle, expected_sha256=args.pit_bundle_sha256
+            )
+            tickers = list(args.tickers or pit_bundle.symbols())
+        else:
+            tickers = _resolve_universe(args.universe, args.tickers)
+            extra = [s for s in settings.EXTRA_SYMBOLS if s not in tickers]
+            if extra:
+                tickers.extend(extra)
+
+        simulator = PortfolioSimulator(
+            initial_capital=args.capital,
+            max_positions=args.max_positions,
+            position_size_pct=args.position_size_pct,
+            position_risk_pct=args.position_risk_pct,
+            stop_loss_pct=args.stop,
+            signal_every_n_days=args.signal_days,
+            min_canslim_score=args.min_canslim,
+            min_rs_score=args.min_rs,
+            min_technical_score=args.min_technical_score,
+            require_bullish_market=(
+                args.require_bullish_market and not args.allow_non_bullish_entries
+            ),
+            use_stateful_regime_gate=args.stateful_regime_gate,
+            cash_deployment_threshold_pct=args.cash_deployment_threshold,
+            technical_only=args.technical_only,
+            take_profit_pct=args.take_profit,
+            scale_out_fraction=args.scale_out_fraction,
+            stagnation_days=args.stagnation_days,
+            stagnation_threshold_pct=args.stagnation_threshold,
+            breakeven_trigger_pct=args.breakeven_trigger,
+            benchmark_symbol=args.benchmark,
+            pit_bundle=pit_bundle,
+        )
+
         result = simulator.run(
             tickers=tickers,
             lookback_weeks=args.weeks,

@@ -36,7 +36,11 @@ def _replace_artifact_identity(
     artifacts[name] = _sha256(run_dir / name)
     manifest["artifacts"] = artifacts
     _write_json(manifest_path, manifest)
-    return replace(authority, artifact_sha256=artifacts)
+    return replace(
+        authority,
+        artifact_sha256=artifacts,
+        manifest_sha256=_sha256(manifest_path),
+    )
 
 
 @pytest.fixture
@@ -150,6 +154,7 @@ def mini_verified_run(tmp_path: Path) -> tuple[Path, BaselineAuthority]:
         source_commit=canonical_authority().source_commit,
         replay_git_head=canonical_authority().replay_git_head,
         bundle_sha256="a" * 64,
+        manifest_sha256=_sha256(run_dir / "run_manifest.json"),
         artifact_sha256=artifacts,
         entry_outcome_row_sha256=baseline_module._normalized_ordered_row_sha256(
             pd.read_csv(run_dir / "entry_attempt_outcomes.csv", keep_default_na=False)
@@ -196,7 +201,7 @@ def test_baseline_verifier_rejects_one_changed_transaction(
     frame = pd.read_csv(run_dir / "transactions.csv")
     frame.loc[0, "Price"] += 0.01
     frame.to_csv(run_dir / "transactions.csv", index=False)
-    with pytest.raises(ValueError, match="artifact hash"):
+    with pytest.raises(ValueError, match="SHA-256"):
         verify_baseline_run(run_dir, authority)
 
 
@@ -273,6 +278,9 @@ def test_baseline_verifier_rejects_nonfinite_summary_value(
     (run_dir / "summary.json").write_text(
         json.dumps(summary, sort_keys=True, allow_nan=True), encoding="utf-8"
     )
+    rehashed_authority = _replace_artifact_identity(
+        run_dir, authority, "summary.json"
+    )
 
-    with pytest.raises(ValueError, match="artifact hash|non-finite"):
-        verify_baseline_run(run_dir, authority)
+    with pytest.raises(ValueError, match="finite JSON"):
+        verify_baseline_run(run_dir, rehashed_authority)

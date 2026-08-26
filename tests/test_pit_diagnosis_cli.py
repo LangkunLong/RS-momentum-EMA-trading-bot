@@ -60,7 +60,7 @@ def mini_completed_context(tmp_path: Path) -> tuple[DiagnosisContext, tuple[obje
     catalog = load_experiment_catalog(Path("config/pit_diagnosis_experiments_v1.json"), rulebook)
     baseline_root = tmp_path / "baseline"
     baseline_root.mkdir()
-    snapshot = replace(_baseline_snapshot(baseline_root), bundle_sha256="a" * 64)
+    snapshot = _baseline_snapshot(baseline_root, bundle_sha256="a" * 64)
     context = DiagnosisContext(
         rulebook=rulebook, catalog=catalog, fact_cache=_Facts(facts_path),
         partitions=fixed_partitions(), diagnostic_leader_labels=("AAA",),

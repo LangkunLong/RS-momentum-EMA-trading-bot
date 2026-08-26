@@ -5,6 +5,7 @@ skipped by default. Run them explicitly with: pytest -m integration
 """
 
 import inspect
+import math
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,7 @@ import quality_stocks
 from core import momentum_analysis
 from core.canslim import a_annual_earnings, n_new_products
 from core.canslim.core import _approximate_buy_point
+from core.canslim.earnings_trace import PIT_PUBLIC_DATES_ATTR, TraceReason
 
 # ─── Index routing ───────────────────────────────────────────────────────────
 
@@ -83,6 +85,85 @@ def test_safe_growth_positive_control_annual() -> None:
     result = a_annual_earnings._safe_growth(1.25, 1.0)
     assert result is not None
     assert abs(result - 0.25) < 1e-9, f"Expected 0.25, got {result}"
+
+
+def test_annual_trace_normalizes_nonfinite_selected_value() -> None:
+    """A selected non-finite observation must not escape into diagnostic JSON."""
+    annual_income = pd.DataFrame(
+        {
+            pd.Timestamp("2023-12-31"): [1.0],
+            pd.Timestamp("2024-12-31"): [float("inf")],
+        },
+        index=["Diluted EPS"],
+    )
+    annual_income.attrs[PIT_PUBLIC_DATES_ATTR] = {
+        "2023-12-31": "2024-02-15",
+        "2024-12-31": "2025-02-15",
+    }
+
+    trace = a_annual_earnings.evaluate_a_with_trace(annual_income)
+
+    assert trace.terminal_reason is TraceReason.NONFINITE_CURRENT_VALUE
+    assert trace.current_value is None
+    assert trace.prior_value == 1.0
+
+
+def test_annual_trace_rejects_nonfinite_roe_without_score_credit() -> None:
+    """A non-finite ROE must be absent and must not inflate the A score."""
+    annual_income = pd.DataFrame(
+        {
+            pd.Timestamp("2023-12-31"): [1.0, 100.0],
+            pd.Timestamp("2024-12-31"): [1.3, float("inf")],
+        },
+        index=["Diluted EPS", "Net Income"],
+    )
+    balance_sheet = pd.DataFrame(
+        {
+            pd.Timestamp("2023-12-31"): [100.0],
+            pd.Timestamp("2024-12-31"): [100.0],
+        },
+        index=["Stockholders Equity"],
+    )
+
+    without_roe = a_annual_earnings.evaluate_a_with_trace(annual_income)
+    trace = a_annual_earnings.evaluate_a_with_trace(
+        annual_income, balance_sheet=balance_sheet
+    )
+    legacy_score, legacy_growth, legacy_roe = a_annual_earnings.evaluate_a(
+        annual_income, balance_sheet=balance_sheet
+    )
+
+    assert trace.roe is None
+    assert trace.score == without_roe.score
+    assert math.isfinite(trace.score)
+    assert legacy_score == pytest.approx(0.8)
+    assert legacy_growth == pytest.approx(0.3)
+    assert math.isinf(legacy_roe)
+
+
+def test_annual_trace_normalizes_score_while_legacy_keeps_raw_nan() -> None:
+    """Trace JSON stays finite without changing the base-compatible tuple API."""
+    annual_income = pd.DataFrame(
+        {
+            pd.Timestamp("2023-12-31"): [1.0],
+            pd.Timestamp("2024-12-31"): [1.3],
+        },
+        index=["Diluted EPS"],
+    )
+
+    trace = a_annual_earnings.evaluate_a_with_trace(
+        annual_income, a_growth_target=float("nan")
+    )
+    legacy_score, legacy_growth, legacy_roe = a_annual_earnings.evaluate_a(
+        annual_income, a_growth_target=float("nan")
+    )
+
+    assert trace.score == 0.0
+    assert trace.annual_growth == pytest.approx(0.3)
+    assert trace.roe is None
+    assert math.isnan(legacy_score)
+    assert legacy_growth == pytest.approx(0.3)
+    assert legacy_roe is None
 
 
 # ─── _safe_growth — n_new_products ───────────────────────────────────────────

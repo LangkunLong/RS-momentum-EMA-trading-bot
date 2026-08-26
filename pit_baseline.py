@@ -34,6 +34,7 @@ from core.canslim.entry_contract import (
     MIN_RS_SCORE,
     MIN_VOLUME_RATIO,
 )
+from core.engine_policy import effective_engine_policy_sha256
 from core.leader_basket import LeaderBasketConfig, LeaderBasketResult, LeaderBasketSimulator
 from core.leader_evaluation import (
     LeaderIdentityContract,
@@ -1470,7 +1471,22 @@ def run_baseline(
                     "rejection_counts": reconciliation["rejection_counts"],
                 },
             }
+            policy_verifier = getattr(portfolio, "_verify_effective_engine_policy", None)
+            if not callable(policy_verifier):
+                raise ValueError("portfolio lacks effective engine policy verification")
+            live_effective_policy_digest = policy_verifier()
             active_config = json.loads(json.dumps(result.config, allow_nan=False))
+            effective_policy = active_config.get("effective_engine_policy")
+            effective_policy_digest = active_config.get("effective_engine_policy_sha256")
+            if not isinstance(effective_policy, dict):
+                raise ValueError("active CANSLIM configuration lacks effective engine policy")
+            if not isinstance(effective_policy_digest, str) or (
+                effective_engine_policy_sha256(effective_policy) != effective_policy_digest
+                or live_effective_policy_digest != effective_policy_digest
+            ):
+                raise ValueError("effective engine policy digest mismatch before publication")
+            summary["effective_engine_policy"] = effective_policy
+            summary["effective_engine_policy_sha256"] = effective_policy_digest
             diagnostics = json.loads(json.dumps(result.execution_diagnostics, allow_nan=False))
             frames = {
                 "five_year_leaders.csv": five_year_leaders_frame(leaders),
@@ -1526,6 +1542,8 @@ def run_baseline(
                     for key, value in vars(args).items()
                 },
                 "canslim_config": active_config,
+                "effective_engine_policy": effective_policy,
+                "effective_engine_policy_sha256": effective_policy_digest,
                 "execution_diagnostics": diagnostics,
                 "entry_attempt_outcome_schema_version": (
                     ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION

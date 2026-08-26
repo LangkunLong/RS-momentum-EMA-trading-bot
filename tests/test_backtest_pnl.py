@@ -136,13 +136,10 @@ def _make_simulator(**kwargs) -> PortfolioSimulator:
     defaults = dict(
         initial_capital=100_000.0,
         max_positions=5,
-        position_size_pct=0.10,
         stop_loss_pct=0.07,
         ma_exit_period=21,
         ma_consecutive=2,
         signal_every_n_days=5,
-        min_canslim_score=40.0,
-        min_rs_score=70.0,
     )
     defaults.update(kwargs)
     return PortfolioSimulator(**defaults)
@@ -637,6 +634,10 @@ class TestPortfolioSimulatorRun:
         fetcher.fetch_price_data.return_value = prices
         fetcher.fetch_rs_universe_closes.return_value = all_closes
         strategy = MagicMock()
+        strategy.effective_policy_identity = {
+            "name": "technical-only-no-industry-test",
+            "version": 1,
+        }
         strategy.evaluate_market.return_value = {"market_is_bullish": False}
         sim = _make_simulator(
             technical_only=True,
@@ -659,7 +660,7 @@ class TestPortfolioSimulatorRun:
         mock_industry_map.assert_not_called()
 
     def test_run_enters_position_on_buy_signal(self) -> None:
-        sim = _make_simulator(min_canslim_score=40.0, min_rs_score=70.0, signal_every_n_days=1)
+        sim = _make_simulator(signal_every_n_days=1)
 
         # n=150 bars >> lookback_weeks=8 (40 business days)
         ticker_ohlcv = self._make_full_signal_ticker_ohlcv("NVDA", n=150)
@@ -733,8 +734,6 @@ class TestPortfolioSimulatorRun:
         sim = _make_simulator(
             stop_loss_pct=0.07,
             signal_every_n_days=1,
-            min_canslim_score=40.0,
-            min_rs_score=70.0,
             data_fetcher=mock_fetcher,
         )
 

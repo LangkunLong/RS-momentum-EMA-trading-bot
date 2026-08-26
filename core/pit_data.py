@@ -42,6 +42,7 @@ from typing import Any, Iterable, Mapping
 import pandas as pd
 
 from core.leader_evaluation import PointInTimeUniverse
+from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _REQUIRED_TABLES = {"dataset_metadata", "membership", "price", "fundamentals"}
@@ -225,6 +226,14 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validated_expected_sha256(expected_sha256: object) -> str:
+    """Return one closed lowercase SHA-256 identity or fail closed."""
+
+    if not isinstance(expected_sha256, str) or not _DIGEST_RE.fullmatch(expected_sha256):
+        raise ValueError("expected_sha256 must be lowercase hexadecimal SHA-256")
+    return expected_sha256
+
+
 def _regular_file(path: str | Path) -> Path:
     candidate = Path(path)
     if not candidate.is_file() or candidate.is_symlink():
@@ -264,17 +273,52 @@ class PITDataBundle:
     """Validated, read-only point-in-time price/fundamental data bundle."""
 
     def __init__(self, path: str | Path, *, expected_sha256: str) -> None:
-        self.path = _regular_file(path)
-        if not isinstance(expected_sha256, str) or not _DIGEST_RE.fullmatch(expected_sha256):
-            raise ValueError("expected_sha256 must be lowercase hexadecimal SHA-256")
-        actual = sha256_file(self.path)
-        if actual != expected_sha256:
+        resolved_path = _regular_file(path)
+        self.path: Path | None = resolved_path
+        expected = _validated_expected_sha256(expected_sha256)
+        actual = sha256_file(resolved_path)
+        if actual != expected:
             raise ValueError("point-in-time bundle SHA-256 does not match the expected digest")
         self.sha256 = actual
-        uri = f"{self.path.as_uri()}?mode=ro"
-        self._connection = sqlite3.connect(uri, uri=True)
-        self._connection.row_factory = sqlite3.Row
+        uri = f"{resolved_path.as_uri()}?mode=ro"
+        self._initialize_connection(sqlite3.connect(uri, uri=True))
+
+    @classmethod
+    def from_authenticated_bytes(
+        cls, data: bytes, *, expected_sha256: str
+    ) -> "PITDataBundle":
+        """Open immutable authenticated SQLite bytes as a query-only memory bundle.
+
+        ``data`` must be the exact immutable byte snapshot whose digest is supplied.
+        The returned bundle has the same validation/query behavior as a path-backed
+        bundle, while ``path`` is ``None`` because SQLite never opens an external file.
+        """
+
+        if type(data) is not bytes:
+            raise ValueError("authenticated point-in-time bundle data must be immutable bytes")
+        expected = _validated_expected_sha256(expected_sha256)
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != expected:
+            raise ValueError("point-in-time bundle SHA-256 does not match the expected digest")
+        connection = sqlite3.connect(":memory:")
         try:
+            connection.deserialize(data)
+        except Exception:
+            connection.close()
+            raise
+        bundle = cls.__new__(cls)
+        bundle.path = None
+        bundle.sha256 = actual
+        bundle._initialize_connection(connection)
+        return bundle
+
+    def _initialize_connection(self, connection: sqlite3.Connection) -> None:
+        """Apply one shared read-only validation initializer to an open connection."""
+
+        self._connection = connection
+        try:
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA query_only=ON")
             self._validate_schema()
             self.metadata = self._load_metadata()
             self.membership = self._load_membership()
@@ -666,7 +710,13 @@ class PITDataBundle:
             .sort_index(axis=1)
         )
 
-    def fundamentals_as_of(self, symbol: str, as_of_date: pd.Timestamp | datetime) -> dict[str, Any]:
+    def fundamentals_as_of(
+        self,
+        symbol: str,
+        as_of_date: pd.Timestamp | datetime,
+        *,
+        include_provenance: bool = False,
+    ) -> dict[str, Any]:
         """Return only fundamental records publicly available by *as_of_date*."""
 
         ticker = _canonical_ticker(symbol)
@@ -685,7 +735,7 @@ class PITDataBundle:
         for record in records:
             if record["statement_type"] not in _STATEMENT_TYPES:
                 raise ValueError("fundamentals statement_type is invalid")
-        return self._fundamental_snapshot(records)
+        return self._fundamental_snapshot(records, include_provenance=include_provenance)
 
     def iter_fundamental_state_boundaries(
         self,
@@ -696,6 +746,8 @@ class PITDataBundle:
                 pd.Timestamp | datetime | date,
             ],
         ],
+        *,
+        include_provenance: bool = False,
     ) -> Iterable[tuple[str, date, dict[str, Any]]]:
         """Yield exact as-of snapshots at each requested ticker's state boundaries.
 
@@ -754,7 +806,9 @@ class PITDataBundle:
                 if public_date > end:
                     break
                 if public_date > start and not baseline_emitted:
-                    yield ticker, start, self._fundamental_snapshot(history)
+                    yield ticker, start, self._fundamental_snapshot(
+                        history, include_provenance=include_provenance
+                    )
                     baseline_emitted = True
                 boundary_rows = [dict(row) for row in visible_rows]
                 for record in boundary_rows:
@@ -762,24 +816,44 @@ class PITDataBundle:
                         raise ValueError("fundamentals statement_type is invalid")
                 history.extend(boundary_rows)
                 if public_date > start:
-                    yield ticker, public_date, self._fundamental_snapshot(history)
+                    yield ticker, public_date, self._fundamental_snapshot(
+                        history, include_provenance=include_provenance
+                    )
             if not baseline_emitted:
-                yield ticker, start, self._fundamental_snapshot(history)
+                yield ticker, start, self._fundamental_snapshot(
+                    history, include_provenance=include_provenance
+                )
 
     @classmethod
-    def _fundamental_snapshot(cls, records: list[dict[str, Any]]) -> dict[str, Any]:
+    def _fundamental_snapshot(
+        cls, records: list[dict[str, Any]], *, include_provenance: bool = False
+    ) -> dict[str, Any]:
         return {
-            "quarterly_income": cls._statement_frame(records, "quarterly"),
-            "annual_income": cls._statement_frame(records, "annual"),
-            "balance_sheet": cls._statement_frame(records, "balance"),
+            "quarterly_income": cls._statement_frame(
+                records, "quarterly", include_provenance=include_provenance
+            ),
+            "annual_income": cls._statement_frame(
+                records, "annual", include_provenance=include_provenance
+            ),
+            "balance_sheet": cls._statement_frame(
+                records, "balance", include_provenance=include_provenance
+            ),
             "company_info": cls._company_info(records),
         }
 
     @staticmethod
-    def _statement_frame(records: list[dict[str, Any]], statement_type: str) -> pd.DataFrame:
+    def _statement_frame(
+        records: list[dict[str, Any]],
+        statement_type: str,
+        *,
+        include_provenance: bool = False,
+    ) -> pd.DataFrame:
         selected = [record for record in records if record["statement_type"] == statement_type]
         if not selected:
-            return pd.DataFrame()
+            frame = pd.DataFrame()
+            if include_provenance:
+                frame.attrs[PIT_PUBLIC_DATES_ATTR] = {}
+            return frame
         # ``DataFrame`` otherwise turns both a SQLite NULL and a supplied NaN
         # into NaN.  Preserve the former only: NULL means unavailable; a NaN
         # must reach the fact-cache numeric validator and fail closed.
@@ -799,6 +873,9 @@ class PITDataBundle:
         frame = frame.sort_values(["period_end", "public_date"], kind="stable").drop_duplicates(
             subset=["period_end"], keep="last"
         )
+        selected_period_public_dates = list(
+            zip(frame["period_end"], frame["public_date"], strict=True)
+        )
         frame = frame.set_index("period_end")[list(_FUNDAMENTAL_COLUMN_MAP)]
         frame = frame.rename(columns=_FUNDAMENTAL_COLUMN_MAP).transpose()
         frame = frame.astype(object)
@@ -810,6 +887,11 @@ class PITDataBundle:
         # SQLite NULLs, and must be rejected by downstream validation.
         frame = frame.loc[~frame.apply(lambda row: all(value is None for value in row), axis=1)]
         frame = frame.sort_index(axis="columns")
+        if include_provenance:
+            frame.attrs[PIT_PUBLIC_DATES_ATTR] = {
+                pd.Timestamp(period_end).date().isoformat(): pd.Timestamp(public_date).date().isoformat()
+                for period_end, public_date in selected_period_public_dates
+            }
         return frame
 
     @staticmethod
@@ -873,7 +955,7 @@ class PITDataBundle:
             boundaries=boundaries,
             next_boundary_index=0,
             visible_records=[],
-            snapshot=self._fundamental_snapshot([]),
+            snapshot=self._fundamental_snapshot([], include_provenance=False),
             latest_as_of=as_of,
         )
         cache[ticker] = state
@@ -911,7 +993,9 @@ class PITDataBundle:
             candidate_records.extend(boundary_rows)
             candidate_next_boundary_index += 1
         if candidate_next_boundary_index != state.next_boundary_index:
-            candidate_snapshot = self._fundamental_snapshot(candidate_records)
+            candidate_snapshot = self._fundamental_snapshot(
+                candidate_records, include_provenance=False
+            )
             state.visible_records = candidate_records
             state.next_boundary_index = candidate_next_boundary_index
             state.snapshot = candidate_snapshot

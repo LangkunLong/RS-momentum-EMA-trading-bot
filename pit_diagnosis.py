@@ -15,7 +15,16 @@ import sys
 from typing import Mapping, Sequence
 
 from core.pit_data import PITDataBundle, sha256_file
-from core.pit_diagnosis.baseline import canonical_authority, compare_reproduction, verify_baseline_run
+from core.pit_diagnosis.baseline import (
+    DEFAULT_BASELINE_PROFILE_ID,
+    STRICT_PROPER_BASE_TASK11_PROFILE_ID,
+    BaselineAuthorityProfile,
+    compare_reproduction,
+    resolve_baseline_authority_profile,
+    verify_baseline_run,
+)
+from core.pit_diagnosis.task11_artifact_diagnosis import diagnose_task11_artifacts
+from core.pit_diagnosis.task11_ca_provenance import diagnose_task11_ca_provenance
 from core.pit_diagnosis.catalog import fixed_partitions, load_experiment_catalog
 from core.pit_diagnosis.experiments import DiagnosisContext, run_catalog, run_experiment, run_locked_catalog
 from core.pit_diagnosis.fact_cache import build_fact_cache, open_fact_cache
@@ -49,6 +58,19 @@ _PIT_EVIDENCE_KEYS = frozenset(
         "fidelity_label",
         "promotion_eligible",
         "partition",
+    }
+)
+_BASELINE_VERIFICATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "profile_id",
+        "scope",
+        "fidelity_label",
+        "fidelity_reason",
+        "manifest_sha256",
+        "bundle_sha256",
+        "replay_git_head",
+        "date_contract",
     }
 )
 
@@ -278,7 +300,38 @@ def _source_fingerprint(root: Path | None = None) -> str:
     ).hexdigest()
 
 
+def _selected_baseline_profile(args: argparse.Namespace) -> BaselineAuthorityProfile:
+    profile = resolve_baseline_authority_profile(getattr(args, "baseline_profile", None))
+    if (
+        profile.profile_id == STRICT_PROPER_BASE_TASK11_PROFILE_ID
+        and bool(getattr(args, "strict_canslim", False))
+    ):
+        raise ValueError(
+            "--baseline-profile strict-proper-base-task11 cannot be combined with "
+            "--strict-canslim because Task 11 lacks required PIT I/L evidence"
+        )
+    return profile
+
+
+def _executable_baseline_profile(args: argparse.Namespace) -> BaselineAuthorityProfile:
+    profile = _selected_baseline_profile(args)
+    if profile.profile_id == STRICT_PROPER_BASE_TASK11_PROFILE_ID:
+        raise ValueError(
+            "--baseline-profile strict-proper-base-task11 is verification-only until "
+            "a production-contract Task 11 replay adapter exists"
+        )
+    return profile
+
+
+def _strategy_identity_for_profile(profile: BaselineAuthorityProfile) -> str:
+    identity = "cached-diagnosis-v2-fidelity-cash"
+    if profile.profile_id != DEFAULT_BASELINE_PROFILE_ID:
+        identity = f"{identity}:baseline-profile:{profile.profile_id}"
+    return identity
+
+
 def _context(args: argparse.Namespace) -> tuple[DiagnosisContext, PITDataBundle, object]:
+    selected_profile = _executable_baseline_profile(args)
     rulebook = load_rulebook(args.rulebook)
     catalog = load_experiment_catalog(args.experiment_catalog, rulebook)
     bundle = PITDataBundle(args.pit_bundle, expected_sha256=args.pit_bundle_sha256)
@@ -305,7 +358,7 @@ def _context(args: argparse.Namespace) -> tuple[DiagnosisContext, PITDataBundle,
     cache.content_sha256 = args.fact_cache_sha256
     cache.schema_sha256 = str(metadata["schema_sha256"])
     try:
-        snapshot = verify_baseline_run(args.baseline_run, canonical_authority())
+        snapshot = verify_baseline_run(args.baseline_run, selected_profile.authority)
     except Exception:
         cache.close()
         bundle.close()
@@ -329,7 +382,7 @@ def _context(args: argparse.Namespace) -> tuple[DiagnosisContext, PITDataBundle,
             if sealed_source_fingerprint is not None
             else _source_fingerprint()
         ),
-        strategy_identity="cached-diagnosis-v2-fidelity-cash",
+        strategy_identity=_strategy_identity_for_profile(selected_profile),
         bundle_sha256=args.pit_bundle_sha256,
         strict_canslim=bool(getattr(args, "strict_canslim", False)),
         baseline_snapshot=snapshot, reproduced_baseline=snapshot,
@@ -348,6 +401,14 @@ def _add_run_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pit-bundle", required=True, type=_absolute_path)
     parser.add_argument("--pit-bundle-sha256", required=True, type=_digest)
     parser.add_argument("--baseline-run", required=True, type=_absolute_path)
+    parser.add_argument(
+        "--baseline-profile",
+        default=DEFAULT_BASELINE_PROFILE_ID,
+        help=(
+            "closed immutable authority profile; defaults to corrected-task6; "
+            "use strict-proper-base-task11 only for the fidelity-incomplete Task 11 replay"
+        ),
+    )
     parser.add_argument("--rulebook", required=True, type=_absolute_path)
     parser.add_argument("--experiment-catalog", required=True, type=_absolute_path)
     parser.add_argument("--fact-cache", required=True, type=_absolute_path)
@@ -395,6 +456,52 @@ def build_parser() -> argparse.ArgumentParser:
     one.add_argument("--partition", required=True, choices=("discovery", "validation"))
     one.add_argument("--checkpoint-root", required=True, type=_absolute_path)
     one.add_argument("--resume", action="store_true")
+
+    verify_baseline = commands.add_parser(
+        "verify-baseline",
+        help="verify one immutable baseline authority publication without running diagnosis",
+    )
+    verify_baseline.add_argument("--baseline-run", required=True, type=_absolute_path)
+    verify_baseline.add_argument(
+        "--baseline-profile",
+        default=DEFAULT_BASELINE_PROFILE_ID,
+        help=(
+            "closed immutable authority profile; defaults to corrected-task6; "
+            "strict-proper-base-task11 is verification-only"
+        ),
+    )
+
+    task11_artifact_diagnosis = commands.add_parser(
+        "diagnose-task11-artifacts",
+        help=(
+            "read the sealed Task 11 engine ledgers after immutable verification; "
+            "does not run the cached diagnosis strategy"
+        ),
+    )
+    task11_artifact_diagnosis.add_argument(
+        "--baseline-run", required=True, type=Path
+    )
+    task11_artifact_diagnosis.add_argument(
+        "--baseline-profile",
+        required=True,
+        help="must be strict-proper-base-task11 for sealed artifact diagnosis",
+    )
+
+    task11_ca_provenance = commands.add_parser(
+        "diagnose-task11-ca-provenance",
+        help=(
+            "reconcile sealed Task 11 C/A scalars to local PIT provenance; "
+            "publishes aggregate counts only"
+        ),
+    )
+    task11_ca_provenance.add_argument(
+        "--baseline-run", required=True, type=Path
+    )
+    task11_ca_provenance.add_argument(
+        "--baseline-profile",
+        required=True,
+        help="must be strict-proper-base-task11 for sealed C/A provenance diagnosis",
+    )
 
     evidence = commands.add_parser("emit-evidence", help="emit one aggregate-only sealed evidence envelope")
     evidence.add_argument("--diagnosis-run", required=True, type=_absolute_path)
@@ -457,6 +564,7 @@ def _run(args: argparse.Namespace) -> int:
     bundle: PITDataBundle | None = None
     cache: object | None = None
     try:
+        profile = _executable_baseline_profile(args)
         context, bundle, cache = _context(args)
         input_identities = {
             "rulebook": sha256_file(args.rulebook), "catalog": sha256_file(args.experiment_catalog),
@@ -488,7 +596,7 @@ def _run(args: argparse.Namespace) -> int:
             or sha256_file(args.rulebook) != input_identities["rulebook"]
             or sha256_file(args.experiment_catalog) != input_identities["catalog"]
             or sha256_file(args.baseline_run / "run_manifest.json") != input_identities["baseline_manifest"]
-            or verify_baseline_run(args.baseline_run, canonical_authority()).manifest_sha256 != context.baseline_snapshot.manifest_sha256
+            or verify_baseline_run(args.baseline_run, profile.authority).manifest_sha256 != context.baseline_snapshot.manifest_sha256
         ):
             raise ValueError("source, bundle, rulebook, catalog, fact-cache, or baseline identity changed during diagnosis")
         run_dir = publish_diagnosis(context, results, output_root)
@@ -503,12 +611,18 @@ def _run_experiment(args: argparse.Namespace) -> int:
     bundle: PITDataBundle | None = None
     cache: object | None = None
     try:
+        profile = _executable_baseline_profile(args)
         context, bundle, cache = _context(args)
         if args.experiment_id not in context.catalog.experiments:
             raise ValueError("experiment ID is not present in the approved catalog")
         if args.experiment_id != "D0.BASELINE_REPRODUCTION":
             context = context.with_verified_baseline_reproduction(compare_reproduction(context.baseline_snapshot, context.reproduced_baseline))
         results = run_catalog(context, (args.experiment_id,), (PartitionName(args.partition),), args.checkpoint_root, resume=args.resume)
+        if (
+            verify_baseline_run(args.baseline_run, profile.authority).manifest_sha256
+            != context.baseline_snapshot.manifest_sha256
+        ):
+            raise ValueError("baseline identity changed during diagnosis experiment")
         payload = {
             "experiment_id": results[0].experiment_id,
             "partition": results[0].partition.value,
@@ -522,6 +636,51 @@ def _run_experiment(args: argparse.Namespace) -> int:
         return 0
     finally:
         _close(bundle, cache)
+
+
+def _verify_baseline(args: argparse.Namespace) -> int:
+    """Verify a selected immutable replay without entering the cached D0-D4 path."""
+
+    profile = _selected_baseline_profile(args)
+    snapshot = verify_baseline_run(args.baseline_run, profile.authority)
+    payload = {
+        "schema_version": 1,
+        "profile_id": profile.profile_id,
+        "scope": profile.scope,
+        "fidelity_label": profile.fidelity_label,
+        "fidelity_reason": profile.fidelity_reason,
+        "manifest_sha256": snapshot.manifest_sha256,
+        "bundle_sha256": snapshot.bundle_sha256,
+        "replay_git_head": snapshot.replay_git_head,
+        "date_contract": dict(profile.authority.date_contract),
+    }
+    if set(payload) != _BASELINE_VERIFICATION_KEYS:
+        raise AssertionError("baseline verification metadata schema changed")
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return 0
+
+
+def _diagnose_task11_artifacts(args: argparse.Namespace) -> int:
+    """Emit an aggregate-only diagnosis from the verified Task 11 replay ledgers."""
+
+    profile = _selected_baseline_profile(args)
+    payload = diagnose_task11_artifacts(args.baseline_run, profile)
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return 0
+
+
+def _diagnose_task11_ca_provenance(args: argparse.Namespace) -> int:
+    """Emit aggregate-only C/A provenance evidence from the sealed Task 11 replay."""
+
+    if args.baseline_profile != STRICT_PROPER_BASE_TASK11_PROFILE_ID:
+        raise ValueError(
+            "diagnose-task11-ca-provenance requires "
+            "--baseline-profile strict-proper-base-task11"
+        )
+    profile = _selected_baseline_profile(args)
+    payload = diagnose_task11_ca_provenance(args.baseline_run, profile)
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return 0
 
 
 def _emit_evidence(args: argparse.Namespace) -> int:
@@ -611,6 +770,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run(args)
         if args.command == "run-experiment":
             return _run_experiment(args)
+        if args.command == "verify-baseline":
+            return _verify_baseline(args)
+        if args.command == "diagnose-task11-artifacts":
+            return _diagnose_task11_artifacts(args)
+        if args.command == "diagnose-task11-ca-provenance":
+            return _diagnose_task11_ca_provenance(args)
         if args.command == "emit-evidence":
             return _emit_evidence(args)
         if args.command == "verify-result":
