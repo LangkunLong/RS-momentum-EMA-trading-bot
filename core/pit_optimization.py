@@ -1153,10 +1153,13 @@ def _validate_route_citations(
     if route.action == "abort":
         return
     supplied = _closed_readiness_ids(readiness, "evidence_ids")
-    domain = _DOMAIN_EVIDENCE_IDS.get(route.domain)
-    if domain is None or not set(route.evidence_ids).issubset(domain):
+    required_domain_evidence = _DOMAIN_EVIDENCE_IDS.get(route.domain)
+    cited_evidence = set(route.evidence_ids)
+    if required_domain_evidence is None or not required_domain_evidence.issubset(
+        cited_evidence
+    ):
         raise ValueError("orchestrator domain evidence citations are invalid")
-    if not set(route.evidence_ids).issubset(supplied):
+    if not cited_evidence.issubset(supplied):
         raise ValueError("orchestrator evidence citation is outside readiness")
 
 
