@@ -12007,6 +12007,8 @@ def _pit_call_gateway_accounted(
         after = ledger_snapshot()
         reservation_tokens = usage.total_tokens - (after[7] - ledger_before[7])
         reservation_usd = usage.cost_usd - (after[6] - ledger_before[6])
+        if math.isclose(reservation_usd, 0.0, rel_tol=0.0, abs_tol=1e-15):
+            reservation_usd = 0.0
         if (
             after[0] != ledger_before[0] + 1
             or after[1] - ledger_before[1] != usage.prompt_tokens
