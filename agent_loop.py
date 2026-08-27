@@ -56,6 +56,7 @@ _PIT_OPTIMIZATION_OFFLINE_PRICING = MappingProxyType(
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
 DEFAULT_MAX_TOKENS = 131_072
+MAX_CHILD_TIMEOUT_SECONDS = 7_200
 MAX_PROPOSAL_SAMPLES = 50
 MAX_BATCH_CALLS = 150
 MAX_BATCH_TOKENS = 2_000_000
@@ -6756,7 +6757,9 @@ class LoopLimits:
             raise ConfigurationError("max_tokens is outside the hard controller limit")
         _finite_positive(self.max_usd, "max_usd")
         _finite_positive(self.api_timeout_seconds, "API timeout")
-        _finite_positive(self.child_timeout_seconds, "child timeout")
+        child_timeout = _finite_positive(self.child_timeout_seconds, "child timeout")
+        if child_timeout > MAX_CHILD_TIMEOUT_SECONDS:
+            raise ConfigurationError("child timeout exceeds the hard controller limit")
         _finite_positive(self.wall_timeout_seconds, "wall timeout")
         if (
             type(self.output_limit_bytes) is not int
@@ -13288,7 +13291,7 @@ def run_hidden_sandbox_watchdog(
         raise SandboxError("sandbox watchdog is not running in the controller-owned environment")
     if _watchdog_requires_pid_one() and os.getpid() != 1:
         raise SandboxError("sandbox watchdog must be the trusted container PID 1")
-    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 3600:
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= MAX_CHILD_TIMEOUT_SECONDS:
         raise SandboxError("sandbox watchdog timeout is invalid")
     if not isinstance(source_root, Path) or not source_root.is_absolute():
         raise SandboxError("sandbox watchdog source root is invalid")
@@ -13359,7 +13362,7 @@ def _dispatch_hidden_watchdog(argv: Sequence[str]) -> int:
     ):
         parser.error("hidden watchdog arguments violate the exact grammar")
     timeout_seconds = int(argv[2])
-    if timeout_seconds > 3600:
+    if timeout_seconds > MAX_CHILD_TIMEOUT_SECONDS:
         parser.error("hidden watchdog timeout exceeds the hard limit")
     python_args = tuple(argv[4:])
     try:
