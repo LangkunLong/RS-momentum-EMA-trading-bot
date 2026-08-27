@@ -348,7 +348,7 @@ def _reconcile_boundaries(
             raise ValueError("fundamental state stream omits the inclusive start boundary")
         if any(
             left >= right
-            for left, right in zip(state_dates, state_dates[1:], strict=True)
+            for left, right in zip(state_dates, state_dates[1:], strict=False)
         ):
             raise ValueError("fundamental state boundaries are not strictly ordered")
         for row in rows:

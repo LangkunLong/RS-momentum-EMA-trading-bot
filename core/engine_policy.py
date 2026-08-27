@@ -169,6 +169,8 @@ def _owned_builtin_provider_mode(simulator: _SimulatorPolicy) -> str:
     strategy = simulator._owned_builtin_strategy
     if strategy is None:
         return "not_owned_builtin"
+    if simulator.technical_only:
+        return "not_used_in_technical_only_mode"
     provider = getattr(strategy, "fundamental_provider", _MISSING_CUSTOM_IDENTITY)
     if simulator.pit_bundle is None:
         return (
