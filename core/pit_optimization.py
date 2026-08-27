@@ -2077,9 +2077,18 @@ def run_pit_optimization_canary(
         provider = _json_primitive(readiness.provider_payload)
         if not isinstance(provider, dict):
             raise ValueError("readiness provider payload is malformed")
+        route_input: dict[str, object] = {
+            "role": "orchestrator",
+            "observation": provider,
+        }
+        if verification_only:
+            route_input["verification_directive"] = {
+                "performance_acceptance_eligible": False,
+                "route_required": True,
+            }
         route = call(
             "orchestrator",
-            {"role": "orchestrator", "observation": provider},
+            route_input,
             PitOptimizationRoute.from_json,
             PitOptimizationRoute,
         )
@@ -2178,7 +2187,7 @@ def run_pit_optimization_canary(
     return PitOptimizationLoopResult(
         phase="canary",
         status=status,
-        exit_code=0,
+        exit_code=1 if status == "aborted" else 0,
         run_id=run_id,
         readiness_sha256=readiness.readiness_sha256,
         effective_policy_sha256=readiness.effective_policy_sha256,

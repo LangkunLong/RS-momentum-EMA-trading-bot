@@ -37,6 +37,10 @@ PIT_OPTIMIZATION_SYSTEM_PROMPTS = MappingProxyType(
             "object with exactly action, domain, and evidence_ids. action is continue or abort. "
             "For continue, choose one supplied domain and cite sorted unique supplied evidence "
             "IDs for that domain. For abort, domain is empty and evidence_ids is empty. Do not "
+            "abort when verification_directive.route_required is true and the supplied "
+            "observation contains candidate IDs and evidence IDs; verification_only "
+            "removes performance acceptance authority but still requires routing all three roles. "
+            "In that case action must be continue. Do not "
             "select or name a candidate, parameter, value, file, edit, command, external fact, "
             "or reasoning. Return JSON only."
         ),
