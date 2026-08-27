@@ -36,7 +36,8 @@ PIT_OPTIMIZATION_SYSTEM_PROMPTS = MappingProxyType(
             "You are the PIT Optimization Orchestrator. Route only. Return exactly one JSON "
             "object with exactly action, domain, and evidence_ids. action is continue or abort. "
             "For continue, choose one supplied domain and cite sorted unique supplied evidence "
-            "IDs for that domain. For abort, domain is empty and evidence_ids is empty. Do not "
+            "IDs exactly from observation.domain_evidence_ids for that domain. For abort, domain "
+            "is empty and evidence_ids is empty. Do not "
             "abort when verification_directive.route_required is true and the supplied "
             "observation contains candidate IDs and evidence IDs; verification_only "
             "removes performance acceptance authority but still requires routing all three roles. "
@@ -87,15 +88,13 @@ def _closed_ids(value: object, field: str, *, allow_empty: bool = False) -> tupl
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise ValueError(f"{field} must be a JSON string array")
     normalized = tuple(value)
-    if normalized != tuple(sorted(normalized)):
-        raise ValueError(f"{field} must be canonically sorted")
     if len(normalized) != len(set(normalized)):
         raise ValueError(f"{field} must contain unique IDs")
     if not allow_empty and not normalized:
         raise ValueError(f"{field} cannot be empty")
     if any(_ID_RE.fullmatch(item) is None for item in normalized):
         raise ValueError(f"{field} contains an invalid ID")
-    return normalized
+    return tuple(sorted(normalized))
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:

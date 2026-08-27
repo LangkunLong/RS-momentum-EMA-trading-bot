@@ -2224,6 +2224,10 @@ def _provider_payload(primitive: Mapping[str, object]) -> dict[str, object]:
             "leader_basket": baseline["leader_basket"],
         },
         "candidate_ids": list(candidate_catalog()),
+        "domain_evidence_ids": {
+            domain: sorted(evidence_ids)
+            for domain, evidence_ids in sorted(_DOMAIN_EVIDENCE_IDS.items())
+        },
         "evidence_ids": list(_EVIDENCE_IDS),
         "invariant_ids": list(_INVARIANT_IDS),
         "editable_path": ENTRY_CONTRACT_PATH,
