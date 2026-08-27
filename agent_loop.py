@@ -41,6 +41,18 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
 REASONER_MODEL = "deepseek/deepseek-r1"
 CODER_MODEL = "qwen/qwen3-coder-next"
+
+# Controller-owned conservative reservation rates for the three-call PIT gate.
+# Provider-returned inline cost remains the authoritative charge; these sealed
+# per-million ceilings prevent a pre-call /models lookup from becoming a fourth
+# provider request.
+_PIT_OPTIMIZATION_OFFLINE_PRICING = MappingProxyType(
+    {
+        ORCHESTRATOR_MODEL: MappingProxyType({"prompt": 5.0, "completion": 5.0}),
+        REASONER_MODEL: MappingProxyType({"prompt": 5.0, "completion": 5.0}),
+        CODER_MODEL: MappingProxyType({"prompt": 5.0, "completion": 5.0}),
+    }
+)
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
 DEFAULT_MAX_TOKENS = 131_072
@@ -157,6 +169,9 @@ _CONTROLLER_INITIALIZATION_STAGES = frozenset(
         "gateway_init",
         "data_bundle",
         "audit_init",
+        "pit_optimization_prepare",
+        "pit_optimization_readiness",
+        "pit_optimization_canary",
         "controller_run",
         "cleanup",
     }
@@ -2220,6 +2235,54 @@ class OpenRouterGateway:
         except Exception as exc:
             raise GatewayError("OpenRouter request failed", status_code=_status_code(exc)) from exc
 
+    def request_pit_optimization_once(
+        self,
+        role: str,
+        dynamic_input: str,
+        parser: Callable[[str], PayloadT],
+        *,
+        budget_window: BudgetWindow | None = None,
+        wall_deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> AgentCompletion[PayloadT]:
+        """Make one accounted request through the isolated PIT optimizer prompts."""
+        if role not in self._MODELS:
+            raise ConfigurationError(f"unknown gateway role: {role}")
+        if not isinstance(dynamic_input, str):
+            raise ConfigurationError("dynamic input must be a string")
+        if wall_deadline is not None:
+            if (
+                type(wall_deadline) not in {int, float}
+                or not math.isfinite(wall_deadline)
+                or not callable(monotonic)
+            ):
+                raise ConfigurationError("gateway wall deadline is invalid")
+            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+                raise BudgetExceededError("PIT optimization wall deadline reached")
+        from core.pit_optimization_contract import (
+            PIT_OPTIMIZATION_SYSTEM_PROMPTS,
+            pit_optimization_response_format,
+        )
+
+        dynamic = f"<dynamic-input>\n{dynamic_input}\n</dynamic-input>"
+        try:
+            return self._request_attempt(
+                role,
+                dynamic,
+                parser,
+                require_complete_accounting=True,
+                allow_generation_recovery=False,
+                budget_window=budget_window,
+                wall_deadline=None if wall_deadline is None else float(wall_deadline),
+                monotonic=monotonic,
+                system_prompts=PIT_OPTIMIZATION_SYSTEM_PROMPTS,
+                response_format=pit_optimization_response_format(role),
+            )
+        except (ResponseValidationError, BudgetExceededError, GatewayError):
+            raise
+        except Exception as exc:
+            raise GatewayError("OpenRouter request failed", status_code=_status_code(exc)) from exc
+
     def preload_pricing(
         self,
         roles: Sequence[str] = ("orchestrator", "reasoner", "coder"),
@@ -2483,6 +2546,7 @@ class OpenRouterGateway:
         budget_window: BudgetWindow | None,
         wall_deadline: float | None,
         monotonic: Callable[[], float],
+        allow_generation_recovery: bool = True,
         system_prompts: Mapping[str, str] | None = None,
         response_format: Mapping[str, object] | None = None,
     ) -> AgentCompletion[PayloadT]:
@@ -2578,6 +2642,9 @@ class OpenRouterGateway:
             if not require_complete_accounting:
                 self.ledger.reconcile(reservation, Usage(), window=budget_window)
                 raise
+            if not allow_generation_recovery:
+                self.ledger.reconcile(reservation, Usage(), window=budget_window)
+                raise inline_exc
             try:
                 usage, recovered_semantics_valid = self._recover_generation_usage(
                     response,
@@ -4618,6 +4685,29 @@ class SandboxRunner:
             ("-m", "compileall", "-q", "."),
             ("-m", "ruff", "check", "--no-cache", "."),
         }:
+            return
+        if len(args) == 9 and args[:3] == (
+            "-m",
+            "core.pit_optimization",
+            "--worker-evaluate",
+        ):
+            if (
+                args[3:5] != (
+                    "--pit-bundle",
+                    "/workspace/data/pit-bundle.sqlite3",
+                )
+                or args[5] != "--pit-bundle-sha256"
+                or _SHA256_RE.fullmatch(args[6]) is None
+                or args[7:9]
+                != (
+                    "--output",
+                    "/workspace/output/pit-optimization-result.json",
+                )
+                or not (source / "core" / "pit_optimization.py").is_file()
+            ):
+                raise SandboxError(
+                    "PIT optimization worker argv violates the exact grammar"
+                )
             return
         if len(args) == 26 and args[:2] == ("pit_diagnosis.py", "run-experiment"):
             # This is the only deterministic PIT execution grammar admitted to the
@@ -7771,7 +7861,22 @@ class LoopConfig:
             pit_gate_type: tuple[type[object], ...] = (PitDiagnosisGateConfig,)
         except ImportError:
             pit_gate_type = ()
-        if not isinstance(self.gate, (TestGateConfig, BacktestGateConfig, *pit_gate_type)):
+        try:
+            from core.pit_optimization import PitOptimizationGateConfig
+            optimization_gate_type: tuple[type[object], ...] = (
+                PitOptimizationGateConfig,
+            )
+        except ImportError:
+            optimization_gate_type = ()
+        if not isinstance(
+            self.gate,
+            (
+                TestGateConfig,
+                BacktestGateConfig,
+                *pit_gate_type,
+                *optimization_gate_type,
+            ),
+        ):
             raise ConfigurationError("gate must be a validated gate config")
         if pit_gate_type and isinstance(self.gate, pit_gate_type):
             for name in (
@@ -7786,6 +7891,24 @@ class LoopConfig:
                     continue
                 if _configuration_paths_overlap(getattr(self.gate, name), runtime):
                     raise ConfigurationError("PIT diagnosis input must not overlap the permanent runtime")
+        if optimization_gate_type and isinstance(self.gate, optimization_gate_type):
+            protected = (
+                source,
+                controller,
+                runtime,
+                self.gate.baseline_run,
+                self.gate.pit_bundle,
+            )
+            if any(_configuration_paths_overlap(artifacts, path) for path in protected):
+                raise ConfigurationError(
+                    "artifact_root must not overlap source, controller runtime, "
+                    "permanent runtime, or sealed PIT optimization inputs"
+                )
+            for name in ("baseline_run", "pit_bundle"):
+                if _configuration_paths_overlap(getattr(self.gate, name), runtime):
+                    raise ConfigurationError(
+                        "PIT optimization input must not overlap the permanent runtime"
+                    )
         if not isinstance(self.models, ModelConfig) or not isinstance(self.limits, LoopLimits):
             raise ConfigurationError("models and limits must be validated configs")
         object.__setattr__(self, "source_root", source)
@@ -8480,6 +8603,8 @@ class AuditTrail:
             raise AuditError("audit manifest source head is invalid")
         if _SHA256_RE.fullmatch(source_fingerprint_sha256) is None:
             raise AuditError("audit manifest source fingerprint is invalid")
+        from core.pit_optimization import PitOptimizationGateConfig
+
         if isinstance(config.gate, TestGateConfig):
             gate: dict[str, object] = {
                 "kind": "test",
@@ -8495,6 +8620,21 @@ class AuditTrail:
                 "historical_data_bundle": config.gate.historical_data_bundle,
                 "historical_data_sha256": config.gate.historical_data_sha256,
                 "thresholds": asdict(config.gate.thresholds),
+            }
+        elif isinstance(config.gate, PitOptimizationGateConfig):
+            gate = {
+                "kind": "pit_optimization",
+                "phase": config.gate.phase,
+                "baseline_run": config.gate.baseline_run,
+                "baseline_manifest_sha256": config.gate.baseline_manifest_sha256,
+                "pit_bundle": config.gate.pit_bundle,
+                "pit_bundle_sha256": config.gate.pit_bundle_sha256,
+                "effective_policy_sha256": config.gate.effective_policy_sha256,
+                "readiness_sha256": config.gate.readiness_sha256,
+                "max_usd": config.gate.max_usd,
+                "max_api_calls": config.gate.max_api_calls,
+                "max_iterations": config.gate.max_iterations,
+                "apply": config.gate.apply,
             }
         else:
             gate = {
@@ -11309,6 +11449,8 @@ def _pit_call_gateway(
     *,
     deadline: float,
     monotonic: Callable[[], float],
+    request_method: str = "request_pit_diagnosis_once",
+    payload_types: tuple[type[object], ...] | None = None,
 ) -> tuple[object, str]:
     """Issue one closed request and return its validated payload plus an audit hash."""
     from pit_diagnosis_agent import PitReasoningPlan, PitRoute
@@ -11316,7 +11458,7 @@ def _pit_call_gateway(
     if monotonic() >= deadline:
         raise BudgetExceededError("PIT diagnosis wall deadline reached")
     gateway = services.gateway
-    method = getattr(gateway, "request_pit_diagnosis_once", None)
+    method = getattr(gateway, request_method, None)
     if not callable(method):
         raise ConfigurationError("PIT gateway has no isolated request method")
     ledger = getattr(gateway, "ledger", None)
@@ -11571,7 +11713,12 @@ def _pit_call_gateway(
     if not isinstance(completion, AgentCompletion):
         raise ResponseValidationError("PIT gateway did not return accounted completion facts")
     value = completion.payload
-    if not isinstance(value, (PitRoute, PitReasoningPlan, TypedCodingProposal)):
+    closed_types = (
+        (PitRoute, PitReasoningPlan, TypedCodingProposal)
+        if payload_types is None
+        else payload_types
+    )
+    if not closed_types or not isinstance(value, closed_types):
         raise ResponseValidationError("PIT gateway returned an invalid closed role payload")
     usage = completion.usage
     if any(
@@ -11931,6 +12078,97 @@ def _pit_sandbox_evidence_runner(sandbox: SandboxRunner, config: Any, candidate:
         "worker_confined": True,
     }
     return build_evidence
+
+
+def _pit_optimization_sandbox_evaluator(
+    sandbox: SandboxRunner,
+    config: Any,
+    candidate: Candidate,
+) -> Callable[[Path], Mapping[str, object]]:
+    """Evaluate one candidate through the existing attested network-none worker."""
+
+    def evaluate(candidate_root: Path) -> Mapping[str, object]:
+        if isinstance(candidate, Candidate) and candidate_root.resolve() != _require_candidate(
+            candidate
+        ):
+            raise ConfigurationError(
+                "PIT optimization evaluator received the wrong disposable candidate"
+            )
+
+        def setup(layout: WorkerLayout) -> None:
+            _pit_stage_file(
+                config.pit_bundle,
+                layout.data / "pit-bundle.sqlite3",
+                config.pit_bundle_sha256,
+            )
+
+        def execute(layout: WorkerLayout) -> Mapping[str, object]:
+            environment = build_child_environment(os.environ, layout.home)
+            argv = (
+                "-m",
+                "core.pit_optimization",
+                "--worker-evaluate",
+                "--pit-bundle",
+                "/workspace/data/pit-bundle.sqlite3",
+                "--pit-bundle-sha256",
+                config.pit_bundle_sha256,
+                "--output",
+                "/workspace/output/pit-optimization-result.json",
+            )
+            observation = sandbox.run_worker(layout, argv, environment)
+            observed = _pit_observation_payload(sandbox, observation)
+            if (
+                observation.returncode != 0
+                or observation.timed_out
+                or observation.stdout
+                or observation.stderr
+                or observed.get("gate_observation") is not True
+                or observed.get("network_disabled") is not True
+                or observed.get("read_only") is not True
+                or observed.get("worker_confined") is not True
+            ):
+                raise QuarantineError(
+                    "PIT optimization worker did not complete inside the closed sandbox"
+                )
+            output = layout.output / "pit-optimization-result.json"
+            try:
+                info = output.lstat()
+                raw = output.read_bytes()
+            except OSError as exc:
+                raise QuarantineError(
+                    "PIT optimization worker aggregate is unavailable"
+                ) from exc
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or output.is_symlink()
+                or _has_reparse_point(output)
+                or info.st_nlink != 1
+                or not raw
+                or len(raw) > 4 * 1024 * 1024
+            ):
+                raise QuarantineError(
+                    "PIT optimization worker aggregate boundary is unsafe"
+                )
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise QuarantineError(
+                    "PIT optimization worker aggregate is invalid JSON"
+                ) from exc
+            if not isinstance(value, dict):
+                raise QuarantineError(
+                    "PIT optimization worker aggregate must be an object"
+                )
+            return MappingProxyType(value)
+
+        return _run_pit_worker_with_setup(candidate, setup, execute)
+
+    evaluate.__pit_worker_attestation__ = {
+        "network_disabled": True,
+        "read_only": True,
+        "worker_confined": True,
+    }
+    return evaluate
 
 
 def _pit_sandbox_experiment_runner(sandbox: SandboxRunner, config: Any, candidate: Candidate) -> Callable[..., object]:
@@ -12722,7 +12960,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--docker-executable", type=Path, required=True)
     parser.add_argument("--sandbox-image", required=True)
-    parser.add_argument("--gate", choices=("test", "backtest", "pit_diagnosis"), required=True)
+    parser.add_argument(
+        "--gate",
+        choices=("test", "backtest", "pit_diagnosis", "pit_optimization"),
+        required=True,
+    )
     parser.add_argument(
         "--test-path",
         action="append",
@@ -12749,6 +12991,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment-catalog", type=Path)
     parser.add_argument("--experiment-catalog-sha256")
     parser.add_argument("--pit-partition", choices=("discovery", "validation"), default="discovery")
+    parser.add_argument("--optimization-phase", choices=("prepare", "canary"))
+    parser.add_argument("--baseline-manifest-sha256")
+    parser.add_argument("--effective-policy-sha256")
+    parser.add_argument("--readiness-sha256")
     parser.add_argument("--minimum-total-return", type=float)
     parser.add_argument("--minimum-annualized-return", type=float)
     parser.add_argument("--minimum-sharpe-ratio", type=float)
@@ -12760,7 +13006,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-api-calls",
         type=int,
         default=None,
-        help="maximum paid calls (defaults to 3 for PIT diagnosis, otherwise the general limit)",
+        help=(
+            "maximum paid calls (defaults to 3 for PIT diagnosis/optimization, "
+            "otherwise the general limit)"
+        ),
     )
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument(
@@ -12794,7 +13043,11 @@ def _build_cli_config(
 ) -> tuple[LoopConfig, Path, str]:
     max_api_calls = namespace.max_api_calls
     if max_api_calls is None:
-        max_api_calls = 3 if namespace.gate == "pit_diagnosis" else DEFAULT_MAX_CALLS
+        max_api_calls = (
+            3
+            if namespace.gate in {"pit_diagnosis", "pit_optimization"}
+            else DEFAULT_MAX_CALLS
+        )
     docker_executable = _absolute_cli_path(
         namespace.docker_executable, "docker executable"
     )
@@ -12806,6 +13059,7 @@ def _build_cli_config(
         raise ConfigurationError(
             "sandbox image must be an exact repository@sha256 digest"
         )
+    from core.pit_optimization import PitOptimizationGateConfig
     from pit_diagnosis_agent import PitDiagnosisGateConfig
 
     backtest_fields = (
@@ -12823,12 +13077,14 @@ def _build_cli_config(
         namespace.maximum_drawdown_magnitude,
         namespace.minimum_closed_trades,
     )
-    pit_fields = (
-        namespace.diagnosis_run,
-        namespace.diagnosis_manifest_sha256,
+    pit_shared_fields = (
         namespace.baseline_run,
         namespace.pit_bundle,
         namespace.pit_bundle_sha256,
+    )
+    diagnosis_fields = (
+        namespace.diagnosis_run,
+        namespace.diagnosis_manifest_sha256,
         namespace.fact_cache,
         namespace.fact_cache_sha256,
         namespace.rulebook,
@@ -12836,13 +13092,20 @@ def _build_cli_config(
         namespace.experiment_catalog,
         namespace.experiment_catalog_sha256,
     )
+    optimization_fields = (
+        namespace.optimization_phase,
+        namespace.baseline_manifest_sha256,
+        namespace.effective_policy_sha256,
+        namespace.readiness_sha256,
+    )
+    all_pit_fields = (*pit_shared_fields, *diagnosis_fields, *optimization_fields)
     if namespace.gate == "test":
         if any(value is not None for value in backtest_fields):
             raise ConfigurationError(
                 "backtest-only options cannot be supplied to the test gate"
             )
-        if any(value is not None for value in pit_fields):
-            raise ConfigurationError("PIT diagnosis options cannot be supplied to the test gate")
+        if any(value is not None for value in all_pit_fields):
+            raise ConfigurationError("PIT options cannot be supplied to the test gate")
         gate: Any = TestGateConfig(
             tuple(namespace.test_path)
         )
@@ -12876,14 +13139,16 @@ def _build_cli_config(
             holdout_start_date=namespace.holdout_start_date,
             holdout_end_date=namespace.holdout_end_date,
         )
-        if any(value is not None for value in pit_fields):
-            raise ConfigurationError("PIT diagnosis options cannot be supplied to the backtest gate")
-    else:
+        if any(value is not None for value in all_pit_fields):
+            raise ConfigurationError("PIT options cannot be supplied to the backtest gate")
+    elif namespace.gate == "pit_diagnosis":
         if namespace.test_path or any(value is not None for value in backtest_fields):
             raise ConfigurationError("test/backtest options cannot be supplied to the PIT diagnosis gate")
         if namespace.proposal_samples is not None or namespace.canary_max_usd is not None:
             raise ConfigurationError("proposal samples are not supported by the PIT diagnosis gate")
-        if any(value is None for value in pit_fields):
+        if any(value is not None for value in optimization_fields):
+            raise ConfigurationError("PIT optimization options cannot be supplied to the diagnosis gate")
+        if any(value is None for value in (*pit_shared_fields, *diagnosis_fields)):
             raise ConfigurationError("the PIT diagnosis gate requires all sealed input identities")
         assert namespace.diagnosis_run is not None
         assert namespace.baseline_run is not None
@@ -12916,6 +13181,47 @@ def _build_cli_config(
             output_limit_bytes=namespace.output_limit_bytes,
             apply=namespace.apply,
         )
+    else:
+        if namespace.test_path or any(value is not None for value in backtest_fields):
+            raise ConfigurationError(
+                "test/backtest options cannot be supplied to the PIT optimization gate"
+            )
+        if any(value is not None for value in diagnosis_fields):
+            raise ConfigurationError(
+                "PIT diagnosis options cannot be supplied to the optimization gate"
+            )
+        if namespace.proposal_samples is not None or namespace.canary_max_usd is not None:
+            raise ConfigurationError(
+                "proposal samples are not supported by the PIT optimization gate"
+            )
+        required_optimization = (
+            *pit_shared_fields,
+            namespace.optimization_phase,
+            namespace.baseline_manifest_sha256,
+            namespace.effective_policy_sha256,
+        )
+        if any(value is None for value in required_optimization):
+            raise ConfigurationError(
+                "the PIT optimization gate requires all sealed input identities"
+            )
+        assert namespace.baseline_run is not None
+        assert namespace.pit_bundle is not None
+        try:
+            gate = PitOptimizationGateConfig(
+                phase=namespace.optimization_phase,
+                baseline_run=_absolute_cli_path(namespace.baseline_run, "baseline run"),
+                baseline_manifest_sha256=namespace.baseline_manifest_sha256,
+                pit_bundle=_absolute_cli_path(namespace.pit_bundle, "PIT bundle"),
+                pit_bundle_sha256=namespace.pit_bundle_sha256,
+                effective_policy_sha256=namespace.effective_policy_sha256,
+                max_usd=namespace.max_usd,
+                max_api_calls=max_api_calls,
+                max_iterations=namespace.max_iterations,
+                apply=namespace.apply,
+                readiness_sha256=namespace.readiness_sha256,
+            )
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
     config = LoopConfig(
         source_root=_absolute_cli_path(namespace.repo_root, "repository root"),
         permanent_runtime_root=_absolute_cli_path(
@@ -13172,7 +13478,7 @@ def _execute_cli_run(
     sandbox_image: str,
     run_id: str,
     batch_limits: ProposalBatchLimits | None = None,
-) -> LoopResult | ProposalBatchResult:
+) -> LoopResult | ProposalBatchResult | Any:
     """Assemble production-only capabilities and execute one initialized controller run."""
     if not isinstance(config, LoopConfig):
         raise ConfigurationError("CLI execution requires a validated LoopConfig")
@@ -13197,6 +13503,307 @@ def _execute_cli_run(
             raise ControllerInitializationError(
                 _closed_source_preflight_stage(exc)
             ) from exc
+        from core.pit_optimization import (
+            PitOptimizationCanaryServices,
+            PitOptimizationCleanup,
+            PitOptimizationGateConfig,
+            PitOptimizationLoopResult,
+            PitOptimizationRoleCall,
+            prepare_pit_optimization,
+            run_pit_optimization_canary,
+            verify_sealed_baseline_artifacts,
+        )
+
+        if (
+            isinstance(config.gate, PitOptimizationGateConfig)
+            and config.gate.phase == "prepare"
+        ):
+            if state.fingerprint is None:
+                raise ConfigurationError("preflight source fingerprint is absent")
+            stage = "pit_optimization_prepare"
+            readiness = prepare_pit_optimization(
+                config.gate,
+                source_root=config.source_root,
+                artifact_root=config.artifact_root,
+                source_head=state.head,
+                source_fingerprint_sha256=state.fingerprint.sha256,
+            )
+            if recheck_source_unchanged(state).source_modified:
+                raise CandidateMutationError(
+                    "source changed during PIT optimization readiness publication"
+                )
+            state.close()
+            state = None
+            result = PitOptimizationLoopResult(
+                phase="prepare",
+                status="ready",
+                exit_code=0,
+                run_id=run_id,
+                readiness_sha256=readiness.readiness_sha256,
+                effective_policy_sha256=readiness.effective_policy_sha256,
+                selected_candidate_id=None,
+                accepted=None,
+                artifact_paths=(
+                    (readiness.artifact_path, readiness.artifact_sha256),
+                ),
+                provider_calls=0,
+                spent_usd=0.0,
+                source_modified=False,
+                cleanup_complete=True,
+                operator_lines=_pit_optimization_prepare_lines(
+                    config,
+                    docker_executable=docker_executable,
+                    sandbox_image=sandbox_image,
+                    readiness=readiness,
+                ),
+            )
+            loop_returned = True
+            return result
+        if (
+            isinstance(config.gate, PitOptimizationGateConfig)
+            and config.gate.phase == "canary"
+        ):
+            if state.fingerprint is None or config.gate.readiness_sha256 is None:
+                raise ConfigurationError("PIT optimization canary readiness is absent")
+            stage = "pit_optimization_readiness"
+            readiness = prepare_pit_optimization(
+                config.gate,
+                source_root=config.source_root,
+                artifact_root=config.artifact_root,
+                source_head=state.head,
+                source_fingerprint_sha256=state.fingerprint.sha256,
+            )
+            if readiness.readiness_sha256 != config.gate.readiness_sha256:
+                raise ConfigurationError(
+                    "PIT optimization readiness differs from the prepared identity"
+                )
+            stage = "candidate_export"
+            candidate = export_candidate(state)
+            candidate_initial_manifest = _candidate_tracked_manifest_sha256(candidate)
+            candidate_patched_manifest: str | None = None
+            if _git(
+                candidate.root,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ).stdout:
+                raise CandidateMutationError(
+                    "fresh PIT optimization candidate contains untracked paths"
+                )
+            stage = "docker_capability"
+            docker_capability = configure_docker_executable(
+                docker_executable,
+                source_root=config.source_root,
+                controller_root=config.controller_temp_parent,
+                permanent_runtime_root=config.permanent_runtime_root,
+            )
+            stage = "sandbox_init"
+            sandbox = SandboxRunner(
+                image=sandbox_image,
+                engine=docker_capability,
+                timeout_seconds=config.limits.child_timeout_seconds,
+                output_limit=config.limits.output_limit_bytes,
+                run_id=run_id,
+            )
+            stage = "gateway_init"
+            ledger = BudgetLedger(
+                max_usd=config.limits.max_usd,
+                max_calls=config.limits.max_api_calls,
+                max_tokens=config.limits.max_tokens,
+            )
+            gateway = OpenRouterGateway(
+                run_id=run_id,
+                ledger=ledger,
+                pricing_loader=lambda model: dict(
+                    _PIT_OPTIMIZATION_OFFLINE_PRICING[model]
+                ),
+                timeout_seconds=config.limits.api_timeout_seconds,
+                max_attempts=1,
+                controller_root=config.source_root,
+            )
+            known_secrets = (
+                (gateway.api_key,)
+                if isinstance(gateway.api_key, str) and gateway.api_key
+                else ()
+            )
+            stage = "audit_init"
+            audit = AuditTrail(
+                config.artifact_root,
+                run_id,
+                known_secrets=known_secrets,
+            )
+            audit.write_manifest(
+                config,
+                source_head=state.head,
+                source_fingerprint_sha256=state.fingerprint.sha256,
+            )
+
+            class OptimizationCallServices:
+                def __init__(self) -> None:
+                    self.gateway = gateway
+                    self.known_secrets = known_secrets
+
+            call_services = OptimizationCallServices()
+            deadline = time.monotonic() + config.limits.wall_timeout_seconds
+
+            def call_optimization_role(
+                role: str,
+                dynamic: dict[str, object],
+                parser: Callable[[str], object],
+            ) -> PitOptimizationRoleCall:
+                from core.pit_optimization_contract import (
+                    PitOptimizationCoding,
+                    PitOptimizationReasoning,
+                    PitOptimizationRoute,
+                )
+
+                spent_before = ledger.spent_usd
+                payload, digest = _pit_call_gateway(
+                    audit,
+                    call_services,
+                    role,
+                    dynamic,
+                    parser,
+                    deadline=deadline,
+                    monotonic=time.monotonic,
+                    request_method="request_pit_optimization_once",
+                    payload_types=(
+                        PitOptimizationRoute,
+                        PitOptimizationReasoning,
+                        PitOptimizationCoding,
+                    ),
+                )
+                return PitOptimizationRoleCall(
+                    role=role,
+                    call_index=ledger.calls,
+                    payload=payload,
+                    cost_usd=ledger.spent_usd - spent_before,
+                    accounting_complete=ledger.incomplete_accounting_calls == 0,
+                    audit_sha256=digest,
+                )
+
+            def verify_optimization_inputs() -> None:
+                nonlocal candidate_patched_manifest
+                if state is None or recheck_source_unchanged(state).source_modified:
+                    raise CandidateMutationError(
+                        "source changed during PIT optimization canary"
+                    )
+                if candidate is None:
+                    raise CandidateMutationError(
+                        "PIT optimization candidate disappeared"
+                    )
+                untracked = _git(
+                    candidate.root,
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ).stdout
+                changed = tuple(
+                    value.decode("utf-8")
+                    for value in _git(
+                        candidate.root,
+                        "diff",
+                        "--name-only",
+                        "-z",
+                        "--",
+                    ).stdout.split(b"\0")
+                    if value
+                )
+                current_manifest = _candidate_tracked_manifest_sha256(candidate)
+                if untracked or changed not in {(), ("core/canslim/entry_contract.py",)}:
+                    raise CandidateMutationError(
+                        "PIT optimization candidate manifest or untracked set changed unexpectedly"
+                    )
+                if not changed and current_manifest != candidate_initial_manifest:
+                    raise CandidateMutationError(
+                        "PIT optimization candidate tracked manifest changed before patch"
+                    )
+                if changed:
+                    if candidate_patched_manifest is None:
+                        candidate_patched_manifest = current_manifest
+                    elif current_manifest != candidate_patched_manifest:
+                        raise CandidateMutationError(
+                            "PIT optimization patched candidate manifest changed"
+                        )
+                primitive = readiness.primitive
+                sealed = primitive.get("sealed_inputs")
+                baseline_artifacts = (
+                    sealed.get("baseline_artifact_sha256")
+                    if isinstance(sealed, Mapping)
+                    else None
+                )
+                if not isinstance(baseline_artifacts, Mapping):
+                    raise ConfigurationError(
+                        "PIT optimization readiness lacks exhaustive sealed artifacts"
+                    )
+                verify_sealed_baseline_artifacts(
+                    config.gate.baseline_run, baseline_artifacts
+                )
+                for path, expected, field in (
+                    (
+                        config.gate.pit_bundle,
+                        config.gate.pit_bundle_sha256,
+                        "PIT bundle",
+                    ),
+                ):
+                    try:
+                        info = path.lstat()
+                    except OSError as exc:
+                        raise ConfigurationError(
+                            f"PIT optimization {field} is unavailable"
+                        ) from exc
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or path.is_symlink()
+                        or _has_reparse_point(path)
+                        or _file_sha256(path) != expected
+                    ):
+                        raise ConfigurationError(
+                            f"PIT optimization {field} changed after readiness"
+                        )
+
+            evaluate_optimization_candidate = _pit_optimization_sandbox_evaluator(
+                sandbox, config.gate, candidate
+            )
+
+            def cleanup_optimization() -> PitOptimizationCleanup:
+                nonlocal state, candidate
+                if state is None or candidate is None:
+                    raise ConfigurationError(
+                        "PIT optimization cleanup resources are absent"
+                    )
+                observation = cleanup_run_resources(
+                    state,
+                    candidate,
+                    retain_candidate=False,
+                )
+                state = None
+                candidate = None
+                return PitOptimizationCleanup(
+                    source_modified=observation.source_modified,
+                    cleanup_complete=observation.cleanup_complete,
+                )
+
+            stage = "pit_optimization_canary"
+            result = run_pit_optimization_canary(
+                readiness=readiness,
+                expected_readiness_sha256=config.gate.readiness_sha256,
+                expected_effective_policy_sha256=config.gate.effective_policy_sha256,
+                source_root=config.source_root,
+                candidate_root=candidate.root,
+                artifact_root=config.artifact_root,
+                run_id=run_id,
+                services=PitOptimizationCanaryServices(
+                    call_role=call_optimization_role,
+                    evaluate_candidate=evaluate_optimization_candidate,
+                    verify_inputs=verify_optimization_inputs,
+                    cleanup=cleanup_optimization,
+                ),
+            )
+            loop_returned = True
+            return result
         stage = "candidate_export"
         candidate = export_candidate(state)
         stage = "docker_capability"
@@ -13535,6 +14142,124 @@ def _pit_diagnosis_summary(result: Any) -> dict[str, object]:
     }
 
 
+def _pit_optimization_summary(result: Any) -> dict[str, object]:
+    """Serialize the bounded PIT optimization result without provider content."""
+    from core.pit_optimization import PitOptimizationLoopResult
+
+    if not isinstance(result, PitOptimizationLoopResult):
+        raise ConfigurationError(
+            "CLI execution did not return a PitOptimizationLoopResult"
+        )
+    return {
+        "schema_version": 1,
+        "phase": result.phase,
+        "status": result.status,
+        "exit_code": result.exit_code,
+        "run_id": result.run_id,
+        "readiness_sha256": result.readiness_sha256,
+        "effective_policy_sha256": result.effective_policy_sha256,
+        "selected_candidate_id": result.selected_candidate_id,
+        "accepted": result.accepted,
+        "artifacts": [
+            {"path": str(path), "sha256": digest}
+            for path, digest in result.artifact_paths
+        ],
+        "provider_calls": result.provider_calls,
+        "spent_usd": result.spent_usd,
+        "source_modified": result.source_modified,
+        "cleanup_complete": result.cleanup_complete,
+    }
+
+
+def _pit_optimization_prepare_lines(
+    config: LoopConfig,
+    *,
+    docker_executable: Path,
+    sandbox_image: str,
+    readiness: Any,
+) -> tuple[str, str]:
+    """Return the canonical readiness record and its exact inert canary command."""
+
+    from core.pit_optimization import PitOptimizationGateConfig, PitOptimizationReadiness
+
+    if (
+        not isinstance(config, LoopConfig)
+        or not isinstance(config.gate, PitOptimizationGateConfig)
+        or config.gate.phase != "prepare"
+        or not isinstance(readiness, PitOptimizationReadiness)
+    ):
+        raise ConfigurationError("prepare output requires authenticated optimization readiness")
+    argv = (
+        sys.executable,
+        "-B",
+        str((config.source_root / "agent_loop.py").resolve()),
+        "--repo-root",
+        str(config.source_root),
+        "--permanent-runtime-root",
+        str(config.permanent_runtime_root),
+        "--git-executable",
+        str(config.git_executable),
+        "--controller-temp-parent",
+        str(config.controller_temp_parent),
+        "--artifact-root",
+        str(config.artifact_root),
+        "--docker-executable",
+        str(docker_executable),
+        "--sandbox-image",
+        sandbox_image,
+        "--gate",
+        "pit_optimization",
+        "--optimization-phase",
+        "canary",
+        "--baseline-run",
+        str(config.gate.baseline_run),
+        "--baseline-manifest-sha256",
+        config.gate.baseline_manifest_sha256,
+        "--pit-bundle",
+        str(config.gate.pit_bundle),
+        "--pit-bundle-sha256",
+        config.gate.pit_bundle_sha256,
+        "--effective-policy-sha256",
+        readiness.effective_policy_sha256,
+        "--readiness-sha256",
+        readiness.readiness_sha256,
+        "--max-usd",
+        "0.50",
+        "--max-api-calls",
+        "3",
+        "--max-iterations",
+        "1",
+        "--max-tokens",
+        str(config.limits.max_tokens),
+        "--api-timeout-seconds",
+        str(config.limits.api_timeout_seconds),
+        "--child-timeout-seconds",
+        str(config.limits.child_timeout_seconds),
+        "--wall-timeout-seconds",
+        str(config.limits.wall_timeout_seconds),
+        "--output-limit-bytes",
+        str(config.limits.output_limit_bytes),
+    )
+    command = subprocess.list2cmdline(argv)
+    ready = {
+        "canary_command": command,
+        "effective_policy_sha256": readiness.effective_policy_sha256,
+        "readiness_artifact": str(readiness.artifact_path),
+        "readiness_sha256": readiness.readiness_sha256,
+    }
+    return (
+        "PIT_OPTIMIZATION_READY="
+        + json.dumps(
+            ready,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ),
+        "PIT_OPTIMIZATION_CANARY_COMMAND=" + command,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the protected child dispatcher or one production controller invocation."""
     arguments = tuple(sys.argv[1:] if argv is None else argv)
@@ -13558,6 +14283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_id=run_id,
             batch_limits=batch_limits,
         )
+        from core.pit_optimization import PitOptimizationLoopResult
         from pit_diagnosis_agent import PitDiagnosisLoopResult
 
         summary = (
@@ -13565,6 +14291,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(result, ProposalBatchResult)
             else _pit_diagnosis_summary(result)
             if isinstance(result, PitDiagnosisLoopResult)
+            else _pit_optimization_summary(result)
+            if isinstance(result, PitOptimizationLoopResult)
             else _loop_result_summary(result)
         )
     except ControllerInitializationError as exc:
@@ -13573,6 +14301,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         print("agent loop initialization failed", file=sys.stderr)
         return 22
+    if isinstance(result, PitOptimizationLoopResult):
+        for line in result.operator_lines:
+            print(line)
     print(
         "AGENT_LOOP_SUMMARY="
         + json.dumps(
