@@ -4888,7 +4888,7 @@ class SandboxRunner:
             ("-m", "ruff", "check", "--no-cache", "."),
         }:
             return
-        if len(args) == 9 and args[:3] == (
+        if len(args) in {9, 13} and args[:3] == (
             "-m",
             "core.pit_optimization",
             "--worker-evaluate",
@@ -4900,15 +4900,35 @@ class SandboxRunner:
                 )
                 or args[5] != "--pit-bundle-sha256"
                 or _SHA256_RE.fullmatch(args[6]) is None
-                or args[7:9]
-                != (
-                    "--output",
-                    "/workspace/output/pit-optimization-result.json",
-                )
                 or not (source / "core" / "pit_optimization.py").is_file()
             ):
                 raise SandboxError(
                     "PIT optimization worker argv violates the exact grammar"
+                )
+            if len(args) == 9 and args[7:9] != (
+                "--output",
+                "/workspace/output/pit-optimization-result.json",
+            ):
+                raise SandboxError(
+                    "PIT optimization worker argv violates the full-evaluation grammar"
+                )
+            if len(args) == 13 and (
+                args[7:11]
+                != (
+                    "--verification-subset",
+                    "/workspace/data/pit-optimization-verification-subset.json",
+                    "--verification-subset-sha256",
+                    args[10],
+                )
+                or _SHA256_RE.fullmatch(args[10]) is None
+                or args[11:13]
+                != (
+                    "--output",
+                    "/workspace/output/pit-optimization-result.json",
+                )
+            ):
+                raise SandboxError(
+                    "PIT optimization worker argv violates the verification grammar"
                 )
             return
         if len(args) == 26 and args[:2] == ("pit_diagnosis.py", "run-experiment"):
@@ -12562,8 +12582,46 @@ def _pit_optimization_sandbox_evaluator(
     sandbox: SandboxRunner,
     config: Any,
     candidate: Candidate,
+    readiness: Any = None,
 ) -> Callable[[Path], Mapping[str, object]]:
     """Evaluate one candidate through the existing attested network-none worker."""
+
+    primitive = getattr(readiness, "primitive", None)
+    evaluation_contract = (
+        primitive.get("evaluation_contract") if isinstance(primitive, Mapping) else None
+    )
+    readiness_verification_only = (
+        evaluation_contract.get("verification_only")
+        if isinstance(evaluation_contract, Mapping)
+        else None
+    )
+    configured_verification_only = bool(getattr(config, "verification_subset", False))
+    if readiness_verification_only is None and not configured_verification_only:
+        verification_only = False
+    elif (
+        type(readiness_verification_only) is not bool
+        or readiness_verification_only != configured_verification_only
+    ):
+        raise ConfigurationError(
+            "PIT optimization evaluator mode differs from authenticated readiness"
+        )
+    else:
+        verification_only = readiness_verification_only
+    verification_payload: bytes | None = None
+    verification_sha256: str | None = None
+    if verification_only:
+        scope = evaluation_contract.get("scope")
+        expected_scope_sha256 = evaluation_contract.get("scope_sha256")
+        if not isinstance(scope, Mapping) or not isinstance(expected_scope_sha256, str):
+            raise ConfigurationError(
+                "PIT optimization verification scope is absent from readiness"
+            )
+        verification_payload = _canonical_json_bytes(dict(scope)) + b"\n"
+        verification_sha256 = hashlib.sha256(verification_payload).hexdigest()
+        if verification_sha256 != expected_scope_sha256:
+            raise ConfigurationError(
+                "PIT optimization verification scope identity differs"
+            )
 
     def evaluate(candidate_root: Path) -> Mapping[str, object]:
         if isinstance(candidate, Candidate) and candidate_root.resolve() != _require_candidate(
@@ -12579,9 +12637,32 @@ def _pit_optimization_sandbox_evaluator(
                 layout.data / "pit-bundle.sqlite3",
                 config.pit_bundle_sha256,
             )
+            if verification_payload is not None:
+                target = layout.data / "pit-optimization-verification-subset.json"
+                with target.open("xb") as handle:
+                    handle.write(verification_payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if (
+                    verification_sha256 is None
+                    or _file_sha256(target) != verification_sha256
+                ):
+                    raise ConfigurationError(
+                        "PIT optimization verification scope staging failed"
+                    )
 
         def execute(layout: WorkerLayout) -> Mapping[str, object]:
             environment = build_child_environment(os.environ, layout.home)
+            verification_args = (
+                (
+                    "--verification-subset",
+                    "/workspace/data/pit-optimization-verification-subset.json",
+                    "--verification-subset-sha256",
+                    verification_sha256,
+                )
+                if verification_sha256 is not None
+                else ()
+            )
             argv = (
                 "-m",
                 "core.pit_optimization",
@@ -12590,6 +12671,7 @@ def _pit_optimization_sandbox_evaluator(
                 "/workspace/data/pit-bundle.sqlite3",
                 "--pit-bundle-sha256",
                 config.pit_bundle_sha256,
+                *verification_args,
                 "--output",
                 "/workspace/output/pit-optimization-result.json",
             )
@@ -13472,6 +13554,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment-catalog-sha256")
     parser.add_argument("--pit-partition", choices=("discovery", "validation"), default="discovery")
     parser.add_argument("--optimization-phase", choices=("prepare", "canary"))
+    parser.add_argument(
+        "--optimization-verification-subset",
+        action="store_true",
+        help="Run the PIT optimizer in verification-only subset mode.",
+    )
     parser.add_argument("--baseline-manifest-sha256")
     parser.add_argument("--effective-policy-sha256")
     parser.add_argument("--readiness-sha256")
@@ -13586,6 +13673,10 @@ def _build_cli_config(
             )
         if any(value is not None for value in all_pit_fields):
             raise ConfigurationError("PIT options cannot be supplied to the test gate")
+        if namespace.optimization_verification_subset:
+            raise ConfigurationError(
+                "PIT optimization options cannot be supplied to the test gate"
+            )
         gate: Any = TestGateConfig(
             tuple(namespace.test_path)
         )
@@ -13621,6 +13712,10 @@ def _build_cli_config(
         )
         if any(value is not None for value in all_pit_fields):
             raise ConfigurationError("PIT options cannot be supplied to the backtest gate")
+        if namespace.optimization_verification_subset:
+            raise ConfigurationError(
+                "PIT optimization options cannot be supplied to the backtest gate"
+            )
     elif namespace.gate == "pit_diagnosis":
         if namespace.test_path or any(value is not None for value in backtest_fields):
             raise ConfigurationError("test/backtest options cannot be supplied to the PIT diagnosis gate")
@@ -13628,6 +13723,10 @@ def _build_cli_config(
             raise ConfigurationError("proposal samples are not supported by the PIT diagnosis gate")
         if any(value is not None for value in optimization_fields):
             raise ConfigurationError("PIT optimization options cannot be supplied to the diagnosis gate")
+        if namespace.optimization_verification_subset:
+            raise ConfigurationError(
+                "PIT optimization options cannot be supplied to the diagnosis gate"
+            )
         if any(value is None for value in (*pit_shared_fields, *diagnosis_fields)):
             raise ConfigurationError("the PIT diagnosis gate requires all sealed input identities")
         assert namespace.diagnosis_run is not None
@@ -13698,6 +13797,7 @@ def _build_cli_config(
                 max_api_calls=max_api_calls,
                 max_iterations=namespace.max_iterations,
                 apply=namespace.apply,
+                verification_subset=namespace.optimization_verification_subset,
                 readiness_sha256=namespace.readiness_sha256,
             )
         except ValueError as exc:
@@ -14030,6 +14130,7 @@ def _execute_cli_run(
                 spent_usd=0.0,
                 source_modified=False,
                 cleanup_complete=True,
+                verification_only=config.gate.verification_subset,
                 operator_lines=_pit_optimization_prepare_lines(
                     config,
                     docker_executable=docker_executable,
@@ -14245,7 +14346,7 @@ def _execute_cli_run(
                         )
 
             evaluate_optimization_candidate = _pit_optimization_sandbox_evaluator(
-                sandbox, config.gate, candidate
+                sandbox, config.gate, candidate, readiness
             )
 
             def cleanup_optimization() -> PitOptimizationCleanup:
@@ -14655,6 +14756,7 @@ def _pit_optimization_summary(result: Any) -> dict[str, object]:
         "spent_usd": result.spent_usd,
         "source_modified": result.source_modified,
         "cleanup_complete": result.cleanup_complete,
+        "verification_only": result.verification_only,
     }
 
 
@@ -14698,6 +14800,11 @@ def _pit_optimization_prepare_lines(
         "pit_optimization",
         "--optimization-phase",
         "canary",
+        *(
+            ("--optimization-verification-subset",)
+            if config.gate.verification_subset
+            else ()
+        ),
         "--baseline-run",
         str(config.gate.baseline_run),
         "--baseline-manifest-sha256",

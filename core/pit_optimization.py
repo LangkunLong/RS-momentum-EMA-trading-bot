@@ -90,6 +90,8 @@ _ENTRY_OUTCOMES = (
     "entry_rejected_invalid_risk",
     "entry_rejected_no_cash",
 )
+_VERIFICATION_SESSION_COUNT = 60
+_VERIFICATION_SYMBOL_COUNT = 25
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -183,6 +185,7 @@ class PitOptimizationGateConfig:
     max_api_calls: int
     max_iterations: int
     apply: bool
+    verification_subset: bool = False
     readiness_sha256: str | None = None
 
     def __post_init__(self) -> None:
@@ -216,6 +219,8 @@ class PitOptimizationGateConfig:
             raise ValueError("PIT optimization requires exactly one iteration")
         if self.apply is not False:
             raise ValueError("PIT optimization is apply=false only")
+        if type(self.verification_subset) is not bool:
+            raise ValueError("optimization verification-subset flag must be boolean")
         if self.phase == "prepare" and self.readiness_sha256 is not None:
             raise ValueError("prepare cannot trust a prior readiness identity")
         if self.phase == "canary" and (
@@ -874,6 +879,199 @@ def verify_sealed_baseline_artifacts(
             raise ValueError(f"sealed baseline artifact changed: {name}")
 
 
+_VERIFICATION_SCOPE_KEYS = frozenset(
+    {
+        "benchmark",
+        "known_activity_symbols",
+        "known_entry_attempts",
+        "measurement_end",
+        "measurement_start",
+        "selection",
+        "session_count",
+        "symbol_count",
+        "symbols",
+        "warmup_start",
+    }
+)
+
+
+def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, object]:
+    """Return one closed, canonical verification-only evaluator scope."""
+
+    value = _json_primitive(scope)
+    if not isinstance(value, dict) or set(value) != _VERIFICATION_SCOPE_KEYS:
+        raise ValueError("optimization verification scope keys are not exact")
+    symbols = value.get("symbols")
+    if (
+        not isinstance(symbols, list)
+        or len(symbols) != _VERIFICATION_SYMBOL_COUNT
+        or len(set(symbols)) != len(symbols)
+        or any(
+            not isinstance(symbol, str)
+            or re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol) is None
+            or symbol == "SPY"
+            for symbol in symbols
+        )
+    ):
+        raise ValueError("optimization verification symbols are invalid")
+    if (
+        value.get("benchmark") != "SPY"
+        or value.get("warmup_start") != FULL_START_DATE
+        or value.get("selection")
+        != "sealed_entry_activity_then_hash_ranked_active_fill"
+        or value.get("session_count") != _VERIFICATION_SESSION_COUNT
+        or value.get("symbol_count") != _VERIFICATION_SYMBOL_COUNT
+    ):
+        raise ValueError("optimization verification scope contract changed")
+    for field in ("known_activity_symbols", "known_entry_attempts"):
+        count = value.get(field)
+        if type(count) is not int or count < 1:
+            raise ValueError(f"optimization verification {field} must be positive")
+    if int(value["known_activity_symbols"]) > _VERIFICATION_SYMBOL_COUNT:
+        raise ValueError("optimization verification activity symbols exceed the subset")
+    try:
+        measurement_start = pd.Timestamp(value["measurement_start"]).normalize()
+        measurement_end = pd.Timestamp(value["measurement_end"]).normalize()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("optimization verification dates are invalid") from exc
+    if (
+        measurement_start < pd.Timestamp(FULL_START_DATE)
+        or measurement_end > pd.Timestamp(FULL_END_DATE)
+        or measurement_start > measurement_end
+        or measurement_start.date().isoformat() != value["measurement_start"]
+        or measurement_end.date().isoformat() != value["measurement_end"]
+    ):
+        raise ValueError("optimization verification dates escape the sealed window")
+    return value
+
+
+def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, object]:
+    """Derive a small, active slice solely from authenticated local inputs."""
+
+    attempts_path = _regular_file(
+        baseline_run / "entry_attempt_outcomes.csv", "baseline entry attempts"
+    )
+    attempts = pd.read_csv(attempts_path, dtype=str, keep_default_na=False)
+    expected_columns = {
+        "symbol",
+        "signal_date",
+        "entry_date",
+        "pivot",
+        "buy_zone_lower",
+        "buy_zone_upper",
+        "entry_open",
+        "outcome",
+    }
+    if attempts.empty or set(attempts.columns) != expected_columns:
+        raise ValueError("baseline entry attempts cannot define verification activity")
+    attempts["symbol"] = attempts["symbol"].str.upper()
+    try:
+        attempts["signal_date"] = pd.to_datetime(
+            attempts["signal_date"], errors="raise"
+        ).dt.normalize()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("baseline entry-attempt dates are invalid") from exc
+    first_activity = attempts["signal_date"].min()
+    fetch_closes = getattr(bundle, "fetch_closes", None)
+    members_at = getattr(bundle, "members_at", None)
+    symbols_method = getattr(bundle, "symbols", None)
+    if not all(callable(value) for value in (fetch_closes, members_at, symbols_method)):
+        raise ValueError("PIT bundle cannot derive a verification scope")
+    benchmark = fetch_closes(
+        ["SPY"], pd.Timestamp(FULL_START_DATE), pd.Timestamp(FULL_END_DATE)
+    )
+    if "SPY" not in benchmark:
+        raise ValueError("PIT bundle lacks the verification benchmark")
+    sessions = pd.DatetimeIndex(benchmark["SPY"].dropna().index).normalize()
+    measurement_sessions = sessions[sessions >= first_activity][
+        :_VERIFICATION_SESSION_COUNT
+    ]
+    if len(measurement_sessions) != _VERIFICATION_SESSION_COUNT:
+        raise ValueError("PIT bundle lacks sixty verification sessions")
+    measurement_start = measurement_sessions[0]
+    measurement_end = measurement_sessions[-1]
+    active_attempts = attempts.loc[
+        attempts["signal_date"].between(measurement_start, measurement_end)
+    ]
+    attempt_counts = active_attempts.groupby("symbol", sort=True).size()
+    ranked_activity = sorted(
+        (str(symbol) for symbol in attempt_counts.index),
+        key=lambda symbol: (-int(attempt_counts[symbol]), symbol),
+    )
+    active_members = {
+        str(symbol)
+        for symbol in members_at(measurement_start)
+        if str(symbol) != "SPY"
+    }
+    available = {
+        str(symbol)
+        for symbol in symbols_method()
+        if str(symbol) != "SPY"
+    }
+    candidate_pool = sorted(active_members & available)
+    closes = fetch_closes(
+        candidate_pool, pd.Timestamp(FULL_START_DATE), measurement_end
+    )
+    minimum_warmup_bars = 100
+    covered = {
+        symbol
+        for symbol in candidate_pool
+        if symbol in closes and int(closes[symbol].count()) >= minimum_warmup_bars
+    }
+    if any(symbol not in covered for symbol in ranked_activity):
+        raise ValueError("known verification activity lacks sufficient warm-up prices")
+    fill = sorted(
+        covered - set(ranked_activity),
+        key=lambda symbol: _sha256_bytes(
+            f"{PIT_BUNDLE_SHA256}:{symbol}".encode("ascii")
+        ),
+    )
+    selected = [*ranked_activity, *fill][:_VERIFICATION_SYMBOL_COUNT]
+    if len(selected) != _VERIFICATION_SYMBOL_COUNT:
+        raise ValueError("PIT bundle lacks enough covered verification symbols")
+    return _validate_verification_scope(
+        {
+            "benchmark": "SPY",
+            "known_activity_symbols": len(ranked_activity),
+            "known_entry_attempts": int(len(active_attempts)),
+            "measurement_end": measurement_end.date().isoformat(),
+            "measurement_start": measurement_start.date().isoformat(),
+            "selection": "sealed_entry_activity_then_hash_ranked_active_fill",
+            "session_count": _VERIFICATION_SESSION_COUNT,
+            "symbol_count": _VERIFICATION_SYMBOL_COUNT,
+            "symbols": selected,
+            "warmup_start": FULL_START_DATE,
+        }
+    )
+
+
+def _evaluation_contract(
+    *, verification_subset: bool, verification_scope: Mapping[str, object] | None
+) -> dict[str, object]:
+    if verification_subset:
+        if verification_scope is None:
+            raise ValueError("optimization verification scope is absent")
+        scope = _validate_verification_scope(verification_scope)
+        mode = "verification_subset"
+    else:
+        if verification_scope is not None:
+            raise ValueError("full optimization cannot carry a verification scope")
+        scope = {
+            "full_end": FULL_END_DATE,
+            "full_start": FULL_START_DATE,
+            "holdout_end": HOLDOUT_END_DATE,
+            "holdout_start": HOLDOUT_START_DATE,
+        }
+        mode = "full_acceptance"
+    return {
+        "mode": mode,
+        "performance_acceptance_eligible": not verification_subset,
+        "scope": scope,
+        "scope_sha256": _sha256_bytes(_canonical_json_bytes(scope)),
+        "verification_only": verification_subset,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class PitOptimizationReadiness:
     readiness_sha256: str
@@ -901,12 +1099,13 @@ class PitOptimizationLoopResult:
     spent_usd: float
     source_modified: bool
     cleanup_complete: bool
+    verification_only: bool = False
     operator_lines: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.phase not in {"prepare", "canary"}:
             raise ValueError("optimization result phase is invalid")
-        if self.status not in {"ready", "accepted", "rejected", "aborted"}:
+        if self.status not in {"ready", "verified", "accepted", "rejected", "aborted"}:
             raise ValueError("optimization result status is invalid")
         if type(self.exit_code) is not int or not 0 <= self.exit_code <= 255:
             raise ValueError("optimization result exit code is invalid")
@@ -932,6 +1131,8 @@ class PitOptimizationLoopResult:
             raise ValueError("optimization result spend is invalid")
         if type(self.source_modified) is not bool or type(self.cleanup_complete) is not bool:
             raise ValueError("optimization result cleanup/source facts are invalid")
+        if type(self.verification_only) is not bool:
+            raise ValueError("optimization result verification-only fact is invalid")
         for path, digest in self.artifact_paths:
             if not isinstance(path, Path) or not path.is_absolute() or (
                 _SHA256_RE.fullmatch(digest or "") is None
@@ -945,6 +1146,7 @@ class PitOptimizationLoopResult:
             raise ValueError("canary result cannot emit a second operator command")
         if self.status in {"accepted", "rejected"} and (
             self.phase != "canary"
+            or self.verification_only
             or self.exit_code != 0
             or self.provider_calls != MAX_CANARY_CALLS
             or self.selected_candidate_id is None
@@ -956,6 +1158,21 @@ class PitOptimizationLoopResult:
             raise ValueError(
                 "successful optimization terminal result requires exactly three calls "
                 "and the complete artifact set"
+            )
+        if self.status == "verified" and (
+            self.phase != "canary"
+            or not self.verification_only
+            or self.exit_code != 0
+            or self.provider_calls != MAX_CANARY_CALLS
+            or self.selected_candidate_id is None
+            or self.accepted is not None
+            or len(self.artifact_paths) != 4
+            or self.source_modified
+            or not self.cleanup_complete
+        ):
+            raise ValueError(
+                "successful verification result requires exactly three calls, no "
+                "acceptance verdict, and the complete artifact set"
             )
         if self.status == "ready" and (
             self.phase != "prepare"
@@ -1106,6 +1323,25 @@ def _readiness_identity(
         "provider_retries": 0,
     }:
         raise ValueError("canary readiness budget contract changed")
+    evaluation_contract = primitive.get("evaluation_contract")
+    if not isinstance(evaluation_contract, dict) or set(evaluation_contract) != {
+        "mode",
+        "performance_acceptance_eligible",
+        "scope",
+        "scope_sha256",
+        "verification_only",
+    }:
+        raise ValueError("canary readiness evaluation contract is incomplete")
+    verification_only = evaluation_contract.get("verification_only")
+    scope = evaluation_contract.get("scope")
+    if type(verification_only) is not bool or not isinstance(scope, Mapping):
+        raise ValueError("canary readiness evaluation scope is malformed")
+    expected_contract = _evaluation_contract(
+        verification_subset=verification_only,
+        verification_scope=scope if verification_only else None,
+    )
+    if evaluation_contract != expected_contract:
+        raise ValueError("canary readiness evaluation contract changed")
     expected_source_sha = identities.get("entry_contract_source_sha256")
     if not isinstance(expected_source_sha, str) or _SHA256_RE.fullmatch(expected_source_sha) is None:
         raise ValueError("canary readiness source identity is invalid")
@@ -1304,6 +1540,88 @@ def _candidate_comparison(
         baseline_holdout=closed_window_metrics(baseline_holdout),
         candidate_holdout=closed_window_metrics(candidate_holdout),
     )
+
+
+def _validate_verification_candidate(
+    readiness: PitOptimizationReadiness,
+    evaluation: Mapping[str, object],
+    candidate: object,
+) -> Mapping[str, object]:
+    """Authenticate a subset replay without producing an acceptance verdict."""
+
+    from core.pit_optimization_contract import CandidateDefinition
+    from core.engine_policy import effective_engine_policy_sha256
+
+    if not isinstance(candidate, CandidateDefinition) or not isinstance(evaluation, Mapping):
+        raise ValueError("verification candidate evaluation is malformed")
+    if set(evaluation) != {
+        "effective_policy",
+        "effective_policy_sha256",
+        "performance_acceptance_eligible",
+        "pit_bundle_sha256",
+        "schema_version",
+        "scope",
+        "verification",
+        "verification_only",
+    }:
+        raise ValueError("verification candidate evaluation has open or missing keys")
+    if (
+        evaluation.get("schema_version") != 1
+        or evaluation.get("verification_only") is not True
+        or evaluation.get("performance_acceptance_eligible") is not False
+    ):
+        raise ValueError("verification candidate eligibility markers are invalid")
+    primitive = _json_primitive(readiness.primitive)
+    if not isinstance(primitive, dict):
+        raise ValueError("verification readiness is malformed")
+    identities = primitive.get("identities")
+    contract = primitive.get("evaluation_contract")
+    baseline_policy = primitive.get("effective_policy")
+    candidate_policy = evaluation.get("effective_policy")
+    if (
+        not isinstance(identities, dict)
+        or not isinstance(contract, dict)
+        or contract.get("verification_only") is not True
+        or not isinstance(baseline_policy, dict)
+        or not isinstance(candidate_policy, Mapping)
+    ):
+        raise ValueError("verification readiness contract is incomplete")
+    if evaluation.get("pit_bundle_sha256") != identities.get("pit_bundle_sha256"):
+        raise ValueError("verification candidate used a different PIT bundle")
+    policy_sha = evaluation.get("effective_policy_sha256")
+    if (
+        not isinstance(policy_sha, str)
+        or _SHA256_RE.fullmatch(policy_sha) is None
+        or effective_engine_policy_sha256(candidate_policy) != policy_sha
+        or effective_engine_policy_sha256(baseline_policy)
+        != identities.get("effective_policy_sha256")
+    ):
+        raise ValueError("verification candidate policy identity is invalid")
+    validate_policy_delta(baseline_policy, candidate_policy, candidate)
+    expected_scope = contract.get("scope")
+    observed_scope = evaluation.get("scope")
+    if (
+        not isinstance(expected_scope, Mapping)
+        or not isinstance(observed_scope, Mapping)
+        or _validate_verification_scope(observed_scope)
+        != _validate_verification_scope(expected_scope)
+    ):
+        raise ValueError("verification candidate scope differs from readiness")
+    window = evaluation.get("verification")
+    if not isinstance(window, Mapping):
+        raise ValueError("verification candidate aggregate is absent")
+    _validate_aggregate_window(window)
+    performance = window.get("performance")
+    funnel = window.get("funnel")
+    if (
+        not isinstance(performance, Mapping)
+        or performance.get("equity_observations") != _VERIFICATION_SESSION_COUNT
+        or not isinstance(funnel, Mapping)
+        or type(funnel.get("attempted")) is not int
+        or int(funnel["attempted"]) < 1
+    ):
+        raise ValueError("verification candidate did not exercise known strategy activity")
+    return window
 
 
 _PERFORMANCE_KEYS = frozenset(
@@ -1545,39 +1863,82 @@ def _write_canary_artifacts(
     candidate_id: str,
     baseline: Mapping[str, object],
     evaluation: Mapping[str, object],
-    comparison: OptimizationComparison,
+    comparison: OptimizationComparison | None,
     diff: str,
     call_sha256s: Sequence[str],
+    verification_only: bool = False,
+    verification_scope: Mapping[str, object] | None = None,
 ) -> tuple[tuple[Path, str], ...]:
     root = _absolute_path(artifact_root, "artifact root")
     if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id) is None:
         raise ValueError("optimization run ID is invalid")
     root.mkdir(parents=True, exist_ok=True)
     _regular_directory(root, "artifact root")
-    baseline_payload = {
-        "schema_version": 1,
-        "candidate_id": candidate_id,
-        "baseline": baseline,
-    }
-    candidate_payload = {
-        "schema_version": 1,
-        "candidate_id": candidate_id,
-        "pit_bundle_sha256": evaluation["pit_bundle_sha256"],
-        "effective_policy_sha256": evaluation["effective_policy_sha256"],
-        "full": evaluation["full"],
-        "holdout": evaluation["holdout"],
-    }
-    comparison_payload = {
-        "schema_version": 1,
-        "candidate_id": candidate_id,
-        "accepted": comparison.accepted,
-        "full_objective_delta": comparison.full_objective_delta,
-        "holdout_objective_delta": comparison.holdout_objective_delta,
-        "full_checks": dict(comparison.full_checks),
-        "holdout_checks": dict(comparison.holdout_checks),
-        "holdout_minimum_closed_trades": comparison.holdout_minimum_closed_trades,
-        "provider_call_record_sha256s": list(call_sha256s),
-    }
+    if verification_only:
+        if comparison is not None or verification_scope is None:
+            raise ValueError("verification artifact inputs are inconsistent")
+        scope = _validate_verification_scope(verification_scope)
+        if evaluation.get("scope") != scope:
+            raise ValueError("verification artifact scope differs from evaluation")
+        baseline_payload = {
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "performance_acceptance_eligible": False,
+            "reference_baseline": baseline,
+            "scope": scope,
+            "verification_only": True,
+        }
+        candidate_payload = {
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "effective_policy_sha256": evaluation["effective_policy_sha256"],
+            "performance_acceptance_eligible": False,
+            "pit_bundle_sha256": evaluation["pit_bundle_sha256"],
+            "scope": scope,
+            "verification": evaluation["verification"],
+            "verification_only": True,
+        }
+        comparison_payload = {
+            "schema_version": 1,
+            "accepted": None,
+            "candidate_id": candidate_id,
+            "performance_acceptance_eligible": False,
+            "provider_call_record_sha256s": list(call_sha256s),
+            "verification_checks": {
+                "aggregate_schema": True,
+                "candidate_policy_delta": True,
+                "known_strategy_activity": True,
+                "sealed_input_identity": True,
+            },
+            "verification_only": True,
+        }
+    else:
+        if comparison is None or verification_scope is not None:
+            raise ValueError("full optimization artifact inputs are inconsistent")
+        baseline_payload = {
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "baseline": baseline,
+        }
+        candidate_payload = {
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "pit_bundle_sha256": evaluation["pit_bundle_sha256"],
+            "effective_policy_sha256": evaluation["effective_policy_sha256"],
+            "full": evaluation["full"],
+            "holdout": evaluation["holdout"],
+        }
+        comparison_payload = {
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "accepted": comparison.accepted,
+            "full_objective_delta": comparison.full_objective_delta,
+            "holdout_objective_delta": comparison.holdout_objective_delta,
+            "full_checks": dict(comparison.full_checks),
+            "holdout_checks": dict(comparison.holdout_checks),
+            "holdout_minimum_closed_trades": comparison.holdout_minimum_closed_trades,
+            "provider_call_record_sha256s": list(call_sha256s),
+        }
     final_root = root / f"pit-optimization-{run_id}"
     if final_root.exists() or final_root.is_symlink():
         raise ValueError("optimization artifact set already exists")
@@ -1668,6 +2029,18 @@ def run_pit_optimization_canary(
     artifacts: tuple[tuple[Path, str], ...] = ()
     call_sha256s: list[str] = []
     cleanup: PitOptimizationCleanup | None = None
+    readiness_primitive = _json_primitive(readiness.primitive)
+    if not isinstance(readiness_primitive, dict):
+        raise ValueError("canary readiness payload is malformed")
+    evaluation_contract = readiness_primitive.get("evaluation_contract")
+    if not isinstance(evaluation_contract, dict):
+        raise ValueError("canary readiness evaluation contract is absent")
+    verification_only = evaluation_contract.get("verification_only")
+    verification_scope = evaluation_contract.get("scope")
+    if type(verification_only) is not bool or not isinstance(verification_scope, Mapping):
+        raise ValueError("canary readiness evaluation scope is malformed")
+    if verification_only:
+        verification_scope = _validate_verification_scope(verification_scope)
 
     def verify_boundary(*, candidate_is_patched: bool = False) -> None:
         _readiness_identity(
@@ -1757,9 +2130,16 @@ def run_pit_optimization_canary(
                 if (candidate_path / selected.path).read_bytes() != rewritten:
                     raise ValueError("candidate evaluator mutated the disposable source")
                 verify_boundary(candidate_is_patched=True)
-                comparison = _candidate_comparison(readiness, evaluation, selected)
-                accepted = comparison.accepted
-                status = "accepted" if accepted else "rejected"
+                comparison: OptimizationComparison | None
+                if verification_only:
+                    _validate_verification_candidate(readiness, evaluation, selected)
+                    comparison = None
+                    accepted = None
+                    status = "verified"
+                else:
+                    comparison = _candidate_comparison(readiness, evaluation, selected)
+                    accepted = comparison.accepted
+                    status = "accepted" if accepted else "rejected"
                 artifacts = _write_canary_artifacts(
                     artifact_root,
                     run_id=run_id,
@@ -1769,6 +2149,10 @@ def run_pit_optimization_canary(
                     comparison=comparison,
                     diff=diff,
                     call_sha256s=call_sha256s,
+                    verification_only=verification_only,
+                    verification_scope=(
+                        verification_scope if verification_only else None
+                    ),
                 )
                 try:
                     verify_boundary(candidate_is_patched=True)
@@ -1805,6 +2189,7 @@ def run_pit_optimization_canary(
         spent_usd=spent,
         source_modified=cleanup.source_modified,
         cleanup_complete=cleanup.cleanup_complete,
+        verification_only=verification_only,
     )
 
 
@@ -1814,6 +2199,13 @@ def _provider_payload(primitive: Mapping[str, object]) -> dict[str, object]:
     full = baseline["full"]
     holdout = baseline["holdout"]
     assert isinstance(full, Mapping) and isinstance(holdout, Mapping)
+    evaluation_contract = primitive["evaluation_contract"]
+    assert isinstance(evaluation_contract, Mapping)
+    provider_contract = _json_primitive(evaluation_contract)
+    assert isinstance(provider_contract, dict)
+    provider_scope = provider_contract.get("scope")
+    assert isinstance(provider_scope, dict)
+    provider_scope.pop("symbols", None)
     return {
         "schema_version": 1,
         "identities": primitive["identities"],
@@ -1826,6 +2218,7 @@ def _provider_payload(primitive: Mapping[str, object]) -> dict[str, object]:
         "evidence_ids": list(_EVIDENCE_IDS),
         "invariant_ids": list(_INVARIANT_IDS),
         "editable_path": ENTRY_CONTRACT_PATH,
+        "evaluation_contract": provider_contract,
     }
 
 
@@ -1889,6 +2282,14 @@ def prepare_pit_optimization(
             baseline_run, policy=policy
         )
     verify_sealed_baseline_artifacts(baseline_run, baseline_artifacts)
+    verification_scope: dict[str, object] | None = None
+    if config.verification_subset:
+        with PITDataBundle(bundle_path, expected_sha256=config.pit_bundle_sha256) as bundle:
+            verification_scope = _build_verification_scope(bundle, baseline_run)
+    evaluation_contract = _evaluation_contract(
+        verification_subset=config.verification_subset,
+        verification_scope=verification_scope,
+    )
     catalog_payload = [
         {
             "candidate_id": item.candidate_id,
@@ -1933,6 +2334,7 @@ def prepare_pit_optimization(
             "apply": False,
             "provider_retries": 0,
         },
+        "evaluation_contract": evaluation_contract,
         "candidate_catalog": catalog_payload,
         "effective_policy": policy,
         "baseline": baseline,
@@ -2107,6 +2509,104 @@ def evaluate_full_pit_candidate(
         }
 
 
+def evaluate_verification_pit_candidate(
+    *,
+    pit_bundle: Path,
+    pit_bundle_sha256: str,
+    verification_scope: Mapping[str, object],
+) -> dict[str, object]:
+    """Run the production simulator on one deterministic verification-only slice."""
+
+    scope = _validate_verification_scope(verification_scope)
+    bundle_path = _regular_file(pit_bundle, "verification PIT bundle")
+    if pit_bundle_sha256 != PIT_BUNDLE_SHA256 or _sha256_file(bundle_path) != pit_bundle_sha256:
+        raise ValueError("verification PIT bundle identity differs")
+    from core.backtest_engine import PortfolioSimulator
+    from core.engine_policy import effective_engine_policy_sha256
+    from core.pit_data import PITDataBundle
+
+    with PITDataBundle(bundle_path, expected_sha256=pit_bundle_sha256) as bundle:
+        symbols = list(scope["symbols"])
+        if not set(symbols).issubset(set(bundle.symbols()) - {"SPY"}):
+            raise ValueError("verification symbols differ from the sealed PIT bundle")
+        simulator = PortfolioSimulator(pit_bundle=bundle, signal_every_n_days=1)
+        result = simulator.run(
+            symbols,
+            start_date=str(scope["warmup_start"]),
+            end_date=str(scope["measurement_end"]),
+            benchmark_symbol=str(scope["benchmark"]),
+        )
+        if result.config.get("data_mode") != "point_in_time" or (
+            result.config.get("pit_bundle_sha256") != pit_bundle_sha256
+        ):
+            raise ValueError("verification result did not use the sealed PIT bundle")
+        policy = result.config.get("effective_engine_policy")
+        policy_sha = result.config.get("effective_engine_policy_sha256")
+        if not isinstance(policy, dict) or not isinstance(policy_sha, str) or (
+            effective_engine_policy_sha256(policy) != policy_sha
+            or simulator._verify_effective_engine_policy() != policy_sha
+        ):
+            raise ValueError("verification effective policy identity is invalid")
+        equity = pd.DataFrame(
+            {
+                "date": pd.to_datetime(result.equity_curve.index),
+                "portfolio": result.equity_curve.values,
+                "benchmark": result.benchmark_curve.reindex(result.equity_curve.index).values,
+            }
+        )
+        transactions = result.transaction_log.copy()
+        weekly = result.weekly_holdings.copy()
+        outcomes = _entry_outcomes_frame(result.entry_outcomes)
+        sessions = pd.DatetimeIndex(pd.to_datetime(equity["date"])).normalize()
+        measurement_start = str(scope["measurement_start"])
+        measurement_end = str(scope["measurement_end"])
+        measured_sessions = sessions[
+            (sessions >= pd.Timestamp(measurement_start))
+            & (sessions <= pd.Timestamp(measurement_end))
+        ]
+        if len(measured_sessions) != _VERIFICATION_SESSION_COUNT:
+            raise ValueError("verification replay did not produce sixty measured sessions")
+        thresholds = _policy_thresholds(policy)
+        trades = aggregate_transaction_window(
+            transactions,
+            sessions=sessions,
+            start_date=measurement_start,
+            end_date=measurement_end,
+        )
+        window = {
+            "performance": aggregate_equity_window(
+                equity,
+                start_date=measurement_start,
+                end_date=measurement_end,
+                closed_trades=int(trades["closed_trades"]),
+            ),
+            "trades": trades,
+            "weekly": aggregate_weekly_window(
+                weekly, start_date=measurement_start, end_date=measurement_end
+            ),
+            "funnel": aggregate_signal_funnel(
+                result.signal_log,
+                outcomes,
+                start_date=measurement_start,
+                end_date=measurement_end,
+                min_current_growth=thresholds["min_current_growth"],
+                min_annual_growth=thresholds["min_annual_growth"],
+                min_rs_score=thresholds["min_rs_score"],
+                min_composite_score=thresholds["min_entry_composite_score"],
+            ),
+        }
+        return {
+            "schema_version": 1,
+            "verification_only": True,
+            "performance_acceptance_eligible": False,
+            "pit_bundle_sha256": pit_bundle_sha256,
+            "effective_policy_sha256": policy_sha,
+            "effective_policy": policy,
+            "scope": scope,
+            "verification": window,
+        }
+
+
 def _worker_main(arguments: Sequence[str]) -> int:
     """Exact container-only evaluator entrypoint admitted by SandboxRunner."""
 
@@ -2116,6 +2616,8 @@ def _worker_main(arguments: Sequence[str]) -> int:
     parser.add_argument("--worker-evaluate", action="store_true", required=True)
     parser.add_argument("--pit-bundle", type=Path, required=True)
     parser.add_argument("--pit-bundle-sha256", required=True)
+    parser.add_argument("--verification-subset", type=Path)
+    parser.add_argument("--verification-subset-sha256")
     parser.add_argument("--output", type=Path, required=True)
     namespace = parser.parse_args(list(arguments))
     if (
@@ -2123,12 +2625,45 @@ def _worker_main(arguments: Sequence[str]) -> int:
         or namespace.output
         != Path("/workspace/output/pit-optimization-result.json")
         or _SHA256_RE.fullmatch(namespace.pit_bundle_sha256 or "") is None
+        or (namespace.verification_subset is None)
+        != (namespace.verification_subset_sha256 is None)
     ):
         raise ValueError("PIT optimization worker paths or identity are invalid")
-    value = evaluate_full_pit_candidate(
-        pit_bundle=namespace.pit_bundle,
-        pit_bundle_sha256=namespace.pit_bundle_sha256,
-    )
+    verification_scope: Mapping[str, object] | None = None
+    if namespace.verification_subset is not None:
+        if (
+            namespace.verification_subset
+            != Path("/workspace/data/pit-optimization-verification-subset.json")
+            or _SHA256_RE.fullmatch(namespace.verification_subset_sha256 or "") is None
+        ):
+            raise ValueError("PIT optimization verification input is invalid")
+        scope_path = _regular_file(
+            namespace.verification_subset, "verification subset manifest"
+        )
+        if _sha256_file(scope_path) != namespace.verification_subset_sha256:
+            raise ValueError("PIT optimization verification input identity differs")
+        try:
+            scope_value = json.loads(scope_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("PIT optimization verification input is malformed") from exc
+        if not isinstance(scope_value, Mapping):
+            raise ValueError("PIT optimization verification scope must be an object")
+        verification_scope = _validate_verification_scope(scope_value)
+    from contextlib import redirect_stderr, redirect_stdout
+
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with redirect_stdout(sink), redirect_stderr(sink):
+            if verification_scope is None:
+                value = evaluate_full_pit_candidate(
+                    pit_bundle=namespace.pit_bundle,
+                    pit_bundle_sha256=namespace.pit_bundle_sha256,
+                )
+            else:
+                value = evaluate_verification_pit_candidate(
+                    pit_bundle=namespace.pit_bundle,
+                    pit_bundle_sha256=namespace.pit_bundle_sha256,
+                    verification_scope=verification_scope,
+                )
     payload = _canonical_json_bytes(value)
     with namespace.output.open("xb") as handle:
         handle.write(payload)
