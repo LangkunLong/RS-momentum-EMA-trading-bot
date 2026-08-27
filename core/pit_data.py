@@ -318,6 +318,7 @@ class PITDataBundle:
         self._connection = connection
         try:
             self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA temp_store=MEMORY")
             self._connection.execute("PRAGMA query_only=ON")
             self._validate_schema()
             self.metadata = self._load_metadata()
