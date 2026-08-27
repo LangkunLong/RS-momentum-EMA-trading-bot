@@ -43,10 +43,10 @@ PIT_OPTIMIZATION_SYSTEM_PROMPTS = MappingProxyType(
         "reasoner": (
             "You are the PIT Optimization Reasoner. Return exactly one JSON object with exactly "
             "hypothesis, evidence_ids, invariant_ids, candidate_id, skip, and skip_reason. Use "
-            "only the supplied aggregate metrics and closed IDs. For skip=false, choose exactly "
-            "one supplied candidate_id, cite sorted unique supplied evidence and invariant IDs, "
-            "and leave skip_reason empty. For skip=true, candidate_id is empty and skip_reason is "
-            "nonempty. Do not invent a value, file, replacement, source fact, external knowledge, "
+            "only the supplied aggregate metrics and closed IDs. This cycle requires exactly one "
+            "candidate: set skip to false, set skip_reason to the empty string, choose exactly one "
+            "supplied candidate_id, and cite nonempty sorted unique supplied evidence and invariant "
+            "IDs. Do not invent a value, file, replacement, source fact, external knowledge, "
             "retrieval, command, or chain-of-thought. Return JSON only."
         ),
         "coder": (
@@ -275,24 +275,16 @@ class PitOptimizationReasoning:
                 }
             ),
         )
-        if type(value["skip"]) is not bool:
-            raise ValueError("reasoner skip must be boolean")
+        if value["skip"] is not False:
+            raise ValueError("reasoner must choose exactly one catalog candidate")
         skip = value["skip"]
         hypothesis = _closed_text(value["hypothesis"], "reasoner hypothesis")
-        candidate_id = _closed_text(
-            value["candidate_id"], "reasoner candidate ID", allow_empty=skip
-        )
+        candidate_id = _closed_text(value["candidate_id"], "reasoner candidate ID")
         skip_reason = _closed_text(
-            value["skip_reason"], "reasoner skip reason", allow_empty=not skip
+            value["skip_reason"], "reasoner skip reason", allow_empty=True
         )
-        evidence_ids = _closed_ids(
-            value["evidence_ids"], "reasoner evidence IDs", allow_empty=skip
-        )
-        invariant_ids = _closed_ids(
-            value["invariant_ids"], "reasoner invariant IDs", allow_empty=skip
-        )
-        if skip:
-            raise ValueError("reasoner must choose exactly one catalog candidate")
+        evidence_ids = _closed_ids(value["evidence_ids"], "reasoner evidence IDs")
+        invariant_ids = _closed_ids(value["invariant_ids"], "reasoner invariant IDs")
         if candidate_id not in _CATALOG or skip_reason:
             raise ValueError("reasoner must choose exactly one catalog candidate")
         return cls(
@@ -632,9 +624,9 @@ _RESPONSE_SCHEMAS = MappingProxyType(
                 "hypothesis": {"type": "string"},
                 "evidence_ids": {"type": "array", "items": {"type": "string"}},
                 "invariant_ids": {"type": "array", "items": {"type": "string"}},
-                "candidate_id": {"type": "string", "enum": ["", *tuple(_CATALOG)]},
-                "skip": {"type": "boolean"},
-                "skip_reason": {"type": "string"},
+                "candidate_id": {"type": "string", "enum": list(_CATALOG)},
+                "skip": {"type": "boolean", "enum": [False]},
+                "skip_reason": {"type": "string", "enum": [""]},
             },
         },
         "coder": {

@@ -12102,35 +12102,6 @@ def _pit_call_gateway_accounted(
         usage = facts.usage
         call_index = complete_call_index(usage, facts_call_index=facts.call_index)
         audit._pit_call_count = call_index
-        rejected = ProviderCallRecord(
-            schema_version=1,
-            call_index=call_index,
-            iteration=1,
-            role=role,
-            api_backend="openrouter",
-            requested_model=facts.requested_model,
-            returned_model=facts.returned_model,
-            outcome=(
-                "budget_exceeded"
-                if isinstance(exc, AccountedBudgetExceededError)
-                else "protocol_invalid"
-            ),
-            finish_reason=facts.finish_reason,
-            response_schema_valid=False,
-            accounting_complete=True,
-            prompt_tokens=usage.prompt_tokens,
-            cached_tokens=usage.cached_tokens,
-            completion_tokens=usage.completion_tokens,
-            reasoning_tokens=usage.reasoning_tokens,
-            total_tokens=usage.total_tokens,
-            cost_usd=usage.cost_usd,
-            accounting_source=usage.accounting_source,
-            protocol_failure_code=(
-                facts.protocol_failure_code
-                or ProtocolFailureCode.VALIDATOR_BOUNDARY_INVALID
-            ),
-        )
-        audit.write_provider_call(rejected)
         raise
     except IncompleteAccountingError as exc:
         facts = exc.facts
