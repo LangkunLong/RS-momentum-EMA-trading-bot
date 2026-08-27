@@ -149,6 +149,22 @@ class ConfigurationError(ValueError):
     """Raised when the controller's local configuration is not safe to use."""
 
 
+class PitProviderFailurePhase(str, Enum):
+    """Closed, content-free phase for one failed PIT provider-call boundary."""
+
+    PRE_CALL = "pre_call"
+    REQUEST_INVOCATION = "request_invocation"
+    RESPONSE_VALIDATION = "response_validation"
+    LEDGER_RECONCILIATION = "ledger_reconciliation"
+    PROVIDER_RECORD_WRITE = "provider_record_write"
+    TERMINAL_AUDIT_WRITE = "terminal_audit_write"
+
+
+_PIT_OPTIMIZATION_PROVIDER_STAGES = frozenset(
+    f"pit_optimization_{phase.value}" for phase in PitProviderFailurePhase
+)
+
+
 _CONTROLLER_INITIALIZATION_STAGES = frozenset(
     {
         "git_capability",
@@ -175,7 +191,7 @@ _CONTROLLER_INITIALIZATION_STAGES = frozenset(
         "controller_run",
         "cleanup",
     }
-)
+) | _PIT_OPTIMIZATION_PROVIDER_STAGES
 
 
 class ControllerInitializationError(RuntimeError):
@@ -186,6 +202,24 @@ class ControllerInitializationError(RuntimeError):
             raise ConfigurationError("controller initialization stage is invalid")
         super().__init__(stage)
         self.stage = stage
+
+
+class PitProviderCallFailure(RuntimeError):
+    """Propagate one closed PIT provider phase without provider exception content."""
+
+    def __init__(
+        self,
+        phase: PitProviderFailurePhase,
+        *,
+        terminal_audit_persisted: bool,
+    ) -> None:
+        if not isinstance(phase, PitProviderFailurePhase):
+            raise ConfigurationError("PIT provider failure phase is invalid")
+        if type(terminal_audit_persisted) is not bool:
+            raise ConfigurationError("PIT provider audit persistence fact is invalid")
+        super().__init__(phase.value)
+        self.phase = phase
+        self.terminal_audit_persisted = terminal_audit_persisted
 
 
 def _closed_source_preflight_stage(exc: "PreflightError") -> str:
@@ -517,6 +551,19 @@ class DataBundleError(ValueError):
 
 class AuditError(RuntimeError):
     """A sanitized audit artifact could not be written or verified safely."""
+
+
+class ProviderCallAuditError(AuditError):
+    """Carry only the closed provider-record audit phase across the writer boundary."""
+
+    def __init__(self, phase: PitProviderFailurePhase) -> None:
+        if phase not in {
+            PitProviderFailurePhase.PROVIDER_RECORD_WRITE,
+            PitProviderFailurePhase.TERMINAL_AUDIT_WRITE,
+        }:
+            raise ConfigurationError("provider-call audit phase is invalid")
+        super().__init__(phase.value)
+        self.phase = phase
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1070,7 +1117,7 @@ class AgentCompletion(Generic[PayloadT]):
 
 @dataclass(frozen=True)
 class ProviderCallRecord:
-    """Closed paid-call accounting; prompts and response content are intentionally absent."""
+    """Closed call accounting; prompts and response content are intentionally absent."""
 
     schema_version: int
     call_index: int
@@ -1083,42 +1130,63 @@ class ProviderCallRecord:
     finish_reason: str
     response_schema_valid: bool
     accounting_complete: bool
-    prompt_tokens: int
+    prompt_tokens: int | None
     cached_tokens: int | None
-    completion_tokens: int
+    completion_tokens: int | None
     reasoning_tokens: int | None
-    total_tokens: int
-    cost_usd: float
-    accounting_source: str = "inline"
+    total_tokens: int | None
+    cost_usd: float | None
+    accounting_source: str | None = "inline"
     protocol_failure_code: ProtocolFailureCode | None = None
+    failure_phase: PitProviderFailurePhase | None = None
+    request_started: bool | None = None
+    response_received: bool | None = None
+    locally_accounted: bool | None = None
+    authoritative_spend_known: bool | None = None
+    retained_reservation_usd: float | None = None
+    retained_reservation_tokens: int | None = None
+    maximum_exposure_usd: float | None = None
+    maximum_exposure_tokens: int | None = None
+    exposure_basis: str | None = None
+    ledger_snapshot: BudgetSnapshot | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ConfigurationError("provider call schema version must be 1")
+        if self.schema_version not in {1, 2}:
+            raise ConfigurationError("provider call schema version is invalid")
         if type(self.call_index) is not int or self.call_index < 1:
             raise ConfigurationError("provider call index must be positive")
         if type(self.iteration) is not int or self.iteration < 1:
             raise ConfigurationError("provider call iteration must be positive")
         if self.role not in {"orchestrator", "reasoner", "coder"}:
             raise ConfigurationError("provider call role is invalid")
-        if self.api_backend != "openrouter" or self.outcome not in {
-            "accepted",
-            "protocol_invalid",
-            "budget_exceeded",
-        }:
+        allowed_outcomes = (
+            {"accepted", "protocol_invalid", "budget_exceeded"}
+            if self.schema_version == 1
+            else {"failed"}
+        )
+        if self.api_backend != "openrouter" or self.outcome not in allowed_outcomes:
             raise ConfigurationError("provider call backend/outcome is invalid")
         if self.finish_reason not in {"stop", "non_stop", "unknown"}:
             raise ConfigurationError("provider call finish reason is invalid")
-        if self.accounting_complete is not True or type(self.response_schema_valid) is not bool:
-            raise ConfigurationError("provider call must have complete validated accounting")
-        if self.accounting_source not in {"inline", "generation_endpoint"}:
-            raise ConfigurationError("provider call accounting source is invalid")
-        if _MODEL_SLUG_RE.fullmatch(self.requested_model) is None:
+        if type(self.response_schema_valid) is not bool:
+            raise ConfigurationError("provider response schema fact must be boolean")
+        if self.requested_model != "unknown" and _MODEL_SLUG_RE.fullmatch(
+            self.requested_model
+        ) is None:
             raise ConfigurationError("provider call requested model is invalid")
         if self.returned_model != "unknown" and _MODEL_SLUG_RE.fullmatch(
             self.returned_model
         ) is None:
             raise ConfigurationError("provider call returned model is invalid")
+        if self.schema_version == 2:
+            self._validate_failure_record()
+            return
+        if self.accounting_complete is not True:
+            raise ConfigurationError("provider call must have complete validated accounting")
+        if self.accounting_source not in {"inline", "generation_endpoint"}:
+            raise ConfigurationError("provider call accounting source is invalid")
+        if self.requested_model == "unknown":
+            raise ConfigurationError("accounted provider call requires a requested model")
         if self.outcome in {"accepted", "budget_exceeded"} and self.response_schema_valid:
             if self.finish_reason != "stop" or self.requested_model != self.returned_model:
                 raise ConfigurationError("validated provider call identity is inconsistent")
@@ -1131,6 +1199,37 @@ class ProviderCallRecord:
                 raise ConfigurationError("validated provider call cannot have a failure code")
         elif not isinstance(self.protocol_failure_code, ProtocolFailureCode):
             raise ConfigurationError("rejected provider call requires a closed failure code")
+        if any(
+            value is not None
+            for value in (
+                self.failure_phase,
+                self.request_started,
+                self.response_received,
+                self.locally_accounted,
+                self.authoritative_spend_known,
+                self.retained_reservation_usd,
+                self.retained_reservation_tokens,
+                self.maximum_exposure_usd,
+                self.maximum_exposure_tokens,
+                self.exposure_basis,
+                self.ledger_snapshot,
+            )
+        ):
+            raise ConfigurationError("version 1 provider call has failure-only fields")
+        if any(
+            value is None
+            for value in (
+                self.prompt_tokens,
+                self.completion_tokens,
+                self.total_tokens,
+                self.cost_usd,
+            )
+        ):
+            raise ConfigurationError("accounted provider call requires complete usage")
+        assert self.prompt_tokens is not None
+        assert self.completion_tokens is not None
+        assert self.total_tokens is not None
+        assert self.cost_usd is not None
         Usage(
             prompt_tokens=self.prompt_tokens,
             completion_tokens=self.completion_tokens,
@@ -1141,6 +1240,108 @@ class ProviderCallRecord:
         )
         if self.total_tokens != self.prompt_tokens + self.completion_tokens:
             raise ConfigurationError("provider call token total is inconsistent")
+
+    def _validate_failure_record(self) -> None:
+        if not isinstance(self.failure_phase, PitProviderFailurePhase):
+            raise ConfigurationError("failed provider call requires a closed phase")
+        if (
+            type(self.request_started) is not bool
+            or (
+                self.response_received is not None
+                and type(self.response_received) is not bool
+            )
+            or type(self.locally_accounted) is not bool
+            or type(self.authoritative_spend_known) is not bool
+        ):
+            raise ConfigurationError("failed provider call lifecycle facts are invalid")
+        if self.protocol_failure_code is not None and not isinstance(
+            self.protocol_failure_code, ProtocolFailureCode
+        ):
+            raise ConfigurationError("failed provider protocol code is invalid")
+        if self.response_received is True and self.request_started is not True:
+            raise ConfigurationError("provider response cannot precede request start")
+        if self.locally_accounted and self.request_started is not True:
+            raise ConfigurationError("local provider accounting cannot precede request start")
+        if self.accounting_complete is not self.authoritative_spend_known:
+            raise ConfigurationError("failed provider accounting completeness is inconsistent")
+        if self.authoritative_spend_known and not self.locally_accounted:
+            raise ConfigurationError("authoritative spend requires local accounting")
+        if not isinstance(self.ledger_snapshot, BudgetSnapshot):
+            raise ConfigurationError("failed provider call requires a budget snapshot")
+        if (
+            type(self.maximum_exposure_usd) not in {int, float}
+            or not math.isfinite(self.maximum_exposure_usd)
+            or self.maximum_exposure_usd < 0
+            or type(self.maximum_exposure_tokens) is not int
+            or self.maximum_exposure_tokens < 0
+        ):
+            raise ConfigurationError("failed provider maximum exposure is invalid")
+        retained_present = (
+            self.retained_reservation_usd is not None
+            or self.retained_reservation_tokens is not None
+        )
+        if retained_present and (
+            type(self.retained_reservation_usd) not in {int, float}
+            or not math.isfinite(self.retained_reservation_usd)
+            or self.retained_reservation_usd < 0
+            or type(self.retained_reservation_tokens) is not int
+            or self.retained_reservation_tokens < 0
+        ):
+            raise ConfigurationError("failed provider retained reservation is invalid")
+        if self.authoritative_spend_known:
+            if self.exposure_basis != "authoritative" or retained_present:
+                raise ConfigurationError("authoritative failed-call exposure is inconsistent")
+            if self.accounting_source not in {"inline", "generation_endpoint"}:
+                raise ConfigurationError("authoritative failed-call source is invalid")
+            if any(
+                value is None
+                for value in (
+                    self.prompt_tokens,
+                    self.completion_tokens,
+                    self.total_tokens,
+                    self.cost_usd,
+                )
+            ):
+                raise ConfigurationError("authoritative failed call requires complete usage")
+            assert self.prompt_tokens is not None
+            assert self.completion_tokens is not None
+            assert self.total_tokens is not None
+            assert self.cost_usd is not None
+            Usage(
+                prompt_tokens=self.prompt_tokens,
+                completion_tokens=self.completion_tokens,
+                total_tokens=self.total_tokens,
+                cached_tokens=self.cached_tokens,
+                reasoning_tokens=self.reasoning_tokens,
+                cost_usd=self.cost_usd,
+                accounting_source=self.accounting_source,
+            )
+            if self.total_tokens != self.prompt_tokens + self.completion_tokens:
+                raise ConfigurationError("authoritative failed-call token total is inconsistent")
+            if self.cost_usd > self.maximum_exposure_usd:
+                raise ConfigurationError("authoritative spend exceeds recorded maximum exposure")
+        else:
+            if any(
+                value is not None
+                for value in (
+                    self.prompt_tokens,
+                    self.cached_tokens,
+                    self.completion_tokens,
+                    self.reasoning_tokens,
+                    self.total_tokens,
+                    self.cost_usd,
+                    self.accounting_source,
+                )
+            ):
+                raise ConfigurationError("incomplete failed call cannot claim exact usage")
+            expected_basis = "retained_reservation" if retained_present else "maximum_exposure"
+            if self.exposure_basis != expected_basis:
+                raise ConfigurationError("incomplete failed-call exposure basis is inconsistent")
+            if retained_present and (
+                self.retained_reservation_usd > self.maximum_exposure_usd
+                or self.retained_reservation_tokens > self.maximum_exposure_tokens
+            ):
+                raise ConfigurationError("retained reservation exceeds recorded maximum exposure")
 
 
 @dataclass(frozen=True)
@@ -8764,8 +8965,13 @@ class AuditTrail:
         elif payload_sha256 is not None:
             raise AuditError("rejected provider call cannot bind a validated payload digest")
         path = self.run_root / f"provider-call-{record.call_index:04d}.json"
-        self._write_json(path, asdict(record))
-        digest = _file_sha256(path)
+        try:
+            self._write_json(path, asdict(record))
+            digest = _file_sha256(path)
+        except Exception as exc:
+            raise ProviderCallAuditError(
+                PitProviderFailurePhase.PROVIDER_RECORD_WRITE
+            ) from exc
         state = {
             "orchestrator": LoopState.CALL_ORCHESTRATOR,
             "reasoner": LoopState.CALL_REASONER,
@@ -8781,11 +8987,33 @@ class AuditTrail:
             details["protocol_failure_code"] = record.protocol_failure_code.value
         if payload_sha256 is not None:
             details["payload_sha256"] = payload_sha256
-        self.append_event(
-            state,
-            "provider_call_accepted" if record.outcome == "accepted" else "provider_call_rejected",
-            details,
-        )
+        if record.schema_version == 2:
+            details.update(
+                {
+                    "failure_phase": record.failure_phase.value,
+                    "request_started": record.request_started,
+                    "response_received": record.response_received,
+                    "locally_accounted": record.locally_accounted,
+                    "authoritative_spend_known": record.authoritative_spend_known,
+                    "exposure_basis": record.exposure_basis,
+                    "maximum_exposure_usd": record.maximum_exposure_usd,
+                    "maximum_exposure_tokens": record.maximum_exposure_tokens,
+                    "ledger_snapshot": asdict(record.ledger_snapshot),
+                }
+            )
+            if record.retained_reservation_usd is not None:
+                details["retained_reservation_usd"] = record.retained_reservation_usd
+                details["retained_reservation_tokens"] = record.retained_reservation_tokens
+        event = {
+            "accepted": "provider_call_accepted",
+            "failed": "provider_call_failed",
+        }.get(record.outcome, "provider_call_rejected")
+        try:
+            self.append_event(state, event, details)
+        except Exception as exc:
+            raise ProviderCallAuditError(
+                PitProviderFailurePhase.TERMINAL_AUDIT_WRITE
+            ) from exc
         return path, digest
 
     def write_provider_evidence(
@@ -11452,6 +11680,278 @@ def _pit_call_gateway(
     request_method: str = "request_pit_diagnosis_once",
     payload_types: tuple[type[object], ...] | None = None,
 ) -> tuple[object, str]:
+    """Run one PIT call with durable start, terminal, and conservative exposure facts."""
+    phase = PitProviderFailurePhase.PRE_CALL
+    request_started = False
+    terminal_audit_persisted = False
+    gateway = getattr(services, "gateway", None)
+    ledger = getattr(gateway, "ledger", None)
+    before: BudgetSnapshot | None = None
+    maximum_exposure_usd = 0.0
+    maximum_exposure_tokens = 0
+    planned_call_index = 1
+    requested_model = "unknown"
+    state = {
+        "orchestrator": LoopState.CALL_ORCHESTRATOR,
+        "reasoner": LoopState.CALL_REASONER,
+        "coder": LoopState.CALL_CODER,
+    }.get(role)
+
+    try:
+        if not isinstance(audit, AuditTrail) or state is None:
+            raise AuditError("PIT provider audit boundary is invalid")
+        if not isinstance(ledger, BudgetLedger):
+            raise ConfigurationError("PIT gateway ledger is not the bounded controller ledger")
+        if monotonic() >= deadline:
+            raise BudgetExceededError("PIT provider wall deadline reached")
+        method = getattr(gateway, request_method, None)
+        if not callable(method):
+            raise ConfigurationError("PIT gateway has no isolated request method")
+        models = getattr(gateway, "_MODELS", {})
+        model = models.get(role) if isinstance(models, Mapping) else None
+        if not isinstance(model, str) or _MODEL_SLUG_RE.fullmatch(model) is None:
+            raise ConfigurationError("PIT gateway requested model is invalid")
+        requested_model = model
+        prior_call_index = getattr(audit, "_pit_call_count", 0)
+        if type(prior_call_index) is not int or prior_call_index < 0:
+            raise AuditError("PIT provider call counter is invalid")
+        if prior_call_index != ledger.calls:
+            raise AuditError("PIT provider call counter and ledger are out of sync")
+        planned_call_index = prior_call_index + 1
+        before = _budget_snapshot(ledger)
+        maximum_exposure_usd = max(0.0, float(ledger.max_usd - ledger.committed_usd))
+        maximum_exposure_tokens = max(0, ledger.max_tokens - ledger.reserved_tokens)
+
+        # Complete every controller-owned operation that can fail without provider
+        # exposure before durably declaring that the paid request is starting.
+        _provider_dynamic_payload(dynamic, services.known_secrets)
+        import inspect
+
+        try:
+            inspect.signature(method)
+        except (TypeError, ValueError):
+            pass
+        audit.append_event(
+            state,
+            "provider_call_started",
+            {
+                "call_index": planned_call_index,
+                "role": role,
+                "requested_model": requested_model,
+                "request_started": True,
+                "reservation_state": "pending_gateway",
+                "maximum_exposure_usd": maximum_exposure_usd,
+                "maximum_exposure_tokens": maximum_exposure_tokens,
+                "ledger_snapshot": asdict(before),
+            },
+        )
+        request_started = True
+        phase = PitProviderFailurePhase.REQUEST_INVOCATION
+        return _pit_call_gateway_accounted(
+            audit,
+            services,
+            role,
+            dynamic,
+            parser,
+            deadline=deadline,
+            monotonic=monotonic,
+            request_method=request_method,
+            payload_types=payload_types,
+        )
+    except PitProviderCallFailure:
+        raise
+    except Exception as exc:
+        if isinstance(exc, ProviderCallAuditError):
+            phase = exc.phase
+        elif isinstance(exc, AccountedResponseValidationError):
+            phase = PitProviderFailurePhase.RESPONSE_VALIDATION
+        elif isinstance(
+            exc,
+            (
+                AccountedBudgetExceededError,
+                IncompleteAccountingError,
+                AccountingValidationError,
+            ),
+        ):
+            phase = PitProviderFailurePhase.LEDGER_RECONCILIATION
+        elif isinstance(exc, ResponseValidationError):
+            phase = PitProviderFailurePhase.RESPONSE_VALIDATION
+        elif isinstance(exc, AuditError) and request_started:
+            phase = PitProviderFailurePhase.PROVIDER_RECORD_WRITE
+
+        if isinstance(ledger, BudgetLedger) and before is not None:
+            after = _budget_snapshot(ledger)
+            call_delta = after.api_calls - before.api_calls
+            prompt_delta = after.prompt_tokens - before.prompt_tokens
+            completion_delta = after.completion_tokens - before.completion_tokens
+            total_delta = after.total_tokens - before.total_tokens
+            spent_delta = after.spent_usd - before.spent_usd
+            authoritative_delta = after.authoritative_usd - before.authoritative_usd
+            retained_usd_delta = (
+                after.retained_reservation_usd - before.retained_reservation_usd
+            )
+            retained_tokens_delta = (
+                after.retained_reservation_tokens - before.retained_reservation_tokens
+            )
+            incomplete_delta = (
+                after.incomplete_accounting_calls - before.incomplete_accounting_calls
+            )
+            authoritative_spend_known = (
+                call_delta == 1
+                and incomplete_delta == 0
+                and prompt_delta >= 0
+                and completion_delta >= 0
+                and total_delta == prompt_delta + completion_delta
+                and math.isclose(
+                    spent_delta,
+                    authoritative_delta,
+                    rel_tol=1e-12,
+                    abs_tol=1e-15,
+                )
+                and math.isclose(retained_usd_delta, 0.0, rel_tol=1e-12, abs_tol=1e-15)
+                and retained_tokens_delta == 0
+            )
+            retained_reservation = (
+                call_delta == 1
+                and incomplete_delta == 1
+                and retained_tokens_delta >= 0
+                and math.isclose(
+                    spent_delta,
+                    retained_usd_delta,
+                    rel_tol=1e-12,
+                    abs_tol=1e-15,
+                )
+            )
+            locally_accounted = authoritative_spend_known or retained_reservation
+            if (
+                request_started
+                and isinstance(exc, (ConfigurationError, BudgetExceededError))
+                and locally_accounted
+            ):
+                phase = PitProviderFailurePhase.LEDGER_RECONCILIATION
+            response_received: bool | None = (
+                True
+                if phase
+                in {
+                    PitProviderFailurePhase.RESPONSE_VALIDATION,
+                    PitProviderFailurePhase.LEDGER_RECONCILIATION,
+                    PitProviderFailurePhase.PROVIDER_RECORD_WRITE,
+                    PitProviderFailurePhase.TERMINAL_AUDIT_WRITE,
+                }
+                else None
+                if request_started
+                else False
+            )
+            call_index = after.api_calls if call_delta == 1 else planned_call_index
+            maximum_exposure_usd = max(
+                maximum_exposure_usd,
+                authoritative_delta if authoritative_spend_known else 0.0,
+                retained_usd_delta if retained_reservation else 0.0,
+            )
+            maximum_exposure_tokens = max(
+                maximum_exposure_tokens,
+                total_delta if authoritative_spend_known else 0,
+                retained_tokens_delta if retained_reservation else 0,
+            )
+            accounted_facts = exc.facts if isinstance(exc, AccountedCallError) else None
+            exact_usage = accounted_facts.usage if accounted_facts is not None else None
+            record = ProviderCallRecord(
+                schema_version=2,
+                call_index=call_index,
+                iteration=1,
+                role=role,
+                api_backend="openrouter",
+                requested_model=requested_model,
+                returned_model=(
+                    accounted_facts.returned_model
+                    if accounted_facts is not None
+                    else "unknown"
+                ),
+                outcome="failed",
+                finish_reason=(
+                    accounted_facts.finish_reason
+                    if accounted_facts is not None
+                    else "unknown"
+                ),
+                response_schema_valid=(
+                    accounted_facts.response_schema_valid
+                    if accounted_facts is not None
+                    else False
+                ),
+                accounting_complete=authoritative_spend_known,
+                prompt_tokens=prompt_delta if authoritative_spend_known else None,
+                cached_tokens=(
+                    exact_usage.cached_tokens
+                    if authoritative_spend_known and exact_usage is not None
+                    else None
+                ),
+                completion_tokens=completion_delta if authoritative_spend_known else None,
+                reasoning_tokens=(
+                    exact_usage.reasoning_tokens
+                    if authoritative_spend_known and exact_usage is not None
+                    else None
+                ),
+                total_tokens=total_delta if authoritative_spend_known else None,
+                cost_usd=authoritative_delta if authoritative_spend_known else None,
+                accounting_source=(
+                    exact_usage.accounting_source
+                    if authoritative_spend_known and exact_usage is not None
+                    else "inline"
+                    if authoritative_spend_known
+                    else None
+                ),
+                protocol_failure_code=(
+                    accounted_facts.protocol_failure_code
+                    if accounted_facts is not None
+                    else None
+                ),
+                failure_phase=phase,
+                request_started=request_started,
+                response_received=response_received,
+                locally_accounted=locally_accounted,
+                authoritative_spend_known=authoritative_spend_known,
+                retained_reservation_usd=(
+                    retained_usd_delta if retained_reservation else None
+                ),
+                retained_reservation_tokens=(
+                    retained_tokens_delta if retained_reservation else None
+                ),
+                maximum_exposure_usd=maximum_exposure_usd,
+                maximum_exposure_tokens=maximum_exposure_tokens,
+                exposure_basis=(
+                    "authoritative"
+                    if authoritative_spend_known
+                    else "retained_reservation"
+                    if retained_reservation
+                    else "maximum_exposure"
+                ),
+                ledger_snapshot=after,
+            )
+            try:
+                audit.write_provider_call(record)
+                terminal_audit_persisted = True
+                if call_delta == 1:
+                    audit._pit_call_count = after.api_calls
+            except Exception:
+                terminal_audit_persisted = False
+        raise PitProviderCallFailure(
+            phase,
+            terminal_audit_persisted=terminal_audit_persisted,
+        ) from exc
+
+
+def _pit_call_gateway_accounted(
+    audit: AuditTrail,
+    services: Any,
+    role: str,
+    dynamic: Mapping[str, object],
+    parser: Callable[[str], object],
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+    request_method: str = "request_pit_diagnosis_once",
+    payload_types: tuple[type[object], ...] | None = None,
+) -> tuple[object, str]:
     """Issue one closed request and return its validated payload plus an audit hash."""
     from pit_diagnosis_agent import PitReasoningPlan, PitRoute
 
@@ -14015,6 +14515,13 @@ def _execute_cli_run(
         return result
     except ControllerInitializationError:
         raise
+    except PitProviderCallFailure as exc:
+        provider_stage = (
+            f"pit_optimization_{exc.phase.value}"
+            if stage == "pit_optimization_canary"
+            else stage
+        )
+        raise ControllerInitializationError(provider_stage) from exc
     except Exception as exc:
         raise ControllerInitializationError(stage) from exc
     finally:
