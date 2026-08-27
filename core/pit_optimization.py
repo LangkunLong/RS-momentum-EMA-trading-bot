@@ -80,6 +80,12 @@ _EVIDENCE_IDS = (
     "metric.full.trade_quality",
     "metric.holdout.objective",
 )
+_VERIFICATION_EVIDENCE_IDS = (
+    "metric.discovery.cash",
+    "metric.discovery.entry_funnel",
+    "metric.discovery.objective",
+    "metric.discovery.trade_quality",
+)
 _ENTRY_OUTCOMES = (
     "entries_executed",
     "entry_rejected_already_open",
@@ -187,6 +193,8 @@ class PitOptimizationGateConfig:
     apply: bool
     verification_subset: bool = False
     readiness_sha256: str | None = None
+    prior_discovery_feedback: Path | None = None
+    prior_discovery_feedback_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.phase not in {"prepare", "canary"}:
@@ -221,6 +229,28 @@ class PitOptimizationGateConfig:
             raise ValueError("PIT optimization is apply=false only")
         if type(self.verification_subset) is not bool:
             raise ValueError("optimization verification-subset flag must be boolean")
+        if (self.prior_discovery_feedback is None) != (
+            self.prior_discovery_feedback_sha256 is None
+        ):
+            raise ValueError(
+                "prior discovery feedback path and SHA-256 must be supplied together"
+            )
+        if self.prior_discovery_feedback is not None:
+            object.__setattr__(
+                self,
+                "prior_discovery_feedback",
+                _absolute_path(
+                    self.prior_discovery_feedback, "prior discovery feedback"
+                ),
+            )
+            if (
+                not self.verification_subset
+                or _SHA256_RE.fullmatch(self.prior_discovery_feedback_sha256 or "")
+                is None
+            ):
+                raise ValueError(
+                    "prior discovery feedback requires verification-subset mode and a valid SHA-256"
+                )
         if self.phase == "prepare" and self.readiness_sha256 is not None:
             raise ValueError("prepare cannot trust a prior readiness identity")
         if self.phase == "canary" and (
@@ -882,10 +912,13 @@ def verify_sealed_baseline_artifacts(
 _VERIFICATION_SCOPE_KEYS = frozenset(
     {
         "benchmark",
+        "discovery_end",
+        "discovery_start",
         "known_activity_symbols",
-        "known_entry_attempts",
-        "measurement_end",
-        "measurement_start",
+        "known_discovery_entry_attempts",
+        "known_holdout_entry_attempts",
+        "holdout_end",
+        "holdout_start",
         "selection",
         "session_count",
         "symbol_count",
@@ -893,6 +926,82 @@ _VERIFICATION_SCOPE_KEYS = frozenset(
         "warmup_start",
     }
 )
+
+_PRIOR_DISCOVERY_FEEDBACK_KEYS = frozenset(
+    {
+        "candidate_id",
+        "discovery_closed_trades_delta",
+        "discovery_drawdown_delta_pct",
+        "discovery_objective_delta",
+        "discovery_return_delta_pct",
+    }
+)
+
+
+def _validate_prior_discovery_feedback(
+    feedback: object,
+) -> list[dict[str, object]]:
+    """Return one closed sequence of aggregate-only prior discovery outcomes."""
+
+    value = _json_primitive(feedback)
+    if not isinstance(value, list) or len(value) > len(candidate_catalog()):
+        raise ValueError("prior discovery feedback must be a bounded JSON array")
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for record in value:
+        if not isinstance(record, dict) or set(record) != _PRIOR_DISCOVERY_FEEDBACK_KEYS:
+            raise ValueError("prior discovery feedback record keys are not exact")
+        candidate_id = record.get("candidate_id")
+        if (
+            not isinstance(candidate_id, str)
+            or candidate_id not in candidate_catalog()
+            or candidate_id in seen
+        ):
+            raise ValueError("prior discovery feedback candidate IDs are invalid")
+        closed_trades_delta = record.get("discovery_closed_trades_delta")
+        if type(closed_trades_delta) is not int:
+            raise ValueError("prior discovery trade delta must be an integer")
+        normalized: dict[str, object] = {
+            "candidate_id": candidate_id,
+            "discovery_closed_trades_delta": closed_trades_delta,
+        }
+        for field in (
+            "discovery_drawdown_delta_pct",
+            "discovery_objective_delta",
+            "discovery_return_delta_pct",
+        ):
+            metric = record.get(field)
+            if (
+                isinstance(metric, bool)
+                or type(metric) not in {int, float}
+                or not math.isfinite(float(metric))
+            ):
+                raise ValueError(f"prior discovery {field} must be finite")
+            normalized[field] = float(metric)
+        result.append(normalized)
+        seen.add(candidate_id)
+    return result
+
+
+def _load_prior_discovery_feedback(
+    path: Path | None, expected_sha256: str | None
+) -> list[dict[str, object]]:
+    if path is None and expected_sha256 is None:
+        return []
+    if path is None or _SHA256_RE.fullmatch(expected_sha256 or "") is None:
+        raise ValueError("prior discovery feedback identity is incomplete")
+    source = _regular_file(path, "prior discovery feedback")
+    raw = source.read_bytes()
+    if _sha256_bytes(raw) != expected_sha256:
+        raise ValueError("prior discovery feedback identity differs")
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("prior discovery feedback is malformed") from exc
+    feedback = _validate_prior_discovery_feedback(decoded)
+    if raw != _canonical_json_bytes(feedback):
+        raise ValueError("prior discovery feedback is not canonical JSON")
+    return feedback
 
 
 def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, object]:
@@ -918,28 +1027,38 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
         value.get("benchmark") != "SPY"
         or value.get("warmup_start") != FULL_START_DATE
         or value.get("selection")
-        != "sealed_entry_activity_then_hash_ranked_active_fill"
+        != "sealed_discovery_activity_then_hash_ranked_active_fill"
         or value.get("session_count") != _VERIFICATION_SESSION_COUNT
         or value.get("symbol_count") != _VERIFICATION_SYMBOL_COUNT
     ):
         raise ValueError("optimization verification scope contract changed")
-    for field in ("known_activity_symbols", "known_entry_attempts"):
+    for field in (
+        "known_activity_symbols",
+        "known_discovery_entry_attempts",
+        "known_holdout_entry_attempts",
+    ):
         count = value.get(field)
         if type(count) is not int or count < 1:
             raise ValueError(f"optimization verification {field} must be positive")
     if int(value["known_activity_symbols"]) > _VERIFICATION_SYMBOL_COUNT:
         raise ValueError("optimization verification activity symbols exceed the subset")
     try:
-        measurement_start = pd.Timestamp(value["measurement_start"]).normalize()
-        measurement_end = pd.Timestamp(value["measurement_end"]).normalize()
+        discovery_start = pd.Timestamp(value["discovery_start"]).normalize()
+        discovery_end = pd.Timestamp(value["discovery_end"]).normalize()
+        holdout_start = pd.Timestamp(value["holdout_start"]).normalize()
+        holdout_end = pd.Timestamp(value["holdout_end"]).normalize()
     except (TypeError, ValueError) as exc:
         raise ValueError("optimization verification dates are invalid") from exc
     if (
-        measurement_start < pd.Timestamp(FULL_START_DATE)
-        or measurement_end > pd.Timestamp(FULL_END_DATE)
-        or measurement_start > measurement_end
-        or measurement_start.date().isoformat() != value["measurement_start"]
-        or measurement_end.date().isoformat() != value["measurement_end"]
+        discovery_start < pd.Timestamp(FULL_START_DATE)
+        or holdout_end > pd.Timestamp(FULL_END_DATE)
+        or discovery_start > discovery_end
+        or discovery_end >= holdout_start
+        or holdout_start > holdout_end
+        or discovery_start.date().isoformat() != value["discovery_start"]
+        or discovery_end.date().isoformat() != value["discovery_end"]
+        or holdout_start.date().isoformat() != value["holdout_start"]
+        or holdout_end.date().isoformat() != value["holdout_end"]
     ):
         raise ValueError("optimization verification dates escape the sealed window")
     return value
@@ -984,23 +1103,27 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
         raise ValueError("PIT bundle lacks the verification benchmark")
     sessions = pd.DatetimeIndex(benchmark["SPY"].dropna().index).normalize()
     measurement_sessions = sessions[sessions >= first_activity][
-        :_VERIFICATION_SESSION_COUNT
+        : 2 * _VERIFICATION_SESSION_COUNT
     ]
-    if len(measurement_sessions) != _VERIFICATION_SESSION_COUNT:
-        raise ValueError("PIT bundle lacks sixty verification sessions")
-    measurement_start = measurement_sessions[0]
-    measurement_end = measurement_sessions[-1]
-    active_attempts = attempts.loc[
-        attempts["signal_date"].between(measurement_start, measurement_end)
+    if len(measurement_sessions) != 2 * _VERIFICATION_SESSION_COUNT:
+        raise ValueError("PIT bundle lacks discovery and holdout verification sessions")
+    discovery_sessions = measurement_sessions[:_VERIFICATION_SESSION_COUNT]
+    holdout_sessions = measurement_sessions[_VERIFICATION_SESSION_COUNT:]
+    discovery_start = discovery_sessions[0]
+    discovery_end = discovery_sessions[-1]
+    holdout_start = holdout_sessions[0]
+    holdout_end = holdout_sessions[-1]
+    discovery_attempts = attempts.loc[
+        attempts["signal_date"].between(discovery_start, discovery_end)
     ]
-    attempt_counts = active_attempts.groupby("symbol", sort=True).size()
+    attempt_counts = discovery_attempts.groupby("symbol", sort=True).size()
     ranked_activity = sorted(
         (str(symbol) for symbol in attempt_counts.index),
         key=lambda symbol: (-int(attempt_counts[symbol]), symbol),
     )
     active_members = {
         str(symbol)
-        for symbol in members_at(measurement_start)
+        for symbol in members_at(discovery_start)
         if str(symbol) != "SPY"
     }
     available = {
@@ -1010,7 +1133,7 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
     }
     candidate_pool = sorted(active_members & available)
     closes = fetch_closes(
-        candidate_pool, pd.Timestamp(FULL_START_DATE), measurement_end
+        candidate_pool, pd.Timestamp(FULL_START_DATE), holdout_end
     )
     minimum_warmup_bars = 100
     covered = {
@@ -1029,14 +1152,23 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
     selected = [*ranked_activity, *fill][:_VERIFICATION_SYMBOL_COUNT]
     if len(selected) != _VERIFICATION_SYMBOL_COUNT:
         raise ValueError("PIT bundle lacks enough covered verification symbols")
+    holdout_attempts = attempts.loc[
+        attempts["signal_date"].between(holdout_start, holdout_end)
+        & attempts["symbol"].isin(selected)
+    ]
+    if holdout_attempts.empty:
+        raise ValueError("verification holdout lacks known strategy activity")
     return _validate_verification_scope(
         {
             "benchmark": "SPY",
+            "discovery_end": discovery_end.date().isoformat(),
+            "discovery_start": discovery_start.date().isoformat(),
             "known_activity_symbols": len(ranked_activity),
-            "known_entry_attempts": int(len(active_attempts)),
-            "measurement_end": measurement_end.date().isoformat(),
-            "measurement_start": measurement_start.date().isoformat(),
-            "selection": "sealed_entry_activity_then_hash_ranked_active_fill",
+            "known_discovery_entry_attempts": int(len(discovery_attempts)),
+            "known_holdout_entry_attempts": int(len(holdout_attempts)),
+            "holdout_end": holdout_end.date().isoformat(),
+            "holdout_start": holdout_start.date().isoformat(),
+            "selection": "sealed_discovery_activity_then_hash_ranked_active_fill",
             "session_count": _VERIFICATION_SESSION_COUNT,
             "symbol_count": _VERIFICATION_SYMBOL_COUNT,
             "symbols": selected,
@@ -1166,7 +1298,7 @@ class PitOptimizationLoopResult:
             or self.provider_calls != MAX_CANARY_CALLS
             or self.selected_candidate_id is None
             or self.accepted is not None
-            or len(self.artifact_paths) != 4
+            or len(self.artifact_paths) != 6
             or self.source_modified
             or not self.cleanup_complete
         ):
@@ -1263,6 +1395,14 @@ _DOMAIN_EVIDENCE_IDS = MappingProxyType(
         "trade_quality": frozenset({"metric.full.trade_quality"}),
     }
 )
+_VERIFICATION_DOMAIN_EVIDENCE_IDS = MappingProxyType(
+    {
+        "entry_funnel": frozenset({"metric.discovery.entry_funnel"}),
+        "return_drawdown": frozenset({"metric.discovery.objective"}),
+        "cash_exposure": frozenset({"metric.discovery.cash"}),
+        "trade_quality": frozenset({"metric.discovery.trade_quality"}),
+    }
+)
 
 
 def _json_primitive(value: object) -> object:
@@ -1271,6 +1411,42 @@ def _json_primitive(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return [_json_primitive(item) for item in value]
     return value
+
+
+def _verification_only(readiness: PitOptimizationReadiness) -> bool:
+    primitive = _json_primitive(readiness.primitive)
+    contract = primitive.get("evaluation_contract") if isinstance(primitive, dict) else None
+    value = contract.get("verification_only") if isinstance(contract, dict) else None
+    if type(value) is not bool:
+        raise ValueError("canary readiness verification mode is malformed")
+    return value
+
+
+def _available_candidate_ids(readiness: PitOptimizationReadiness) -> tuple[str, ...]:
+    primitive = _json_primitive(readiness.primitive)
+    catalog = primitive.get("candidate_catalog") if isinstance(primitive, dict) else None
+    if not isinstance(catalog, list) or not catalog:
+        raise ValueError("canary readiness candidate catalog is absent")
+    ids: list[str] = []
+    for item in catalog:
+        candidate_id = item.get("candidate_id") if isinstance(item, dict) else None
+        if not isinstance(candidate_id, str) or candidate_id not in candidate_catalog():
+            raise ValueError("canary readiness candidate catalog is malformed")
+        ids.append(candidate_id)
+    if ids != sorted(ids) or len(ids) != len(set(ids)):
+        raise ValueError("canary readiness candidate catalog is not closed")
+    prior = _validate_prior_discovery_feedback(
+        primitive.get("prior_discovery_feedback", [])
+    )
+    tested = {str(item["candidate_id"]) for item in prior}
+    expected = tuple(
+        candidate_id
+        for candidate_id in candidate_catalog()
+        if candidate_id not in tested
+    )
+    if tuple(ids) != expected:
+        raise ValueError("canary readiness candidate exclusions are inconsistent")
+    return tuple(ids)
 
 
 def _readiness_identity(
@@ -1342,6 +1518,29 @@ def _readiness_identity(
     )
     if evaluation_contract != expected_contract:
         raise ValueError("canary readiness evaluation contract changed")
+    prior_feedback = _validate_prior_discovery_feedback(
+        primitive.get("prior_discovery_feedback", [])
+    )
+    if prior_feedback != primitive.get("prior_discovery_feedback"):
+        raise ValueError("canary readiness prior discovery feedback changed")
+    prior_sha256 = identities.get("prior_discovery_feedback_sha256")
+    expected_prior_sha256 = (
+        None
+        if prior_sha256 is None
+        else _sha256_bytes(_canonical_json_bytes(prior_feedback))
+    )
+    if (
+        (prior_sha256 is None and prior_feedback)
+        or (
+            prior_sha256 is not None
+            and _SHA256_RE.fullmatch(str(prior_sha256)) is None
+        )
+        or prior_sha256 != expected_prior_sha256
+    ):
+        raise ValueError("canary readiness prior discovery feedback identity changed")
+    _available_candidate_ids(readiness)
+    if _json_primitive(readiness.provider_payload) != _provider_payload(primitive):
+        raise ValueError("canary readiness provider projection changed")
     expected_source_sha = identities.get("entry_contract_source_sha256")
     if not isinstance(expected_source_sha, str) or _SHA256_RE.fullmatch(expected_source_sha) is None:
         raise ValueError("canary readiness source identity is invalid")
@@ -1389,7 +1588,12 @@ def _validate_route_citations(
     if route.action == "abort":
         return
     supplied = _closed_readiness_ids(readiness, "evidence_ids")
-    required_domain_evidence = _DOMAIN_EVIDENCE_IDS.get(route.domain)
+    domain_evidence = (
+        _VERIFICATION_DOMAIN_EVIDENCE_IDS
+        if _verification_only(readiness)
+        else _DOMAIN_EVIDENCE_IDS
+    )
+    required_domain_evidence = domain_evidence.get(route.domain)
     cited_evidence = set(route.evidence_ids)
     if required_domain_evidence is None or not required_domain_evidence.issubset(
         cited_evidence
@@ -1542,18 +1746,22 @@ def _candidate_comparison(
     )
 
 
-def _validate_verification_candidate(
+def _validate_verification_evaluation(
     readiness: PitOptimizationReadiness,
     evaluation: Mapping[str, object],
-    candidate: object,
-) -> Mapping[str, object]:
-    """Authenticate a subset replay without producing an acceptance verdict."""
+    *,
+    candidate: object | None,
+) -> Mapping[str, Mapping[str, object]]:
+    """Authenticate one baseline or candidate two-window subset replay."""
 
     from core.pit_optimization_contract import CandidateDefinition
     from core.engine_policy import effective_engine_policy_sha256
 
-    if not isinstance(candidate, CandidateDefinition) or not isinstance(evaluation, Mapping):
-        raise ValueError("verification candidate evaluation is malformed")
+    if (
+        (candidate is not None and not isinstance(candidate, CandidateDefinition))
+        or not isinstance(evaluation, Mapping)
+    ):
+        raise ValueError("verification evaluation is malformed")
     if set(evaluation) != {
         "effective_policy",
         "effective_policy_sha256",
@@ -1564,13 +1772,13 @@ def _validate_verification_candidate(
         "verification",
         "verification_only",
     }:
-        raise ValueError("verification candidate evaluation has open or missing keys")
+        raise ValueError("verification evaluation has open or missing keys")
     if (
         evaluation.get("schema_version") != 1
         or evaluation.get("verification_only") is not True
         or evaluation.get("performance_acceptance_eligible") is not False
     ):
-        raise ValueError("verification candidate eligibility markers are invalid")
+        raise ValueError("verification eligibility markers are invalid")
     primitive = _json_primitive(readiness.primitive)
     if not isinstance(primitive, dict):
         raise ValueError("verification readiness is malformed")
@@ -1587,7 +1795,7 @@ def _validate_verification_candidate(
     ):
         raise ValueError("verification readiness contract is incomplete")
     if evaluation.get("pit_bundle_sha256") != identities.get("pit_bundle_sha256"):
-        raise ValueError("verification candidate used a different PIT bundle")
+        raise ValueError("verification evaluation used a different PIT bundle")
     policy_sha = evaluation.get("effective_policy_sha256")
     if (
         not isinstance(policy_sha, str)
@@ -1596,8 +1804,15 @@ def _validate_verification_candidate(
         or effective_engine_policy_sha256(baseline_policy)
         != identities.get("effective_policy_sha256")
     ):
-        raise ValueError("verification candidate policy identity is invalid")
-    validate_policy_delta(baseline_policy, candidate_policy, candidate)
+        raise ValueError("verification evaluation policy identity is invalid")
+    if candidate is None:
+        if (
+            policy_sha != identities.get("effective_policy_sha256")
+            or _json_primitive(candidate_policy) != _json_primitive(baseline_policy)
+        ):
+            raise ValueError("verification baseline policy differs from readiness")
+    else:
+        validate_policy_delta(baseline_policy, candidate_policy, candidate)
     expected_scope = contract.get("scope")
     observed_scope = evaluation.get("scope")
     if (
@@ -1606,22 +1821,152 @@ def _validate_verification_candidate(
         or _validate_verification_scope(observed_scope)
         != _validate_verification_scope(expected_scope)
     ):
-        raise ValueError("verification candidate scope differs from readiness")
-    window = evaluation.get("verification")
-    if not isinstance(window, Mapping):
-        raise ValueError("verification candidate aggregate is absent")
-    _validate_aggregate_window(window)
-    performance = window.get("performance")
-    funnel = window.get("funnel")
-    if (
-        not isinstance(performance, Mapping)
-        or performance.get("equity_observations") != _VERIFICATION_SESSION_COUNT
-        or not isinstance(funnel, Mapping)
-        or type(funnel.get("attempted")) is not int
-        or int(funnel["attempted"]) < 1
+        raise ValueError("verification evaluation scope differs from readiness")
+    windows = evaluation.get("verification")
+    if not isinstance(windows, Mapping) or set(windows) != {"discovery", "holdout"}:
+        raise ValueError("verification aggregate windows are not exact")
+    normalized: dict[str, Mapping[str, object]] = {}
+    for name in ("discovery", "holdout"):
+        window = windows.get(name)
+        if not isinstance(window, Mapping):
+            raise ValueError(f"verification {name} aggregate is absent")
+        _validate_aggregate_window(window)
+        performance = window.get("performance")
+        funnel = window.get("funnel")
+        if (
+            not isinstance(performance, Mapping)
+            or performance.get("equity_observations") != _VERIFICATION_SESSION_COUNT
+            or not isinstance(funnel, Mapping)
+            or type(funnel.get("attempted")) is not int
+        ):
+            raise ValueError(f"verification {name} aggregate is incomplete")
+        if candidate is None and int(funnel["attempted"]) < 1:
+            raise ValueError(
+                f"verification baseline {name} lacks known strategy activity"
+            )
+        normalized[name] = window
+    return MappingProxyType(normalized)
+
+
+def _validate_verification_baseline(
+    readiness: PitOptimizationReadiness,
+    evaluation: Mapping[str, object],
+) -> Mapping[str, Mapping[str, object]]:
+    return _validate_verification_evaluation(
+        readiness, evaluation, candidate=None
+    )
+
+
+def _validate_verification_candidate(
+    readiness: PitOptimizationReadiness,
+    evaluation: Mapping[str, object],
+    candidate: object,
+) -> Mapping[str, Mapping[str, object]]:
+    return _validate_verification_evaluation(
+        readiness, evaluation, candidate=candidate
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationSubsetComparison:
+    discovery_deltas: Mapping[str, float | int]
+    holdout_deltas: Mapping[str, float | int]
+    discovery_checks: Mapping[str, bool]
+    holdout_checks: Mapping[str, bool]
+    discovery_minimum_closed_trades: int
+    holdout_minimum_closed_trades: int
+    subset_candidate_passed: bool
+
+
+def _verification_window_deltas(
+    baseline: Mapping[str, object], candidate: Mapping[str, object]
+) -> dict[str, float | int]:
+    baseline_performance = baseline.get("performance")
+    candidate_performance = candidate.get("performance")
+    if not isinstance(baseline_performance, Mapping) or not isinstance(
+        candidate_performance, Mapping
     ):
-        raise ValueError("verification candidate did not exercise known strategy activity")
-    return window
+        raise ValueError("verification comparison performance is absent")
+    return {
+        "closed_trades": int(candidate_performance["closed_trades"])
+        - int(baseline_performance["closed_trades"]),
+        "max_drawdown_pct": float(candidate_performance["max_drawdown_pct"])
+        - float(baseline_performance["max_drawdown_pct"]),
+        "objective": float(candidate_performance["objective"])
+        - float(baseline_performance["objective"]),
+        "sharpe_ratio": float(candidate_performance["sharpe_ratio"])
+        - float(baseline_performance["sharpe_ratio"]),
+        "total_return_pct": float(candidate_performance["total_return_pct"])
+        - float(baseline_performance["total_return_pct"]),
+    }
+
+
+def _verification_subset_comparison(
+    *,
+    baseline: Mapping[str, Mapping[str, object]],
+    candidate: Mapping[str, Mapping[str, object]],
+) -> VerificationSubsetComparison:
+    """Build a discovery-only, explicitly non-promotional subset verdict."""
+
+    epsilon = 1e-12
+    deltas: dict[str, Mapping[str, float | int]] = {}
+    checks: dict[str, Mapping[str, bool]] = {}
+    floors: dict[str, int] = {}
+    for name in ("discovery", "holdout"):
+        baseline_window = baseline.get(name)
+        candidate_window = candidate.get(name)
+        if not isinstance(baseline_window, Mapping) or not isinstance(
+            candidate_window, Mapping
+        ):
+            raise ValueError("verification comparison windows are absent")
+        window_deltas = _verification_window_deltas(
+            baseline_window, candidate_window
+        )
+        baseline_performance = baseline_window["performance"]
+        candidate_performance = candidate_window["performance"]
+        assert isinstance(baseline_performance, Mapping)
+        assert isinstance(candidate_performance, Mapping)
+        minimum_closed_trades = max(
+            1, math.floor(0.5 * int(baseline_performance["closed_trades"]))
+        )
+        window_checks = {
+            "total_return_improved": float(window_deltas["total_return_pct"])
+            > epsilon,
+            "objective_delta_nonnegative": float(window_deltas["objective"])
+            + epsilon
+            >= 0.0,
+            "drawdown_not_worse_by_more_than_0_50pp": (
+                abs(min(float(candidate_performance["max_drawdown_pct"]), 0.0))
+                <= abs(min(float(baseline_performance["max_drawdown_pct"]), 0.0))
+                + 0.50
+                + epsilon
+            ),
+            "sharpe_not_worse_by_more_than_0_05": (
+                float(candidate_performance["sharpe_ratio"]) + epsilon
+                >= float(baseline_performance["sharpe_ratio"]) - 0.05
+            ),
+            "closed_trades_at_least_half_baseline_floor": (
+                int(candidate_performance["closed_trades"])
+                >= minimum_closed_trades
+            ),
+        }
+        deltas[name] = MappingProxyType(window_deltas)
+        checks[name] = MappingProxyType(window_checks)
+        floors[name] = minimum_closed_trades
+    passed = all(
+        value
+        for window_checks in checks.values()
+        for value in window_checks.values()
+    )
+    return VerificationSubsetComparison(
+        discovery_deltas=deltas["discovery"],
+        holdout_deltas=deltas["holdout"],
+        discovery_checks=checks["discovery"],
+        holdout_checks=checks["holdout"],
+        discovery_minimum_closed_trades=floors["discovery"],
+        holdout_minimum_closed_trades=floors["holdout"],
+        subset_candidate_passed=passed,
+    )
 
 
 _PERFORMANCE_KEYS = frozenset(
@@ -1863,11 +2208,13 @@ def _write_canary_artifacts(
     candidate_id: str,
     baseline: Mapping[str, object],
     evaluation: Mapping[str, object],
-    comparison: OptimizationComparison | None,
+    comparison: OptimizationComparison | VerificationSubsetComparison | None,
     diff: str,
     call_sha256s: Sequence[str],
     verification_only: bool = False,
     verification_scope: Mapping[str, object] | None = None,
+    feedback: Mapping[str, object] | None = None,
+    prior_discovery_feedback: Sequence[Mapping[str, object]] | None = None,
 ) -> tuple[tuple[Path, str], ...]:
     root = _absolute_path(artifact_root, "artifact root")
     if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id) is None:
@@ -1875,16 +2222,32 @@ def _write_canary_artifacts(
     root.mkdir(parents=True, exist_ok=True)
     _regular_directory(root, "artifact root")
     if verification_only:
-        if comparison is not None or verification_scope is None:
+        if (
+            not isinstance(comparison, VerificationSubsetComparison)
+            or verification_scope is None
+            or not isinstance(feedback, Mapping)
+            or prior_discovery_feedback is None
+        ):
             raise ValueError("verification artifact inputs are inconsistent")
         scope = _validate_verification_scope(verification_scope)
         if evaluation.get("scope") != scope:
             raise ValueError("verification artifact scope differs from evaluation")
+        baseline_windows = baseline.get("verification")
+        candidate_windows = evaluation.get("verification")
+        if (
+            not isinstance(baseline_windows, Mapping)
+            or set(baseline_windows) != {"discovery", "holdout"}
+            or not isinstance(candidate_windows, Mapping)
+            or set(candidate_windows) != {"discovery", "holdout"}
+        ):
+            raise ValueError("verification artifact windows are inconsistent")
         baseline_payload = {
             "schema_version": 1,
             "candidate_id": candidate_id,
             "performance_acceptance_eligible": False,
-            "reference_baseline": baseline,
+            "pit_bundle_sha256": baseline["pit_bundle_sha256"],
+            "effective_policy_sha256": baseline["effective_policy_sha256"],
+            "verification": baseline_windows,
             "scope": scope,
             "verification_only": True,
         }
@@ -1902,18 +2265,63 @@ def _write_canary_artifacts(
             "schema_version": 1,
             "accepted": None,
             "candidate_id": candidate_id,
+            "discovery_checks": dict(comparison.discovery_checks),
+            "discovery_deltas": dict(comparison.discovery_deltas),
+            "discovery_minimum_closed_trades": (
+                comparison.discovery_minimum_closed_trades
+            ),
+            "holdout_checks": dict(comparison.holdout_checks),
+            "holdout_deltas": dict(comparison.holdout_deltas),
+            "holdout_minimum_closed_trades": (
+                comparison.holdout_minimum_closed_trades
+            ),
             "performance_acceptance_eligible": False,
             "provider_call_record_sha256s": list(call_sha256s),
+            "subset_candidate_passed": comparison.subset_candidate_passed,
             "verification_checks": {
                 "aggregate_schema": True,
+                "baseline_candidate_comparison": True,
                 "candidate_policy_delta": True,
+                "holdout_hidden_from_roles": True,
                 "known_strategy_activity": True,
                 "sealed_input_identity": True,
             },
             "verification_only": True,
         }
+        feedback_payload = {
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "feedback": _json_primitive(feedback),
+            "next_cycle_feedback": {
+                "candidate_id": candidate_id,
+                "discovery_closed_trades_delta": int(
+                    comparison.discovery_deltas["closed_trades"]
+                ),
+                "discovery_drawdown_delta_pct": float(
+                    comparison.discovery_deltas["max_drawdown_pct"]
+                ),
+                "discovery_objective_delta": float(
+                    comparison.discovery_deltas["objective"]
+                ),
+                "discovery_return_delta_pct": float(
+                    comparison.discovery_deltas["total_return_pct"]
+                ),
+            },
+            "provider_raw_output_included": False,
+        }
+        prior_feedback = _validate_prior_discovery_feedback(
+            list(prior_discovery_feedback)
+        )
+        carry_forward_feedback = _validate_prior_discovery_feedback(
+            [*prior_feedback, feedback_payload["next_cycle_feedback"]]
+        )
     else:
-        if comparison is None or verification_scope is not None:
+        if (
+            not isinstance(comparison, OptimizationComparison)
+            or verification_scope is not None
+            or feedback is not None
+            or prior_discovery_feedback is not None
+        ):
             raise ValueError("full optimization artifact inputs are inconsistent")
         baseline_payload = {
             "schema_version": 1,
@@ -1962,6 +2370,19 @@ def _write_canary_artifacts(
             diff.encode("utf-8"),
         ),
     ]
+    if verification_only:
+        artifacts.append(
+            (
+                "feedback.json",
+                _canonical_json_bytes(_json_primitive(feedback_payload)),
+            )
+        )
+        artifacts.append(
+            (
+                "prior-discovery-feedback.json",
+                _canonical_json_bytes(carry_forward_feedback),
+            )
+        )
     digests: dict[str, str] = {}
     try:
         for name, payload in artifacts:
@@ -2029,6 +2450,7 @@ def run_pit_optimization_canary(
     artifacts: tuple[tuple[Path, str], ...] = ()
     call_sha256s: list[str] = []
     cleanup: PitOptimizationCleanup | None = None
+    verification_baseline_evaluation: Mapping[str, object] | None = None
     readiness_primitive = _json_primitive(readiness.primitive)
     if not isinstance(readiness_primitive, dict):
         raise ValueError("canary readiness payload is malformed")
@@ -2077,6 +2499,19 @@ def run_pit_optimization_canary(
         provider = _json_primitive(readiness.provider_payload)
         if not isinstance(provider, dict):
             raise ValueError("readiness provider payload is malformed")
+        if verification_only:
+            verify_boundary()
+            observed_baseline = services.evaluate_candidate(candidate_path)
+            if not isinstance(observed_baseline, Mapping):
+                raise ValueError("verification baseline evaluator returned a non-mapping")
+            verify_boundary()
+            baseline_windows = _validate_verification_baseline(
+                readiness, observed_baseline
+            )
+            verification_baseline_evaluation = observed_baseline
+            provider["baseline_metrics"] = {
+                "discovery": _json_primitive(baseline_windows["discovery"])
+            }
         route_input: dict[str, object] = {
             "role": "orchestrator",
             "observation": provider,
@@ -2109,6 +2544,10 @@ def run_pit_optimization_canary(
             _validate_reasoning_citations(reasoning, route, readiness)
             if not reasoning.skip:
                 selected_candidate_id = reasoning.candidate_id
+                if selected_candidate_id not in _available_candidate_ids(readiness):
+                    raise ValueError(
+                        "reasoner selected a candidate excluded by prior discovery feedback"
+                    )
                 selected = candidate_catalog()[selected_candidate_id]
                 coding = call(
                     "coder",
@@ -2139,10 +2578,37 @@ def run_pit_optimization_canary(
                 if (candidate_path / selected.path).read_bytes() != rewritten:
                     raise ValueError("candidate evaluator mutated the disposable source")
                 verify_boundary(candidate_is_patched=True)
-                comparison: OptimizationComparison | None
+                comparison: OptimizationComparison | VerificationSubsetComparison
+                role_feedback: Mapping[str, object] | None = None
                 if verification_only:
-                    _validate_verification_candidate(readiness, evaluation, selected)
-                    comparison = None
+                    if verification_baseline_evaluation is None:
+                        raise ValueError("verification baseline evaluation is absent")
+                    baseline_windows = _validate_verification_baseline(
+                        readiness, verification_baseline_evaluation
+                    )
+                    candidate_windows = _validate_verification_candidate(
+                        readiness, evaluation, selected
+                    )
+                    comparison = _verification_subset_comparison(
+                        baseline=baseline_windows,
+                        candidate=candidate_windows,
+                    )
+                    role_feedback = {
+                        "coder": {
+                            "candidate_id": coding.candidate_id,
+                            "summary": coding.summary,
+                        },
+                        "orchestrator": {
+                            "domain": route.domain,
+                            "evidence_ids": list(route.evidence_ids),
+                        },
+                        "reasoner": {
+                            "candidate_id": reasoning.candidate_id,
+                            "evidence_ids": list(reasoning.evidence_ids),
+                            "hypothesis": reasoning.hypothesis,
+                            "invariant_ids": list(reasoning.invariant_ids),
+                        },
+                    }
                     accepted = None
                     status = "verified"
                 else:
@@ -2153,7 +2619,11 @@ def run_pit_optimization_canary(
                     artifact_root,
                     run_id=run_id,
                     candidate_id=selected_candidate_id,
-                    baseline=_json_primitive(readiness.primitive)["baseline"],
+                    baseline=(
+                        verification_baseline_evaluation
+                        if verification_only
+                        else _json_primitive(readiness.primitive)["baseline"]
+                    ),
                     evaluation=evaluation,
                     comparison=comparison,
                     diff=diff,
@@ -2161,6 +2631,12 @@ def run_pit_optimization_canary(
                     verification_only=verification_only,
                     verification_scope=(
                         verification_scope if verification_only else None
+                    ),
+                    feedback=role_feedback,
+                    prior_discovery_feedback=(
+                        readiness_primitive.get("prior_discovery_feedback", [])
+                        if verification_only
+                        else None
                     ),
                 )
                 try:
@@ -2215,23 +2691,52 @@ def _provider_payload(primitive: Mapping[str, object]) -> dict[str, object]:
     provider_scope = provider_contract.get("scope")
     assert isinstance(provider_scope, dict)
     provider_scope.pop("symbols", None)
+    verification_only = provider_contract.get("verification_only") is True
+    if verification_only:
+        for key in tuple(provider_scope):
+            if key.startswith("holdout_") or key == "known_holdout_entry_attempts":
+                provider_scope.pop(key, None)
+    catalog = primitive.get("candidate_catalog")
+    if not isinstance(catalog, list):
+        raise ValueError("provider candidate catalog is malformed")
+    candidate_ids = [
+        item.get("candidate_id") for item in catalog if isinstance(item, Mapping)
+    ]
+    if (
+        len(candidate_ids) != len(catalog)
+        or any(not isinstance(item, str) for item in candidate_ids)
+    ):
+        raise ValueError("provider candidate IDs are malformed")
+    domain_evidence = (
+        _VERIFICATION_DOMAIN_EVIDENCE_IDS
+        if verification_only
+        else _DOMAIN_EVIDENCE_IDS
+    )
+    evidence_ids = (
+        _VERIFICATION_EVIDENCE_IDS if verification_only else _EVIDENCE_IDS
+    )
     return {
         "schema_version": 1,
         "identities": primitive["identities"],
-        "baseline_metrics": {
-            "full": full,
-            "holdout": holdout,
-            "leader_basket": baseline["leader_basket"],
-        },
-        "candidate_ids": list(candidate_catalog()),
+        "baseline_metrics": (
+            {}
+            if verification_only
+            else {
+                "full": full,
+                "holdout": holdout,
+                "leader_basket": baseline["leader_basket"],
+            }
+        ),
+        "candidate_ids": candidate_ids,
         "domain_evidence_ids": {
             domain: sorted(evidence_ids)
-            for domain, evidence_ids in sorted(_DOMAIN_EVIDENCE_IDS.items())
+            for domain, evidence_ids in sorted(domain_evidence.items())
         },
-        "evidence_ids": list(_EVIDENCE_IDS),
+        "evidence_ids": list(evidence_ids),
         "invariant_ids": list(_INVARIANT_IDS),
         "editable_path": ENTRY_CONTRACT_PATH,
         "evaluation_contract": provider_contract,
+        "prior_discovery_feedback": primitive.get("prior_discovery_feedback", []),
     }
 
 
@@ -2251,9 +2756,9 @@ def prepare_pit_optimization(
         raise ValueError("prepare phase is invalid")
     source = _regular_directory(source_root, "source root")
     artifacts = _absolute_path(Path(artifact_root), "artifact root")
+    protected_inputs = [source, config.baseline_run, config.pit_bundle]
     if any(
-        _paths_overlap(artifacts, protected)
-        for protected in (source, config.baseline_run, config.pit_bundle)
+        _paths_overlap(artifacts, protected) for protected in protected_inputs
     ):
         raise ValueError(
             "artifact root must not overlap source or sealed optimization inputs"
@@ -2303,6 +2808,20 @@ def prepare_pit_optimization(
         verification_subset=config.verification_subset,
         verification_scope=verification_scope,
     )
+    prior_feedback = _load_prior_discovery_feedback(
+        config.prior_discovery_feedback,
+        config.prior_discovery_feedback_sha256,
+    )
+    tested_candidate_ids = {
+        str(record["candidate_id"]) for record in prior_feedback
+    }
+    available_catalog = [
+        item
+        for item in candidate_catalog().values()
+        if item.candidate_id not in tested_candidate_ids
+    ]
+    if not available_catalog:
+        raise ValueError("prior discovery feedback exhausted the candidate catalog")
     catalog_payload = [
         {
             "candidate_id": item.candidate_id,
@@ -2314,7 +2833,7 @@ def prepare_pit_optimization(
             "old_line": item.old_line,
             "new_line": item.new_line,
         }
-        for item in candidate_catalog().values()
+        for item in available_catalog
     ]
     primitive: dict[str, object] = {
         "schema_version": 1,
@@ -2328,10 +2847,16 @@ def prepare_pit_optimization(
             "baseline_manifest_sha256": config.baseline_manifest_sha256,
             "baseline_source_commit": BASELINE_SOURCE_COMMIT,
             "effective_policy_sha256": policy_digest,
+            "prior_discovery_feedback_sha256": (
+                config.prior_discovery_feedback_sha256
+            ),
         },
         "sealed_inputs": {
             "pit_bundle_sha256": config.pit_bundle_sha256,
             "baseline_artifact_sha256": baseline_artifacts,
+            "prior_discovery_feedback_sha256": (
+                config.prior_discovery_feedback_sha256
+            ),
         },
         "date_contract": {
             "full_start": FULL_START_DATE,
@@ -2351,7 +2876,12 @@ def prepare_pit_optimization(
         "candidate_catalog": catalog_payload,
         "effective_policy": policy,
         "baseline": baseline,
-        "evidence_ids": list(_EVIDENCE_IDS),
+        "prior_discovery_feedback": prior_feedback,
+        "evidence_ids": list(
+            _VERIFICATION_EVIDENCE_IDS
+            if config.verification_subset
+            else _EVIDENCE_IDS
+        ),
         "invariant_ids": list(_INVARIANT_IDS),
     }
     readiness_bytes = _canonical_json_bytes(primitive)
@@ -2528,7 +3058,7 @@ def evaluate_verification_pit_candidate(
     pit_bundle_sha256: str,
     verification_scope: Mapping[str, object],
 ) -> dict[str, object]:
-    """Run the production simulator on one deterministic verification-only slice."""
+    """Run the production simulator on deterministic discovery and hidden holdout slices."""
 
     scope = _validate_verification_scope(verification_scope)
     bundle_path = _regular_file(pit_bundle, "verification PIT bundle")
@@ -2546,7 +3076,7 @@ def evaluate_verification_pit_candidate(
         result = simulator.run(
             symbols,
             start_date=str(scope["warmup_start"]),
-            end_date=str(scope["measurement_end"]),
+            end_date=str(scope["holdout_end"]),
             benchmark_symbol=str(scope["benchmark"]),
         )
         if result.config.get("data_mode") != "point_in_time" or (
@@ -2571,43 +3101,70 @@ def evaluate_verification_pit_candidate(
         weekly = result.weekly_holdings.copy()
         outcomes = _entry_outcomes_frame(result.entry_outcomes)
         sessions = pd.DatetimeIndex(pd.to_datetime(equity["date"])).normalize()
-        measurement_start = str(scope["measurement_start"])
-        measurement_end = str(scope["measurement_end"])
-        measured_sessions = sessions[
-            (sessions >= pd.Timestamp(measurement_start))
-            & (sessions <= pd.Timestamp(measurement_end))
+        discovery_start = str(scope["discovery_start"])
+        discovery_end = str(scope["discovery_end"])
+        holdout_start = str(scope["holdout_start"])
+        holdout_end = str(scope["holdout_end"])
+        discovery_sessions = sessions[
+            (sessions >= pd.Timestamp(discovery_start))
+            & (sessions <= pd.Timestamp(discovery_end))
         ]
-        if len(measured_sessions) != _VERIFICATION_SESSION_COUNT:
-            raise ValueError("verification replay did not produce sixty measured sessions")
+        holdout_sessions = sessions[
+            (sessions >= pd.Timestamp(holdout_start))
+            & (sessions <= pd.Timestamp(holdout_end))
+        ]
+        combined_sessions = sessions[
+            (sessions >= pd.Timestamp(discovery_start))
+            & (sessions <= pd.Timestamp(holdout_end))
+        ]
+        if (
+            len(discovery_sessions) != _VERIFICATION_SESSION_COUNT
+            or len(holdout_sessions) != _VERIFICATION_SESSION_COUNT
+            or len(combined_sessions) != 2 * _VERIFICATION_SESSION_COUNT
+            or not discovery_sessions.equals(
+                combined_sessions[:_VERIFICATION_SESSION_COUNT]
+            )
+            or not holdout_sessions.equals(
+                combined_sessions[_VERIFICATION_SESSION_COUNT:]
+            )
+        ):
+            raise ValueError(
+                "verification replay did not produce adjacent sixty-session windows"
+            )
         thresholds = _policy_thresholds(policy)
-        trades = aggregate_transaction_window(
-            transactions,
-            sessions=sessions,
-            start_date=measurement_start,
-            end_date=measurement_end,
-        )
-        window = {
-            "performance": aggregate_equity_window(
-                equity,
-                start_date=measurement_start,
-                end_date=measurement_end,
-                closed_trades=int(trades["closed_trades"]),
-            ),
-            "trades": trades,
-            "weekly": aggregate_weekly_window(
-                weekly, start_date=measurement_start, end_date=measurement_end
-            ),
-            "funnel": aggregate_signal_funnel(
-                result.signal_log,
-                outcomes,
-                start_date=measurement_start,
-                end_date=measurement_end,
-                min_current_growth=thresholds["min_current_growth"],
-                min_annual_growth=thresholds["min_annual_growth"],
-                min_rs_score=thresholds["min_rs_score"],
-                min_composite_score=thresholds["min_entry_composite_score"],
-            ),
-        }
+        windows: dict[str, object] = {}
+        for name, start_date, end_date in (
+            ("discovery", discovery_start, discovery_end),
+            ("holdout", holdout_start, holdout_end),
+        ):
+            trades = aggregate_transaction_window(
+                transactions,
+                sessions=sessions,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            windows[name] = {
+                "performance": aggregate_equity_window(
+                    equity,
+                    start_date=start_date,
+                    end_date=end_date,
+                    closed_trades=int(trades["closed_trades"]),
+                ),
+                "trades": trades,
+                "weekly": aggregate_weekly_window(
+                    weekly, start_date=start_date, end_date=end_date
+                ),
+                "funnel": aggregate_signal_funnel(
+                    result.signal_log,
+                    outcomes,
+                    start_date=start_date,
+                    end_date=end_date,
+                    min_current_growth=thresholds["min_current_growth"],
+                    min_annual_growth=thresholds["min_annual_growth"],
+                    min_rs_score=thresholds["min_rs_score"],
+                    min_composite_score=thresholds["min_entry_composite_score"],
+                ),
+            }
         return {
             "schema_version": 1,
             "verification_only": True,
@@ -2616,7 +3173,7 @@ def evaluate_verification_pit_candidate(
             "effective_policy_sha256": policy_sha,
             "effective_policy": policy,
             "scope": scope,
-            "verification": window,
+            "verification": windows,
         }
 
 

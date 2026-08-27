@@ -8861,6 +8861,11 @@ class AuditTrail:
                 "max_api_calls": config.gate.max_api_calls,
                 "max_iterations": config.gate.max_iterations,
                 "apply": config.gate.apply,
+                "verification_subset": config.gate.verification_subset,
+                "prior_discovery_feedback": config.gate.prior_discovery_feedback,
+                "prior_discovery_feedback_sha256": (
+                    config.gate.prior_discovery_feedback_sha256
+                ),
             }
         else:
             gate = {
@@ -13559,6 +13564,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run the PIT optimizer in verification-only subset mode.",
     )
+    parser.add_argument(
+        "--optimization-prior-discovery-feedback",
+        type=Path,
+        help="Canonical aggregate-only feedback from earlier subset candidates.",
+    )
+    parser.add_argument("--optimization-prior-discovery-feedback-sha256")
     parser.add_argument("--baseline-manifest-sha256")
     parser.add_argument("--effective-policy-sha256")
     parser.add_argument("--readiness-sha256")
@@ -13664,6 +13675,8 @@ def _build_cli_config(
         namespace.baseline_manifest_sha256,
         namespace.effective_policy_sha256,
         namespace.readiness_sha256,
+        namespace.optimization_prior_discovery_feedback,
+        namespace.optimization_prior_discovery_feedback_sha256,
     )
     all_pit_fields = (*pit_shared_fields, *diagnosis_fields, *optimization_fields)
     if namespace.gate == "test":
@@ -13799,6 +13812,17 @@ def _build_cli_config(
                 apply=namespace.apply,
                 verification_subset=namespace.optimization_verification_subset,
                 readiness_sha256=namespace.readiness_sha256,
+                prior_discovery_feedback=(
+                    _absolute_cli_path(
+                        namespace.optimization_prior_discovery_feedback,
+                        "prior discovery feedback",
+                    )
+                    if namespace.optimization_prior_discovery_feedback is not None
+                    else None
+                ),
+                prior_discovery_feedback_sha256=(
+                    namespace.optimization_prior_discovery_feedback_sha256
+                ),
             )
         except ValueError as exc:
             raise ConfigurationError(str(exc)) from exc
@@ -14803,6 +14827,17 @@ def _pit_optimization_prepare_lines(
         *(
             ("--optimization-verification-subset",)
             if config.gate.verification_subset
+            else ()
+        ),
+        *(
+            (
+                "--optimization-prior-discovery-feedback",
+                str(config.gate.prior_discovery_feedback),
+                "--optimization-prior-discovery-feedback-sha256",
+                config.gate.prior_discovery_feedback_sha256,
+            )
+            if config.gate.prior_discovery_feedback is not None
+            and config.gate.prior_discovery_feedback_sha256 is not None
             else ()
         ),
         "--baseline-run",
