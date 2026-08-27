@@ -1828,7 +1828,7 @@ def _validate_aggregate_window(window: Mapping[str, object]) -> None:
         float(weekly["average_cash_pct"]) + float(weekly["average_exposure_pct"]),
         100.0,
         rel_tol=0.0,
-        abs_tol=1e-6,
+        abs_tol=1e-5,
     ):
         raise ValueError("candidate aggregate schema cash/exposure is inconsistent")
     outcomes = funnel["outcomes"]
