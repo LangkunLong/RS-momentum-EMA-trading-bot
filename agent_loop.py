@@ -49,6 +49,14 @@ from typing import (
     TypeVar,
 )
 
+# Keep direct script execution and imports on one module identity.  The
+# authorization ledger binds its audit trail through ``from agent_loop import
+# AuditTrail``; without this alias, ``python agent_loop.py`` creates a second
+# module and the cross-module ``isinstance`` check fails closed at gateway
+# initialization.
+if __name__ == "__main__":
+    sys.modules.setdefault("agent_loop", sys.modules[__name__])
+
 if TYPE_CHECKING:
     from core.pit_optimization_contract import (
         PitOptimizerCallBudget,
