@@ -12,7 +12,13 @@ import pandas as pd
 import pytest
 
 import core.pit_policy_parity as parity
-from core.backtest_engine import EntryAttemptOutcome, SimulationResult, Trade
+from core.backtest_engine import (
+    EntryAttemptOutcome,
+    PortfolioSimulator,
+    SimulationResult,
+    Trade,
+)
+from core.strategy_policy.runtime import InProcessPolicyClient
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
     FoldAggregateSummary,
@@ -62,6 +68,44 @@ def _fold(fold_id: str, purpose: str, start: str) -> FoldSpec:
         end_date=sessions[-1],
         sessions=sessions,
     )
+
+
+def test_policy_client_factory_is_fresh_for_consecutive_parity_fold_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: fold reuse could leak one stateful policy client across runs."""
+    made: list[InProcessPolicyClient] = []
+    closed: list[int] = []
+
+    class Client(InProcessPolicyClient):
+        def close(self) -> None:
+            closed.append(1)
+
+    def factory() -> Client:
+        client = Client()
+        made.append(client)
+        return client
+
+    simulator = PortfolioSimulator(policy_client_factory=factory)
+    monkeypatch.setattr(
+        simulator,
+        "_run_with_policy_client_active",
+        lambda *_args, **_kwargs: SimulationResult(),
+    )
+
+    for fold in (
+        _fold("discovery_1", "discovery", "2021-06-25"),
+        _fold("discovery_2", "discovery", "2021-09-21"),
+    ):
+        simulator.run(
+            ["AAA"],
+            start_date=fold.start_date,
+            end_date=fold.end_date,
+        )
+
+    assert len({id(client) for client in made}) == 2
+    assert closed == [1, 1]
+    assert simulator._policy_client is None
 
 
 def _aggregate(

@@ -223,7 +223,7 @@ def test_injected_technical_only_signal_uses_recomputed_technical_facts() -> Non
         technical_only=True,
     )
 
-    assert [row["symbol"] for row in signals] == ["AAA"]
+    assert [pending.signal["symbol"] for pending in signals] == ["AAA"]
     logged = simulator._signal_rows[-1]
     assert logged["technical_setup_eligible"] is True
     assert logged["entry_contract_eligible"] is True

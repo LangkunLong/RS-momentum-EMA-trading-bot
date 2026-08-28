@@ -14,6 +14,7 @@ from core.engine_policy import (
     PolicyClassification,
     effective_engine_policy_sha256,
 )
+from core.strategy_policy import POLICY_INTERFACE_VERSION
 
 
 _POLICY_SECTIONS = (
@@ -268,6 +269,20 @@ def test_effective_policy_has_closed_leaf_schema_and_canonical_digest() -> None:
     assert effective_engine_policy_sha256(policy) == expected_digest
     assert effective_engine_policy_sha256(reordered) == expected_digest
     assert simulator._effective_engine_policy_sha256 == expected_digest
+
+
+def test_policy_interface_identity_is_separate_from_effective_policy_bytes() -> None:
+    """Break caught: interface identity could rewrite the sealed schema-v1 policy."""
+    simulator = _simulator()
+    policy = deepcopy(simulator._effective_engine_policy)
+    digest = simulator._effective_engine_policy_sha256
+
+    config = _result_config(simulator)
+
+    assert config["policy_interface_version"] == POLICY_INTERFACE_VERSION == 1
+    assert simulator._effective_engine_policy == policy
+    assert simulator._effective_engine_policy_sha256 == digest
+    assert "policy_interface_version" not in policy
 
 
 def test_effective_policy_reports_independently_literal_behavior_facts() -> None:

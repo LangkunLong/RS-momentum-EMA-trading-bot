@@ -9,10 +9,23 @@ import pandas as pd
 import pytest
 
 from core.canslim.entry_contract import CanslimEntryFacts
+from core.strategy_policy import (
+    AllocationDecision,
+    CapacityDecision,
+    EntryDecision,
+    EntrySnapshot,
+    EvictionDecision,
+    ExitAction,
+    ExitDecision,
+    ExitSnapshot,
+)
+from core.strategy_policy.runtime import InProcessPolicyClient
 from core.backtest_engine import (
     CanslimStrategy,
     DataFetcher,
+    PendingEntry,
     PerformanceReport,
+    ProjectedEntryTransition,
     SimulationResult,
     _calculate_rs_snapshot,
     _resolve_universe,
@@ -20,6 +33,44 @@ from core.backtest_engine import (
 )
 from backtest_pnl import PortfolioSimulator, Trade
 from backtest import _calculate_rs_at_date
+
+
+class _ExplodingFetcher:
+    def fetch_price_data(self, *_args, **_kwargs):
+        raise RuntimeError("injected fetch failure")
+
+
+class _CountingClient(InProcessPolicyClient):
+    def __init__(self, closed: list[int]) -> None:
+        self._closed_events = closed
+
+    def close(self) -> None:
+        self._closed_events.append(1)
+
+
+def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
+    made: list[_CountingClient] = []
+    closed: list[int] = []
+
+    def factory() -> _CountingClient:
+        client = _CountingClient(closed)
+        made.append(client)
+        return client
+
+    simulator = PortfolioSimulator(
+        data_fetcher=_ExplodingFetcher(),
+        policy_client_factory=factory,
+    )
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="injected fetch failure"):
+            simulator.run(
+                ["AAPL"],
+                start_date="2021-06-25",
+                end_date="2021-09-20",
+            )
+    assert len({id(client) for client in made}) == 2
+    assert closed == [1, 1]
+    assert simulator._policy_client is None
 
 
 def _make_ohlcv(
@@ -373,6 +424,75 @@ def test_technical_only_mode_skips_fundamental_fetch() -> None:
     mocked_fund.assert_not_called()
 
 
+def test_entry_policy_canslim_strategy_receives_institutional_reweighted_snapshot() -> None:
+    """Break caught: the built-in strategy could bypass policy after scoring facts."""
+    snapshots: list[EntrySnapshot] = []
+
+    class Client(InProcessPolicyClient):
+        def evaluate_entry(self, snapshot: EntrySnapshot) -> EntryDecision:
+            snapshots.append(snapshot)
+            return EntryDecision(False, True, (77.0, 88.0), ("policy_block",))
+
+    strategy = CanslimStrategy()
+    strategy._policy_client_provider = Client
+    dates = pd.date_range("2026-01-01", periods=80, freq="B")
+    ticker_ohlcv = {"AAA": _make_ohlcv(n=80, close_value=100.0)}
+    ticker_ohlcv["AAA"].index = dates
+    all_closes = pd.DataFrame({"AAA": [100.0] * 80}, index=dates)
+
+    with (
+        patch("core.backtest_engine._calculate_rs_at_date", return_value=90.0),
+        patch(
+            "core.backtest_engine._evaluate_fundamentals_at_date",
+            return_value={
+                "c_score": 0.8,
+                "a_score": 0.8,
+                "i_score": 0.5,
+                "current_growth": 0.30,
+                "annual_growth": 0.30,
+                "shares_outstanding": None,
+                "institutional_data_available": False,
+                "quarterly_income": pd.DataFrame(),
+            },
+        ),
+        patch(
+            "core.backtest_engine._evaluate_technical_at_date",
+            return_value={
+                "n_score": 0.8,
+                "s_score": 0.8,
+                "close": 102.0,
+                "has_power_gap": False,
+                "power_gap_details": {},
+                "entry_facts": _eligible_entry_facts(),
+            },
+        ),
+    ):
+        row = strategy.evaluate_symbol(
+            ticker="AAA",
+            ticker_ohlcv=ticker_ohlcv,
+            all_closes=all_closes,
+            eval_date=dates[-1],
+            market_state={
+                "m_score": 0.8,
+                "market_is_bullish": True,
+                "distribution_days": 0,
+                "follow_through": False,
+            },
+        )
+
+    assert len(snapshots) == 1
+    assert snapshots[0].institutional_data_available is False
+    assert snapshots[0].canslim_score == pytest.approx(82.2222222222)
+    assert not hasattr(snapshots[0], "symbol")
+    assert not hasattr(snapshots[0], "signal_date")
+    assert row is not None
+    assert (row["buy_signal"], row["canslim_score"], row["rs_score"]) == (
+        False,
+        77.0,
+        88.0,
+    )
+
+
 def test_export_trade_charts_writes_html(tmp_path: Path) -> None:
     trades = [Trade("NVDA", "2026-04-01", 100.0, 10.0, 93.0, exit_date="2026-04-10", exit_price=110.0, exit_reason="ma_violation")]
     tx = pd.DataFrame(
@@ -548,7 +668,7 @@ def test_full_portfolio_signal_reaches_eviction_and_replaces_lower_rs_position()
         market_state={"market_is_bullish": True},
     )
 
-    assert [row["symbol"] for row in signals] == ["GEV"]
+    assert [pending.signal["symbol"] for pending in signals] == ["GEV"]
     sim._enter_position(signals[0], ohlcv_map, entry_date)
     assert set(sim._open_positions) == {"GEV"}
     assert [(trade.symbol, trade.exit_reason) for trade in sim._trades] == [("MSFT", "evicted")]
@@ -603,7 +723,7 @@ def test_open_slot_returns_only_best_ranked_candidate() -> None:
         market_state={"market_is_bullish": True},
     )
 
-    assert [row["symbol"] for row in signals] == ["BEST"]
+    assert [pending.signal["symbol"] for pending in signals] == ["BEST"]
 
 
 def test_eviction_skips_incumbent_with_missing_price_data() -> None:
@@ -740,3 +860,379 @@ def test_eviction_disabled_when_flag_is_false() -> None:
 
     assert set(sim._open_positions.keys()) == original
     assert "VST" not in sim._open_positions
+
+
+@pytest.mark.parametrize(
+    ("configured_limit", "configured_eviction", "open_count", "expected"),
+    [
+        (None, True, 2, CapacityDecision(None, True)),
+        (4, True, 2, CapacityDecision(4, True)),
+        (2, False, 2, CapacityDecision(2, False)),
+        (2, True, 2, CapacityDecision(2, True)),
+    ],
+)
+def test_policy_capacity_resolves_validated_baseline_decisions(
+    configured_limit: int | None,
+    configured_eviction: bool,
+    open_count: int,
+    expected: CapacityDecision,
+) -> None:
+    """Break caught: capacity could remain an unvalidated simulator-only setting."""
+    simulator = PortfolioSimulator(
+        max_positions=configured_limit,
+        enable_eviction=configured_eviction,
+    )
+    simulator._open_positions = {
+        f"OLD{slot}": Trade(f"OLD{slot}", "2026-01-01", 100.0, 1.0, 92.0)
+        for slot in range(open_count)
+    }
+    assert simulator._resolve_capacity(
+        eligible_signal_count=3,
+        cash_fraction=0.5,
+    ) == expected
+
+
+def test_policy_capacity_rejects_finite_limit_above_engine_ceiling() -> None:
+    """Break caught: an injected policy could bypass the 25-position safety ceiling."""
+
+    class Client(InProcessPolicyClient):
+        def recommend_capacity(self, _snapshot):
+            return CapacityDecision(26, True)
+
+    simulator = PortfolioSimulator()
+    simulator._policy_client = Client()
+    with pytest.raises(ValueError, match="max_positions"):
+        simulator._resolve_capacity(eligible_signal_count=1, cash_fraction=1.0)
+
+
+def test_policy_capacity_pending_entry_round_trip_and_carried_capacity() -> None:
+    """Break caught: next-session entry could silently reread changed defaults."""
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 90.0},
+        capacity=CapacityDecision(max_positions=1, eviction_enabled=False),
+    )
+    assert PendingEntry.from_primitive(pending.to_primitive()) == pending
+    simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+    simulator._open_positions = {"OLD": object()}
+    assert simulator._capacity_state(pending) == (True, False)
+
+
+def test_policy_capacity_lowered_below_holdings_blocks_without_liquidation() -> None:
+    """Break caught: lowering a policy cap could force unrequested liquidation."""
+    simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+    positions = {
+        "OLD1": Trade("OLD1", "2026-01-01", 100.0, 1.0, 92.0),
+        "OLD2": Trade("OLD2", "2026-01-01", 100.0, 1.0, 92.0),
+    }
+    simulator._open_positions = dict(positions)
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 99.0},
+        capacity=CapacityDecision(1, False),
+    )
+    assert simulator._capacity_state(pending) == (True, False)
+    assert simulator._open_positions == positions
+
+
+def test_policy_capacity_evaluate_signals_carries_one_batch_decision() -> None:
+    """Break caught: ranking/truncation could discard the signal-session capacity."""
+
+    class Client(InProcessPolicyClient):
+        def __init__(self) -> None:
+            self.capacity_calls = 0
+
+        def recommend_capacity(self, _snapshot):
+            self.capacity_calls += 1
+            return CapacityDecision(1, False)
+
+    simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+    client = Client()
+    simulator._policy_client = client
+    simulator._regime_tracker = SimpleNamespace(allows_entries=True)
+    simulator._ticker_industry = {}
+    frame = _make_canonical_entry_ohlcv(120.0)
+    simulator.strategy = SimpleNamespace(
+        evaluate_symbol=lambda **_kwargs: _canonical_full_signal(
+            "NEW", rs_score=90.0, canslim_score=80.0
+        )
+    )
+
+    pending = simulator._evaluate_signals(
+        tickers=["NEW"],
+        ticker_ohlcv={"NEW": frame},
+        all_closes=pd.DataFrame(index=frame.index),
+        eval_date=frame.index[-1],
+        market_state={"market_is_bullish": True},
+    )
+
+    assert client.capacity_calls == 1
+    assert pending == [
+        PendingEntry(
+            signal=pending[0].signal,
+            capacity=CapacityDecision(1, False),
+        )
+    ]
+
+
+def test_policy_capacity_checkpoint_serializes_pending_carrier() -> None:
+    """Break caught: a resumed run could lose the carried capacity decision."""
+    simulator = PortfolioSimulator()
+    simulator._reset_run_state()
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 90.0},
+        capacity=CapacityDecision(1, False),
+    )
+    payload = simulator._checkpoint_payload(
+        fingerprint="a" * 64,
+        code_identity="code",
+        strategy_identity={"kind": "built_in"},
+        next_day_index=1,
+        total_days=2,
+        state_log_offset=0,
+        regime_tracker=simulator._regime_tracker,
+        pending_entries=[pending],
+        benchmark_start_price=100.0,
+        origin_requested_min_rs_score=80.0,
+        origin_requested_min_canslim_score=70.0,
+    )
+    assert payload["pending_entries"] == [pending.to_primitive()]
+    assert PendingEntry.from_primitive(payload["pending_entries"][0]) == pending
+
+
+def test_policy_capacity_next_session_enforces_carried_decision() -> None:
+    """Break caught: entry execution could use permissive current defaults instead."""
+    simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+    old = Trade("OLD", "2026-01-01", 100.0, 1.0, 92.0)
+    simulator._open_positions = {"OLD": old}
+    frame = _make_ohlcv(n=60, close_value=100.0)
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 99.0, "canslim_score": 90.0},
+        capacity=CapacityDecision(1, False),
+    )
+
+    simulator._enter_position(pending, {"NEW": frame, "OLD": frame}, frame.index[-1])
+
+    assert simulator._open_positions == {"OLD": old}
+    assert simulator._transactions == []
+    assert simulator._entry_outcomes[-1].outcome == "entry_rejected_capacity"
+
+
+def test_policy_eviction_snapshot_uses_stable_opaque_slots() -> None:
+    """Break caught: eviction policy could receive symbols or unstable slot order."""
+    simulator = PortfolioSimulator(max_positions=2, enable_eviction=True)
+    simulator._open_positions = {
+        "BBB": Trade("BBB", "2026-01-01", 100.0, 1.0, 92.0, rs_score=60.0),
+        "AAA": Trade("AAA", "2026-01-01", 100.0, 1.0, 92.0, rs_score=70.0),
+    }
+    frame = _make_ohlcv(n=2, close_value=95.0)
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 90.0},
+        capacity=CapacityDecision(2, True),
+    )
+
+    snapshot = simulator._build_eviction_snapshot(
+        pending=pending,
+        ticker_ohlcv={"BBB": frame, "AAA": frame, "NEW": frame},
+        entry_date=frame.index[-1],
+    )
+
+    assert [position.slot for position in snapshot.positions] == [0, 1]
+    assert [position.rs_score for position in snapshot.positions] == [60.0, 70.0]
+    assert all(not hasattr(position, "symbol") for position in snapshot.positions)
+
+
+def test_policy_eviction_rejects_unknown_slot_without_mutation() -> None:
+    """Break caught: a policy-selected unknown slot could evict an arbitrary holding."""
+    simulator = PortfolioSimulator(max_positions=1, enable_eviction=True)
+    old = Trade("OLD", "2026-01-01", 100.0, 1.0, 92.0, rs_score=60.0)
+    simulator._open_positions = {"OLD": old}
+    frame = _make_ohlcv(n=2, close_value=95.0)
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 90.0},
+        capacity=CapacityDecision(1, True),
+    )
+    before = (simulator._equity, dict(simulator._open_positions), list(simulator._transactions))
+
+    with pytest.raises(ValueError, match="slot"):
+        simulator._project_entry_transition(
+            pending=pending,
+            ticker_ohlcv={"OLD": frame, "NEW": frame},
+            entry_date=frame.index[-1],
+            eviction=EvictionDecision(9),
+        )
+
+    assert (simulator._equity, simulator._open_positions, simulator._transactions) == before
+
+
+@pytest.mark.parametrize(
+    ("projection", "recommendation", "message"),
+    [
+        (
+            ProjectedEntryTransition(None, None, None, 100.0, 10_000.0, 5_000.0, 5_000.0),
+            AllocationDecision(0.011, 0.08, None),
+            "risk_fraction",
+        ),
+        (
+            ProjectedEntryTransition(None, None, None, 100.0, 10_000.0, 5_000.0, 5_000.0),
+            AllocationDecision(0.01, 0.081, None),
+            "stop_distance_fraction",
+        ),
+        (
+            ProjectedEntryTransition(None, None, None, 100.0, 10_000.0, 100.0, 5_000.0),
+            AllocationDecision(0.01, 0.08, None),
+            "projected cash",
+        ),
+        (
+            ProjectedEntryTransition(None, None, None, 100.0, 10_000.0, 5_000.0, 9_500.0),
+            AllocationDecision(0.01, 0.08, None),
+            "gross long notional",
+        ),
+    ],
+)
+def test_policy_allocation_rejects_unsafe_projected_transition(
+    projection: ProjectedEntryTransition,
+    recommendation: AllocationDecision,
+    message: str,
+) -> None:
+    """Break caught: unsafe risk/cash/leverage could reach the mutating apply phase."""
+    simulator = PortfolioSimulator()
+    with pytest.raises(ValueError, match=message):
+        simulator._validate_entry_transition(projection, recommendation)
+
+
+def test_projected_entry_transition_failed_allocation_is_byte_stable() -> None:
+    """Break caught: eviction could occur before allocation validation completes."""
+
+    class Client(InProcessPolicyClient):
+        def recommend_allocation(self, _snapshot):
+            return AllocationDecision(0.011, 0.08, None)
+
+    simulator = PortfolioSimulator(max_positions=1, enable_eviction=True)
+    simulator._policy_client = Client()
+    old = Trade("OLD", "2026-01-01", 100.0, 10.0, 92.0, rs_score=60.0)
+    simulator._open_positions = {"OLD": old}
+    simulator._equity = 1_000.0
+    frame = _make_ohlcv(n=60, close_value=95.0)
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
+        capacity=CapacityDecision(1, True),
+    )
+    before = (
+        simulator._equity,
+        dict(simulator._open_positions),
+        list(simulator._trades),
+        list(simulator._transactions),
+    )
+
+    with pytest.raises(ValueError, match="risk_fraction"):
+        simulator._enter_position(
+            pending,
+            {"OLD": frame, "NEW": frame},
+            frame.index[-1],
+        )
+
+    assert (
+        simulator._equity,
+        simulator._open_positions,
+        simulator._trades,
+        simulator._transactions,
+    ) == before
+
+
+def test_policy_allocation_uncapped_batch_preserves_cash_for_remaining_entries() -> None:
+    """Break caught: early uncapped entries could starve a same-session batch."""
+    simulator = PortfolioSimulator(initial_capital=1_000.0, max_positions=None)
+    simulator._pending_entries_remaining = 10
+    frame = _make_ohlcv(n=2, close_value=100.0)
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
+        capacity=CapacityDecision(None, True),
+    )
+
+    simulator._enter_position(pending, {"NEW": frame}, frame.index[-1])
+
+    buy = simulator._transactions[-1]
+    assert buy["Action"] == "BUY"
+    assert buy["Value"] == 100.0
+
+
+def test_policy_exit_hard_stop_precedes_any_policy_call() -> None:
+    """Break caught: policy code could delay or override the engine hard stop."""
+    calls: list[ExitSnapshot] = []
+
+    class Client(InProcessPolicyClient):
+        def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision:
+            calls.append(snapshot)
+            return super().evaluate_exit(snapshot)
+
+    simulator = PortfolioSimulator()
+    simulator._policy_client = Client()
+    trade = Trade("AAA", "2026-01-01", 100.0, 10.0, 92.0)
+    simulator._open_positions = {"AAA": trade}
+    frame = _make_ohlcv(n=3, close_value=90.0, high_value=91.0, low_value=89.0)
+
+    simulator._check_exits("AAA", frame, frame.index[-1])
+
+    assert calls == []
+    assert simulator._trades[-1].exit_reason == "stop_loss"
+    assert simulator._trades[-1].exit_price == 92.0
+
+
+def test_policy_exit_close_uses_trusted_current_close() -> None:
+    """Break caught: an exit decision could fail to route or acquire fill authority."""
+
+    class Client(InProcessPolicyClient):
+        def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision:
+            return ExitDecision(
+                actions=(ExitAction("close", None, None, "policy_exit"),),
+                next_stop_price=None,
+                early_winner_hold=snapshot.early_winner_hold,
+                scale_out_tier=snapshot.scale_out_tier,
+                breakeven_armed=snapshot.breakeven_armed,
+                ema_trailing_active=snapshot.ema_trailing_active,
+            )
+
+    simulator = PortfolioSimulator(stagnation_days=999)
+    simulator._policy_client = Client()
+    simulator._open_positions = {
+        "AAA": Trade("AAA", "2026-01-01", 100.0, 10.0, 92.0)
+    }
+    frame = _make_ohlcv(n=3, close_value=103.0, high_value=104.0, low_value=99.0)
+
+    simulator._check_exits("AAA", frame, frame.index[-1])
+
+    assert simulator._trades[-1].exit_reason == "policy_exit"
+    assert simulator._trades[-1].exit_price == 103.0
+
+
+def test_policy_exit_rejects_uncrossed_scale_out_before_mutation() -> None:
+    """Break caught: an invalid action plan could partially sell before rejection."""
+
+    class Client(InProcessPolicyClient):
+        def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision:
+            return ExitDecision(
+                actions=(
+                    ExitAction(
+                        "scale_out",
+                        0.10,
+                        0.25,
+                        "take_profit_scale_out",
+                    ),
+                ),
+                next_stop_price=None,
+                early_winner_hold=False,
+                scale_out_tier=1,
+                breakeven_armed=False,
+                ema_trailing_active=False,
+            )
+
+    simulator = PortfolioSimulator(stagnation_days=999)
+    simulator._policy_client = Client()
+    trade = Trade("AAA", "2026-01-01", 100.0, 10.0, 92.0)
+    simulator._open_positions = {"AAA": trade}
+    frame = _make_ohlcv(n=3, close_value=105.0, high_value=109.0, low_value=99.0)
+    before = (trade.remaining_qty, simulator._equity, list(simulator._transactions))
+
+    with pytest.raises(ValueError, match="crossed"):
+        simulator._check_exits("AAA", frame, frame.index[-1])
+
+    assert (trade.remaining_qty, simulator._equity, simulator._transactions) == before

@@ -7,9 +7,13 @@ import math
 from dataclasses import FrozenInstanceError, fields
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
+from core.backtest_engine import PortfolioSimulator
+from core.canslim.entry_contract import CanslimEntryFacts
 from core.strategy_policy import (
     POLICY_INTERFACE_VERSION,
     AllocationDecision,
@@ -33,6 +37,7 @@ from core.strategy_policy.risk import (
     recommend_capacity,
     select_eviction,
 )
+from core.strategy_policy.runtime import InProcessPolicyClient
 
 
 def _entry_snapshot(**changes: object) -> EntrySnapshot:
@@ -163,6 +168,212 @@ def _exit_snapshot(**changes: object) -> ExitSnapshot:
     }
     values.update(changes)
     return ExitSnapshot(**values)  # type: ignore[arg-type]
+
+
+def _entry_facts() -> CanslimEntryFacts:
+    return CanslimEntryFacts(
+        event_close=102.0,
+        prior_close=100.0,
+        event_volume=130.0,
+        prior_average_volume_50=100.0,
+        pivot=100.0,
+        volume_ratio=1.3,
+        extension=0.02,
+        price_advanced=True,
+        has_volume_surge=True,
+        in_buy_zone=True,
+        eligible=True,
+        blocking_reasons=(),
+    )
+
+
+class _EntryDecisionClient(InProcessPolicyClient):
+    def __init__(self, decision: object) -> None:
+        self.decision = decision
+        self.snapshots: list[EntrySnapshot] = []
+
+    def evaluate_entry(self, snapshot: EntrySnapshot) -> object:
+        self.snapshots.append(snapshot)
+        return self.decision
+
+
+@pytest.mark.parametrize(
+    ("technical_only", "decision", "expected"),
+    [
+        (
+            False,
+            EntryDecision(False, True, (91.0, 81.0), ("policy_block",)),
+            (False, 91.0, 81.0, "policy_block"),
+        ),
+        (
+            True,
+            EntryDecision(True, True, (None, None), ()),
+            (True, None, None, ""),
+        ),
+    ],
+)
+def test_entry_policy_recanonicalizes_full_and_technical_rows(
+    technical_only: bool,
+    decision: EntryDecision,
+    expected: tuple[bool, float | None, float | None, str],
+) -> None:
+    """Break caught: the engine could retain duplicate inline entry/rank authority."""
+    simulator = PortfolioSimulator(technical_only=technical_only)
+    client = _EntryDecisionClient(decision)
+    simulator._policy_client = client
+    facts = _entry_facts()
+    row = {
+        "current_growth": 0.30,
+        "annual_growth": 0.30,
+        "rs_score": 85.0,
+        "entry_composite_score": 75.0,
+        "canslim_score": 80.0,
+        "c_score": 0.8,
+        "a_score": 0.8,
+        "n_score": 0.8,
+        "s_score": 0.8,
+        "i_score": 0.5,
+        "m_score": 0.8,
+        "technical_score": 80.0,
+        "institutional_data_available": False,
+        "has_peg_today": False,
+    }
+    history = pd.DataFrame(
+        {
+            "Close": [100.0] * 59 + [102.0],
+            "Volume": [100.0] * 59 + [130.0],
+        },
+        index=pd.bdate_range("2026-01-01", periods=60),
+    )
+
+    canonical = simulator._canonicalize_signal_row(
+        row=row,
+        ticker="AAA",
+        ticker_history=history,
+        eval_date=history.index[-1],
+        market_allowed=True,
+        market_state={"market_is_bullish": True},
+        entry_facts=facts,
+    )
+
+    assert (
+        canonical["buy_signal"],
+        canonical["canslim_score"],
+        canonical["rs_score"],
+        canonical["entry_blocking_reasons"],
+    ) == expected
+    assert len(client.snapshots) == 1
+    assert client.snapshots[0].technical_only is technical_only
+    assert client.snapshots[0].institutional_data_available is False
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {"qualified": True, "market_permitted": True, "rank": [80.0, 90.0], "blocking_codes": [], "date": "2026-01-01"},
+        SimpleNamespace(qualified=True, market_permitted=True, rank=(80.0, 90.0), blocking_codes=(), symbol="AAA"),
+        SimpleNamespace(qualified=True, market_permitted=True, rank=(80.0, 90.0), blocking_codes=(), fill_price=100.0),
+        SimpleNamespace(qualified=True, market_permitted=True, rank=(float("inf"), 90.0), blocking_codes=()),
+        SimpleNamespace(qualified=True, market_permitted=True, rank=(80.0, 90.0), blocking_codes=(), unknown=True),
+    ],
+)
+def test_entry_policy_rejects_identity_fill_nonfinite_and_unknown_fields(
+    decision: object,
+) -> None:
+    """Break caught: an injected client could acquire identity or fill authority."""
+    simulator = PortfolioSimulator()
+    simulator._policy_client = _EntryDecisionClient(decision)
+    facts = _entry_facts()
+    history = pd.DataFrame(
+        {"Close": [100.0] * 59 + [102.0], "Volume": [100.0] * 59 + [130.0]},
+        index=pd.bdate_range("2026-01-01", periods=60),
+    )
+    with pytest.raises(ValueError, match="entry policy decision"):
+        simulator._canonicalize_signal_row(
+            row={
+                "current_growth": 0.30,
+                "annual_growth": 0.30,
+                "rs_score": 85.0,
+                "entry_composite_score": 75.0,
+                "canslim_score": 80.0,
+            },
+            ticker="AAA",
+            ticker_history=history,
+            eval_date=history.index[-1],
+            market_allowed=True,
+            market_state={"market_is_bullish": True},
+            entry_facts=facts,
+        )
+
+
+@pytest.mark.parametrize(
+    ("rank_mode", "ticker_order", "expected_order"),
+    [
+        ("reverse", ("LOW", "BEST"), ("LOW", "BEST")),
+        ("nullable_tie", ("BEST", "LOW"), ("BEST", "LOW")),
+    ],
+)
+def test_policy_rank_uses_valid_nullable_decisions_and_stable_order(
+    rank_mode: str,
+    ticker_order: tuple[str, str],
+    expected_order: tuple[str, str],
+) -> None:
+    """Break caught: engine sorting could ignore policy ranks or destabilize ties."""
+
+    class Client(InProcessPolicyClient):
+        def evaluate_entry(self, snapshot: EntrySnapshot) -> EntryDecision:
+            rank = (
+                (snapshot.rs_score, snapshot.canslim_score)
+                if rank_mode == "reverse"
+                else (None, None)
+            )
+            return EntryDecision(True, True, rank, ())
+
+    history = pd.DataFrame(
+        {
+            "Open": [100.0] * 60,
+            "High": [103.0] * 60,
+            "Low": [99.0] * 60,
+            "Close": [100.0] * 59 + [102.0],
+            "Volume": [100.0] * 59 + [130.0],
+        },
+        index=pd.bdate_range("2026-01-01", periods=60),
+    )
+    rows = {
+        "LOW": {
+            "symbol": "LOW",
+            "current_growth": 0.30,
+            "annual_growth": 0.30,
+            "rs_score": 99.0,
+            "entry_composite_score": 75.0,
+            "canslim_score": 70.0,
+        },
+        "BEST": {
+            "symbol": "BEST",
+            "current_growth": 0.30,
+            "annual_growth": 0.30,
+            "rs_score": 80.0,
+            "entry_composite_score": 75.0,
+            "canslim_score": 90.0,
+        },
+    }
+    simulator = PortfolioSimulator()
+    simulator._policy_client = Client()
+    simulator._regime_tracker = SimpleNamespace(allows_entries=True)
+    simulator._ticker_industry = {}
+    simulator.strategy = SimpleNamespace(
+        evaluate_symbol=lambda **kwargs: rows[kwargs["ticker"]]
+    )
+
+    pending = simulator._evaluate_signals(
+        tickers=list(ticker_order),
+        ticker_ohlcv={ticker: history for ticker in ticker_order},
+        all_closes=pd.DataFrame(index=history.index),
+        eval_date=history.index[-1],
+        market_state={"market_is_bullish": True},
+    )
+
+    assert tuple(item.signal["symbol"] for item in pending) == expected_order
 
 
 def test_entry_decision_is_closed_and_bool_strict() -> None:
