@@ -2651,6 +2651,23 @@ Every artifact has schema_version=2 and exact top-level keys:
 - [ ] **Step 9: Report, but do not execute, the exact six-call subset canary command.** Report the exact PolicySourceScope digest/preimage summary, sealed per-role response/cost caps, and cumulative six-call/448000-token/USD-0.40 ceilings. Do not print/run a record-grant command or load live pricing. Stop for fresh explicit operator authorization of that scope plus calls/tokens/USD; live canary setup must still freeze pricing and may stop with zero calls if any conservative per-call cost exceeds its sealed cap.
 - [ ] **Step 10: Defer full-window parity and the long replay.** Full-window provider-free policy parity is required immediately before a later full optimizer/long replay, not during this subset architecture proof.
 
+### Task 9A: Enforce the Rounded-Stop Risk Ceiling and Version Local Evidence
+
+The legacy sizing path can exceed the written risk ceiling when the derived stop rounds
+down to the nearest cent. Preserve the hard safety contract: derive the rounded stop
+before final sizing, cap quantity by both the recommended and engine risk budgets using
+the actual rounded loss per share, and recompute the buy notional from the clamped
+quantity. Preserve the existing cash, gross-exposure, and notional-cap checks. Keep the
+original sealed reference and baseline artifacts immutable; corrected provider-free
+subset evidence is written under a new local artifact version and must carry the new
+source identity. A full baseline reseal remains part of the later long-replay gate and
+must not be started by this task.
+
+ - [x] Add adverse, exact, and favorable cent-rounding regression coverage.
+ - [x] Implement and independently review the engine-owned post-rounding clamp.
+ - [x] Capture and verify the corrected two-fold subset reference under a new local
+       artifact version; do not evaluate the hidden fold.
+
 ## Completion Criteria
 
 - Baseline strategy behavior matches exactly on both independent discovery folds after extraction.
