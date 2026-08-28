@@ -737,6 +737,164 @@ def test_artifact_store_rejects_nested_link_before_any_outside_mutation(
     assert list(outside.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "mutation_kind",
+    ["create_only", "replace_json", "replace_diff"],
+)
+def test_artifact_store_blocks_post_check_path_replacement_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation_kind: str,
+) -> None:
+    """Break caught: a checked parent could be swapped before open/replace."""
+    import os
+
+    import core.pit_optimizer_artifacts as artifacts
+
+    root = (tmp_path / "run").resolve()
+    root.mkdir()
+    store = artifacts.IncrementalArtifactStore(root)
+    if mutation_kind == "create_only":
+        store.prepare_iteration(1)
+        name = "iterations/001/investigator.json"
+        target_name = "investigator.json"
+        component = root / "iterations"
+        detached = (tmp_path / "detached_iterations").resolve()
+        outside = (tmp_path / "outside_iterations").resolve()
+        outside.mkdir()
+        (outside / "001").mkdir()
+        original_bytes: bytes | None = None
+        replacement_bytes: bytes | None = None
+        updated_bytes = b'{"schema_version":2,"stage":"after"}\n'
+    elif mutation_kind == "replace_json":
+        name = "accounting.json"
+        target_name = name
+        component = root
+        detached = (tmp_path / "detached_run_json").resolve()
+        outside = (tmp_path / "outside_run_json").resolve()
+        outside.mkdir()
+        store.write_json_artifact(name, {"schema_version": 2, "stage": "before"})
+        original_bytes = (root / name).read_bytes()
+        replacement_bytes = b"synthetic replacement json marker\n"
+        (outside / name).write_bytes(replacement_bytes)
+        updated_bytes = b'{"schema_version":2,"stage":"after"}\n'
+    else:
+        name = "incumbent.diff"
+        target_name = name
+        component = root
+        detached = (tmp_path / "detached_run_diff").resolve()
+        outside = (tmp_path / "outside_run_diff").resolve()
+        outside.mkdir()
+        store.write_diff_artifact(name, "before\n")
+        original_bytes = (root / name).read_bytes()
+        replacement_bytes = b"synthetic replacement diff marker\n"
+        (outside / name).write_bytes(replacement_bytes)
+        updated_bytes = b"after\n"
+
+    race = {"injected": False, "blocked": False, "link": False}
+
+    def inject_replacement() -> None:
+        if race["injected"]:
+            return
+        race["injected"] = True
+        try:
+            component.rename(detached)
+        except OSError:
+            race["blocked"] = True
+            return
+        try:
+            component.symlink_to(outside, target_is_directory=True)
+            race["link"] = True
+        except OSError:
+            component.mkdir()
+            if mutation_kind == "create_only":
+                (component / "001").mkdir()
+            else:
+                assert replacement_bytes is not None
+                (component / target_name).write_bytes(replacement_bytes)
+
+    original_path_open = Path.open
+
+    def racing_path_open(path: Path, mode: str = "r", *args: object, **kwargs: object):
+        if path.name == target_name and "x" in mode:
+            inject_replacement()
+        return original_path_open(path, mode, *args, **kwargs)
+
+    original_mkstemp = artifacts.tempfile.mkstemp
+
+    def racing_mkstemp(*args: object, **kwargs: object):
+        prefix = kwargs.get("prefix", "")
+        if isinstance(prefix, str) and prefix.startswith(f".{target_name}."):
+            inject_replacement()
+        return original_mkstemp(*args, **kwargs)
+
+    original_os_open = artifacts.os.open
+
+    def racing_os_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        candidate_name = Path(os.fsdecode(path)).name if not isinstance(path, int) else ""
+        if candidate_name == target_name or (
+            candidate_name.startswith(f".{target_name}.")
+            and candidate_name.endswith(".tmp")
+        ):
+            inject_replacement()
+        if dir_fd is None:
+            return original_os_open(path, flags, mode)
+        return original_os_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(Path, "open", racing_path_open)
+    monkeypatch.setattr(artifacts.tempfile, "mkstemp", racing_mkstemp)
+    monkeypatch.setattr(artifacts.os, "open", racing_os_open)
+
+    try:
+        if mutation_kind in {"create_only", "replace_json"}:
+            store.write_json_artifact(
+                name,
+                {"schema_version": 2, "stage": "after"},
+            )
+        else:
+            store.write_diff_artifact(name, "after\n")
+    except (OSError, ValueError):
+        pass
+
+    assert race["injected"] is True
+    outside_target = (
+        outside / "001" / target_name
+        if mutation_kind == "create_only"
+        else outside / target_name
+    )
+    if race["blocked"]:
+        assert component.exists()
+        assert not detached.exists()
+        safe_target = (
+            component / "001" / target_name
+            if mutation_kind == "create_only"
+            else component / target_name
+        )
+        assert safe_target.read_bytes() == updated_bytes
+        if mutation_kind == "create_only":
+            assert not outside_target.exists()
+        else:
+            assert outside_target.read_bytes() == replacement_bytes
+        return
+
+    if mutation_kind == "create_only":
+        assert not outside_target.exists()
+        assert not (detached / "001" / target_name).exists()
+        if not race["link"]:
+            assert not (component / "001" / target_name).exists()
+    else:
+        assert outside_target.read_bytes() == replacement_bytes
+        assert (detached / target_name).read_bytes() == original_bytes
+        if not race["link"]:
+            assert (component / target_name).read_bytes() == replacement_bytes
+
+
 def test_artifact_initialization_candidate_capability_is_keyed_only_by_workspace_id(
     tmp_path: Path,
 ) -> None:
@@ -1487,6 +1645,12 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
 
     inputs = _prepare_fixture(tmp_path)
     readiness = _prepare(inputs)
+    raw_envelope_marker = "SYNTHETIC_RAW_ENVELOPE_MARKER_7R2"
+    approval_input_marker = "SYNTHETIC_APPROVAL_INPUT_MARKER_7R2"
+    candidate_input_marker = "SYNTHETIC_CANDIDATE_INPUT_MARKER_7R2"
+    raw_boundary_seen: list[str] = []
+    approval_boundary_seen: list[str] = []
+    candidate_boundary_seen: list[str] = []
     git_path = shutil.which("git")
     assert git_path is not None
     git_capability = agent_loop.configure_git_executable(Path(git_path).resolve())
@@ -1494,6 +1658,15 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
     run_root.mkdir()
     store = IncrementalArtifactStore(run_root)
     pricing, lease = _pricing_and_lease(readiness.manifest)
+    lease = replace(
+        lease,
+        one_shot_key_sha256=hashlib.sha256(
+            approval_input_marker.encode("utf-8")
+        ).hexdigest(),
+    )
+    synthetic_approval_input = {
+        "operator_approval_reference": approval_input_marker,
+    }
     initial_bundle = controller.build_policy_source_bundle(
         candidate_root=Path(inputs["source_root"]).resolve(),
         cumulative_diff="",
@@ -1512,6 +1685,14 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
         workspace_id = f"workspace_actual_{candidate_number}"
         root = (tmp_path / workspace_id).resolve()
         shutil.copytree(Path(inputs["source_root"]), root)
+        exclude = root / ".git" / "info" / "exclude"
+        with exclude.open("a", encoding="utf-8") as handle:
+            handle.write("\n.synthetic_candidate_boundary\n")
+        candidate_boundary = root / ".synthetic_candidate_boundary"
+        candidate_boundary.write_text(candidate_input_marker, encoding="utf-8")
+        candidate_boundary_seen.append(
+            candidate_boundary.read_text(encoding="utf-8")
+        )
         if cumulative_diff:
             agent_loop._git(
                 root,
@@ -1570,9 +1751,21 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
                 disposition="refine",
                 next_direction=f"bounded direction {plan.iteration}",
             )
+        raw_envelope = {
+            "synthetic_transport_marker": raw_envelope_marker,
+            "message": {
+                "content": json.dumps(
+                    asdict(payload),
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        assert callable(parser)
+        closed_payload = parser(raw_envelope["message"]["content"])
+        raw_boundary_seen.append(raw_envelope["synthetic_transport_marker"])
         return PitOptimizerRoleCall(
             plan,
-            payload,
+            closed_payload,
             _role_facts(plan, frozen_pricing_sha256=pricing.pricing_sha256),
         )
 
@@ -1692,9 +1885,17 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
             hidden,
         )
 
+    def open_lease(ready: object, frozen: object) -> object:
+        assert ready is readiness
+        assert frozen is pricing
+        approval_boundary_seen.append(
+            synthetic_approval_input["operator_approval_reference"]
+        )
+        return lease
+
     services = PitOptimizerServices(
         freeze_pricing=lambda model: pricing,
-        open_run_lease=lambda ready, frozen: lease,
+        open_run_lease=open_lease,
         close_run_lease=lambda active, terminal: None,
         call_role=call_role,
         recover_role_attempt=lambda plan, active: (_ for _ in ()).throw(
@@ -1728,6 +1929,9 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
     )
     result = run_pit_optimizer_v2(readiness=readiness, services=services)
 
+    assert raw_boundary_seen == [raw_envelope_marker] * 6
+    assert approval_boundary_seen == [approval_input_marker]
+    assert candidate_boundary_seen == [candidate_input_marker] * 2
     assert result.terminal_code == "iteration_limit"
     assert result.status == "long_replay_eligible"
     assert result.iterations_started == result.iterations_completed == 2
@@ -1828,13 +2032,15 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
     durable = b"\n".join(
         path.read_bytes() for path in run_root.rglob("*") if path.is_file()
     )
-    for sentinel in (
-        b"RAW_PROVIDER_SECRET_SENTINEL",
-        b"SYSTEM_PROMPT_SECRET_SENTINEL",
-        b"OPERATOR_APPROVAL_SECRET_SENTINEL",
-        b"AUTHORIZATION_HEADER_SECRET_SENTINEL",
+    persisted_and_public = durable + controller.canonical_json_bytes(
+        result.to_public_artifact()
+    )
+    for marker in (
+        raw_envelope_marker,
+        approval_input_marker,
+        candidate_input_marker,
     ):
-        assert sentinel not in durable
+        assert marker.encode("utf-8") not in persisted_and_public
 
 
 def _decision_calls(state: object, *, iteration: int):
