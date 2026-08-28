@@ -1658,6 +1658,84 @@ def validate_policy_source_bundle_descendant(
         raise ValueError("policy source cumulative diff resulting source texts differ")
 
 
+def _reverse_unified_diff(unified_diff: str) -> str:
+    """Reverse one already closed unified diff without trusting omitted source context."""
+
+    output: list[str] = []
+    remaining_old = 0
+    remaining_new = 0
+    in_hunk = False
+    for line in unified_diff.splitlines(keepends=True):
+        if not in_hunk:
+            match = _HUNK_RE.fullmatch(line)
+            if match is None:
+                output.append(line)
+                continue
+            old_start = int(match.group(1))
+            old_count = int(match.group(2) or "1")
+            new_start = int(match.group(3))
+            new_count = int(match.group(4) or "1")
+            closing_marker = line.find("@@", 2)
+            if closing_marker < 0:
+                raise ValueError("policy source cumulative diff hunk is invalid")
+            suffix = line[closing_marker + 2 :]
+            output.append(
+                f"@@ -{new_start},{new_count} +{old_start},{old_count} @@{suffix}"
+            )
+            remaining_old = old_count
+            remaining_new = new_count
+            in_hunk = remaining_old > 0 or remaining_new > 0
+            continue
+        if not line or line[0] not in {" ", "+", "-"}:
+            raise ValueError("policy source cumulative diff body is invalid")
+        prefix = line[0]
+        if prefix in {" ", "-"}:
+            remaining_old -= 1
+        if prefix in {" ", "+"}:
+            remaining_new -= 1
+        if remaining_old < 0 or remaining_new < 0:
+            raise ValueError("policy source cumulative diff counts are invalid")
+        output.append({"+": "-", "-": "+"}.get(prefix, prefix) + line[1:])
+        in_hunk = remaining_old > 0 or remaining_new > 0
+    if in_hunk:
+        raise ValueError("policy source cumulative diff is truncated")
+    return "".join(output)
+
+
+def authenticate_policy_source_bundle(
+    *,
+    scope: PolicySourceScope,
+    bundle: PolicySourceBundle,
+) -> None:
+    """Bind actual initial/current policy bytes to one exact authorized source scope."""
+
+    if not isinstance(scope, PolicySourceScope) or not isinstance(
+        bundle, PolicySourceBundle
+    ):
+        raise ValueError("policy source authentication contracts are invalid")
+    current_texts = {record.path: record.text for record in bundle.files}
+    if bundle.cumulative_diff:
+        initial_texts, _stats = _apply_unified_diff(
+            current_texts,
+            _reverse_unified_diff(bundle.cumulative_diff),
+            bounds=scope.hard_patch_bounds,
+        )
+    else:
+        initial_texts = current_texts
+    try:
+        initial_bundle = initial_policy_source_bundle(
+            scope=scope,
+            source_texts=initial_texts,
+        )
+    except ValueError as exc:
+        raise ValueError("initial policy source hashes differ from scope") from exc
+    validate_policy_source_bundle_descendant(
+        scope=scope,
+        initial_bundle=initial_bundle,
+        bundle=bundle,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateDefinition:
     """One controller-owned one-line entry-contract alternative."""
@@ -2877,11 +2955,13 @@ def _validate_role_common(
     *,
     schema_version: int,
     iteration: int,
+    run_manifest_sha256: str,
     immutable_constraint_ids: tuple[str, ...],
 ) -> None:
     if schema_version != 2:
         raise ValueError("optimizer role input schema is unsupported")
     _require_positive_int(iteration, "optimizer role iteration")
+    _require_digest(run_manifest_sha256, "optimizer role run manifest SHA-256")
     _v2_string_tuple(immutable_constraint_ids, "immutable constraint IDs")
 
 
@@ -2889,6 +2969,7 @@ def _validate_role_common(
 class InvestigatorInput(_V2Canonical):
     schema_version: int
     iteration: int
+    run_manifest_sha256: str
     policy_interface_version: int
     immutable_constraint_ids: tuple[str, ...]
     candidate_bounds: PatchBounds
@@ -2902,6 +2983,7 @@ class InvestigatorInput(_V2Canonical):
         _validate_role_common(
             schema_version=self.schema_version,
             iteration=self.iteration,
+            run_manifest_sha256=self.run_manifest_sha256,
             immutable_constraint_ids=self.immutable_constraint_ids,
         )
         _require_positive_int(self.policy_interface_version, "policy interface version")
@@ -2939,6 +3021,7 @@ class InvestigatorInput(_V2Canonical):
 class AuthorInput(_V2Canonical):
     schema_version: int
     iteration: int
+    run_manifest_sha256: str
     policy_interface_version: int
     immutable_constraint_ids: tuple[str, ...]
     candidate_bounds: PatchBounds
@@ -2949,6 +3032,7 @@ class AuthorInput(_V2Canonical):
         _validate_role_common(
             schema_version=self.schema_version,
             iteration=self.iteration,
+            run_manifest_sha256=self.run_manifest_sha256,
             immutable_constraint_ids=self.immutable_constraint_ids,
         )
         _require_positive_int(self.policy_interface_version, "policy interface version")
@@ -2981,6 +3065,7 @@ class AuthorInput(_V2Canonical):
 class CriticInput(_V2Canonical):
     schema_version: int
     iteration: int
+    run_manifest_sha256: str
     immutable_constraint_ids: tuple[str, ...]
     hypothesis_id: str
     investigator_summary: InvestigatorArtifact
@@ -2993,6 +3078,7 @@ class CriticInput(_V2Canonical):
         _validate_role_common(
             schema_version=self.schema_version,
             iteration=self.iteration,
+            run_manifest_sha256=self.run_manifest_sha256,
             immutable_constraint_ids=self.immutable_constraint_ids,
         )
         _v2_identifier(self.hypothesis_id, "critic input hypothesis ID")
@@ -3215,6 +3301,7 @@ def render_worst_iteration_two_role_inputs(
         "investigator": {
             "schema_version": 2,
             "iteration": 2,
+            "run_manifest_sha256": "0" * 64,
             "policy_interface_version": scope.policy_interface_version,
             "immutable_constraint_ids": immutable_constraint_ids,
             "candidate_bounds": scope.candidate_bounds,
@@ -3227,6 +3314,7 @@ def render_worst_iteration_two_role_inputs(
         "author": {
             "schema_version": 2,
             "iteration": 2,
+            "run_manifest_sha256": "0" * 64,
             "policy_interface_version": scope.policy_interface_version,
             "immutable_constraint_ids": immutable_constraint_ids,
             "candidate_bounds": scope.candidate_bounds,
@@ -3236,6 +3324,7 @@ def render_worst_iteration_two_role_inputs(
         "critic": {
             "schema_version": 2,
             "iteration": 2,
+            "run_manifest_sha256": "0" * 64,
             "immutable_constraint_ids": immutable_constraint_ids,
             "hypothesis_id": investigator_artifact.hypothesis_id,
             "investigator_summary": investigator_artifact,

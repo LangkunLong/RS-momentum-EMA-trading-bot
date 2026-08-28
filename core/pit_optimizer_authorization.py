@@ -86,6 +86,35 @@ def _canonical_json_bytes(value: object) -> bytes:
     )
 
 
+def _canonical_decimal_text(value: Decimal) -> str:
+    if value.is_zero():
+        return "0"
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
+
+
+def _frozen_pricing_digest(
+    model: str,
+    prompt_per_million: Decimal,
+    completion_per_million: Decimal,
+) -> str:
+    payload = {
+        "model": model,
+        "prompt_per_million": _canonical_decimal_text(prompt_per_million),
+        "completion_per_million": _canonical_decimal_text(completion_per_million),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     value: dict[str, object] = {}
     for key, item in pairs:
@@ -174,6 +203,31 @@ class FrozenModelPricing:
             if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
                 raise ValueError("frozen pricing rates must be finite non-negative Decimals")
         _require_digest(self.pricing_payload_sha256, "frozen pricing payload SHA-256")
+        if self.pricing_payload_sha256 != _frozen_pricing_digest(
+            self.model,
+            self.prompt_per_million,
+            self.completion_per_million,
+        ):
+            raise ValueError("frozen pricing digest differs from model and rates")
+
+    @classmethod
+    def from_rates(
+        cls,
+        *,
+        model: str,
+        prompt_per_million: Decimal,
+        completion_per_million: Decimal,
+    ) -> "FrozenModelPricing":
+        return cls(
+            model=model,
+            prompt_per_million=prompt_per_million,
+            completion_per_million=completion_per_million,
+            pricing_payload_sha256=_frozen_pricing_digest(
+                model,
+                prompt_per_million,
+                completion_per_million,
+            ),
+        )
 
     @property
     def pricing_sha256(self) -> str:
@@ -321,6 +375,15 @@ class PitOptimizerProviderFacts:
                 or self.cost_usd != 0
             ):
                 raise ValueError("before-send optimizer failure facts are inconsistent")
+        if self.outcome == "accepted" and not (
+            self.request_started
+            and self.response_received
+            and self.returned_model == self.requested_model
+            and self.finish_reason == "stop"
+            and self.response_schema_valid
+            and self.accounting_complete
+        ):
+            raise ValueError("accepted optimizer provider facts are not fully closed")
         _require_digest(self.audit_sha256, "optimizer provider audit SHA-256")
 
 
@@ -434,6 +497,12 @@ class AuthorizationLedger:
         self._manifest = manifest
         with _authorization_file_lock(self._lock_path):
             self._read_records()
+
+    @property
+    def manifest(self) -> PitOptimizerRunManifest:
+        """Return the immutable manifest authenticated by this ledger instance."""
+
+        return self._manifest
 
     @staticmethod
     def _record_digest(record: dict[str, object]) -> str:
@@ -703,12 +772,53 @@ class AuthorizationLedger:
             record = self._build_record(working, primitive)
             appended.append(record)
             working.append(record)
-        payload = b"".join(_canonical_json_bytes(record) for record in appended)
-        with self._path.open("ab") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        expected_existing = b"".join(
+            _canonical_json_bytes(record) for record in records
+        )
+        actual_existing = self._path.read_bytes() if self._path.exists() else b""
+        if actual_existing != expected_existing:
+            raise AuthorizationError("authorization ledger changed during append")
+        payload = b"".join(_canonical_json_bytes(record) for record in working)
+        temporary = self._path.with_name(
+            f".auth-{os.urandom(4).hex()}.tmp"
+        )
+        try:
+            with temporary.open("xb") as handle:
+                self._write_all(handle, payload)
+                if handle.tell() != len(payload):
+                    raise OSError("authorization ledger write was incomplete")
+                handle.flush()
+                os.fsync(handle.fileno())
+            if temporary.read_bytes() != payload:
+                raise OSError("authorization ledger write was incomplete")
+            os.replace(temporary, self._path)
+            if self._path.read_bytes() != payload:
+                raise AuthorizationError("authorization ledger atomic replace was incomplete")
+            if os.name != "nt":
+                directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                directory_fd = os.open(self._path.parent, directory_flags)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
         return appended
+
+    @staticmethod
+    def _write_all(handle: object, payload: bytes) -> None:
+        """Write every byte or fail without publishing the temporary ledger."""
+
+        offset = 0
+        while offset < len(payload):
+            written = handle.write(payload[offset:])  # type: ignore[attr-defined]
+            if (
+                type(written) is not int
+                or written <= 0
+                or written > len(payload) - offset
+            ):
+                raise OSError("authorization ledger write was incomplete")
+            offset += written
 
     def _validate_grant(
         self,
@@ -931,6 +1041,43 @@ class AuthorizationLedger:
         approval_sha256 = _approval_reference_sha256(operator_approval_reference)
         with _authorization_file_lock(self._lock_path):
             records = self._read_records()
+            existing_grant = next(
+                (
+                    record
+                    for record in records
+                    if record.get("record_type") == "grant"
+                    and isinstance(record.get("grant"), dict)
+                    and record["grant"].get("grant_id") == grant.grant_id
+                ),
+                None,
+            )
+            existing_window = next(
+                (
+                    record
+                    for record in records
+                    if record.get("record_type") == "window"
+                    and isinstance(record.get("window"), dict)
+                    and record["window"].get("window_id") == window.window_id
+                ),
+                None,
+            )
+            if existing_grant is not None or existing_window is not None:
+                if (
+                    existing_grant is not None
+                    and existing_window is not None
+                    and _canonical_json_bytes(existing_grant["grant"])
+                    == _canonical_json_bytes(asdict(grant))
+                    and _canonical_json_bytes(existing_window["window"])
+                    == _canonical_json_bytes(asdict(window))
+                    and existing_grant.get("operator_approval_reference_sha256")
+                    == approval_sha256
+                    and existing_window.get("operator_approval_reference_sha256")
+                    == approval_sha256
+                ):
+                    return
+                raise AuthorizationError(
+                    "authorization grant/window retry differs from recorded authority"
+                )
             self._validate_grant(grant, records)
             grant_record = self._build_record(
                 records,
@@ -1257,7 +1404,17 @@ class AuthorizationLedger:
             if stored_reservation != reservation:
                 raise AuthorizationError("authorization reservation identity mismatch")
             if reservation.reservation_id in self._reconciled_ids(records):
-                raise AuthorizationError("authorization reservation is already reconciled")
+                existing = next(
+                    item
+                    for item in records
+                    if item.get("record_type") == "reconciliation"
+                    and item.get("reservation_id") == reservation.reservation_id
+                )
+                if existing.get("provider_facts") == asdict(provider_facts):
+                    return
+                raise AuthorizationError(
+                    "authorization reservation reconciliation differs from prior facts"
+                )
             lease_record = next(
                 item
                 for item in records
@@ -1342,6 +1499,41 @@ class AuthorizationLedger:
         if overage:
             raise AuthorizationError("authoritative provider overage was committed")
 
+    def recover_active_reservation(
+        self,
+        lease: AuthorizationRunLease,
+        plan: PitOptimizerCallBudget,
+    ) -> AuthorizationCallReservation | None:
+        """Recover the one durable active reservation after an interrupted reserve call."""
+
+        if not isinstance(lease, AuthorizationRunLease) or not isinstance(
+            plan, PitOptimizerCallBudget
+        ):
+            raise AuthorizationError("authorization reservation recovery is invalid")
+        with _authorization_file_lock(self._lock_path):
+            records = self._read_records()
+            self._lease_from_records(records, lease)
+            reconciled = self._reconciled_ids(records)
+            matches: list[AuthorizationCallReservation] = []
+            for item in self._reservation_records(records, lease.lease_id):
+                primitive = item.get("reservation")
+                if not isinstance(primitive, dict):
+                    raise AuthorizationError("authorization reservation record is invalid")
+                reservation = AuthorizationCallReservation(**primitive)
+                if (
+                    reservation.reservation_id not in reconciled
+                    and (
+                        reservation.call_index,
+                        reservation.iteration,
+                        reservation.role,
+                    )
+                    == (plan.call_index, plan.iteration, plan.role)
+                ):
+                    matches.append(reservation)
+            if len(matches) > 1:
+                raise AuthorizationError("authorization lease has concurrent reservations")
+            return matches[0] if matches else None
+
     def close_run_lease(
         self,
         lease: AuthorizationRunLease,
@@ -1361,11 +1553,18 @@ class AuthorizationLedger:
         with _authorization_file_lock(self._lock_path):
             records = self._read_records()
             self._lease_from_records(records, lease)
-            if any(
-                item.get("record_type") == "lease_close"
-                and item.get("lease_id") == lease.lease_id
-                for item in records
-            ):
+            prior_close = next(
+                (
+                    item
+                    for item in records
+                    if item.get("record_type") == "lease_close"
+                    and item.get("lease_id") == lease.lease_id
+                ),
+                None,
+            )
+            if prior_close is not None:
+                if prior_close.get("terminal_code") == terminal_code:
+                    return
                 raise AuthorizationError("authorization lease is already closed")
             reservations = self._reservation_records(records, lease.lease_id)
             reconciled = self._reconciled_ids(records)
@@ -1374,6 +1573,67 @@ class AuthorizationLedger:
                 for item in reservations
             ):
                 raise AuthorizationError("authorization lease has an active call reservation")
+            if terminal_code in {"completed", "early_stop"}:
+                accepted_plans: list[PitOptimizerCallBudget] = []
+                for offset, item in enumerate(reservations):
+                    primitive = item.get("reservation")
+                    if not isinstance(primitive, dict):
+                        raise AuthorizationError(
+                            "authorization reservation record is invalid"
+                        )
+                    reservation = AuthorizationCallReservation(**primitive)
+                    if offset >= len(self._manifest.call_budgets):
+                        raise AuthorizationError(
+                            "authorization completed plan has excess calls"
+                        )
+                    plan = self._manifest.call_budgets[offset]
+                    if (
+                        reservation.call_index,
+                        reservation.iteration,
+                        reservation.role,
+                    ) != (plan.call_index, plan.iteration, plan.role):
+                        raise AuthorizationError(
+                            "authorization completed plan order differs"
+                        )
+                    reconciliation = next(
+                        record
+                        for record in records
+                        if record.get("record_type") == "reconciliation"
+                        and record.get("reservation_id")
+                        == reservation.reservation_id
+                    )
+                    facts_primitive = reconciliation.get("provider_facts")
+                    if not isinstance(facts_primitive, dict):
+                        raise AuthorizationError(
+                            "authorization provider facts are invalid"
+                        )
+                    facts = PitOptimizerProviderFacts(**facts_primitive)
+                    if not (
+                        facts.outcome == "accepted"
+                        and facts.request_started
+                        and facts.response_received
+                        and facts.finish_reason == "stop"
+                        and facts.returned_model == plan.model
+                        and facts.requested_model == plan.model
+                        and facts.response_schema_valid
+                        and facts.accounting_complete
+                    ):
+                        raise AuthorizationError(
+                            "authorization completed plan has a non-accepted call"
+                        )
+                    accepted_plans.append(plan)
+                if terminal_code == "completed" and len(accepted_plans) != len(
+                    self._manifest.call_budgets
+                ):
+                    raise AuthorizationError(
+                        "authorization completed lease requires the exact call plan"
+                    )
+                if terminal_code == "early_stop" and not (
+                    0 < len(accepted_plans) < len(self._manifest.call_budgets)
+                ):
+                    raise AuthorizationError(
+                        "authorization early stop requires an accepted partial plan"
+                    )
             self._append_records(
                 records,
                 [
