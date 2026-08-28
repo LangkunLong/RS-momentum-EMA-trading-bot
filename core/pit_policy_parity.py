@@ -25,6 +25,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _HEAD_RE = re.compile(r"[0-9a-f]{40}")
 _REFERENCE_SCHEMA_VERSION = 1
 _ATTESTATION_SCHEMA_VERSION = 1
+_PARITY_SIGNAL_EVERY_N_DAYS = 1
 _DISCOVERY_WINDOWS = (
     ("discovery_1", "2021-06-25", "2021-09-20"),
     ("discovery_2", "2021-09-21", "2021-12-14"),
@@ -776,6 +777,24 @@ def _authenticated_readiness(path: Path) -> tuple[dict[str, object], str]:
     return readiness, readiness_sha256
 
 
+def simulator_kwargs_from_readiness(
+    readiness: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind simulator constructor inputs that differ from engine defaults."""
+
+    policy = readiness.get("effective_policy")
+    entry_policy = policy.get("entry_policy") if isinstance(policy, Mapping) else None
+    cadence = (
+        entry_policy.get("signal_every_n_days")
+        if isinstance(entry_policy, Mapping)
+        else None
+    )
+    value = cadence.get("value") if isinstance(cadence, Mapping) else None
+    if type(value) is not int or value != _PARITY_SIGNAL_EVERY_N_DAYS:
+        raise ValueError("readiness signal cadence is invalid for parity capture")
+    return {"signal_every_n_days": value}
+
+
 def capture_parity_reference(
     *,
     readiness_path: Path,
@@ -809,7 +828,11 @@ def capture_parity_reference(
         if benchmark != "SPY":
             raise ValueError("readiness benchmark is invalid")
         calendar = _benchmark_calendar(bundle, benchmark)
-        simulator = PortfolioSimulator(pit_bundle=bundle, benchmark_symbol=benchmark)
+        simulator = PortfolioSimulator(
+            pit_bundle=bundle,
+            benchmark_symbol=benchmark,
+            **simulator_kwargs_from_readiness(readiness),
+        )
 
         def evaluate(fold: FoldSpec, universe: tuple[str, ...], warmup: str) -> ParityFoldEvidence:
             result = simulator.run(
@@ -859,6 +882,7 @@ def verify_parity_reference(
         simulator = PortfolioSimulator(
             pit_bundle=bundle,
             benchmark_symbol=reference.fold_manifest.benchmark,
+            signal_every_n_days=_PARITY_SIGNAL_EVERY_N_DAYS,
         )
         evidence = tuple(
             build_fold_evidence(

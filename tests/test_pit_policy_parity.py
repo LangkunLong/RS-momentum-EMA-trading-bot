@@ -27,6 +27,7 @@ from core.pit_policy_parity import (
     capture_from_authenticated_inputs,
     load_parity_reference,
     persist_parity_reference,
+    simulator_kwargs_from_readiness,
     verify_parity_evidence,
 )
 
@@ -405,3 +406,21 @@ def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Pa
     assert evaluated == ["discovery_1", "discovery_2"]
     assert reference.fold_manifest.hidden_fold.fold_id == "hidden_1"
     assert len(reference.discovery_evidence) == 2
+
+
+def test_capture_simulator_binds_authenticated_signal_cadence() -> None:
+    """Break caught: reference capture silently used the engine's five-day default cadence."""
+    readiness = {
+        "effective_policy": {
+            "entry_policy": {
+                "signal_every_n_days": {
+                    "classification": "active_tunable_policy",
+                    "optimizer_candidate": True,
+                    "source": "core.backtest_engine.PortfolioSimulator.signal_every_n_days",
+                    "value": 1,
+                }
+            }
+        }
+    }
+
+    assert simulator_kwargs_from_readiness(readiness) == {"signal_every_n_days": 1}
