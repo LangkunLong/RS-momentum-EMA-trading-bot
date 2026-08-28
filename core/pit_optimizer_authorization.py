@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Iterator, Sequence
 
 from core.pit_optimization_contract import (
@@ -47,7 +48,6 @@ _UNSAFE_APPROVAL_RE = re.compile(
     re.IGNORECASE,
 )
 _ZERO_SHA256 = "0" * 64
-_TERMINAL_AUDIT_RECEIPT_SEAL = object()
 
 
 class AuthorizationError(RuntimeError):
@@ -433,7 +433,7 @@ class PitOptimizerRoleCall:
 
 @dataclass(frozen=True, slots=True)
 class TerminalAuditReceipt:
-    """AuditTrail-authenticated identity for one immutable terminal provider event."""
+    """Durable identity cross-verified against one immutable AuditTrail event."""
 
     audit_run_id: str
     run_manifest_sha256: str
@@ -444,11 +444,9 @@ class TerminalAuditReceipt:
     provider_record_sha256: str
     terminal_event_sha256: str
     payload_sha256: str | None
-    _audit_seal: object = field(repr=False, compare=False)
+    terminal_code: str | None = None
 
     def __post_init__(self) -> None:
-        if self._audit_seal is not _TERMINAL_AUDIT_RECEIPT_SEAL:
-            raise ValueError("terminal audit receipt is not AuditTrail authenticated")
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", self.audit_run_id) is None:
             raise ValueError("terminal audit receipt run ID is invalid")
         _require_digest(
@@ -481,8 +479,21 @@ class TerminalAuditReceipt:
                 self.payload_sha256,
                 "terminal audit receipt payload SHA-256",
             )
+            if self.terminal_code not in {
+                None,
+                "failed",
+                "cancelled",
+                "budget_exhausted",
+            }:
+                raise ValueError("terminal audit receipt code is invalid")
         elif self.payload_sha256 is not None:
             raise ValueError("rejected terminal audit receipt cannot bind a payload")
+        elif self.terminal_code not in {
+            "failed",
+            "cancelled",
+            "budget_exhausted",
+        }:
+            raise ValueError("rejected terminal audit receipt code is invalid")
 
     def to_primitive(self) -> dict[str, object]:
         return {
@@ -495,6 +506,7 @@ class TerminalAuditReceipt:
             "provider_record_sha256": self.provider_record_sha256,
             "terminal_event_sha256": self.terminal_event_sha256,
             "payload_sha256": self.payload_sha256,
+            "terminal_code": self.terminal_code,
         }
 
 
@@ -641,6 +653,8 @@ class AuthorizationLedger:
             tuple[object, AuthenticatedRoleInputSnapshot],
         ] = {}
         self._consumed_role_input_plans: set[int] = set()
+        self._role_input_lock = threading.Lock()
+        self._audit_trail: object | None = None
         with _authorization_file_lock(self._lock_path):
             self._read_records()
 
@@ -649,6 +663,85 @@ class AuthorizationLedger:
         """Return the immutable manifest authenticated by this ledger instance."""
 
         return self._manifest
+
+    def attach_audit_trail(self, audit_trail: object) -> None:
+        """Bind and cross-verify the one AuditTrail backing durable receipts."""
+
+        # The import stays local so the authorization contract remains usable by
+        # manifest tooling without importing the provider controller at startup.
+        from agent_loop import AuditTrail
+
+        if not isinstance(audit_trail, AuditTrail):
+            raise AuthorizationError("authorization audit trail is invalid")
+        if audit_trail.run_id != self._manifest.run_id:
+            raise AuthorizationError(
+                "authorization audit run differs from manifest"
+            )
+        if self._audit_trail is not None and self._audit_trail is not audit_trail:
+            raise AuthorizationError("authorization audit trail is already bound")
+        with _authorization_file_lock(self._lock_path):
+            records = self._read_records()
+        reservations: dict[str, AuthorizationCallReservation] = {}
+        for item in records:
+            if item.get("record_type") != "reservation":
+                continue
+            primitive = item.get("reservation")
+            if not isinstance(primitive, dict):
+                raise AuthorizationError(
+                    "authorization reservation record is invalid"
+                )
+            try:
+                reservation = AuthorizationCallReservation(**primitive)
+            except (TypeError, ValueError) as exc:
+                raise AuthorizationError(
+                    "authorization reservation record is invalid"
+                ) from exc
+            reservations[reservation.reservation_id] = reservation
+        for item in records:
+            primitive = item.get("terminal_audit_receipt")
+            if item.get("record_type") != "reconciliation" or primitive is None:
+                continue
+            try:
+                if not isinstance(primitive, dict):
+                    raise TypeError("receipt is not a mapping")
+                receipt = TerminalAuditReceipt(**primitive)
+                facts_primitive = item.get("provider_facts")
+                if not isinstance(facts_primitive, dict):
+                    raise TypeError("facts are not a mapping")
+                facts = PitOptimizerProviderFacts(**facts_primitive)
+                reservation = reservations[str(item.get("reservation_id"))]
+                audit_trail.verify_terminal_audit_receipt(
+                    receipt,
+                    authorization_reservation=reservation,
+                    provider_facts=facts,
+                )
+            except Exception as exc:
+                raise AuthorizationError(
+                    "authorization audit receipt cross-verification failed"
+                ) from exc
+        self._audit_trail = audit_trail
+
+    def _cross_verify_audit_receipt(
+        self,
+        receipt: TerminalAuditReceipt,
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+    ) -> None:
+        audit_trail = self._audit_trail
+        if audit_trail is None:
+            raise AuthorizationError(
+                "authorization audit trail is required for terminal receipt"
+            )
+        try:
+            audit_trail.verify_terminal_audit_receipt(
+                receipt,
+                authorization_reservation=reservation,
+                provider_facts=provider_facts,
+            )
+        except Exception as exc:
+            raise AuthorizationError(
+                "authorization audit receipt cross-verification failed"
+            ) from exc
 
     def snapshot_call_plan(
         self,
@@ -881,6 +974,40 @@ class AuthorizationLedger:
                     raise AuthorizationError(
                         "optimizer role input predecessor receipt is absent"
                     )
+                reconciliation = matches[0]
+                receipt_primitive = reconciliation.get(
+                    "terminal_audit_receipt"
+                )
+                reservation_id = reconciliation.get("reservation_id")
+                reservation_record = next(
+                    (
+                        item
+                        for item in records
+                        if item.get("record_type") == "reservation"
+                        and isinstance(item.get("reservation"), dict)
+                        and item["reservation"].get("reservation_id")
+                        == reservation_id
+                    ),
+                    None,
+                )
+                try:
+                    if not isinstance(receipt_primitive, dict):
+                        raise TypeError("receipt is not a mapping")
+                    if reservation_record is None:
+                        raise TypeError("reservation is absent")
+                    receipt = TerminalAuditReceipt(**receipt_primitive)
+                    durable_reservation = AuthorizationCallReservation(
+                        **reservation_record["reservation"]
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise AuthorizationError(
+                        "optimizer role input predecessor receipt is invalid"
+                    ) from exc
+                self._cross_verify_audit_receipt(
+                    receipt,
+                    durable_reservation,
+                    predecessor.facts,
+                )
         primitive = json.loads(
             snapshot.canonical_bytes,
             object_pairs_hook=_reject_duplicate_keys,
@@ -947,18 +1074,19 @@ class AuthorizationLedger:
                 raise AuthorizationError(
                     "optimizer role input predecessor artifact differs"
                 )
-        if canonical_plan.call_index in self._consumed_role_input_plans:
-            raise AuthorizationError("optimizer role input plan was already consumed")
-        prior = self._role_input_capabilities.get(canonical_plan.call_index)
-        if prior is not None and (
-            prior[0] is not dynamic_input
-            or prior[1].canonical_bytes != snapshot.canonical_bytes
-        ):
-            raise AuthorizationError("optimizer role input plan is already bound")
-        self._role_input_capabilities[canonical_plan.call_index] = (
-            dynamic_input,
-            snapshot,
-        )
+        with self._role_input_lock:
+            if canonical_plan.call_index in self._consumed_role_input_plans:
+                raise AuthorizationError("optimizer role input plan was already consumed")
+            prior = self._role_input_capabilities.get(canonical_plan.call_index)
+            if prior is not None and (
+                prior[0] is not dynamic_input
+                or prior[1].canonical_bytes != snapshot.canonical_bytes
+            ):
+                raise AuthorizationError("optimizer role input plan is already bound")
+            self._role_input_capabilities[canonical_plan.call_index] = (
+                dynamic_input,
+                snapshot,
+            )
         return snapshot
 
     def capture_controller_role_input(
@@ -969,20 +1097,18 @@ class AuthorizationLedger:
         """Reauthenticate an exact snapshot against a live controller capability."""
 
         canonical_plan = self.snapshot_call_plan(plan)
-        if canonical_plan.call_index in self._consumed_role_input_plans:
-            raise AuthorizationError("optimizer role input plan was already consumed")
-        capability = self._role_input_capabilities.pop(
-            canonical_plan.call_index,
-            None,
-        )
-        if (
-            capability is None
-            or capability[0] is not dynamic_input
-        ):
-            raise AuthorizationError(
-                "optimizer role input provenance is not controller authenticated"
+        with self._role_input_lock:
+            if canonical_plan.call_index in self._consumed_role_input_plans:
+                raise AuthorizationError("optimizer role input plan was already consumed")
+            capability = self._role_input_capabilities.pop(
+                canonical_plan.call_index,
+                None,
             )
-        self._consumed_role_input_plans.add(canonical_plan.call_index)
+            if capability is None or capability[0] is not dynamic_input:
+                raise AuthorizationError(
+                    "optimizer role input provenance is not controller authenticated"
+                )
+            self._consumed_role_input_plans.add(canonical_plan.call_index)
         return capability[1]
 
     def verify_consumed_role_input_unchanged(
@@ -994,14 +1120,15 @@ class AuthorizationLedger:
         """Reject mutation of the live source object after snapshot consumption."""
 
         canonical_plan = self.snapshot_call_plan(plan)
-        if (
-            canonical_plan.call_index not in self._consumed_role_input_plans
-            or not isinstance(snapshot, AuthenticatedRoleInputSnapshot)
-        ):
-            raise AuthorizationError("optimizer role input snapshot was not consumed")
-        current = self._snapshot_role_input(dynamic_input, canonical_plan)
-        if current.canonical_bytes != snapshot.canonical_bytes:
-            raise AuthorizationError("optimizer role input changed after authentication")
+        with self._role_input_lock:
+            if (
+                canonical_plan.call_index not in self._consumed_role_input_plans
+                or not isinstance(snapshot, AuthenticatedRoleInputSnapshot)
+            ):
+                raise AuthorizationError("optimizer role input snapshot was not consumed")
+            current = self._snapshot_role_input(dynamic_input, canonical_plan)
+            if current.canonical_bytes != snapshot.canonical_bytes:
+                raise AuthorizationError("optimizer role input changed after authentication")
 
     @staticmethod
     def _record_digest(record: dict[str, object]) -> str:
@@ -1185,8 +1312,7 @@ class AuthorizationLedger:
                         )
                     try:
                         replayed_receipt = TerminalAuditReceipt(
-                            **terminal_audit_receipt,
-                            _audit_seal=_TERMINAL_AUDIT_RECEIPT_SEAL,
+                            **terminal_audit_receipt
                         )
                     except (TypeError, ValueError) as exc:
                         raise AuthorizationError(
@@ -2035,6 +2161,10 @@ class AuthorizationLedger:
             provider_facts, PitOptimizerProviderFacts
         ):
             raise AuthorizationError("authorization reconciliation contracts are invalid")
+        if self._audit_trail is not None and terminal_audit_receipt is None:
+            raise AuthorizationError(
+                "authorization terminal audit receipt is required"
+            )
         if terminal_audit_receipt is not None:
             if not isinstance(terminal_audit_receipt, TerminalAuditReceipt):
                 raise AuthorizationError(
@@ -2078,6 +2208,16 @@ class AuthorizationLedger:
             provider_facts,
             terminal_code,
         )
+        if terminal_audit_receipt is not None:
+            if terminal_audit_receipt.terminal_code != effective_terminal_code:
+                raise AuthorizationError(
+                    "authorization terminal audit receipt code differs"
+                )
+            self._cross_verify_audit_receipt(
+                terminal_audit_receipt,
+                reservation,
+                provider_facts,
+            )
         overage = False
         with _authorization_file_lock(self._lock_path):
             records = self._read_records()
@@ -2265,6 +2405,10 @@ class AuthorizationLedger:
     ) -> None:
         """Verify the exact durable postcondition after an interrupted publication."""
 
+        if self._audit_trail is not None and terminal_audit_receipt is None:
+            raise AuthorizationError(
+                "authorization terminal audit receipt is required"
+            )
         with _authorization_file_lock(self._lock_path):
             records = self._read_records()
             if terminal_audit_receipt is not None:
@@ -2282,6 +2426,19 @@ class AuthorizationLedger:
                     )
                 terminal_audit_sha256 = (
                     terminal_audit_receipt.terminal_event_sha256
+                )
+                effective_terminal_code = self._terminal_code_for_reconciliation(
+                    provider_facts,
+                    terminal_code,
+                )
+                if terminal_audit_receipt.terminal_code != effective_terminal_code:
+                    raise AuthorizationError(
+                        "authorization terminal audit receipt code differs"
+                    )
+                self._cross_verify_audit_receipt(
+                    terminal_audit_receipt,
+                    reservation,
+                    provider_facts,
                 )
             try:
                 terminal_audit_sha256 = _require_digest(

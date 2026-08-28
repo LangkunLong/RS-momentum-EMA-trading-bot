@@ -3723,8 +3723,8 @@ def _task6_gateway_context(
     budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
     audit_suffix = hashlib.sha256(grant_id.encode("utf-8")).hexdigest()[:10]
     audit = agent_loop.AuditTrail(
-        tmp_path / f"audit-{audit_suffix}",
-        f"pit-{audit_suffix}",
+        tmp_path / f"a-{audit_suffix[:4]}",
+        manifest.run_id,
     )
     client = _Task6FakeClient(outcomes)
     gateway = agent_loop.OpenRouterGateway(
@@ -3851,7 +3851,10 @@ def test_pit_optimizer_v2_gateway_rejects_equal_shaped_foreign_source_pre_effect
         grant_id="grant-foreign-source",
     )
     budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
-    audit = agent_loop.AuditTrail(tmp_path / "audit-foreign-source", "pit-v2-source")
+    audit = agent_loop.AuditTrail(
+        tmp_path / "audit-foreign-source",
+        v2_manifest.run_id,
+    )
     client = _Task6FakeClient(
         [_task6_fake_response(_canonical_text(_investigator_payload()))]
     )
@@ -3968,17 +3971,20 @@ def test_pit_optimizer_v2_gateway_rejects_foreign_author_source_pre_effect(
     import agent_loop
     from core.pit_optimizer_authorization import AuthorizationError
 
-    authorization, ledger_path, window = _task6_authorized_ledger(
+    authorization, ledger_path, _window = _task6_authorized_ledger(
         tmp_path,
         v2_manifest,
         grant_id="grant-foreign-author",
     )
     budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
-    audit = agent_loop.AuditTrail(tmp_path / "audit-foreign-author", "pit-v2-author")
+    audit = agent_loop.AuditTrail(
+        tmp_path / "audit-foreign-author",
+        v2_manifest.run_id,
+    )
     client = _Task6FakeClient(
         [_task6_fake_response(_canonical_text(_author_payload()))]
     )
-    gateway = agent_loop.OpenRouterGateway(
+    agent_loop.OpenRouterGateway(
         client=client,
         pricing_loader=lambda _model: {
             "prompt": Decimal("2"),
@@ -3988,25 +3994,6 @@ def test_pit_optimizer_v2_gateway_rejects_foreign_author_source_pre_effect(
         authorization_ledger=authorization,
         audit_trail=audit,
         max_attempts=1,
-    )
-    pricing = gateway.freeze_pit_optimizer_pricing(
-        model=contract.PIT_OPTIMIZER_R1_MODEL,
-        wall_deadline=10.0,
-        monotonic=lambda: 1.0,
-    )
-    lease = authorization.open_run_lease(
-        window_id=window.window_id,
-        authorization_requirement_sha256=(
-            v2_manifest.authorization_requirement.sha256
-        ),
-        run_manifest_sha256=v2_manifest.sha256,
-        frozen_pricing_sha256=pricing.pricing_sha256,
-    )
-    first = authorization.reserve_call(lease, v2_manifest.call_budgets[0])
-    authorization.reconcile_call(
-        first,
-        _task6_provider_facts(first, pricing),
-        terminal_audit_sha256="b" * 64,
     )
     before_records = len(ledger_path.read_bytes().splitlines())
 
@@ -4037,17 +4024,20 @@ def test_pit_optimizer_v2_gateway_rejects_cross_run_critic_summary_pre_effect(
     import agent_loop
     from core.pit_optimizer_authorization import AuthorizationError
 
-    authorization, ledger_path, window = _task6_authorized_ledger(
+    authorization, ledger_path, _window = _task6_authorized_ledger(
         tmp_path,
         v2_manifest,
         grant_id="grant-foreign-summary",
     )
     budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
-    audit = agent_loop.AuditTrail(tmp_path / "audit-foreign-summary", "pit-v2-summary")
+    audit = agent_loop.AuditTrail(
+        tmp_path / "audit-foreign-summary",
+        v2_manifest.run_id,
+    )
     client = _Task6FakeClient(
         [_task6_fake_response(_canonical_text(_critic_payload()))]
     )
-    gateway = agent_loop.OpenRouterGateway(
+    agent_loop.OpenRouterGateway(
         client=client,
         pricing_loader=lambda _model: {
             "prompt": Decimal("2"),
@@ -4058,26 +4048,6 @@ def test_pit_optimizer_v2_gateway_rejects_cross_run_critic_summary_pre_effect(
         audit_trail=audit,
         max_attempts=1,
     )
-    pricing = gateway.freeze_pit_optimizer_pricing(
-        model=contract.PIT_OPTIMIZER_R1_MODEL,
-        wall_deadline=10.0,
-        monotonic=lambda: 1.0,
-    )
-    lease = authorization.open_run_lease(
-        window_id=window.window_id,
-        authorization_requirement_sha256=(
-            v2_manifest.authorization_requirement.sha256
-        ),
-        run_manifest_sha256=v2_manifest.sha256,
-        frozen_pricing_sha256=pricing.pricing_sha256,
-    )
-    for plan in v2_manifest.call_budgets[:2]:
-        reservation = authorization.reserve_call(lease, plan)
-        authorization.reconcile_call(
-            reservation,
-            _task6_provider_facts(reservation, pricing),
-            terminal_audit_sha256="b" * 64,
-        )
     before_records = len(ledger_path.read_bytes().splitlines())
 
     foreign_input = _task6_manifest_critic_input(
@@ -4213,6 +4183,47 @@ def test_pit_optimizer_v2_role_input_binding_is_exclusive_per_manifest_plan(
     authorization.bind_controller_role_input(first, plan)
     with pytest.raises(AuthorizationError, match="already bound"):
         authorization.bind_controller_role_input(second, plan)
+
+
+def test_pit_optimizer_v2_concurrent_distinct_role_binders_have_one_winner(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: concurrent check-then-set binders could both claim one plan."""
+    from core.pit_optimizer_authorization import AuthorizationError
+
+    authorization, _ledger_path, _window = _task6_authorized_ledger(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-concurrent-role-binders",
+    )
+    plan = v2_manifest.call_budgets[0]
+    first = _task6_manifest_investigator_input(v2_manifest)
+    second = replace(first)
+    race = threading.Barrier(2)
+
+    class ForcedRaceDict(dict[int, tuple[object, object]]):
+        def get(self, key: int, default: object = None) -> object:
+            current = super().get(key, default)
+            try:
+                race.wait(timeout=2.0)
+            except threading.BrokenBarrierError:
+                pass
+            return current
+
+    authorization._role_input_capabilities = ForcedRaceDict()
+
+    def bind(role_input: object) -> bool:
+        try:
+            authorization.bind_controller_role_input(role_input, plan)
+        except AuthorizationError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(bind, (first, second)))
+
+    assert sum(results) == 1
 
 
 def test_pit_optimizer_v2_role_input_snapshot_is_consumed_once(
@@ -4589,7 +4600,7 @@ def test_pit_optimizer_v2_gateway_requires_its_own_fresh_pricing_record_pre_effe
     budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
     audit = agent_loop.AuditTrail(
         tmp_path / f"audit-pricing-{freeze_gateway}",
-        f"pit-v2-pricing-{freeze_gateway}",
+        v2_manifest.run_id,
     )
     client = _Task6FakeClient(
         [_task6_fake_response(_canonical_text(_investigator_payload()))]
@@ -4672,7 +4683,10 @@ def test_pit_optimizer_v2_gateway_rejects_cross_run_pricing_cache_reuse(
         grant_id="grant-pricing-run-b",
     )
     budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
-    audit = agent_loop.AuditTrail(tmp_path / "audit-pricing-cross-run", "pit-cross-run")
+    audit = agent_loop.AuditTrail(
+        tmp_path / "audit-pricing-cross-run",
+        v2_manifest.run_id,
+    )
     client = _Task6FakeClient(
         [_task6_fake_response(_canonical_text(_investigator_payload()))]
     )
@@ -4732,7 +4746,10 @@ def test_pit_optimizer_v2_gateway_rejects_noncallable_parser_pre_effect(
         grant_id="grant-parser-preflight",
     )
     budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
-    audit = agent_loop.AuditTrail(tmp_path / "audit-parser", "pit-v2-parser")
+    audit = agent_loop.AuditTrail(
+        tmp_path / "audit-parser",
+        v2_manifest.run_id,
+    )
     client = _Task6FakeClient(
         [_task6_fake_response(_canonical_text(_investigator_payload()))]
     )
@@ -5062,8 +5079,16 @@ def test_pit_optimizer_v2_keyboard_interrupt_during_finalizer_is_retryable(
     )
     assert reconciliation["charge_basis"] == "authoritative"
     assert reconciliation["provider_facts"]["outcome"] == expected_outcome
-    assert records[-1]["record_type"] == "lease_close"
-    assert records[-1]["terminal_code"] == "cancelled"
+    if phase == "authorization_reconciliation":
+        assert records[-1]["record_type"] == "reconciliation"
+        assert reconciliation["terminal_audit_receipt"]["terminal_code"] is None
+    else:
+        assert records[-1]["record_type"] == "lease_close"
+        assert records[-1]["terminal_code"] == (
+            "failed"
+            if phase == "authorization_terminal_transition"
+            else "cancelled"
+        )
     provider_record = json.loads(
         (audit.run_root / "provider-call-0001.json").read_bytes()
     )
@@ -5330,10 +5355,14 @@ def test_pit_optimizer_v2_deadline_expiry_after_start_intent_sends_nothing(
         )
 
     assert client.completions.calls == []
-    assert budget.calls == 0
+    # Once the exact start commitment is durable, a deadline race is charged
+    # conservatively even though the fake SDK callable was never entered.
+    assert budget.calls == 1
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
-    assert records[-2]["charge_basis"] == "before_send_release"
+    assert records[-2]["charge_basis"] == "retained_reservation"
+    assert records[-2]["provider_facts"]["outcome"] == "uncertain_accounting"
     assert records[-1]["record_type"] == "lease_close"
+    assert records[-1]["terminal_code"] == "budget_exhausted"
     assert (audit.run_root / "provider-call-0001.json").is_file()
 
 
@@ -5547,6 +5576,7 @@ def test_pit_optimizer_v2_authorization_binds_terminal_audit_event_receipt(
         "payload_sha256": hashlib.sha256(
             _investigator_artifact().canonical_json_bytes()
         ).hexdigest(),
+        "terminal_code": None,
     }
     assert reconciliation["terminal_audit_sha256"] == terminal_event["event_sha256"]
     reconciliation["terminal_audit_receipt"]["role"] = "author"
@@ -5563,11 +5593,293 @@ def test_pit_optimizer_v2_authorization_binds_terminal_audit_event_receipt(
         AuthorizationLedger(ledger_path, v2_manifest)
 
 
-def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
+def test_pit_optimizer_v2_public_audit_writer_cannot_mint_a_predecessor(
     tmp_path: Path,
     v2_manifest: contract.PitOptimizerRunManifest,
 ) -> None:
-    """Break caught: a crash after terminal audit permanently wedged the lease."""
+    """Break caught: caller-built facts/artifact could mint an accepted predecessor."""
+    import agent_loop
+    from core.pit_optimizer_authorization import (
+        AuthorizationError,
+        PitOptimizerRoleCall,
+        TerminalAuditReceipt,
+    )
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-public-receipt-forgery",
+        outcomes=[],
+    )
+    authorization_reservation = authorization.reserve_call(lease, plan)
+    artifact = _investigator_artifact()
+    facts = _task6_provider_facts(
+        authorization_reservation,
+        pricing,
+        cost_usd=0.001,
+    )
+    provider_record = gateway._pit_optimizer_record(
+        facts,
+        authorization_reservation,
+    )
+    payload_sha256 = hashlib.sha256(artifact.canonical_json_bytes()).hexdigest()
+
+    with pytest.raises(agent_loop.AuditError, match="gateway.*lifecycle"):
+        audit.write_provider_call_receipt(
+            provider_record,
+            payload_sha256=payload_sha256,
+            run_manifest_sha256=v2_manifest.sha256,
+            lifecycle_audit_sha256="a" * 64,
+        )
+
+    forged_receipt = TerminalAuditReceipt(
+        audit_run_id=audit.run_id,
+        run_manifest_sha256=v2_manifest.sha256,
+        call_index=plan.call_index,
+        iteration=plan.iteration,
+        role=plan.role,
+        outcome="accepted",
+        provider_record_sha256="b" * 64,
+        terminal_event_sha256="c" * 64,
+        payload_sha256=payload_sha256,
+        terminal_code=None,
+    )
+    with pytest.raises(AuthorizationError, match="cross-verification"):
+        authorization.reconcile_call(
+            authorization_reservation,
+            facts,
+            terminal_audit_receipt=forged_receipt,
+        )
+    with pytest.raises(AuthorizationError, match="receipt.*required"):
+        authorization.reconcile_call(
+            authorization_reservation,
+            facts,
+            terminal_audit_sha256="d" * 64,
+        )
+
+    predecessor = PitOptimizerRoleCall(plan, artifact, facts)
+    with pytest.raises(AuthorizationError, match="predecessor receipt"):
+        authorization.bind_controller_role_input(
+            _task6_manifest_author_input(v2_manifest),
+            v2_manifest.call_budgets[1],
+            predecessor_calls=(predecessor,),
+        )
+
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    assert not any(item["record_type"] == "reconciliation" for item in records)
+    assert budget.calls == 0
+    assert audit._events == []
+    assert client.completions.calls == []
+
+
+@pytest.mark.parametrize(
+    ("receipt_field", "tampered_value", "grant_id"),
+    (
+        ("provider_record_sha256", "f" * 64, "grant-tamper-provider"),
+        ("audit_run_id", "foreign-audit-run", "grant-tamper-run"),
+    ),
+)
+def test_pit_optimizer_v2_replayed_receipt_is_cross_verified_against_audit(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    receipt_field: str,
+    tampered_value: str,
+    grant_id: str,
+) -> None:
+    """Break caught: hash-valid receipt relabels reopened without durable audit proof."""
+    import agent_loop
+    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        _budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id=grant_id,
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, plan)
+    gateway.request_pit_optimizer_once(
+        "investigator",
+        role_input,
+        _task6_investigator_parser,
+        call_budget=plan,
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    reconciliation = records[-1]
+    reconciliation["terminal_audit_receipt"][receipt_field] = tampered_value
+    reconciliation["record_sha256"] = authorization._record_digest(reconciliation)
+    ledger_path.write_bytes(
+        b"".join(
+            (_canonical_text(record) + "\n").encode("utf-8")
+            for record in records
+        )
+    )
+
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    reopened_audit = agent_loop.AuditTrail.open_existing(
+        audit.artifact_root,
+        audit.run_id,
+    )
+    with pytest.raises(AuthorizationError, match="audit"):
+        agent_loop.OpenRouterGateway(
+            client=client,
+            pricing_loader=lambda _model: pytest.fail("replay loaded pricing"),
+            ledger=agent_loop.BudgetLedger(
+                max_usd=1.0,
+                max_calls=6,
+                max_tokens=448_000,
+            ),
+            authorization_ledger=reopened_authorization,
+            audit_trail=reopened_audit,
+            max_attempts=1,
+        )
+
+
+def test_pit_optimizer_v2_recovery_rejects_post_terminal_retry_event(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: replay ignored a second start marker after terminal publication."""
+    import agent_loop
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        _ledger_path,
+        lease,
+        pricing,
+        _budget,
+        audit,
+        _client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-post-terminal-retry",
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, plan)
+    gateway.request_pit_optimizer_once(
+        "investigator",
+        role_input,
+        _task6_investigator_parser,
+        call_budget=plan,
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    audit.append_event(
+        agent_loop.LoopState.CALL_INVESTIGATOR,
+        "provider_call_started",
+        {
+            "call_index": 1,
+            "iteration": 1,
+            "role": "investigator",
+            "reservation_event_sha256": audit._events[0]["event_sha256"],
+        },
+    )
+
+    reopened = agent_loop.AuditTrail.open_existing(audit.artifact_root, audit.run_id)
+    with pytest.raises(agent_loop.AuditError, match="post-terminal"):
+        reopened.recover_pit_optimizer_terminal(
+            run_manifest_sha256=v2_manifest.sha256,
+            call_budget=plan,
+        )
+
+
+def test_pit_optimizer_v2_recovery_rejects_wrong_lifecycle_digest(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: a present random lifecycle digest bypassed exact start replay."""
+    import agent_loop
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        _ledger_path,
+        lease,
+        pricing,
+        _budget,
+        audit,
+        _client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-wrong-lifecycle-digest",
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, plan)
+    gateway.request_pit_optimizer_once(
+        "investigator",
+        role_input,
+        _task6_investigator_parser,
+        call_budget=plan,
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    terminal = dict(audit._events[-1])
+    terminal["details"] = {
+        **terminal["details"],
+        "lifecycle_audit_sha256": "f" * 64,
+    }
+    core = {key: value for key, value in terminal.items() if key != "event_sha256"}
+    terminal["event_sha256"] = hashlib.sha256(
+        _canonical_text(core).encode("utf-8")
+    ).hexdigest()
+    audit.events_path.write_bytes(
+        (_canonical_text(terminal) + "\n").encode("utf-8")
+        if len(audit._events) == 1
+        else b"".join(
+            (_canonical_text(item) + "\n").encode("utf-8")
+            for item in (*audit._events[:-1], terminal)
+        )
+    )
+
+    reopened = agent_loop.AuditTrail.open_existing(audit.artifact_root, audit.run_id)
+    with pytest.raises(agent_loop.AuditError, match="lifecycle"):
+        reopened.recover_pit_optimizer_terminal(
+            run_manifest_sha256=v2_manifest.sha256,
+            call_budget=plan,
+        )
+
+
+def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: restart recovery depended on the pre-crash BudgetLedger object."""
     import agent_loop
 
     plan = v2_manifest.call_budgets[0]
@@ -5584,90 +5896,52 @@ def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
         tmp_path,
         v2_manifest,
         grant_id="grant-restart-finalizer",
-        outcomes=[],
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
     )
-    budget_reservation = budget.reserve_pit_optimizer(
-        rendered_prompt_bytes=100,
-        max_output_tokens=plan.max_output_tokens,
-        conservative_cost_usd=Decimal("0.01"),
-    )
-    authorization_reservation = authorization.reserve_call(lease, plan)
-    audit.append_event(
-        agent_loop.LoopState.CALL_INVESTIGATOR,
-        "provider_call_reserved",
-        {"call_index": 1, "iteration": 1, "role": "investigator"},
-    )
-    started = audit.append_event(
-        agent_loop.LoopState.CALL_INVESTIGATOR,
-        "provider_call_started",
-        {
-            "call_index": 1,
-            "iteration": 1,
-            "role": "investigator",
-            "reservation_event_sha256": audit._events[-1]["event_sha256"],
-        },
-    )
-    usage = agent_loop.Usage(
-        prompt_tokens=100,
-        completion_tokens=50,
-        total_tokens=150,
-        cost_usd=0.001,
-    )
-    facts = replace(
-        _task6_provider_facts(
-            authorization_reservation,
-            pricing,
-            cost_usd=0.001,
+    monkeypatch.setattr(
+        authorization,
+        "reconcile_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("authorization-publication-crash")
         ),
-        audit_sha256=started["event_sha256"],
     )
-    budget.reconcile_pit_optimizer(
-        budget_reservation,
-        usage,
-        request_started=True,
-    )
-    payload_sha256 = hashlib.sha256(
-        _investigator_artifact().canonical_json_bytes()
-    ).hexdigest()
-    audit.write_provider_call_receipt(
-        gateway._pit_optimizer_record(facts, authorization_reservation),
-        run_manifest_sha256=v2_manifest.sha256,
-        payload_sha256=payload_sha256,
-    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, plan)
+    with pytest.raises(KeyboardInterrupt, match="authorization-publication-crash"):
+        gateway.request_pit_optimizer_once(
+            "investigator",
+            role_input,
+            _task6_investigator_parser,
+            call_budget=plan,
+            authorization_lease=lease,
+            frozen_pricing=pricing,
+            wall_deadline=10.0,
+            monotonic=lambda: 1.0,
+        )
     before_recovery = len(ledger_path.read_bytes().splitlines())
+    assert budget.calls == 1
+    assert len(client.completions.calls) == 1
 
-    assert hasattr(agent_loop.AuditTrail, "open_existing")
+    audit_root = audit.artifact_root
+    audit_run_id = audit.run_id
+    del gateway, budget, audit, authorization, pricing
+
     reopened_audit = agent_loop.AuditTrail.open_existing(
-        audit.artifact_root,
-        audit.run_id,
+        audit_root,
+        audit_run_id,
     )
     from core.pit_optimizer_authorization import AuthorizationLedger
 
     reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
-    mismatched_budget_gateway = agent_loop.OpenRouterGateway(
-        client=client,
-        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
-        ledger=agent_loop.BudgetLedger(
-            max_usd=1.0,
-            max_calls=6,
-            max_tokens=448_000,
-        ),
-        authorization_ledger=reopened_authorization,
-        audit_trail=reopened_audit,
-        max_attempts=1,
-    )
-    with pytest.raises(agent_loop.AuditError, match="budget snapshot"):
-        mismatched_budget_gateway.recover_pit_optimizer_finalization(
-            authorization_lease=lease,
-            call_budget=plan,
-        )
-    assert reopened_authorization.recover_active_reservation(lease, plan) == (
-        authorization_reservation
+    fresh_budget = agent_loop.BudgetLedger(
+        max_usd=1.0,
+        max_calls=6,
+        max_tokens=448_000,
     )
     restarted = agent_loop.OpenRouterGateway(
         client=client,
         pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
-        ledger=budget,
+        ledger=fresh_budget,
         authorization_ledger=reopened_authorization,
         audit_trail=reopened_audit,
         max_attempts=1,
@@ -5681,7 +5955,12 @@ def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
         call_budget=plan,
     )
 
-    assert client.completions.calls == []
+    assert len(client.completions.calls) == 1
+    assert fresh_budget.calls == 1
+    assert fresh_budget.total_tokens == 150
+    assert fresh_budget.authoritative_usd == pytest.approx(0.001)
+    assert fresh_budget._pit_optimizer_reservations == {}
+    assert len(fresh_budget._pit_optimizer_reconciliations) == 1
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
     assert len(records) == before_recovery + 1
     assert records[-1]["record_type"] == "reconciliation"
@@ -5693,6 +5972,87 @@ def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
         v2_manifest.call_budgets[1],
     )
     assert next_reservation.call_index == 2
+
+
+def test_pit_optimizer_v2_fresh_restart_preserves_cancelled_terminal_code(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: recovered cancellation was relabeled as a generic failure."""
+    import agent_loop
+    from core.pit_optimizer_authorization import AuthorizationLedger
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-restart-cancelled",
+        outcomes=[],
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt("operator-cancelled")),
+    )
+    monkeypatch.setattr(
+        authorization,
+        "reconcile_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("authorization-publication-crash")
+        ),
+    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, plan)
+    with pytest.raises(KeyboardInterrupt, match="operator-cancelled"):
+        gateway.request_pit_optimizer_once(
+            "investigator",
+            role_input,
+            _task6_investigator_parser,
+            call_budget=plan,
+            authorization_lease=lease,
+            frozen_pricing=pricing,
+            wall_deadline=10.0,
+            monotonic=lambda: 1.0,
+        )
+    audit_root = audit.artifact_root
+    audit_run_id = audit.run_id
+    del gateway, budget, audit, authorization, pricing
+
+    reopened_audit = agent_loop.AuditTrail.open_existing(audit_root, audit_run_id)
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    fresh_budget = agent_loop.BudgetLedger(
+        max_usd=1.0,
+        max_calls=6,
+        max_tokens=448_000,
+    )
+    restarted = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=fresh_budget,
+        authorization_ledger=reopened_authorization,
+        audit_trail=reopened_audit,
+        max_attempts=1,
+    )
+    restarted.recover_pit_optimizer_finalization(
+        authorization_lease=lease,
+        call_budget=plan,
+    )
+
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    assert records[-1]["record_type"] == "lease_close"
+    assert records[-1]["terminal_code"] == "cancelled"
+    assert fresh_budget.calls == 0
+    assert client.completions.calls == []
 
 
 def test_pit_optimizer_v2_audit_replay_rejects_a_truncated_tail(
@@ -5779,6 +6139,7 @@ def test_pit_optimizer_v2_restart_recovers_terminal_before_send_without_start_ev
     assert client.completions.calls == []
     assert budget.calls == 0
     assert [event["event"] for event in audit._events] == [
+        "provider_call_reserved",
         "provider_call_rejected"
     ]
     reopened_audit = agent_loop.AuditTrail.open_existing(
@@ -5857,7 +6218,10 @@ def test_pit_optimizer_v2_lazy_sdk_is_fake_and_sets_max_retries_zero(
         return fake_client
 
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=fake_openai))
-    audit = agent_loop.AuditTrail(tmp_path / "audit-sdk", "pit-v2-sdk")
+    audit = agent_loop.AuditTrail(
+        tmp_path / "audit-sdk",
+        v2_manifest.run_id,
+    )
     gateway = agent_loop.OpenRouterGateway(
         client=None,
         api_key="synthetic-local-only",
@@ -6238,7 +6602,6 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
             wall_deadline=10.0,
             monotonic=lambda: 1.0,
         )
-
     assert len(client.completions.calls) == 1
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
     assert records[-2]["record_type"] == "reconciliation"

@@ -1764,7 +1764,7 @@ class BudgetLedger:
             str, PitOptimizerBudgetReservation
         ] = {}
         self._pit_optimizer_reconciliations: dict[
-            str, tuple[Usage, bool]
+            str, tuple[PitOptimizerBudgetReservation, Usage, bool]
         ] = {}
 
     @property
@@ -1883,7 +1883,7 @@ class BudgetLedger:
             raise ConfigurationError("optimizer budget reconciliation is invalid")
         prior = self._pit_optimizer_reconciliations.get(reservation.reservation_id)
         if prior is not None:
-            if prior == (usage, request_started):
+            if prior == (reservation, usage, request_started):
                 return
             raise ConfigurationError("optimizer budget reconciliation differs from prior facts")
         if (
@@ -1908,6 +1908,7 @@ class BudgetLedger:
             self._reserved_usd_decimal -= reservation.amount_usd
             self.reserved_usd = float(self._reserved_usd_decimal)
             self._pit_optimizer_reconciliations[reservation.reservation_id] = (
+                reservation,
                 usage,
                 request_started,
             )
@@ -1964,6 +1965,7 @@ class BudgetLedger:
             self.retained_reservation_tokens += charged_tokens
             self.incomplete_accounting_calls += 1
         self._pit_optimizer_reconciliations[reservation.reservation_id] = (
+            reservation,
             usage,
             request_started,
         )
@@ -1986,12 +1988,361 @@ class BudgetLedger:
 
         if (
             self._pit_optimizer_reconciliations.get(reservation.reservation_id)
-            != (usage, request_started)
+            != (reservation, usage, request_started)
             or reservation.reservation_id in self._pit_optimizer_reservations
         ):
             raise ConfigurationError(
                 "optimizer budget reconciliation postcondition is absent"
             )
+
+    @staticmethod
+    def _pit_optimizer_reservation_primitive(
+        reservation: PitOptimizerBudgetReservation,
+    ) -> dict[str, object]:
+        return {
+            "reservation_id": reservation.reservation_id,
+            "amount_usd": str(reservation.amount_usd),
+            "prompt_bytes": reservation.prompt_bytes,
+            "completion_allowance": reservation.completion_allowance,
+            "token_upper_bound": reservation.token_upper_bound,
+        }
+
+    @classmethod
+    def _pit_optimizer_reservation_from_primitive(
+        cls,
+        value: object,
+    ) -> PitOptimizerBudgetReservation:
+        if not isinstance(value, dict) or set(value) != {
+            "reservation_id",
+            "amount_usd",
+            "prompt_bytes",
+            "completion_allowance",
+            "token_upper_bound",
+        }:
+            raise AuditError("optimizer budget recovery reservation is malformed")
+        try:
+            amount = Decimal(value["amount_usd"])
+            reservation = PitOptimizerBudgetReservation(
+                reservation_id=value["reservation_id"],
+                amount_usd=amount,
+                prompt_bytes=value["prompt_bytes"],
+                completion_allowance=value["completion_allowance"],
+                token_upper_bound=value["token_upper_bound"],
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise AuditError(
+                "optimizer budget recovery reservation is invalid"
+            ) from exc
+        if (
+            not isinstance(reservation.reservation_id, str)
+            or re.fullmatch(r"optimizer_budget_[0-9a-f]{32}", reservation.reservation_id)
+            is None
+            or not reservation.amount_usd.is_finite()
+            or reservation.amount_usd < 0
+            or type(reservation.prompt_bytes) is not int
+            or reservation.prompt_bytes < 0
+            or type(reservation.completion_allowance) is not int
+            or reservation.completion_allowance <= 0
+            or reservation.token_upper_bound
+            != reservation.prompt_bytes + reservation.completion_allowance
+        ):
+            raise AuditError("optimizer budget recovery reservation is invalid")
+        return reservation
+
+    @staticmethod
+    def _validate_pit_optimizer_recovery_components(
+        *,
+        snapshot: "BudgetSnapshot",
+        reserved_decimal: Decimal,
+        active: Mapping[str, PitOptimizerBudgetReservation],
+        reconciliations: Mapping[
+            str,
+            tuple[PitOptimizerBudgetReservation, Usage, bool],
+        ],
+    ) -> None:
+        """Recompute the aggregate image from exact optimizer transitions."""
+
+        calls = len(active)
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        reserved_tokens = sum(item.token_upper_bound for item in active.values())
+        reserved_usd = sum(
+            (item.amount_usd for item in active.values()),
+            Decimal("0"),
+        )
+        spent_usd = Decimal("0")
+        authoritative_usd = Decimal("0")
+        retained_usd = Decimal("0")
+        retained_tokens = 0
+        incomplete_calls = 0
+        for reservation, usage, request_started in reconciliations.values():
+            values = (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                usage.cost_usd,
+            )
+            if not request_started:
+                if any(value is not None for value in values):
+                    raise AuditError(
+                        "optimizer budget recovery before-send usage is invalid"
+                    )
+                continue
+            calls += 1
+            if all(value is not None for value in values):
+                assert usage.prompt_tokens is not None
+                assert usage.completion_tokens is not None
+                assert usage.total_tokens is not None
+                assert usage.cost_usd is not None
+                if (
+                    usage.total_tokens
+                    != usage.prompt_tokens + usage.completion_tokens
+                ):
+                    raise AuditError(
+                        "optimizer budget recovery token accounting differs"
+                    )
+                charge_usd = Decimal(str(usage.cost_usd))
+                if not charge_usd.is_finite() or charge_usd < 0:
+                    raise AuditError(
+                        "optimizer budget recovery cost accounting is invalid"
+                    )
+                prompt_tokens += usage.prompt_tokens
+                completion_tokens += usage.completion_tokens
+                charged_tokens = usage.total_tokens
+                authoritative_usd += charge_usd
+            elif all(value is None for value in values):
+                charge_usd = reservation.amount_usd
+                charged_tokens = reservation.token_upper_bound
+                retained_usd += charge_usd
+                retained_tokens += charged_tokens
+                incomplete_calls += 1
+            else:
+                raise AuditError(
+                    "optimizer budget recovery usage is partially accounted"
+                )
+            total_tokens += charged_tokens
+            reserved_tokens += charged_tokens
+            reserved_usd += charge_usd
+            spent_usd += charge_usd
+        expected = BudgetSnapshot(
+            api_calls=calls,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            reserved_tokens=reserved_tokens,
+            reserved_usd=float(reserved_usd),
+            spent_usd=float(spent_usd),
+            authoritative_usd=float(authoritative_usd),
+            retained_reservation_usd=float(retained_usd),
+            retained_reservation_tokens=retained_tokens,
+            incomplete_accounting_calls=incomplete_calls,
+            accounting_basis=(
+                "authoritative"
+                if incomplete_calls == 0
+                else "authoritative_plus_retained_reservations"
+            ),
+        )
+        if snapshot != expected or reserved_decimal != reserved_usd:
+            raise AuditError("optimizer budget recovery aggregate differs")
+
+    def _pit_optimizer_recovery_state(
+        self,
+        *,
+        run_manifest_sha256: str,
+        audit_run_id: str,
+    ) -> dict[str, object]:
+        """Return the closed exact state image embedded by the live gateway."""
+
+        if (
+            _SHA256_RE.fullmatch(run_manifest_sha256) is None
+            or _RUN_ID_RE.fullmatch(audit_run_id) is None
+        ):
+            raise AuditError("optimizer budget recovery identity is invalid")
+        snapshot = _budget_snapshot(self)
+        self._validate_pit_optimizer_recovery_components(
+            snapshot=snapshot,
+            reserved_decimal=self._reserved_usd_decimal,
+            active=self._pit_optimizer_reservations,
+            reconciliations=self._pit_optimizer_reconciliations,
+        )
+        return {
+            "schema_version": 1,
+            "run_manifest_sha256": run_manifest_sha256,
+            "audit_run_id": audit_run_id,
+            "limits": {
+                "max_usd": self.max_usd,
+                "max_calls": self.max_calls,
+                "max_tokens": self.max_tokens,
+            },
+            "snapshot": asdict(snapshot),
+            "reserved_usd_decimal": str(self._reserved_usd_decimal),
+            "active_reservations": [
+                self._pit_optimizer_reservation_primitive(item)
+                for item in self._pit_optimizer_reservations.values()
+            ],
+            "reconciliations": [
+                {
+                    "reservation": self._pit_optimizer_reservation_primitive(
+                        reservation
+                    ),
+                    "usage": asdict(usage),
+                    "request_started": request_started,
+                }
+                for reservation, usage, request_started in (
+                    self._pit_optimizer_reconciliations.values()
+                )
+            ],
+        }
+
+    def _restore_pit_optimizer_recovery_state(
+        self,
+        value: object,
+        *,
+        run_manifest_sha256: str,
+        audit_run_id: str,
+    ) -> None:
+        """Restore one authenticated terminal state image idempotently."""
+
+        expected_keys = {
+            "schema_version",
+            "run_manifest_sha256",
+            "audit_run_id",
+            "limits",
+            "snapshot",
+            "reserved_usd_decimal",
+            "active_reservations",
+            "reconciliations",
+        }
+        if not isinstance(value, dict) or set(value) != expected_keys:
+            raise AuditError("optimizer budget recovery state is malformed")
+        if (
+            value.get("schema_version") != 1
+            or value.get("run_manifest_sha256") != run_manifest_sha256
+            or value.get("audit_run_id") != audit_run_id
+        ):
+            raise AuditError("optimizer budget recovery identity differs")
+        limits = value.get("limits")
+        if limits != {
+            "max_usd": self.max_usd,
+            "max_calls": self.max_calls,
+            "max_tokens": self.max_tokens,
+        }:
+            raise AuditError("optimizer budget recovery limits differ")
+        snapshot_value = value.get("snapshot")
+        try:
+            if not isinstance(snapshot_value, dict):
+                raise TypeError("snapshot is not a mapping")
+            snapshot = BudgetSnapshot(**snapshot_value)
+            reserved_decimal = Decimal(value["reserved_usd_decimal"])
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise AuditError("optimizer budget recovery snapshot is invalid") from exc
+        if (
+            not reserved_decimal.is_finite()
+            or reserved_decimal < 0
+            or float(reserved_decimal) != snapshot.reserved_usd
+        ):
+            raise AuditError("optimizer budget recovery Decimal snapshot differs")
+        active_value = value.get("active_reservations")
+        reconciliation_value = value.get("reconciliations")
+        if not isinstance(active_value, list) or not isinstance(
+            reconciliation_value, list
+        ):
+            raise AuditError("optimizer budget recovery entries are malformed")
+        active: dict[str, PitOptimizerBudgetReservation] = {}
+        for primitive in active_value:
+            reservation = self._pit_optimizer_reservation_from_primitive(primitive)
+            if reservation.reservation_id in active:
+                raise AuditError("optimizer budget recovery reservation is repeated")
+            active[reservation.reservation_id] = reservation
+        reconciliations: dict[
+            str,
+            tuple[PitOptimizerBudgetReservation, Usage, bool],
+        ] = {}
+        for item in reconciliation_value:
+            if not isinstance(item, dict) or set(item) != {
+                "reservation",
+                "usage",
+                "request_started",
+            }:
+                raise AuditError(
+                    "optimizer budget recovery reconciliation is malformed"
+                )
+            reservation = self._pit_optimizer_reservation_from_primitive(
+                item["reservation"]
+            )
+            usage_value = item.get("usage")
+            try:
+                if not isinstance(usage_value, dict):
+                    raise TypeError("usage is not a mapping")
+                usage = Usage(**usage_value)
+            except (ProtocolValidationError, TypeError, ValueError) as exc:
+                raise AuditError(
+                    "optimizer budget recovery usage is invalid"
+                ) from exc
+            request_started = item.get("request_started")
+            if type(request_started) is not bool:
+                raise AuditError(
+                    "optimizer budget recovery lifecycle is invalid"
+                )
+            if (
+                reservation.reservation_id in active
+                or reservation.reservation_id in reconciliations
+            ):
+                raise AuditError(
+                    "optimizer budget recovery reservation is repeated"
+                )
+            reconciliations[reservation.reservation_id] = (
+                reservation,
+                usage,
+                request_started,
+            )
+        self._validate_pit_optimizer_recovery_components(
+            snapshot=snapshot,
+            reserved_decimal=reserved_decimal,
+            active=active,
+            reconciliations=reconciliations,
+        )
+        current_state = self._pit_optimizer_recovery_state(
+            run_manifest_sha256=run_manifest_sha256,
+            audit_run_id=audit_run_id,
+        )
+        if current_state == value:
+            return
+        if (
+            _budget_snapshot(self)
+            != BudgetSnapshot(
+                api_calls=0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                reserved_tokens=0,
+                reserved_usd=0.0,
+                spent_usd=0.0,
+                authoritative_usd=0.0,
+                retained_reservation_usd=0.0,
+                retained_reservation_tokens=0,
+                incomplete_accounting_calls=0,
+                accounting_basis="authoritative",
+            )
+            or self._pit_optimizer_reservations
+            or self._pit_optimizer_reconciliations
+        ):
+            raise AuditError("optimizer budget recovery target is not fresh")
+        self.calls = snapshot.api_calls
+        self.prompt_tokens = snapshot.prompt_tokens
+        self.completion_tokens = snapshot.completion_tokens
+        self.total_tokens = snapshot.total_tokens
+        self.reserved_tokens = snapshot.reserved_tokens
+        self.reserved_usd = snapshot.reserved_usd
+        self._reserved_usd_decimal = reserved_decimal
+        self.spent_usd = snapshot.spent_usd
+        self.authoritative_usd = snapshot.authoritative_usd
+        self.retained_reservation_usd = snapshot.retained_reservation_usd
+        self.retained_reservation_tokens = snapshot.retained_reservation_tokens
+        self.incomplete_accounting_calls = snapshot.incomplete_accounting_calls
+        self._pit_optimizer_reservations = active
+        self._pit_optimizer_reconciliations = reconciliations
 
     def reconcile(
         self,
@@ -2044,6 +2395,30 @@ class BudgetLedger:
             raise BudgetExceededError("provider reported cost exceeds the hard USD budget")
         if self.reserved_tokens > self.max_tokens:
             raise BudgetExceededError("provider reported tokens exceed the hard token budget")
+
+
+@dataclass
+class _PitOptimizerGatewayLifecycle:
+    """Live plan-exclusive authority for one gateway-owned optimizer transition."""
+
+    gateway: object
+    audit_trail: object
+    budget_ledger: BudgetLedger
+    authorization_ledger: object
+    authorization_lease: object
+    call_budget: object
+    budget_reservation: PitOptimizerBudgetReservation
+    authorization_reservation: object
+    reserved_event_sha256: str | None = None
+    started_event_sha256: str | None = None
+    response_processed: bool = False
+    facts: object | None = None
+    usage: Usage | None = None
+    payload_sha256: str | None = None
+    terminal_code: str | None = None
+    provider_record: ProviderCallRecord | None = None
+    budget_state: dict[str, object] | None = None
+    terminal_receipt: object | None = None
 
 
 class ResponseParser(Protocol[PayloadT]):
@@ -2836,6 +3211,17 @@ class OpenRouterGateway:
         self._pit_optimizer_frozen_pricing_commitment: str | None = None
         self._pit_optimizer_frozen_manifest_sha256: str | None = None
         self._pit_optimizer_frozen_authorization_ledger: object | None = None
+        self._pit_optimizer_lifecycles: dict[
+            tuple[str, int],
+            _PitOptimizerGatewayLifecycle,
+        ] = {}
+        if authorization_ledger is not None and audit_trail is not None:
+            attach = getattr(authorization_ledger, "attach_audit_trail", None)
+            if not callable(attach):
+                raise ConfigurationError(
+                    "optimizer authorization audit binding is unavailable"
+                )
+            attach(audit_trail)
 
     def _get_client(self) -> Any:
         """Construct the SDK client lazily, only after configuration has succeeded."""
@@ -3135,6 +3521,267 @@ class OpenRouterGateway:
             "critic": LoopState.CALL_CRITIC,
         }[role]
 
+    @staticmethod
+    def _pit_optimizer_terminal_code(
+        facts: "PitOptimizerProviderFacts",
+        requested: str | None,
+    ) -> str | None:
+        if requested not in {None, "failed", "cancelled", "budget_exhausted"}:
+            raise AuditError("optimizer terminal code is invalid")
+        if requested is not None:
+            return requested
+        if facts.outcome == "accepted":
+            return None
+        if facts.outcome == "budget_exceeded":
+            return "budget_exhausted"
+        return "failed"
+
+    def _register_pit_optimizer_lifecycle(
+        self,
+        *,
+        authorization_lease: "AuthorizationRunLease",
+        plan: "PitOptimizerCallBudget",
+        budget_reservation: PitOptimizerBudgetReservation,
+        authorization_reservation: "AuthorizationCallReservation",
+    ) -> _PitOptimizerGatewayLifecycle:
+        if not isinstance(self.audit_trail, AuditTrail):
+            raise AuditError("optimizer audit trail is required")
+        if self.audit_trail.run_id != self.authorization_ledger.manifest.run_id:
+            raise AuditError("optimizer audit run differs from manifest")
+        key = (authorization_lease.run_manifest_sha256, plan.call_index)
+        if key in self._pit_optimizer_lifecycles:
+            raise AuditError("optimizer gateway lifecycle is already registered")
+        lifecycle = _PitOptimizerGatewayLifecycle(
+            gateway=self,
+            audit_trail=self.audit_trail,
+            budget_ledger=self.ledger,
+            authorization_ledger=self.authorization_ledger,
+            authorization_lease=authorization_lease,
+            call_budget=plan,
+            budget_reservation=budget_reservation,
+            authorization_reservation=authorization_reservation,
+        )
+        self._pit_optimizer_lifecycles[key] = lifecycle
+        return lifecycle
+
+    def _require_pit_optimizer_lifecycle(
+        self,
+        lifecycle: _PitOptimizerGatewayLifecycle,
+    ) -> None:
+        plan = lifecycle.call_budget
+        lease = lifecycle.authorization_lease
+        key = (lease.run_manifest_sha256, plan.call_index)
+        if (
+            not isinstance(lifecycle, _PitOptimizerGatewayLifecycle)
+            or lifecycle.gateway is not self
+            or lifecycle.audit_trail is not self.audit_trail
+            or lifecycle.budget_ledger is not self.ledger
+            or lifecycle.authorization_ledger is not self.authorization_ledger
+            or self._pit_optimizer_lifecycles.get(key) is not lifecycle
+        ):
+            raise AuditError("optimizer gateway lifecycle capability is invalid")
+
+    def _pit_optimizer_reserved_details(
+        self,
+        lifecycle: _PitOptimizerGatewayLifecycle,
+    ) -> dict[str, object]:
+        plan = lifecycle.call_budget
+        authorization_reservation = lifecycle.authorization_reservation
+        budget_reservation = lifecycle.budget_reservation
+        return {
+            "audit_run_id": self.audit_trail.run_id,
+            "run_manifest_sha256": lifecycle.authorization_lease.run_manifest_sha256,
+            "call_index": plan.call_index,
+            "iteration": plan.iteration,
+            "role": plan.role,
+            "authorization_reservation_id": (
+                authorization_reservation.reservation_id
+            ),
+            "budget_reservation_id": budget_reservation.reservation_id,
+            "budget_reservation_sha256": hashlib.sha256(
+                _canonical_json_bytes(
+                    BudgetLedger._pit_optimizer_reservation_primitive(
+                        budget_reservation
+                    )
+                )
+            ).hexdigest(),
+        }
+
+    def _ensure_pit_optimizer_reserved_event(
+        self,
+        lifecycle: _PitOptimizerGatewayLifecycle,
+    ) -> str:
+        self._require_pit_optimizer_lifecycle(lifecycle)
+        details = self._pit_optimizer_reserved_details(lifecycle)
+        matches = [
+            item
+            for item in self.audit_trail._events
+            if item.get("event") == "provider_call_reserved"
+            and item.get("state")
+            == self._pit_optimizer_audit_state(
+                lifecycle.call_budget.role
+            ).value
+            and item.get("details") == details
+        ]
+        if len(matches) > 1:
+            raise AuditError("optimizer reserved lifecycle event is ambiguous")
+        if matches:
+            digest = str(matches[0]["event_sha256"])
+        else:
+            event = self.audit_trail.append_event(
+                self._pit_optimizer_audit_state(lifecycle.call_budget.role),
+                "provider_call_reserved",
+                details,
+            )
+            digest = str(event["event_sha256"])
+        if lifecycle.reserved_event_sha256 not in {None, digest}:
+            raise AuditError("optimizer reserved lifecycle digest changed")
+        lifecycle.reserved_event_sha256 = digest
+        return digest
+
+    def _ensure_pit_optimizer_started_event(
+        self,
+        lifecycle: _PitOptimizerGatewayLifecycle,
+    ) -> str:
+        reserved_digest = self._ensure_pit_optimizer_reserved_event(lifecycle)
+        plan = lifecycle.call_budget
+        details = {
+            **self._pit_optimizer_reserved_details(lifecycle),
+            "reservation_event_sha256": reserved_digest,
+        }
+        matches = [
+            item
+            for item in self.audit_trail._events
+            if item.get("event") == "provider_call_started"
+            and item.get("state") == self._pit_optimizer_audit_state(plan.role).value
+            and item.get("details") == details
+        ]
+        if len(matches) > 1:
+            raise AuditError("optimizer started lifecycle event is ambiguous")
+        if matches:
+            digest = str(matches[0]["event_sha256"])
+        else:
+            event = self.audit_trail.append_event(
+                self._pit_optimizer_audit_state(plan.role),
+                "provider_call_started",
+                details,
+            )
+            digest = str(event["event_sha256"])
+        if lifecycle.started_event_sha256 not in {None, digest}:
+            raise AuditError("optimizer started lifecycle digest changed")
+        lifecycle.started_event_sha256 = digest
+        return digest
+
+    def _seal_pit_optimizer_lifecycle(
+        self,
+        lifecycle: _PitOptimizerGatewayLifecycle,
+        *,
+        facts: "PitOptimizerProviderFacts",
+        usage: Usage,
+        payload_sha256: str | None,
+        terminal_code: str | None,
+        response_processed: bool,
+    ) -> None:
+        self._require_pit_optimizer_lifecycle(lifecycle)
+        reserved_digest = self._ensure_pit_optimizer_reserved_event(lifecycle)
+        expected_lifecycle_digest = (
+            lifecycle.started_event_sha256 or reserved_digest
+        )
+        if facts.audit_sha256 != expected_lifecycle_digest:
+            raise AuditError("optimizer lifecycle facts digest differs")
+        if facts.request_started and lifecycle.started_event_sha256 is None:
+            raise AuditError("optimizer started lifecycle event is absent")
+        if not facts.request_started and lifecycle.started_event_sha256 is not None:
+            raise AuditError("optimizer before-send lifecycle has a start event")
+        if facts.outcome == "accepted" and not response_processed:
+            raise AuditError("optimizer accepted response was not processed by gateway")
+        if facts.outcome == "accepted":
+            if payload_sha256 is None or _SHA256_RE.fullmatch(payload_sha256) is None:
+                raise AuditError("optimizer accepted artifact digest is invalid")
+        elif payload_sha256 is not None:
+            raise AuditError("optimizer rejected lifecycle cannot bind an artifact")
+        self.ledger.verify_pit_optimizer_reconciliation(
+            lifecycle.budget_reservation,
+            usage,
+            request_started=facts.request_started,
+        )
+        recovered_authorization = self.authorization_ledger.recover_call_reservation(
+            lifecycle.authorization_lease,
+            lifecycle.call_budget,
+        )
+        if recovered_authorization != lifecycle.authorization_reservation:
+            raise AuditError("optimizer authorization reservation changed")
+        effective_terminal_code = self._pit_optimizer_terminal_code(
+            facts,
+            terminal_code,
+        )
+        provider_record = self._pit_optimizer_record(
+            facts,
+            lifecycle.authorization_reservation,
+        )
+        budget_state = self.ledger._pit_optimizer_recovery_state(
+            run_manifest_sha256=lifecycle.authorization_lease.run_manifest_sha256,
+            audit_run_id=self.audit_trail.run_id,
+        )
+        candidate = (
+            response_processed,
+            facts,
+            usage,
+            payload_sha256,
+            effective_terminal_code,
+            provider_record,
+            budget_state,
+        )
+        prior = (
+            lifecycle.response_processed,
+            lifecycle.facts,
+            lifecycle.usage,
+            lifecycle.payload_sha256,
+            lifecycle.terminal_code,
+            lifecycle.provider_record,
+            lifecycle.budget_state,
+        )
+        if lifecycle.facts is not None:
+            if candidate == prior:
+                return
+            terminal_exists = any(
+                item.get("event")
+                in {
+                    "provider_call_accepted",
+                    "provider_call_rejected",
+                    "provider_call_failed",
+                }
+                and isinstance(item.get("details"), dict)
+                and (
+                    item["details"].get("call_index"),
+                    item["details"].get("iteration"),
+                    item["details"].get("role"),
+                )
+                == (
+                    lifecycle.call_budget.call_index,
+                    lifecycle.call_budget.iteration,
+                    lifecycle.call_budget.role,
+                )
+                for item in self.audit_trail._events
+            )
+            terminal_code_only = (
+                candidate[:4] == prior[:4]
+                and candidate[5:] == prior[5:]
+            )
+            if (
+                not terminal_code_only
+                or lifecycle.terminal_receipt is not None
+                or terminal_exists
+            ):
+                raise AuditError("optimizer gateway lifecycle seal differs")
+        lifecycle.response_processed = response_processed
+        lifecycle.facts = facts
+        lifecycle.usage = usage
+        lifecycle.payload_sha256 = payload_sha256
+        lifecycle.terminal_code = effective_terminal_code
+        lifecycle.provider_record = provider_record
+        lifecycle.budget_state = budget_state
+
     def _pit_optimizer_record(
         self,
         facts: "PitOptimizerProviderFacts",
@@ -3193,9 +3840,7 @@ class OpenRouterGateway:
     def _finalize_pit_optimizer_call(
         self,
         *,
-        budget_reservation: PitOptimizerBudgetReservation,
-        authorization_reservation: "AuthorizationCallReservation",
-        authorization_lease: "AuthorizationRunLease",
+        lifecycle: _PitOptimizerGatewayLifecycle,
         facts: "PitOptimizerProviderFacts",
         usage: Usage,
         payload_sha256: str | None = None,
@@ -3209,14 +3854,14 @@ class OpenRouterGateway:
         first_postpublication_error: BaseException | None = None
         try:
             self.ledger.reconcile_pit_optimizer(
-                budget_reservation,
+                lifecycle.budget_reservation,
                 usage,
                 request_started=facts.request_started,
             )
         except BaseException as error:
             try:
                 self.ledger.verify_pit_optimizer_reconciliation(
-                    budget_reservation,
+                    lifecycle.budget_reservation,
                     usage,
                     request_started=facts.request_started,
                 )
@@ -3226,30 +3871,28 @@ class OpenRouterGateway:
                 expected_overage = True
             else:
                 first_postpublication_error = error
-        provider_record = self._pit_optimizer_record(
-            facts,
-            authorization_reservation,
+        effective_terminal_code = (
+            terminal_code
+            or ("budget_exhausted" if expected_overage else None)
         )
+        self._seal_pit_optimizer_lifecycle(
+            lifecycle,
+            facts=facts,
+            usage=usage,
+            payload_sha256=payload_sha256,
+            terminal_code=effective_terminal_code,
+            response_processed=lifecycle.response_processed,
+        )
+        assert lifecycle.facts is not None
+        facts = lifecycle.facts
         try:
             _provider_path, terminal_audit_receipt = (
-                self.audit_trail.write_provider_call_receipt(
-                    provider_record,
-                    payload_sha256=payload_sha256,
-                    run_manifest_sha256=authorization_lease.run_manifest_sha256,
-                    lifecycle_audit_sha256=facts.audit_sha256,
-                )
+                self.audit_trail.write_provider_call_receipt(lifecycle)
             )
         except BaseException as error:
             try:
                 terminal_audit_receipt = (
-                    self.audit_trail.verify_provider_call_receipt(
-                        provider_record,
-                        payload_sha256=payload_sha256,
-                        run_manifest_sha256=(
-                            authorization_lease.run_manifest_sha256
-                        ),
-                        lifecycle_audit_sha256=facts.audit_sha256,
-                    )
+                    self.audit_trail.verify_provider_call_receipt(lifecycle)
                 )
             except BaseException as verification_error:
                 raise error from verification_error
@@ -3257,24 +3900,18 @@ class OpenRouterGateway:
                 first_postpublication_error = error
         try:
             self.authorization_ledger.reconcile_call(
-                authorization_reservation,
+                lifecycle.authorization_reservation,
                 facts,
                 terminal_audit_receipt=terminal_audit_receipt,
-                terminal_code=(
-                    terminal_code
-                    or ("budget_exhausted" if expected_overage else None)
-                ),
+                terminal_code=lifecycle.terminal_code,
             )
         except BaseException as error:
             try:
                 self.authorization_ledger.verify_reconciliation(
-                    authorization_reservation,
+                    lifecycle.authorization_reservation,
                     facts,
                     terminal_audit_receipt=terminal_audit_receipt,
-                    terminal_code=(
-                        terminal_code
-                        or ("budget_exhausted" if expected_overage else None)
-                    ),
+                    terminal_code=lifecycle.terminal_code,
                 )
             except BaseException as verification_error:
                 raise error from verification_error
@@ -3319,18 +3956,22 @@ class OpenRouterGateway:
             authorization_lease,
             plan_snapshot,
         )
-        facts, receipt, expected_budget_snapshot = (
+        facts, receipt, budget_recovery_state = (
             self.audit_trail.recover_pit_optimizer_terminal(
                 run_manifest_sha256=authorization_lease.run_manifest_sha256,
                 call_budget=plan_snapshot,
             )
         )
-        if _budget_snapshot(self.ledger) != expected_budget_snapshot:
-            raise AuditError("optimizer recovery budget snapshot differs")
+        self.ledger._restore_pit_optimizer_recovery_state(
+            budget_recovery_state,
+            run_manifest_sha256=authorization_lease.run_manifest_sha256,
+            audit_run_id=self.audit_trail.run_id,
+        )
         self.authorization_ledger.reconcile_call(
             reservation,
             facts,
             terminal_audit_receipt=receipt,
+            terminal_code=receipt.terminal_code,
         )
 
     def request_pit_optimizer_once(
@@ -3446,6 +4087,7 @@ class OpenRouterGateway:
         )
         budget_reservation: PitOptimizerBudgetReservation | None = None
         authorization_reservation: AuthorizationCallReservation | None = None
+        lifecycle: _PitOptimizerGatewayLifecycle | None = None
         audit_sha256 = hashlib.sha256(
             f"{manifest.sha256}:{plan_snapshot.call_index}:reserved".encode("utf-8")
         ).hexdigest()
@@ -3458,7 +4100,6 @@ class OpenRouterGateway:
         pending_usage = Usage()
         pending_payload_sha256: str | None = None
         pending_terminal_code: str | None = None
-        state = self._pit_optimizer_audit_state(role)
         zero_usage = Usage(
             prompt_tokens=0,
             completion_tokens=0,
@@ -3518,15 +4159,14 @@ class OpenRouterGateway:
             nonlocal pending_terminal_code
             assert budget_reservation is not None
             assert authorization_reservation is not None
+            assert lifecycle is not None
             pending_facts = facts
             pending_usage = usage
             pending_payload_sha256 = payload_sha256
             pending_terminal_code = terminal_code
             try:
                 self._finalize_pit_optimizer_call(
-                    budget_reservation=budget_reservation,
-                    authorization_reservation=authorization_reservation,
-                    authorization_lease=authorization_lease,
+                    lifecycle=lifecycle,
                     facts=facts,
                     usage=usage,
                     payload_sha256=payload_sha256,
@@ -3540,23 +4180,14 @@ class OpenRouterGateway:
                         request_started=facts.request_started,
                     )
                     terminal_audit_receipt = (
-                        self.audit_trail.verify_provider_call_receipt(
-                            self._pit_optimizer_record(
-                                facts,
-                                authorization_reservation,
-                            ),
-                            payload_sha256=payload_sha256,
-                            run_manifest_sha256=(
-                                authorization_lease.run_manifest_sha256
-                            ),
-                            lifecycle_audit_sha256=facts.audit_sha256,
-                        )
+                        self.audit_trail.verify_provider_call_receipt(lifecycle)
                     )
+                    verified_facts = lifecycle.facts or facts
                     self.authorization_ledger.verify_reconciliation(
                         authorization_reservation,
-                        facts,
+                        verified_facts,
                         terminal_audit_receipt=terminal_audit_receipt,
-                        terminal_code=terminal_code,
+                        terminal_code=lifecycle.terminal_code,
                     )
                 except BaseException:
                     pass
@@ -3580,16 +4211,13 @@ class OpenRouterGateway:
                 plan_snapshot,
             )
             assert isinstance(authorization_reservation, AuthorizationCallReservation)
-            reserved_event = self.audit_trail.append_event(
-                state,
-                "provider_call_reserved",
-                {
-                    "call_index": plan_snapshot.call_index,
-                    "iteration": plan_snapshot.iteration,
-                    "role": role,
-                },
+            lifecycle = self._register_pit_optimizer_lifecycle(
+                authorization_lease=authorization_lease,
+                plan=plan_snapshot,
+                budget_reservation=budget_reservation,
+                authorization_reservation=authorization_reservation,
             )
-            audit_sha256 = str(reserved_event["event_sha256"])
+            audit_sha256 = self._ensure_pit_optimizer_reserved_event(lifecycle)
             try:
                 client = self._get_client()
             except Exception as exc:
@@ -3599,17 +4227,6 @@ class OpenRouterGateway:
                 ) from exc
             if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
-            started_event = self.audit_trail.append_event(
-                state,
-                "provider_call_started",
-                {
-                    "call_index": plan_snapshot.call_index,
-                    "iteration": plan_snapshot.iteration,
-                    "role": role,
-                    "reservation_event_sha256": audit_sha256,
-                },
-            )
-            audit_sha256 = str(started_event["event_sha256"])
             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
             if remaining <= 0:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
@@ -3623,7 +4240,10 @@ class OpenRouterGateway:
             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
             if remaining <= 0:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
+            audit_sha256 = self._ensure_pit_optimizer_started_event(lifecycle)
             possibly_sent = True
+            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+                raise BudgetExceededError("PIT optimizer wall deadline reached")
             try:
                 response = client.chat.completions.create(
                     model=REASONER_MODEL,
@@ -3636,10 +4256,12 @@ class OpenRouterGateway:
                     extra_body={"provider": {"require_parameters": True}},
                 )
             except Exception as exc:
+                lifecycle.response_processed = True
                 raise GatewayError(
                     "OpenRouter request accounting is uncertain",
                     status_code=_status_code(exc),
                 ) from exc
+            lifecycle.response_processed = True
             response_received = True
             raw_model = _read_field(response, "model")
             returned_model = (
@@ -3843,6 +4465,29 @@ class OpenRouterGateway:
                     except BaseException:
                         pass
                 else:
+                    if lifecycle is None:
+                        try:
+                            lifecycle = self._register_pit_optimizer_lifecycle(
+                                authorization_lease=authorization_lease,
+                                plan=plan_snapshot,
+                                budget_reservation=budget_reservation,
+                                authorization_reservation=authorization_reservation,
+                            )
+                        except BaseException:
+                            lifecycle = None
+                    if lifecycle is not None:
+                        try:
+                            reserved_sha256 = (
+                                self._ensure_pit_optimizer_reserved_event(
+                                    lifecycle
+                                )
+                            )
+                            audit_sha256 = (
+                                lifecycle.started_event_sha256
+                                or reserved_sha256
+                            )
+                        except BaseException:
+                            pass
                     if pending_facts is None:
                         pending_facts = provider_facts(
                             outcome=(
@@ -3862,7 +4507,14 @@ class OpenRouterGateway:
                         pending_usage = Usage()
                         pending_terminal_code = outer_terminal_code
                     elif pending_terminal_code is None:
-                        pending_terminal_code = outer_terminal_code
+                        pending_terminal_code = (
+                            lifecycle.terminal_code
+                            if lifecycle is not None
+                            and lifecycle.terminal_receipt is not None
+                            else outer_terminal_code
+                        )
+                    if lifecycle is None:
+                        raise
                     try:
                         finalize(
                             pending_facts,
@@ -11203,7 +11855,9 @@ def _atomic_write_audit(path: Path, payload: bytes) -> None:
                 or info.st_nlink != 1
             ):
                 raise AuditError("audit target is not a private regular file")
-        temporary = path.parent / f".{path.name}.tmp-{secrets.token_hex(12)}"
+        # Keep the atomic sibling name bounded on Windows even when an
+        # authenticated optimizer run ID is longer than legacy audit IDs.
+        temporary = path.parent / f".a-{secrets.token_hex(12)}"
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(descriptor, "wb") as stream:
@@ -11481,10 +12135,44 @@ class AuditTrail:
         payload_sha256: str | None = None,
         run_manifest_sha256: str | None = None,
         lifecycle_audit_sha256: str | None = None,
+        _optimizer_lifecycle: _PitOptimizerGatewayLifecycle | None = None,
     ) -> tuple[Path, str]:
         """Persist one exact paid-call record without any provider content or headers."""
         if not isinstance(record, ProviderCallRecord):
             raise AuditError("provider call audit requires a validated record")
+        optimizer_record = record.schema_version == 2 and record.role in {
+            "investigator",
+            "author",
+            "critic",
+        }
+        if optimizer_record:
+            lifecycle = _optimizer_lifecycle
+            if not isinstance(lifecycle, _PitOptimizerGatewayLifecycle):
+                raise AuditError(
+                    "optimizer gateway lifecycle capability is required"
+                )
+            gateway = lifecycle.gateway
+            if not isinstance(gateway, OpenRouterGateway):
+                raise AuditError("optimizer gateway lifecycle capability is invalid")
+            gateway._require_pit_optimizer_lifecycle(lifecycle)
+            if (
+                lifecycle.audit_trail is not self
+                or lifecycle.provider_record != record
+                or lifecycle.facts is None
+                or lifecycle.usage is None
+                or lifecycle.budget_state is None
+            ):
+                raise AuditError("optimizer gateway lifecycle is not sealed")
+            gateway.ledger.verify_pit_optimizer_reconciliation(
+                lifecycle.budget_reservation,
+                lifecycle.usage,
+                request_started=lifecycle.facts.request_started,
+            )
+            payload_sha256 = lifecycle.payload_sha256
+            run_manifest_sha256 = (
+                lifecycle.authorization_lease.run_manifest_sha256
+            )
+            lifecycle_audit_sha256 = lifecycle.facts.audit_sha256
         if record.outcome == "accepted":
             if payload_sha256 is None or _SHA256_RE.fullmatch(payload_sha256) is None:
                 raise AuditError("accepted provider call requires a validated payload digest")
@@ -11501,6 +12189,7 @@ class AuditTrail:
         ):
             raise AuditError("provider call lifecycle audit digest is invalid")
         path = self.run_root / f"provider-call-{record.call_index:04d}.json"
+        budget_recovery_sha256: str | None = None
         try:
             primitive = _sanitize_audit_value(asdict(record), self._known_secrets)
             if path.exists():
@@ -11510,6 +12199,23 @@ class AuditTrail:
             else:
                 self._write_json(path, primitive)
             digest = _file_sha256(path)
+            if optimizer_record:
+                assert _optimizer_lifecycle is not None
+                budget_path = self.run_root / (
+                    f"provider-budget-{record.call_index:04d}.json"
+                )
+                budget_primitive = _sanitize_audit_value(
+                    _optimizer_lifecycle.budget_state,
+                    self._known_secrets,
+                )
+                if budget_path.exists():
+                    if json.loads(budget_path.read_bytes()) != budget_primitive:
+                        raise AuditError(
+                            "optimizer budget recovery artifact is immutable"
+                        )
+                else:
+                    self._write_json(budget_path, budget_primitive)
+                budget_recovery_sha256 = _file_sha256(budget_path)
         except Exception as exc:
             raise ProviderCallAuditError(
                 PitProviderFailurePhase.PROVIDER_RECORD_WRITE
@@ -11553,6 +12259,36 @@ class AuditTrail:
                     "maximum_exposure_tokens": record.maximum_exposure_tokens,
                     "frozen_pricing_sha256": record.frozen_pricing_sha256,
                     "ledger_snapshot": asdict(record.ledger_snapshot),
+                }
+            )
+            assert _optimizer_lifecycle is not None
+            details.update(
+                {
+                    "audit_run_id": self.run_id,
+                    "terminal_code": _optimizer_lifecycle.terminal_code,
+                    "authorization_reservation_id": (
+                        _optimizer_lifecycle.authorization_reservation.reservation_id
+                    ),
+                    "budget_reservation_id": (
+                        _optimizer_lifecycle.budget_reservation.reservation_id
+                    ),
+                    "budget_reservation_sha256": hashlib.sha256(
+                        _canonical_json_bytes(
+                            BudgetLedger._pit_optimizer_reservation_primitive(
+                                _optimizer_lifecycle.budget_reservation
+                            )
+                        )
+                    ).hexdigest(),
+                    "reservation_event_sha256": (
+                        _optimizer_lifecycle.reserved_event_sha256
+                    ),
+                    "start_event_sha256": (
+                        _optimizer_lifecycle.started_event_sha256
+                    ),
+                    "response_processed": (
+                        _optimizer_lifecycle.response_processed
+                    ),
+                    "budget_recovery_sha256": budget_recovery_sha256,
                 }
             )
             if record.retained_reservation_usd is not None:
@@ -11718,107 +12454,23 @@ class AuditTrail:
             raise AuditError("provider call terminal audit event is absent")
         return digest
 
-    def verify_provider_call_receipt(
+    def _read_pit_optimizer_provider_record(
         self,
-        record: ProviderCallRecord,
-        *,
-        run_manifest_sha256: str,
-        payload_sha256: str | None = None,
-        lifecycle_audit_sha256: str | None = None,
-    ) -> "TerminalAuditReceipt":
-        """Verify and seal the exact provider record plus terminal audit event."""
-
-        from core.pit_optimizer_authorization import (
-            TerminalAuditReceipt,
-            _TERMINAL_AUDIT_RECEIPT_SEAL,
-        )
-
-        provider_digest = self.verify_provider_call(
-            record,
-            payload_sha256=payload_sha256,
-            run_manifest_sha256=run_manifest_sha256,
-            lifecycle_audit_sha256=lifecycle_audit_sha256,
-        )
-        event_code = {
-            "accepted": "provider_call_accepted",
-            "failed": "provider_call_failed",
-        }.get(record.outcome, "provider_call_rejected")
-        matches = [
-            item
-            for item in self._events
-            if item.get("event") == event_code
-            and isinstance(item.get("details"), dict)
-            and item["details"].get("call_index") == record.call_index
-            and item["details"].get("iteration") == record.iteration
-            and item["details"].get("role") == record.role
-            and item["details"].get("outcome") == record.outcome
-            and item["details"].get("artifact_sha256") == provider_digest
-            and item["details"].get("run_manifest_sha256")
-            == run_manifest_sha256
-            and item["details"].get("payload_sha256") == payload_sha256
-        ]
-        if len(matches) != 1:
-            raise AuditError("provider call terminal audit receipt is ambiguous")
-        return TerminalAuditReceipt(
-            audit_run_id=self.run_id,
-            run_manifest_sha256=run_manifest_sha256,
-            call_index=record.call_index,
-            iteration=record.iteration,
-            role=record.role,
-            outcome=record.outcome,
-            provider_record_sha256=provider_digest,
-            terminal_event_sha256=str(matches[0]["event_sha256"]),
-            payload_sha256=payload_sha256,
-            _audit_seal=_TERMINAL_AUDIT_RECEIPT_SEAL,
-        )
-
-    def write_provider_call_receipt(
-        self,
-        record: ProviderCallRecord,
-        *,
-        run_manifest_sha256: str,
-        payload_sha256: str | None = None,
-        lifecycle_audit_sha256: str | None = None,
-    ) -> tuple[Path, "TerminalAuditReceipt"]:
-        """Persist and return the sealed terminal receipt for an optimizer call."""
-
-        path, _provider_digest = self.write_provider_call(
-            record,
-            payload_sha256=payload_sha256,
-            run_manifest_sha256=run_manifest_sha256,
-            lifecycle_audit_sha256=lifecycle_audit_sha256,
-        )
-        return path, self.verify_provider_call_receipt(
-            record,
-            payload_sha256=payload_sha256,
-            run_manifest_sha256=run_manifest_sha256,
-            lifecycle_audit_sha256=lifecycle_audit_sha256,
-        )
-
-    def recover_pit_optimizer_terminal(
-        self,
-        *,
-        run_manifest_sha256: str,
-        call_budget: "PitOptimizerCallBudget",
-    ) -> tuple[
-        "PitOptimizerProviderFacts",
-        "TerminalAuditReceipt",
-        BudgetSnapshot,
-    ]:
-        """Rebuild exact closed optimizer facts from a replayed terminal audit."""
-
-        from core.pit_optimization_contract import PitOptimizerCallBudget
-        from core.pit_optimizer_authorization import PitOptimizerProviderFacts
-
-        if not isinstance(call_budget, PitOptimizerCallBudget):
-            raise AuditError("optimizer terminal recovery plan is invalid")
-        path = self.run_root / f"provider-call-{call_budget.call_index:04d}.json"
+        call_index: int,
+    ) -> tuple[Path, ProviderCallRecord, str]:
+        path = self.run_root / f"provider-call-{call_index:04d}.json"
         try:
+            if not path.is_file() or path.is_symlink():
+                raise AuditError("optimizer provider record is absent")
+            raw = path.read_bytes()
             primitive = json.loads(
-                path.read_bytes(),
+                raw,
                 object_pairs_hook=_reject_duplicate_keys,
             )
-            if not isinstance(primitive, dict):
+            if (
+                not isinstance(primitive, dict)
+                or raw != _canonical_json_bytes(primitive) + b"\n"
+            ):
                 raise AuditError("optimizer provider record is malformed")
             values = dict(primitive)
             ledger_snapshot = values.get("ledger_snapshot")
@@ -11834,84 +12486,26 @@ class AuditTrail:
                     values["failure_phase"]
                 )
             record = ProviderCallRecord(**values)
+            if record.schema_version != 2 or record.role not in {
+                "investigator",
+                "author",
+                "critic",
+            }:
+                raise AuditError("optimizer provider record schema is invalid")
+            return path, record, _file_sha256(path)
         except AuditError:
             raise
         except (KeyError, OSError, TypeError, ValueError) as exc:
             raise AuditError("optimizer provider record cannot be recovered") from exc
-        if (
-            record.schema_version != 2
-            or (
-                record.call_index,
-                record.iteration,
-                record.role,
-                record.requested_model,
-            )
-            != (
-                call_budget.call_index,
-                call_budget.iteration,
-                call_budget.role,
-                call_budget.model,
-            )
-        ):
-            raise AuditError("optimizer provider record differs from sealed plan")
-        provider_digest = _file_sha256(path)
-        terminal_matches = [
-            item
-            for item in self._events
-            if isinstance(item.get("details"), dict)
-            and item["details"].get("call_index") == call_budget.call_index
-            and item["details"].get("iteration") == call_budget.iteration
-            and item["details"].get("role") == call_budget.role
-            and item["details"].get("outcome") == record.outcome
-            and item["details"].get("artifact_sha256") == provider_digest
-            and item["details"].get("run_manifest_sha256")
-            == run_manifest_sha256
-            and item.get("event")
-            in {"provider_call_accepted", "provider_call_rejected"}
-        ]
-        started_matches = [
-            item
-            for item in self._events
-            if item.get("event") == "provider_call_started"
-            and isinstance(item.get("details"), dict)
-            and (
-                item["details"].get("call_index"),
-                item["details"].get("iteration"),
-                item["details"].get("role"),
-            )
-            == (
-                call_budget.call_index,
-                call_budget.iteration,
-                call_budget.role,
-            )
-        ]
-        if len(terminal_matches) != 1:
-            raise AuditError("optimizer terminal audit lifecycle is incomplete")
-        terminal_details = terminal_matches[0]["details"]
-        terminal_lifecycle_sha256 = terminal_details.get(
-            "lifecycle_audit_sha256"
-        )
-        if terminal_lifecycle_sha256 is None:
-            if len(started_matches) != 1:
-                raise AuditError("optimizer terminal audit lifecycle is incomplete")
-            lifecycle_audit_sha256 = str(started_matches[0]["event_sha256"])
-        elif (
-            not isinstance(terminal_lifecycle_sha256, str)
-            or _SHA256_RE.fullmatch(terminal_lifecycle_sha256) is None
-        ):
-            raise AuditError("optimizer terminal lifecycle digest is invalid")
-        else:
-            lifecycle_audit_sha256 = terminal_lifecycle_sha256
-        payload_sha256 = terminal_details.get("payload_sha256")
-        if payload_sha256 is not None and not isinstance(payload_sha256, str):
-            raise AuditError("optimizer terminal payload digest is invalid")
-        receipt = self.verify_provider_call_receipt(
-            record,
-            run_manifest_sha256=run_manifest_sha256,
-            payload_sha256=payload_sha256,
-            lifecycle_audit_sha256=terminal_lifecycle_sha256,
-        )
-        facts = PitOptimizerProviderFacts(
+
+    @staticmethod
+    def _pit_optimizer_facts_from_record(
+        record: ProviderCallRecord,
+        lifecycle_audit_sha256: str,
+    ) -> "PitOptimizerProviderFacts":
+        from core.pit_optimizer_authorization import PitOptimizerProviderFacts
+
+        return PitOptimizerProviderFacts(
             call_index=record.call_index,
             iteration=record.iteration,
             role=record.role,
@@ -11936,8 +12530,540 @@ class AuditTrail:
             retained_reservation_usd=(record.retained_reservation_usd or 0.0),
             audit_sha256=lifecycle_audit_sha256,
         )
-        assert isinstance(record.ledger_snapshot, BudgetSnapshot)
-        return facts, receipt, record.ledger_snapshot
+
+    @staticmethod
+    def _pit_optimizer_event_matches(
+        event: Mapping[str, object],
+        record: ProviderCallRecord,
+    ) -> bool:
+        details = event.get("details")
+        return isinstance(details, dict) and (
+            details.get("call_index"),
+            details.get("iteration"),
+            details.get("role"),
+        ) == (record.call_index, record.iteration, record.role)
+
+    def _verify_pit_optimizer_budget_evidence(
+        self,
+        *,
+        record: ProviderCallRecord,
+        run_manifest_sha256: str,
+        details: Mapping[str, object],
+    ) -> dict[str, object]:
+        recovery_digest = details.get("budget_recovery_sha256")
+        recovery_path = self.run_root / (
+            f"provider-budget-{record.call_index:04d}.json"
+        )
+        try:
+            if (
+                not isinstance(recovery_digest, str)
+                or _SHA256_RE.fullmatch(recovery_digest) is None
+                or not recovery_path.is_file()
+                or recovery_path.is_symlink()
+                or _file_sha256(recovery_path) != recovery_digest
+            ):
+                raise AuditError("optimizer budget recovery artifact differs")
+            raw = recovery_path.read_bytes()
+            state = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+            if (
+                not isinstance(state, dict)
+                or raw != _canonical_json_bytes(state) + b"\n"
+            ):
+                raise AuditError("optimizer budget recovery artifact is invalid")
+        except AuditError:
+            raise
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AuditError("optimizer budget recovery artifact is invalid") from exc
+        limits = state.get("limits") if isinstance(state, dict) else None
+        if not isinstance(limits, dict):
+            raise AuditError("optimizer budget recovery limits are absent")
+        try:
+            verifier = BudgetLedger(
+                max_usd=limits["max_usd"],
+                max_calls=limits["max_calls"],
+                max_tokens=limits["max_tokens"],
+            )
+            verifier._restore_pit_optimizer_recovery_state(
+                state,
+                run_manifest_sha256=run_manifest_sha256,
+                audit_run_id=self.run_id,
+            )
+        except (AuditError, ConfigurationError, KeyError, TypeError, ValueError) as exc:
+            raise AuditError("optimizer budget recovery evidence is invalid") from exc
+        if _budget_snapshot(verifier) != record.ledger_snapshot:
+            raise AuditError("optimizer budget recovery snapshot differs")
+        budget_reservation_id = details.get("budget_reservation_id")
+        reconciliations = state.get("reconciliations")
+        if not isinstance(reconciliations, list):
+            raise AuditError("optimizer budget recovery reconciliation is absent")
+        matches = [
+            item
+            for item in reconciliations
+            if isinstance(item, dict)
+            and isinstance(item.get("reservation"), dict)
+            and item["reservation"].get("reservation_id")
+            == budget_reservation_id
+        ]
+        if len(matches) != 1:
+            raise AuditError("optimizer budget recovery reservation is ambiguous")
+        target = matches[0]
+        reservation = target["reservation"]
+        reservation_digest = hashlib.sha256(
+            _canonical_json_bytes(reservation)
+        ).hexdigest()
+        if (
+            details.get("budget_reservation_sha256") != reservation_digest
+            or target.get("request_started") is not record.request_started
+        ):
+            raise AuditError("optimizer budget recovery lifecycle differs")
+        expected_usage = Usage()
+        if record.request_started and record.accounting_complete:
+            expected_usage = Usage(
+                prompt_tokens=record.prompt_tokens,
+                completion_tokens=record.completion_tokens,
+                total_tokens=record.total_tokens,
+                cost_usd=record.cost_usd,
+            )
+        usage_primitive = target.get("usage")
+        try:
+            if not isinstance(usage_primitive, dict):
+                raise TypeError("usage is not a mapping")
+            replayed_usage = Usage(**usage_primitive)
+        except (ProtocolValidationError, TypeError, ValueError) as exc:
+            raise AuditError("optimizer budget recovery usage is invalid") from exc
+        if (
+            replayed_usage.prompt_tokens,
+            replayed_usage.completion_tokens,
+            replayed_usage.total_tokens,
+            replayed_usage.cost_usd,
+        ) != (
+            expected_usage.prompt_tokens,
+            expected_usage.completion_tokens,
+            expected_usage.total_tokens,
+            expected_usage.cost_usd,
+        ):
+            raise AuditError("optimizer budget recovery usage differs")
+        return state
+
+    def _verify_pit_optimizer_terminal_semantics(
+        self,
+        *,
+        record: ProviderCallRecord,
+        provider_digest: str,
+        run_manifest_sha256: str,
+    ) -> tuple[
+        dict[str, object],
+        "PitOptimizerProviderFacts",
+        dict[str, object],
+    ]:
+        relevant_codes = {
+            "provider_call_reserved",
+            "provider_call_started",
+            "provider_call_accepted",
+            "provider_call_rejected",
+            "provider_call_failed",
+        }
+        relevant = [
+            item
+            for item in self._events
+            if item.get("event") in relevant_codes
+            and self._pit_optimizer_event_matches(item, record)
+        ]
+        terminals = [
+            item
+            for item in relevant
+            if item.get("event")
+            in {
+                "provider_call_accepted",
+                "provider_call_rejected",
+                "provider_call_failed",
+            }
+        ]
+        if len(terminals) != 1:
+            raise AuditError("optimizer terminal audit lifecycle is incomplete")
+        terminal = terminals[0]
+        terminal_sequence = terminal.get("sequence")
+        if type(terminal_sequence) is not int:
+            raise AuditError("optimizer terminal audit sequence is invalid")
+        if any(
+            type(item.get("sequence")) is int
+            and item["sequence"] > terminal_sequence
+            for item in relevant
+        ):
+            raise AuditError("optimizer audit contains a post-terminal retry")
+        expected_terminal_event = (
+            "provider_call_accepted"
+            if record.outcome == "accepted"
+            else "provider_call_rejected"
+        )
+        if terminal.get("event") != expected_terminal_event:
+            raise AuditError("optimizer terminal audit outcome differs")
+        reserved = [
+            item for item in relevant if item.get("event") == "provider_call_reserved"
+        ]
+        started = [
+            item for item in relevant if item.get("event") == "provider_call_started"
+        ]
+        if len(reserved) != 1:
+            raise AuditError("optimizer reserved audit lifecycle is incomplete")
+        if record.request_started and len(started) != 1:
+            raise AuditError("optimizer started audit lifecycle is incomplete")
+        if not record.request_started and started:
+            raise AuditError("optimizer before-send lifecycle contains a start event")
+        if not (
+            reserved[0]["sequence"] < terminal_sequence
+            and (
+                not started
+                or reserved[0]["sequence"]
+                < started[0]["sequence"]
+                < terminal_sequence
+            )
+        ):
+            raise AuditError("optimizer audit lifecycle ordering is invalid")
+        terminal_details = terminal.get("details")
+        if not isinstance(terminal_details, dict):
+            raise AuditError("optimizer terminal audit details are malformed")
+        authorization_reservation_id = terminal_details.get(
+            "authorization_reservation_id"
+        )
+        budget_reservation_id = terminal_details.get("budget_reservation_id")
+        budget_reservation_sha256 = terminal_details.get(
+            "budget_reservation_sha256"
+        )
+        if (
+            not isinstance(authorization_reservation_id, str)
+            or re.fullmatch(
+                r"reservation_[0-9a-f]{32}",
+                authorization_reservation_id,
+            )
+            is None
+            or not isinstance(budget_reservation_id, str)
+            or re.fullmatch(
+                r"optimizer_budget_[0-9a-f]{32}",
+                budget_reservation_id,
+            )
+            is None
+            or not isinstance(budget_reservation_sha256, str)
+            or _SHA256_RE.fullmatch(budget_reservation_sha256) is None
+        ):
+            raise AuditError("optimizer audit reservation identity is invalid")
+        reserved_details = {
+            "audit_run_id": self.run_id,
+            "run_manifest_sha256": run_manifest_sha256,
+            "call_index": record.call_index,
+            "iteration": record.iteration,
+            "role": record.role,
+            "authorization_reservation_id": authorization_reservation_id,
+            "budget_reservation_id": budget_reservation_id,
+            "budget_reservation_sha256": budget_reservation_sha256,
+        }
+        if reserved[0].get("details") != reserved_details:
+            raise AuditError("optimizer reserved audit evidence differs")
+        reserved_digest = str(reserved[0].get("event_sha256"))
+        start_digest: str | None = None
+        if started:
+            expected_started_details = {
+                **reserved_details,
+                "reservation_event_sha256": reserved_digest,
+            }
+            if started[0].get("details") != expected_started_details:
+                raise AuditError("optimizer started audit evidence differs")
+            start_digest = str(started[0].get("event_sha256"))
+        lifecycle_digest = start_digest or reserved_digest
+        if _SHA256_RE.fullmatch(lifecycle_digest) is None:
+            raise AuditError("optimizer lifecycle digest is invalid")
+        if terminal_details.get("lifecycle_audit_sha256") != lifecycle_digest:
+            raise AuditError("optimizer terminal lifecycle digest differs")
+        facts = self._pit_optimizer_facts_from_record(
+            record,
+            lifecycle_digest,
+        )
+        terminal_code = terminal_details.get("terminal_code")
+        if record.outcome == "accepted":
+            if terminal_code not in {
+                None,
+                "failed",
+                "cancelled",
+                "budget_exhausted",
+            }:
+                raise AuditError("optimizer audit terminal code is invalid")
+        elif terminal_code not in {
+            "failed",
+            "cancelled",
+            "budget_exhausted",
+        }:
+            raise AuditError("rejected optimizer audit terminal code is invalid")
+        payload_sha256 = terminal_details.get("payload_sha256")
+        if record.outcome == "accepted":
+            if (
+                not isinstance(payload_sha256, str)
+                or _SHA256_RE.fullmatch(payload_sha256) is None
+            ):
+                raise AuditError("accepted optimizer audit payload is invalid")
+        elif payload_sha256 is not None:
+            raise AuditError("rejected optimizer audit binds a payload")
+        budget_state = self._verify_pit_optimizer_budget_evidence(
+            record=record,
+            run_manifest_sha256=run_manifest_sha256,
+            details=terminal_details,
+        )
+        expected_details: dict[str, object] = {
+            "call_index": record.call_index,
+            "role": record.role,
+            "outcome": record.outcome,
+            "artifact_sha256": provider_digest,
+            "run_manifest_sha256": run_manifest_sha256,
+            "lifecycle_audit_sha256": lifecycle_digest,
+            "iteration": record.iteration,
+            "request_started": record.request_started,
+            "response_received": record.response_received,
+            "locally_accounted": record.locally_accounted,
+            "authoritative_spend_known": record.authoritative_spend_known,
+            "exposure_basis": record.exposure_basis,
+            "maximum_exposure_usd": record.maximum_exposure_usd,
+            "maximum_exposure_tokens": record.maximum_exposure_tokens,
+            "frozen_pricing_sha256": record.frozen_pricing_sha256,
+            "ledger_snapshot": asdict(record.ledger_snapshot),
+            "audit_run_id": self.run_id,
+            "terminal_code": terminal_code,
+            "authorization_reservation_id": authorization_reservation_id,
+            "budget_reservation_id": budget_reservation_id,
+            "budget_reservation_sha256": budget_reservation_sha256,
+            "reservation_event_sha256": reserved_digest,
+            "start_event_sha256": start_digest,
+            "response_processed": terminal_details.get("response_processed"),
+            "budget_recovery_sha256": terminal_details.get(
+                "budget_recovery_sha256"
+            ),
+        }
+        if payload_sha256 is not None:
+            expected_details["payload_sha256"] = payload_sha256
+        if record.retained_reservation_usd is not None:
+            expected_details["retained_reservation_usd"] = (
+                record.retained_reservation_usd
+            )
+            expected_details["retained_reservation_tokens"] = (
+                record.retained_reservation_tokens
+            )
+        if terminal_details != expected_details:
+            raise AuditError("optimizer terminal audit evidence differs")
+        if type(terminal_details.get("response_processed")) is not bool:
+            raise AuditError("optimizer response processing evidence is invalid")
+        if record.outcome == "accepted" and not terminal_details[
+            "response_processed"
+        ]:
+            raise AuditError("optimizer accepted response was not processed")
+        return terminal, facts, budget_state
+
+    def verify_terminal_audit_receipt(
+        self,
+        receipt: "TerminalAuditReceipt",
+        *,
+        authorization_reservation: "AuthorizationCallReservation",
+        provider_facts: "PitOptimizerProviderFacts",
+    ) -> dict[str, object]:
+        """Cross-verify one durable receipt against exact audit and ledger facts."""
+
+        from core.pit_optimizer_authorization import (
+            AuthorizationCallReservation,
+            PitOptimizerProviderFacts,
+            TerminalAuditReceipt,
+        )
+
+        if (
+            not isinstance(receipt, TerminalAuditReceipt)
+            or not isinstance(
+                authorization_reservation,
+                AuthorizationCallReservation,
+            )
+            or not isinstance(provider_facts, PitOptimizerProviderFacts)
+        ):
+            raise AuditError("optimizer terminal audit verification is invalid")
+        if receipt.audit_run_id != self.run_id:
+            raise AuditError("optimizer terminal audit run differs")
+        _path, record, provider_digest = (
+            self._read_pit_optimizer_provider_record(receipt.call_index)
+        )
+        terminal, replayed_facts, budget_state = (
+            self._verify_pit_optimizer_terminal_semantics(
+                record=record,
+                provider_digest=provider_digest,
+                run_manifest_sha256=receipt.run_manifest_sha256,
+            )
+        )
+        terminal_details = terminal["details"]
+        if (
+            receipt.provider_record_sha256 != provider_digest
+            or receipt.terminal_event_sha256 != terminal.get("event_sha256")
+            or receipt.payload_sha256 != terminal_details.get("payload_sha256")
+            or receipt.terminal_code != terminal_details.get("terminal_code")
+            or (
+                receipt.call_index,
+                receipt.iteration,
+                receipt.role,
+                receipt.outcome,
+            )
+            != (
+                record.call_index,
+                record.iteration,
+                record.role,
+                record.outcome,
+            )
+            or provider_facts != replayed_facts
+            or (
+                authorization_reservation.call_index,
+                authorization_reservation.iteration,
+                authorization_reservation.role,
+            )
+            != (record.call_index, record.iteration, record.role)
+            or terminal_details.get("authorization_reservation_id")
+            != authorization_reservation.reservation_id
+            or record.maximum_exposure_tokens
+            != authorization_reservation.reserved_tokens
+            or Decimal(str(record.maximum_exposure_usd))
+            != Decimal(str(authorization_reservation.reserved_usd))
+        ):
+            raise AuditError("optimizer terminal audit receipt differs")
+        return budget_state
+
+    def _receipt_for_pit_optimizer_lifecycle(
+        self,
+        lifecycle: _PitOptimizerGatewayLifecycle,
+    ) -> "TerminalAuditReceipt":
+        from core.pit_optimizer_authorization import TerminalAuditReceipt
+
+        lifecycle.gateway._require_pit_optimizer_lifecycle(lifecycle)
+        if lifecycle.provider_record is None or lifecycle.facts is None:
+            raise AuditError("optimizer gateway lifecycle is not sealed")
+        _path, record, provider_digest = self._read_pit_optimizer_provider_record(
+            lifecycle.provider_record.call_index
+        )
+        terminal, _facts, _budget_state = (
+            self._verify_pit_optimizer_terminal_semantics(
+                record=record,
+                provider_digest=provider_digest,
+                run_manifest_sha256=(
+                    lifecycle.authorization_lease.run_manifest_sha256
+                ),
+            )
+        )
+        details = terminal["details"]
+        receipt = TerminalAuditReceipt(
+            audit_run_id=self.run_id,
+            run_manifest_sha256=(
+                lifecycle.authorization_lease.run_manifest_sha256
+            ),
+            call_index=record.call_index,
+            iteration=record.iteration,
+            role=record.role,
+            outcome=record.outcome,
+            provider_record_sha256=provider_digest,
+            terminal_event_sha256=str(terminal["event_sha256"]),
+            payload_sha256=details.get("payload_sha256"),
+            terminal_code=details.get("terminal_code"),
+        )
+        self.verify_terminal_audit_receipt(
+            receipt,
+            authorization_reservation=lifecycle.authorization_reservation,
+            provider_facts=lifecycle.facts,
+        )
+        return receipt
+
+    def verify_provider_call_receipt(
+        self,
+        lifecycle: object,
+        **legacy_arguments: object,
+    ) -> "TerminalAuditReceipt":
+        """Verify only a sealed live gateway lifecycle, never caller-built facts."""
+
+        if (
+            not isinstance(lifecycle, _PitOptimizerGatewayLifecycle)
+            or legacy_arguments
+        ):
+            raise AuditError("optimizer gateway lifecycle capability is required")
+        receipt = self._receipt_for_pit_optimizer_lifecycle(lifecycle)
+        if lifecycle.terminal_receipt not in {None, receipt}:
+            raise AuditError("optimizer terminal receipt changed")
+        lifecycle.terminal_receipt = receipt
+        return receipt
+
+    def write_provider_call_receipt(
+        self,
+        lifecycle: object,
+        **legacy_arguments: object,
+    ) -> tuple[Path, "TerminalAuditReceipt"]:
+        """Persist a receipt only from the plan-exclusive gateway lifecycle."""
+
+        if (
+            not isinstance(lifecycle, _PitOptimizerGatewayLifecycle)
+            or legacy_arguments
+        ):
+            raise AuditError("optimizer gateway lifecycle capability is required")
+        lifecycle.gateway._require_pit_optimizer_lifecycle(lifecycle)
+        if lifecycle.provider_record is None:
+            raise AuditError("optimizer gateway lifecycle is not sealed")
+        path, _provider_digest = self.write_provider_call(
+            lifecycle.provider_record,
+            _optimizer_lifecycle=lifecycle,
+        )
+        return path, self.verify_provider_call_receipt(lifecycle)
+
+    def recover_pit_optimizer_terminal(
+        self,
+        *,
+        run_manifest_sha256: str,
+        call_budget: "PitOptimizerCallBudget",
+    ) -> tuple[
+        "PitOptimizerProviderFacts",
+        "TerminalAuditReceipt",
+        dict[str, object],
+    ]:
+        """Rebuild exact facts and budget state from semantic audit replay."""
+
+        from core.pit_optimization_contract import PitOptimizerCallBudget
+        from core.pit_optimizer_authorization import TerminalAuditReceipt
+
+        if (
+            not isinstance(call_budget, PitOptimizerCallBudget)
+            or _SHA256_RE.fullmatch(run_manifest_sha256) is None
+        ):
+            raise AuditError("optimizer terminal recovery plan is invalid")
+        _path, record, provider_digest = self._read_pit_optimizer_provider_record(
+            call_budget.call_index
+        )
+        if (
+            record.call_index,
+            record.iteration,
+            record.role,
+            record.requested_model,
+        ) != (
+            call_budget.call_index,
+            call_budget.iteration,
+            call_budget.role,
+            call_budget.model,
+        ):
+            raise AuditError("optimizer provider record differs from sealed plan")
+        terminal, facts, budget_state = (
+            self._verify_pit_optimizer_terminal_semantics(
+                record=record,
+                provider_digest=provider_digest,
+                run_manifest_sha256=run_manifest_sha256,
+            )
+        )
+        details = terminal["details"]
+        receipt = TerminalAuditReceipt(
+            audit_run_id=self.run_id,
+            run_manifest_sha256=run_manifest_sha256,
+            call_index=record.call_index,
+            iteration=record.iteration,
+            role=record.role,
+            outcome=record.outcome,
+            provider_record_sha256=provider_digest,
+            terminal_event_sha256=str(terminal["event_sha256"]),
+            payload_sha256=details.get("payload_sha256"),
+            terminal_code=details.get("terminal_code"),
+        )
+        return facts, receipt, budget_state
 
     def write_provider_evidence(
         self, evidence: ProviderGateEvidence, *, name: str = "provider-evidence"
