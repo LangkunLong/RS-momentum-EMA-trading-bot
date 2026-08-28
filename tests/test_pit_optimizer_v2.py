@@ -34,6 +34,108 @@ def _canonical_text(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def test_v2_canonical_text_preserves_utf8_and_rejects_unsafe_controls() -> None:
+    """Break caught: ASCII escaping made valid Unicode larger than the sealed bound."""
+    raw_bytes = contract.MAX_ROLE_TEXT_BYTES
+    backslashes = "\\" * raw_bytes
+    quotes = '"' * raw_bytes
+    newlines = "\n" * raw_bytes
+    unicode_text = "é" * (raw_bytes // len("é".encode("utf-8")))
+    astral_text = "😀" * (raw_bytes // len("😀".encode("utf-8")))
+    unsafe_controls = "x\x01y"
+    for value in (backslashes, quotes, newlines, unicode_text, astral_text):
+        assert len(value.encode("utf-8")) == raw_bytes
+
+    def canonical_string_bytes(value: str) -> bytes:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    backslash_json = canonical_string_bytes(backslashes)
+    quote_json = canonical_string_bytes(quotes)
+    newline_json = canonical_string_bytes(newlines)
+    unicode_json = canonical_string_bytes(unicode_text)
+    astral_json = canonical_string_bytes(astral_text)
+    control_json = json.dumps(
+        "\x01" * raw_bytes,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(backslash_json) == 2 + (2 * raw_bytes)
+    assert len(quote_json) == len(backslash_json)
+    assert len(newline_json) == len(backslash_json)
+    assert len(unicode_json) == 2 + raw_bytes
+    assert len(astral_json) == len(unicode_json)
+    assert len(control_json) == 2 + (6 * raw_bytes)
+
+    artifact = contract.InvestigatorArtifact.from_json(
+        json.dumps(
+            {**_investigator_payload(), "causal_rationale": unicode_text},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    assert unicode_text.encode("utf-8") in artifact.canonical_json_bytes()
+    assert b"\\u00e9" not in artifact.canonical_json_bytes()
+
+    with pytest.raises(ValueError, match="control"):
+        contract.InvestigatorArtifact.from_json(
+            json.dumps(
+                {**_investigator_payload(), "causal_rationale": unsafe_controls},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+        )
+
+
+def test_v2_source_and_diff_blobs_reject_unsafe_controls() -> None:
+    """Break caught: control escapes could exceed every raw-byte source/diff bound."""
+    author_payload = {
+        **_author_payload(),
+        "unified_diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-x\n+y\x01\n",
+    }
+    with pytest.raises(ValueError, match="control"):
+        contract.AuthorArtifact.from_json(
+            json.dumps(
+                author_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            max_total_bytes=contract.MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES
+            + contract.MAX_AUTHOR_DIFF_BYTES,
+            max_diff_bytes=contract.MAX_AUTHOR_DIFF_BYTES,
+        )
+
+    base = _source_bundle()
+    source_texts = {
+        record.path: (
+            record.text + "# unsafe \x01 control\n"
+            if record.path == "core/strategy_policy/entry.py"
+            else record.text
+        )
+        for record in base.files
+    }
+    scope = replace(
+        _source_scope(base),
+        initial_policy_source_sha256s=tuple(
+            (path, hashlib.sha256(text.encode("utf-8")).hexdigest())
+            for path, text in source_texts.items()
+        ),
+    )
+    with pytest.raises(ValueError, match="control"):
+        contract.initial_policy_source_bundle(
+            scope=scope,
+            source_texts=source_texts,
+        )
+
+
 def _investigator_payload() -> dict[str, object]:
     return {
         "hypothesis_id": "hypothesis_1",
@@ -565,20 +667,33 @@ def test_controller_rejects_inconsistent_new_range_location() -> None:
 
 
 @pytest.mark.parametrize(
-    ("source_padding", "expected_failure_code"),
-    ((10_000, None), (45_000, "next_context_oversize")),
+    ("padding_kind", "raw_padding_bytes", "expected_failure_code"),
+    (
+        ("ascii", 10_000, None),
+        ("ascii", 45_000, "next_context_oversize"),
+        ("backslash", 30_000, "next_context_oversize"),
+        ("unicode", 30_000, None),
+    ),
 )
 def test_candidate_materialization_checks_exact_next_role_envelope(
-    source_padding: int,
+    padding_kind: str,
+    raw_padding_bytes: int,
     expected_failure_code: str | None,
 ) -> None:
     """Break caught: a source-cap-valid incumbent could overflow the next role input."""
     base = _source_bundle()
     entry_path = "core/strategy_policy/entry.py"
+    padding_unit = {"ascii": "p", "backslash": "\\", "unicode": "é"}[
+        padding_kind
+    ]
+    padding = padding_unit * (
+        raw_padding_bytes // len(padding_unit.encode("utf-8"))
+    )
+    assert len(padding.encode("utf-8")) == raw_padding_bytes
     padded_texts = {
         record.path: (
             "# "
-            + ("p" * source_padding)
+            + padding
             + "\n# spacer_1\n# spacer_2\n# spacer_3\n# spacer_4\n"
             + record.text
             if record.path == entry_path
@@ -624,7 +739,15 @@ def test_candidate_materialization_checks_exact_next_role_envelope(
         "files": candidate_records,
     }
     assert (
-        len(_canonical_text(candidate_bundle).encode("utf-8"))
+        len(
+            json.dumps(
+                candidate_bundle,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
         <= scope.max_policy_source_bundle_bytes
     )
 
@@ -1708,6 +1831,47 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
         role: json.loads(payload.decode("utf-8"))
         for role, payload in rendered.items()
     }
+    investigator_value = rendered_values["investigator"]
+    source_value = investigator_value["source_bundle"]
+    worst_raw_diff_bytes = manifest.policy_source_scope.candidate_bounds.max_diff_bytes
+    expected_diff_maximizer = "\\" * worst_raw_diff_bytes
+    assert len(source_value["cumulative_diff"].encode("utf-8")) == worst_raw_diff_bytes
+    assert source_value["cumulative_diff"] == expected_diff_maximizer
+    entry_record = next(
+        record
+        for record in source_value["files"]
+        if record["path"] == "core/strategy_policy/entry.py"
+    )
+    initial_entry = expected["source_texts"]["core/strategy_policy/entry.py"]
+    assert entry_record["text"][len(initial_entry) :] == expected_diff_maximizer
+
+    incumbent_value = investigator_value["incumbent_summary"]
+    expected_text_maximizer = "\\" * contract.MAX_ROLE_TEXT_BYTES
+    assert incumbent_value["behavioral_summary"] == expected_text_maximizer
+    unicode_incumbent = {
+        **incumbent_value,
+        "behavioral_summary": "é"
+        * (contract.MAX_ROLE_TEXT_BYTES // len("é".encode("utf-8"))),
+    }
+    incumbent_bytes = len(
+        json.dumps(
+            incumbent_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+    unicode_incumbent_bytes = len(
+        json.dumps(
+            unicode_incumbent,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+    assert incumbent_bytes - unicode_incumbent_bytes == contract.MAX_ROLE_TEXT_BYTES
     cap_derived_sections = (
         (
             rendered_values["investigator"]["rule_summary"],

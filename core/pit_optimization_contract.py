@@ -56,6 +56,8 @@ MAX_AUTHOR_DYNAMIC_BYTES = 76_000
 MAX_CRITIC_DYNAMIC_BYTES = 24_000
 MAX_CANDIDATE_COMPARISON_BYTES = 3 * 1024
 
+_DISALLOWED_TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
 _INVESTIGATOR_FAMILIES = ("entry", "exit", "risk_sizing")
 _CRITIC_DISPOSITIONS = ("refine", "abandon", "change_family")
 _CANDIDATE_COMPARISON_SEAL = object()
@@ -251,7 +253,13 @@ def _parse_v2_closed_object(
 
 
 def _v2_text(value: object, field: str, *, allow_empty: bool = False) -> str:
-    if not isinstance(value, str) or value != value.strip() or "\x00" in value:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or _DISALLOWED_TEXT_CONTROL_RE.search(value) is not None
+    ):
+        if isinstance(value, str) and _DISALLOWED_TEXT_CONTROL_RE.search(value):
+            raise ValueError(f"{field} contains a disallowed control character")
         raise ValueError(f"{field} must be canonical text")
     if not allow_empty and not value:
         raise ValueError(f"{field} cannot be empty")
@@ -300,9 +308,11 @@ def _v2_blob(value: object, field: str, *, max_bytes: int) -> str:
     if (
         not isinstance(value, str)
         or not value
-        or "\x00" in value
+        or _DISALLOWED_TEXT_CONTROL_RE.search(value) is not None
         or len(value.encode("utf-8")) > max_bytes
     ):
+        if isinstance(value, str) and _DISALLOWED_TEXT_CONTROL_RE.search(value):
+            raise ValueError(f"{field} contains a disallowed control character")
         raise ValueError(f"{field} exceeds its byte cap")
     return value
 
@@ -313,6 +323,7 @@ def _v2_canonical_bytes(value: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
+        ensure_ascii=False,
     ).encode("utf-8")
 
 
@@ -333,6 +344,26 @@ def _v2_primitive(value: object) -> object:
     if isinstance(value, (tuple, list)):
         return [_v2_primitive(item) for item in value]
     return value
+
+
+def _v2_max_canonical_text(max_raw_bytes: int) -> str:
+    """Return deterministic valid text with maximum canonical JSON expansion."""
+
+    _require_positive_int(max_raw_bytes, "canonical text raw-byte cap")
+    best = ""
+    best_size = -1
+    # UTF-8 is emitted raw. After closing unsafe controls, backslash/quote are
+    # the maximum two-byte JSON escapes; representative Unicode cannot exceed
+    # its raw UTF-8 size. The first maximum wins to make ties deterministic.
+    for unit in ("\\", '"', "é", "😀"):
+        unit_bytes = len(unit.encode("utf-8"))
+        candidate = unit * (max_raw_bytes // unit_bytes)
+        candidate += "x" * (max_raw_bytes - len(candidate.encode("utf-8")))
+        size = len(_v2_canonical_bytes(candidate))
+        if size > best_size:
+            best = candidate
+            best_size = size
+    return best
 
 
 class _V2Canonical:
@@ -2970,9 +3001,11 @@ def render_worst_iteration_two_role_inputs(
         raise ValueError("worst role source paths differ from scope")
     if prospective_source_bundle is None:
         grown_texts = dict(source_texts)
-        worst_escaped_bytes = "\\" * scope.candidate_bounds.max_diff_bytes
-        grown_texts[scope.editable_paths[0]] += worst_escaped_bytes
-        cumulative_diff = worst_escaped_bytes
+        worst_raw_text = _v2_max_canonical_text(
+            scope.candidate_bounds.max_diff_bytes
+        )
+        grown_texts[scope.editable_paths[0]] += worst_raw_text
+        cumulative_diff = worst_raw_text
         source_records = tuple(
             PolicySourceRecord(
                 path=path,
@@ -3061,11 +3094,11 @@ def render_worst_iteration_two_role_inputs(
             raise ValueError("worst role section cannot reach its canonical cap")
         return best
 
-    def escaped(count: int) -> str:
-        return "\\" * count
+    def maximized(count: int) -> str:
+        return _v2_max_canonical_text(count)
     rule_summary = maximize_contract(
         lambda count: StrategyRuleSummary(
-            records=(RuleSummaryRecord("rule_1", "r" + escaped(count)),)
+            records=(RuleSummaryRecord("rule_1", "r" + maximized(count)),)
         ),
         MAX_DISCOVERY_EVIDENCE_BYTES,
     )
@@ -3073,14 +3106,14 @@ def render_worst_iteration_two_role_inputs(
         lambda count: DiscoveryEvidenceSummary(
             folds=folds,
             score=None,
-            evidence_ids=("e" + escaped(count), "evidence_2"),
+            evidence_ids=("e" + maximized(count), "evidence_2"),
         ),
         MAX_DISCOVERY_EVIDENCE_BYTES,
     )
     incumbent = IncumbentSummary(
         candidate_identity_sha256="1" * 64,
         accepted_iteration=1,
-        behavioral_summary="\\" * MAX_ROLE_TEXT_BYTES,
+        behavioral_summary=_v2_max_canonical_text(MAX_ROLE_TEXT_BYTES),
         discovery=discovery,
     )
     feedback = maximize_contract(
@@ -3088,7 +3121,7 @@ def render_worst_iteration_two_role_inputs(
             iteration=1,
             hypothesis_id="hypothesis_1",
             family="entry",
-            author_summary="a" + escaped(count),
+            author_summary="a" + maximized(count),
             validation_code="valid",
             discovery_score=None,
             critic_disposition="refine",
@@ -3102,7 +3135,7 @@ def render_worst_iteration_two_role_inputs(
             hypothesis_id="hypothesis_2",
             family="entry",
             evidence_ids=("evidence_1",),
-            causal_rationale="c" + escaped(count),
+            causal_rationale="c" + maximized(count),
             target_paths=(scope.editable_paths[0],),
             target_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
             expected_diagnostic_changes=("diagnostic",),
@@ -3114,7 +3147,7 @@ def render_worst_iteration_two_role_inputs(
     author_manifest = maximize_contract(
         lambda count: AuthorManifestSummary(
             hypothesis_id=investigator_artifact.hypothesis_id,
-            behavioral_summary="b" + escaped(count),
+            behavioral_summary="b" + maximized(count),
             changed_paths=(scope.editable_paths[0],),
             changed_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
         ),
@@ -3133,7 +3166,7 @@ def render_worst_iteration_two_role_inputs(
         lambda count: CandidateComparisonSummary(
             folds=folds,
             score=comparison_score,
-            diagnostics=(AggregateMetric("d" + escaped(count), 1),),
+            diagnostics=(AggregateMetric("d" + maximized(count), 1),),
             _controller_seal=_CANDIDATE_COMPARISON_SEAL,
         ),
         MAX_CANDIDATE_COMPARISON_BYTES,
