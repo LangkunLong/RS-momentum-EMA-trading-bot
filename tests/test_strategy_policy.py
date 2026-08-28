@@ -184,6 +184,25 @@ def test_entry_decision_is_closed_and_bool_strict() -> None:
         )
 
 
+def test_contract_instances_have_no_mutable_instance_dictionary() -> None:
+    """Break caught: inherited instance storage could admit hidden policy fields."""
+    contracts = (
+        _entry_snapshot(),
+        EntryDecision(True, True, (80.0, 85.0), ()),
+        _capacity_snapshot(),
+        CapacityDecision(4, True),
+        _allocation_snapshot(),
+        AllocationDecision(0.01, 0.08, None),
+        EvictionPosition(0, 100.0, 95.0, 70.0),
+        _eviction_snapshot(),
+        EvictionDecision(0),
+        _exit_snapshot(),
+        ExitAction("scale_out", 0.10, 0.25, "take_profit_scale_out"),
+        ExitDecision((), 100.0, False, 0, True, True),
+    )
+    assert all(not hasattr(contract, "__dict__") for contract in contracts)
+
+
 def test_every_contract_round_trips_canonical_json_and_is_frozen() -> None:
     """Break caught: policy transport could change a validated primitive contract."""
     contracts = (

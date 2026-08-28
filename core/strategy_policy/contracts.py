@@ -63,6 +63,8 @@ def _tuple(value: object, name: str, *, maximum: int = _MAX_TUPLE_ITEMS) -> tupl
 class _CanonicalContract:
     """Strict canonical JSON conversion shared by closed dataclass contracts."""
 
+    __slots__ = ()
+
     _nested_fields: ClassVar[dict[str, type["_CanonicalContract"]]] = {}
 
     def to_primitive(self) -> dict[str, object]:
