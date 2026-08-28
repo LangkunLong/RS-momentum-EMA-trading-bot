@@ -21,11 +21,18 @@ from typing import Iterator, Sequence
 from core.pit_optimization_contract import (
     AuthorizationRequirement,
     AuthorArtifact,
+    AuthorInput,
     CriticArtifact,
+    CriticInput,
     InvestigatorArtifact,
+    InvestigatorInput,
     OPTIMIZER_V2_ROLES,
+    PatchBounds,
     PitOptimizerCallBudget,
     PitOptimizerRunManifest,
+    PolicySourceBundle,
+    PolicySourceRecord,
+    authenticate_policy_source_bundle,
 )
 import core.pit_optimization_contract as _contract
 
@@ -423,6 +430,51 @@ class PitOptimizerRoleCall:
             raise ValueError("optimizer role call requires accepted provider facts")
 
 
+@dataclass(frozen=True, slots=True)
+class AuthenticatedRoleInputSnapshot:
+    """One controller-originated role input, closed over its exact wire bytes."""
+
+    role: str
+    iteration: int
+    canonical_bytes: bytes
+    expected_hypothesis_id: str | None = None
+    source_bundle: PolicySourceBundle | None = None
+    candidate_bounds: PatchBounds | None = None
+
+    def validate_artifact(
+        self,
+        artifact: InvestigatorArtifact | AuthorArtifact | CriticArtifact,
+    ) -> None:
+        """Validate response relationships only against the authenticated snapshot."""
+
+        expected_type = {
+            "investigator": InvestigatorArtifact,
+            "author": AuthorArtifact,
+            "critic": CriticArtifact,
+        }[self.role]
+        if not isinstance(artifact, expected_type):
+            raise ValueError("optimizer response has an invalid type")
+        if self.role == "author":
+            assert isinstance(artifact, AuthorArtifact)
+            if artifact.hypothesis_id != self.expected_hypothesis_id:
+                raise ValueError("author hypothesis differs from investigator")
+            assert self.source_bundle is not None
+            assert self.candidate_bounds is not None
+            _resulting_texts, stats = _contract._apply_unified_diff(
+                {record.path: record.text for record in self.source_bundle.files},
+                artifact.unified_diff,
+                bounds=self.candidate_bounds,
+            )
+            if stats.paths != artifact.changed_paths:
+                raise ValueError(
+                    "author changed paths differ from candidate unified diff"
+                )
+        elif self.role == "critic":
+            assert isinstance(artifact, CriticArtifact)
+            if artifact.hypothesis_id != self.expected_hypothesis_id:
+                raise ValueError("critic hypothesis differs from its input")
+
+
 def require_authorized_policy_source_scope(
     manifest: PitOptimizerRunManifest,
     requirement: AuthorizationRequirement,
@@ -495,6 +547,13 @@ class AuthorizationLedger:
         self._path = candidate.resolve()
         self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
         self._manifest = manifest
+        # Strong references make object identity a bounded, live controller
+        # capability.  Reopening the ledger intentionally loses these
+        # process-local capabilities and therefore fails closed.
+        self._role_input_capabilities: dict[
+            int,
+            tuple[object, int, bytes],
+        ] = {}
         with _authorization_file_lock(self._lock_path):
             self._read_records()
 
@@ -503,6 +562,185 @@ class AuthorizationLedger:
         """Return the immutable manifest authenticated by this ledger instance."""
 
         return self._manifest
+
+    def _snapshot_role_input(
+        self,
+        dynamic_input: object,
+        plan: PitOptimizerCallBudget,
+    ) -> AuthenticatedRoleInputSnapshot:
+        """Capture first, then authenticate provenance from those exact bytes."""
+
+        expected_types = {
+            "investigator": InvestigatorInput,
+            "author": AuthorInput,
+            "critic": CriticInput,
+        }
+        if (
+            not isinstance(plan, PitOptimizerCallBudget)
+            or not isinstance(dynamic_input, expected_types.get(plan.role, ()))
+        ):
+            raise AuthorizationError("optimizer role input contract is invalid")
+        try:
+            canonical_bytes = dynamic_input.canonical_json_bytes()
+            primitive = json.loads(
+                canonical_bytes,
+                object_pairs_hook=_reject_duplicate_keys,
+            )
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AuthorizationError("optimizer role input snapshot is invalid") from exc
+        if (
+            not isinstance(primitive, dict)
+            or canonical_bytes
+            != json.dumps(
+                primitive,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ):
+            raise AuthorizationError("optimizer role input snapshot is not canonical")
+        if (
+            primitive.get("schema_version") != 2
+            or primitive.get("iteration") != plan.iteration
+            or primitive.get("run_manifest_sha256") != self._manifest.sha256
+            or primitive.get("immutable_constraint_ids")
+            != list(self._manifest.immutable_constraint_ids)
+        ):
+            raise AuthorizationError("optimizer role input differs from run manifest")
+
+        source_bundle: PolicySourceBundle | None = None
+        candidate_bounds: PatchBounds | None = None
+        expected_hypothesis_id: str | None = None
+        if plan.role in {"investigator", "author"}:
+            if (
+                primitive.get("policy_interface_version")
+                != self._manifest.policy_interface_version
+                or primitive.get("candidate_bounds")
+                != self._manifest.candidate_bounds.to_primitive()
+            ):
+                raise AuthorizationError(
+                    "optimizer source input differs from run manifest"
+                )
+            source = primitive.get("source_bundle")
+            try:
+                if not isinstance(source, dict) or set(source) != {
+                    "policy_interface_version",
+                    "cumulative_diff_sha256",
+                    "cumulative_diff",
+                    "files",
+                }:
+                    raise ValueError("policy source snapshot keys are invalid")
+                files = source.get("files")
+                if not isinstance(files, list):
+                    raise ValueError("policy source snapshot files are invalid")
+                source_records: list[PolicySourceRecord] = []
+                for item in files:
+                    if not isinstance(item, dict) or set(item) != {
+                        "path",
+                        "sha256",
+                        "declared_symbols",
+                        "text",
+                    }:
+                        raise ValueError("policy source record snapshot is invalid")
+                    declared_symbols = item.get("declared_symbols")
+                    if not isinstance(declared_symbols, list):
+                        raise ValueError("policy source symbols snapshot is invalid")
+                    source_records.append(
+                        PolicySourceRecord(
+                            path=item.get("path"),
+                            sha256=item.get("sha256"),
+                            declared_symbols=tuple(declared_symbols),
+                            text=item.get("text"),
+                        )
+                    )
+                source_bundle = PolicySourceBundle(
+                    policy_interface_version=source.get(
+                        "policy_interface_version"
+                    ),
+                    cumulative_diff_sha256=source.get(
+                        "cumulative_diff_sha256"
+                    ),
+                    cumulative_diff=source.get("cumulative_diff"),
+                    files=tuple(source_records),
+                    _controller_seal=_contract._POLICY_SOURCE_BUNDLE_SEAL,
+                )
+                if source_bundle.to_primitive() != source:
+                    raise ValueError("policy source snapshot differs after rebuild")
+                authenticate_policy_source_bundle(
+                    scope=self._manifest.policy_source_scope,
+                    bundle=source_bundle,
+                )
+                bounds = primitive.get("candidate_bounds")
+                if not isinstance(bounds, dict):
+                    raise ValueError("candidate bounds snapshot is invalid")
+                candidate_bounds = PatchBounds(**bounds)
+            except (TypeError, ValueError) as exc:
+                raise AuthorizationError(
+                    "policy source bundle differs from authorized scope"
+                ) from exc
+            if plan.role == "author":
+                investigator = primitive.get("investigator")
+                if not isinstance(investigator, dict):
+                    raise AuthorizationError(
+                        "optimizer author input provenance is invalid"
+                    )
+                expected_hypothesis_id = investigator.get("hypothesis_id")
+        elif plan.role == "critic":
+            expected_hypothesis_id = primitive.get("hypothesis_id")
+
+        if expected_hypothesis_id is not None and not isinstance(
+            expected_hypothesis_id, str
+        ):
+            raise AuthorizationError("optimizer role input provenance is invalid")
+        return AuthenticatedRoleInputSnapshot(
+            role=plan.role,
+            iteration=plan.iteration,
+            canonical_bytes=canonical_bytes,
+            expected_hypothesis_id=expected_hypothesis_id,
+            source_bundle=source_bundle,
+            candidate_bounds=candidate_bounds,
+        )
+
+    def bind_controller_role_input(
+        self,
+        dynamic_input: object,
+        plan: PitOptimizerCallBudget,
+    ) -> AuthenticatedRoleInputSnapshot:
+        """Register the exact live object produced by the trusted controller."""
+
+        snapshot = self._snapshot_role_input(dynamic_input, plan)
+        key = id(dynamic_input)
+        prior = self._role_input_capabilities.get(key)
+        capability = (dynamic_input, plan.call_index, snapshot.canonical_bytes)
+        if prior is not None and prior != capability:
+            raise AuthorizationError("optimizer role input capability changed")
+        if prior is None and len(self._role_input_capabilities) >= len(
+            self._manifest.call_budgets
+        ):
+            raise AuthorizationError("optimizer role input capabilities are exhausted")
+        self._role_input_capabilities[key] = capability
+        return snapshot
+
+    def capture_controller_role_input(
+        self,
+        dynamic_input: object,
+        plan: PitOptimizerCallBudget,
+    ) -> AuthenticatedRoleInputSnapshot:
+        """Reauthenticate an exact snapshot against a live controller capability."""
+
+        snapshot = self._snapshot_role_input(dynamic_input, plan)
+        capability = self._role_input_capabilities.get(id(dynamic_input))
+        if (
+            capability is None
+            or capability[0] is not dynamic_input
+            or capability[1] != plan.call_index
+            or capability[2] != snapshot.canonical_bytes
+        ):
+            raise AuthorizationError(
+                "optimizer role input provenance is not controller authenticated"
+            )
+        return snapshot
 
     @staticmethod
     def _record_digest(record: dict[str, object]) -> str:
@@ -657,8 +895,20 @@ class AuthorizationLedger:
                     "charged_usd",
                     "charge_basis",
                 }
-                if set(value) != expected:
+                if frozenset(value) not in {
+                    frozenset(expected),
+                    frozenset(expected | {"terminal_audit_sha256"}),
+                }:
                     raise AuthorizationError("authorization reconciliation keys are invalid")
+                terminal_audit_sha256 = value.get("terminal_audit_sha256")
+                if terminal_audit_sha256 is not None:
+                    try:
+                        _require_digest(
+                            terminal_audit_sha256,
+                            "authorization terminal audit SHA-256",
+                        )
+                    except ValueError as exc:
+                        raise AuthorizationError(str(exc)) from exc
                 reservation_id = value.get("reservation_id")
                 match = next(
                     (
@@ -1277,6 +1527,78 @@ class AuthorizationLedger:
         }
 
     @staticmethod
+    def _terminal_code_for_reconciliation(
+        provider_facts: PitOptimizerProviderFacts,
+        requested_terminal_code: str | None,
+    ) -> str | None:
+        if requested_terminal_code not in {
+            None,
+            "failed",
+            "cancelled",
+            "budget_exhausted",
+        }:
+            raise AuthorizationError(
+                "authorization reconciliation terminal code is invalid"
+            )
+        if requested_terminal_code is not None:
+            return requested_terminal_code
+        if provider_facts.outcome == "accepted":
+            return None
+        if provider_facts.outcome == "budget_exceeded":
+            return "budget_exhausted"
+        return "failed"
+
+    @classmethod
+    def _verify_reconciliation_records(
+        cls,
+        records: Sequence[dict[str, object]],
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+        terminal_audit_sha256: str,
+        terminal_code: str | None,
+    ) -> None:
+        reconciliation = next(
+            (
+                item
+                for item in records
+                if item.get("record_type") == "reconciliation"
+                and item.get("reservation_id") == reservation.reservation_id
+            ),
+            None,
+        )
+        if (
+            reconciliation is None
+            or reconciliation.get("provider_facts") != asdict(provider_facts)
+            or reconciliation.get("terminal_audit_sha256")
+            != terminal_audit_sha256
+        ):
+            raise AuthorizationError(
+                "authorization reconciliation postcondition is absent"
+            )
+        expected_close = cls._terminal_code_for_reconciliation(
+            provider_facts,
+            terminal_code,
+        )
+        close = next(
+            (
+                item
+                for item in records
+                if item.get("record_type") == "lease_close"
+                and item.get("lease_id") == reservation.lease_id
+            ),
+            None,
+        )
+        if expected_close is None:
+            if close is not None:
+                raise AuthorizationError(
+                    "authorization accepted reconciliation was terminally closed"
+                )
+        elif close is None or close.get("terminal_code") != expected_close:
+            raise AuthorizationError(
+                "authorization terminal reconciliation is not closed"
+            )
+
+    @staticmethod
     def _charged_totals(
         records: Sequence[dict[str, object]],
         reservation_records: Sequence[dict[str, object]],
@@ -1331,6 +1653,20 @@ class AuthorizationLedger:
                 raise AuthorizationError("authorization lease is closed")
             reservations = self._reservation_records(records, lease.lease_id)
             reconciled = self._reconciled_ids(records)
+            reservation_ids = {
+                str(item["reservation"].get("reservation_id"))
+                for item in reservations
+            }
+            if any(
+                item.get("record_type") == "reconciliation"
+                and item.get("reservation_id") in reservation_ids
+                and isinstance(item.get("provider_facts"), dict)
+                and item["provider_facts"].get("outcome") != "accepted"
+                for item in records
+            ):
+                raise AuthorizationError(
+                    "authorization lease has a terminal reconciliation"
+                )
             if any(
                 item["reservation"].get("reservation_id") not in reconciled
                 for item in reservations
@@ -1372,13 +1708,27 @@ class AuthorizationLedger:
         self,
         reservation: AuthorizationCallReservation,
         provider_facts: PitOptimizerProviderFacts,
+        *,
+        terminal_audit_sha256: str,
+        terminal_code: str | None = None,
     ) -> None:
-        """Replace one reservation with authoritative or conservatively retained usage."""
+        """Publish reconciliation and any terminal lease close as one transaction."""
 
         if not isinstance(reservation, AuthorizationCallReservation) or not isinstance(
             provider_facts, PitOptimizerProviderFacts
         ):
             raise AuthorizationError("authorization reconciliation contracts are invalid")
+        try:
+            _require_digest(
+                terminal_audit_sha256,
+                "authorization terminal audit SHA-256",
+            )
+        except ValueError as exc:
+            raise AuthorizationError(str(exc)) from exc
+        effective_terminal_code = self._terminal_code_for_reconciliation(
+            provider_facts,
+            terminal_code,
+        )
         overage = False
         with _authorization_file_lock(self._lock_path):
             records = self._read_records()
@@ -1410,11 +1760,48 @@ class AuthorizationLedger:
                     if item.get("record_type") == "reconciliation"
                     and item.get("reservation_id") == reservation.reservation_id
                 )
-                if existing.get("provider_facts") == asdict(provider_facts):
-                    return
-                raise AuthorizationError(
-                    "authorization reservation reconciliation differs from prior facts"
+                if (
+                    existing.get("provider_facts") != asdict(provider_facts)
+                    or existing.get("terminal_audit_sha256")
+                    != terminal_audit_sha256
+                ):
+                    raise AuthorizationError(
+                        "authorization reservation reconciliation differs "
+                        "from prior facts"
+                    )
+                prior_close = next(
+                    (
+                        item
+                        for item in records
+                        if item.get("record_type") == "lease_close"
+                        and item.get("lease_id") == reservation.lease_id
+                    ),
+                    None,
                 )
+                if effective_terminal_code is not None and prior_close is None:
+                    if provider_facts.outcome != "accepted":
+                        raise AuthorizationError(
+                            "authorization terminal reconciliation is not closed"
+                        )
+                    self._append_records(
+                        records,
+                        [
+                            {
+                                "record_type": "lease_close",
+                                "lease_id": reservation.lease_id,
+                                "terminal_code": effective_terminal_code,
+                            }
+                        ],
+                    )
+                    return
+                self._verify_reconciliation_records(
+                    records,
+                    reservation,
+                    provider_facts,
+                    terminal_audit_sha256,
+                    terminal_code,
+                )
+                return
             lease_record = next(
                 item
                 for item in records
@@ -1481,9 +1868,8 @@ class AuthorizationLedger:
                 "charged_tokens": charged_tokens,
                 "charged_usd": float(charged_usd),
                 "charge_basis": charge_basis,
+                "terminal_audit_sha256": terminal_audit_sha256,
             }
-            self._append_records(records, [primitive])
-
             reservations = self._reservation_records(records, lease.lease_id)
             prior_calls, prior_tokens, prior_usd = self._charged_totals(
                 records,
@@ -1496,8 +1882,38 @@ class AuthorizationLedger:
                 or prior_tokens + charged_tokens > lease.max_tokens
                 or prior_usd + charged_usd > Decimal(str(lease.max_usd))
             )
+            primitives = [primitive]
+            if effective_terminal_code is not None:
+                primitives.append(
+                    {
+                        "record_type": "lease_close",
+                        "lease_id": lease.lease_id,
+                        "terminal_code": effective_terminal_code,
+                    }
+                )
+            self._append_records(records, primitives)
         if overage:
             raise AuthorizationError("authoritative provider overage was committed")
+
+    def verify_reconciliation(
+        self,
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+        *,
+        terminal_audit_sha256: str,
+        terminal_code: str | None = None,
+    ) -> None:
+        """Verify the exact durable postcondition after an interrupted publication."""
+
+        with _authorization_file_lock(self._lock_path):
+            records = self._read_records()
+            self._verify_reconciliation_records(
+                records,
+                reservation,
+                provider_facts,
+                terminal_audit_sha256,
+                terminal_code,
+            )
 
     def recover_active_reservation(
         self,
