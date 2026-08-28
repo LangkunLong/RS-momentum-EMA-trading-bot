@@ -17,6 +17,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from core.engine_policy import effective_engine_policy_sha256
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
     DiscoveryExposureProof,
@@ -1255,9 +1256,7 @@ def build_subset_manifest(
     effective_policy = legacy_readiness.get("effective_policy")
     if not isinstance(effective_policy, Mapping):
         raise ValueError("legacy readiness effective policy is absent")
-    effective_policy_sha256 = hashlib.sha256(
-        _canonical_mapping_bytes(effective_policy)
-    ).hexdigest()
+    effective_policy_sha256 = effective_engine_policy_sha256(effective_policy)
     if identities.get("effective_policy_sha256") != effective_policy_sha256:
         raise ValueError("legacy readiness effective policy identity differs")
 

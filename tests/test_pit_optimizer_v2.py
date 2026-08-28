@@ -27,6 +27,7 @@ import pytest
 
 import core.pit_optimization_contract as contract
 import core.pit_optimizer_evaluation as evaluation
+from core.engine_policy import effective_engine_policy_sha256
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
     FoldAggregateSummary,
@@ -1857,7 +1858,7 @@ def _builder_fixture(
     (baseline_run / "run_manifest.json").write_bytes(baseline_bytes)
     baseline_sha256 = hashlib.sha256(baseline_bytes).hexdigest()
     policy = {"schema_version": 1, "policy": "synthetic"}
-    effective_policy_sha256 = hashlib.sha256(_canonical_file_bytes(policy)).hexdigest()
+    effective_policy_sha256 = effective_engine_policy_sha256(policy)
     constraint_ids = ["causal_only", "no_external_io"]
     readiness = {
         "schema_version": 1,
@@ -2428,6 +2429,41 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
                 "candidate_bounds": contract.PatchBounds(3, 12, 80, 32 * 1024),
             }
         )
+
+
+def test_manifest_builder_accepts_engine_policy_digest_and_rejects_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a serialized-readiness newline must not alter engine policy identity."""
+    inputs, _expected = _builder_fixture(tmp_path)
+    _patch_authenticated_readiness(monkeypatch, inputs)
+    readiness = inputs["legacy_readiness"]
+    assert isinstance(readiness, dict)
+    policy = readiness["effective_policy"]
+    assert isinstance(policy, dict)
+    policy_digest = effective_engine_policy_sha256(policy)
+
+    manifest = contract.build_subset_manifest(**inputs)
+
+    assert manifest.effective_policy_sha256 == policy_digest
+
+    mismatched = dict(readiness)
+    mismatched_identities = dict(mismatched["identities"])
+    mismatched_identities["effective_policy_sha256"] = "0" * 64
+    mismatched["identities"] = mismatched_identities
+    mismatched_path = tmp_path / "mismatched-readiness.json"
+    mismatched_bytes = _canonical_file_bytes(mismatched)
+    mismatched_path.write_bytes(mismatched_bytes)
+    mismatched_inputs = {
+        **inputs,
+        "legacy_readiness": mismatched,
+        "legacy_readiness_path": mismatched_path,
+    }
+    _patch_authenticated_readiness(monkeypatch, mismatched_inputs)
+
+    with pytest.raises(ValueError, match="effective policy identity differs"):
+        contract.build_subset_manifest(**mismatched_inputs)
 
 
 def test_build_subset_manifest_cli_is_exact_and_provider_free(
