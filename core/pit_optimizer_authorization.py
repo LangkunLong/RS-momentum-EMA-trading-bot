@@ -2795,9 +2795,8 @@ class AuthorizationLedger:
             return "budget_exhausted"
         return "failed"
 
-    @classmethod
     def _verify_reconciliation_records(
-        cls,
+        self,
         records: Sequence[dict[str, object]],
         reservation: AuthorizationCallReservation,
         provider_facts: PitOptimizerProviderFacts,
@@ -2828,7 +2827,7 @@ class AuthorizationLedger:
             raise AuthorizationError(
                 "authorization reconciliation postcondition is absent"
             )
-        expected_close = cls._terminal_code_for_reconciliation(
+        expected_close = self._terminal_code_for_reconciliation(
             provider_facts,
             terminal_code,
         )
@@ -2843,9 +2842,128 @@ class AuthorizationLedger:
         )
         if expected_close is None:
             if close is not None:
-                raise AuthorizationError(
-                    "authorization accepted reconciliation was terminally closed"
+                # A lease close belongs to the lease's terminal
+                # reconciliation, not to every earlier accepted call. Validate
+                # the close when this reconciliation is the final one; earlier
+                # accepted calls remain valid evidence for a later failed,
+                # early-stop, or completed lease transition.
+                reservation_ids = {
+                    str(item["reservation"]["reservation_id"])
+                    for item in records
+                    if item.get("record_type") == "reservation"
+                    and isinstance(item.get("reservation"), dict)
+                    and item["reservation"].get("lease_id")
+                    == reservation.lease_id
+                }
+                current_index = next(
+                    (
+                        index
+                        for index, item in enumerate(records)
+                        if item.get("record_type") == "reconciliation"
+                        and item.get("reservation_id")
+                        == reservation.reservation_id
+                    ),
+                    None,
                 )
+                if current_index is None:
+                    raise AuthorizationError(
+                        "authorization reconciliation postcondition is absent"
+                    )
+                if any(
+                    index > current_index
+                    and item.get("record_type") == "reconciliation"
+                    and item.get("reservation_id") in reservation_ids
+                    for index, item in enumerate(records)
+                ):
+                    return
+
+                close_code = close.get("terminal_code")
+                if close_code not in {"completed", "early_stop"}:
+                    raise AuthorizationError(
+                        "authorization accepted reconciliation was terminally closed"
+                    )
+                lease_reconciliations: list[
+                    tuple[AuthorizationCallReservation, PitOptimizerProviderFacts]
+                ] = []
+                for item in records:
+                    if (
+                        item.get("record_type") != "reconciliation"
+                        or item.get("reservation_id") not in reservation_ids
+                    ):
+                        continue
+                    reservation_record = next(
+                        (
+                            candidate
+                            for candidate in records
+                            if candidate.get("record_type") == "reservation"
+                            and isinstance(candidate.get("reservation"), dict)
+                            and candidate["reservation"].get("reservation_id")
+                            == item.get("reservation_id")
+                        ),
+                        None,
+                    )
+                    facts_primitive = item.get("provider_facts")
+                    if not isinstance(reservation_record, dict) or not isinstance(
+                        facts_primitive, dict
+                    ):
+                        raise AuthorizationError(
+                            "authorization reconciliation evidence is malformed"
+                        )
+                    try:
+                        lease_reservation = AuthorizationCallReservation(
+                            **reservation_record["reservation"]
+                        )
+                        lease_facts = PitOptimizerProviderFacts(**facts_primitive)
+                    except (TypeError, ValueError) as exc:
+                        raise AuthorizationError(
+                            "authorization reconciliation evidence is invalid"
+                        ) from exc
+                    lease_reconciliations.append((lease_reservation, lease_facts))
+                expected_plans = self._call_plan_snapshots
+                if not lease_reconciliations or any(
+                    facts.outcome != "accepted"
+                    for _lease_reservation, facts in lease_reconciliations
+                ):
+                    raise AuthorizationError(
+                        "authorization accepted reconciliation close has a non-accepted prefix"
+                    )
+                if close_code == "completed":
+                    if len(lease_reconciliations) != len(expected_plans):
+                        raise AuthorizationError(
+                            "authorization completed lease has an incomplete call plan"
+                        )
+                elif not 0 < len(lease_reconciliations) < len(expected_plans):
+                    raise AuthorizationError(
+                        "authorization early-stop lease has an invalid call prefix"
+                    )
+                for offset, (lease_reservation, lease_facts) in enumerate(
+                    lease_reconciliations
+                ):
+                    if offset >= len(expected_plans):
+                        raise AuthorizationError(
+                            "authorization lease call plan has excess calls"
+                        )
+                    expected_plan = expected_plans[offset]
+                    if (
+                        lease_reservation.call_index,
+                        lease_reservation.iteration,
+                        lease_reservation.role,
+                    ) != (
+                        expected_plan.call_index,
+                        expected_plan.iteration,
+                        expected_plan.role,
+                    ) or (
+                        lease_facts.call_index,
+                        lease_facts.iteration,
+                        lease_facts.role,
+                    ) != (
+                        expected_plan.call_index,
+                        expected_plan.iteration,
+                        expected_plan.role,
+                    ):
+                        raise AuthorizationError(
+                            "authorization lease call order differs"
+                        )
         elif close is None or close.get("terminal_code") != expected_close:
             raise AuthorizationError(
                 "authorization terminal reconciliation is not closed"
