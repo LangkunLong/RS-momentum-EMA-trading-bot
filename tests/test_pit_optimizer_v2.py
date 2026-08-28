@@ -3240,6 +3240,8 @@ def _task5_entry_source(body: str, *, prelude: str = "") -> str:
         (_task5_entry_source("cache = []\ncache = math\ncache.pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
         (_task5_entry_source("cache = []\ncache = EntryDecision\ncache.to_primitive = _helper\nreturn EntryDecision(True, True, (None, None), ())", prelude="\ndef _helper():\n    return None\n"), "mutation root"),
         (_task5_entry_source("cache = [math]\ncache[0].pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
+        (_task5_entry_source("cache = [[]]\ncache[0].append(True)\nreturn EntryDecision(True, True, (None, None), ())"), "attribute call"),
+        (_task5_entry_source("cache = []\ncache.member.append(True)\nreturn EntryDecision(True, True, (None, None), ())"), "attribute call"),
         (_task5_entry_source("value = getattr(snapshot, 'market_is_bullish')\nreturn EntryDecision(value, True, (None, None), ())"), "reflection"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport time\n"), "import"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport random\n"), "import"),

@@ -4596,6 +4596,10 @@ def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseExcepti
             )
             if not isinstance(result, ProcessResult):
                 raise SandboxError("policy daemon control result is invalid")
+            if result.timed_out or result.returncode != 0:
+                errors.append(
+                    SandboxError(f"policy daemon {args[0]} action failed")
+                )
             return result
         except BaseException as exc:
             errors.append(exc)
@@ -4612,8 +4616,6 @@ def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseExcepti
         "--no-trunc",
         "--filter",
         f"id={daemon.container_id}",
-        "--filter",
-        f"label=pit-policy.owner={daemon.owner_token}",
     )
     if (
         absence is None
@@ -4632,7 +4634,8 @@ def _record_policy_secondary_errors(
 ) -> None:
     for error in errors:
         primary.add_note(
-            f"policy daemon {phase} secondary failure: {type(error).__name__}"
+            "policy daemon "
+            f"{phase} secondary failure: {type(error).__name__}: {error}"
         )
 
 
@@ -4801,8 +4804,13 @@ class PolicyWorkerSession:
                 _remove_private_tree(temporary_root)
         except BaseException as exc:
             errors.append(exc)
-        if errors and primary_error is None:
-            raise SandboxError("policy worker cleanup could not be fully verified") from errors[0]
+        if errors:
+            if primary_error is not None:
+                _record_policy_secondary_errors(primary_error, "cleanup", errors)
+            else:
+                raise SandboxError(
+                    "policy worker cleanup could not be fully verified"
+                ) from errors[0]
 
 
 class PolicyWorkerRunner:

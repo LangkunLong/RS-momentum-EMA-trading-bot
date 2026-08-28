@@ -369,24 +369,31 @@ class _Task5FakeDockerControl:
         *,
         failures: dict[str, BaseException] | None = None,
         failures_on_call: dict[tuple[str, int], BaseException] | None = None,
+        nonzero_operations: frozenset[str] = frozenset(),
+        timed_out_operations: frozenset[str] = frozenset(),
         fail_after_create: bool = False,
         raise_after_create: BaseException | None = None,
         create_output: str | None = None,
         tamper_inspect: bool = False,
+        stored_owner_mismatch: bool = False,
     ) -> None:
         self.container_id = "c" * 64
         self.calls: list[tuple[str, ...]] = []
         self.exists = False
         self.name = ""
         self.owner = ""
+        self.stored_owner = ""
         self.image = ""
         self.failures = failures or {}
         self.failures_on_call = failures_on_call or {}
         self.operation_counts: dict[str, int] = {}
+        self.nonzero_operations = nonzero_operations
+        self.timed_out_operations = timed_out_operations
         self.fail_after_create = fail_after_create
         self.raise_after_create = raise_after_create
         self.create_output = create_output
         self.tamper_inspect = tamper_inspect
+        self.stored_owner_mismatch = stored_owner_mismatch
 
     def __call__(self, argv: tuple[str, ...], **_kwargs: object) -> object:
         from agent_loop import ProcessResult
@@ -402,9 +409,29 @@ class _Task5FakeDockerControl:
             raise occurrence_failure
         if operation in self.failures:
             raise self.failures[operation]
+        if operation in self.nonzero_operations:
+            return ProcessResult(
+                1,
+                "",
+                f"{operation} failed",
+                hashlib.sha256(b"").hexdigest(),
+                hashlib.sha256(f"{operation} failed".encode("utf-8")).hexdigest(),
+            )
+        if operation in self.timed_out_operations:
+            return ProcessResult(
+                -9,
+                "",
+                f"{operation} timed out",
+                hashlib.sha256(b"").hexdigest(),
+                hashlib.sha256(f"{operation} timed out".encode("utf-8")).hexdigest(),
+                timed_out=True,
+            )
         if operation == "create":
             self.name = args[args.index("--name") + 1]
             self.owner = args[args.index("--label") + 1].split("=", 1)[1]
+            self.stored_owner = (
+                "0" * 64 if self.stored_owner_mismatch else self.owner
+            )
             self.image = args[-5]
             self.exists = True
             if self.raise_after_create is not None:
@@ -430,6 +457,8 @@ class _Task5FakeDockerControl:
                                 "Labels": {
                                     "pit-policy.owner": (
                                         "0" * 64 if self.tamper_inspect else self.owner
+                                        if not self.stored_owner_mismatch
+                                        else self.stored_owner
                                     )
                                 },
                             },
@@ -441,7 +470,25 @@ class _Task5FakeDockerControl:
             self.exists = False
             return ProcessResult.ok()
         if operation == "container":
-            return ProcessResult.ok(self.container_id + "\n" if self.exists else "")
+            matches = self.exists
+            filters = (
+                args[index + 1]
+                for index, value in enumerate(args[:-1])
+                if value == "--filter"
+            )
+            for value in filters:
+                if value.startswith("id="):
+                    matches = matches and value.removeprefix("id=") == self.container_id
+                elif value.startswith("label=pit-policy.owner="):
+                    matches = matches and value.removeprefix(
+                        "label=pit-policy.owner="
+                    ) == self.stored_owner
+                elif value.startswith("name=^/"):
+                    matches = matches and re.fullmatch(
+                        value.removeprefix("name="),
+                        "/" + self.name,
+                    ) is not None
+            return ProcessResult.ok(self.container_id + "\n" if matches else "")
         return ProcessResult.ok()
 
 
@@ -489,6 +536,69 @@ def _task5_authenticated_capacity_process() -> _Task5FakeProcess:
     return process
 
 
+def _task5_executing_candidate_process(package_root: Path) -> _Task5FakeProcess:
+    from core.strategy_policy.worker import (
+        WorkerBootstrap,
+        decode_policy_request,
+        encode_policy_response,
+        initial_chain_sha256,
+    )
+
+    dispatch: dict[str, Any] = {}
+    exports = {
+        "entry.py": ("evaluate_entry",),
+        "risk.py": (
+            "recommend_capacity",
+            "recommend_allocation",
+            "select_eviction",
+        ),
+        "exit.py": ("evaluate_exit",),
+    }
+    for name, symbols in exports.items():
+        path = package_root / "core" / "strategy_policy" / name
+        namespace: dict[str, Any] = {
+            "__name__": f"task5_isolated_{name.removesuffix('.py')}",
+            "__package__": "core.strategy_policy",
+        }
+        exec(compile(path.read_bytes(), str(path), "exec"), namespace)
+        dispatch.update({symbol: namespace[symbol] for symbol in symbols})
+
+    process = _Task5FakeProcess()
+    state: dict[str, object] = {"sequence": 1}
+
+    def respond(value: bytes) -> None:
+        raw = value.decode("utf-8").rstrip("\n")
+        if "bootstrap" not in state:
+            bootstrap = WorkerBootstrap.from_json(raw)
+            state["bootstrap"] = bootstrap
+            state["previous"] = initial_chain_sha256(bootstrap)
+            return
+        bootstrap = state["bootstrap"]
+        sequence = state["sequence"]
+        assert isinstance(bootstrap, WorkerBootstrap)
+        assert isinstance(sequence, int)
+        request, snapshot = decode_policy_request(
+            raw,
+            bootstrap=bootstrap,
+            expected_sequence=sequence,
+            expected_previous_hmac_sha256=str(state["previous"]),
+        )
+        decision = dispatch[request.method](snapshot)
+        line, _response = encode_policy_response(
+            bootstrap=bootstrap,
+            sequence=sequence,
+            request_hmac_sha256=request.hmac_sha256,
+            method=request.method,
+            decision=decision,
+        )
+        state["previous"] = request.hmac_sha256
+        state["sequence"] = sequence + 1
+        process.stdout.values.put(line.encode("utf-8") + b"\n")
+
+    process.stdin.callback = respond
+    return process
+
+
 def _task5_policy_candidate(tmp_path: Path) -> Path:
     source = Path(__file__).parents[1] / "core" / "strategy_policy"
     candidate = tmp_path / "candidate"
@@ -499,6 +609,54 @@ def _task5_policy_candidate(tmp_path: Path) -> Path:
     (candidate / "credentials.env").write_text("TOKEN=forbidden\n", encoding="utf-8")
     (candidate / "pit.sqlite3").write_bytes(b"sealed-data")
     return candidate
+
+
+@pytest.mark.parametrize("operation", ("kill", "wait", "rm"))
+@pytest.mark.parametrize("failure_kind", ("nonzero", "timeout"))
+def test_policy_daemon_cleanup_checks_status_and_exact_id(
+    operation: str,
+    failure_kind: str,
+) -> None:
+    """Break caught: a label-filtered query hid a known full-ID daemon after rm failed."""
+    from agent_loop import (
+        SandboxError,
+        _OwnedPolicyDaemon,
+        _cleanup_owned_policy_daemon,
+    )
+
+    control = _Task5FakeDockerControl(
+        nonzero_operations=(
+            frozenset({operation}) if failure_kind == "nonzero" else frozenset()
+        ),
+        timed_out_operations=(
+            frozenset({operation}) if failure_kind == "timeout" else frozenset()
+        ),
+    )
+    control.exists = True
+    control.name = "pit-policy-direct"
+    control.owner = "a" * 64
+    control.stored_owner = "0" * 64
+    control.image = "example.invalid/policy@sha256:" + "b" * 64
+    daemon = _OwnedPolicyDaemon(
+        engine_path=Path("C:/fake/docker.exe"),
+        control_runner=control,
+        environment={},
+        container_id=control.container_id,
+        container_name=control.name,
+        owner_token=control.owner,
+        image=control.image,
+    )
+
+    errors = _cleanup_owned_policy_daemon(daemon)
+
+    assert control.exists is (operation == "rm")
+    assert all(isinstance(error, SandboxError) for error in errors)
+    assert any(operation in str(error) for error in errors)
+    assert any("absence" in str(error) for error in errors) is (operation == "rm")
+    absence_query = control.calls[-1]
+    assert f"id={control.container_id}" in absence_query
+    assert not any("label=" in value for value in absence_query)
+    control.exists = False
 
 
 def _task5_create_directory_link(target: Path, link: Path) -> None:
@@ -976,11 +1134,23 @@ def test_policy_worker_cleanup_faults_preserve_primary_and_attempt_every_owner_a
     monkeypatch.setattr(session._stdout_thread, "join", stdout_join)
     monkeypatch.setattr(agent_loop, "_remove_private_tree", remove_then_fail)
 
-    with pytest.raises(ValueError, match="fields"):
+    with pytest.raises(ValueError, match="fields") as captured:
         session.call(
             "recommend_capacity",
             CapacitySnapshot(None, 25, 0, 3, 1.0, False),
         )
+    notes = getattr(captured.value, "__notes__", ())
+    for evidence in (
+        "stdin close fault",
+        "terminate fault",
+        "wait fault",
+        "kill fault",
+        "stdout close fault",
+        "stderr close fault",
+        "thread join fault",
+        "private removal fault",
+    ):
+        assert any(evidence in note for note in notes)
     assert local_actions == [
         "stdin",
         "terminate",
@@ -1000,6 +1170,110 @@ def test_policy_worker_cleanup_faults_preserve_primary_and_attempt_every_owner_a
     ]
     assert not control.exists
     assert not package_parent.exists()
+
+
+def test_policy_worker_protocol_primary_retains_unverified_daemon_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Break caught: malformed protocol hid rm/absence failures behind its primary."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+
+    control = _Task5FakeDockerControl()
+    process = _Task5FakeProcess()
+    writes = 0
+
+    def malformed_after_bootstrap(_value: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            process.stdout.values.put(b"{}\n")
+
+    process.stdin.callback = malformed_after_bootstrap
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id="protocol_cleanup_evidence",
+    )
+    control.nonzero_operations = frozenset({"rm"})
+
+    with pytest.raises(ValueError, match="fields") as captured:
+        session.call(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        )
+
+    notes = getattr(captured.value, "__notes__", ())
+    assert any("rm" in note for note in notes)
+    assert any("absence" in note for note in notes)
+    assert control.exists
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert not tuple(tmp_path.glob("pw-*"))
+    control.exists = False
+
+
+def test_policy_worker_cancellation_retains_unverified_daemon_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Break caught: BaseException cleanup failures disappeared during cancellation."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+
+    control = _Task5FakeDockerControl()
+    process = _Task5FakeProcess()
+    writes = 0
+
+    def cancel_after_bootstrap(_value: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            raise KeyboardInterrupt("cancel primary")
+
+    process.stdin.callback = cancel_after_bootstrap
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id="cancel_cleanup_evidence",
+    )
+    control.nonzero_operations = frozenset({"rm"})
+
+    with pytest.raises(KeyboardInterrupt, match="cancel primary") as captured:
+        session.call(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        )
+
+    notes = getattr(captured.value, "__notes__", ())
+    assert any("rm" in note for note in notes)
+    assert any("absence" in note for note in notes)
+    assert control.exists
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert not tuple(tmp_path.glob("pw-*"))
+    control.exists = False
 
 
 def test_policy_worker_cancellation_cleans_local_and_daemon_owners(
@@ -1472,6 +1746,56 @@ def test_policy_worker_rejects_tampered_daemon_identity_before_attach_and_cleans
     assert not tuple(tmp_path.glob("pw-*"))
 
 
+def test_policy_worker_tampered_identity_primary_retains_live_daemon_evidence(
+    tmp_path: Path,
+) -> None:
+    """Break caught: label mismatch plus nonzero rm falsely proved full-ID absence."""
+    from agent_loop import PolicyWorkerRunner, ProcessResult, SandboxError
+
+    control = _Task5FakeDockerControl(
+        nonzero_operations=frozenset({"rm"}),
+        stored_owner_mismatch=True,
+    )
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+
+    with pytest.raises(SandboxError, match="identity or ownership") as captured:
+        runner.start(
+            candidate_root=_task5_policy_candidate(tmp_path),
+            interface_version=1,
+            fold_run_id="tampered_live",
+        )
+
+    notes = getattr(captured.value, "__notes__", ())
+    assert any("rm" in note for note in notes)
+    assert any("absence" in note for note in notes)
+    cleanup_query = control.calls[-1]
+    assert f"id={control.container_id}" in cleanup_query
+    assert not any("label=" in value for value in cleanup_query)
+    observable = control(
+        (
+            "C:/fake/docker.exe",
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            f"id={control.container_id}",
+        )
+    )
+    assert isinstance(observable, ProcessResult)
+    assert observable.stdout.strip() == control.container_id
+    assert control.exists
+    assert not tuple(tmp_path.glob("pw-*"))
+    control.exists = False
+
+
 def test_policy_worker_client_factory_starts_one_authenticated_session_per_fold(
     tmp_path: Path,
 ) -> None:
@@ -1571,6 +1895,73 @@ def test_policy_worker_client_factory_starts_one_authenticated_session_per_fold(
     assert second_decision == first_decision
     assert second_decision.to_canonical_json() == first_decision.to_canonical_json()
     second.close()
+    assert len(processes) == 2
+    assert all(process.terminated == 1 for process in processes)
+
+
+def test_policy_worker_two_fresh_runtimes_execute_same_candidate_policy(
+    tmp_path: Path,
+) -> None:
+    """Break caught: cross-worker equality used a hard-coded decision, not candidate code."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacityDecision, CapacitySnapshot
+    from core.strategy_policy.worker import PolicyDeterminismProbe
+
+    candidate = _task5_policy_candidate(tmp_path)
+    risk = candidate / "core" / "strategy_policy" / "risk.py"
+    risk.write_text(
+        risk.read_text("utf-8").replace(
+            "max_positions=snapshot.configured_max_positions,",
+            (
+                "max_positions=(3 if snapshot.configured_max_positions "
+                "is not None else None),"
+            ),
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    processes: list[_Task5FakeProcess] = []
+    control = _Task5FakeDockerControl()
+
+    def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
+        create = next(call for call in reversed(control.calls) if call[1] == "create")
+        mount = create[create.index("--mount") + 1]
+        package_root = Path(mount.split(",src=", 1)[1].split(",dst=", 1)[0])
+        process = _task5_executing_candidate_process(package_root)
+        processes.append(process)
+        return process
+
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=process_factory,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    snapshot = CapacitySnapshot(7, 25, 2, 1, 0.5, True)
+    unrelated = CapacitySnapshot(None, 25, 0, 3, 1.0, False)
+    decisions = []
+    for fold_run_id in ("candidate_runtime_1", "candidate_runtime_2"):
+        client = runner.client_factory(
+            candidate_root=candidate,
+            interface_version=1,
+            fold_run_id=fold_run_id,
+            determinism_probes=(
+                PolicyDeterminismProbe(
+                    "recommend_capacity",
+                    snapshot,
+                    unrelated,
+                ),
+            ),
+        )()
+        decisions.append(client.recommend_capacity(snapshot))
+        client.close()
+
+    assert decisions == [
+        CapacityDecision(3, True),
+        CapacityDecision(3, True),
+    ]
+    assert decisions[0].to_canonical_json() == decisions[1].to_canonical_json()
     assert len(processes) == 2
     assert all(process.terminated == 1 for process in processes)
 

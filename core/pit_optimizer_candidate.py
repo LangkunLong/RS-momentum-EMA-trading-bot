@@ -425,7 +425,11 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                 if root == "math":
                     if not imported_math or node.func.attr.startswith("_"):
                         raise ValueError("policy math call is outside the allowlist")
-                elif node.func.attr == "append" and root in call_appendables:
+                elif (
+                    node.func.attr == "append"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in call_appendables
+                ):
                     continue
                 else:
                     raise ValueError("policy attribute call is outside the allowlist")
