@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
 import re
 from itertools import pairwise
+from typing import Iterator
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_CLOSED_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+_EXPOSURE_KINDS = {
+    "candidate_validation",
+    "provider_context",
+    "hidden_validation",
+}
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -156,3 +167,551 @@ class FoldAggregateSummary:
             ids = tuple(metric.metric_id for metric in metrics)
             if len(set(ids)) != len(ids):
                 raise ValueError(f"{name} metric IDs must be unique")
+
+
+_OBJECTIVE_QUANTUM = Decimal("0.01")
+
+
+def _objective_decimal(value: object, label: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise ValueError(f"{label} must be numeric")
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError(f"{label} must be numeric") from exc
+    if not number.is_finite():
+        raise ValueError(f"{label} must be finite")
+    return number.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryScore:
+    median_excess_return_pp: Decimal
+    worst_excess_return_pp: Decimal
+    max_drawdown_magnitude_pp: Decimal
+
+    def __post_init__(self) -> None:
+        for name in (
+            "median_excess_return_pp",
+            "worst_excess_return_pp",
+            "max_drawdown_magnitude_pp",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite():
+                raise ValueError(f"{name} must be a finite Decimal")
+            if value != value.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN):
+                raise ValueError(f"{name} must be quantized to 0.01")
+        if self.max_drawdown_magnitude_pp < 0:
+            raise ValueError("max_drawdown_magnitude_pp cannot be negative")
+
+    @property
+    def ordering_key(self) -> tuple[Decimal, Decimal, Decimal]:
+        return (
+            self.median_excess_return_pp,
+            self.worst_excess_return_pp,
+            -self.max_drawdown_magnitude_pp,
+        )
+
+
+def discovery_score_from_folds(
+    folds: tuple[FoldAggregateSummary, ...],
+) -> DiscoveryScore:
+    if (
+        type(folds) is not tuple
+        or len(folds) != 2
+        or any(not isinstance(item, FoldAggregateSummary) for item in folds)
+    ):
+        raise ValueError("discovery objective requires exactly two fold summaries")
+    if len({item.fold_id for item in folds}) != 2 or any(
+        not item.fold_id.startswith("discovery_") for item in folds
+    ):
+        raise ValueError("discovery objective fold identities are invalid")
+    if any(item.closed_trades < 1 for item in folds):
+        raise ValueError("each fold requires at least one closed discovery trade")
+    if any(item.excess_total_return_pp is None for item in folds):
+        raise ValueError("discovery objective requires fixed-baseline excess return")
+    excess = tuple(
+        _objective_decimal(item.excess_total_return_pp, "fold excess return")
+        for item in folds
+    )
+    ordered = tuple(sorted(excess))
+    median = ((ordered[0] + ordered[1]) / Decimal(2)).quantize(
+        _OBJECTIVE_QUANTUM,
+        rounding=ROUND_HALF_EVEN,
+    )
+    drawdowns = tuple(
+        _objective_decimal(
+            abs(min(Decimal(str(item.max_drawdown_pct)), Decimal(0))),
+            "fold drawdown magnitude",
+        )
+        for item in folds
+    )
+    return DiscoveryScore(
+        median_excess_return_pp=median,
+        worst_excess_return_pp=ordered[0],
+        max_drawdown_magnitude_pp=max(drawdowns),
+    )
+
+
+def strictly_improves_discovery(
+    candidate: DiscoveryScore,
+    incumbent: DiscoveryScore,
+) -> bool:
+    if not isinstance(candidate, DiscoveryScore) or not isinstance(
+        incumbent, DiscoveryScore
+    ):
+        raise ValueError("discovery comparison requires closed scores")
+    return candidate.ordering_key > incumbent.ordering_key
+
+
+@dataclass(frozen=True, slots=True)
+class HoldoutDecision:
+    excess_total_return_pp: Decimal
+    closed_trades: int
+    safety_complete: bool
+    integrity_complete: bool
+    accounting_complete: bool
+    long_replay_eligible: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.excess_total_return_pp, Decimal)
+            or not self.excess_total_return_pp.is_finite()
+            or self.excess_total_return_pp
+            != self.excess_total_return_pp.quantize(
+                _OBJECTIVE_QUANTUM,
+                rounding=ROUND_HALF_EVEN,
+            )
+        ):
+            raise ValueError("holdout excess return must be a quantized finite Decimal")
+        if type(self.closed_trades) is not int or self.closed_trades < 0:
+            raise ValueError("holdout closed trades are invalid")
+        for name in (
+            "safety_complete",
+            "integrity_complete",
+            "accounting_complete",
+            "long_replay_eligible",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"holdout {name} must be boolean")
+        expected = (
+            self.excess_total_return_pp >= Decimal("0.10")
+            and self.closed_trades >= 3
+            and self.safety_complete
+            and self.integrity_complete
+            and self.accounting_complete
+        )
+        if self.long_replay_eligible is not expected:
+            raise ValueError("holdout eligibility differs from the closed gate")
+
+    @classmethod
+    def from_result(
+        cls,
+        *,
+        excess_total_return_pp: float | int | Decimal,
+        closed_trades: int,
+        safety_complete: bool,
+        integrity_complete: bool,
+        accounting_complete: bool,
+    ) -> "HoldoutDecision":
+        excess = _objective_decimal(
+            excess_total_return_pp,
+            "holdout excess return",
+        )
+        eligible = (
+            excess >= Decimal("0.10")
+            and type(closed_trades) is int
+            and closed_trades >= 3
+            and safety_complete is True
+            and integrity_complete is True
+            and accounting_complete is True
+        )
+        return cls(
+            excess_total_return_pp=excess,
+            closed_trades=closed_trades,
+            safety_complete=safety_complete,
+            integrity_complete=integrity_complete,
+            accounting_complete=accounting_complete,
+            long_replay_eligible=eligible,
+        )
+
+
+def _require_digest(value: object, label: str) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _require_closed_id(value: object, label: str) -> str:
+    if not isinstance(value, str) or _CLOSED_ID_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationWindowIdentity:
+    pit_bundle_sha256: str
+    universe_sha256: str
+    benchmark: str
+    warmup_contract_sha256: str
+    sessions_sha256: str
+    session_count: int
+    first_session: str
+    last_session: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "pit_bundle_sha256",
+            "universe_sha256",
+            "warmup_contract_sha256",
+            "sessions_sha256",
+        ):
+            _require_digest(getattr(self, name), f"validation {name}")
+        if (
+            not isinstance(self.benchmark, str)
+            or not self.benchmark
+            or self.benchmark != self.benchmark.upper()
+        ):
+            raise ValueError("validation benchmark is invalid")
+        if type(self.session_count) is not int or self.session_count <= 0:
+            raise ValueError("validation session count is invalid")
+        first = _date(self.first_session, "validation first session")
+        last = _date(self.last_session, "validation last session")
+        if first > last:
+            raise ValueError("validation session bounds are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationExposureMetadata:
+    run_id: str
+    source_head: str
+    baseline_policy_sha256: str
+    candidate_identity_sha256: str | None
+    exposure_kind: str
+
+    def __post_init__(self) -> None:
+        _require_closed_id(self.run_id, "validation run ID")
+        if not isinstance(self.source_head, str) or re.fullmatch(
+            r"[0-9a-f]{40}", self.source_head
+        ) is None:
+            raise ValueError("validation source HEAD is invalid")
+        _require_digest(
+            self.baseline_policy_sha256,
+            "validation baseline policy SHA-256",
+        )
+        if self.candidate_identity_sha256 is not None:
+            _require_digest(
+                self.candidate_identity_sha256,
+                "validation candidate identity SHA-256",
+            )
+        if self.exposure_kind not in _EXPOSURE_KINDS:
+            raise ValueError("validation exposure kind is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationReservation:
+    consumption_key_sha256: str
+    reservation_record_sha256: str
+
+    def __post_init__(self) -> None:
+        _require_digest(
+            self.consumption_key_sha256,
+            "validation consumption key SHA-256",
+        )
+        _require_digest(
+            self.reservation_record_sha256,
+            "validation reservation record SHA-256",
+        )
+
+
+def _reject_duplicate_record_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("validation ledger contains duplicate JSON keys")
+        value[key] = item
+    return value
+
+
+@contextmanager
+def _validation_file_lock(path: Path) -> Iterator[None]:
+    with path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class ValidationLedger:
+    """Permanent, hash-chained consumption ledger for validation windows."""
+
+    def __init__(self, path: Path) -> None:
+        candidate = Path(path)
+        if (
+            not candidate.is_absolute()
+            or candidate.name != "pit_optimizer_validation_ledger.jsonl"
+            or not candidate.parent.is_dir()
+            or candidate.parent.is_symlink()
+            or candidate.is_symlink()
+        ):
+            raise ValueError("validation ledger path is invalid")
+        self._path = candidate.resolve()
+        self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        with _validation_file_lock(self._lock_path):
+            self._read_records()
+
+    @staticmethod
+    def _consumption_key(identity: ValidationWindowIdentity) -> str:
+        return hashlib.sha256(_canonical_json_bytes(asdict(identity))).hexdigest()
+
+    @staticmethod
+    def _record_digest(record: dict[str, object]) -> str:
+        preimage = dict(record)
+        preimage.pop("record_sha256", None)
+        return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
+
+    def _read_records(self) -> list[dict[str, object]]:
+        if not self._path.exists():
+            return []
+        if self._path.is_symlink() or not self._path.is_file():
+            raise ValueError("validation ledger must be a regular non-link file")
+        raw = self._path.read_bytes()
+        if raw and not raw.endswith(b"\n"):
+            raise ValueError("validation ledger has a partial record")
+        records: list[dict[str, object]] = []
+        previous = "0" * 64
+        consumed: set[str] = set()
+        reservations: set[str] = set()
+        outcomes: set[str] = set()
+        for index, line in enumerate(raw.splitlines(keepends=True), start=1):
+            try:
+                value = json.loads(
+                    line,
+                    object_pairs_hook=_reject_duplicate_record_keys,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError("validation ledger contains invalid JSON") from exc
+            if not isinstance(value, dict) or line != _canonical_json_bytes(value):
+                raise ValueError("validation ledger record is not canonical JSON")
+            if value.get("schema_version") != 2 or value.get("record_index") != index:
+                raise ValueError("validation ledger record index is invalid")
+            if value.get("previous_record_sha256") != previous:
+                raise ValueError("validation ledger hash chain is broken")
+            record_sha256 = value.get("record_sha256")
+            _require_digest(record_sha256, "validation ledger record SHA-256")
+            if record_sha256 != self._record_digest(value):
+                raise ValueError("validation ledger record digest differs")
+            record_type = value.get("record_type")
+            if record_type == "consumption":
+                expected_keys = {
+                    "schema_version",
+                    "record_type",
+                    "record_index",
+                    "previous_record_sha256",
+                    "consumption_key_sha256",
+                    "identity",
+                    "metadata",
+                    "record_sha256",
+                }
+                if set(value) != expected_keys:
+                    raise ValueError("validation consumption record keys are invalid")
+                key = value.get("consumption_key_sha256")
+                _require_digest(key, "validation consumption key SHA-256")
+                if key in consumed:
+                    raise ValueError("validation ledger repeats a consumed identity")
+                identity = value.get("identity")
+                metadata = value.get("metadata")
+                if not isinstance(identity, dict) or not isinstance(metadata, dict):
+                    raise ValueError("validation consumption record is malformed")
+                closed_identity = ValidationWindowIdentity(**identity)
+                ValidationExposureMetadata(**metadata)
+                if key != self._consumption_key(closed_identity):
+                    raise ValueError("validation consumption key differs from identity")
+                consumed.add(key)
+                reservations.add(str(record_sha256))
+            elif record_type == "outcome":
+                expected_keys = {
+                    "schema_version",
+                    "record_type",
+                    "record_index",
+                    "previous_record_sha256",
+                    "reservation_record_sha256",
+                    "attempted",
+                    "completed",
+                    "failure_code",
+                    "record_sha256",
+                }
+                if set(value) != expected_keys:
+                    raise ValueError("validation outcome record keys are invalid")
+                reservation = value.get("reservation_record_sha256")
+                if reservation not in reservations or reservation in outcomes:
+                    raise ValueError("validation outcome reservation is invalid")
+                self._validate_outcome_fields(
+                    attempted=value.get("attempted"),
+                    completed=value.get("completed"),
+                    failure_code=value.get("failure_code"),
+                )
+                outcomes.add(str(reservation))
+            else:
+                raise ValueError("validation ledger record type is invalid")
+            previous = str(record_sha256)
+            records.append(value)
+        return records
+
+    @staticmethod
+    def _validate_outcome_fields(
+        *,
+        attempted: object,
+        completed: object,
+        failure_code: object,
+    ) -> None:
+        if type(attempted) is not bool or type(completed) is not bool:
+            raise ValueError("validation outcome flags must be boolean")
+        if completed and not attempted:
+            raise ValueError("completed validation must have been attempted")
+        if completed:
+            if failure_code is not None:
+                raise ValueError("completed validation cannot have a failure code")
+        else:
+            _require_closed_id(failure_code, "validation outcome failure code")
+
+    def _append_record(
+        self,
+        records: list[dict[str, object]],
+        primitive: dict[str, object],
+    ) -> dict[str, object]:
+        record = {
+            "schema_version": 2,
+            "record_index": len(records) + 1,
+            "previous_record_sha256": (
+                "0" * 64 if not records else records[-1]["record_sha256"]
+            ),
+            **primitive,
+        }
+        record["record_sha256"] = self._record_digest(record)
+        payload = _canonical_json_bytes(record)
+        with self._path.open("ab") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return record
+
+    def _reserve(
+        self,
+        identity: ValidationWindowIdentity,
+        metadata: ValidationExposureMetadata,
+    ) -> ValidationReservation:
+        if not isinstance(identity, ValidationWindowIdentity) or not isinstance(
+            metadata, ValidationExposureMetadata
+        ):
+            raise ValueError("validation reservation requires closed contracts")
+        key = self._consumption_key(identity)
+        with _validation_file_lock(self._lock_path):
+            records = self._read_records()
+            if any(
+                record.get("record_type") == "consumption"
+                and record.get("consumption_key_sha256") == key
+                for record in records
+            ):
+                raise ValueError("validation window identity is permanently consumed")
+            record = self._append_record(
+                records,
+                {
+                    "record_type": "consumption",
+                    "consumption_key_sha256": key,
+                    "identity": asdict(identity),
+                    "metadata": asdict(metadata),
+                },
+            )
+        return ValidationReservation(key, str(record["record_sha256"]))
+
+    def mark_discovery(
+        self,
+        identity: ValidationWindowIdentity,
+        metadata: ValidationExposureMetadata,
+    ) -> ValidationReservation:
+        if not isinstance(metadata, ValidationExposureMetadata) or metadata.exposure_kind not in {
+            "candidate_validation",
+            "provider_context",
+        }:
+            raise ValueError("discovery exposure kind is invalid")
+        return self._reserve(identity, metadata)
+
+    def reserve_hidden(
+        self,
+        identity: ValidationWindowIdentity,
+        metadata: ValidationExposureMetadata,
+    ) -> ValidationReservation:
+        if not isinstance(metadata, ValidationExposureMetadata) or metadata.exposure_kind != "hidden_validation":
+            raise ValueError("hidden exposure kind is invalid")
+        return self._reserve(identity, metadata)
+
+    def record_outcome(
+        self,
+        reservation: ValidationReservation,
+        *,
+        attempted: bool,
+        completed: bool,
+        failure_code: str | None,
+    ) -> None:
+        if not isinstance(reservation, ValidationReservation):
+            raise ValueError("validation outcome requires a closed reservation")
+        self._validate_outcome_fields(
+            attempted=attempted,
+            completed=completed,
+            failure_code=failure_code,
+        )
+        with _validation_file_lock(self._lock_path):
+            records = self._read_records()
+            consumption = next(
+                (
+                    record
+                    for record in records
+                    if record.get("record_type") == "consumption"
+                    and record.get("record_sha256")
+                    == reservation.reservation_record_sha256
+                    and record.get("consumption_key_sha256")
+                    == reservation.consumption_key_sha256
+                ),
+                None,
+            )
+            if consumption is None:
+                raise ValueError("validation reservation is not present in this ledger")
+            if any(
+                record.get("record_type") == "outcome"
+                and record.get("reservation_record_sha256")
+                == reservation.reservation_record_sha256
+                for record in records
+            ):
+                raise ValueError("validation reservation outcome is already recorded")
+            self._append_record(
+                records,
+                {
+                    "record_type": "outcome",
+                    "reservation_record_sha256": reservation.reservation_record_sha256,
+                    "attempted": attempted,
+                    "completed": completed,
+                    "failure_code": failure_code,
+                },
+            )
