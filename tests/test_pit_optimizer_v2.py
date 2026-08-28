@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict, fields, replace
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
+import difflib
 from itertools import product
 from pathlib import Path
 import sqlite3
 import string
+import subprocess
+import threading
 
 import pytest
 
@@ -106,7 +110,14 @@ def _author_payload() -> dict[str, object]:
         "behavioral_summary": "Require a stronger entry confirmation.",
         "changed_paths": ["core/strategy_policy/entry.py"],
         "changed_symbols": ["core.strategy_policy.entry.evaluate_entry"],
-        "unified_diff": "--- a/core/strategy_policy/entry.py\n+++ b/core/strategy_policy/entry.py\n",
+        "unified_diff": (
+            "--- a/core/strategy_policy/entry.py\n"
+            "+++ b/core/strategy_policy/entry.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def evaluate_entry(snapshot):\n"
+            "-    return None\n"
+            "+    return True\n"
+        ),
         "assumptions": ["The aggregate funnel is causal."],
         "validation_suggestions": ["Run the focused entry checks."],
     }
@@ -225,21 +236,226 @@ def _source_bundle() -> contract.PolicySourceBundle:
             "def evaluate_exit(snapshot):\n    return None\n",
         ),
     )
-    records = tuple(
-        contract.PolicySourceRecord(
-            path=path,
-            sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            declared_symbols=(symbol,) if isinstance(symbol, str) else symbol,
-            text=text,
-        )
-        for path, symbol, text in sources
+    source_texts = {path: text for path, _symbol, text in sources}
+    source_sha256s = tuple(
+        (path, hashlib.sha256(text.encode("utf-8")).hexdigest())
+        for path, text in source_texts.items()
     )
-    return contract.PolicySourceBundle(
+    scope = contract.PolicySourceScope(
+        schema_version=2,
         policy_interface_version=1,
-        cumulative_diff_sha256=hashlib.sha256(b"").hexdigest(),
-        cumulative_diff="",
-        files=records,
+        initial_policy_source_sha256s=source_sha256s,
+        editable_paths=tuple(source_texts),
+        max_policy_source_bundle_bytes=64 * 1024,
+        max_iteration_feedback_bytes=4 * 1024,
+        max_iteration_history_bytes=32 * 1024,
+        hard_patch_bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+        candidate_bounds=contract.PatchBounds(3, 12, 80, 8 * 1024),
+        max_iterations=2,
+        allowed_descendant_rule=(
+            "authenticated_initial_sources_plus_validated_cumulative_diff"
+        ),
     )
+    return contract.initial_policy_source_bundle(
+        scope=scope,
+        source_texts=source_texts,
+    )
+
+
+def _source_scope(
+    bundle: contract.PolicySourceBundle,
+    *,
+    bounds: contract.PatchBounds | None = None,
+    bundle_cap: int = 64 * 1024,
+) -> contract.PolicySourceScope:
+    candidate_bounds = bounds or contract.PatchBounds(3, 12, 80, 8 * 1024)
+    return contract.PolicySourceScope(
+        schema_version=2,
+        policy_interface_version=bundle.policy_interface_version,
+        initial_policy_source_sha256s=tuple(
+            (record.path, record.sha256) for record in bundle.files
+        ),
+        editable_paths=tuple(record.path for record in bundle.files),
+        max_policy_source_bundle_bytes=bundle_cap,
+        max_iteration_feedback_bytes=4 * 1024,
+        max_iteration_history_bytes=32 * 1024,
+        hard_patch_bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+        candidate_bounds=candidate_bounds,
+        max_iterations=2,
+        allowed_descendant_rule=(
+            "authenticated_initial_sources_plus_validated_cumulative_diff"
+        ),
+    )
+
+
+def _diff_for_changes(
+    bundle: contract.PolicySourceBundle,
+    changes: dict[str, str],
+    *,
+    context: int = 3,
+) -> str:
+    by_path = {record.path: record.text for record in bundle.files}
+    return "".join(
+        line
+        for path in tuple(record.path for record in bundle.files)
+        if path in changes
+        for line in difflib.unified_diff(
+            by_path[path].splitlines(keepends=True),
+            changes[path].splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            n=context,
+            lineterm="\n",
+        )
+    )
+
+
+def _artifact_for_diff(diff: str, paths: tuple[str, ...]) -> contract.AuthorArtifact:
+    symbols = tuple(
+        {
+            "core/strategy_policy/entry.py": "core.strategy_policy.entry.evaluate_entry",
+            "core/strategy_policy/risk.py": "core.strategy_policy.risk.recommend_capacity",
+            "core/strategy_policy/exit.py": "core.strategy_policy.exit.evaluate_exit",
+        }[path]
+        for path in paths
+    )
+    return contract.AuthorArtifact.from_json(
+        _canonical_text(
+            {
+                **_author_payload(),
+                "changed_paths": list(paths),
+                "changed_symbols": list(symbols),
+                "unified_diff": diff,
+            }
+        ),
+        max_diff_bytes=64 * 1024,
+        max_total_bytes=72 * 1024,
+    )
+
+
+def test_controller_materializes_only_bounds_valid_source_descendants() -> None:
+    """Break caught: arbitrary source text or an over-bound patch could reach a role."""
+    initial = _source_bundle()
+    scope = _source_scope(initial)
+    initial = contract.initial_policy_source_bundle(
+        scope=scope,
+        source_texts={record.path: record.text for record in initial.files},
+    )
+    entry_path = "core/strategy_policy/entry.py"
+    risk_path = "core/strategy_policy/risk.py"
+    entry_text = initial.files[0].text.replace("return None", "return True")
+    valid_diff = _diff_for_changes(initial, {entry_path: entry_text})
+    valid = contract.materialize_policy_source_descendant(
+        scope=scope,
+        initial_bundle=initial,
+        current_bundle=initial,
+        artifact=_artifact_for_diff(valid_diff, (entry_path,)),
+    )
+    assert valid.validation.failure_code is None
+    assert valid.bundle is not None
+    contract.validate_policy_source_bundle_descendant(
+        scope=scope,
+        initial_bundle=initial,
+        bundle=valid.bundle,
+    )
+
+    arbitrary_record = replace(
+        initial.files[0],
+        text="arbitrary provider source\n",
+        sha256=hashlib.sha256(b"arbitrary provider source\n").hexdigest(),
+    )
+    with pytest.raises(ValueError, match="controller derived"):
+        replace(
+            valid.bundle,
+            files=(arbitrary_record, *initial.files[1:]),
+        )
+
+    risk_text = initial.files[1].text.replace("return 1", "return 2")
+    two_file_diff = _diff_for_changes(
+        initial,
+        {entry_path: entry_text, risk_path: risk_text},
+    )
+    with pytest.raises(ValueError, match="max_files"):
+        contract.materialize_policy_source_descendant(
+            scope=replace(
+                scope,
+                candidate_bounds=contract.PatchBounds(1, 12, 80, 8 * 1024),
+            ),
+            initial_bundle=initial,
+            current_bundle=initial,
+            artifact=_artifact_for_diff(two_file_diff, (entry_path, risk_path)),
+        )
+
+    five_lines = "a\nb\nc\nd\ne\n"
+    expanded_initial_texts = {
+        record.path: (five_lines if record.path == entry_path else record.text)
+        for record in initial.files
+    }
+    expanded_hashes = tuple(
+        (path, hashlib.sha256(text.encode("utf-8")).hexdigest())
+        for path, text in expanded_initial_texts.items()
+    )
+    expanded_scope = replace(scope, initial_policy_source_sha256s=expanded_hashes)
+    expanded_initial = contract.initial_policy_source_bundle(
+        scope=expanded_scope,
+        source_texts=expanded_initial_texts,
+    )
+    two_hunk_text = "A\nb\nc\nd\nE\n"
+    two_hunk_diff = _diff_for_changes(
+        expanded_initial,
+        {entry_path: two_hunk_text},
+        context=0,
+    )
+    with pytest.raises(ValueError, match="max_hunks"):
+        contract.materialize_policy_source_descendant(
+            scope=replace(
+                expanded_scope,
+                candidate_bounds=contract.PatchBounds(3, 1, 80, 8 * 1024),
+            ),
+            initial_bundle=expanded_initial,
+            current_bundle=expanded_initial,
+            artifact=_artifact_for_diff(two_hunk_diff, (entry_path,)),
+        )
+    with pytest.raises(ValueError, match="max_changed_lines"):
+        contract.materialize_policy_source_descendant(
+            scope=replace(
+                expanded_scope,
+                candidate_bounds=contract.PatchBounds(3, 12, 3, 8 * 1024),
+            ),
+            initial_bundle=expanded_initial,
+            current_bundle=expanded_initial,
+            artifact=_artifact_for_diff(two_hunk_diff, (entry_path,)),
+        )
+    with pytest.raises(ValueError, match="max_diff_bytes"):
+        contract.materialize_policy_source_descendant(
+            scope=replace(
+                expanded_scope,
+                candidate_bounds=contract.PatchBounds(
+                    3,
+                    12,
+                    80,
+                    len(two_hunk_diff.encode("utf-8")) - 1,
+                ),
+            ),
+            initial_bundle=expanded_initial,
+            current_bundle=expanded_initial,
+            artifact=_artifact_for_diff(two_hunk_diff, (entry_path,)),
+        )
+
+    overflow_scope = replace(
+        scope,
+        max_policy_source_bundle_bytes=len(initial.canonical_json_bytes()) + 32,
+    )
+    overflow_text = initial.files[0].text.replace("return None", "return " + "1" * 256)
+    overflow_diff = _diff_for_changes(initial, {entry_path: overflow_text})
+    overflow = contract.materialize_policy_source_descendant(
+        scope=overflow_scope,
+        initial_bundle=initial,
+        current_bundle=initial,
+        artifact=_artifact_for_diff(overflow_diff, (entry_path,)),
+    )
+    assert overflow.bundle is None
+    assert overflow.validation.failure_code == "next_context_oversize"
 
 
 def _fold_summary(fold_id: str, excess: float) -> FoldAggregateSummary:
@@ -257,6 +473,12 @@ def _fold_summary(fold_id: str, excess: float) -> FoldAggregateSummary:
     )
 
 
+def _aggregate_sha256(folds: tuple[FoldAggregateSummary, ...]) -> str:
+    return hashlib.sha256(
+        (_canonical_text([asdict(item) for item in folds]) + "\n").encode("utf-8")
+    ).hexdigest()
+
+
 def _discovery_summary() -> contract.DiscoveryEvidenceSummary:
     return contract.DiscoveryEvidenceSummary(
         folds=(
@@ -268,6 +490,82 @@ def _discovery_summary() -> contract.DiscoveryEvidenceSummary:
     )
 
 
+def _discovery_exposure_proof(tmp_path: Path) -> evaluation.DiscoveryExposureProof:
+    ledger = evaluation.ValidationLedger(
+        tmp_path / "pit_optimizer_validation_ledger.jsonl"
+    )
+    manifest = _fold_manifest()
+    metadata = evaluation.ValidationExposureMetadata(
+        run_id="run_1",
+        source_head="1" * 40,
+        baseline_policy_sha256="d" * 64,
+        candidate_identity_sha256=None,
+        exposure_kind="provider_context",
+    )
+    reservations = tuple(
+        ledger.mark_discovery(_validation_identity(fold, fold.fold_id), metadata)
+        for fold in manifest.discovery_folds
+    )
+    return ledger.seal_discovery_folds(manifest, reservations)
+
+
+def test_candidate_comparison_structurally_rejects_hidden_fold_identity(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a caller could serialize hidden validation evidence for a role."""
+    baseline = (
+        _fold_summary("discovery_1", 0.0),
+        _fold_summary("discovery_2", 0.0),
+    )
+    baseline_sha256 = _aggregate_sha256(baseline)
+    with pytest.raises(ValueError, match="ledger exposure"):
+        contract.candidate_comparison_from_fixed_baseline(
+            candidate_folds=(
+                _fold_summary("discovery_1", 0.5),
+                _fold_summary("hidden_1", 99.0),
+            ),
+            original_baseline_folds=baseline,
+            original_baseline_sha256=baseline_sha256,
+            expected_original_baseline_sha256=baseline_sha256,
+            discovery_exposure=_discovery_exposure_proof(tmp_path),
+            diagnostics=(),
+        )
+
+
+def test_candidate_validation_codes_are_closed_and_match_stage_flags() -> None:
+    """Break caught: arbitrary or contradictory failure labels could reach a role."""
+    with pytest.raises(ValueError, match="failure code is not closed"):
+        contract.CandidateValidationSummary(
+            failure_code="invented_failure",
+            syntax_ok=False,
+            imports_ok=False,
+            purity_ok=False,
+            deterministic_ok=False,
+            worker_ok=False,
+            replay_attempted=False,
+        )
+    with pytest.raises(ValueError, match="syntax_failed flags"):
+        contract.CandidateValidationSummary(
+            failure_code="syntax_failed",
+            syntax_ok=True,
+            imports_ok=False,
+            purity_ok=False,
+            deterministic_ok=False,
+            worker_ok=False,
+            replay_attempted=False,
+        )
+    with pytest.raises(ValueError, match="successful validation flags"):
+        contract.CandidateValidationSummary(
+            failure_code=None,
+            syntax_ok=True,
+            imports_ok=True,
+            purity_ok=True,
+            deterministic_ok=True,
+            worker_ok=True,
+            replay_attempted=False,
+        )
+
+
 def _investigator_artifact() -> contract.InvestigatorArtifact:
     return contract.InvestigatorArtifact.from_json(
         _canonical_text(_investigator_payload()),
@@ -275,7 +573,9 @@ def _investigator_artifact() -> contract.InvestigatorArtifact:
     )
 
 
-def test_role_schema_inputs_are_exact_bounded_provider_projections() -> None:
+def test_role_schema_inputs_are_exact_bounded_provider_projections(
+    tmp_path: Path,
+) -> None:
     """Break caught: a role input could admit hidden identity or unbounded prior context."""
     bounds = contract.PatchBounds(3, 12, 80, 8 * 1024)
     discovery = _discovery_summary()
@@ -333,9 +633,17 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections() -> None:
         changed_paths=author_artifact.changed_paths,
         changed_symbols=author_artifact.changed_symbols,
     )
-    comparison = contract.CandidateComparisonSummary(
-        folds=discovery.folds,
-        score=None,
+    original_baseline = (
+        _fold_summary("discovery_1", 0.0),
+        _fold_summary("discovery_2", 0.0),
+    )
+    baseline_sha256 = _aggregate_sha256(original_baseline)
+    comparison = contract.candidate_comparison_from_fixed_baseline(
+        candidate_folds=discovery.folds,
+        original_baseline_folds=original_baseline,
+        original_baseline_sha256=baseline_sha256,
+        expected_original_baseline_sha256=baseline_sha256,
+        discovery_exposure=_discovery_exposure_proof(tmp_path),
         diagnostics=(AggregateMetric("entry_quality_delta", 0.2),),
     )
     critic_input = contract.CriticInput(
@@ -605,6 +913,11 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
         (6, 2, "critic"),
     ]
     assert sum(item.max_input_tokens for item in manifest.call_budgets) == 416_000
+    assert sum(item.max_output_tokens for item in manifest.call_budgets) == 32_000
+    assert sum(
+        item.max_input_tokens + item.max_output_tokens
+        for item in manifest.call_budgets
+    ) == 448_000
     assert manifest.authorization_requirement.max_tokens == 448_000
     assert sum(item.max_usd for item in manifest.call_budgets) == pytest.approx(0.40)
     assert manifest.authorization_requirement.apply is False
@@ -638,6 +951,29 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
         replace(
             manifest.authorization_requirement,
             apply=True,
+        )
+    inflated_output = replace(
+        manifest.call_budgets[0],
+        max_output_tokens=manifest.call_budgets[0].max_output_tokens + 1,
+    )
+    with pytest.raises(ValueError, match="tokens exceed authorization"):
+        replace(manifest, call_budgets=(inflated_output, *manifest.call_budgets[1:]))
+    with pytest.raises(ValueError, match="exactly consume authorization"):
+        replace(
+            manifest,
+            authorization_requirement=replace(
+                manifest.authorization_requirement,
+                max_tokens=448_001,
+            ),
+        )
+    with pytest.raises(ValueError, match="exactly 448000"):
+        replace(
+            manifest,
+            call_budgets=(inflated_output, *manifest.call_budgets[1:]),
+            authorization_requirement=replace(
+                manifest.authorization_requirement,
+                max_tokens=448_001,
+            ),
         )
 
 
@@ -755,10 +1091,19 @@ def _canonical_file_bytes(value: object) -> bytes:
     )
 
 
-def _builder_fixture(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
+def _builder_fixture(
+    tmp_path: Path,
+    *,
+    source_padding: int = 0,
+) -> tuple[dict[str, object], dict[str, object]]:
     source_root = tmp_path / "source"
     source_texts = {
-        "core/strategy_policy/entry.py": "raise RuntimeError('must not import')\ndef evaluate_entry(snapshot):\n    return None\n",
+        "core/strategy_policy/entry.py": (
+            "raise RuntimeError('must not import')\n"
+            "def evaluate_entry(snapshot):\n"
+            "    return None\n"
+            + ("# bounded source padding\n" * source_padding)
+        ),
         "core/strategy_policy/risk.py": "raise RuntimeError('must not import')\ndef recommend_capacity(snapshot):\n    return 1\n",
         "core/strategy_policy/exit.py": "raise RuntimeError('must not import')\ndef evaluate_exit(snapshot):\n    return None\n",
     }
@@ -766,6 +1111,36 @@ def _builder_fixture(tmp_path: Path) -> tuple[dict[str, object], dict[str, objec
         path = source_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(text.encode("utf-8"))
+    for arguments in (
+        ("init",),
+        ("config", "user.name", "Optimizer Contract Test"),
+        ("config", "user.email", "optimizer@example.invalid"),
+        ("add", "."),
+        ("commit", "-m", "synthetic policy source"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=source_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    source_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source_root,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    source_tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--full-tree", "HEAD"],
+        cwd=source_root,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout
+    source_fingerprint = hashlib.sha256(source_tree).hexdigest()
 
     pit_bundle = tmp_path / "pit.sqlite3"
     pit_sha256, universe = _write_pit_bundle(pit_bundle)
@@ -807,8 +1182,6 @@ def _builder_fixture(tmp_path: Path) -> tuple[dict[str, object], dict[str, objec
     baseline_sha256 = hashlib.sha256(baseline_bytes).hexdigest()
     policy = {"schema_version": 1, "policy": "synthetic"}
     effective_policy_sha256 = hashlib.sha256(_canonical_file_bytes(policy)).hexdigest()
-    source_head = "c" * 40
-    source_fingerprint = "d" * 64
     constraint_ids = ["causal_only", "no_external_io"]
     readiness = {
         "schema_version": 1,
@@ -908,11 +1281,32 @@ def _builder_fixture(tmp_path: Path) -> tuple[dict[str, object], dict[str, objec
     return inputs, expected
 
 
+def _patch_authenticated_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    inputs: dict[str, object],
+) -> None:
+    import core.pit_policy_parity as parity
+
+    readiness = inputs["legacy_readiness"]
+    readiness_path = Path(inputs["legacy_readiness_path"])
+    readiness_sha256 = hashlib.sha256(readiness_path.read_bytes()).hexdigest()
+
+    def authenticate(path: Path, *, source_root: Path) -> tuple[dict[str, object], str]:
+        assert Path(path).resolve() == readiness_path.resolve()
+        assert Path(source_root).resolve() == Path(inputs["source_root"]).resolve()
+        assert isinstance(readiness, dict)
+        return readiness, readiness_sha256
+
+    monkeypatch.setattr(parity, "_authenticated_readiness", authenticate)
+
+
 def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Break caught: preparation could execute source or seal a context that cannot fit."""
     inputs, expected = _builder_fixture(tmp_path)
+    _patch_authenticated_readiness(monkeypatch, inputs)
 
     manifest = contract.build_subset_manifest(**inputs)
     second = contract.build_subset_manifest(**inputs)
@@ -976,6 +1370,12 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
     assert manifest.policy_source_sha256s == tuple(
         (record["path"], record["sha256"]) for record in source_records
     )
+    rendered = contract.render_worst_iteration_two_role_inputs(
+        scope=manifest.policy_source_scope,
+        source_texts=expected["source_texts"],
+        immutable_constraint_ids=manifest.immutable_constraint_ids,
+        call_budgets=manifest.call_budgets,
+    )
     for budget in manifest.call_budgets:
         static_bytes = len(
             contract.PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[budget.role].encode("utf-8")
@@ -986,6 +1386,9 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
         )
         assert static_bytes <= budget.max_static_input_bytes
         assert static_bytes + budget.max_dynamic_input_bytes <= budget.max_input_tokens
+        if budget.iteration == 2:
+            assert len(rendered[budget.role]) <= budget.max_dynamic_input_bytes
+            assert static_bytes + len(rendered[budget.role]) <= budget.max_input_tokens
 
     output = tmp_path / "optimizer-manifest.json"
     written, digest = contract.write_optimizer_manifest(manifest, output)
@@ -1004,11 +1407,46 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
         )
 
 
+def test_manifest_builder_rejects_fabricated_non_git_source_identity(
+    tmp_path: Path,
+) -> None:
+    """Break caught: caller-provided source hashes could authorize unrelated file bytes."""
+    inputs, _expected = _builder_fixture(tmp_path)
+    inputs["source_root"] = Path(inputs["source_root"]) / "core"
+
+    with pytest.raises(ValueError, match="Git repository root"):
+        contract.build_subset_manifest(**inputs)
+
+
+def test_manifest_builder_requires_complete_authenticated_v1_readiness(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a caller-selected readiness subset could bypass schema-v1 identity."""
+    inputs, _expected = _builder_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="closed readiness contract"):
+        contract.build_subset_manifest(**inputs)
+
+
+def test_manifest_builder_renders_and_rejects_oversized_iteration_two_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: declared arithmetic could hide an oversized actual role message."""
+    inputs, _expected = _builder_fixture(tmp_path, source_padding=1_750)
+    _patch_authenticated_readiness(monkeypatch, inputs)
+
+    with pytest.raises(ValueError, match="worst iteration-2 investigator"):
+        contract.build_subset_manifest(**inputs)
+
+
 def test_gate_and_prepare_command_authenticate_without_granting_authority(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Break caught: a prepare command could imply spending or use an unauthenticated path."""
     inputs, _expected = _builder_fixture(tmp_path)
+    _patch_authenticated_readiness(monkeypatch, inputs)
     manifest = contract.build_subset_manifest(**inputs)
     manifest_path = tmp_path / "optimizer-manifest.json"
     contract.write_optimizer_manifest(manifest, manifest_path)
@@ -1042,15 +1480,35 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
         replace(gate, apply=True).validate()
     with pytest.raises(ValueError, match="optimizer manifest"):
         replace(gate, optimizer_manifest_sha256="0" * 64).validate()
+    parity_mismatch = replace(manifest, parity_attestation_sha256="8" * 64)
+    parity_mismatch_path = tmp_path / "optimizer-manifest-parity-mismatch.json"
+    contract.write_optimizer_manifest(parity_mismatch, parity_mismatch_path)
+    with pytest.raises(ValueError, match="parity identity differs from manifest"):
+        replace(
+            gate,
+            optimizer_manifest=parity_mismatch_path,
+            optimizer_manifest_sha256=parity_mismatch.sha256,
+        ).validate()
     run_gate = replace(
         gate,
         phase="run",
         readiness_artifact=inputs["legacy_readiness_path"],
         readiness_sha256=manifest.legacy_readiness_sha256,
-        authorization_window_id="window_live",
+        authorization_window_id=manifest.authorization_requirement.window_id,
         source_transmission_authorized=True,
     )
     run_gate.validate()
+    readiness_mismatch = replace(manifest, legacy_readiness_sha256="8" * 64)
+    readiness_mismatch_path = tmp_path / "optimizer-manifest-readiness-mismatch.json"
+    contract.write_optimizer_manifest(readiness_mismatch, readiness_mismatch_path)
+    with pytest.raises(ValueError, match="readiness identity differs from manifest"):
+        replace(
+            run_gate,
+            optimizer_manifest=readiness_mismatch_path,
+            optimizer_manifest_sha256=readiness_mismatch.sha256,
+        ).validate()
+    with pytest.raises(ValueError, match="authorization window"):
+        replace(run_gate, authorization_window_id="window_live").validate()
     with pytest.raises(ValueError, match="apply"):
         replace(run_gate, apply=True).validate()
 
@@ -1107,7 +1565,17 @@ def test_objective_is_quantized_lexicographic_strict_and_trade_eligible() -> Non
         ),
     )
 
-    score = evaluation.discovery_score_from_folds(folds)
+    original_baseline = (
+        _fold_summary("discovery_1", 0.0),
+        _fold_summary("discovery_2", 0.0),
+    )
+    baseline_sha256 = _aggregate_sha256(original_baseline)
+    score = evaluation.discovery_score_from_folds(
+        folds,
+        original_baseline,
+        original_baseline_sha256=baseline_sha256,
+        expected_original_baseline_sha256=baseline_sha256,
+    )
 
     expected_first = Decimal(str(1.235)).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_EVEN
@@ -1136,7 +1604,64 @@ def test_objective_is_quantized_lexicographic_strict_and_trade_eligible() -> Non
     ) is True
     with pytest.raises(ValueError, match="closed discovery trade"):
         evaluation.discovery_score_from_folds(
-            (replace(folds[0], closed_trades=0), folds[1])
+            (replace(folds[0], closed_trades=0), folds[1]),
+            original_baseline,
+            original_baseline_sha256=baseline_sha256,
+            expected_original_baseline_sha256=baseline_sha256,
+        )
+
+
+def test_discovery_objective_derives_excess_from_authenticated_fixed_baseline(
+    tmp_path: Path,
+) -> None:
+    """Break caught: fabricated excess or a substituted incumbent could drive ranking."""
+    candidate = (
+        replace(
+            _fold_summary("discovery_1", 0.0),
+            total_return_pct=2.235,
+            excess_total_return_pp=99.0,
+        ),
+        replace(
+            _fold_summary("discovery_2", 0.0),
+            total_return_pct=1.505,
+            excess_total_return_pp=-99.0,
+        ),
+    )
+    original_baseline = (
+        replace(_fold_summary("discovery_1", 0.0), total_return_pct=1.0),
+        replace(_fold_summary("discovery_2", 0.0), total_return_pct=1.0),
+    )
+    baseline_sha256 = _aggregate_sha256(original_baseline)
+
+    score = evaluation.discovery_score_from_folds(
+        candidate,
+        original_baseline,
+        original_baseline_sha256=baseline_sha256,
+        expected_original_baseline_sha256=baseline_sha256,
+    )
+
+    assert score.median_excess_return_pp == Decimal("0.87")
+    assert score.worst_excess_return_pp == Decimal("0.50")
+    with pytest.raises(ValueError, match="fixed baseline identity"):
+        evaluation.discovery_score_from_folds(
+            candidate,
+            original_baseline,
+            original_baseline_sha256=baseline_sha256,
+            expected_original_baseline_sha256="f" * 64,
+        )
+    with pytest.raises(ValueError, match="supplied score differs"):
+        contract.candidate_comparison_from_fixed_baseline(
+            candidate_folds=candidate,
+            original_baseline_folds=original_baseline,
+            original_baseline_sha256=baseline_sha256,
+            expected_original_baseline_sha256=baseline_sha256,
+            discovery_exposure=_discovery_exposure_proof(tmp_path),
+            diagnostics=(),
+            supplied_score=replace(
+                score,
+                worst_excess_return_pp=score.worst_excess_return_pp
+                + Decimal("0.01"),
+            ),
         )
 
 
@@ -1239,11 +1764,18 @@ def test_validation_ledger_permanently_consumes_identity_before_outcome(
         exposure_kind="hidden_validation",
     )
     hidden_reservation = ledger.reserve_hidden(hidden_identity, hidden_metadata)
+    with pytest.raises(ValueError, match="outcome failure code is not closed"):
+        ledger.record_outcome(
+            hidden_reservation,
+            attempted=True,
+            completed=False,
+            failure_code="invented_failure",
+        )
     ledger.record_outcome(
         hidden_reservation,
         attempted=True,
         completed=False,
-        failure_code="injected_failure",
+        failure_code="worker_failed",
     )
 
     reopened = evaluation.ValidationLedger(ledger_path)
@@ -1275,3 +1807,36 @@ def test_validation_ledger_permanently_consumes_identity_before_outcome(
     assert not {"return", "sharpe", "trades", "holdings", "metrics"}.intersection(
         outcome
     )
+
+
+def test_validation_ledger_atomically_rejects_concurrent_duplicate_reservation(
+    tmp_path: Path,
+) -> None:
+    """Break caught: two controllers could race the same fold past uniqueness."""
+    ledger_path = tmp_path / "pit_optimizer_validation_ledger.jsonl"
+    identity = _validation_identity(_fold_manifest().hidden_fold, "hidden_1")
+    metadata = evaluation.ValidationExposureMetadata(
+        run_id="run_1",
+        source_head="1" * 40,
+        baseline_policy_sha256="d" * 64,
+        candidate_identity_sha256="f" * 64,
+        exposure_kind="hidden_validation",
+    )
+    barrier = threading.Barrier(2)
+
+    def reserve() -> str:
+        ledger = evaluation.ValidationLedger(ledger_path)
+        barrier.wait(timeout=5)
+        try:
+            ledger.reserve_hidden(identity, metadata)
+        except ValueError as exc:
+            return str(exc)
+        return "reserved"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _index: reserve(), range(2)))
+
+    assert results.count("reserved") == 1
+    assert sum("permanently consumed" in result for result in results) == 1
+    records = ledger_path.read_text("utf-8").splitlines()
+    assert len(records) == 1

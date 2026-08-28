@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import difflib
 import json
 import math
 import os
@@ -10,7 +11,7 @@ import re
 import stat
 import subprocess
 import uuid
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import InitVar, dataclass, fields, is_dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -18,9 +19,11 @@ from typing import Mapping
 
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
+    DiscoveryExposureProof,
     DiscoveryScore,
     FoldAggregateSummary,
     FoldManifest,
+    discovery_score_from_folds,
 )
 
 
@@ -46,12 +49,48 @@ MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES = 8 * 1024
 MAX_CRITIC_ARTIFACT_BYTES = 8 * 1024
 MAX_ITERATION_FEEDBACK_BYTES = 4 * 1024
 MAX_ITERATION_HISTORY_BYTES = 32 * 1024
-MAX_INVESTIGATOR_DYNAMIC_BYTES = 112 * 1024
-MAX_AUTHOR_DYNAMIC_BYTES = 96 * 1024
-MAX_CRITIC_DYNAMIC_BYTES = 24 * 1024
+MAX_INVESTIGATOR_DYNAMIC_BYTES = 80_000
+MAX_AUTHOR_DYNAMIC_BYTES = 76_000
+MAX_CRITIC_DYNAMIC_BYTES = 24_000
+MAX_CANDIDATE_COMPARISON_BYTES = 3 * 1024
 
 _INVESTIGATOR_FAMILIES = ("entry", "exit", "risk_sizing")
 _CRITIC_DISPOSITIONS = ("refine", "abandon", "change_family")
+_CANDIDATE_COMPARISON_SEAL = object()
+_POLICY_SOURCE_BUNDLE_SEAL = object()
+CANDIDATE_VALIDATION_FAILURE_CODES = frozenset(
+    {
+        "author_diff_invalid",
+        "author_diff_noop",
+        "author_diff_not_applicable",
+        "author_diff_oversize",
+        "determinism_failed",
+        "imports_failed",
+        "next_context_oversize",
+        "no_discovery_trades",
+        "purity_failed",
+        "replay_failed",
+        "syntax_failed",
+        "worker_failed",
+    }
+)
+_PRECHECK_FAILURE_FLAGS = (False, False, False, False, False, False)
+_VALIDATION_FAILURE_FLAGS = MappingProxyType(
+    {
+        "author_diff_invalid": _PRECHECK_FAILURE_FLAGS,
+        "author_diff_noop": _PRECHECK_FAILURE_FLAGS,
+        "author_diff_not_applicable": _PRECHECK_FAILURE_FLAGS,
+        "author_diff_oversize": _PRECHECK_FAILURE_FLAGS,
+        "syntax_failed": (False, False, False, False, False, False),
+        "imports_failed": (True, False, False, False, False, False),
+        "purity_failed": (True, True, False, False, False, False),
+        "determinism_failed": (True, True, True, False, False, False),
+        "worker_failed": (True, True, True, True, False, True),
+        "replay_failed": (True, True, True, True, True, True),
+        "no_discovery_trades": (True, True, True, True, True, True),
+        "next_context_oversize": (True, True, True, True, True, True),
+    }
+)
 _POLICY_EDITABLE_PATHS = (
     "core/strategy_policy/entry.py",
     "core/strategy_policy/risk.py",
@@ -620,11 +659,20 @@ class PitOptimizerRunManifest(_V2Canonical):
                 raise ValueError("optimizer call static section exceeds its declared cap")
         if len(self.call_budgets) > self.authorization_requirement.max_calls:
             raise ValueError("optimizer calls exceed authorization")
-        if (
-            sum(item.max_input_tokens for item in self.call_budgets)
-            > self.authorization_requirement.max_tokens
-        ):
+        total_tokens = sum(
+            item.max_input_tokens + item.max_output_tokens
+            for item in self.call_budgets
+        )
+        if total_tokens > self.authorization_requirement.max_tokens:
             raise ValueError("optimizer tokens exceed authorization")
+        if (
+            total_tokens != 448_000
+            or self.authorization_requirement.max_tokens != 448_000
+        ):
+            if total_tokens == self.authorization_requirement.max_tokens:
+                raise ValueError("first subset canary tokens must be exactly 448000")
+        if total_tokens != self.authorization_requirement.max_tokens:
+            raise ValueError("optimizer tokens must exactly consume authorization")
         if (
             sum(float(item.max_usd) for item in self.call_budgets)
             > float(self.authorization_requirement.max_usd) + 1e-12
@@ -700,6 +748,9 @@ class PitOptimizerGateConfig:
             raise ValueError("optimizer manifest is invalid JSON") from exc
         if not isinstance(primitive, dict) or raw_manifest != _v2_canonical_bytes(primitive) + b"\n":
             raise ValueError("optimizer manifest is not canonical JSON")
+        closed_manifest = _pit_optimizer_manifest_from_primitive(primitive)
+        if closed_manifest.sha256 != self.optimizer_manifest_sha256:
+            raise ValueError("optimizer manifest closed identity differs")
         identity_fields = {
             "baseline_manifest_sha256": self.baseline_manifest_sha256,
             "pit_bundle_sha256": self.pit_bundle_sha256,
@@ -707,6 +758,8 @@ class PitOptimizerGateConfig:
         }
         if any(primitive.get(name) != expected for name, expected in identity_fields.items()):
             raise ValueError("optimizer gate identities differ from manifest")
+        if closed_manifest.parity_attestation_sha256 != self.verified_parity_sha256:
+            raise ValueError("optimizer gate parity identity differs from manifest")
         authorization = primitive.get("authorization_requirement")
         if not isinstance(authorization, dict):
             raise ValueError("optimizer manifest authorization requirement is absent")
@@ -752,6 +805,8 @@ class PitOptimizerGateConfig:
             )
             if _sha256_file(readiness) != self.readiness_sha256:
                 raise ValueError("optimizer gate readiness artifact digest differs")
+            if closed_manifest.legacy_readiness_sha256 != self.readiness_sha256:
+                raise ValueError("optimizer gate readiness identity differs from manifest")
         if self.phase == "prepare":
             if self.authorization_window_id is not None:
                 raise ValueError("prepare phase cannot carry an authorization window")
@@ -761,6 +816,11 @@ class PitOptimizerGateConfig:
                 raise ValueError("prepare phase apply must be false")
         else:
             _v2_identifier(self.authorization_window_id, "authorization window ID")
+            if (
+                self.authorization_window_id
+                != closed_manifest.authorization_requirement.window_id
+            ):
+                raise ValueError("optimizer gate authorization window differs from manifest")
             if self.source_transmission_authorized is not True:
                 raise ValueError("run phase source transmission must be authorized")
             if type(self.apply) is not bool:
@@ -787,6 +847,70 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _pit_optimizer_manifest_from_primitive(
+    primitive: Mapping[str, object],
+) -> PitOptimizerRunManifest:
+    expected_keys = {field.name for field in fields(PitOptimizerRunManifest)}
+    if set(primitive) != expected_keys:
+        raise ValueError("optimizer manifest keys are invalid")
+    try:
+        scope_value = primitive["policy_source_scope"]
+        fold_value = primitive["fold_manifest"]
+        authorization_value = primitive["authorization_requirement"]
+        if not all(
+            isinstance(value, dict)
+            for value in (scope_value, fold_value, authorization_value)
+        ):
+            raise ValueError("optimizer manifest nested contracts are invalid")
+        scope_primitive = dict(scope_value)
+        scope_primitive["initial_policy_source_sha256s"] = tuple(
+            tuple(item)
+            for item in scope_primitive["initial_policy_source_sha256s"]
+        )
+        scope_primitive["editable_paths"] = tuple(scope_primitive["editable_paths"])
+        scope_primitive["hard_patch_bounds"] = PatchBounds(
+            **scope_primitive["hard_patch_bounds"]
+        )
+        scope_primitive["candidate_bounds"] = PatchBounds(
+            **scope_primitive["candidate_bounds"]
+        )
+        fold_primitive = dict(fold_value)
+
+        def fold_spec(value: object) -> object:
+            if not isinstance(value, dict):
+                raise ValueError("optimizer fold specification is invalid")
+            nested = dict(value)
+            nested["sessions"] = tuple(nested["sessions"])
+            from core.pit_optimizer_evaluation import FoldSpec
+
+            return FoldSpec(**nested)
+
+        fold_primitive["discovery_folds"] = tuple(
+            fold_spec(item) for item in fold_primitive["discovery_folds"]
+        )
+        fold_primitive["hidden_fold"] = fold_spec(fold_primitive["hidden_fold"])
+        values = dict(primitive)
+        values["policy_source_sha256s"] = tuple(
+            tuple(item) for item in values["policy_source_sha256s"]
+        )
+        values["editable_paths"] = tuple(values["editable_paths"])
+        values["policy_source_scope"] = PolicySourceScope(**scope_primitive)
+        values["fold_manifest"] = FoldManifest(**fold_primitive)
+        values["immutable_constraint_ids"] = tuple(
+            values["immutable_constraint_ids"]
+        )
+        values["candidate_bounds"] = PatchBounds(**values["candidate_bounds"])
+        values["call_budgets"] = tuple(
+            PitOptimizerCallBudget(**item) for item in values["call_budgets"]
+        )
+        values["authorization_requirement"] = AuthorizationRequirement(
+            **authorization_value
+        )
+        return PitOptimizerRunManifest(**values)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("optimizer manifest closed contract is invalid") from exc
 
 
 def _canonical_mapping_bytes(value: Mapping[str, object]) -> bytes:
@@ -908,6 +1032,18 @@ def build_subset_manifest(
         Path(verified_parity_path),
     )
     source = _resolved_directory(Path(source_root), "source root")
+    from core.pit_policy_parity import _authenticated_readiness, _source_identity
+
+    actual_source_head, actual_source_fingerprint = _source_identity(source)
+    authenticated_readiness, authenticated_readiness_sha256 = _authenticated_readiness(
+        _readiness_path,
+        source_root=source,
+    )
+    if (
+        authenticated_readiness != dict(legacy_readiness)
+        or authenticated_readiness_sha256 != readiness_sha256
+    ):
+        raise ValueError("legacy readiness differs from authenticated readiness")
     _resolved_directory(Path(permanent_runtime_root), "permanent runtime root")
     _resolved_directory(Path(controller_temp_parent), "controller temp parent")
     _resolved_directory(Path(artifact_root), "optimizer artifact root")
@@ -929,6 +1065,12 @@ def build_subset_manifest(
     evaluation = legacy_readiness.get("evaluation_contract")
     if not isinstance(identities, Mapping) or not isinstance(sealed_inputs, Mapping):
         raise ValueError("legacy readiness identities are absent")
+    if (
+        identities.get("source_head") != actual_source_head
+        or identities.get("source_fingerprint_sha256")
+        != actual_source_fingerprint
+    ):
+        raise ValueError("legacy readiness source identity differs from source root")
     if not isinstance(evaluation, Mapping) or evaluation.get("verification_only") is not True:
         raise ValueError("legacy readiness evaluation contract is invalid")
 
@@ -1037,6 +1179,12 @@ def build_subset_manifest(
         allowed_descendant_rule=(
             "authenticated_initial_sources_plus_validated_cumulative_diff"
         ),
+    )
+    render_worst_iteration_two_role_inputs(
+        scope=scope,
+        source_texts=source_texts,
+        immutable_constraint_ids=constraint_ids,
+        call_budgets=call_budgets,
     )
     authorization = AuthorizationRequirement(
         window_id=f"window_{uuid.uuid4().hex}",
@@ -1223,8 +1371,11 @@ class PolicySourceBundle(_V2Canonical):
     cumulative_diff_sha256: str
     cumulative_diff: str
     files: tuple[PolicySourceRecord, ...]
+    _controller_seal: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _controller_seal: object) -> None:
+        if _controller_seal is not _POLICY_SOURCE_BUNDLE_SEAL:
+            raise ValueError("policy source bundle must be controller derived")
         _require_positive_int(self.policy_interface_version, "policy interface version")
         _require_digest(self.cumulative_diff_sha256, "cumulative diff SHA-256")
         if not isinstance(self.cumulative_diff, str) or "\x00" in self.cumulative_diff:
@@ -1241,6 +1392,192 @@ class PolicySourceBundle(_V2Canonical):
             raise ValueError("policy source bundle must contain the three editable files")
         if len(self.canonical_json_bytes()) > MAX_POLICY_SOURCE_BUNDLE_BYTES:
             raise ValueError("policy source bundle exceeds its byte cap")
+
+
+@dataclass(frozen=True, slots=True)
+class _PatchStats:
+    paths: tuple[str, ...]
+    hunks: int
+    changed_lines: int
+    diff_bytes: int
+
+
+_HUNK_RE = re.compile(
+    r"@@ -(0|[1-9][0-9]*)(?:,([0-9]+))? \+(0|[1-9][0-9]*)(?:,([0-9]+))? @@(?: [^\r\n]*)?\n?"
+)
+
+
+def _require_patch_bounds(stats: _PatchStats, bounds: PatchBounds) -> None:
+    comparisons = (
+        (len(stats.paths), bounds.max_files, "max_files"),
+        (stats.hunks, bounds.max_hunks, "max_hunks"),
+        (stats.changed_lines, bounds.max_changed_lines, "max_changed_lines"),
+        (stats.diff_bytes, bounds.max_diff_bytes, "max_diff_bytes"),
+    )
+    for actual, maximum, name in comparisons:
+        if actual > maximum:
+            raise ValueError(f"candidate patch exceeds {name}")
+
+
+def _apply_unified_diff(
+    source_texts: Mapping[str, str],
+    unified_diff: str,
+    *,
+    bounds: PatchBounds,
+    allow_empty: bool = False,
+) -> tuple[dict[str, str], _PatchStats]:
+    if not isinstance(bounds, PatchBounds):
+        raise ValueError("candidate patch bounds are invalid")
+    if not isinstance(unified_diff, str) or "\x00" in unified_diff:
+        raise ValueError("candidate unified diff is invalid")
+    diff_bytes = len(unified_diff.encode("utf-8"))
+    if not unified_diff:
+        if not allow_empty:
+            raise ValueError("candidate unified diff is empty")
+        stats = _PatchStats((), 0, 0, 0)
+        _require_patch_bounds(stats, bounds)
+        return dict(source_texts), stats
+    lines = unified_diff.splitlines(keepends=True)
+    output = dict(source_texts)
+    paths: list[str] = []
+    hunks = 0
+    changed_lines = 0
+    index = 0
+    while index < len(lines):
+        old_header = lines[index]
+        if not old_header.startswith("--- a/"):
+            raise ValueError("candidate unified diff old-file header is invalid")
+        path = old_header[len("--- a/") :].rstrip("\r\n")
+        index += 1
+        if index >= len(lines) or lines[index].rstrip("\r\n") != f"+++ b/{path}":
+            raise ValueError("candidate unified diff new-file header is invalid")
+        index += 1
+        if path not in source_texts or path in paths:
+            raise ValueError("candidate unified diff path is invalid")
+        paths.append(path)
+        original = source_texts[path].splitlines(keepends=True)
+        result: list[str] = []
+        source_index = 0
+        file_hunks = 0
+        while index < len(lines) and not lines[index].startswith("--- a/"):
+            header = lines[index]
+            match = _HUNK_RE.fullmatch(header)
+            if match is None:
+                raise ValueError("candidate unified diff hunk header is invalid")
+            old_start = int(match.group(1))
+            old_count = int(match.group(2) or "1")
+            new_count = int(match.group(4) or "1")
+            target_index = max(old_start - 1, 0)
+            if target_index < source_index or target_index > len(original):
+                raise ValueError("candidate unified diff hunk location is invalid")
+            result.extend(original[source_index:target_index])
+            source_index = target_index
+            index += 1
+            observed_old = 0
+            observed_new = 0
+            while index < len(lines) and not lines[index].startswith(("@@ ", "--- a/")):
+                line = lines[index]
+                if line.startswith("\\ No newline at end of file"):
+                    raise ValueError("candidate unified diff newline markers are unsupported")
+                if not line or line[0] not in {" ", "+", "-"}:
+                    raise ValueError("candidate unified diff body is invalid")
+                payload = line[1:]
+                if line[0] in {" ", "-"}:
+                    if source_index >= len(original) or original[source_index] != payload:
+                        raise ValueError("candidate unified diff does not apply to source")
+                    source_index += 1
+                    observed_old += 1
+                if line[0] in {" ", "+"}:
+                    result.append(payload)
+                    observed_new += 1
+                if line[0] in {"+", "-"}:
+                    changed_lines += 1
+                index += 1
+            if observed_old != old_count or observed_new != new_count:
+                raise ValueError("candidate unified diff hunk counts differ")
+            file_hunks += 1
+            hunks += 1
+        if file_hunks == 0:
+            raise ValueError("candidate unified diff file has no hunks")
+        result.extend(original[source_index:])
+        output[path] = "".join(result)
+    stats = _PatchStats(tuple(paths), hunks, changed_lines, diff_bytes)
+    _require_patch_bounds(stats, bounds)
+    if all(output[path] == source_texts[path] for path in paths):
+        raise ValueError("candidate unified diff is a no-op")
+    return output, stats
+
+
+def initial_policy_source_bundle(
+    *,
+    scope: PolicySourceScope,
+    source_texts: Mapping[str, str],
+) -> PolicySourceBundle:
+    if not isinstance(scope, PolicySourceScope) or not isinstance(source_texts, Mapping):
+        raise ValueError("initial policy source inputs are invalid")
+    if tuple(source_texts) != scope.editable_paths:
+        raise ValueError("initial policy source paths differ from scope")
+    records = tuple(
+        PolicySourceRecord(
+            path=path,
+            sha256=hashlib.sha256(source_texts[path].encode("utf-8")).hexdigest(),
+            declared_symbols=_POLICY_DECLARED_SYMBOLS[path],
+            text=source_texts[path],
+        )
+        for path in scope.editable_paths
+    )
+    if tuple((record.path, record.sha256) for record in records) != (
+        scope.initial_policy_source_sha256s
+    ):
+        raise ValueError("initial policy source hashes differ from scope")
+    bundle = PolicySourceBundle(
+        policy_interface_version=scope.policy_interface_version,
+        cumulative_diff_sha256=hashlib.sha256(b"").hexdigest(),
+        cumulative_diff="",
+        files=records,
+        _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
+    )
+    if len(bundle.canonical_json_bytes()) > scope.max_policy_source_bundle_bytes:
+        raise ValueError("initial policy source bundle exceeds scope")
+    return bundle
+
+
+def validate_policy_source_bundle_descendant(
+    *,
+    scope: PolicySourceScope,
+    initial_bundle: PolicySourceBundle,
+    bundle: PolicySourceBundle,
+) -> None:
+    if not isinstance(scope, PolicySourceScope) or not all(
+        isinstance(item, PolicySourceBundle) for item in (initial_bundle, bundle)
+    ):
+        raise ValueError("policy source descendant contracts are invalid")
+    initial_texts = {record.path: record.text for record in initial_bundle.files}
+    authenticated_initial = initial_policy_source_bundle(
+        scope=scope,
+        source_texts=initial_texts,
+    )
+    if authenticated_initial != initial_bundle:
+        raise ValueError("initial policy source bundle is not canonical")
+    if bundle.policy_interface_version != scope.policy_interface_version:
+        raise ValueError("policy source descendant interface differs from scope")
+    if len(bundle.canonical_json_bytes()) > scope.max_policy_source_bundle_bytes:
+        raise ValueError("policy source descendant exceeds scope")
+    resulting_texts, stats = _apply_unified_diff(
+        initial_texts,
+        bundle.cumulative_diff,
+        bounds=scope.hard_patch_bounds,
+        allow_empty=True,
+    )
+    if stats.paths and stats.paths != tuple(
+        record.path
+        for record in bundle.files
+        if record.text != initial_texts[record.path]
+    ):
+        raise ValueError("policy source cumulative diff paths differ from files")
+    supplied_texts = {record.path: record.text for record in bundle.files}
+    if resulting_texts != supplied_texts:
+        raise ValueError("policy source cumulative diff resulting source texts differ")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2146,6 +2483,8 @@ class AuthorManifestSummary(_V2Canonical):
             self.changed_symbols,
             "author manifest changed",
         )
+        if len(self.canonical_json_bytes()) > MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES:
+            raise ValueError("author manifest exceeds its byte cap")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2159,17 +2498,152 @@ class CandidateValidationSummary(_V2Canonical):
     replay_attempted: bool
 
     def __post_init__(self) -> None:
-        if self.failure_code is not None:
-            _v2_identifier(self.failure_code, "candidate validation failure code")
-        for name in (
+        flag_names = (
             "syntax_ok",
             "imports_ok",
             "purity_ok",
             "deterministic_ok",
             "worker_ok",
             "replay_attempted",
-        ):
+        )
+        for name in flag_names:
             _require_bool(getattr(self, name), f"candidate validation {name}")
+        actual_flags = tuple(getattr(self, name) for name in flag_names)
+        if self.failure_code is None:
+            if actual_flags != (True, True, True, True, True, True):
+                raise ValueError("candidate successful validation flags are inconsistent")
+            return
+        if self.failure_code not in CANDIDATE_VALIDATION_FAILURE_CODES:
+            raise ValueError("candidate validation failure code is not closed")
+        if actual_flags != _VALIDATION_FAILURE_FLAGS[self.failure_code]:
+            raise ValueError(
+                f"candidate {self.failure_code} flags are inconsistent"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PolicySourceMaterialization(_V2Canonical):
+    bundle: PolicySourceBundle | None
+    validation: CandidateValidationSummary
+
+    def __post_init__(self) -> None:
+        if self.bundle is not None and not isinstance(self.bundle, PolicySourceBundle):
+            raise ValueError("policy source materialization bundle is invalid")
+        if not isinstance(self.validation, CandidateValidationSummary):
+            raise ValueError("policy source materialization validation is invalid")
+        if self.bundle is None:
+            if self.validation.failure_code != "next_context_oversize":
+                raise ValueError("missing policy source bundle requires context overflow")
+        elif self.validation.failure_code is not None:
+            raise ValueError("failed policy source materialization cannot carry a bundle")
+
+
+def _successful_candidate_validation() -> CandidateValidationSummary:
+    return CandidateValidationSummary(
+        failure_code=None,
+        syntax_ok=True,
+        imports_ok=True,
+        purity_ok=True,
+        deterministic_ok=True,
+        worker_ok=True,
+        replay_attempted=True,
+    )
+
+
+def _controller_cumulative_diff(
+    initial_texts: Mapping[str, str],
+    resulting_texts: Mapping[str, str],
+) -> str:
+    return "".join(
+        line
+        for path in _POLICY_EDITABLE_PATHS
+        if initial_texts[path] != resulting_texts[path]
+        for line in difflib.unified_diff(
+            initial_texts[path].splitlines(keepends=True),
+            resulting_texts[path].splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            n=3,
+            lineterm="\n",
+        )
+    )
+
+
+def materialize_policy_source_descendant(
+    *,
+    scope: PolicySourceScope,
+    initial_bundle: PolicySourceBundle,
+    current_bundle: PolicySourceBundle,
+    artifact: AuthorArtifact,
+) -> PolicySourceMaterialization:
+    if not isinstance(artifact, AuthorArtifact):
+        raise ValueError("policy source materialization author artifact is invalid")
+    validate_policy_source_bundle_descendant(
+        scope=scope,
+        initial_bundle=initial_bundle,
+        bundle=current_bundle,
+    )
+    current_texts = {record.path: record.text for record in current_bundle.files}
+    resulting_texts, stats = _apply_unified_diff(
+        current_texts,
+        artifact.unified_diff,
+        bounds=scope.candidate_bounds,
+    )
+    if stats.paths != artifact.changed_paths:
+        raise ValueError("author changed paths differ from candidate unified diff")
+    initial_texts = {record.path: record.text for record in initial_bundle.files}
+    cumulative_diff = _controller_cumulative_diff(initial_texts, resulting_texts)
+    cumulative_texts, _stats = _apply_unified_diff(
+        initial_texts,
+        cumulative_diff,
+        bounds=scope.hard_patch_bounds,
+        allow_empty=False,
+    )
+    if cumulative_texts != resulting_texts:
+        raise ValueError("controller cumulative diff does not reproduce candidate source")
+    records = tuple(
+        PolicySourceRecord(
+            path=path,
+            sha256=hashlib.sha256(resulting_texts[path].encode("utf-8")).hexdigest(),
+            declared_symbols=_POLICY_DECLARED_SYMBOLS[path],
+            text=resulting_texts[path],
+        )
+        for path in scope.editable_paths
+    )
+    primitive = {
+        "policy_interface_version": scope.policy_interface_version,
+        "cumulative_diff_sha256": hashlib.sha256(
+            cumulative_diff.encode("utf-8")
+        ).hexdigest(),
+        "cumulative_diff": cumulative_diff,
+        "files": records,
+    }
+    if len(_v2_canonical_bytes(primitive)) > scope.max_policy_source_bundle_bytes:
+        return PolicySourceMaterialization(
+            bundle=None,
+            validation=CandidateValidationSummary(
+                failure_code="next_context_oversize",
+                syntax_ok=True,
+                imports_ok=True,
+                purity_ok=True,
+                deterministic_ok=True,
+                worker_ok=True,
+                replay_attempted=True,
+            ),
+        )
+    bundle = PolicySourceBundle(
+        **primitive,
+        _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
+    )
+    validate_policy_source_bundle_descendant(
+        scope=scope,
+        initial_bundle=initial_bundle,
+        bundle=bundle,
+    )
+    return PolicySourceMaterialization(
+        bundle=bundle,
+        validation=_successful_candidate_validation(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2177,14 +2651,22 @@ class CandidateComparisonSummary(_V2Canonical):
     folds: tuple[FoldAggregateSummary, ...]
     score: DiscoveryScore | None
     diagnostics: tuple[AggregateMetric, ...]
+    _controller_seal: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _controller_seal: object) -> None:
+        if _controller_seal is not _CANDIDATE_COMPARISON_SEAL:
+            raise ValueError("candidate comparison must be controller derived")
         if (
             type(self.folds) is not tuple
             or len(self.folds) != 2
             or any(not isinstance(item, FoldAggregateSummary) for item in self.folds)
         ):
             raise ValueError("candidate comparison folds are invalid")
+        if tuple(item.fold_id for item in self.folds) != (
+            "discovery_1",
+            "discovery_2",
+        ):
+            raise ValueError("candidate comparison must use sealed discovery fold IDs")
         if self.score is not None and not isinstance(self.score, DiscoveryScore):
             raise ValueError("candidate comparison score is invalid")
         if (
@@ -2196,8 +2678,52 @@ class CandidateComparisonSummary(_V2Canonical):
         ids = tuple(item.metric_id for item in self.diagnostics)
         if len(ids) != len(set(ids)):
             raise ValueError("candidate comparison diagnostic IDs must be unique")
-        if len(self.canonical_json_bytes()) > MAX_DISCOVERY_EVIDENCE_BYTES:
+        if len(self.canonical_json_bytes()) > MAX_CANDIDATE_COMPARISON_BYTES:
             raise ValueError("candidate comparison exceeds its byte cap")
+
+
+def candidate_comparison_from_fixed_baseline(
+    *,
+    candidate_folds: tuple[FoldAggregateSummary, ...],
+    original_baseline_folds: tuple[FoldAggregateSummary, ...],
+    original_baseline_sha256: str,
+    expected_original_baseline_sha256: str,
+    discovery_exposure: DiscoveryExposureProof,
+    diagnostics: tuple[AggregateMetric, ...],
+    supplied_score: DiscoveryScore | None = None,
+) -> CandidateComparisonSummary:
+    if not isinstance(discovery_exposure, DiscoveryExposureProof):
+        raise ValueError("candidate comparison discovery exposure is invalid")
+    if tuple(item.fold_id for item in candidate_folds) != discovery_exposure.fold_ids:
+        raise ValueError("candidate comparison folds differ from ledger exposure")
+    score = discovery_score_from_folds(
+        candidate_folds,
+        original_baseline_folds,
+        original_baseline_sha256=original_baseline_sha256,
+        expected_original_baseline_sha256=expected_original_baseline_sha256,
+    )
+    if supplied_score is not None and supplied_score != score:
+        raise ValueError("candidate comparison supplied score differs from fixed baseline")
+    derived_folds = tuple(
+        replace(
+            candidate,
+            excess_total_return_pp=(
+                float(candidate.total_return_pct)
+                - float(original_baseline.total_return_pct)
+            ),
+        )
+        for candidate, original_baseline in zip(
+            candidate_folds,
+            original_baseline_folds,
+            strict=True,
+        )
+    )
+    return CandidateComparisonSummary(
+        folds=derived_folds,
+        score=score,
+        diagnostics=diagnostics,
+        _controller_seal=_CANDIDATE_COMPARISON_SEAL,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2263,14 +2789,14 @@ class InvestigatorInput(_V2Canonical):
             immutable_constraint_ids=self.immutable_constraint_ids,
         )
         _require_positive_int(self.policy_interface_version, "policy interface version")
-        if self.source_bundle.policy_interface_version != self.policy_interface_version:
-            raise ValueError("investigator policy interface versions differ")
         if not isinstance(self.candidate_bounds, PatchBounds):
             raise ValueError("investigator candidate bounds are invalid")
         if not isinstance(self.rule_summary, StrategyRuleSummary):
             raise ValueError("investigator rule summary is invalid")
         if not isinstance(self.source_bundle, PolicySourceBundle):
             raise ValueError("investigator source bundle is invalid")
+        if self.source_bundle.policy_interface_version != self.policy_interface_version:
+            raise ValueError("investigator policy interface versions differ")
         if not isinstance(self.baseline_discovery, DiscoveryEvidenceSummary):
             raise ValueError("investigator baseline discovery is invalid")
         if not isinstance(self.incumbent_summary, IncumbentSummary):
@@ -2312,14 +2838,14 @@ class AuthorInput(_V2Canonical):
             immutable_constraint_ids=self.immutable_constraint_ids,
         )
         _require_positive_int(self.policy_interface_version, "policy interface version")
-        if self.source_bundle.policy_interface_version != self.policy_interface_version:
-            raise ValueError("author policy interface versions differ")
         if not isinstance(self.candidate_bounds, PatchBounds):
             raise ValueError("author candidate bounds are invalid")
         if not isinstance(self.investigator, InvestigatorArtifact):
             raise ValueError("author investigator artifact is invalid")
         if not isinstance(self.source_bundle, PolicySourceBundle):
             raise ValueError("author source bundle is invalid")
+        if self.source_bundle.policy_interface_version != self.policy_interface_version:
+            raise ValueError("author policy interface versions differ")
         if len(self.canonical_json_bytes()) > MAX_AUTHOR_DYNAMIC_BYTES:
             raise ValueError("author dynamic input exceeds its byte cap")
 
@@ -2328,6 +2854,13 @@ class AuthorInput(_V2Canonical):
             raise ValueError("author response has an invalid type")
         if artifact.hypothesis_id != self.investigator.hypothesis_id:
             raise ValueError("author hypothesis differs from investigator")
+        _resulting_texts, stats = _apply_unified_diff(
+            {record.path: record.text for record in self.source_bundle.files},
+            artifact.unified_diff,
+            bounds=self.candidate_bounds,
+        )
+        if stats.paths != artifact.changed_paths:
+            raise ValueError("author changed paths differ from candidate unified diff")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2374,6 +2907,175 @@ class CriticInput(_V2Canonical):
             raise ValueError("critic response has an invalid type")
         if artifact.hypothesis_id != self.hypothesis_id:
             raise ValueError("critic hypothesis differs from its input")
+
+
+def render_worst_iteration_two_role_inputs(
+    *,
+    scope: PolicySourceScope,
+    source_texts: Mapping[str, str],
+    immutable_constraint_ids: tuple[str, ...],
+    call_budgets: tuple[PitOptimizerCallBudget, ...],
+) -> Mapping[str, bytes]:
+    """Render complete bounded iteration-2 role inputs before a manifest is sealed."""
+
+    if not isinstance(scope, PolicySourceScope):
+        raise ValueError("worst role input source scope is invalid")
+    _v2_string_tuple(immutable_constraint_ids, "worst role immutable constraints")
+    if tuple(source_texts) != scope.editable_paths:
+        raise ValueError("worst role source paths differ from scope")
+    grown_texts = dict(source_texts)
+    grown_texts[scope.editable_paths[0]] += "s" * scope.candidate_bounds.max_diff_bytes
+    cumulative_diff = "d" * scope.candidate_bounds.max_diff_bytes
+    source_bundle = PolicySourceBundle(
+        policy_interface_version=scope.policy_interface_version,
+        cumulative_diff_sha256=hashlib.sha256(
+            cumulative_diff.encode("utf-8")
+        ).hexdigest(),
+        cumulative_diff=cumulative_diff,
+        files=tuple(
+            PolicySourceRecord(
+                path=path,
+                sha256=hashlib.sha256(grown_texts[path].encode("utf-8")).hexdigest(),
+                declared_symbols=_POLICY_DECLARED_SYMBOLS[path],
+                text=grown_texts[path],
+            )
+            for path in scope.editable_paths
+        ),
+        _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
+    )
+    rule_summary = StrategyRuleSummary(
+        records=(
+            RuleSummaryRecord("rule_1", "r" * 3_800),
+            RuleSummaryRecord("rule_2", "s" * 3_800),
+        )
+    )
+    folds = tuple(
+        FoldAggregateSummary(
+            fold_id=fold_id,
+            total_return_pct=1.0,
+            excess_total_return_pp=0.0,
+            max_drawdown_pct=-1.0,
+            sharpe_ratio=1.0,
+            closed_trades=1,
+            turnover_pct=1.0,
+            average_exposure_pct=1.0,
+            entry_funnel=(AggregateMetric("entries_executed", 1),),
+            exit_attribution=(AggregateMetric("end_of_test", 1),),
+        )
+        for fold_id in ("discovery_1", "discovery_2")
+    )
+    discovery = DiscoveryEvidenceSummary(
+        folds=folds,
+        score=None,
+        evidence_ids=("e" * 3_000, "f" * 3_000),
+    )
+    incumbent = IncumbentSummary(
+        candidate_identity_sha256="1" * 64,
+        accepted_iteration=1,
+        behavioral_summary="b" * 3_000,
+        discovery=discovery,
+    )
+    feedback = IterationFeedbackSummary(
+        iteration=1,
+        hypothesis_id="hypothesis_1",
+        family="entry",
+        author_summary="a" * 1_700,
+        validation_code="valid",
+        discovery_score=None,
+        critic_disposition="refine",
+        critic_next_direction="n" * 1_700,
+        incumbent_changed=True,
+    )
+    investigator_artifact = InvestigatorArtifact(
+        hypothesis_id="hypothesis_2",
+        family="entry",
+        evidence_ids=("evidence_1",),
+        causal_rationale="c" * 3_000,
+        target_paths=(scope.editable_paths[0],),
+        target_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
+        expected_diagnostic_changes=("d" * 1_000,),
+        known_risks=("k" * 1_000,),
+        author_instructions=("i" * 1_000,),
+    )
+    author_manifest = AuthorManifestSummary(
+        hypothesis_id=investigator_artifact.hypothesis_id,
+        behavioral_summary="b" * 4_000,
+        changed_paths=(scope.editable_paths[0],),
+        changed_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
+    )
+    diagnostics = tuple(
+        AggregateMetric(f"diagnostic_{index:02d}_" + ("x" * 80), index)
+        for index in range(MAX_ROLE_LIST_ITEMS)
+    )
+    synthetic_baseline_sha256 = hashlib.sha256(
+        _v2_canonical_bytes([_v2_primitive(item) for item in folds]) + b"\n"
+    ).hexdigest()
+    comparison_score = discovery_score_from_folds(
+        folds,
+        folds,
+        original_baseline_sha256=synthetic_baseline_sha256,
+        expected_original_baseline_sha256=synthetic_baseline_sha256,
+    )
+    comparison = CandidateComparisonSummary(
+        folds=folds,
+        score=comparison_score,
+        diagnostics=diagnostics,
+        _controller_seal=_CANDIDATE_COMPARISON_SEAL,
+    )
+    validation = _successful_candidate_validation()
+    dynamic_values = {
+        "investigator": {
+            "schema_version": 2,
+            "iteration": 2,
+            "policy_interface_version": scope.policy_interface_version,
+            "immutable_constraint_ids": immutable_constraint_ids,
+            "candidate_bounds": scope.candidate_bounds,
+            "rule_summary": rule_summary,
+            "source_bundle": source_bundle,
+            "baseline_discovery": discovery,
+            "incumbent_summary": incumbent,
+            "prior_iterations": (feedback,),
+        },
+        "author": {
+            "schema_version": 2,
+            "iteration": 2,
+            "policy_interface_version": scope.policy_interface_version,
+            "immutable_constraint_ids": immutable_constraint_ids,
+            "candidate_bounds": scope.candidate_bounds,
+            "investigator": investigator_artifact,
+            "source_bundle": source_bundle,
+        },
+        "critic": {
+            "schema_version": 2,
+            "iteration": 2,
+            "immutable_constraint_ids": immutable_constraint_ids,
+            "hypothesis_id": investigator_artifact.hypothesis_id,
+            "investigator_summary": investigator_artifact,
+            "author_manifest": author_manifest,
+            "validation": validation,
+            "candidate_vs_baseline": comparison,
+            "candidate_vs_incumbent": comparison,
+        },
+    }
+    rendered = {
+        role: _v2_canonical_bytes(value) for role, value in dynamic_values.items()
+    }
+    iteration_two = {
+        budget.role: budget
+        for budget in call_budgets
+        if budget.iteration == 2
+    }
+    if set(iteration_two) != set(OPTIMIZER_V2_ROLES):
+        raise ValueError("worst iteration-2 call plan is incomplete")
+    for role, payload in rendered.items():
+        budget = iteration_two[role]
+        static_bytes = len(PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role].encode("utf-8"))
+        static_bytes += len(_v2_canonical_bytes(pit_optimizer_response_format(role)))
+        if len(payload) > budget.max_dynamic_input_bytes:
+            raise ValueError(f"worst iteration-2 {role} dynamic input exceeds call cap")
+        if static_bytes + len(payload) > budget.max_input_tokens:
+            raise ValueError(f"worst iteration-2 {role} message exceeds token cap")
+    return MappingProxyType(rendered)
 
 
 def _v2_string_schema() -> dict[str, object]:

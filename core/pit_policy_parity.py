@@ -768,6 +768,11 @@ def _source_identity(source_root: Path) -> tuple[str, str]:
         )
         return completed.stdout
 
+    repository_root = Path(
+        git("rev-parse", "--show-toplevel").decode("utf-8").strip()
+    ).resolve()
+    if repository_root != root:
+        raise ValueError("source root must be the Git repository root")
     if git("status", "--porcelain", "--untracked-files=all").strip():
         raise ValueError("parity capture requires a clean committed source")
     head = git("rev-parse", "HEAD").decode("ascii").strip()

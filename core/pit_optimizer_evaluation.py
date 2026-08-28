@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import InitVar, asdict, dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import hashlib
@@ -23,6 +23,18 @@ _EXPOSURE_KINDS = {
     "provider_context",
     "hidden_validation",
 }
+VALIDATION_OUTCOME_FAILURE_CODES = frozenset(
+    {
+        "accounting_failed",
+        "candidate_exception",
+        "candidate_timeout",
+        "integrity_failed",
+        "not_attempted",
+        "replay_failed",
+        "worker_failed",
+    }
+)
+_DISCOVERY_EXPOSURE_SEAL = object()
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -214,25 +226,58 @@ class DiscoveryScore:
 
 
 def discovery_score_from_folds(
-    folds: tuple[FoldAggregateSummary, ...],
+    candidate_folds: tuple[FoldAggregateSummary, ...],
+    original_baseline_folds: tuple[FoldAggregateSummary, ...],
+    *,
+    original_baseline_sha256: str,
+    expected_original_baseline_sha256: str,
 ) -> DiscoveryScore:
+    for folds, label in (
+        (candidate_folds, "candidate"),
+        (original_baseline_folds, "original baseline"),
+    ):
+        if (
+            type(folds) is not tuple
+            or len(folds) != 2
+            or any(not isinstance(item, FoldAggregateSummary) for item in folds)
+        ):
+            raise ValueError(
+                f"discovery objective requires exactly two {label} fold summaries"
+            )
+        if tuple(item.fold_id for item in folds) != (
+            "discovery_1",
+            "discovery_2",
+        ):
+            raise ValueError("discovery objective fold identities are invalid")
+    _require_digest(
+        original_baseline_sha256,
+        "discovery original baseline SHA-256",
+    )
+    _require_digest(
+        expected_original_baseline_sha256,
+        "discovery expected original baseline SHA-256",
+    )
+    actual_baseline_sha256 = hashlib.sha256(
+        _canonical_json_bytes([asdict(item) for item in original_baseline_folds])
+    ).hexdigest()
     if (
-        type(folds) is not tuple
-        or len(folds) != 2
-        or any(not isinstance(item, FoldAggregateSummary) for item in folds)
+        original_baseline_sha256 != expected_original_baseline_sha256
+        or actual_baseline_sha256 != original_baseline_sha256
     ):
-        raise ValueError("discovery objective requires exactly two fold summaries")
-    if len({item.fold_id for item in folds}) != 2 or any(
-        not item.fold_id.startswith("discovery_") for item in folds
-    ):
-        raise ValueError("discovery objective fold identities are invalid")
-    if any(item.closed_trades < 1 for item in folds):
+        raise ValueError("discovery fixed baseline identity differs")
+    if any(item.closed_trades < 1 for item in candidate_folds):
         raise ValueError("each fold requires at least one closed discovery trade")
-    if any(item.excess_total_return_pp is None for item in folds):
-        raise ValueError("discovery objective requires fixed-baseline excess return")
     excess = tuple(
-        _objective_decimal(item.excess_total_return_pp, "fold excess return")
-        for item in folds
+        _objective_decimal(
+            Decimal(str(candidate.total_return_pct))
+            - Decimal(str(original_baseline.total_return_pct)),
+            "fold excess return",
+        )
+        for candidate, original_baseline in zip(
+            candidate_folds,
+            original_baseline_folds,
+            strict=True,
+        )
     )
     ordered = tuple(sorted(excess))
     median = ((ordered[0] + ordered[1]) / Decimal(2)).quantize(
@@ -244,7 +289,7 @@ def discovery_score_from_folds(
             abs(min(Decimal(str(item.max_drawdown_pct)), Decimal(0))),
             "fold drawdown magnitude",
         )
-        for item in folds
+        for item in candidate_folds
     )
     return DiscoveryScore(
         median_excess_return_pp=median,
@@ -424,6 +469,24 @@ class ValidationReservation:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoveryExposureProof:
+    fold_ids: tuple[str, str]
+    reservation_record_sha256s: tuple[str, str]
+    ledger_head_sha256: str
+    _controller_seal: InitVar[object] = None
+
+    def __post_init__(self, _controller_seal: object) -> None:
+        if _controller_seal is not _DISCOVERY_EXPOSURE_SEAL:
+            raise ValueError("discovery exposure proof must be ledger derived")
+        if self.fold_ids != ("discovery_1", "discovery_2"):
+            raise ValueError("discovery exposure proof fold IDs are invalid")
+        if type(self.reservation_record_sha256s) is not tuple:
+            raise ValueError("discovery exposure proof reservations are invalid")
+        for digest in (*self.reservation_record_sha256s, self.ledger_head_sha256):
+            _require_digest(digest, "discovery exposure proof SHA-256")
+
+
 def _reject_duplicate_record_keys(
     pairs: list[tuple[str, object]],
 ) -> dict[str, object]:
@@ -594,7 +657,12 @@ class ValidationLedger:
             if failure_code is not None:
                 raise ValueError("completed validation cannot have a failure code")
         else:
-            _require_closed_id(failure_code, "validation outcome failure code")
+            if failure_code not in VALIDATION_OUTCOME_FAILURE_CODES:
+                raise ValueError("validation outcome failure code is not closed")
+            if attempted is False and failure_code != "not_attempted":
+                raise ValueError("unattempted validation outcome code is inconsistent")
+            if attempted is True and failure_code == "not_attempted":
+                raise ValueError("attempted validation outcome code is inconsistent")
 
     def _append_record(
         self,
@@ -666,6 +734,76 @@ class ValidationLedger:
         if not isinstance(metadata, ValidationExposureMetadata) or metadata.exposure_kind != "hidden_validation":
             raise ValueError("hidden exposure kind is invalid")
         return self._reserve(identity, metadata)
+
+    def seal_discovery_folds(
+        self,
+        fold_manifest: FoldManifest,
+        reservations: tuple[ValidationReservation, ValidationReservation],
+    ) -> DiscoveryExposureProof:
+        if not isinstance(fold_manifest, FoldManifest):
+            raise ValueError("discovery exposure fold manifest is invalid")
+        if (
+            type(reservations) is not tuple
+            or len(reservations) != 2
+            or any(not isinstance(item, ValidationReservation) for item in reservations)
+        ):
+            raise ValueError("discovery exposure reservations are invalid")
+        with _validation_file_lock(self._lock_path):
+            records = self._read_records()
+            selected: list[dict[str, object]] = []
+            for fold, reservation in zip(
+                fold_manifest.discovery_folds,
+                reservations,
+                strict=True,
+            ):
+                record = next(
+                    (
+                        item
+                        for item in records
+                        if item.get("record_type") == "consumption"
+                        and item.get("record_sha256")
+                        == reservation.reservation_record_sha256
+                        and item.get("consumption_key_sha256")
+                        == reservation.consumption_key_sha256
+                    ),
+                    None,
+                )
+                if record is None:
+                    raise ValueError("discovery exposure reservation is absent")
+                metadata = record.get("metadata")
+                identity = record.get("identity")
+                expected_sessions_sha256 = hashlib.sha256(
+                    _canonical_json_bytes(list(fold.sessions))
+                ).hexdigest()
+                if (
+                    not isinstance(metadata, dict)
+                    or metadata.get("exposure_kind")
+                    not in {"candidate_validation", "provider_context"}
+                    or not isinstance(identity, dict)
+                    or identity.get("pit_bundle_sha256")
+                    != fold_manifest.data_identity_sha256
+                    or identity.get("universe_sha256")
+                    != fold_manifest.universe_sha256
+                    or identity.get("benchmark") != fold_manifest.benchmark
+                    or identity.get("sessions_sha256") != expected_sessions_sha256
+                    or identity.get("session_count") != len(fold.sessions)
+                    or identity.get("first_session") != fold.start_date
+                    or identity.get("last_session") != fold.end_date
+                ):
+                    raise ValueError("discovery exposure reservation differs from fold")
+                selected.append(record)
+            if not records:
+                raise ValueError("discovery exposure ledger is empty")
+            return DiscoveryExposureProof(
+                fold_ids=tuple(
+                    fold.fold_id for fold in fold_manifest.discovery_folds
+                ),
+                reservation_record_sha256s=tuple(
+                    str(item["record_sha256"]) for item in selected
+                ),
+                ledger_head_sha256=str(records[-1]["record_sha256"]),
+                _controller_seal=_DISCOVERY_EXPOSURE_SEAL,
+            )
 
     def record_outcome(
         self,
