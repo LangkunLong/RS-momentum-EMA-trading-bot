@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 import re
 import threading
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping, Sequence
 
 from core.pit_optimization_contract import (
     AuthorizationRequirement,
@@ -710,10 +710,17 @@ class AuthorizationLedger:
                     raise TypeError("facts are not a mapping")
                 facts = PitOptimizerProviderFacts(**facts_primitive)
                 reservation = reservations[str(item.get("reservation_id"))]
-                audit_trail.verify_terminal_audit_receipt(
+                budget_state = audit_trail.verify_terminal_audit_receipt(
                     receipt,
                     authorization_reservation=reservation,
                     provider_facts=facts,
+                )
+                self._require_gateway_lifecycle_commitment(
+                    records,
+                    reservation,
+                    facts,
+                    receipt,
+                    budget_state=budget_state,
                 )
             except Exception as exc:
                 raise AuthorizationError(
@@ -726,22 +733,96 @@ class AuthorizationLedger:
         receipt: TerminalAuditReceipt,
         reservation: AuthorizationCallReservation,
         provider_facts: PitOptimizerProviderFacts,
-    ) -> None:
+        *,
+        records: Sequence[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
         audit_trail = self._audit_trail
         if audit_trail is None:
             raise AuthorizationError(
                 "authorization audit trail is required for terminal receipt"
             )
         try:
-            audit_trail.verify_terminal_audit_receipt(
+            if records is None:
+                with _authorization_file_lock(self._lock_path):
+                    durable_records = self._read_records()
+            else:
+                durable_records = list(records)
+            matches = [
+                item
+                for item in durable_records
+                if item.get("record_type") == "reservation"
+                and isinstance(item.get("reservation"), dict)
+                and item["reservation"].get("reservation_id")
+                == reservation.reservation_id
+            ]
+            if len(matches) != 1:
+                raise AuthorizationError(
+                    "authorization audit reservation is absent"
+                )
+            durable_reservation = AuthorizationCallReservation(
+                **matches[0]["reservation"]
+            )
+            if durable_reservation != reservation:
+                raise AuthorizationError(
+                    "authorization audit reservation identity mismatch"
+                )
+            budget_state = audit_trail.verify_terminal_audit_receipt(
                 receipt,
-                authorization_reservation=reservation,
+                authorization_reservation=durable_reservation,
                 provider_facts=provider_facts,
             )
+            self._require_gateway_lifecycle_commitment(
+                durable_records,
+                durable_reservation,
+                provider_facts,
+                receipt,
+                budget_state=budget_state,
+            )
+            return budget_state
         except Exception as exc:
             raise AuthorizationError(
                 "authorization audit receipt cross-verification failed"
             ) from exc
+
+    def verify_terminal_audit_receipt(
+        self,
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+        receipt: TerminalAuditReceipt,
+    ) -> dict[str, object]:
+        """Authenticate terminal evidence and return only its verified budget image."""
+
+        if (
+            not isinstance(reservation, AuthorizationCallReservation)
+            or not isinstance(provider_facts, PitOptimizerProviderFacts)
+            or not isinstance(receipt, TerminalAuditReceipt)
+        ):
+            raise AuthorizationError(
+                "authorization terminal audit verification is invalid"
+            )
+        if (
+            receipt.run_manifest_sha256 != self._manifest.sha256
+            or (
+                receipt.call_index,
+                receipt.iteration,
+                receipt.role,
+                receipt.outcome,
+            )
+            != (
+                reservation.call_index,
+                reservation.iteration,
+                reservation.role,
+                provider_facts.outcome,
+            )
+        ):
+            raise AuthorizationError(
+                "authorization terminal audit receipt differs from reservation"
+            )
+        return self._cross_verify_audit_receipt(
+            receipt,
+            reservation,
+            provider_facts,
+        )
 
     def snapshot_call_plan(
         self,
@@ -1007,6 +1088,7 @@ class AuthorizationLedger:
                     receipt,
                     durable_reservation,
                     predecessor.facts,
+                    records=records,
                 )
         primitive = json.loads(
             snapshot.canonical_bytes,
@@ -1136,6 +1218,359 @@ class AuthorizationLedger:
         preimage.pop("record_sha256", None)
         return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
 
+    @staticmethod
+    def _gateway_lifecycle_base(
+        value: Mapping[str, object],
+    ) -> dict[str, object]:
+        return {
+            key: item
+            for key, item in value.items()
+            if key != "start_event_sha256"
+        }
+
+    def _parse_gateway_lifecycle(
+        self,
+        value: object,
+        *,
+        reservation: AuthorizationCallReservation,
+        lease: AuthorizationRunLease,
+    ) -> dict[str, object]:
+        expected_keys = {
+            "authorization_reservation_id",
+            "authorization_reservation_sha256",
+            "lease_id",
+            "call_plan",
+            "call_plan_sha256",
+            "run_manifest_sha256",
+            "audit_run_id",
+            "budget_reservation_id",
+            "budget_reservation_sha256",
+            "reservation_event_sha256",
+            "start_event_sha256",
+        }
+        if not isinstance(value, dict) or set(value) != expected_keys:
+            raise AuthorizationError(
+                "authorization gateway lifecycle commitment is malformed"
+            )
+        primitive = dict(value)
+        plan_primitive = primitive.get("call_plan")
+        try:
+            if not isinstance(plan_primitive, dict):
+                raise TypeError("plan is not a mapping")
+            plan = PitOptimizerCallBudget(**plan_primitive)
+            authorization_digest = _require_digest(
+                primitive.get("authorization_reservation_sha256"),
+                "authorization reservation commitment SHA-256",
+            )
+            call_plan_digest = _require_digest(
+                primitive.get("call_plan_sha256"),
+                "authorization call plan commitment SHA-256",
+            )
+            run_manifest_sha256 = _require_digest(
+                primitive.get("run_manifest_sha256"),
+                "authorization lifecycle run manifest SHA-256",
+            )
+            budget_digest = _require_digest(
+                primitive.get("budget_reservation_sha256"),
+                "authorization budget reservation commitment SHA-256",
+            )
+            reserved_digest = _require_digest(
+                primitive.get("reservation_event_sha256"),
+                "authorization reserved event commitment SHA-256",
+            )
+            started_value = primitive.get("start_event_sha256")
+            started_digest = (
+                None
+                if started_value is None
+                else _require_digest(
+                    started_value,
+                    "authorization started event commitment SHA-256",
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise AuthorizationError(
+                "authorization gateway lifecycle commitment is invalid"
+            ) from exc
+        audit_run_id = primitive.get("audit_run_id")
+        budget_reservation_id = primitive.get("budget_reservation_id")
+        if (
+            primitive.get("authorization_reservation_id")
+            != reservation.reservation_id
+            or authorization_digest
+            != hashlib.sha256(
+                _canonical_json_bytes(asdict(reservation))
+            ).hexdigest()
+            or primitive.get("lease_id") != reservation.lease_id
+            or reservation.lease_id != lease.lease_id
+            or call_plan_digest
+            != hashlib.sha256(plan.canonical_json_bytes()).hexdigest()
+            or reservation.call_index > len(self._call_plan_snapshots)
+            or plan != self._call_plan_snapshots[reservation.call_index - 1]
+            or (
+                plan.call_index,
+                plan.iteration,
+                plan.role,
+                plan.max_input_tokens + plan.max_output_tokens,
+                Decimal(str(plan.max_usd)),
+            )
+            != (
+                reservation.call_index,
+                reservation.iteration,
+                reservation.role,
+                reservation.reserved_tokens,
+                Decimal(str(reservation.reserved_usd)),
+            )
+            or run_manifest_sha256 != lease.run_manifest_sha256
+            or not isinstance(audit_run_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", audit_run_id)
+            is None
+            or audit_run_id != self._manifest.run_id
+            or not isinstance(budget_reservation_id, str)
+            or re.fullmatch(
+                r"optimizer_budget_[0-9a-f]{32}",
+                budget_reservation_id,
+            )
+            is None
+        ):
+            raise AuthorizationError(
+                "authorization gateway lifecycle commitment differs"
+            )
+        primitive["authorization_reservation_sha256"] = authorization_digest
+        primitive["call_plan_sha256"] = call_plan_digest
+        primitive["run_manifest_sha256"] = run_manifest_sha256
+        primitive["budget_reservation_sha256"] = budget_digest
+        primitive["reservation_event_sha256"] = reserved_digest
+        primitive["start_event_sha256"] = started_digest
+        return primitive
+
+    def _require_gateway_lifecycle_commitment(
+        self,
+        records: Sequence[dict[str, object]],
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+        receipt: TerminalAuditReceipt,
+        *,
+        budget_state: Mapping[str, object],
+    ) -> dict[str, object]:
+        lease_record = next(
+            (
+                item
+                for item in records
+                if item.get("record_type") == "lease_open"
+                and isinstance(item.get("lease"), dict)
+                and item["lease"].get("lease_id") == reservation.lease_id
+            ),
+            None,
+        )
+        if lease_record is None:
+            raise AuthorizationError("authorization lifecycle lease is absent")
+        try:
+            lease = AuthorizationRunLease(**lease_record["lease"])
+        except (TypeError, ValueError) as exc:
+            raise AuthorizationError(
+                "authorization lifecycle lease is invalid"
+            ) from exc
+        commitments = [
+            self._parse_gateway_lifecycle(
+                item.get("gateway_lifecycle"),
+                reservation=reservation,
+                lease=lease,
+            )
+            for item in records
+            if item.get("record_type") == "gateway_lifecycle"
+            and isinstance(item.get("gateway_lifecycle"), dict)
+            and item["gateway_lifecycle"].get(
+                "authorization_reservation_id"
+            )
+            == reservation.reservation_id
+        ]
+        started_commitments = [
+            item
+            for item in commitments
+            if item.get("start_event_sha256") is not None
+        ]
+        if provider_facts.request_started != (len(started_commitments) == 1):
+            raise AuthorizationError(
+                "authorization gateway lifecycle stage differs"
+            )
+        expected = [
+            item
+            for item in commitments
+            if (item.get("start_event_sha256") is not None)
+            is provider_facts.request_started
+        ]
+        if len(expected) != 1:
+            raise AuthorizationError(
+                "authorization gateway lifecycle commitment is absent"
+            )
+        commitment = expected[0]
+        lifecycle_digest = (
+            commitment["start_event_sha256"]
+            or commitment["reservation_event_sha256"]
+        )
+        reconciliations = budget_state.get("reconciliations")
+        budget_matches = (
+            [
+                item
+                for item in reconciliations
+                if isinstance(item, dict)
+                and isinstance(item.get("reservation"), dict)
+                and item["reservation"].get("reservation_id")
+                == commitment["budget_reservation_id"]
+            ]
+            if isinstance(reconciliations, list)
+            else []
+        )
+        budget_reservation = (
+            budget_matches[0]["reservation"]
+            if len(budget_matches) == 1
+            else None
+        )
+        if (
+            provider_facts.audit_sha256 != lifecycle_digest
+            or receipt.audit_run_id != commitment["audit_run_id"]
+            or receipt.run_manifest_sha256
+            != commitment["run_manifest_sha256"]
+            or (
+                receipt.call_index,
+                receipt.iteration,
+                receipt.role,
+            )
+            != (
+                reservation.call_index,
+                reservation.iteration,
+                reservation.role,
+            )
+            or not isinstance(budget_reservation, dict)
+            or hashlib.sha256(
+                _canonical_json_bytes(budget_reservation)
+            ).hexdigest()
+            != commitment["budget_reservation_sha256"]
+        ):
+            raise AuthorizationError(
+                "authorization gateway lifecycle commitment differs"
+            )
+        return commitment
+
+    def _bind_gateway_lifecycle_commitment(self, lifecycle: object) -> None:
+        """Durably bind one gateway-owned reserved/started transition."""
+
+        from agent_loop import (
+            BudgetLedger,
+            OpenRouterGateway,
+            _PitOptimizerGatewayLifecycle,
+        )
+
+        if not isinstance(lifecycle, _PitOptimizerGatewayLifecycle):
+            raise AuthorizationError(
+                "authorization gateway lifecycle capability is invalid"
+            )
+        gateway = lifecycle.gateway
+        if (
+            not isinstance(gateway, OpenRouterGateway)
+            or lifecycle.authorization_ledger is not self
+            or lifecycle.reserved_event_sha256 is None
+        ):
+            raise AuthorizationError(
+                "authorization gateway lifecycle capability is invalid"
+            )
+        gateway._require_pit_optimizer_lifecycle(lifecycle)
+        plan = self.snapshot_call_plan(lifecycle.call_budget)
+        reservation = lifecycle.authorization_reservation
+        if not isinstance(reservation, AuthorizationCallReservation):
+            raise AuthorizationError(
+                "authorization gateway lifecycle reservation is invalid"
+            )
+        budget_primitive = BudgetLedger._pit_optimizer_reservation_primitive(
+            lifecycle.budget_reservation
+        )
+        commitment = {
+            "authorization_reservation_id": reservation.reservation_id,
+            "authorization_reservation_sha256": hashlib.sha256(
+                _canonical_json_bytes(asdict(reservation))
+            ).hexdigest(),
+            "lease_id": reservation.lease_id,
+            "call_plan": plan.to_primitive(),
+            "call_plan_sha256": hashlib.sha256(
+                plan.canonical_json_bytes()
+            ).hexdigest(),
+            "run_manifest_sha256": lifecycle.authorization_lease.run_manifest_sha256,
+            "audit_run_id": lifecycle.audit_trail.run_id,
+            "budget_reservation_id": lifecycle.budget_reservation.reservation_id,
+            "budget_reservation_sha256": hashlib.sha256(
+                _canonical_json_bytes(budget_primitive)
+            ).hexdigest(),
+            "reservation_event_sha256": lifecycle.reserved_event_sha256,
+            "start_event_sha256": lifecycle.started_event_sha256,
+        }
+        with _authorization_file_lock(self._lock_path):
+            records = self._read_records()
+            reservation_record = next(
+                (
+                    item
+                    for item in records
+                    if item.get("record_type") == "reservation"
+                    and isinstance(item.get("reservation"), dict)
+                    and item["reservation"].get("reservation_id")
+                    == reservation.reservation_id
+                ),
+                None,
+            )
+            try:
+                if reservation_record is None:
+                    raise TypeError("reservation is absent")
+                stored_reservation = AuthorizationCallReservation(
+                    **reservation_record["reservation"]
+                )
+            except (TypeError, ValueError) as exc:
+                raise AuthorizationError(
+                    "authorization gateway lifecycle reservation is invalid"
+                ) from exc
+            if stored_reservation != reservation:
+                raise AuthorizationError(
+                    "authorization gateway lifecycle reservation differs"
+                )
+            existing = [
+                item["gateway_lifecycle"]
+                for item in records
+                if item.get("record_type") == "gateway_lifecycle"
+                and isinstance(item.get("gateway_lifecycle"), dict)
+                and item["gateway_lifecycle"].get(
+                    "authorization_reservation_id"
+                )
+                == reservation.reservation_id
+            ]
+            if commitment in existing:
+                return
+            same_stage = [
+                item
+                for item in existing
+                if (item.get("start_event_sha256") is not None)
+                is (commitment["start_event_sha256"] is not None)
+            ]
+            if same_stage:
+                raise AuthorizationError(
+                    "authorization gateway lifecycle commitment changed"
+                )
+            if commitment["start_event_sha256"] is not None and not any(
+                self._gateway_lifecycle_base(item)
+                == self._gateway_lifecycle_base(commitment)
+                and item.get("start_event_sha256") is None
+                for item in existing
+            ):
+                raise AuthorizationError(
+                    "authorization reserved lifecycle commitment is absent"
+                )
+            self._append_records(
+                records,
+                [
+                    {
+                        "record_type": "gateway_lifecycle",
+                        "gateway_lifecycle": commitment,
+                    }
+                ],
+            )
+
     def _read_records(self) -> list[dict[str, object]]:
         if not self._path.exists():
             return []
@@ -1153,6 +1588,7 @@ class AuthorizationLedger:
         active_reservations: dict[str, AuthorizationCallReservation] = {}
         reconciled_reservations: set[str] = set()
         closed_leases: set[str] = set()
+        gateway_lifecycles: dict[str, list[dict[str, object]]] = {}
         for index, line in enumerate(raw.splitlines(keepends=True), start=1):
             try:
                 value = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
@@ -1274,6 +1710,57 @@ class AuthorizationLedger:
                 ):
                     raise AuthorizationError("authorization reservation ID is repeated")
                 active_reservations[reservation.lease_id] = reservation
+            elif record_type == "gateway_lifecycle":
+                if set(value) != expected_common | {"gateway_lifecycle"}:
+                    raise AuthorizationError(
+                        "authorization gateway lifecycle record keys are invalid"
+                    )
+                primitive = value.get("gateway_lifecycle")
+                reservation_id = (
+                    primitive.get("authorization_reservation_id")
+                    if isinstance(primitive, dict)
+                    else None
+                )
+                match = next(
+                    (
+                        (lease_id, reservation)
+                        for lease_id, reservation in active_reservations.items()
+                        if reservation.reservation_id == reservation_id
+                    ),
+                    None,
+                )
+                if match is None:
+                    raise AuthorizationError(
+                        "authorization gateway lifecycle reservation is absent"
+                    )
+                lease_id, reservation = match
+                commitment = self._parse_gateway_lifecycle(
+                    primitive,
+                    reservation=reservation,
+                    lease=leases[lease_id],
+                )
+                existing = gateway_lifecycles.setdefault(
+                    reservation.reservation_id,
+                    [],
+                )
+                started = commitment.get("start_event_sha256") is not None
+                if any(
+                    (item.get("start_event_sha256") is not None) is started
+                    for item in existing
+                ):
+                    raise AuthorizationError(
+                        "authorization gateway lifecycle stage is repeated"
+                    )
+                if started and not any(
+                    self._gateway_lifecycle_base(item)
+                    == self._gateway_lifecycle_base(commitment)
+                    and item.get("start_event_sha256") is None
+                    for item in existing
+                ):
+                    raise AuthorizationError(
+                        "authorization reserved lifecycle commitment is absent"
+                    )
+                existing.append(commitment)
             elif record_type == "reconciliation":
                 expected = expected_common | {
                     "reservation_id",
@@ -1369,6 +1856,44 @@ class AuthorizationLedger:
                     ):
                         raise AuthorizationError(
                             "authorization terminal audit receipt differs from reservation"
+                        )
+                    commitments = gateway_lifecycles.get(
+                        reservation.reservation_id,
+                        [],
+                    )
+                    started_commitments = [
+                        item
+                        for item in commitments
+                        if item.get("start_event_sha256") is not None
+                    ]
+                    if facts.request_started != (len(started_commitments) == 1):
+                        raise AuthorizationError(
+                            "authorization gateway lifecycle stage differs"
+                        )
+                    expected_commitments = [
+                        item
+                        for item in commitments
+                        if (item.get("start_event_sha256") is not None)
+                        is facts.request_started
+                    ]
+                    if len(expected_commitments) != 1:
+                        raise AuthorizationError(
+                            "authorization gateway lifecycle commitment is absent"
+                        )
+                    commitment = expected_commitments[0]
+                    if (
+                        facts.audit_sha256
+                        != (
+                            commitment["start_event_sha256"]
+                            or commitment["reservation_event_sha256"]
+                        )
+                        or replayed_receipt.audit_run_id
+                        != commitment["audit_run_id"]
+                        or replayed_receipt.run_manifest_sha256
+                        != commitment["run_manifest_sha256"]
+                    ):
+                        raise AuthorizationError(
+                            "authorization gateway lifecycle commitment differs"
                         )
                 if not facts.request_started:
                     expected_charge = (0, 0, Decimal("0"), "before_send_release")
@@ -2439,6 +2964,7 @@ class AuthorizationLedger:
                     terminal_audit_receipt,
                     reservation,
                     provider_facts,
+                    records=records,
                 )
             try:
                 terminal_audit_sha256 = _require_digest(

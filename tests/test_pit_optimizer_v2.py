@@ -3761,6 +3761,69 @@ def _task6_gateway_context(
     )
 
 
+def _task6_budget_image(budget: object) -> tuple[object, ...]:
+    """Capture every mutable BudgetLedger aggregate/map used by restart recovery."""
+
+    return (
+        budget.calls,
+        budget.prompt_tokens,
+        budget.completion_tokens,
+        budget.total_tokens,
+        budget.reserved_tokens,
+        budget.reserved_usd,
+        budget._reserved_usd_decimal,
+        budget.spent_usd,
+        budget.authoritative_usd,
+        budget.retained_reservation_usd,
+        budget.retained_reservation_tokens,
+        budget.incomplete_accounting_calls,
+        dict(budget._pit_optimizer_reservations),
+        dict(budget._pit_optimizer_reconciliations),
+    )
+
+
+def _task6_crash_after_terminal_audit(
+    tmp_path: Path,
+    manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    grant_id: str,
+) -> tuple[object, ...]:
+    """Publish genuine fake terminal evidence, then interrupt authorization append."""
+
+    context = _task6_gateway_context(
+        tmp_path,
+        manifest,
+        grant_id=grant_id,
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+    )
+    authorization, _ledger_path, lease, pricing, _budget, _audit, _client, gateway = (
+        context
+    )
+    monkeypatch.setattr(
+        authorization,
+        "reconcile_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("authorization-publication-crash")
+        ),
+    )
+    plan = manifest.call_budgets[0]
+    role_input = _task6_manifest_investigator_input(manifest)
+    authorization.bind_controller_role_input(role_input, plan)
+    with pytest.raises(KeyboardInterrupt, match="authorization-publication-crash"):
+        gateway.request_pit_optimizer_once(
+            "investigator",
+            role_input,
+            _task6_investigator_parser,
+            call_budget=plan,
+            authorization_lease=lease,
+            frozen_pricing=pricing,
+            wall_deadline=10.0,
+            monotonic=lambda: 1.0,
+        )
+    return context
+
+
 def _task6_bind_role_input(
     authorization: object,
     plan: contract.PitOptimizerCallBudget,
@@ -4865,11 +4928,11 @@ def test_pit_optimizer_v2_keyboard_interrupt_finalizes_by_provider_phase(
             if phase == "reservation_audit"
             else "provider_call_started"
         )
-        original_append = audit.append_event
+        original_append = audit._append_pit_optimizer_lifecycle_event
         interrupted = False
 
         def interrupt_one_audit(
-            state: object,
+            lifecycle: object,
             event: str,
             details: dict[str, object] | None = None,
         ) -> dict[str, object]:
@@ -4877,9 +4940,13 @@ def test_pit_optimizer_v2_keyboard_interrupt_finalizes_by_provider_phase(
             if event == target_event and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt(phase)
-            return original_append(state, event, details)
+            return original_append(lifecycle, event, details)
 
-        monkeypatch.setattr(audit, "append_event", interrupt_one_audit)
+        monkeypatch.setattr(
+            audit,
+            "_append_pit_optimizer_lifecycle_event",
+            interrupt_one_audit,
+        )
     elif phase == "sdk_construction":
         monkeypatch.setattr(
             gateway,
@@ -5287,7 +5354,7 @@ def test_pit_optimizer_v2_accepted_publication_is_not_retroactively_cancelled(
     assert audit._events[-1]["event"] == "provider_call_accepted"
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
     assert [record["record_type"] for record in records[-3:]] == [
-        "reservation",
+        "gateway_lifecycle",
         "reconciliation",
         "reservation",
     ]
@@ -5324,19 +5391,23 @@ def test_pit_optimizer_v2_deadline_expiry_after_start_intent_sends_nothing(
         outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
     )
     clock = SimpleNamespace(now=1.0)
-    original_append = audit.append_event
+    original_append = audit._append_pit_optimizer_lifecycle_event
 
     def advance_after_start(
-        state: object,
+        lifecycle: object,
         event: str,
         details: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        result = original_append(state, event, details)
+        result = original_append(lifecycle, event, details)
         if event == "provider_call_started":
             clock.now = 11.0
         return result
 
-    monkeypatch.setattr(audit, "append_event", advance_after_start)
+    monkeypatch.setattr(
+        audit,
+        "_append_pit_optimizer_lifecycle_event",
+        advance_after_start,
+    )
 
     with pytest.raises(agent_loop.BudgetExceededError, match="wall deadline"):
         gateway.request_pit_optimizer_once(
@@ -5499,10 +5570,31 @@ def test_pit_optimizer_v2_gateway_sends_one_all_r1_call_without_healing(
     assert sent["stream"] is False
     assert sent["extra_body"] == {"provider": {"require_parameters": True}}
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
-    assert [item["record_type"] for item in records[-2:]] == [
+    assert [item["record_type"] for item in records[-4:]] == [
         "reservation",
+        "gateway_lifecycle",
+        "gateway_lifecycle",
         "reconciliation",
     ]
+    reserved_commitment, started_commitment = (
+        item["gateway_lifecycle"]
+        for item in records
+        if item["record_type"] == "gateway_lifecycle"
+    )
+    assert reserved_commitment["start_event_sha256"] is None
+    assert started_commitment["start_event_sha256"] == audit._events[1][
+        "event_sha256"
+    ]
+    assert {
+        reserved_commitment["authorization_reservation_id"],
+        started_commitment["authorization_reservation_id"],
+    } == {
+        next(
+            item["reservation"]["reservation_id"]
+            for item in records
+            if item["record_type"] == "reservation"
+        )
+    }
     assert [item["event"] for item in audit._events] == [
         "provider_call_reserved",
         "provider_call_started",
@@ -5683,6 +5775,330 @@ def test_pit_optimizer_v2_public_audit_writer_cannot_mint_a_predecessor(
 
 
 @pytest.mark.parametrize(
+    "name",
+    (
+        "provider-call",
+        "provider-call-0001",
+        "provider-budget",
+        "provider-budget-0001",
+        "optimizer-receipt",
+        "optimizer-receipt-0001",
+    ),
+)
+def test_pit_optimizer_v2_generic_audit_namespace_is_reserved(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    """Break caught: a generic JSON writer could replace optimizer-owned evidence."""
+    import agent_loop
+
+    audit = agent_loop.AuditTrail(
+        tmp_path / f"audit-namespace-{hashlib.sha256(name.encode()).hexdigest()[:8]}",
+        "pit-namespace-reserved",
+    )
+
+    with pytest.raises(agent_loop.AuditError, match="optimizer.*reserved"):
+        audit.write_handoff_metadata({"caller_built": True}, name=name)
+
+    assert not (audit.run_root / f"{name}.json").exists()
+    assert audit._events == []
+
+
+@pytest.mark.parametrize(
+    ("state_name", "event"),
+    (
+        ("CALL_INVESTIGATOR", "ordinary_event"),
+        ("PREPARE", "provider_call_reserved"),
+        ("PREPARE", "provider_call_started"),
+        ("PREPARE", "provider_call_accepted"),
+        ("PREPARE", "provider_call_rejected"),
+        ("PREPARE", "provider_call_failed"),
+    ),
+)
+def test_pit_optimizer_v2_public_append_event_cannot_publish_lifecycle(
+    tmp_path: Path,
+    state_name: str,
+    event: str,
+) -> None:
+    """Break caught: generic events could self-authenticate an optimizer lifecycle."""
+    import agent_loop
+
+    audit = agent_loop.AuditTrail(
+        tmp_path / f"audit-event-{hashlib.sha256(event.encode()).hexdigest()[:8]}",
+        "pit-event-reserved",
+    )
+
+    with pytest.raises(agent_loop.AuditError, match="optimizer.*reserved"):
+        audit.append_event(
+            getattr(agent_loop.LoopState, state_name),
+            event,
+            {"call_index": 1, "iteration": 1, "role": "investigator"},
+        )
+
+    assert audit._events == []
+    assert not audit.events_path.exists()
+
+
+def test_pit_optimizer_v2_supported_public_audit_attack_has_zero_author_effects(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: public mappings/events minted call 1 and unlocked a paid author."""
+    import agent_loop
+    from core.pit_optimizer_authorization import (
+        AuthorizationError,
+        PitOptimizerRoleCall,
+    )
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-supported-public-attack",
+        outcomes=[
+            _task6_fake_response(
+                _canonical_text(
+                    {
+                        **_author_payload(),
+                        "unified_diff": (
+                            "--- a/core/strategy_policy/entry.py\n"
+                            "+++ b/core/strategy_policy/entry.py\n"
+                            "@@ -2,2 +2,2 @@\n"
+                            " def evaluate_entry(snapshot):\n"
+                            "-    return None\n"
+                            "+    return True\n"
+                        ),
+                    }
+                )
+            )
+        ],
+    )
+    authorization_reservation = authorization.reserve_call(lease, plan)
+    budget_reservation = budget.reserve_pit_optimizer(
+        rendered_prompt_bytes=10,
+        max_output_tokens=plan.max_output_tokens,
+        conservative_cost_usd=Decimal("0.001"),
+    )
+    usage = agent_loop.Usage(
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
+        cost_usd=0.001,
+    )
+    budget.reconcile_pit_optimizer(
+        budget_reservation,
+        usage,
+        request_started=True,
+    )
+    snapshot = agent_loop.BudgetSnapshot(
+        api_calls=1,
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
+        reserved_tokens=150,
+        reserved_usd=0.001,
+        spent_usd=0.001,
+        authoritative_usd=0.001,
+        retained_reservation_usd=0.0,
+        retained_reservation_tokens=0,
+        incomplete_accounting_calls=0,
+        accounting_basis="authoritative",
+    )
+    provider_record = agent_loop.ProviderCallRecord(
+        schema_version=2,
+        call_index=plan.call_index,
+        iteration=plan.iteration,
+        role=plan.role,
+        api_backend="openrouter",
+        requested_model=plan.model,
+        returned_model=plan.model,
+        outcome="accepted",
+        finish_reason="stop",
+        response_schema_valid=True,
+        accounting_complete=True,
+        prompt_tokens=100,
+        cached_tokens=None,
+        completion_tokens=50,
+        reasoning_tokens=None,
+        total_tokens=150,
+        cost_usd=0.001,
+        accounting_source="inline",
+        request_started=True,
+        response_received=True,
+        locally_accounted=True,
+        authoritative_spend_known=True,
+        maximum_exposure_usd=authorization_reservation.reserved_usd,
+        maximum_exposure_tokens=authorization_reservation.reserved_tokens,
+        exposure_basis="authoritative",
+        ledger_snapshot=snapshot,
+        frozen_pricing_sha256=pricing.pricing_sha256,
+    )
+    budget_reservation_primitive = {
+        "reservation_id": budget_reservation.reservation_id,
+        "amount_usd": str(budget_reservation.amount_usd),
+        "prompt_bytes": budget_reservation.prompt_bytes,
+        "completion_allowance": budget_reservation.completion_allowance,
+        "token_upper_bound": budget_reservation.token_upper_bound,
+    }
+    budget_state = {
+        "schema_version": 1,
+        "run_manifest_sha256": v2_manifest.sha256,
+        "audit_run_id": audit.run_id,
+        "limits": {
+            "max_usd": budget.max_usd,
+            "max_calls": budget.max_calls,
+            "max_tokens": budget.max_tokens,
+        },
+        "snapshot": asdict(snapshot),
+        "reserved_usd_decimal": "0.001",
+        "active_reservations": [],
+        "reconciliations": [
+            {
+                "reservation": budget_reservation_primitive,
+                "usage": asdict(usage),
+                "request_started": True,
+            }
+        ],
+    }
+    payload_sha256 = hashlib.sha256(
+        _investigator_artifact().canonical_json_bytes()
+    ).hexdigest()
+    attack_error: Exception | None = None
+    try:
+        provider_path = audit.write_handoff_metadata(
+            asdict(provider_record),
+            name="provider-call-0001",
+        )
+        budget_path = audit.write_handoff_metadata(
+            budget_state,
+            name="provider-budget-0001",
+        )
+        budget_reservation_sha256 = hashlib.sha256(
+            _canonical_text(budget_reservation_primitive).encode("utf-8")
+        ).hexdigest()
+        reserved_details = {
+            "audit_run_id": audit.run_id,
+            "run_manifest_sha256": v2_manifest.sha256,
+            "call_index": plan.call_index,
+            "iteration": plan.iteration,
+            "role": plan.role,
+            "authorization_reservation_id": (
+                authorization_reservation.reservation_id
+            ),
+            "budget_reservation_id": budget_reservation.reservation_id,
+            "budget_reservation_sha256": budget_reservation_sha256,
+        }
+        reserved = audit.append_event(
+            agent_loop.LoopState.CALL_INVESTIGATOR,
+            "provider_call_reserved",
+            reserved_details,
+        )
+        started = audit.append_event(
+            agent_loop.LoopState.CALL_INVESTIGATOR,
+            "provider_call_started",
+            {
+                **reserved_details,
+                "reservation_event_sha256": reserved["event_sha256"],
+            },
+        )
+        terminal_details = {
+            "call_index": plan.call_index,
+            "role": plan.role,
+            "outcome": "accepted",
+            "artifact_sha256": hashlib.sha256(provider_path.read_bytes()).hexdigest(),
+            "payload_sha256": payload_sha256,
+            "run_manifest_sha256": v2_manifest.sha256,
+            "lifecycle_audit_sha256": started["event_sha256"],
+            "iteration": plan.iteration,
+            "request_started": True,
+            "response_received": True,
+            "locally_accounted": True,
+            "authoritative_spend_known": True,
+            "exposure_basis": "authoritative",
+            "maximum_exposure_usd": authorization_reservation.reserved_usd,
+            "maximum_exposure_tokens": authorization_reservation.reserved_tokens,
+            "frozen_pricing_sha256": pricing.pricing_sha256,
+            "ledger_snapshot": asdict(snapshot),
+            "audit_run_id": audit.run_id,
+            "terminal_code": None,
+            "authorization_reservation_id": (
+                authorization_reservation.reservation_id
+            ),
+            "budget_reservation_id": budget_reservation.reservation_id,
+            "budget_reservation_sha256": budget_reservation_sha256,
+            "reservation_event_sha256": reserved["event_sha256"],
+            "start_event_sha256": started["event_sha256"],
+            "response_processed": True,
+            "budget_recovery_sha256": hashlib.sha256(
+                budget_path.read_bytes()
+            ).hexdigest(),
+        }
+        audit.append_event(
+            agent_loop.LoopState.CALL_INVESTIGATOR,
+            "provider_call_accepted",
+            terminal_details,
+        )
+        replayed_facts, receipt, _state = audit.recover_pit_optimizer_terminal(
+            run_manifest_sha256=v2_manifest.sha256,
+            call_budget=plan,
+        )
+        authorization.reconcile_call(
+            authorization_reservation,
+            replayed_facts,
+            terminal_audit_receipt=receipt,
+        )
+        predecessor = PitOptimizerRoleCall(
+            plan,
+            _investigator_artifact(),
+            replayed_facts,
+        )
+        author_input = _task6_manifest_author_input(v2_manifest)
+        authorization.bind_controller_role_input(
+            author_input,
+            v2_manifest.call_budgets[1],
+            predecessor_calls=(predecessor,),
+        )
+        gateway.request_pit_optimizer_once(
+            "author",
+            author_input,
+            lambda raw: contract.AuthorArtifact.from_json(
+                raw,
+                max_diff_bytes=8 * 1024,
+                max_total_bytes=16 * 1024,
+            ),
+            call_budget=v2_manifest.call_budgets[1],
+            authorization_lease=lease,
+            frozen_pricing=pricing,
+            wall_deadline=10.0,
+            monotonic=lambda: 1.0,
+        )
+    except (agent_loop.AuditError, AuthorizationError) as exc:
+        attack_error = exc
+
+    assert attack_error is not None
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    assert not any(item["record_type"] == "reconciliation" for item in records)
+    assert not any(
+        item["record_type"] == "reservation"
+        and item["reservation"]["call_index"] == 2
+        for item in records
+    )
+    assert budget.calls == 1
+    assert len(budget._pit_optimizer_reconciliations) == 1
+    assert audit._events == []
+    assert client.completions.calls == []
+
+
+@pytest.mark.parametrize(
     ("receipt_field", "tampered_value", "grant_id"),
     (
         ("provider_record_sha256", "f" * 64, "grant-tamper-provider"),
@@ -5739,12 +6155,12 @@ def test_pit_optimizer_v2_replayed_receipt_is_cross_verified_against_audit(
         )
     )
 
-    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
-    reopened_audit = agent_loop.AuditTrail.open_existing(
-        audit.artifact_root,
-        audit.run_id,
-    )
-    with pytest.raises(AuthorizationError, match="audit"):
+    with pytest.raises(AuthorizationError, match="audit|lifecycle"):
+        reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+        reopened_audit = agent_loop.AuditTrail.open_existing(
+            audit.artifact_root,
+            audit.run_id,
+        )
         agent_loop.OpenRouterGateway(
             client=client,
             pricing_loader=lambda _model: pytest.fail("replay loaded pricing"),
@@ -5794,15 +6210,29 @@ def test_pit_optimizer_v2_recovery_rejects_post_terminal_retry_event(
         wall_deadline=10.0,
         monotonic=lambda: 1.0,
     )
-    audit.append_event(
-        agent_loop.LoopState.CALL_INVESTIGATOR,
-        "provider_call_started",
-        {
+    prior = audit._events[-1]
+    core = {
+        "sequence": prior["sequence"] + 1,
+        "timestamp_utc": prior["timestamp_utc"],
+        "state": agent_loop.LoopState.CALL_INVESTIGATOR.value,
+        "event": "provider_call_started",
+        "details": {
             "call_index": 1,
             "iteration": 1,
             "role": "investigator",
             "reservation_event_sha256": audit._events[0]["event_sha256"],
         },
+        "previous_sha256": prior["event_sha256"],
+    }
+    retry = {
+        **core,
+        "event_sha256": hashlib.sha256(
+            _canonical_text(core).encode("utf-8")
+        ).hexdigest(),
+    }
+    audit.events_path.write_bytes(
+        audit.events_path.read_bytes()
+        + (_canonical_text(retry) + "\n").encode("utf-8")
     )
 
     reopened = agent_loop.AuditTrail.open_existing(audit.artifact_root, audit.run_id)
@@ -6055,6 +6485,449 @@ def test_pit_optimizer_v2_fresh_restart_preserves_cancelled_terminal_code(
     assert client.completions.calls == []
 
 
+def test_pit_optimizer_v2_recovery_authenticates_before_budget_restore(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: rejected authorization evidence first mutated a fresh budget."""
+    import agent_loop
+    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_crash_after_terminal_audit(
+        tmp_path,
+        v2_manifest,
+        monkeypatch,
+        grant_id="grant-verify-before-restore",
+    )
+    provider_path = audit.run_root / "provider-call-0001.json"
+    budget_path = audit.run_root / "provider-budget-0001.json"
+    genuine_provider = provider_path.read_bytes()
+    genuine_budget = budget_path.read_bytes()
+    genuine_events = audit.events_path.read_bytes()
+
+    provider = json.loads(genuine_provider)
+    changed_snapshot = {
+        **provider["ledger_snapshot"],
+        "prompt_tokens": 120,
+        "completion_tokens": 60,
+        "total_tokens": 180,
+        "reserved_tokens": 180,
+        "reserved_usd": 0.002,
+        "spent_usd": 0.002,
+        "authoritative_usd": 0.002,
+    }
+    provider.update(
+        {
+            "prompt_tokens": 120,
+            "completion_tokens": 60,
+            "total_tokens": 180,
+            "cost_usd": 0.002,
+            "ledger_snapshot": changed_snapshot,
+        }
+    )
+    changed_provider = (_canonical_text(provider) + "\n").encode("utf-8")
+    provider_path.write_bytes(changed_provider)
+
+    recovery = json.loads(genuine_budget)
+    recovery["snapshot"] = changed_snapshot
+    recovery["reserved_usd_decimal"] = "0.002"
+    recovery["reconciliations"][0]["usage"].update(
+        {
+            "prompt_tokens": 120,
+            "completion_tokens": 60,
+            "total_tokens": 180,
+            "cost_usd": 0.002,
+        }
+    )
+    changed_budget = (_canonical_text(recovery) + "\n").encode("utf-8")
+    budget_path.write_bytes(changed_budget)
+
+    wrong_reservation_id = "reservation_" + ("f" * 32)
+    events = [json.loads(line) for line in genuine_events.splitlines()]
+    previous = "0" * 64
+    reserved_digest = ""
+    started_digest = ""
+    for event in events:
+        event["previous_sha256"] = previous
+        details = dict(event["details"])
+        details["authorization_reservation_id"] = wrong_reservation_id
+        if event["event"] == "provider_call_started":
+            details["reservation_event_sha256"] = reserved_digest
+        elif event["event"] == "provider_call_accepted":
+            details.update(
+                {
+                    "artifact_sha256": hashlib.sha256(changed_provider).hexdigest(),
+                    "budget_recovery_sha256": hashlib.sha256(changed_budget).hexdigest(),
+                    "ledger_snapshot": changed_snapshot,
+                    "reservation_event_sha256": reserved_digest,
+                    "start_event_sha256": started_digest,
+                    "lifecycle_audit_sha256": started_digest,
+                }
+            )
+        event["details"] = details
+        core = {key: value for key, value in event.items() if key != "event_sha256"}
+        digest = hashlib.sha256(_canonical_text(core).encode("utf-8")).hexdigest()
+        event["event_sha256"] = digest
+        previous = digest
+        if event["event"] == "provider_call_reserved":
+            reserved_digest = digest
+        elif event["event"] == "provider_call_started":
+            started_digest = digest
+    audit.events_path.write_bytes(
+        b"".join(
+            (_canonical_text(event) + "\n").encode("utf-8")
+            for event in events
+        )
+    )
+
+    audit_root = audit.artifact_root
+    audit_run_id = audit.run_id
+    del gateway, budget, audit, authorization, pricing
+    tampered_audit = agent_loop.AuditTrail.open_existing(audit_root, audit_run_id)
+    tampered_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    fresh_budget = agent_loop.BudgetLedger(
+        max_usd=1.0,
+        max_calls=6,
+        max_tokens=448_000,
+    )
+    zero_image = _task6_budget_image(fresh_budget)
+    restarted = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=fresh_budget,
+        authorization_ledger=tampered_authorization,
+        audit_trail=tampered_audit,
+        max_attempts=1,
+    )
+
+    with pytest.raises((agent_loop.AuditError, AuthorizationError)):
+        restarted.recover_pit_optimizer_finalization(
+            authorization_lease=lease,
+            call_budget=plan,
+        )
+    assert _task6_budget_image(fresh_budget) == zero_image
+
+    provider_path.write_bytes(genuine_provider)
+    budget_path.write_bytes(genuine_budget)
+    tampered_audit.events_path.write_bytes(genuine_events)
+    genuine_audit = agent_loop.AuditTrail.open_existing(audit_root, audit_run_id)
+    genuine_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    retry = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=fresh_budget,
+        authorization_ledger=genuine_authorization,
+        audit_trail=genuine_audit,
+        max_attempts=1,
+    )
+    retry.recover_pit_optimizer_finalization(
+        authorization_lease=lease,
+        call_budget=plan,
+    )
+
+    assert fresh_budget.calls == 1
+    assert fresh_budget.total_tokens == 150
+    assert len(client.completions.calls) == 1
+    assert genuine_authorization.reserve_call(
+        lease,
+        v2_manifest.call_budgets[1],
+    ).call_index == 2
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ("provider-call-0001.json", "provider-budget-0001.json"),
+)
+def test_pit_optimizer_v2_recovery_rejects_linked_protected_artifact(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+) -> None:
+    """Break caught: a hardlink kept a second write path to trusted evidence."""
+    import agent_loop
+    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_crash_after_terminal_audit(
+        tmp_path,
+        v2_manifest,
+        monkeypatch,
+        grant_id=f"grant-hardlink-{artifact_name[:8]}",
+    )
+    protected_path = audit.run_root / artifact_name
+    os.link(protected_path, tmp_path / f"external-{artifact_name}")
+    audit_root = audit.artifact_root
+    audit_run_id = audit.run_id
+    del gateway, budget, audit, authorization, pricing
+
+    reopened_audit = agent_loop.AuditTrail.open_existing(audit_root, audit_run_id)
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    fresh_budget = agent_loop.BudgetLedger(
+        max_usd=1.0,
+        max_calls=6,
+        max_tokens=448_000,
+    )
+    zero_image = _task6_budget_image(fresh_budget)
+    restarted = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=fresh_budget,
+        authorization_ledger=reopened_authorization,
+        audit_trail=reopened_audit,
+        max_attempts=1,
+    )
+
+    with pytest.raises(agent_loop.AuditError, match="private regular file"):
+        restarted.recover_pit_optimizer_finalization(
+            authorization_lease=lease,
+            call_budget=plan,
+        )
+    assert _task6_budget_image(fresh_budget) == zero_image
+    with pytest.raises(AuthorizationError, match="active"):
+        reopened_authorization.reserve_call(
+            lease,
+            v2_manifest.call_budgets[1],
+        )
+
+
+def test_pit_optimizer_v2_recovery_rejects_reparse_protected_artifact(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: protected replay omitted the Windows reparse-point guard."""
+    import agent_loop
+    from core.pit_optimizer_authorization import AuthorizationLedger
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_crash_after_terminal_audit(
+        tmp_path,
+        v2_manifest,
+        monkeypatch,
+        grant_id="grant-reparse-evidence",
+    )
+    protected_path = audit.run_root / "provider-call-0001.json"
+    audit_root = audit.artifact_root
+    audit_run_id = audit.run_id
+    del gateway, budget, audit, authorization, pricing
+    reopened_audit = agent_loop.AuditTrail.open_existing(audit_root, audit_run_id)
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    fresh_budget = agent_loop.BudgetLedger(
+        max_usd=1.0,
+        max_calls=6,
+        max_tokens=448_000,
+    )
+    zero_image = _task6_budget_image(fresh_budget)
+    restarted = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=fresh_budget,
+        authorization_ledger=reopened_authorization,
+        audit_trail=reopened_audit,
+        max_attempts=1,
+    )
+    original_reparse_check = agent_loop._has_reparse_point
+    monkeypatch.setattr(
+        agent_loop,
+        "_has_reparse_point",
+        lambda path: Path(path) == protected_path or original_reparse_check(path),
+    )
+
+    with pytest.raises(agent_loop.AuditError, match="private regular file"):
+        restarted.recover_pit_optimizer_finalization(
+            authorization_lease=lease,
+            call_budget=plan,
+        )
+    assert _task6_budget_image(fresh_budget) == zero_image
+
+
+def test_pit_optimizer_v2_recovery_hashes_the_same_protected_bytes_it_parses(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: provider JSON was parsed and hashed through separate opens."""
+    import agent_loop
+    from core.pit_optimizer_authorization import AuthorizationLedger
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_crash_after_terminal_audit(
+        tmp_path,
+        v2_manifest,
+        monkeypatch,
+        grant_id="grant-single-open-evidence",
+    )
+    provider_path = audit.run_root / "provider-call-0001.json"
+    original_provider = provider_path.read_bytes()
+    swapped_provider_value = json.loads(original_provider)
+    swapped_provider_value["cached_tokens"] = 0
+    swapped_provider = (
+        _canonical_text(swapped_provider_value) + "\n"
+    ).encode("utf-8")
+    swapped_digest = hashlib.sha256(swapped_provider).hexdigest()
+    events = [json.loads(line) for line in audit.events_path.read_bytes().splitlines()]
+    terminal = events[-1]
+    terminal["details"]["artifact_sha256"] = swapped_digest
+    terminal_core = {
+        key: value for key, value in terminal.items() if key != "event_sha256"
+    }
+    terminal["event_sha256"] = hashlib.sha256(
+        _canonical_text(terminal_core).encode("utf-8")
+    ).hexdigest()
+    audit.events_path.write_bytes(
+        b"".join(
+            (_canonical_text(event) + "\n").encode("utf-8")
+            for event in events
+        )
+    )
+    audit_root = audit.artifact_root
+    audit_run_id = audit.run_id
+    del gateway, budget, audit, authorization, pricing
+    reopened_audit = agent_loop.AuditTrail.open_existing(audit_root, audit_run_id)
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    fresh_budget = agent_loop.BudgetLedger(
+        max_usd=1.0,
+        max_calls=6,
+        max_tokens=448_000,
+    )
+    restarted = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=fresh_budget,
+        authorization_ledger=reopened_authorization,
+        audit_trail=reopened_audit,
+        max_attempts=1,
+    )
+    original_file_sha256 = agent_loop._file_sha256
+
+    def swap_before_second_open(path: Path) -> str:
+        if Path(path) == provider_path:
+            provider_path.write_bytes(swapped_provider)
+            return swapped_digest
+        return original_file_sha256(path)
+
+    monkeypatch.setattr(agent_loop, "_file_sha256", swap_before_second_open)
+
+    with pytest.raises(agent_loop.AuditError, match="evidence differs"):
+        restarted.recover_pit_optimizer_finalization(
+            authorization_lease=lease,
+            call_budget=plan,
+        )
+    assert provider_path.read_bytes() == original_provider
+    assert _task6_budget_image(fresh_budget)[0] == 0
+
+
+def test_pit_optimizer_v2_recovery_requires_exact_optimizer_loop_state(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a hash-valid investigator lifecycle replayed as call_author."""
+    import agent_loop
+    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        _client,
+        gateway,
+    ) = _task6_crash_after_terminal_audit(
+        tmp_path,
+        v2_manifest,
+        monkeypatch,
+        grant_id="grant-wrong-loop-state",
+    )
+    events = [json.loads(line) for line in audit.events_path.read_bytes().splitlines()]
+    previous = "0" * 64
+    reserved_digest = ""
+    started_digest = ""
+    for event in events:
+        event["state"] = agent_loop.LoopState.CALL_AUTHOR.value
+        event["previous_sha256"] = previous
+        details = dict(event["details"])
+        if event["event"] == "provider_call_started":
+            details["reservation_event_sha256"] = reserved_digest
+        elif event["event"] == "provider_call_accepted":
+            details["reservation_event_sha256"] = reserved_digest
+            details["start_event_sha256"] = started_digest
+            details["lifecycle_audit_sha256"] = started_digest
+        event["details"] = details
+        core = {key: value for key, value in event.items() if key != "event_sha256"}
+        digest = hashlib.sha256(_canonical_text(core).encode("utf-8")).hexdigest()
+        event["event_sha256"] = digest
+        previous = digest
+        if event["event"] == "provider_call_reserved":
+            reserved_digest = digest
+        elif event["event"] == "provider_call_started":
+            started_digest = digest
+    audit.events_path.write_bytes(
+        b"".join(
+            (_canonical_text(event) + "\n").encode("utf-8")
+            for event in events
+        )
+    )
+    audit_root = audit.artifact_root
+    audit_run_id = audit.run_id
+    del gateway, budget, audit, authorization, pricing
+    reopened_audit = agent_loop.AuditTrail.open_existing(audit_root, audit_run_id)
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+
+    with pytest.raises(agent_loop.AuditError, match="state"):
+        reopened_audit.recover_pit_optimizer_terminal(
+            run_manifest_sha256=v2_manifest.sha256,
+            call_budget=plan,
+        )
+    with pytest.raises(AuthorizationError, match="active"):
+        reopened_authorization.reserve_call(
+            lease,
+            v2_manifest.call_budgets[1],
+        )
+
+
 def test_pit_optimizer_v2_audit_replay_rejects_a_truncated_tail(
     tmp_path: Path,
 ) -> None:
@@ -6063,9 +6936,9 @@ def test_pit_optimizer_v2_audit_replay_rejects_a_truncated_tail(
 
     audit = agent_loop.AuditTrail(tmp_path / "audit-replay-tail", "pit-replay-tail")
     audit.append_event(
-        agent_loop.LoopState.CALL_INVESTIGATOR,
-        "provider_call_reserved",
-        {"call_index": 1, "iteration": 1, "role": "investigator"},
+        agent_loop.LoopState.PREPARE,
+        "audit_marker",
+        {"phase": "prepare"},
     )
     raw = audit.events_path.read_bytes()
     assert raw.endswith(b"\n")
@@ -6099,11 +6972,11 @@ def test_pit_optimizer_v2_restart_recovers_terminal_before_send_without_start_ev
         grant_id="grant-restart-before-send",
         outcomes=[],
     )
-    original_append = audit.append_event
+    original_append = audit._append_pit_optimizer_lifecycle_event
     failed_reserved_event = False
 
     def fail_reserved_event_once(
-        state: object,
+        lifecycle: object,
         event: str,
         details: dict[str, object] | None = None,
     ) -> dict[str, object]:
@@ -6111,9 +6984,13 @@ def test_pit_optimizer_v2_restart_recovers_terminal_before_send_without_start_ev
         if event == "provider_call_reserved" and not failed_reserved_event:
             failed_reserved_event = True
             raise RuntimeError("reservation-audit-crash")
-        return original_append(state, event, details)
+        return original_append(lifecycle, event, details)
 
-    monkeypatch.setattr(audit, "append_event", fail_reserved_event_once)
+    monkeypatch.setattr(
+        audit,
+        "_append_pit_optimizer_lifecycle_event",
+        fail_reserved_event_once,
+    )
     monkeypatch.setattr(
         authorization,
         "reconcile_call",

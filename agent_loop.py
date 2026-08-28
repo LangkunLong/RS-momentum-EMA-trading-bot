@@ -3628,8 +3628,8 @@ class OpenRouterGateway:
         if matches:
             digest = str(matches[0]["event_sha256"])
         else:
-            event = self.audit_trail.append_event(
-                self._pit_optimizer_audit_state(lifecycle.call_budget.role),
+            event = self.audit_trail._append_pit_optimizer_lifecycle_event(
+                lifecycle,
                 "provider_call_reserved",
                 details,
             )
@@ -3637,6 +3637,7 @@ class OpenRouterGateway:
         if lifecycle.reserved_event_sha256 not in {None, digest}:
             raise AuditError("optimizer reserved lifecycle digest changed")
         lifecycle.reserved_event_sha256 = digest
+        self.authorization_ledger._bind_gateway_lifecycle_commitment(lifecycle)
         return digest
 
     def _ensure_pit_optimizer_started_event(
@@ -3661,8 +3662,8 @@ class OpenRouterGateway:
         if matches:
             digest = str(matches[0]["event_sha256"])
         else:
-            event = self.audit_trail.append_event(
-                self._pit_optimizer_audit_state(plan.role),
+            event = self.audit_trail._append_pit_optimizer_lifecycle_event(
+                lifecycle,
                 "provider_call_started",
                 details,
             )
@@ -3670,6 +3671,7 @@ class OpenRouterGateway:
         if lifecycle.started_event_sha256 not in {None, digest}:
             raise AuditError("optimizer started lifecycle digest changed")
         lifecycle.started_event_sha256 = digest
+        self.authorization_ledger._bind_gateway_lifecycle_commitment(lifecycle)
         return digest
 
     def _seal_pit_optimizer_lifecycle(
@@ -3956,10 +3958,17 @@ class OpenRouterGateway:
             authorization_lease,
             plan_snapshot,
         )
-        facts, receipt, budget_recovery_state = (
+        facts, receipt, _unverified_budget_state = (
             self.audit_trail.recover_pit_optimizer_terminal(
                 run_manifest_sha256=authorization_lease.run_manifest_sha256,
                 call_budget=plan_snapshot,
+            )
+        )
+        budget_recovery_state = (
+            self.authorization_ledger.verify_terminal_audit_receipt(
+                reservation,
+                facts,
+                receipt,
             )
         )
         self.ledger._restore_pit_optimizer_recovery_state(
@@ -11350,6 +11359,27 @@ _AUDIT_FACT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}")
 _AUDIT_JSON_LIMIT = 1024 * 1024
 _AUDIT_CHAIN_LIMIT = 4 * 1024 * 1024
 _AUDIT_ZERO_HASH = "0" * 64
+_OPTIMIZER_AUDIT_ARTIFACT_PREFIXES = (
+    "provider-call",
+    "provider-budget",
+    "optimizer-receipt",
+)
+_OPTIMIZER_AUDIT_EVENT_CODES = frozenset(
+    {
+        "provider_call_reserved",
+        "provider_call_started",
+        "provider_call_accepted",
+        "provider_call_rejected",
+        "provider_call_failed",
+    }
+)
+_OPTIMIZER_AUDIT_STATES = frozenset(
+    {
+        LoopState.CALL_INVESTIGATOR,
+        LoopState.CALL_AUTHOR,
+        LoopState.CALL_CRITIC,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -11842,6 +11872,103 @@ def _assert_directory_chain_no_links(path: Path) -> None:
             raise AuditError("audit directory chain contains a link or reparse point")
 
 
+def _protected_audit_identity(info: os.stat_result) -> tuple[object, ...]:
+    # Windows path-stat exposes creation time as st_ctime while fstat exposes
+    # the legacy metadata-change alias.  st_birthtime is stable across both
+    # views; POSIX platforms fall back to their comparable st_ctime value.
+    stable_identity_time = getattr(
+        info,
+        "st_birthtime_ns",
+        info.st_ctime_ns,
+    )
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        stable_identity_time,
+    )
+
+
+def _read_protected_audit_artifact(
+    path: Path,
+    *,
+    expected_parent: Path,
+    max_bytes: int,
+    label: str,
+) -> tuple[bytes, str]:
+    """Read and hash one exact private artifact through one stable open."""
+
+    if (
+        not isinstance(path, Path)
+        or not isinstance(expected_parent, Path)
+        or type(max_bytes) is not int
+        or max_bytes < 1
+        or not isinstance(label, str)
+        or not label
+    ):
+        raise AuditError("protected audit artifact request is invalid")
+    candidate = Path(os.path.abspath(path))
+    parent = Path(os.path.abspath(expected_parent))
+    if (
+        os.path.normcase(str(candidate.parent)) != os.path.normcase(str(parent))
+        or os.path.normcase(str(candidate))
+        != os.path.normcase(str(parent / candidate.name))
+    ):
+        raise AuditError(f"{label} path is not canonical")
+    try:
+        before = candidate.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or _has_reparse_point(candidate)
+            or before.st_nlink != 1
+            or before.st_size > max_bytes
+        ):
+            raise AuditError(
+                f"{label} is not a bounded private regular file"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(
+            os,
+            "O_NOFOLLOW",
+            0,
+        )
+        descriptor = os.open(candidate, flags)
+        try:
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                opened = os.fstat(stream.fileno())
+                if _protected_audit_identity(opened) != _protected_audit_identity(
+                    before
+                ):
+                    raise AuditError(f"{label} identity changed before read")
+                raw = stream.read(max_bytes + 1)
+                opened_after = os.fstat(stream.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        after = candidate.lstat()
+        if (
+            len(raw) > max_bytes
+            or len(raw) != opened.st_size
+            or _protected_audit_identity(opened_after)
+            != _protected_audit_identity(opened)
+            or _protected_audit_identity(after)
+            != _protected_audit_identity(opened)
+            or stat.S_ISLNK(after.st_mode)
+            or _has_reparse_point(candidate)
+            or after.st_nlink != 1
+        ):
+            raise AuditError(f"{label} identity changed during read")
+    except AuditError:
+        raise
+    except OSError as exc:
+        raise AuditError(f"{label} cannot be read") from exc
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
 def _atomic_write_audit(path: Path, payload: bytes) -> None:
     if len(payload) > _AUDIT_JSON_LIMIT:
         raise AuditError("audit artifact exceeds the byte limit")
@@ -11872,7 +11999,12 @@ def _atomic_write_audit(path: Path, payload: bytes) -> None:
             if temporary.exists() and not temporary.is_symlink():
                 temporary.unlink()
         info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or path.is_symlink() or _has_reparse_point(path):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or path.is_symlink()
+            or _has_reparse_point(path)
+            or info.st_nlink != 1
+        ):
             raise AuditError("atomic audit target verification failed")
     except AuditError:
         raise
@@ -11956,11 +12088,47 @@ class AuditTrail:
             raise AuditError("audit artifact name is not canonical")
         return self.run_root / f"{prefix}{name}{suffix}"
 
+    @staticmethod
+    def _require_generic_audit_name(name: str) -> None:
+        if _AUDIT_NAME_RE.fullmatch(name) is None:
+            raise AuditError("audit artifact name is not canonical")
+        if any(
+            name.startswith(prefix)
+            for prefix in _OPTIMIZER_AUDIT_ARTIFACT_PREFIXES
+        ):
+            raise AuditError("optimizer audit artifact namespace is reserved")
+
     def _write_json(self, path: Path, value: object) -> Path:
         sanitized = _sanitize_audit_value(value, self._known_secrets)
         payload = _canonical_json_bytes(sanitized) + b"\n"
         _atomic_write_audit(path, payload)
         return path
+
+    def _read_protected_json(
+        self,
+        path: Path,
+        *,
+        label: str,
+    ) -> tuple[dict[str, object], str]:
+        raw, digest = _read_protected_audit_artifact(
+            path,
+            expected_parent=self.run_root,
+            max_bytes=_AUDIT_JSON_LIMIT,
+            label=label,
+        )
+        try:
+            primitive = json.loads(
+                raw,
+                object_pairs_hook=_reject_duplicate_keys,
+            )
+        except (json.JSONDecodeError, ProtocolValidationError) as exc:
+            raise AuditError(f"{label} contains invalid JSON") from exc
+        if (
+            not isinstance(primitive, dict)
+            or raw != _canonical_json_bytes(primitive) + b"\n"
+        ):
+            raise AuditError(f"{label} is not canonical JSON")
+        return primitive, digest
 
     def write_manifest(
         self,
@@ -12064,9 +12232,46 @@ class AuditTrail:
         event: str,
         details: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
+        """Append one generic event outside the optimizer-owned lifecycle."""
+
         if not isinstance(state, LoopState):
             raise AuditError("audit event state must be LoopState")
         event_code = _safe_audit_fact(event, "audit event")
+        if (
+            state in _OPTIMIZER_AUDIT_STATES
+            or event_code in _OPTIMIZER_AUDIT_EVENT_CODES
+        ):
+            raise AuditError("optimizer audit lifecycle is reserved")
+        return self._append_event_record(state, event_code, details)
+
+    def _append_pit_optimizer_lifecycle_event(
+        self,
+        lifecycle: _PitOptimizerGatewayLifecycle,
+        event: str,
+        details: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Append one transition authenticated by the live gateway lifecycle."""
+
+        if not isinstance(lifecycle, _PitOptimizerGatewayLifecycle):
+            raise AuditError("optimizer gateway lifecycle capability is required")
+        gateway = lifecycle.gateway
+        if not isinstance(gateway, OpenRouterGateway):
+            raise AuditError("optimizer gateway lifecycle capability is invalid")
+        gateway._require_pit_optimizer_lifecycle(lifecycle)
+        if lifecycle.audit_trail is not self:
+            raise AuditError("optimizer gateway lifecycle audit differs")
+        event_code = _safe_audit_fact(event, "audit event")
+        if event_code not in _OPTIMIZER_AUDIT_EVENT_CODES:
+            raise AuditError("optimizer gateway lifecycle event is invalid")
+        state = gateway._pit_optimizer_audit_state(lifecycle.call_budget.role)
+        return self._append_event_record(state, event_code, details)
+
+    def _append_event_record(
+        self,
+        state: LoopState,
+        event_code: str,
+        details: Mapping[str, object] | None,
+    ) -> dict[str, object]:
         closed_details = _closed_audit_value(details or {}, self._known_secrets)
         if not isinstance(closed_details, dict):
             raise AuditError("audit event details must be a mapping")
@@ -12192,13 +12397,21 @@ class AuditTrail:
         budget_recovery_sha256: str | None = None
         try:
             primitive = _sanitize_audit_value(asdict(record), self._known_secrets)
-            if path.exists():
-                existing = json.loads(path.read_bytes())
+            if path.exists() or path.is_symlink():
+                existing, digest = self._read_protected_json(
+                    path,
+                    label="provider call audit record",
+                )
                 if existing != primitive:
                     raise AuditError("provider call audit record is immutable")
             else:
                 self._write_json(path, primitive)
-            digest = _file_sha256(path)
+                existing, digest = self._read_protected_json(
+                    path,
+                    label="provider call audit record",
+                )
+                if existing != primitive:
+                    raise AuditError("provider call audit record differs after write")
             if optimizer_record:
                 assert _optimizer_lifecycle is not None
                 budget_path = self.run_root / (
@@ -12208,14 +12421,29 @@ class AuditTrail:
                     _optimizer_lifecycle.budget_state,
                     self._known_secrets,
                 )
-                if budget_path.exists():
-                    if json.loads(budget_path.read_bytes()) != budget_primitive:
+                if budget_path.exists() or budget_path.is_symlink():
+                    existing_budget, budget_recovery_sha256 = (
+                        self._read_protected_json(
+                            budget_path,
+                            label="optimizer budget recovery artifact",
+                        )
+                    )
+                    if existing_budget != budget_primitive:
                         raise AuditError(
                             "optimizer budget recovery artifact is immutable"
                         )
                 else:
                     self._write_json(budget_path, budget_primitive)
-                budget_recovery_sha256 = _file_sha256(budget_path)
+                    existing_budget, budget_recovery_sha256 = (
+                        self._read_protected_json(
+                            budget_path,
+                            label="optimizer budget recovery artifact",
+                        )
+                    )
+                    if existing_budget != budget_primitive:
+                        raise AuditError(
+                            "optimizer budget recovery artifact differs after write"
+                        )
         except Exception as exc:
             raise ProviderCallAuditError(
                 PitProviderFailurePhase.PROVIDER_RECORD_WRITE
@@ -12322,7 +12550,15 @@ class AuditTrail:
                 and item.get("details") == details
                 for item in self._events
             ):
-                self.append_event(state, event, details)
+                if optimizer_record:
+                    assert _optimizer_lifecycle is not None
+                    self._append_pit_optimizer_lifecycle_event(
+                        _optimizer_lifecycle,
+                        event,
+                        details,
+                    )
+                else:
+                    self._append_event_record(state, event, details)
         except Exception as exc:
             raise ProviderCallAuditError(
                 PitProviderFailurePhase.TERMINAL_AUDIT_WRITE
@@ -12363,11 +12599,12 @@ class AuditTrail:
         path = self.run_root / f"provider-call-{record.call_index:04d}.json"
         primitive = _sanitize_audit_value(asdict(record), self._known_secrets)
         try:
-            if not path.is_file() or path.is_symlink():
-                raise AuditError("provider call audit record is absent")
-            if json.loads(path.read_bytes()) != primitive:
+            existing, digest = self._read_protected_json(
+                path,
+                label="provider call audit record",
+            )
+            if existing != primitive:
                 raise AuditError("provider call audit record differs")
-            digest = _file_sha256(path)
         except AuditError:
             raise
         except Exception as exc:
@@ -12460,18 +12697,10 @@ class AuditTrail:
     ) -> tuple[Path, ProviderCallRecord, str]:
         path = self.run_root / f"provider-call-{call_index:04d}.json"
         try:
-            if not path.is_file() or path.is_symlink():
-                raise AuditError("optimizer provider record is absent")
-            raw = path.read_bytes()
-            primitive = json.loads(
-                raw,
-                object_pairs_hook=_reject_duplicate_keys,
+            primitive, digest = self._read_protected_json(
+                path,
+                label="optimizer provider record",
             )
-            if (
-                not isinstance(primitive, dict)
-                or raw != _canonical_json_bytes(primitive) + b"\n"
-            ):
-                raise AuditError("optimizer provider record is malformed")
             values = dict(primitive)
             ledger_snapshot = values.get("ledger_snapshot")
             if not isinstance(ledger_snapshot, dict):
@@ -12492,7 +12721,7 @@ class AuditTrail:
                 "critic",
             }:
                 raise AuditError("optimizer provider record schema is invalid")
-            return path, record, _file_sha256(path)
+            return path, record, digest
         except AuditError:
             raise
         except (KeyError, OSError, TypeError, ValueError) as exc:
@@ -12558,18 +12787,14 @@ class AuditTrail:
             if (
                 not isinstance(recovery_digest, str)
                 or _SHA256_RE.fullmatch(recovery_digest) is None
-                or not recovery_path.is_file()
-                or recovery_path.is_symlink()
-                or _file_sha256(recovery_path) != recovery_digest
             ):
                 raise AuditError("optimizer budget recovery artifact differs")
-            raw = recovery_path.read_bytes()
-            state = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
-            if (
-                not isinstance(state, dict)
-                or raw != _canonical_json_bytes(state) + b"\n"
-            ):
-                raise AuditError("optimizer budget recovery artifact is invalid")
+            state, actual_digest = self._read_protected_json(
+                recovery_path,
+                label="optimizer budget recovery artifact",
+            )
+            if actual_digest != recovery_digest:
+                raise AuditError("optimizer budget recovery artifact differs")
         except AuditError:
             raise
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -12669,6 +12894,13 @@ class AuditTrail:
             if item.get("event") in relevant_codes
             and self._pit_optimizer_event_matches(item, record)
         ]
+        expected_state = {
+            "investigator": LoopState.CALL_INVESTIGATOR.value,
+            "author": LoopState.CALL_AUTHOR.value,
+            "critic": LoopState.CALL_CRITIC.value,
+        }[record.role]
+        if any(item.get("state") != expected_state for item in relevant):
+            raise AuditError("optimizer audit lifecycle state differs")
         terminals = [
             item
             for item in relevant
@@ -13074,8 +13306,7 @@ class AuditTrail:
         payload = asdict(evidence)
         if len(_canonical_json_bytes(payload)) > _MAX_PROVIDER_EVIDENCE_BYTES:
             raise AuditError("provider evidence exceeds the closed byte limit")
-        if _AUDIT_NAME_RE.fullmatch(name) is None:
-            raise AuditError("provider evidence artifact name is invalid")
+        self._require_generic_audit_name(name)
         path = self._write_json(self.run_root / f"{name}.json", payload)
         return path, _file_sha256(path)
 
@@ -13128,8 +13359,7 @@ class AuditTrail:
         *,
         name: str = "handoff",
     ) -> Path:
-        if _AUDIT_NAME_RE.fullmatch(name) is None:
-            raise AuditError("handoff metadata name is not canonical")
+        self._require_generic_audit_name(name)
         return self._write_json(self.run_root / f"{name}.json", value)
 
     def write_batch_summary(self, value: Mapping[str, object]) -> Path:
@@ -13140,19 +13370,12 @@ def verify_audit_chain(path: Path) -> tuple[dict[str, object], ...]:
     """Verify exact event ordering and every previous/current SHA-256 link."""
     if not isinstance(path, Path):
         raise AuditError("audit chain path must be a Path")
-    try:
-        info = path.lstat()
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or _has_reparse_point(path)
-            or info.st_nlink != 1
-            or info.st_size > _AUDIT_CHAIN_LIMIT
-        ):
-            raise AuditError("audit hash chain is not a bounded private regular file")
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise AuditError("audit hash chain cannot be read") from exc
+    raw, _digest = _read_protected_audit_artifact(
+        path,
+        expected_parent=path.parent,
+        max_bytes=_AUDIT_CHAIN_LIMIT,
+        label="audit hash chain",
+    )
     if raw and not raw.endswith(b"\n"):
         raise AuditError("audit hash chain has a partial final record")
     expected_keys = {
