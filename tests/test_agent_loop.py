@@ -368,7 +368,10 @@ class _Task5FakeDockerControl:
         self,
         *,
         failures: dict[str, BaseException] | None = None,
+        failures_on_call: dict[tuple[str, int], BaseException] | None = None,
         fail_after_create: bool = False,
+        raise_after_create: BaseException | None = None,
+        create_output: str | None = None,
         tamper_inspect: bool = False,
     ) -> None:
         self.container_id = "c" * 64
@@ -378,7 +381,11 @@ class _Task5FakeDockerControl:
         self.owner = ""
         self.image = ""
         self.failures = failures or {}
+        self.failures_on_call = failures_on_call or {}
+        self.operation_counts: dict[str, int] = {}
         self.fail_after_create = fail_after_create
+        self.raise_after_create = raise_after_create
+        self.create_output = create_output
         self.tamper_inspect = tamper_inspect
 
     def __call__(self, argv: tuple[str, ...], **_kwargs: object) -> object:
@@ -387,6 +394,12 @@ class _Task5FakeDockerControl:
         args = tuple(argv)
         self.calls.append(args)
         operation = args[1]
+        self.operation_counts[operation] = self.operation_counts.get(operation, 0) + 1
+        occurrence_failure = self.failures_on_call.get(
+            (operation, self.operation_counts[operation])
+        )
+        if occurrence_failure is not None:
+            raise occurrence_failure
         if operation in self.failures:
             raise self.failures[operation]
         if operation == "create":
@@ -394,6 +407,8 @@ class _Task5FakeDockerControl:
             self.owner = args[args.index("--label") + 1].split("=", 1)[1]
             self.image = args[-5]
             self.exists = True
+            if self.raise_after_create is not None:
+                raise self.raise_after_create
             if self.fail_after_create:
                 return ProcessResult(
                     125,
@@ -402,7 +417,7 @@ class _Task5FakeDockerControl:
                     hashlib.sha256(b"").hexdigest(),
                     hashlib.sha256(b"create transport fault").hexdigest(),
                 )
-            return ProcessResult.ok(self.container_id + "\n")
+            return ProcessResult.ok((self.create_output or self.container_id) + "\n")
         if operation == "inspect":
             return ProcessResult.ok(
                 json.dumps(
@@ -428,6 +443,50 @@ class _Task5FakeDockerControl:
         if operation == "container":
             return ProcessResult.ok(self.container_id + "\n" if self.exists else "")
         return ProcessResult.ok()
+
+
+def _task5_authenticated_capacity_process() -> _Task5FakeProcess:
+    from core.strategy_policy.contracts import CapacityDecision
+    from core.strategy_policy.worker import (
+        WorkerBootstrap,
+        decode_policy_request,
+        encode_policy_response,
+        initial_chain_sha256,
+    )
+
+    process = _Task5FakeProcess()
+    state: dict[str, object] = {"sequence": 1}
+
+    def respond(value: bytes) -> None:
+        raw = value.decode("utf-8").rstrip("\n")
+        if "bootstrap" not in state:
+            bootstrap = WorkerBootstrap.from_json(raw)
+            state["bootstrap"] = bootstrap
+            state["previous"] = initial_chain_sha256(bootstrap)
+            return
+        bootstrap = state["bootstrap"]
+        sequence = state["sequence"]
+        assert isinstance(bootstrap, WorkerBootstrap)
+        assert isinstance(sequence, int)
+        request, _snapshot = decode_policy_request(
+            raw,
+            bootstrap=bootstrap,
+            expected_sequence=sequence,
+            expected_previous_hmac_sha256=str(state["previous"]),
+        )
+        line, _response = encode_policy_response(
+            bootstrap=bootstrap,
+            sequence=sequence,
+            request_hmac_sha256=request.hmac_sha256,
+            method=request.method,
+            decision=CapacityDecision(None, False),
+        )
+        state["previous"] = request.hmac_sha256
+        state["sequence"] = sequence + 1
+        process.stdout.values.put(line.encode("utf-8") + b"\n")
+
+    process.stdin.callback = respond
+    return process
 
 
 def _task5_policy_candidate(tmp_path: Path) -> Path:
@@ -502,6 +561,63 @@ def test_policy_worker_rejects_intermediate_policy_directory_link_before_launch(
             fold_run_id="discovery_link",
         )
     assert launches == 0
+
+
+def test_policy_worker_alias_state_candidate_cannot_reach_authenticated_client(
+    tmp_path: Path,
+) -> None:
+    """Break caught: an imported-object alias escaped AST checks before authenticated use."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+    from core.strategy_policy.worker import PolicyDeterminismProbe
+
+    candidate = _task5_policy_candidate(tmp_path)
+    entry = candidate / "core" / "strategy_policy" / "entry.py"
+    entry.write_text(
+        entry.read_text("utf-8").replace(
+            "from __future__ import annotations\n",
+            "from __future__ import annotations\nimport math\n",
+            ).replace(
+                "    blocking_codes = list(snapshot.technical_blocking_reasons)\n",
+                "    blocking_codes = list(snapshot.technical_blocking_reasons)\n"
+                "    blocking_codes = math\n"
+                "    blocking_codes.pi += 1.0\n",
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    launches = 0
+    control = _Task5FakeDockerControl()
+
+    def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
+        nonlocal launches
+        launches += 1
+        return _Task5FakeProcess()
+
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=process_factory,
+        control_runner=control,
+        temp_parent=tmp_path,
+        method_timeout_seconds=0.01,
+    )
+    probe = PolicyDeterminismProbe(
+        "recommend_capacity",
+        CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+    )
+    factory = runner.client_factory(
+        candidate_root=candidate,
+        interface_version=1,
+        fold_run_id="alias_state",
+        determinism_probes=(probe,),
+    )
+    with pytest.raises(ValueError, match="mutation root"):
+        factory()
+    assert launches == 0
+    assert control.calls == []
+    assert not tuple(tmp_path.glob("pw-*"))
 
 
 def test_policy_worker_command_mount_allowlist_and_cleanup_use_only_fakes(
@@ -965,7 +1081,10 @@ def test_policy_worker_creation_failure_discovers_and_removes_exact_owned_daemon
     """Break caught: a failed create response orphaned the daemon object it had created."""
     from agent_loop import PolicyWorkerRunner, SandboxError
 
-    control = _Task5FakeDockerControl(fail_after_create=True)
+    control = _Task5FakeDockerControl(
+        fail_after_create=True,
+        tamper_inspect=True,
+    )
     launches = 0
 
     def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
@@ -995,6 +1114,289 @@ def test_policy_worker_creation_failure_discovers_and_removes_exact_owned_daemon
         "rm",
         "container",
     ]
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+@pytest.mark.parametrize("probe_case", ("empty", "wrong_type", "duplicate"))
+def test_policy_worker_rejects_invalid_determinism_probes_before_start(
+    tmp_path: Path,
+    probe_case: str,
+) -> None:
+    """Break caught: invalid probes allocated a package and daemon before rejection."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+    from core.strategy_policy.worker import PolicyDeterminismProbe
+
+    probes: tuple[object, ...]
+    if probe_case == "duplicate":
+        probe = PolicyDeterminismProbe(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+            CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+        )
+        probes = (probe, probe)
+    elif probe_case == "wrong_type":
+        probes = (object(),)
+    else:
+        probes = ()
+    launches = 0
+    control = _Task5FakeDockerControl()
+
+    def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
+        nonlocal launches
+        launches += 1
+        return _Task5FakeProcess()
+
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=process_factory,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    with pytest.raises(ValueError, match="determinism probes"):
+        runner.client_factory(
+            candidate_root=_task5_policy_candidate(tmp_path),
+            interface_version=1,
+            fold_run_id="invalid_probes",
+            determinism_probes=probes,
+        )
+    assert launches == 0
+    assert control.calls == []
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+def test_policy_worker_client_initialization_cancellation_closes_started_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: cancellation constructing the client leaked an initialized worker."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+    from core.strategy_policy.runtime import JsonLinePolicyClient
+    from core.strategy_policy.worker import PolicyDeterminismProbe
+
+    process = _task5_authenticated_capacity_process()
+    control = _Task5FakeDockerControl()
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    probe = PolicyDeterminismProbe(
+        "recommend_capacity",
+        CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+    )
+
+    def cancel_client(_self: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(JsonLinePolicyClient, "__init__", cancel_client)
+    factory = runner.client_factory(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id="client_cancel",
+        determinism_probes=(probe,),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        factory()
+    assert process.terminated == 1
+    assert not control.exists
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+@pytest.mark.parametrize("inspect_mode", ("fault", "tamper"))
+def test_policy_worker_create_primary_survives_discovery_inspection_failure(
+    tmp_path: Path,
+    inspect_mode: str,
+) -> None:
+    """Break caught: inspecting a tentative daemon masked create failure and leaked it."""
+    from agent_loop import PolicyWorkerRunner
+
+    primary = OSError("create primary")
+    control = _Task5FakeDockerControl(
+        failures={"inspect": OSError("inspect secondary")}
+        if inspect_mode == "fault"
+        else None,
+        raise_after_create=primary,
+        tamper_inspect=inspect_mode == "tamper",
+    )
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    with pytest.raises(OSError, match="create primary") as captured:
+        runner.start(
+            candidate_root=_task5_policy_candidate(tmp_path),
+            interface_version=1,
+            fold_run_id=f"inspect_{inspect_mode}",
+        )
+    assert any("inspect" in note for note in getattr(captured.value, "__notes__", ()))
+    assert not control.exists
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+def test_policy_worker_create_primary_survives_discovery_list_failure(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a discovery-list fault replaced the original create error."""
+    from agent_loop import PolicyWorkerRunner
+
+    control = _Task5FakeDockerControl(
+        failures={
+            "create": OSError("create primary"),
+            "container": OSError("list secondary"),
+        }
+    )
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    with pytest.raises(OSError, match="create primary") as captured:
+        runner.start(
+            candidate_root=_task5_policy_candidate(tmp_path),
+            interface_version=1,
+            fold_run_id="list_fault",
+        )
+    assert any("discovery" in note for note in getattr(captured.value, "__notes__", ()))
+    assert not control.exists
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+def test_policy_worker_invalid_create_identity_retains_tentative_owner(
+    tmp_path: Path,
+) -> None:
+    """Break caught: invalid create output lost a discovered owner when inspect failed."""
+    from agent_loop import PolicyWorkerRunner, SandboxError
+
+    control = _Task5FakeDockerControl(
+        failures={"inspect": OSError("inspect secondary")},
+        create_output="short-id",
+    )
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    with pytest.raises(SandboxError, match="invalid full identity") as captured:
+        runner.start(
+            candidate_root=_task5_policy_candidate(tmp_path),
+            interface_version=1,
+            fold_run_id="invalid_identity",
+        )
+    assert any("inspect" in note for note in getattr(captured.value, "__notes__", ()))
+    assert not control.exists
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+@pytest.mark.parametrize("cleanup_operation", ("rm", "container"))
+def test_policy_worker_create_primary_records_cleanup_failure(
+    tmp_path: Path,
+    cleanup_operation: str,
+) -> None:
+    """Break caught: daemon cleanup faults disappeared or replaced failed create."""
+    from agent_loop import PolicyWorkerRunner
+
+    control = _Task5FakeDockerControl(
+        failures={"rm": OSError("rm secondary")}
+        if cleanup_operation == "rm"
+        else None,
+        failures_on_call={
+            ("container", 2): OSError("container secondary")
+        }
+        if cleanup_operation == "container"
+        else None,
+        raise_after_create=OSError("create primary"),
+    )
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    with pytest.raises(OSError, match="create primary") as captured:
+        runner.start(
+            candidate_root=_task5_policy_candidate(tmp_path),
+            interface_version=1,
+            fold_run_id=f"cleanup_{cleanup_operation}",
+        )
+    notes = getattr(captured.value, "__notes__", ())
+    assert any("cleanup" in note for note in notes)
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    if cleanup_operation == "rm":
+        assert control.exists
+        control.exists = False
+    else:
+        assert not control.exists
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+@pytest.mark.parametrize("cleanup_operation", ("rm", "container"))
+def test_policy_worker_explicit_close_reports_cleanup_verification_failure(
+    tmp_path: Path,
+    cleanup_operation: str,
+) -> None:
+    """Break caught: explicit close silently accepted rm or absence-check failure."""
+    from agent_loop import PolicyWorkerRunner, SandboxError
+
+    control = _Task5FakeDockerControl()
+    process = _Task5FakeProcess()
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id=f"close_{cleanup_operation}",
+    )
+    control.failures[cleanup_operation] = OSError(f"{cleanup_operation} fault")
+    with pytest.raises(SandboxError, match="cleanup"):
+        session.close()
+    session.close()
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    if cleanup_operation == "rm":
+        assert control.exists
+        control.exists = False
+    else:
+        assert not control.exists
     assert not tuple(tmp_path.glob("pw-*"))
 
 
@@ -1143,9 +1545,10 @@ def test_policy_worker_client_factory_starts_one_authenticated_session_per_fold(
         ),
     )
     first = first_factory()
-    assert first.recommend_capacity(
+    first_decision = first.recommend_capacity(
         CapacitySnapshot(None, 25, 0, 3, 1.0, False)
-    ) == CapacityDecision(None, False)
+    )
+    assert first_decision == CapacityDecision(None, False)
     with pytest.raises(RuntimeError, match="already started"):
         first_factory()
     first.close()
@@ -1162,6 +1565,11 @@ def test_policy_worker_client_factory_starts_one_authenticated_session_per_fold(
             ),
         ),
     )()
+    second_decision = second.recommend_capacity(
+        CapacitySnapshot(None, 25, 0, 3, 1.0, False)
+    )
+    assert second_decision == first_decision
+    assert second_decision.to_canonical_json() == first_decision.to_canonical_json()
     second.close()
     assert len(processes) == 2
     assert all(process.terminated == 1 for process in processes)

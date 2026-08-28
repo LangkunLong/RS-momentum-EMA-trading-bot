@@ -384,6 +384,20 @@ class PolicyDeterminismProbe:
             raise ValueError("policy determinism probe snapshots must differ")
 
 
+def validate_policy_determinism_probes(
+    probes: tuple[object, ...],
+) -> tuple[PolicyDeterminismProbe, ...]:
+    """Validate the bounded, method-unique probe set before worker allocation."""
+    if (
+        type(probes) is not tuple
+        or not 1 <= len(probes) <= 5
+        or any(type(item) is not PolicyDeterminismProbe for item in probes)
+        or len({item.method for item in probes}) != len(probes)
+    ):
+        raise ValueError("policy determinism probes are invalid")
+    return probes  # type: ignore[return-value]
+
+
 class DecisionDeterminismGuard:
     """Remember bounded snapshot results and reject state-dependent changes."""
 
@@ -479,5 +493,6 @@ __all__ = [
     "encode_policy_request",
     "encode_policy_response",
     "initial_chain_sha256",
+    "validate_policy_determinism_probes",
     "worker_main",
 ]

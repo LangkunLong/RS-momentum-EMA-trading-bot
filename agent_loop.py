@@ -4625,6 +4625,17 @@ def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseExcepti
     return errors
 
 
+def _record_policy_secondary_errors(
+    primary: BaseException,
+    phase: str,
+    errors: Sequence[BaseException],
+) -> None:
+    for error in errors:
+        primary.add_note(
+            f"policy daemon {phase} secondary failure: {type(error).__name__}"
+        )
+
+
 class PolicyWorkerSession:
     """One bounded authenticated JSON-lines session owned by a single fold."""
 
@@ -4759,17 +4770,11 @@ class PolicyWorkerSession:
                 raise
 
     def validate_determinism(self, probes: tuple[object, ...]) -> None:
-        from core.strategy_policy.worker import PolicyDeterminismProbe
+        from core.strategy_policy.worker import validate_policy_determinism_probes
 
-        if (
-            type(probes) is not tuple
-            or not 1 <= len(probes) <= 5
-            or any(not isinstance(item, PolicyDeterminismProbe) for item in probes)
-            or len({item.method for item in probes}) != len(probes)
-        ):
-            raise ValueError("policy determinism probes are invalid")
         try:
-            for probe in probes:
+            validated = validate_policy_determinism_probes(probes)
+            for probe in validated:
                 self.call(probe.method, probe.repeated_snapshot)
                 self.call(probe.method, probe.unrelated_snapshot)
                 self.call(probe.method, probe.repeated_snapshot)
@@ -4918,6 +4923,27 @@ class PolicyWorkerRunner:
         container_name: str,
         owner_token: str,
     ) -> _OwnedPolicyDaemon | None:
+        daemon = self._discover_tentative_owned_daemon(
+            environment=environment,
+            container_name=container_name,
+            owner_token=owner_token,
+        )
+        if daemon is None:
+            return None
+        return self._inspect_owned_daemon(
+            environment=environment,
+            container_id=daemon.container_id,
+            container_name=container_name,
+            owner_token=owner_token,
+        )
+
+    def _discover_tentative_owned_daemon(
+        self,
+        *,
+        environment: Mapping[str, str],
+        container_name: str,
+        owner_token: str,
+    ) -> _OwnedPolicyDaemon | None:
         result = self._control(
             environment,
             "container",
@@ -4938,11 +4964,14 @@ class PolicyWorkerRunner:
             or re.fullmatch(r"[0-9a-f]{64}", identities[0]) is None
         ):
             raise SandboxError("owned policy daemon discovery is ambiguous")
-        return self._inspect_owned_daemon(
-            environment=environment,
+        return _OwnedPolicyDaemon(
+            engine_path=self.engine_path,
+            control_runner=self._control_runner,
+            environment=dict(environment),
             container_id=identities[0],
             container_name=container_name,
             owner_token=owner_token,
+            image=self.image,
         )
 
     @staticmethod
@@ -5095,6 +5124,40 @@ class PolicyWorkerRunner:
                 "-m",
                 "core.strategy_policy.worker",
             )
+
+            def recover_failed_create(
+                primary_error: BaseException,
+            ) -> _OwnedPolicyDaemon | None:
+                try:
+                    tentative = self._discover_tentative_owned_daemon(
+                        environment=environment,
+                        container_name=container_name,
+                        owner_token=owner_token,
+                    )
+                except BaseException as discovery_error:
+                    _record_policy_secondary_errors(
+                        primary_error,
+                        "discovery",
+                        (discovery_error,),
+                    )
+                    return None
+                if tentative is not None:
+                    try:
+                        self._inspect_owned_daemon(
+                            environment=environment,
+                            container_id=tentative.container_id,
+                            container_name=container_name,
+                            owner_token=owner_token,
+                        )
+                    except BaseException as inspect_error:
+                        _record_policy_secondary_errors(
+                            primary_error,
+                            "inspect",
+                            (inspect_error,),
+                        )
+                return tentative
+
+            create_error: BaseException | None = None
             try:
                 created = self._control_runner(
                     create_argv,
@@ -5102,32 +5165,26 @@ class PolicyWorkerRunner:
                     timeout=10.0,
                     output_limit=64 * 1024,
                 )
-            except BaseException:
-                daemon = self._discover_owned_daemon(
-                    environment=environment,
-                    container_name=container_name,
-                    owner_token=owner_token,
-                )
-                raise
-            if (
+            except BaseException as exc:
+                create_error = exc
+                created = None
+            if create_error is None and (
                 not isinstance(created, ProcessResult)
                 or created.timed_out
                 or created.returncode != 0
             ):
-                daemon = self._discover_owned_daemon(
-                    environment=environment,
-                    container_name=container_name,
-                    owner_token=owner_token,
-                )
-                raise SandboxError("policy daemon creation failed")
+                create_error = SandboxError("policy daemon creation failed")
+            if create_error is not None:
+                daemon = recover_failed_create(create_error)
+                raise create_error
+            assert isinstance(created, ProcessResult)
             container_id = created.stdout.strip()
             if re.fullmatch(r"[0-9a-f]{64}", container_id or "") is None:
-                daemon = self._discover_owned_daemon(
-                    environment=environment,
-                    container_name=container_name,
-                    owner_token=owner_token,
+                identity_error = SandboxError(
+                    "policy daemon returned an invalid full identity"
                 )
-                raise SandboxError("policy daemon returned an invalid full identity")
+                daemon = recover_failed_create(identity_error)
+                raise identity_error
             daemon = _OwnedPolicyDaemon(
                 engine_path=engine_path,
                 control_runner=self._control_runner,
@@ -5176,16 +5233,22 @@ class PolicyWorkerRunner:
                 session.close(primary_error=exc)
                 raise
             return session
-        except BaseException:
+        except BaseException as primary_error:
+            cleanup_errors: list[BaseException] = []
             if process is not None and session is None:
-                _cleanup_unowned_policy_process(process)
+                cleanup_errors.extend(_cleanup_unowned_policy_process(process))
             if daemon is not None and session is None:
-                _cleanup_owned_policy_daemon(daemon)
+                cleanup_errors.extend(_cleanup_owned_policy_daemon(daemon))
             try:
                 if temporary_root.exists():
                     _remove_private_tree(temporary_root)
-            except BaseException:
-                pass
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            _record_policy_secondary_errors(
+                primary_error,
+                "cleanup",
+                cleanup_errors,
+            )
             raise
 
     def client_factory(
@@ -5197,6 +5260,9 @@ class PolicyWorkerRunner:
         determinism_probes: tuple[object, ...],
     ) -> Callable[[], Any]:
         """Return a one-shot simulator factory for exactly one fresh fold session."""
+        from core.strategy_policy.worker import validate_policy_determinism_probes
+
+        validated_probes = validate_policy_determinism_probes(determinism_probes)
         started = False
         lock = threading.Lock()
 
@@ -5213,11 +5279,15 @@ class PolicyWorkerRunner:
                 interface_version=interface_version,
                 fold_run_id=fold_run_id,
             )
-            session.validate_determinism(determinism_probes)
-            return JsonLinePolicyClient(
-                session=session,
-                interface_version=interface_version,
-            )
+            try:
+                session.validate_determinism(validated_probes)
+                return JsonLinePolicyClient(
+                    session=session,
+                    interface_version=interface_version,
+                )
+            except BaseException as exc:
+                session.close(primary_error=exc)
+                raise
 
         return create_client
 

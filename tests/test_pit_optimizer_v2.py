@@ -2620,6 +2620,35 @@ def test_candidate_identity_rejects_direct_unsealed_construction() -> None:
         )
 
 
+def test_candidate_identity_has_exact_public_nine_field_json_shape(
+    tmp_path: Path,
+) -> None:
+    """Break caught: the construction seal leaked into persisted identity data."""
+    from core.pit_optimizer_candidate import CandidateIdentity
+
+    identity, _author = _task5_authenticated_identity(tmp_path)
+    expected_fields = (
+        "source_commit",
+        "policy_interface_version",
+        "cumulative_diff_sha256",
+        "editable_file_sha256s",
+        "changed_paths",
+        "changed_symbols",
+        "immutable_constraints_sha256",
+        "discovery_manifest_sha256",
+        "identity_sha256",
+    )
+    assert tuple(item.name for item in fields(CandidateIdentity)) == expected_fields
+    primitive = identity.to_primitive()
+    assert tuple(primitive) == expected_fields
+    assert primitive == asdict(identity)
+    assert not any(key.startswith("_") for key in primitive)
+    rendered = identity.to_canonical_json()
+    assert rendered.endswith("\n")
+    assert json.loads(rendered) == json.loads(json.dumps(primitive))
+    assert "controller_seal" not in rendered
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -2681,7 +2710,12 @@ def test_candidate_identity_rejects_attacker_recomputed_digest(
         ).encode("utf-8")
         + b"\n"
     ).hexdigest()
-    forged = replace(identity, **forged_fields, identity_sha256=recomputed)
+    forged = object.__new__(type(identity))
+    for field_name, field_value in {
+        **forged_fields,
+        "identity_sha256": recomputed,
+    }.items():
+        object.__setattr__(forged, field_name, field_value)
     with pytest.raises(ValueError, match="candidate identity"):
         validate_author_manifest(author, forged)
 
@@ -2914,10 +2948,12 @@ def test_candidate_identity_rejects_protected_or_generated_paths(
         )
 
 
-def test_candidate_identity_rejects_gitlink_index_mode(
+@pytest.mark.parametrize("mode", ("120000", "160000"))
+def test_candidate_identity_rejects_non_regular_index_mode(
     tmp_path: Path,
+    mode: str,
 ) -> None:
-    """Break caught: a gitlink at an editable path could evade regular-source provenance."""
+    """Break caught: a symlink/gitlink could evade regular-source provenance."""
     from core.pit_optimizer_candidate import validate_candidate_diff
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
@@ -2928,12 +2964,22 @@ def test_candidate_identity_rejects_gitlink_index_mode(
         "return EntryDecision(False, True, (None, None), ())",
     )
     commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
+    object_id = (
+        commit
+        if mode == "160000"
+        else _task5_git(
+            authenticated,
+            "rev-parse",
+            "HEAD:core/strategy_policy/entry.py",
+            text=True,
+        ).strip()
+    )
     _task5_git(
         candidate_root,
         "update-index",
         "--add",
         "--cacheinfo",
-        f"160000,{commit},core/strategy_policy/entry.py",
+        f"{mode},{object_id},core/strategy_policy/entry.py",
     )
 
     with pytest.raises(ValueError, match="100644|regular"):
@@ -2944,6 +2990,46 @@ def test_candidate_identity_rejects_gitlink_index_mode(
             git=git,
             bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
             source_commit=commit,
+            policy_interface_version=1,
+            immutable_constraints_sha256="a" * 64,
+            discovery_manifest_sha256="b" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        "GIT binary patch\n",
+        (
+            "similarity index 100%\n"
+            "rename from core/strategy_policy/entry.py\n"
+            "rename to core/strategy_policy/risk.py\n"
+        ),
+        "old mode 100644\nnew mode 100755\n",
+    ),
+)
+def test_candidate_identity_rejects_v2_structural_diff_metadata(
+    tmp_path: Path,
+    metadata: str,
+) -> None:
+    """Break caught: binary, rename, or mode metadata crossed the V2 identity boundary."""
+    from core.pit_optimizer_candidate import validate_candidate_diff
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    incremental = _task5_raw_author_diff(
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(False, True, (None, None), ())",
+    ).replace("index 1111111..2222222 100644\n", metadata)
+    with pytest.raises(ValueError, match="structural|binary|rename|mode"):
+        validate_candidate_diff(
+            authenticated_base_root=authenticated,
+            candidate_root=candidate_root,
+            incremental_diff=incremental,
+            git=git,
+            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+            source_commit=_task5_git(
+                authenticated, "rev-parse", "HEAD", text=True
+            ).strip(),
             policy_interface_version=1,
             immutable_constraints_sha256="a" * 64,
             discovery_manifest_sha256="b" * 64,
@@ -3048,6 +3134,70 @@ def test_candidate_identity_rolls_back_after_fault_or_cancellation(
     assert entry.read_bytes() == before_entry
 
 
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("mutating apply fault"), KeyboardInterrupt()),
+)
+def test_candidate_identity_rolls_back_when_real_mutating_apply_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    """Break caught: Git could mutate bytes and raise before rollback was armed."""
+    import agent_loop
+    from core.pit_optimizer_candidate import (
+        EDITABLE_POLICY_PATHS,
+        validate_candidate_diff,
+    )
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    before = {
+        path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
+    }
+    incremental = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(False, True, (None, None), ())",
+    )
+    real_git = agent_loop._git
+    mutating_apply_seen = False
+
+    def mutate_then_raise(root: Path, *args: str, **kwargs: object) -> object:
+        nonlocal mutating_apply_seen
+        result = real_git(root, *args, **kwargs)
+        if args and args[0] == "apply" and "--check" not in args:
+            mutating_apply_seen = True
+            assert (candidate_root / "core/strategy_policy/entry.py").read_bytes() != (
+                before["core/strategy_policy/entry.py"]
+            )
+            raise failure
+        return result
+
+    monkeypatch.setattr(agent_loop, "_git", mutate_then_raise)
+    with pytest.raises(
+        type(failure),
+        match="mutating apply fault" if isinstance(failure, RuntimeError) else None,
+    ):
+        validate_candidate_diff(
+            authenticated_base_root=authenticated,
+            candidate_root=candidate_root,
+            incremental_diff=incremental,
+            git=git,
+            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+            source_commit=_task5_git(
+                authenticated, "rev-parse", "HEAD", text=True
+            ).strip(),
+            policy_interface_version=1,
+            immutable_constraints_sha256="a" * 64,
+            discovery_manifest_sha256="b" * 64,
+        )
+    assert mutating_apply_seen
+    assert {
+        path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
+    } == before
+
+
 def test_changed_symbols_use_before_after_ast() -> None:
     """Break caught: author symbol claims were trusted instead of AST comparison."""
     from core.pit_optimizer_candidate import derive_changed_symbols
@@ -3087,6 +3237,9 @@ def _task5_entry_source(body: str, *, prelude: str = "") -> str:
         (_task5_entry_source("evaluate_entry.cache = True\nreturn EntryDecision(True, True, (None, None), ())"), "function attribute"),
         (_task5_entry_source("math.pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
         (_task5_entry_source("EntryDecision.to_primitive = _helper\nreturn EntryDecision(True, True, (None, None), ())", prelude="\ndef _helper():\n    return None\n"), "mutation root"),
+        (_task5_entry_source("cache = []\ncache = math\ncache.pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
+        (_task5_entry_source("cache = []\ncache = EntryDecision\ncache.to_primitive = _helper\nreturn EntryDecision(True, True, (None, None), ())", prelude="\ndef _helper():\n    return None\n"), "mutation root"),
+        (_task5_entry_source("cache = [math]\ncache[0].pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
         (_task5_entry_source("value = getattr(snapshot, 'market_is_bullish')\nreturn EntryDecision(value, True, (None, None), ())"), "reflection"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport time\n"), "import"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport random\n"), "import"),

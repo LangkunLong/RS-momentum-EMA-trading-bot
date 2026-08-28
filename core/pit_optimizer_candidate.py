@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass
 import hashlib
 import json
 import os
@@ -171,12 +171,26 @@ class CandidateIdentity:
     immutable_constraints_sha256: str
     discovery_manifest_sha256: str
     identity_sha256: str
-    _controller_seal: object = field(default=None, repr=False, compare=False)
+    _controller_seal: InitVar[object] = None
 
-    def __post_init__(self) -> None:
-        if self._controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
+    def __post_init__(self, _controller_seal: object) -> None:
+        if _controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
             raise ValueError("candidate identity must be controller derived")
         _validate_candidate_identity_fields(self)
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            **_candidate_identity_values(self),
+            "identity_sha256": self.identity_sha256,
+        }
+
+    def to_canonical_json(self) -> str:
+        return json.dumps(
+            self.to_primitive(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n"
 
 
 _AUTHENTICATED_CANDIDATE_IDENTITIES: WeakValueDictionary[
@@ -285,43 +299,48 @@ def validate_policy_ast(*, path: str, source: str) -> None:
         for parent in ast.walk(tree)
         for child in ast.iter_child_nodes(parent)
     }
-    mutable_names: dict[ast.FunctionDef, set[str]] = {}
+    appendable_names: dict[ast.FunctionDef, set[str]] = {}
     for function in (
         item for item in tree.body if isinstance(item, ast.FunctionDef)
     ):
-        names = {
-            descendant.targets[0].id
-            for descendant in ast.walk(function)
-            if isinstance(descendant, ast.Assign)
-            and len(descendant.targets) == 1
-            and isinstance(descendant.targets[0], ast.Name)
-            and isinstance(
-                descendant.value,
-                (ast.List, ast.Dict, ast.ListComp, ast.DictComp),
-            )
-            or isinstance(descendant, ast.Assign)
-            and len(descendant.targets) == 1
-            and isinstance(descendant.targets[0], ast.Name)
-            and isinstance(descendant.value, ast.Call)
-            and isinstance(descendant.value.func, ast.Name)
-            and descendant.value.func.id in {"list", "dict"}
-        }
-        names.update(
-            descendant.target.id
-            for descendant in ast.walk(function)
-            if isinstance(descendant, ast.AnnAssign)
-            and isinstance(descendant.target, ast.Name)
-            and isinstance(
-                descendant.value,
-                (ast.List, ast.Dict, ast.ListComp, ast.DictComp),
-            )
-            or isinstance(descendant, ast.AnnAssign)
-            and isinstance(descendant.target, ast.Name)
-            and isinstance(descendant.value, ast.Call)
-            and isinstance(descendant.value.func, ast.Name)
-            and descendant.value.func.id in {"list", "dict"}
-        )
-        mutable_names[function] = names
+        binding_counts: dict[str, int] = {}
+        for descendant in ast.walk(function):
+            if isinstance(descendant, ast.Name) and isinstance(
+                descendant.ctx, ast.Store
+            ):
+                binding_counts[descendant.id] = binding_counts.get(descendant.id, 0) + 1
+        names: set[str] = set()
+        for descendant in ast.walk(function):
+            if (
+                isinstance(descendant, ast.Assign)
+                and len(descendant.targets) == 1
+                and isinstance(descendant.targets[0], ast.Name)
+                and (
+                    isinstance(descendant.value, ast.List)
+                    or (
+                        isinstance(descendant.value, ast.Call)
+                        and isinstance(descendant.value.func, ast.Name)
+                        and descendant.value.func.id == "list"
+                    )
+                )
+                and binding_counts.get(descendant.targets[0].id) == 1
+            ):
+                names.add(descendant.targets[0].id)
+            elif (
+                isinstance(descendant, ast.AnnAssign)
+                and isinstance(descendant.target, ast.Name)
+                and (
+                    isinstance(descendant.value, ast.List)
+                    or (
+                        isinstance(descendant.value, ast.Call)
+                        and isinstance(descendant.value.func, ast.Name)
+                        and descendant.value.func.id == "list"
+                    )
+                )
+                and binding_counts.get(descendant.target.id) == 1
+            ):
+                names.add(descendant.target.id)
+        appendable_names[function] = names
 
     for node in ast.walk(tree):
         if not isinstance(node, _ALLOWED_AST_NODES):
@@ -358,7 +377,6 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                     *node.args.kwonlyargs,
                 )
             }
-            local_mutables = mutable_names[node]
             for descendant in ast.walk(node):
                 if isinstance(descendant, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                     targets = (
@@ -374,9 +392,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                             target, (ast.Attribute, ast.Subscript)
                         ):
                             raise ValueError("policy function attribute writes are forbidden")
-                        if isinstance(target, (ast.Attribute, ast.Subscript)) and (
-                            root not in local_mutables
-                        ):
+                        if isinstance(target, (ast.Attribute, ast.Subscript)):
                             raise ValueError("policy mutation root is outside local state")
         if isinstance(node, (ast.Set, ast.SetComp)):
             raise ValueError("policy unordered iteration is forbidden")
@@ -389,8 +405,8 @@ def validate_policy_ast(*, path: str, source: str) -> None:
             owner: ast.AST | None = node
             while owner is not None and not isinstance(owner, ast.FunctionDef):
                 owner = parents.get(owner)
-            call_mutables = (
-                mutable_names.get(owner, set())
+            call_appendables = (
+                appendable_names.get(owner, set())
                 if isinstance(owner, ast.FunctionDef)
                 else set()
             )
@@ -409,7 +425,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                 if root == "math":
                     if not imported_math or node.func.attr.startswith("_"):
                         raise ValueError("policy math call is outside the allowlist")
-                elif node.func.attr == "append" and root in call_mutables:
+                elif node.func.attr == "append" and root in call_appendables:
                     continue
                 else:
                     raise ValueError("policy attribute call is outside the allowlist")
@@ -707,6 +723,7 @@ def validate_candidate_diff(
                 timeout=30.0,
                 git=git,
             )
+            applied = True
             _git(
                 candidate_root,
                 "apply",
@@ -716,7 +733,6 @@ def validate_candidate_diff(
                 timeout=30.0,
                 git=git,
             )
-            applied = True
         except PreflightError as exc:
             removed_lines = tuple(
                 line[1:]
