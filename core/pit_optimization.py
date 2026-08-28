@@ -3265,6 +3265,7 @@ def prepare_pit_optimizer_v2(
     permanent_runtime_root: Path,
     source_head: str,
     source_fingerprint_sha256: str,
+    source_identity: Callable[[Path], tuple[str, str]],
 ) -> PitOptimizerReadiness:
     """Provider-free public adapter for schema-v2 readiness preparation."""
 
@@ -3277,6 +3278,7 @@ def prepare_pit_optimizer_v2(
         permanent_runtime_root=permanent_runtime_root,
         source_head=source_head,
         source_fingerprint_sha256=source_fingerprint_sha256,
+        source_identity=source_identity,
     )
 
 

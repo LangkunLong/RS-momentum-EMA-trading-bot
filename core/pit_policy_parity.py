@@ -755,18 +755,17 @@ def _canonical_object(path: Path, label: str) -> tuple[Path, dict[str, object], 
     return resolved, value, hashlib.sha256(raw).hexdigest()
 
 
-def _source_identity(source_root: Path) -> tuple[str, str]:
+def _source_identity_with_command(
+    source_root: Path,
+    git_command: Callable[[Path, tuple[str, ...]], bytes],
+) -> tuple[str, str]:
     root = Path(source_root).resolve()
 
     def git(*args: str) -> bytes:
-        completed = subprocess.run(
-            ["git", *args],
-            cwd=root,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        return completed.stdout
+        output = git_command(root, args)
+        if not isinstance(output, bytes):
+            raise ValueError("source identity Git output must be bytes")
+        return output
 
     repository_root = Path(
         git("rev-parse", "--show-toplevel").decode("utf-8").strip()
@@ -781,10 +780,30 @@ def _source_identity(source_root: Path) -> tuple[str, str]:
     return head, hashlib.sha256(tree).hexdigest()
 
 
-def authenticated_source_identity(source_root: Path) -> tuple[str, str]:
-    """Return the clean-HEAD/tree identity used by parity and optimizer manifests."""
+def _source_identity(source_root: Path) -> tuple[str, str]:
+    def ambient_git(root: Path, args: tuple[str, ...]) -> bytes:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return completed.stdout
 
-    return _source_identity(source_root)
+    return _source_identity_with_command(source_root, ambient_git)
+
+
+def authenticated_source_identity(
+    source_root: Path,
+    *,
+    git_command: Callable[[Path, tuple[str, ...]], bytes],
+) -> tuple[str, str]:
+    """Return the clean-HEAD/tree identity through an approved Git command seam."""
+
+    if not callable(git_command):
+        raise ValueError("source identity Git command is invalid")
+    return _source_identity_with_command(source_root, git_command)
 
 
 def _require_later_descendant_source(

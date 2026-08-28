@@ -71,7 +71,6 @@ from core.pit_policy_parity import (
     ParityEquityPoint,
     ParityFoldEvidence,
     ParityTransaction,
-    _source_identity,
 )
 
 
@@ -676,6 +675,7 @@ def prepare_pit_optimizer_v2(
     permanent_runtime_root: Path,
     source_head: str,
     source_fingerprint_sha256: str,
+    source_identity: Callable[[Path], tuple[str, str]],
 ) -> PitOptimizerReadiness:
     """Authenticate and persist provider-projectable inputs without provider effects."""
 
@@ -688,7 +688,9 @@ def prepare_pit_optimizer_v2(
     for path, label in ((artifacts, "artifact root"), (runtime, "permanent runtime root")):
         if not path.is_absolute() or path.is_symlink() or not path.is_dir():
             raise ValueError(f"optimizer {label} is invalid")
-    actual_source_head, actual_source_fingerprint = _source_identity(source)
+    if not callable(source_identity):
+        raise ValueError("optimizer source identity capability is invalid")
+    actual_source_head, actual_source_fingerprint = source_identity(source)
     if (source_head, source_fingerprint_sha256) != (
         actual_source_head,
         actual_source_fingerprint,

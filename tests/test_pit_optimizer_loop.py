@@ -142,6 +142,20 @@ def _git(root: Path, *args: str) -> bytes:
     ).stdout
 
 
+def _forbid_ambient_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trusted_git: Path,
+) -> Path:
+    """Poison inherited Git state while leaving the approved absolute binary usable."""
+
+    marker = (tmp_path / "ambient-git-invoked.trace").resolve()
+    monkeypatch.setenv("PATH", str(trusted_git.parent))
+    monkeypatch.setenv("GIT_TRACE", str(marker))
+    monkeypatch.setenv("GIT_DIR", str((tmp_path / "forbidden-ambient-git-dir").resolve()))
+    return marker
+
+
 def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
     source_root = tmp_path / "source"
     source_texts = {
@@ -337,6 +351,7 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
 
 def _prepare(inputs: dict[str, object]):
     from core.pit_optimizer_controller import prepare_pit_optimizer_v2
+    from core.pit_policy_parity import _source_identity
 
     return prepare_pit_optimizer_v2(
         inputs["config"],
@@ -345,7 +360,203 @@ def _prepare(inputs: dict[str, object]):
         permanent_runtime_root=inputs["permanent_runtime_root"],
         source_head=inputs["source_head"],
         source_fingerprint_sha256=inputs["source_fingerprint_sha256"],
+        source_identity=_source_identity,
     )
+
+
+def _v2_execution_config(
+    inputs: dict[str, object],
+    *,
+    git_executable: Path,
+    controller_temp_parent: Path,
+    docker_executable: Path,
+    readiness: object | None = None,
+) -> object:
+    import agent_loop
+    from core.pit_optimization_contract import (
+        PitOptimizerGateConfig,
+        PitOptimizerRunManifest,
+    )
+
+    gate = inputs["config"]
+    manifest = inputs["manifest"]
+    assert isinstance(gate, PitOptimizerGateConfig)
+    assert isinstance(manifest, PitOptimizerRunManifest)
+    source_root = Path(inputs["source_root"]).resolve()
+    permanent_runtime_root = Path(inputs["permanent_runtime_root"]).resolve()
+    artifact_root = Path(inputs["artifact_root"]).resolve()
+    canary = readiness is not None
+    execution_gate = replace(
+        gate,
+        phase="canary" if canary else "prepare",
+        readiness_artifact=(
+            Path(readiness.artifact_path).resolve() if canary else None
+        ),
+        readiness_sha256=(readiness.readiness_sha256 if canary else None),
+        authorization_window_id=(
+            manifest.authorization_requirement.window_id if canary else None
+        ),
+        source_transmission_authorized=canary,
+        source_root=source_root,
+        permanent_runtime_root=permanent_runtime_root,
+        controller_temp_parent=controller_temp_parent.resolve(),
+        artifact_root=artifact_root,
+        git_executable=git_executable.resolve(),
+        docker_executable=docker_executable.resolve(),
+        sandbox_image=manifest.sandbox_image,
+    )
+    return agent_loop.LoopConfig(
+        source_root=source_root,
+        permanent_runtime_root=permanent_runtime_root,
+        git_executable=git_executable.resolve(),
+        controller_temp_parent=controller_temp_parent.resolve(),
+        artifact_root=artifact_root,
+        mode=agent_loop.ExecutionMode(),
+        gate=execution_gate,
+        models=agent_loop.ModelConfig(),
+        limits=agent_loop.LoopLimits(
+            max_usd=0.40,
+            max_iterations=2,
+            max_api_calls=6,
+            max_tokens=448_000,
+        ),
+    )
+
+
+def test_production_prepare_uses_exact_configured_git_not_ambient_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Break caught: prepare source authentication could execute PATH Git."""
+    import shutil
+    import tempfile
+
+    import agent_loop
+    from core.pit_optimizer_controller import PitOptimizerReadiness
+
+    inputs = _prepare_fixture(tmp_path)
+    source_root = Path(inputs["source_root"])
+    _git(source_root, "branch", "-m", "codex/task8-configured-git-prepare")
+    located_git = shutil.which("git")
+    assert located_git is not None
+    trusted_git = Path(located_git).resolve()
+    controller_temp_parent = Path(
+        tempfile.mkdtemp(prefix="task8-controller-with-spaces-")
+    ).resolve()
+    request.addfinalizer(
+        lambda: shutil.rmtree(controller_temp_parent, ignore_errors=True)
+    )
+    docker_executable = (tmp_path / "unused docker.exe").resolve()
+    docker_executable.write_bytes(b"unused provider-free boundary")
+    config = _v2_execution_config(
+        inputs,
+        git_executable=trusted_git,
+        controller_temp_parent=controller_temp_parent,
+        docker_executable=docker_executable,
+    )
+    monkeypatch.setattr(agent_loop, "_GIT_CAPABILITY", None)
+    ambient_marker = _forbid_ambient_git(tmp_path, monkeypatch, trusted_git)
+
+    result = agent_loop._execute_cli_run(
+        config,
+        docker_executable=docker_executable,
+        sandbox_image=inputs["manifest"].sandbox_image,
+        run_id="run-20260828T010203Z-abcdef123456",
+    )
+
+    assert isinstance(result, PitOptimizerReadiness)
+    assert result.manifest.source_head == inputs["source_head"]
+    assert not ambient_marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("configured_kind", "expected_stage"),
+    (
+        ("missing", "git_capability"),
+        ("invalid", "source_preflight_git_operation"),
+    ),
+)
+def test_optimizer_canary_wrong_configured_git_fails_before_live_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_kind: str,
+    expected_stage: str,
+) -> None:
+    """Break caught: an unusable approved Git path could fall through to PATH/live work."""
+    import agent_loop
+
+    inputs = _prepare_fixture(tmp_path)
+    source_root = Path(inputs["source_root"])
+    _git(source_root, "branch", "-m", "codex/task8-reject-configured-git")
+    readiness = _prepare(inputs)
+    controller_temp_parent = (tmp_path / "controller boundary").resolve()
+    controller_temp_parent.mkdir()
+    docker_executable = (tmp_path / "unused docker.exe").resolve()
+    docker_executable.write_bytes(b"must not execute")
+    configured_git = (tmp_path / "configured git" / "git.exe").resolve()
+    configured_git.parent.mkdir()
+    if configured_kind == "invalid":
+        configured_git.write_bytes(b"not an executable")
+    config = _v2_execution_config(
+        inputs,
+        git_executable=configured_git,
+        controller_temp_parent=controller_temp_parent,
+        docker_executable=docker_executable,
+        readiness=readiness,
+    )
+    downstream: list[str] = []
+
+    def forbidden(name: str):
+        def fail(*_args: object, **_kwargs: object) -> object:
+            downstream.append(name)
+            raise AssertionError(f"{name} crossed the configured-Git failure")
+
+        return fail
+
+    monkeypatch.setattr(agent_loop, "_GIT_CAPABILITY", None)
+    monkeypatch.setattr(
+        agent_loop,
+        "_build_pit_optimizer_v2_live_run",
+        forbidden("live-services"),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "configure_docker_executable",
+        forbidden("docker"),
+    )
+    monkeypatch.setattr(agent_loop, "OpenRouterGateway", forbidden("provider"))
+    before_runtime = {
+        path.relative_to(inputs["permanent_runtime_root"]): path.read_bytes()
+        for path in Path(inputs["permanent_runtime_root"]).rglob("*")
+        if path.is_file()
+    }
+    before_artifacts = {
+        path.relative_to(inputs["artifact_root"]): path.read_bytes()
+        for path in Path(inputs["artifact_root"]).rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(agent_loop.ControllerInitializationError) as raised:
+        agent_loop._execute_cli_run(
+            config,
+            docker_executable=docker_executable,
+            sandbox_image=inputs["manifest"].sandbox_image,
+            run_id="run-20260828T010203Z-abcdef123456",
+        )
+
+    assert raised.value.stage == expected_stage
+    assert downstream == []
+    assert before_runtime == {
+        path.relative_to(inputs["permanent_runtime_root"]): path.read_bytes()
+        for path in Path(inputs["permanent_runtime_root"]).rglob("*")
+        if path.is_file()
+    }
+    assert before_artifacts == {
+        path.relative_to(inputs["artifact_root"]): path.read_bytes()
+        for path in Path(inputs["artifact_root"]).rglob("*")
+        if path.is_file()
+    }
 
 
 def test_prepare_v2_writes_one_self_digested_provider_free_readiness(
@@ -2051,6 +2262,7 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
 def test_dispatch_with_production_composition_completes_mocked_two_iteration_canary(
     tmp_path: Path,
     request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Break caught: unit fakes could mask production composition and evidence drift."""
     import shutil
@@ -2317,6 +2529,7 @@ def test_dispatch_with_production_composition_completes_mocked_two_iteration_can
             evaluate_baseline=evaluate_baseline,
         )
 
+    ambient_marker = _forbid_ambient_git(tmp_path, monkeypatch, git_executable)
     result = agent_loop._dispatch_pit_optimizer_v2(
         canary_config,
         prepare=lambda _config: pytest.fail("canary dispatched prepare"),
@@ -2357,8 +2570,14 @@ def test_dispatch_with_production_composition_completes_mocked_two_iteration_can
     assert result.long_replay_eligible is True
     assert result.cleanup_complete is True
     assert result.source_modified is False
+    assert not ambient_marker.exists()
     assert not tuple(controller_temp_parent.glob("agent-loop-candidate-*"))
-    assert _git(source_root, "status", "--porcelain") == b""
+    assert agent_loop._git(
+        source_root,
+        "status",
+        "--porcelain",
+        git=git_capability,
+    ).stdout == b""
 
     authorization_records = [
         json.loads(line) for line in authorization_path.read_bytes().splitlines()

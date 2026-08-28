@@ -5336,6 +5336,19 @@ def _git_text(
         raise PreflightError("Git operation returned non-UTF-8 text") from exc
 
 
+def _pit_optimizer_source_identity(
+    source_root: Path,
+    git: GitCapability,
+) -> tuple[str, str]:
+    """Authenticate optimizer source through the approved bounded Git capability."""
+    from core.pit_policy_parity import authenticated_source_identity
+
+    return authenticated_source_identity(
+        source_root,
+        git_command=lambda root, args: _git(root, *args, git=git).stdout,
+    )
+
+
 def derive_authenticated_cumulative_diff(
     *,
     git: GitCapability,
@@ -18272,11 +18285,7 @@ def _build_pit_optimizer_v2_live_run(
         discovery_score_from_folds,
         strictly_improves_discovery,
     )
-    from core.pit_policy_parity import (
-        ParityFoldEvidence,
-        authenticated_source_identity,
-        build_fold_evidence,
-    )
+    from core.pit_policy_parity import ParityFoldEvidence, build_fold_evidence
     from core.strategy_policy.contracts import CapacitySnapshot
     from core.strategy_policy.worker import PolicyDeterminismProbe
 
@@ -18470,7 +18479,10 @@ def _build_pit_optimizer_v2_live_run(
         nonlocal worker_sequence
         if supplied_config is not config or supplied_readiness is not readiness:
             raise ConfigurationError("PIT optimizer authenticated inputs changed")
-        source_identity = authenticated_source_identity(config.source_root)
+        source_identity = _pit_optimizer_source_identity(
+            config.source_root,
+            git_capability,
+        )
         if (
             source_state.head != manifest.source_head
             or source_identity
@@ -19637,11 +19649,12 @@ def _execute_cli_run(
             PitOptimizerReadiness,
             PitOptimizerResult,
         )
-        from core.pit_policy_parity import authenticated_source_identity
-
         if isinstance(config.gate, PitOptimizerGateConfig):
             if state.fingerprint is None:
                 raise ConfigurationError("preflight source fingerprint is absent")
+
+            def v2_source_identity(root: Path) -> tuple[str, str]:
+                return _pit_optimizer_source_identity(root, git_capability)
 
             def prepare_v2(
                 gate: PitOptimizerGateConfig,
@@ -19649,7 +19662,7 @@ def _execute_cli_run(
                 nonlocal stage
                 stage = "pit_optimizer_prepare"
                 manifest_source_head, manifest_source_fingerprint = (
-                    authenticated_source_identity(config.source_root)
+                    v2_source_identity(config.source_root)
                 )
                 if (
                     manifest_source_head != state.head
@@ -19665,6 +19678,7 @@ def _execute_cli_run(
                     permanent_runtime_root=config.permanent_runtime_root,
                     source_head=manifest_source_head,
                     source_fingerprint_sha256=manifest_source_fingerprint,
+                    source_identity=v2_source_identity,
                 )
 
             def build_v2(
