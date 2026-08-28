@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import stat
@@ -181,6 +182,410 @@ def test_task3_state_and_terminal_status_values_are_closed() -> None:
         "limits_exhausted",
         "controller_error",
     )
+
+
+def _task5_raw_patch(
+    *,
+    path: str,
+    removed: tuple[str, ...] = ("old",),
+    added: tuple[str, ...] = ("new",),
+) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "index 1111111..2222222 100644\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        f"@@ -1,{len(removed)} +1,{len(added)} @@\n"
+        + "".join(f"-{line}\n" for line in removed)
+        + "".join(f"+{line}\n" for line in added)
+    )
+
+
+def test_patch_bounds_preserve_legacy_default_and_reject_v2_fourth_file() -> None:
+    """Break caught: V2 inherited the legacy four-file allowance."""
+    import agent_loop
+    from core.pit_optimization_contract import PatchBounds
+
+    raw = "".join(
+        _task5_raw_patch(path=f"core/canslim/policy_{index}.py")
+        for index in range(4)
+    )
+
+    assert len(agent_loop._parse_unified_diff(raw).files) == 4
+    with pytest.raises(agent_loop.PatchPolicyError, match="max_files"):
+        agent_loop._parse_unified_diff(
+            raw,
+            bounds=PatchBounds(3, 12, 200, 64 * 1024),
+        )
+
+
+@pytest.mark.parametrize(
+    ("bounds", "raw", "field"),
+    (
+        (
+            (3, 12, 200, 64 * 1024),
+            _task5_raw_patch(
+                path="core/strategy_policy/entry.py",
+                removed=tuple(f"old_{index}" for index in range(100)),
+                added=tuple(f"new_{index}" for index in range(101)),
+            ),
+            "max_changed_lines",
+        ),
+        (
+            (3, 12, 80, 8 * 1024),
+            _task5_raw_patch(
+                path="core/strategy_policy/entry.py",
+                removed=tuple(f"old_{index}" for index in range(40)),
+                added=tuple(f"new_{index}" for index in range(41)),
+            ),
+            "max_changed_lines",
+        ),
+    ),
+)
+def test_patch_bounds_reject_first_line_beyond_supplied_ceiling(
+    bounds: tuple[int, int, int, int],
+    raw: str,
+    field: str,
+) -> None:
+    """Break caught: the parser checked only the old global line ceiling."""
+    import agent_loop
+    from core.pit_optimization_contract import PatchBounds
+
+    with pytest.raises(agent_loop.PatchPolicyError, match=field):
+        agent_loop._parse_unified_diff(raw, bounds=PatchBounds(*bounds))
+
+
+@pytest.mark.parametrize("byte_ceiling", (8 * 1024, 64 * 1024))
+def test_patch_bounds_reject_first_byte_beyond_supplied_ceiling(
+    byte_ceiling: int,
+) -> None:
+    """Break caught: raw author and cumulative diffs had different byte enforcement."""
+    import agent_loop
+    from core.pit_optimization_contract import PatchBounds
+
+    raw = _task5_raw_patch(path="core/strategy_policy/entry.py", added=("",))
+    raw = raw.replace("+\n", "+" + ("x" * (byte_ceiling + 1 - len(raw.encode("utf-8")))) + "\n")
+    assert len(raw.encode("utf-8")) == byte_ceiling + 1
+
+    with pytest.raises(agent_loop.PatchPolicyError, match="max_diff_bytes"):
+        agent_loop._parse_unified_diff(
+            raw,
+            bounds=PatchBounds(3, 12, 200, byte_ceiling),
+        )
+
+
+class _Task5QueueStream:
+    def __init__(self) -> None:
+        self.values: queue.Queue[bytes] = queue.Queue()
+        self.closed = False
+
+    def readline(self, _size: int = -1) -> bytes:
+        return self.values.get(timeout=5)
+
+    def read(self, _size: int = -1) -> bytes:
+        return self.values.get(timeout=5)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.values.put(b"")
+
+
+class _Task5FakeStdin:
+    def __init__(self, callback: Any | None = None) -> None:
+        self.callback = callback
+        self.lines: list[bytes] = []
+        self.closed = False
+
+    def write(self, value: bytes) -> int:
+        self.lines.append(value)
+        if self.callback is not None:
+            self.callback(value)
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Task5FakeProcess:
+    def __init__(self, callback: Any | None = None) -> None:
+        self.stdout = _Task5QueueStream()
+        self.stderr = _Task5QueueStream()
+        self.stdin = _Task5FakeStdin(callback)
+        self.returncode: int | None = None
+        self.terminated = 0
+        self.killed = 0
+        self.waited = 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated += 1
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed += 1
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        self.waited += 1
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+
+def _task5_policy_candidate(tmp_path: Path) -> Path:
+    source = Path(__file__).parents[1] / "core" / "strategy_policy"
+    candidate = tmp_path / "candidate"
+    for name in ("entry.py", "risk.py", "exit.py"):
+        target = candidate / "core" / "strategy_policy" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source / name, target)
+    (candidate / "credentials.env").write_text("TOKEN=forbidden\n", encoding="utf-8")
+    (candidate / "pit.sqlite3").write_bytes(b"sealed-data")
+    return candidate
+
+
+def test_policy_worker_command_mount_allowlist_and_cleanup_use_only_fakes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: the policy worker inherited host access or weak Docker limits."""
+    from agent_loop import PolicyWorkerRunner
+
+    candidate = _task5_policy_candidate(tmp_path)
+    calls: list[tuple[list[str], dict[str, object], _Task5FakeProcess]] = []
+
+    def process_factory(argv: list[str], **kwargs: object) -> _Task5FakeProcess:
+        process = _Task5FakeProcess()
+        process.stderr.values.put(b"x" * (70 * 1024))
+        process.stderr.values.put(b"")
+        calls.append((argv, kwargs, process))
+        return process
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "must-not-reach-worker")
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=process_factory,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=candidate,
+        interface_version=1,
+        fold_run_id="discovery_1",
+    )
+    argv, kwargs, process = calls[0]
+
+    required_pairs = (
+        ("--network", "none"),
+        ("--user", "65532:65532"),
+        ("--cap-drop", "ALL"),
+        ("--security-opt", "no-new-privileges"),
+        ("--pids-limit", "32"),
+        ("--memory", "256m"),
+        ("--cpus", "1.0"),
+        ("--tmpfs", "/tmp:rw,noexec,nosuid,size=16m"),
+    )
+    assert "--read-only" in argv
+    for option, value in required_pairs:
+        index = argv.index(option)
+        assert argv[index + 1] == value
+    assert argv[-4:] == ["python", "-B", "-m", "core.strategy_policy.worker"]
+    mount = argv[argv.index("--mount") + 1]
+    assert mount.endswith(",dst=/workspace/policy,readonly")
+    package_root = Path(mount.split(",src=", 1)[1].split(",dst=", 1)[0])
+    assert package_root != candidate
+    assert str(candidate) not in " ".join(argv)
+    packaged = tuple(
+        sorted(
+            path.relative_to(package_root).as_posix()
+            for path in package_root.rglob("*")
+            if path.is_file()
+        )
+    )
+    assert packaged == (
+        "core/__init__.py",
+        "core/strategy_policy/__init__.py",
+        "core/strategy_policy/contracts.py",
+        "core/strategy_policy/entry.py",
+        "core/strategy_policy/exit.py",
+        "core/strategy_policy/risk.py",
+        "core/strategy_policy/worker.py",
+    )
+    assert not any(name in mount for name in ("credentials", "pit.sqlite3", ".git"))
+    assert kwargs["shell"] is False
+    assert kwargs["close_fds"] is True
+    assert kwargs["stdin"] == subprocess.PIPE
+    assert kwargs["stdout"] == subprocess.PIPE
+    assert kwargs["stderr"] == subprocess.PIPE
+    environment = kwargs["env"]
+    assert isinstance(environment, dict)
+    assert "OPENROUTER_API_KEY" not in environment
+    assert runner.method_timeout_seconds == 1.0
+    assert runner.fold_timeout_seconds == 900.0
+
+    session.close()
+    assert not package_root.parent.exists()
+    assert process.terminated == 1
+    assert process.waited >= 1
+    assert len(session.stderr_bytes) == 64 * 1024
+
+
+def test_policy_worker_timeout_unconditionally_cleans_process_and_package(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a silent worker survived a method deadline with mounted source."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+
+    candidate = _task5_policy_candidate(tmp_path)
+    processes: list[_Task5FakeProcess] = []
+
+    def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
+        process = _Task5FakeProcess()
+        processes.append(process)
+        return process
+
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=process_factory,
+        temp_parent=tmp_path,
+        method_timeout_seconds=0.01,
+    )
+    session = runner.start(
+        candidate_root=candidate,
+        interface_version=1,
+        fold_run_id="discovery_1",
+    )
+    package_parent = session.package_root.parent
+    with pytest.raises(TimeoutError, match="method timeout"):
+        session.call(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        )
+    assert not package_parent.exists()
+    assert processes[0].terminated == 1
+    assert processes[0].waited >= 1
+
+
+def test_policy_worker_cleanup_after_process_start_failure_uses_only_fake(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a launched process survived a session-construction failure."""
+    from agent_loop import PolicyWorkerRunner, SandboxError
+
+    candidate = _task5_policy_candidate(tmp_path)
+    processes: list[_Task5FakeProcess] = []
+
+    def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
+        process = _Task5FakeProcess()
+        process.stdin = None  # type: ignore[assignment]
+        processes.append(process)
+        return process
+
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=process_factory,
+        temp_parent=tmp_path,
+    )
+    with pytest.raises(SandboxError, match="stdio"):
+        runner.start(
+            candidate_root=candidate,
+            interface_version=1,
+            fold_run_id="discovery_1",
+        )
+    assert processes[0].terminated == 1
+    assert processes[0].waited >= 1
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+def test_policy_worker_client_factory_starts_one_authenticated_session_per_fold(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a worker session was reused across independent fold runs."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacityDecision, CapacitySnapshot
+    from core.strategy_policy.worker import (
+        WorkerBootstrap,
+        decode_policy_request,
+        encode_policy_response,
+        initial_chain_sha256,
+    )
+
+    candidate = _task5_policy_candidate(tmp_path)
+    processes: list[_Task5FakeProcess] = []
+
+    def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
+        process = _Task5FakeProcess()
+        state: dict[str, object] = {"sequence": 1}
+
+        def respond(value: bytes) -> None:
+            raw = value.decode("utf-8").rstrip("\n")
+            if "bootstrap" not in state:
+                bootstrap = WorkerBootstrap.from_json(raw)
+                state["bootstrap"] = bootstrap
+                state["previous"] = initial_chain_sha256(bootstrap)
+                return
+            bootstrap = state["bootstrap"]
+            assert isinstance(bootstrap, WorkerBootstrap)
+            sequence = state["sequence"]
+            assert isinstance(sequence, int)
+            request, _snapshot = decode_policy_request(
+                raw,
+                bootstrap=bootstrap,
+                expected_sequence=sequence,
+                expected_previous_hmac_sha256=str(state["previous"]),
+            )
+            line, _response = encode_policy_response(
+                bootstrap=bootstrap,
+                sequence=sequence,
+                request_hmac_sha256=request.hmac_sha256,
+                method=request.method,
+                decision=CapacityDecision(None, False),
+            )
+            state["previous"] = request.hmac_sha256
+            state["sequence"] = sequence + 1
+            process.stdout.values.put(line.encode("utf-8") + b"\n")
+
+        process.stdin.callback = respond
+        processes.append(process)
+        return process
+
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=process_factory,
+        temp_parent=tmp_path,
+    )
+    first_factory = runner.client_factory(
+        candidate_root=candidate,
+        interface_version=1,
+        fold_run_id="discovery_1",
+    )
+    first = first_factory()
+    assert first.recommend_capacity(
+        CapacitySnapshot(None, 25, 0, 3, 1.0, False)
+    ) == CapacityDecision(None, False)
+    with pytest.raises(RuntimeError, match="already started"):
+        first_factory()
+    first.close()
+
+    second = runner.client_factory(
+        candidate_root=candidate,
+        interface_version=1,
+        fold_run_id="discovery_2",
+    )()
+    second.close()
+    assert len(processes) == 2
+    assert all(process.terminated == 1 for process in processes)
 
 
 def test_task3_models_and_limits_validate_exact_boundaries() -> None:

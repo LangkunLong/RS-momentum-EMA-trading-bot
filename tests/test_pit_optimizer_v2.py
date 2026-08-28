@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,7 @@ from decimal import Decimal, ROUND_HALF_EVEN
 import difflib
 from itertools import product
 from pathlib import Path
+import shutil
 import sqlite3
 import string
 import subprocess
@@ -28,6 +30,13 @@ from core.pit_optimizer_evaluation import (
     FoldSpec,
 )
 from core.pit_policy_parity import ParityAttestation
+
+
+_POLICY_PATHS = (
+    "core/strategy_policy/entry.py",
+    "core/strategy_policy/risk.py",
+    "core/strategy_policy/exit.py",
+)
 
 
 def _canonical_text(value: object) -> str:
@@ -2368,3 +2377,673 @@ def test_validation_ledger_atomically_rejects_concurrent_duplicate_reservation(
     assert sum("permanently consumed" in result for result in results) == 1
     records = ledger_path.read_text("utf-8").splitlines()
     assert len(records) == 1
+
+
+def _task5_git(root: Path, *args: str, text: bool = False) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=text,
+    )
+    if text:
+        assert isinstance(completed.stdout, str)
+        return completed.stdout
+    return completed.stdout.decode("utf-8")
+
+
+def _task5_policy_roots(tmp_path: Path) -> tuple[Path, Path, object]:
+    import agent_loop
+
+    git_path = shutil.which("git")
+    assert git_path is not None
+    capability = agent_loop.configure_git_executable(Path(git_path).resolve())
+    authenticated = tmp_path / "authenticated"
+    authenticated.mkdir()
+    sources = {
+        "core/strategy_policy/entry.py": (
+            "from .contracts import EntryDecision, EntrySnapshot\n\n"
+            "def evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision:\n"
+            "    return EntryDecision(True, True, (None, None), ())\n"
+        ),
+        "core/strategy_policy/risk.py": (
+            "from .contracts import AllocationDecision, AllocationSnapshot, CapacityDecision, CapacitySnapshot, EvictionDecision, EvictionSnapshot\n\n"
+            "def recommend_capacity(snapshot: CapacitySnapshot) -> CapacityDecision:\n"
+            "    return CapacityDecision(snapshot.configured_max_positions, False)\n\n"
+            "def recommend_allocation(snapshot: AllocationSnapshot) -> AllocationDecision:\n"
+            "    return AllocationDecision(0.01, 0.08, None)\n\n"
+            "def select_eviction(snapshot: EvictionSnapshot) -> EvictionDecision:\n"
+            "    return EvictionDecision(None)\n"
+        ),
+        "core/strategy_policy/exit.py": (
+            "from .contracts import ExitDecision, ExitSnapshot\n\n"
+            "def evaluate_exit(snapshot: ExitSnapshot) -> ExitDecision:\n"
+            "    return ExitDecision((), None, False, 0, False, False)\n"
+        ),
+    }
+    for relative, source in sources.items():
+        target = authenticated / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source, encoding="utf-8", newline="\n")
+    _task5_git(authenticated, "init")
+    _task5_git(authenticated, "config", "user.name", "Task Five Tests")
+    _task5_git(authenticated, "config", "user.email", "task5@example.invalid")
+    _task5_git(authenticated, "config", "core.autocrlf", "false")
+    _task5_git(authenticated, "add", ".")
+    _task5_git(authenticated, "commit", "-m", "authenticated policy")
+    candidate = tmp_path / "candidate"
+    shutil.copytree(authenticated, candidate)
+    return authenticated, candidate, capability
+
+
+def _task5_incremental_diff(candidate: Path, path: str, old: str, new: str) -> str:
+    target = candidate / path
+    source = target.read_text("utf-8")
+    target.write_text(source.replace(old, new), encoding="utf-8", newline="\n")
+    raw = _task5_git(
+        candidate, "diff", "--no-ext-diff", "--no-color", "HEAD", "--", path
+    )
+    target.write_text(source, encoding="utf-8", newline="\n")
+    assert raw
+    return raw
+
+
+def _task5_raw_author_diff(old: str, new: str) -> str:
+    path = "core/strategy_policy/entry.py"
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "index 1111111..2222222 100644\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -4,1 +4,1 @@\n"
+        f"-{old}\n"
+        f"+{new}\n"
+    )
+
+
+def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
+    tmp_path: Path,
+) -> None:
+    """Break caught: author-declared scope could replace controller-derived identity."""
+    from core.pit_optimizer_candidate import (
+        PIT_OPTIMIZER_PATCH_BOUNDS,
+        validate_author_manifest,
+        validate_candidate_diff,
+    )
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    incremental = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(snapshot.market_is_bullish, True, (None, None), ())",
+    )
+    source_commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
+
+    identity, cumulative_diff = validate_candidate_diff(
+        authenticated_base_root=authenticated,
+        candidate_root=candidate_root,
+        incremental_diff=incremental,
+        git=git,
+        bounds=PIT_OPTIMIZER_PATCH_BOUNDS,
+        source_commit=source_commit,
+        policy_interface_version=1,
+        immutable_constraints_sha256="a" * 64,
+        discovery_manifest_sha256="b" * 64,
+    )
+
+    assert cumulative_diff == _task5_git(
+        candidate_root,
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "HEAD",
+        "--",
+        *_POLICY_PATHS,
+    )
+    assert identity.source_commit == source_commit
+    assert identity.cumulative_diff_sha256 == hashlib.sha256(
+        cumulative_diff.encode("utf-8")
+    ).hexdigest()
+    assert identity.changed_paths == ("core/strategy_policy/entry.py",)
+    assert identity.changed_symbols == (
+        "core.strategy_policy.entry.evaluate_entry",
+    )
+    assert tuple(path for path, _digest in identity.editable_file_sha256s) == tuple(
+        sorted(_POLICY_PATHS)
+    )
+
+    matching = contract.AuthorArtifact.from_json(
+        _canonical_text(
+            {
+                **_author_payload(),
+                "changed_paths": list(identity.changed_paths),
+                "changed_symbols": list(identity.changed_symbols),
+                "unified_diff": incremental,
+            }
+        ),
+        max_diff_bytes=64 * 1024,
+        max_total_bytes=72 * 1024,
+    )
+    validate_author_manifest(matching, identity)
+    mismatch = replace(
+        matching,
+        changed_paths=("core/strategy_policy/risk.py",),
+        changed_symbols=("core.strategy_policy.risk.recommend_capacity",),
+    )
+    with pytest.raises(ValueError, match="author_manifest_mismatch"):
+        validate_author_manifest(mismatch, identity)
+
+
+def test_candidate_identity_rejects_git_derived_cumulative_scope_growth(
+    tmp_path: Path,
+) -> None:
+    """Break caught: individually small generations could evade cumulative bounds."""
+    from core.pit_optimizer_candidate import validate_candidate_diff
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    risk_path = candidate_root / "core/strategy_policy/risk.py"
+    risk_path.write_text(
+        risk_path.read_text("utf-8").replace(
+            "return CapacityDecision(snapshot.configured_max_positions, False)",
+            "return CapacityDecision(snapshot.maximum_policy_positions, False)",
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    incremental = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(False, True, (None, None), ())",
+    )
+
+    with pytest.raises(ValueError, match="max_files"):
+        validate_candidate_diff(
+            authenticated_base_root=authenticated,
+            candidate_root=candidate_root,
+            incremental_diff=incremental,
+            git=git,
+            bounds=contract.PatchBounds(1, 12, 200, 64 * 1024),
+            source_commit=_task5_git(
+                authenticated, "rev-parse", "HEAD", text=True
+            ).strip(),
+            policy_interface_version=1,
+            immutable_constraints_sha256="a" * 64,
+            discovery_manifest_sha256="b" * 64,
+        )
+    assert "return EntryDecision(True, True, (None, None), ())" in (
+        candidate_root / "core/strategy_policy/entry.py"
+    ).read_text("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    (
+        (
+            "return EntryDecision(True, True, (None, None), ())",
+            "return EntryDecision(True, True, (None, None), ())",
+            "no-op",
+        ),
+        (
+            "return EntryDecision(False, False, (None, None), ())",
+            "return EntryDecision(True, False, (None, None), ())",
+            "apply",
+        ),
+    ),
+)
+def test_candidate_identity_rejects_noop_or_non_applicable_incremental_diff(
+    tmp_path: Path,
+    old: str,
+    new: str,
+    message: str,
+) -> None:
+    """Break caught: an unapplied author artifact could receive an executable identity."""
+    from core.pit_optimizer_candidate import validate_candidate_diff
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    with pytest.raises(ValueError, match=message):
+        validate_candidate_diff(
+            authenticated_base_root=authenticated,
+            candidate_root=candidate_root,
+            incremental_diff=_task5_raw_author_diff(old, new),
+            git=git,
+            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+            source_commit=_task5_git(
+                authenticated, "rev-parse", "HEAD", text=True
+            ).strip(),
+            policy_interface_version=1,
+            immutable_constraints_sha256="a" * 64,
+            discovery_manifest_sha256="b" * 64,
+        )
+
+
+def test_changed_symbols_use_before_after_ast() -> None:
+    """Break caught: author symbol claims were trusted instead of AST comparison."""
+    from core.pit_optimizer_candidate import derive_changed_symbols
+
+    path = "core/strategy_policy/risk.py"
+    before = {path: "def recommend_capacity(snapshot):\n    return None\n"}
+    after = {
+        path: (
+            "def recommend_capacity(snapshot):\n"
+            "    return snapshot.configured_max_positions\n"
+        )
+    }
+    assert derive_changed_symbols(
+        before_sources=before,
+        after_sources=after,
+    ) == ("core.strategy_policy.risk.recommend_capacity",)
+
+
+def _task5_entry_source(body: str, *, prelude: str = "") -> str:
+    return (
+        "from .contracts import EntryDecision, EntrySnapshot\n"
+        + prelude
+        + "\ndef evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision:\n"
+        + "".join(f"    {line}\n" for line in body.splitlines())
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    (
+        (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nclass MutablePolicy:\n    pass\n"), "class"),
+        (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nVALUES = []\n"), "constant"),
+        ("from .contracts import EntryDecision\n\ndef evaluate_entry(snapshot, cache=[]):\n    return EntryDecision(True, True, (None, None), ())\n", "default"),
+        (_task5_entry_source("global STATE\nreturn EntryDecision(True, True, (None, None), ())"), "global"),
+        (_task5_entry_source("snapshot.market_is_bullish = True\nreturn EntryDecision(True, True, (None, None), ())"), "input"),
+        (_task5_entry_source("snapshot[0] = True\nreturn EntryDecision(True, True, (None, None), ())"), "input"),
+        (_task5_entry_source("evaluate_entry.cache = True\nreturn EntryDecision(True, True, (None, None), ())"), "function attribute"),
+        (_task5_entry_source("value = getattr(snapshot, 'market_is_bullish')\nreturn EntryDecision(value, True, (None, None), ())"), "reflection"),
+        (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport time\n"), "import"),
+        (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport random\n"), "import"),
+        (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport os\n"), "import"),
+        (_task5_entry_source("handle = open('x')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+        (_task5_entry_source("module = __import__('os')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+        (_task5_entry_source("value = eval('1')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+        ("from .contracts import EntryDecision\n\nasync def evaluate_entry(snapshot):\n    return EntryDecision(True, True, (None, None), ())\n", "async"),
+        (_task5_entry_source("yield snapshot\nreturn EntryDecision(True, True, (None, None), ())"), "generator"),
+        (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\ndef public_helper():\n    return True\n"), "public"),
+        (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nfrom .contracts import _CanonicalContract\n"), "contract import"),
+        ("FLOOR = 0.25\nfrom __future__ import annotations\nfrom .contracts import EntryDecision\n\ndef evaluate_entry(snapshot):\n    return EntryDecision(True, True, (None, None), ())\n", "syntax"),
+    ),
+)
+def test_ast_purity_rejects_non_closed_policy_behavior(
+    source: str,
+    message: str,
+) -> None:
+    """Break caught: candidate code could retain state or reach ambient capabilities."""
+    from core.pit_optimizer_candidate import validate_policy_ast
+
+    with pytest.raises(ValueError, match=message):
+        validate_policy_ast(path="core/strategy_policy/entry.py", source=source)
+
+
+def test_ast_purity_accepts_current_policy_and_immutable_literal_constants() -> None:
+    """Break caught: the closed validator rejected the authenticated baseline policy."""
+    from core.pit_optimizer_candidate import validate_policy_ast
+
+    root = Path(__file__).parents[1]
+    for path in _POLICY_PATHS:
+        source = (root / path).read_text("utf-8")
+        if path == "core/strategy_policy/entry.py":
+            source = source.replace(
+                "from __future__ import annotations\n",
+                "from __future__ import annotations\nFLOORS = (0.25, 70.0, None, 'entry')\n",
+                1,
+            )
+        validate_policy_ast(path=path, source=source)
+
+
+def _task5_feedback(iteration: int) -> contract.IterationFeedbackSummary:
+    return contract.IterationFeedbackSummary(
+        iteration=iteration,
+        hypothesis_id=f"hypothesis_{iteration}",
+        family="entry",
+        author_summary="bounded author summary",
+        validation_code="valid",
+        discovery_score=None,
+        critic_disposition="refine",
+        critic_next_direction="bounded next direction",
+        incumbent_changed=False,
+    )
+
+
+def test_source_bundle_contains_only_complete_current_policy_context(
+    tmp_path: Path,
+) -> None:
+    """Break caught: source packaging leaked unrelated repository or local material."""
+    from core.pit_optimizer_candidate import build_policy_source_bundle
+
+    _authenticated, candidate_root, _git = _task5_policy_roots(tmp_path)
+    (candidate_root / "credentials.env").write_text("TOKEN=forbidden\n", encoding="utf-8")
+    (candidate_root / "trades.json").write_text('[{"symbol":"SECRET"}]', encoding="utf-8")
+    unrelated = candidate_root / "core" / "unrelated.py"
+    unrelated.write_text("LOCAL_PATH = 'C:/private/data'\n", encoding="utf-8")
+
+    bundle = build_policy_source_bundle(
+        candidate_root=candidate_root,
+        cumulative_diff="",
+        policy_interface_version=1,
+    )
+
+    assert tuple(record.path for record in bundle.files) == _POLICY_PATHS
+    assert all(record.text == (candidate_root / record.path).read_text("utf-8") for record in bundle.files)
+    assert all(record.sha256 == hashlib.sha256(record.text.encode("utf-8")).hexdigest() for record in bundle.files)
+    assert bundle.files[0].declared_symbols == (
+        "core.strategy_policy.entry.evaluate_entry",
+    )
+    assert bundle.files[1].declared_symbols == (
+        "core.strategy_policy.risk.recommend_capacity",
+        "core.strategy_policy.risk.recommend_allocation",
+        "core.strategy_policy.risk.select_eviction",
+    )
+    rendered = bundle.canonical_json_bytes()
+    assert len(rendered) <= 64 * 1024
+    for forbidden in (b"TOKEN", b"SECRET", b"C:/private", b"credentials.env", b"trades.json"):
+        assert forbidden not in rendered
+
+
+def test_next_context_oversize_is_candidate_attributable_and_never_truncated(
+    tmp_path: Path,
+) -> None:
+    """Break caught: an oversized next incumbent could be truncated into a different policy."""
+    from core.pit_optimizer_candidate import build_policy_source_bundle
+
+    _authenticated, candidate_root, _git = _task5_policy_roots(tmp_path)
+    entry = candidate_root / "core/strategy_policy/entry.py"
+    original = entry.read_text("utf-8")
+    entry.write_text(original + ("# candidate padding\n" * 4_000), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="next_context_oversize"):
+        build_policy_source_bundle(
+            candidate_root=candidate_root,
+            cumulative_diff="candidate cumulative diff",
+            policy_interface_version=1,
+        )
+    assert entry.read_text("utf-8").endswith("# candidate padding\n")
+
+
+def test_source_context_fit_preserves_all_feedback_and_enforces_precall_budget(
+    tmp_path: Path,
+) -> None:
+    """Break caught: later calls silently dropped history or exceeded their sealed input cap."""
+    from core.pit_optimizer_candidate import (
+        build_policy_source_bundle,
+        require_source_context_fit,
+    )
+
+    _authenticated, candidate_root, _git = _task5_policy_roots(tmp_path)
+    bundle = build_policy_source_bundle(
+        candidate_root=candidate_root,
+        cumulative_diff="",
+        policy_interface_version=1,
+    )
+    iteration_two = next(
+        budget
+        for budget in _call_budgets()
+        if budget.role == "investigator" and budget.iteration == 2
+    )
+    require_source_context_fit(
+        source_bundle=bundle,
+        prior_iterations=(_task5_feedback(1),),
+        role_budget=iteration_two,
+    )
+
+    with pytest.raises(ValueError, match="history"):
+        require_source_context_fit(
+            source_bundle=bundle,
+            prior_iterations=(_task5_feedback(1), _task5_feedback(2)),
+            role_budget=iteration_two,
+        )
+    tiny = contract.PitOptimizerCallBudget(
+        call_index=4,
+        iteration=2,
+        role="investigator",
+        model="deepseek/deepseek-r1",
+        max_static_input_bytes=1,
+        max_dynamic_input_bytes=1,
+        max_input_tokens=2,
+        max_output_tokens=1,
+        max_response_bytes=1,
+        max_usd=0.01,
+    )
+    with pytest.raises(ValueError, match="context_budget_exhausted"):
+        require_source_context_fit(
+            source_bundle=bundle,
+            prior_iterations=(_task5_feedback(1),),
+            role_budget=tiny,
+        )
+
+
+def test_worker_protocol_bootstrap_has_closed_shape_and_fresh_key_material() -> None:
+    """Break caught: short, reusable, or extensible bootstrap secrets weakened framing."""
+    from core.strategy_policy.worker import WorkerBootstrap
+
+    first = WorkerBootstrap.create(interface_version=1)
+    second = WorkerBootstrap.create(interface_version=1)
+    assert first.schema_version == 1
+    assert len(base64.b64decode(first.nonce_b64, validate=True)) == 16
+    assert len(base64.b64decode(first.hmac_key_b64, validate=True)) == 32
+    assert (first.nonce_b64, first.hmac_key_b64) != (
+        second.nonce_b64,
+        second.hmac_key_b64,
+    )
+    assert WorkerBootstrap.from_json(first.to_json()) == first
+    duplicate = first.to_json()[:-1] + f',"schema_version":{first.schema_version}}}'
+    with pytest.raises(ValueError, match="duplicate"):
+        WorkerBootstrap.from_json(duplicate)
+    with pytest.raises(ValueError, match="fields"):
+        WorkerBootstrap.from_json(first.to_json()[:-1] + ',"extra":true}')
+    with pytest.raises(ValueError, match="nonce"):
+        WorkerBootstrap(
+            schema_version=1,
+            interface_version=1,
+            nonce_b64=base64.b64encode(b"short").decode("ascii"),
+            hmac_key_b64=first.hmac_key_b64,
+        )
+
+
+def test_worker_protocol_authenticates_hashes_sequence_chain_and_response_binding() -> None:
+    """Break caught: a replayed/tampered causal snapshot or decision could be accepted."""
+    from core.strategy_policy.contracts import CapacityDecision, CapacitySnapshot
+    from core.strategy_policy.worker import (
+        WorkerBootstrap,
+        decode_policy_request,
+        decode_policy_response,
+        encode_policy_request,
+        encode_policy_response,
+        initial_chain_sha256,
+    )
+
+    bootstrap = WorkerBootstrap.create(interface_version=1)
+    snapshot = CapacitySnapshot(None, 25, 0, 3, 1.0, False)
+    request_line, request = encode_policy_request(
+        bootstrap=bootstrap,
+        sequence=1,
+        previous_hmac_sha256=initial_chain_sha256(bootstrap),
+        method="recommend_capacity",
+        snapshot=snapshot,
+    )
+    decoded_request, decoded_snapshot = decode_policy_request(
+        request_line,
+        bootstrap=bootstrap,
+        expected_sequence=1,
+        expected_previous_hmac_sha256=initial_chain_sha256(bootstrap),
+    )
+    assert decoded_request == request
+    assert decoded_snapshot == snapshot
+    assert request.payload_sha256 == hashlib.sha256(
+        snapshot.to_canonical_json().encode("utf-8")
+    ).hexdigest()
+
+    tampered = json.loads(request_line)
+    tampered["payload"]["eligible_signal_count"] = 4
+    with pytest.raises(ValueError, match="payload hash"):
+        decode_policy_request(
+            _canonical_text(tampered),
+            bootstrap=bootstrap,
+            expected_sequence=1,
+            expected_previous_hmac_sha256=initial_chain_sha256(bootstrap),
+        )
+    with pytest.raises(ValueError, match="sequence"):
+        decode_policy_request(
+            request_line,
+            bootstrap=bootstrap,
+            expected_sequence=2,
+            expected_previous_hmac_sha256=initial_chain_sha256(bootstrap),
+        )
+    with pytest.raises(ValueError, match="chain"):
+        decode_policy_request(
+            request_line,
+            bootstrap=bootstrap,
+            expected_sequence=1,
+            expected_previous_hmac_sha256="0" * 64,
+        )
+
+    response_line, response = encode_policy_response(
+        bootstrap=bootstrap,
+        sequence=1,
+        request_hmac_sha256=request.hmac_sha256,
+        method="recommend_capacity",
+        decision=CapacityDecision(None, False),
+    )
+    decoded_response, decoded_decision = decode_policy_response(
+        response_line,
+        bootstrap=bootstrap,
+        expected_sequence=1,
+        expected_request_hmac_sha256=request.hmac_sha256,
+        expected_method="recommend_capacity",
+    )
+    assert decoded_response == response
+    assert decoded_decision == CapacityDecision(None, False)
+    with pytest.raises(ValueError, match="request binding"):
+        decode_policy_response(
+            response_line,
+            bootstrap=bootstrap,
+            expected_sequence=1,
+            expected_request_hmac_sha256="0" * 64,
+            expected_method="recommend_capacity",
+        )
+
+
+def test_worker_protocol_rejects_malformed_oversized_or_mispaired_lines() -> None:
+    """Break caught: permissive JSON or method pairing widened the worker API."""
+    from core.strategy_policy.contracts import CapacitySnapshot
+    from core.strategy_policy.worker import (
+        POLICY_METHODS,
+        WorkerBootstrap,
+        decode_policy_request,
+        encode_policy_request,
+        initial_chain_sha256,
+    )
+
+    bootstrap = WorkerBootstrap.create(interface_version=1)
+    snapshot = CapacitySnapshot(None, 25, 0, 3, 1.0, False)
+    assert POLICY_METHODS == (
+        "evaluate_entry",
+        "recommend_capacity",
+        "recommend_allocation",
+        "select_eviction",
+        "evaluate_exit",
+    )
+    with pytest.raises(ValueError, match="pairing"):
+        encode_policy_request(
+            bootstrap=bootstrap,
+            sequence=1,
+            previous_hmac_sha256=initial_chain_sha256(bootstrap),
+            method="evaluate_entry",
+            snapshot=snapshot,
+        )
+    with pytest.raises(ValueError, match="method"):
+        encode_policy_request(
+            bootstrap=bootstrap,
+            sequence=1,
+            previous_hmac_sha256=initial_chain_sha256(bootstrap),
+            method="unknown",
+            snapshot=snapshot,
+        )
+    for raw, message in (
+        ("x" * (16 * 1024 + 1), "line limit"),
+        ("not-json", "malformed"),
+        ('{"sequence":1,"sequence":1}', "duplicate"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            decode_policy_request(
+                raw,
+                bootstrap=bootstrap,
+                expected_sequence=1,
+                expected_previous_hmac_sha256=initial_chain_sha256(bootstrap),
+            )
+
+
+def test_worker_nondeterminism_detects_changed_probe_after_unrelated_call() -> None:
+    """Break caught: process-global state could alter repeated identical decisions."""
+    from core.strategy_policy.contracts import CapacityDecision, CapacitySnapshot
+    from core.strategy_policy.worker import DecisionDeterminismGuard
+
+    guard = DecisionDeterminismGuard()
+    repeated = CapacitySnapshot(None, 25, 0, 3, 1.0, False)
+    unrelated = CapacitySnapshot(5, 25, 2, 1, 0.5, True)
+    guard.observe("recommend_capacity", repeated, CapacityDecision(None, False))
+    guard.observe("recommend_capacity", unrelated, CapacityDecision(5, True))
+    with pytest.raises(ValueError, match="candidate_nondeterminism"):
+        guard.observe("recommend_capacity", repeated, CapacityDecision(5, False))
+
+
+def test_worker_protocol_json_line_policy_client_dispatches_and_closes_once() -> None:
+    """Break caught: the evaluator adapter omitted a method or leaked a worker session."""
+    from core.strategy_policy.contracts import (
+        AllocationDecision,
+        AllocationSnapshot,
+        CapacityDecision,
+        CapacitySnapshot,
+        EntryDecision,
+        EntrySnapshot,
+        EvictionDecision,
+        EvictionSnapshot,
+        ExitDecision,
+        ExitSnapshot,
+    )
+    from core.strategy_policy.runtime import JsonLinePolicyClient
+
+    decisions = {
+        "evaluate_entry": EntryDecision(True, True, (None, None), ()),
+        "recommend_capacity": CapacityDecision(None, False),
+        "recommend_allocation": AllocationDecision(0.01, 0.08, None),
+        "select_eviction": EvictionDecision(None),
+        "evaluate_exit": ExitDecision((), None, False, 0, False, False),
+    }
+
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+            self.closed = 0
+
+        def call(self, method: str, snapshot: object) -> object:
+            self.calls.append((method, snapshot))
+            return decisions[method]
+
+        def close(self) -> None:
+            self.closed += 1
+
+    snapshots = (
+        object.__new__(EntrySnapshot),
+        object.__new__(CapacitySnapshot),
+        object.__new__(AllocationSnapshot),
+        object.__new__(EvictionSnapshot),
+        object.__new__(ExitSnapshot),
+    )
+    session = RecordingSession()
+    client = JsonLinePolicyClient(session=session, interface_version=1)
+    assert client.evaluate_entry(snapshots[0]) == decisions["evaluate_entry"]
+    assert client.recommend_capacity(snapshots[1]) == decisions["recommend_capacity"]
+    assert client.recommend_allocation(snapshots[2]) == decisions["recommend_allocation"]
+    assert client.select_eviction(snapshots[3]) == decisions["select_eviction"]
+    assert client.evaluate_exit(snapshots[4]) == decisions["evaluate_exit"]
+    assert [method for method, _snapshot in session.calls] == list(decisions)
+    client.close()
+    client.close()
+    assert session.closed == 1

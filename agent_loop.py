@@ -13,6 +13,7 @@ import json
 import hashlib
 import math
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -3234,6 +3235,44 @@ def _git(
         raise PreflightError(f"Git operation failed: {' '.join(args)}: {detail}") from exc
 
 
+def _git_text(
+    git: GitCapability,
+    root: Path,
+    *args: str,
+) -> str:
+    """Return strict UTF-8 from one operation through the approved Git capability."""
+    try:
+        return _git(root, *args, timeout=30.0, git=git).stdout.decode(
+            "utf-8", errors="strict"
+        )
+    except UnicodeDecodeError as exc:
+        raise PreflightError("Git operation returned non-UTF-8 text") from exc
+
+
+def derive_authenticated_cumulative_diff(
+    *,
+    git: GitCapability,
+    authenticated_base_root: Path,
+    candidate_root: Path,
+    editable_paths: tuple[str, ...],
+) -> str:
+    """Derive a candidate diff from equal authenticated HEADs; never accept supplied text."""
+    base_head = _git_text(git, authenticated_base_root, "rev-parse", "HEAD").strip()
+    candidate_head = _git_text(git, candidate_root, "rev-parse", "HEAD").strip()
+    if base_head != candidate_head:
+        raise ValueError("candidate base commit mismatch")
+    return _git_text(
+        git,
+        candidate_root,
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "HEAD",
+        "--",
+        *editable_paths,
+    )
+
+
 def _audit_local_git_config(root: Path, git: GitCapability) -> None:
     """Reject local config that can execute or redirect code before reading the worktree."""
     raw_values: list[bytes] = []
@@ -4497,6 +4536,452 @@ def _approved_docker_executable(
     return canonical
 
 
+def _cleanup_unowned_policy_process(process: Any) -> None:
+    """Best-effort cleanup when launch succeeded but session ownership did not."""
+    try:
+        if process.stdin is not None and not getattr(process.stdin, "closed", False):
+            process.stdin.close()
+    except (OSError, ValueError):
+        pass
+    try:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+    finally:
+        for stream in (process.stdout, process.stderr):
+            try:
+                if stream is not None and not getattr(stream, "closed", False):
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+
+class PolicyWorkerSession:
+    """One bounded authenticated JSON-lines session owned by a single fold."""
+
+    def __init__(
+        self,
+        *,
+        process: Any,
+        package_root: Path,
+        bootstrap: object,
+        method_timeout_seconds: float,
+        fold_timeout_seconds: float,
+    ) -> None:
+        from core.strategy_policy.worker import (
+            DecisionDeterminismGuard,
+            initial_chain_sha256,
+        )
+
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            raise SandboxError("policy worker stdio is incomplete")
+        self._process = process
+        self.package_root = package_root
+        self._bootstrap = bootstrap
+        self._method_timeout_seconds = method_timeout_seconds
+        self._fold_timeout_seconds = fold_timeout_seconds
+        self._started_at = time.monotonic()
+        self._sequence = 1
+        self._previous_hmac = initial_chain_sha256(bootstrap)
+        self._guard = DecisionDeterminismGuard()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._stdout_values: queue.Queue[bytes | BaseException | None] = queue.Queue()
+        self._stderr = bytearray()
+        self._stderr_sha256 = hashlib.sha256()
+        self._stdout_thread = threading.Thread(
+            target=self._read_stdout,
+            name="pit-policy-stdout",
+            daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._read_stderr,
+            name="pit-policy-stderr",
+            daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    @property
+    def stderr_bytes(self) -> bytes:
+        return bytes(self._stderr)
+
+    def _read_stdout(self) -> None:
+        try:
+            while True:
+                raw = self._process.stdout.readline(16 * 1024 + 2)
+                if not raw:
+                    self._stdout_values.put(None)
+                    return
+                self._stdout_values.put(raw)
+        except BaseException as exc:
+            self._stdout_values.put(exc)
+
+    def _read_stderr(self) -> None:
+        try:
+            while True:
+                raw = self._process.stderr.read(4096)
+                if not raw:
+                    return
+                self._stderr_sha256.update(raw)
+                remaining = 64 * 1024 - len(self._stderr)
+                if remaining > 0:
+                    self._stderr.extend(raw[:remaining])
+        except (OSError, ValueError, queue.Empty):
+            return
+
+    def call(self, method: str, snapshot: object) -> object:
+        from core.strategy_policy.worker import (
+            decode_policy_response,
+            encode_policy_request,
+        )
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("policy worker session is closed")
+            remaining_fold = self._fold_timeout_seconds - (
+                time.monotonic() - self._started_at
+            )
+            if remaining_fold <= 0:
+                self.close()
+                raise TimeoutError("policy worker fold timeout")
+            request_line, request = encode_policy_request(
+                bootstrap=self._bootstrap,
+                sequence=self._sequence,
+                previous_hmac_sha256=self._previous_hmac,
+                method=method,
+                snapshot=snapshot,
+            )
+            try:
+                self._process.stdin.write(request_line.encode("utf-8") + b"\n")
+                self._process.stdin.flush()
+                try:
+                    result = self._stdout_values.get(
+                        timeout=min(self._method_timeout_seconds, remaining_fold)
+                    )
+                except queue.Empty as exc:
+                    raise TimeoutError("policy worker method timeout") from exc
+                if result is None:
+                    raise RuntimeError("policy worker closed before a response")
+                if isinstance(result, BaseException):
+                    raise RuntimeError("policy worker output failed") from result
+                if len(result) > 16 * 1024 + 1:
+                    raise ValueError("policy worker response line limit exceeded")
+                try:
+                    response_line = result.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise ValueError("policy worker response is not UTF-8") from exc
+                _response, decision = decode_policy_response(
+                    response_line,
+                    bootstrap=self._bootstrap,
+                    expected_sequence=self._sequence,
+                    expected_request_hmac_sha256=request.hmac_sha256,
+                    expected_method=method,
+                )
+                self._guard.observe(method, snapshot, decision)
+                self._previous_hmac = request.hmac_sha256
+                self._sequence += 1
+                return decision
+            except BaseException:
+                self.close()
+                raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        process = self._process
+        try:
+            try:
+                if process.stdin is not None and not getattr(process.stdin, "closed", False):
+                    process.stdin.close()
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=5)
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None and not getattr(stream, "closed", False):
+                    stream.close()
+            self._stdout_thread.join(timeout=5)
+            self._stderr_thread.join(timeout=5)
+            temporary_root = self.package_root.parent
+            if temporary_root.exists():
+                _remove_private_tree(temporary_root)
+
+
+class PolicyWorkerRunner:
+    """Build and launch one policy-only, capability-injected Docker worker per fold."""
+
+    def __init__(
+        self,
+        *,
+        image: str,
+        engine: DockerCapability | None = None,
+        injected_engine_path: Path | None = None,
+        process_factory: Callable[..., Any] = subprocess.Popen,
+        temp_parent: Path | None = None,
+        method_timeout_seconds: float = 1.0,
+    ) -> None:
+        if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image or "") is None:
+            raise SandboxError("policy worker image must be digest pinned")
+        if (
+            not math.isfinite(method_timeout_seconds)
+            or method_timeout_seconds <= 0
+            or method_timeout_seconds > 1.0
+        ):
+            raise SandboxError("policy worker method timeout is invalid")
+        self.image = image
+        self._process_factory = process_factory
+        self._engine_capability = engine
+        if process_factory is subprocess.Popen:
+            if engine is None or injected_engine_path is not None:
+                raise SandboxError("production policy worker requires a Docker capability")
+            self.engine_path = _approved_docker_executable(engine)
+            if method_timeout_seconds != 1.0:
+                raise SandboxError("production policy worker timeout is fixed")
+        else:
+            if (
+                engine is not None
+                or injected_engine_path is None
+                or not injected_engine_path.is_absolute()
+                or injected_engine_path.name.casefold() not in {"docker", "docker.exe"}
+            ):
+                raise SandboxError("injected policy worker requires a Docker-shaped endpoint")
+            self.engine_path = injected_engine_path
+        parent = temp_parent or Path(tempfile.gettempdir())
+        if not isinstance(parent, Path) or not parent.is_absolute() or not parent.is_dir():
+            raise SandboxError("policy worker temporary parent is invalid")
+        self.temp_parent = parent.resolve()
+        self.method_timeout_seconds = float(method_timeout_seconds)
+        self.fold_timeout_seconds = 900.0
+
+    @staticmethod
+    def _candidate_sources(candidate_root: Path) -> dict[str, bytes]:
+        from core.pit_optimizer_candidate import EDITABLE_POLICY_PATHS, validate_policy_ast
+
+        if (
+            not isinstance(candidate_root, Path)
+            or not candidate_root.is_absolute()
+            or not candidate_root.is_dir()
+            or candidate_root.is_symlink()
+            or _has_reparse_point(candidate_root)
+        ):
+            raise SandboxError("policy candidate root is invalid")
+        sources: dict[str, bytes] = {}
+        for relative in EDITABLE_POLICY_PATHS:
+            target = candidate_root / relative
+            if (
+                not target.is_file()
+                or target.is_symlink()
+                or _has_reparse_point(target)
+            ):
+                raise SandboxError("policy candidate source is not a regular file")
+            try:
+                content = target.read_bytes()
+                text = content.decode("utf-8", errors="strict")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise SandboxError("policy candidate source is not bounded UTF-8") from exc
+            if len(content) > 64 * 1024:
+                raise SandboxError("policy candidate source exceeds its cap")
+            validate_policy_ast(path=relative, source=text)
+            sources[relative] = content
+        return sources
+
+    def _make_package(self, candidate_root: Path, interface_version: int) -> Path:
+        if type(interface_version) is not int or interface_version <= 0:
+            raise SandboxError("policy worker interface is invalid")
+        sources = self._candidate_sources(candidate_root)
+        temporary_root = self.temp_parent / f"pw-{secrets.token_hex(4)}"
+        temporary_root.mkdir(mode=0o777 if os.name == "nt" else 0o700)
+        temporary_root = temporary_root.resolve()
+        if not _is_relative_to(temporary_root, self.temp_parent):
+            raise SandboxError("policy worker temporary root escaped its parent")
+        package_root = temporary_root / "package"
+        strategy_root = package_root / "core" / "strategy_policy"
+        try:
+            strategy_root.mkdir(parents=True)
+            (package_root / "core" / "__init__.py").write_bytes(b"")
+            (strategy_root / "__init__.py").write_text(
+                f"POLICY_INTERFACE_VERSION = {interface_version}\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            trusted_root = Path(__file__).resolve().parent / "core" / "strategy_policy"
+            for name in ("contracts.py", "worker.py"):
+                source = trusted_root / name
+                if not source.is_file() or source.is_symlink() or _has_reparse_point(source):
+                    raise SandboxError("trusted policy worker source is invalid")
+                (strategy_root / name).write_bytes(source.read_bytes())
+            for relative, content in sources.items():
+                (package_root / relative).write_bytes(content)
+            if os.name != "nt":
+                for path in package_root.rglob("*"):
+                    try:
+                        path.chmod(0o555 if path.is_dir() else 0o444)
+                    except OSError as exc:
+                        raise SandboxError("policy package could not be made read-only") from exc
+            return package_root
+        except BaseException:
+            if temporary_root.exists():
+                _remove_private_tree(temporary_root)
+            raise
+
+    def _engine_environment(self, temporary_root: Path) -> dict[str, str]:
+        control = temporary_root / "engine-control"
+        home = control / "home"
+        config = control / "config"
+        temp = control / "tmp"
+        for directory in (home, config, temp):
+            directory.mkdir(parents=True, exist_ok=False)
+        environment = _canonical_environment(
+            os.environ,
+            {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"},
+        )
+        environment.update(
+            {
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "DOCKER_CONFIG": str(config),
+                "TEMP": str(temp),
+                "TMP": str(temp),
+            }
+        )
+        return environment
+
+    def start(
+        self,
+        *,
+        candidate_root: Path,
+        interface_version: int,
+        fold_run_id: str,
+    ) -> PolicyWorkerSession:
+        from core.strategy_policy.worker import WorkerBootstrap
+
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", fold_run_id or "") is None:
+            raise SandboxError("policy worker fold run ID is invalid")
+        package_root = self._make_package(candidate_root, interface_version)
+        temporary_root = package_root.parent
+        process: Any | None = None
+        session: PolicyWorkerSession | None = None
+        try:
+            if "," in str(package_root):
+                raise SandboxError("policy worker package path is not mount-safe")
+            if self._process_factory is subprocess.Popen:
+                assert self._engine_capability is not None
+                engine_path = _approved_docker_executable(
+                    self._engine_capability,
+                    extra_forbidden_roots=(candidate_root, temporary_root),
+                )
+            else:
+                engine_path = self.engine_path
+            argv = [
+                str(engine_path),
+                "run",
+                "--rm",
+                "--name",
+                f"pit-policy-{fold_run_id}-{secrets.token_hex(4)}",
+                "--network",
+                "none",
+                "--read-only",
+                "--user",
+                "65532:65532",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--pids-limit",
+                "32",
+                "--memory",
+                "256m",
+                "--cpus",
+                "1.0",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=16m",
+                "--mount",
+                f"type=bind,src={package_root},dst=/workspace/policy,readonly",
+                "--workdir",
+                "/workspace/policy",
+                self.image,
+                "python",
+                "-B",
+                "-m",
+                "core.strategy_policy.worker",
+            ]
+            process = self._process_factory(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                close_fds=True,
+                bufsize=0,
+                env=self._engine_environment(temporary_root),
+            )
+            bootstrap = WorkerBootstrap.create(interface_version=interface_version)
+            session = PolicyWorkerSession(
+                process=process,
+                package_root=package_root,
+                bootstrap=bootstrap,
+                method_timeout_seconds=self.method_timeout_seconds,
+                fold_timeout_seconds=self.fold_timeout_seconds,
+            )
+            try:
+                process.stdin.write(bootstrap.to_json().encode("utf-8") + b"\n")
+                process.stdin.flush()
+            except BaseException:
+                session.close()
+                raise
+            return session
+        except BaseException:
+            if process is not None and session is None:
+                _cleanup_unowned_policy_process(process)
+            if temporary_root.exists():
+                _remove_private_tree(temporary_root)
+            raise
+
+    def client_factory(
+        self,
+        *,
+        candidate_root: Path,
+        interface_version: int,
+        fold_run_id: str,
+    ) -> Callable[[], Any]:
+        """Return a one-shot simulator factory for exactly one fresh fold session."""
+        started = False
+        lock = threading.Lock()
+
+        def create_client() -> Any:
+            nonlocal started
+            with lock:
+                if started:
+                    raise RuntimeError("policy worker fold session already started")
+                started = True
+            from core.strategy_policy.runtime import JsonLinePolicyClient
+
+            session = self.start(
+                candidate_root=candidate_root,
+                interface_version=interface_version,
+                fold_run_id=fold_run_id,
+            )
+            return JsonLinePolicyClient(
+                session=session,
+                interface_version=interface_version,
+            )
+
+        return create_client
+
+
 class SandboxRunner:
     """Digest-pinned observational runner with an exact inspected confinement contract."""
 
@@ -5457,9 +5942,20 @@ class ParsedPatch:
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 
 
-def _parse_unified_diff(raw: str) -> ParsedPatch:
-    if not isinstance(raw, str) or not raw or len(raw.encode("utf-8")) > _MAX_DIFF_BYTES:
-        raise PatchPolicyError("patch is blank or exceeds 256 KiB")
+def _parse_unified_diff(
+    raw: str,
+    *,
+    bounds: object | None = None,
+) -> ParsedPatch:
+    from core.pit_optimization_contract import PatchBounds
+
+    effective_bounds = bounds or PatchBounds(4, 25, 400, _MAX_DIFF_BYTES)
+    if not isinstance(effective_bounds, PatchBounds):
+        raise PatchPolicyError("patch bounds are invalid")
+    if not isinstance(raw, str) or not raw:
+        raise PatchPolicyError("patch is blank")
+    if len(raw.encode("utf-8")) > effective_bounds.max_diff_bytes:
+        raise PatchPolicyError("patch exceeds max_diff_bytes")
     if "\r" in raw or "\x00" in raw:
         raise PatchPolicyError("patch must use canonical LF text")
     lines = raw.splitlines(keepends=True)
@@ -5540,8 +6036,13 @@ def _parse_unified_diff(raw: str) -> ParsedPatch:
                 raise PatchPolicyError("hunk line counts do not match its header")
         if section_hunks == 0:
             raise PatchPolicyError("each diff section requires at least one hunk")
-    if len(files) > 4 or hunk_total > 25 or changed > 400:
-        raise PatchPolicyError("patch exceeds file, hunk, or changed-line caps")
+    for actual, maximum, name in (
+        (len(files), effective_bounds.max_files, "max_files"),
+        (hunk_total, effective_bounds.max_hunks, "max_hunks"),
+        (changed, effective_bounds.max_changed_lines, "max_changed_lines"),
+    ):
+        if actual > maximum:
+            raise PatchPolicyError(f"patch exceeds {name}")
     return ParsedPatch(tuple(files), hunk_total, changed, tuple(added), raw)
 
 
@@ -5553,13 +6054,15 @@ def validate_unified_diff(
     editable_paths: Sequence[str] = (),
     gate: str = "test",
     allow_protected_backtest_paths: bool = False,
+    bounds: object | None = None,
+    git: GitCapability | None = None,
 ) -> ParsedPatch:
     """Apply all path, structure, cap, mode, scope, and live-reference policy before Git."""
     if type(allow_protected_backtest_paths) is not bool:
         raise PatchPolicyError("protected backtest path policy must be boolean")
     if allow_protected_backtest_paths and gate != "backtest":
         raise PatchPolicyError("protected backtest paths require the backtest gate")
-    parsed = _parse_unified_diff(raw)
+    parsed = _parse_unified_diff(raw, bounds=bounds)
     try:
         declared = tuple(canonical_patch_path(path) for path in declared_files)
         extra_editable = {canonical_patch_path(path) for path in editable_paths}
@@ -5580,7 +6083,14 @@ def validate_unified_diff(
             and not (allow_protected_backtest_paths and path in PROPOSAL_BATCH_PROTECTED_BACKTEST_PATHS)
         ):
             raise PatchPolicyError(f"backtest oracle path is read-only: {path}")
-        entry = _git(candidate_root, "ls-files", "-s", "--", path).stdout.decode().strip()
+        entry = _git(
+            candidate_root,
+            "ls-files",
+            "-s",
+            "--",
+            path,
+            git=git,
+        ).stdout.decode().strip()
         fields = entry.split()
         if len(fields) != 4 or fields[0] != "100644" or fields[2] != "0" or fields[3] != path:
             raise PatchPolicyError(f"target must be a tracked 100644 stage-0 file: {path}")
@@ -5703,6 +6213,8 @@ def apply_candidate_patch(
     editable_paths: Sequence[str] = (),
     compile_runner: Callable[[WorkerLayout, tuple[str, ...]], bool] | None = None,
     allow_protected_backtest_paths: bool = False,
+    bounds: object | None = None,
+    git: GitCapability | None = None,
 ) -> ParsedPatch:
     """Apply one validated transaction using a controller-issued candidate capability."""
     candidate_root = _require_candidate(candidate)
@@ -5715,6 +6227,8 @@ def apply_candidate_patch(
         editable_paths=editable_paths,
         gate=gate,
         allow_protected_backtest_paths=allow_protected_backtest_paths,
+        bounds=bounds,
+        git=git,
     )
     _validate_exact_patch_anchors(candidate_root, parsed)
     before = snapshot_tree(candidate_root)
