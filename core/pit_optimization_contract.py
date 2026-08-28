@@ -41,6 +41,7 @@ MAX_CANARY_CALLS = 3
 MAX_CANARY_USD = 0.50
 
 OPTIMIZER_V2_ROLES = ("investigator", "author", "critic")
+PIT_OPTIMIZER_R1_MODEL = "deepseek/deepseek-r1"
 MAX_ROLE_TEXT_BYTES = 4 * 1024
 MAX_ROLE_LIST_ITEMS = 16
 MAX_AUTHOR_DIFF_BYTES = 64 * 1024
@@ -616,7 +617,7 @@ class PitOptimizerRunManifest(_V2Canonical):
         _v2_identifier(self.run_id, "optimizer run ID")
         if self.run_kind != "subset_canary":
             raise ValueError("optimizer run kind is invalid")
-        if self.model != "deepseek/deepseek-r1":
+        if self.model != PIT_OPTIMIZER_R1_MODEL:
             raise ValueError("optimizer model is invalid")
         if not isinstance(self.source_head, str) or re.fullmatch(
             r"[0-9a-f]{40}", self.source_head
@@ -1045,7 +1046,7 @@ def _require_first_call_plan(
             budget.max_response_bytes,
             float(budget.max_usd),
         )
-        if budget.model != "deepseek/deepseek-r1" or actual != expected:
+        if budget.model != PIT_OPTIMIZER_R1_MODEL or actual != expected:
             raise ValueError("first subset canary call caps are invalid")
 
 
@@ -1247,7 +1248,7 @@ def build_subset_manifest(
         schema_version=2,
         run_id=f"run_{uuid.uuid4().hex}",
         run_kind="subset_canary",
-        model="deepseek/deepseek-r1",
+        model=PIT_OPTIMIZER_R1_MODEL,
         source_head=str(identities["source_head"]),
         source_fingerprint_sha256=str(identities["source_fingerprint_sha256"]),
         legacy_readiness_sha256=readiness_sha256,
