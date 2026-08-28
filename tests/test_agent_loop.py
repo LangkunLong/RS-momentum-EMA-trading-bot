@@ -537,6 +537,36 @@ def _task5_authenticated_capacity_process() -> _Task5FakeProcess:
     return process
 
 
+def _task5_malformed_protocol_process() -> _Task5FakeProcess:
+    process = _Task5FakeProcess()
+    writes = 0
+
+    def malformed_after_bootstrap(_value: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            process.stdout.values.put(b"{}\n")
+
+    process.stdin.callback = malformed_after_bootstrap
+    return process
+
+
+def _task5_observe_close_primary(
+    session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[BaseException]:
+    observed: list[BaseException] = []
+    close = session.close
+
+    def observing_close(*, primary_error: BaseException | None = None) -> None:
+        if primary_error is not None:
+            observed.append(primary_error)
+        close(primary_error=primary_error)
+
+    monkeypatch.setattr(session, "close", observing_close)
+    return observed
+
+
 def _task5_executing_candidate_process(package_root: Path) -> _Task5FakeProcess:
     from core.strategy_policy.worker import (
         WorkerBootstrap,
@@ -1414,6 +1444,249 @@ def test_policy_worker_cleanup_evidence_redacts_timeout_capability_values(
     assert control.exists
     assert not tuple(tmp_path.glob("pw-*"))
     control.exists = False
+
+
+def test_policy_worker_cleanup_normalizes_hostile_returncode_before_comparison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: hostile cleanup returncode comparison replaced the protocol primary."""
+    from agent_loop import ProcessResult, PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+
+    sentinel = "hostile-returncode-comparison-escaped"
+    comparisons: list[object] = []
+
+    class HostileReturncode:
+        def __ne__(self, other: object) -> bool:
+            comparisons.append(other)
+            raise RuntimeError(sentinel)
+
+    docker = _Task5FakeDockerControl()
+
+    def control(argv: tuple[str, ...], **kwargs: object) -> object:
+        result = docker(argv, **kwargs)
+        if argv[1] == "kill":
+            return ProcessResult(
+                HostileReturncode(),  # type: ignore[arg-type]
+                "",
+                "",
+                hashlib.sha256(b"").hexdigest(),
+                hashlib.sha256(b"").hexdigest(),
+            )
+        return result
+
+    process = _task5_malformed_protocol_process()
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id="hostile_returncode_cleanup",
+    )
+    package_parent = session.package_root.parent
+    observed_primaries = _task5_observe_close_primary(session, monkeypatch)
+
+    with pytest.raises(ValueError) as captured:
+        session.call(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        )
+
+    assert len(observed_primaries) == 1
+    assert captured.value is observed_primaries[0]
+    assert type(captured.value) is ValueError
+    assert captured.value.args == ("policy JSON fields are invalid",)
+    notes = getattr(captured.value, "__notes__", ())
+    assert notes == [
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_kill reason=invalid_result"
+        )
+    ]
+    assert comparisons == []
+    assert sentinel not in "".join(traceback.format_exception(captured.value))
+    assert all(len(note.encode("ascii")) <= 128 for note in notes)
+    assert [call[1] for call in docker.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert not docker.exists
+    assert not package_parent.exists()
+
+
+@pytest.mark.parametrize(
+    ("operation", "hostile_field", "expected_notes"),
+    (
+        (
+            "kill",
+            "timed_out",
+            (
+                "policy_worker_secondary_failure phase=cleanup "
+                "action=daemon_kill reason=invalid_result",
+            ),
+        ),
+        (
+            "container",
+            "stdout",
+            (
+                "policy_worker_secondary_failure phase=cleanup "
+                "action=daemon_absence_query reason=invalid_result",
+                "policy_worker_secondary_failure phase=cleanup "
+                "action=daemon_absence_verify reason=unverified",
+            ),
+        ),
+    ),
+)
+def test_policy_worker_cleanup_rejects_hostile_result_getter_without_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    hostile_field: str,
+    expected_notes: tuple[str, ...],
+) -> None:
+    """Break caught: a ProcessResult subclass getter escaped owner cleanup."""
+    from agent_loop import ProcessResult, PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+
+    sentinel = f"hostile-{hostile_field}-getter-escaped"
+    getter_calls: list[str] = []
+
+    class HostileFieldResult(ProcessResult):
+        def __getattribute__(self, name: str) -> object:
+            if name == hostile_field:
+                getter_calls.append(name)
+                raise RuntimeError(sentinel)
+            return super().__getattribute__(name)
+
+    hostile_result = HostileFieldResult(
+        0,
+        "",
+        "",
+        hashlib.sha256(b"").hexdigest(),
+        hashlib.sha256(b"").hexdigest(),
+    )
+    docker = _Task5FakeDockerControl()
+
+    def control(argv: tuple[str, ...], **kwargs: object) -> object:
+        result = docker(argv, **kwargs)
+        if argv[1] == operation:
+            return hostile_result
+        return result
+
+    process = _task5_malformed_protocol_process()
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id=f"hostile_{hostile_field}_getter",
+    )
+    package_parent = session.package_root.parent
+    observed_primaries = _task5_observe_close_primary(session, monkeypatch)
+
+    with pytest.raises(ValueError) as captured:
+        session.call(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        )
+
+    assert len(observed_primaries) == 1
+    assert captured.value is observed_primaries[0]
+    assert type(captured.value) is ValueError
+    assert captured.value.args == ("policy JSON fields are invalid",)
+    notes = getattr(captured.value, "__notes__", ())
+    assert tuple(notes) == expected_notes
+    assert getter_calls == []
+    assert sentinel not in "".join(traceback.format_exception(captured.value))
+    assert all(len(note.encode("ascii")) <= 128 for note in notes)
+    assert [call[1] for call in docker.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert not docker.exists
+    assert not package_parent.exists()
+
+
+def test_policy_worker_explicit_close_normalizes_hostile_result_to_generic_error(
+    tmp_path: Path,
+) -> None:
+    """Break caught: hostile cleanup truth testing escaped explicit-close reporting."""
+    from agent_loop import ProcessResult, PolicyWorkerRunner, SandboxError
+
+    sentinel = "hostile-timeout-truth-test-escaped"
+    truth_tests: list[bool] = []
+
+    class HostileTimedOut:
+        def __bool__(self) -> bool:
+            truth_tests.append(True)
+            raise RuntimeError(sentinel)
+
+    docker = _Task5FakeDockerControl()
+
+    def control(argv: tuple[str, ...], **kwargs: object) -> object:
+        result = docker(argv, **kwargs)
+        if argv[1] == "kill":
+            return ProcessResult(
+                0,
+                "",
+                "",
+                hashlib.sha256(b"").hexdigest(),
+                hashlib.sha256(b"").hexdigest(),
+                timed_out=HostileTimedOut(),  # type: ignore[arg-type]
+            )
+        return result
+
+    process = _Task5FakeProcess()
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id="hostile_explicit_close",
+    )
+    package_parent = session.package_root.parent
+
+    with pytest.raises(SandboxError) as captured:
+        session.close()
+
+    assert type(captured.value) is SandboxError
+    assert captured.value.args == ("policy worker cleanup could not be fully verified",)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert getattr(captured.value, "__notes__", ()) == ()
+    assert sentinel not in "".join(traceback.format_exception(captured.value))
+    assert truth_tests == []
+    assert [call[1] for call in docker.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert not docker.exists
+    assert not package_parent.exists()
+    calls_after_first_close = tuple(docker.calls)
+    session.close()
+    assert tuple(docker.calls) == calls_after_first_close
 
 
 def test_policy_worker_protocol_primary_retains_unverified_daemon_cleanup(

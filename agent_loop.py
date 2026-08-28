@@ -4590,6 +4590,13 @@ class _PolicySecondaryFailure:
     reason: _PolicySecondaryReason
 
 
+@dataclass(frozen=True, slots=True)
+class _NormalizedPolicyCleanupResult:
+    timed_out: bool
+    nonzero: bool
+    stdout_present: bool | None
+
+
 _MAX_POLICY_SECONDARY_NOTES = 32
 _MAX_POLICY_SECONDARY_NOTE_BYTES = 128
 
@@ -4665,10 +4672,23 @@ def _cleanup_owned_policy_daemon(
     """Force-remove one authenticated daemon object and verify exact owner absence."""
     errors: list[_PolicySecondaryFailure] = []
 
+    def record(
+        action: _PolicySecondaryAction,
+        reason: _PolicySecondaryReason,
+    ) -> None:
+        errors.append(
+            _PolicySecondaryFailure(
+                _PolicySecondaryPhase.CLEANUP,
+                action,
+                reason,
+            )
+        )
+
     def control(
         action: _PolicySecondaryAction,
         *args: str,
-    ) -> ProcessResult | None:
+        require_stdout: bool = False,
+    ) -> _NormalizedPolicyCleanupResult | None:
         try:
             result = daemon.control_runner(
                 (str(daemon.engine_path), *args),
@@ -4677,40 +4697,37 @@ def _cleanup_owned_policy_daemon(
                 output_limit=64 * 1024,
             )
         except BaseException:
-            errors.append(
-                _PolicySecondaryFailure(
-                    _PolicySecondaryPhase.CLEANUP,
-                    action,
-                    _PolicySecondaryReason.EXCEPTION,
-                )
-            )
+            record(action, _PolicySecondaryReason.EXCEPTION)
             return None
-        if not isinstance(result, ProcessResult):
-            errors.append(
-                _PolicySecondaryFailure(
-                    _PolicySecondaryPhase.CLEANUP,
-                    action,
-                    _PolicySecondaryReason.INVALID_RESULT,
-                )
+        try:
+            if type(result) is not ProcessResult:
+                record(action, _PolicySecondaryReason.INVALID_RESULT)
+                return None
+            timed_out = result.timed_out
+            returncode = result.returncode
+            if type(timed_out) is not bool or type(returncode) is not int:
+                record(action, _PolicySecondaryReason.INVALID_RESULT)
+                return None
+            stdout_present: bool | None = None
+            if require_stdout:
+                stdout = result.stdout
+                if type(stdout) is not str:
+                    record(action, _PolicySecondaryReason.INVALID_RESULT)
+                    return None
+                stdout_present = bool(stdout.strip())
+            normalized = _NormalizedPolicyCleanupResult(
+                timed_out=timed_out,
+                nonzero=returncode != 0,
+                stdout_present=stdout_present,
             )
+        except BaseException:
+            record(action, _PolicySecondaryReason.EXCEPTION)
             return None
-        if result.timed_out:
-            errors.append(
-                _PolicySecondaryFailure(
-                    _PolicySecondaryPhase.CLEANUP,
-                    action,
-                    _PolicySecondaryReason.TIMEOUT,
-                )
-            )
-        elif result.returncode != 0:
-            errors.append(
-                _PolicySecondaryFailure(
-                    _PolicySecondaryPhase.CLEANUP,
-                    action,
-                    _PolicySecondaryReason.NONZERO,
-                )
-            )
-        return result
+        if normalized.timed_out:
+            record(action, _PolicySecondaryReason.TIMEOUT)
+        elif normalized.nonzero:
+            record(action, _PolicySecondaryReason.NONZERO)
+        return normalized
 
     control(
         _PolicySecondaryAction.DAEMON_KILL,
@@ -4739,11 +4756,12 @@ def _cleanup_owned_policy_daemon(
         "--no-trunc",
         "--filter",
         f"id={daemon.container_id}",
+        require_stdout=True,
     )
     if (
         absence is None
         or absence.timed_out
-        or absence.returncode != 0
+        or absence.nonzero
     ):
         errors.append(
             _PolicySecondaryFailure(
@@ -4752,7 +4770,7 @@ def _cleanup_owned_policy_daemon(
                 _PolicySecondaryReason.UNVERIFIED,
             )
         )
-    elif absence.stdout.strip():
+    elif absence.stdout_present:
         errors.append(
             _PolicySecondaryFailure(
                 _PolicySecondaryPhase.CLEANUP,
