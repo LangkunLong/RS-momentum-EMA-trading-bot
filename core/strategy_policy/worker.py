@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from dataclasses import dataclass, fields
 import hashlib
 import hmac
@@ -100,7 +101,7 @@ class WorkerBootstrap:
     hmac_key_b64: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("worker bootstrap schema is unsupported")
         if type(self.interface_version) is not int or self.interface_version <= 0:
             raise ValueError("worker bootstrap interface is invalid")
@@ -146,6 +147,17 @@ class PolicyRequestEnvelope:
     payload: Mapping[str, object]
     hmac_sha256: str
 
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("policy sequence is invalid")
+        _sha256(self.previous_hmac_sha256, "request chain")
+        if self.method not in _METHOD_TYPES:
+            raise ValueError("policy method is invalid")
+        _sha256(self.payload_sha256, "request payload hash")
+        if not isinstance(self.payload, Mapping):
+            raise ValueError("policy payload is invalid")
+        _sha256(self.hmac_sha256, "request HMAC")
+
 
 @dataclass(frozen=True, slots=True)
 class PolicyResponseEnvelope:
@@ -155,6 +167,17 @@ class PolicyResponseEnvelope:
     payload_sha256: str
     payload: Mapping[str, object]
     hmac_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("policy sequence is invalid")
+        _sha256(self.request_hmac_sha256, "response request binding")
+        if self.method not in _METHOD_TYPES:
+            raise ValueError("policy method is invalid")
+        _sha256(self.payload_sha256, "response payload hash")
+        if not isinstance(self.payload, Mapping):
+            raise ValueError("policy payload is invalid")
+        _sha256(self.hmac_sha256, "response HMAC")
 
 
 def initial_chain_sha256(bootstrap: WorkerBootstrap) -> str:
@@ -241,7 +264,12 @@ def decode_policy_request(
             }
         ),
     )
-    if value["sequence"] != expected_sequence:
+    if (
+        type(expected_sequence) is not int
+        or expected_sequence <= 0
+        or type(value["sequence"]) is not int
+        or value["sequence"] != expected_sequence
+    ):
         raise ValueError("policy sequence is invalid")
     if value["previous_hmac_sha256"] != expected_previous_hmac_sha256:
         raise ValueError("policy request chain is invalid")
@@ -315,7 +343,12 @@ def decode_policy_response(
             }
         ),
     )
-    if value["sequence"] != expected_sequence:
+    if (
+        type(expected_sequence) is not int
+        or expected_sequence <= 0
+        or type(value["sequence"]) is not int
+        or value["sequence"] != expected_sequence
+    ):
         raise ValueError("policy sequence is invalid")
     if value["request_hmac_sha256"] != expected_request_hmac_sha256:
         raise ValueError("policy response request binding is invalid")
@@ -336,18 +369,46 @@ def decode_policy_response(
     return envelope, parsed
 
 
+@dataclass(frozen=True, slots=True)
+class PolicyDeterminismProbe:
+    method: str
+    repeated_snapshot: object
+    unrelated_snapshot: object
+
+    def __post_init__(self) -> None:
+        _require_method_pair(self.method, self.repeated_snapshot, response=False)
+        _require_method_pair(self.method, self.unrelated_snapshot, response=False)
+        if _canonical_bytes(self.repeated_snapshot.to_primitive()) == _canonical_bytes(  # type: ignore[attr-defined]
+            self.unrelated_snapshot.to_primitive()  # type: ignore[attr-defined]
+        ):
+            raise ValueError("policy determinism probe snapshots must differ")
+
+
 class DecisionDeterminismGuard:
     """Remember bounded snapshot results and reject state-dependent changes."""
 
-    def __init__(self) -> None:
-        self._observed: dict[tuple[str, bytes], bytes] = {}
+    def __init__(self, *, max_observations: int = 32) -> None:
+        if type(max_observations) is not int or not 1 <= max_observations <= 32:
+            raise ValueError("policy determinism observation cap is invalid")
+        self._max_observations = max_observations
+        self._observed: OrderedDict[tuple[str, bytes], bytes] = OrderedDict()
+
+    @property
+    def observed_count(self) -> int:
+        return len(self._observed)
 
     def observe(self, method: str, snapshot: object, decision: object) -> None:
         _require_method_pair(method, snapshot, response=False)
         _require_method_pair(method, decision, response=True)
         key = (method, _canonical_bytes(snapshot.to_primitive()))  # type: ignore[attr-defined]
         rendered = _canonical_bytes(decision.to_primitive())  # type: ignore[attr-defined]
-        previous = self._observed.setdefault(key, rendered)
+        previous = self._observed.get(key)
+        if previous is None:
+            if len(self._observed) == self._max_observations:
+                self._observed.popitem(last=False)
+            self._observed[key] = rendered
+            return
+        self._observed.move_to_end(key)
         if not hmac.compare_digest(previous, rendered):
             raise ValueError("candidate_nondeterminism")
 
@@ -409,6 +470,7 @@ __all__ = [
     "DecisionDeterminismGuard",
     "MAX_POLICY_LINE_BYTES",
     "POLICY_METHODS",
+    "PolicyDeterminismProbe",
     "PolicyRequestEnvelope",
     "PolicyResponseEnvelope",
     "WorkerBootstrap",

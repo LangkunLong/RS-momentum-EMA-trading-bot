@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Mapping
+from weakref import WeakValueDictionary
 
 import core.pit_optimization_contract as optimization_contract
 from core.pit_optimization_contract import (
     AuthorArtifact,
-    IterationFeedbackSummary,
+    AuthorInput,
+    CriticInput,
+    InvestigatorInput,
     PatchBounds,
     PitOptimizerCallBudget,
     PolicySourceBundle,
@@ -50,6 +55,7 @@ _DECLARED_SYMBOLS = {
     ),
 }
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_CANDIDATE_IDENTITY_CONSTRUCTION_SEAL = object()
 _CONTRACT_IMPORTS = frozenset(
     {
         "AllocationDecision",
@@ -154,7 +160,7 @@ _ALLOWED_AST_NODES = (
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class CandidateIdentity:
     source_commit: str
     policy_interface_version: int
@@ -165,6 +171,17 @@ class CandidateIdentity:
     immutable_constraints_sha256: str
     discovery_manifest_sha256: str
     identity_sha256: str
+    _controller_seal: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
+            raise ValueError("candidate identity must be controller derived")
+        _validate_candidate_identity_fields(self)
+
+
+_AUTHENTICATED_CANDIDATE_IDENTITIES: WeakValueDictionary[
+    int, CandidateIdentity
+] = WeakValueDictionary()
 
 
 def _immutable_literal(value: object) -> bool:
@@ -263,6 +280,49 @@ def validate_policy_ast(*, path: str, source: str) -> None:
             if not _immutable_literal(value):
                 raise ValueError("policy constant requires an immutable literal")
 
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    mutable_names: dict[ast.FunctionDef, set[str]] = {}
+    for function in (
+        item for item in tree.body if isinstance(item, ast.FunctionDef)
+    ):
+        names = {
+            descendant.targets[0].id
+            for descendant in ast.walk(function)
+            if isinstance(descendant, ast.Assign)
+            and len(descendant.targets) == 1
+            and isinstance(descendant.targets[0], ast.Name)
+            and isinstance(
+                descendant.value,
+                (ast.List, ast.Dict, ast.ListComp, ast.DictComp),
+            )
+            or isinstance(descendant, ast.Assign)
+            and len(descendant.targets) == 1
+            and isinstance(descendant.targets[0], ast.Name)
+            and isinstance(descendant.value, ast.Call)
+            and isinstance(descendant.value.func, ast.Name)
+            and descendant.value.func.id in {"list", "dict"}
+        }
+        names.update(
+            descendant.target.id
+            for descendant in ast.walk(function)
+            if isinstance(descendant, ast.AnnAssign)
+            and isinstance(descendant.target, ast.Name)
+            and isinstance(
+                descendant.value,
+                (ast.List, ast.Dict, ast.ListComp, ast.DictComp),
+            )
+            or isinstance(descendant, ast.AnnAssign)
+            and isinstance(descendant.target, ast.Name)
+            and isinstance(descendant.value, ast.Call)
+            and isinstance(descendant.value.func, ast.Name)
+            and descendant.value.func.id in {"list", "dict"}
+        )
+        mutable_names[function] = names
+
     for node in ast.walk(tree):
         if not isinstance(node, _ALLOWED_AST_NODES):
             if isinstance(node, ast.ClassDef):
@@ -298,6 +358,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                     *node.args.kwonlyargs,
                 )
             }
+            local_mutables = mutable_names[node]
             for descendant in ast.walk(node):
                 if isinstance(descendant, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                     targets = (
@@ -313,12 +374,26 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                             target, (ast.Attribute, ast.Subscript)
                         ):
                             raise ValueError("policy function attribute writes are forbidden")
+                        if isinstance(target, (ast.Attribute, ast.Subscript)) and (
+                            root not in local_mutables
+                        ):
+                            raise ValueError("policy mutation root is outside local state")
+        if isinstance(node, (ast.Set, ast.SetComp)):
+            raise ValueError("policy unordered iteration is forbidden")
         if isinstance(node, ast.Attribute):
             if node.attr.startswith("__"):
                 raise ValueError("policy reflection attributes are forbidden")
             if _root_name(node) in local_functions:
                 raise ValueError("policy function attributes are forbidden")
         if isinstance(node, ast.Call):
+            owner: ast.AST | None = node
+            while owner is not None and not isinstance(owner, ast.FunctionDef):
+                owner = parents.get(owner)
+            call_mutables = (
+                mutable_names.get(owner, set())
+                if isinstance(owner, ast.FunctionDef)
+                else set()
+            )
             if isinstance(node.func, ast.Name):
                 name = node.func.id
                 if name in _REFLECTION_CALLS:
@@ -334,7 +409,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                 if root == "math":
                     if not imported_math or node.func.attr.startswith("_"):
                         raise ValueError("policy math call is outside the allowlist")
-                elif node.func.attr == "append" and root not in local_functions:
+                elif node.func.attr == "append" and root in call_mutables:
                     continue
                 else:
                     raise ValueError("policy attribute call is outside the allowlist")
@@ -426,16 +501,45 @@ def _require_identity_inputs(
 
 
 def _read_policy_sources(root: Path) -> dict[str, str]:
+    if not isinstance(root, Path) or not root.is_absolute():
+        raise ValueError("policy source provenance root is invalid")
+    try:
+        absolute_root = _existing_path_without_links(root)
+        if not stat.S_ISDIR(absolute_root.lstat().st_mode):
+            raise ValueError("policy source provenance root is not a directory")
+    except OSError as exc:
+        raise ValueError("policy source provenance contains a link or reparse point") from exc
     sources: dict[str, str] = {}
     for relative in EDITABLE_POLICY_PATHS:
-        target = root / relative
+        target = absolute_root / relative
         try:
-            if not target.is_file() or target.is_symlink():
+            target = _existing_path_without_links(target)
+            target.relative_to(absolute_root)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "policy source provenance contains a link or reparse point"
+            ) from exc
+        try:
+            if not stat.S_ISREG(target.lstat().st_mode):
                 raise ValueError("policy source is not a regular file")
             sources[relative] = target.read_bytes().decode("utf-8", errors="strict")
         except (OSError, UnicodeDecodeError) as exc:
             raise ValueError("policy source cannot be read as UTF-8") from exc
     return sources
+
+
+def _existing_path_without_links(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode) or bool(
+            getattr(info, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            raise OSError("path contains a link or reparse point")
+    return absolute
 
 
 def _identity_digest(fields: Mapping[str, object]) -> str:
@@ -448,6 +552,96 @@ def _identity_digest(fields: Mapping[str, object]) -> str:
         ).encode("utf-8")
         + b"\n"
     ).hexdigest()
+
+
+def _candidate_identity_values(candidate: CandidateIdentity) -> dict[str, object]:
+    return {
+        "source_commit": candidate.source_commit,
+        "policy_interface_version": candidate.policy_interface_version,
+        "cumulative_diff_sha256": candidate.cumulative_diff_sha256,
+        "editable_file_sha256s": candidate.editable_file_sha256s,
+        "changed_paths": candidate.changed_paths,
+        "changed_symbols": candidate.changed_symbols,
+        "immutable_constraints_sha256": candidate.immutable_constraints_sha256,
+        "discovery_manifest_sha256": candidate.discovery_manifest_sha256,
+    }
+
+
+def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}", candidate.source_commit or "") is None:
+        raise ValueError("candidate identity source commit is invalid")
+    if (
+        type(candidate.policy_interface_version) is not int
+        or candidate.policy_interface_version <= 0
+    ):
+        raise ValueError("candidate identity interface version is invalid")
+    for value in (
+        candidate.cumulative_diff_sha256,
+        candidate.immutable_constraints_sha256,
+        candidate.discovery_manifest_sha256,
+        candidate.identity_sha256,
+    ):
+        if _SHA256_RE.fullmatch(value or "") is None:
+            raise ValueError("candidate identity digest is invalid")
+    if (
+        type(candidate.editable_file_sha256s) is not tuple
+        or tuple(path for path, _digest in candidate.editable_file_sha256s)
+        != EDITABLE_POLICY_PATHS
+        or any(
+            _SHA256_RE.fullmatch(digest or "") is None
+            for _path, digest in candidate.editable_file_sha256s
+        )
+    ):
+        raise ValueError("candidate identity editable hashes are invalid")
+    canonical_paths = tuple(
+        path for path in EDITABLE_POLICY_PATHS if path in candidate.changed_paths
+    )
+    if (
+        type(candidate.changed_paths) is not tuple
+        or not candidate.changed_paths
+        or candidate.changed_paths != canonical_paths
+    ):
+        raise ValueError("candidate identity changed paths are invalid")
+    if (
+        type(candidate.changed_symbols) is not tuple
+        or not candidate.changed_symbols
+        or len(candidate.changed_symbols) != len(set(candidate.changed_symbols))
+        or any(not isinstance(symbol, str) for symbol in candidate.changed_symbols)
+    ):
+        raise ValueError("candidate identity changed symbols are invalid")
+    allowed = {
+        symbol
+        for path in candidate.changed_paths
+        for symbol in _DECLARED_SYMBOLS[path]
+    }
+    constant_prefixes = tuple(
+        f"{path.removesuffix('.py').replace('/', '.')}."
+        for path in candidate.changed_paths
+    )
+    if any(
+        symbol not in allowed
+        and not any(
+            symbol.startswith(prefix)
+            and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix))
+            is not None
+            for prefix in constant_prefixes
+        )
+        for symbol in candidate.changed_symbols
+    ):
+        raise ValueError("candidate identity changed symbols are invalid")
+    if candidate.identity_sha256 != _identity_digest(
+        _candidate_identity_values(candidate)
+    ):
+        raise ValueError("candidate identity self-digest is invalid")
+
+
+def validate_candidate_identity(candidate: CandidateIdentity) -> None:
+    """Authenticate one exact controller-created identity object at consumption."""
+    if not isinstance(candidate, CandidateIdentity):
+        raise ValueError("candidate identity is invalid")
+    _validate_candidate_identity_fields(candidate)
+    if _AUTHENTICATED_CANDIDATE_IDENTITIES.get(id(candidate)) is not candidate:
+        raise ValueError("candidate identity is not authenticated")
 
 
 def validate_candidate_diff(
@@ -573,13 +767,11 @@ def validate_candidate_diff(
         if actual_head != source_commit:
             raise ValueError("candidate source commit differs from authenticated base")
         changed_paths = tuple(
-            sorted(
-                path
-                for path in EDITABLE_POLICY_PATHS
-                if base_sources[path] != after_sources[path]
-            )
+            path
+            for path in EDITABLE_POLICY_PATHS
+            if base_sources[path] != after_sources[path]
         )
-        if changed_paths != tuple(sorted(cumulative.files)):
+        if set(changed_paths) != set(cumulative.files):
             raise ValueError("candidate changed paths differ from Git cumulative diff")
         changed_symbols = derive_changed_symbols(
             before_sources=base_sources,
@@ -587,7 +779,7 @@ def validate_candidate_diff(
         )
         editable_hashes = tuple(
             (path, hashlib.sha256(after_sources[path].encode("utf-8")).hexdigest())
-            for path in sorted(EDITABLE_POLICY_PATHS)
+            for path in EDITABLE_POLICY_PATHS
         )
         values: dict[str, object] = {
             "source_commit": source_commit,
@@ -601,10 +793,13 @@ def validate_candidate_diff(
             "immutable_constraints_sha256": immutable_constraints_sha256,
             "discovery_manifest_sha256": discovery_manifest_sha256,
         }
-        return CandidateIdentity(
+        identity = CandidateIdentity(
             **values,
             identity_sha256=_identity_digest(values),
-        ), cumulative_diff
+            _controller_seal=_CANDIDATE_IDENTITY_CONSTRUCTION_SEAL,
+        )
+        _AUTHENTICATED_CANDIDATE_IDENTITIES[id(identity)] = identity
+        return identity, cumulative_diff
     except BaseException as exc:
         if applied:
             for path, content in before_bytes.items():
@@ -623,6 +818,7 @@ def validate_author_manifest(
         candidate, CandidateIdentity
     ):
         raise ValueError("author_manifest_mismatch")
+    validate_candidate_identity(candidate)
     if (
         author.changed_paths != candidate.changed_paths
         or author.changed_symbols != candidate.changed_symbols
@@ -679,52 +875,47 @@ def build_policy_source_bundle(
 
 def require_source_context_fit(
     *,
-    source_bundle: PolicySourceBundle,
-    prior_iterations: tuple[IterationFeedbackSummary, ...],
+    role_input: InvestigatorInput | AuthorInput | CriticInput,
     role_budget: PitOptimizerCallBudget,
-) -> None:
+) -> bytes:
     """Reject complete role context that cannot fit; never drop or truncate feedback."""
-    if not isinstance(source_bundle, PolicySourceBundle) or not isinstance(
-        role_budget, PitOptimizerCallBudget
+    role_types = {
+        "investigator": InvestigatorInput,
+        "author": AuthorInput,
+        "critic": CriticInput,
+    }
+    if not isinstance(role_budget, PitOptimizerCallBudget) or type(role_input) not in (
+        InvestigatorInput,
+        AuthorInput,
+        CriticInput,
     ):
         raise ValueError("source context contracts are invalid")
     if (
-        type(prior_iterations) is not tuple
-        or len(prior_iterations) > 8
-        or any(not isinstance(item, IterationFeedbackSummary) for item in prior_iterations)
+        type(role_input) is not role_types[role_budget.role]
+        or role_input.iteration != role_budget.iteration
     ):
-        raise ValueError("source context history is invalid")
-    if role_budget.iteration == 2 and len(prior_iterations) > 1:
-        raise ValueError("source context history exceeds the two-iteration canary")
-    if any(
-        len(item.canonical_json_bytes()) > 4 * 1024 for item in prior_iterations
-    ):
-        raise ValueError("source context feedback exceeds its cap")
-    history_bytes = json.dumps(
-        [asdict(item) for item in prior_iterations],
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    if len(history_bytes) > 32 * 1024:
-        raise ValueError("source context history exceeds its byte cap")
-    if len(source_bundle.canonical_json_bytes()) > 64 * 1024:
-        raise ValueError("next_context_oversize")
-    dynamic_bytes = json.dumps(
-        {
-            "source_bundle": asdict(source_bundle),
-            "prior_iterations": [asdict(item) for item in prior_iterations],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+        raise ValueError("source context role or iteration differs from its budget")
+    rendered = role_input.canonical_json_bytes()
+    static_bytes = len(
+        optimization_contract.PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[
+            role_budget.role
+        ].encode("utf-8")
+    ) + len(
+        json.dumps(
+            optimization_contract.pit_optimizer_response_format(role_budget.role),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
     if (
-        len(dynamic_bytes) > role_budget.max_dynamic_input_bytes
-        or role_budget.max_static_input_bytes + len(dynamic_bytes)
-        > role_budget.max_input_tokens
+        static_bytes > role_budget.max_static_input_bytes
+        or len(rendered) > role_budget.max_dynamic_input_bytes
+        or static_bytes + len(rendered) > role_budget.max_input_tokens
     ):
         raise ValueError("context_budget_exhausted")
+    return rendered
 __all__ = [
     "CandidateIdentity",
     "EDITABLE_POLICY_PATHS",
@@ -735,5 +926,6 @@ __all__ = [
     "require_source_context_fit",
     "validate_author_manifest",
     "validate_candidate_diff",
+    "validate_candidate_identity",
     "validate_policy_ast",
 ]

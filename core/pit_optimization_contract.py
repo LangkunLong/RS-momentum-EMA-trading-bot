@@ -426,12 +426,27 @@ def _validate_scoped_paths_symbols(
 ) -> None:
     if any(path not in _POLICY_EDITABLE_PATHS for path in paths):
         raise ValueError(f"{label} paths are outside the editable scope")
+    canonical_paths = tuple(path for path in _POLICY_EDITABLE_PATHS if path in paths)
+    if paths != canonical_paths:
+        raise ValueError(f"{label} paths are not in canonical policy order")
     allowed_symbols = {
         symbol
         for path in paths
         for symbol in _POLICY_DECLARED_SYMBOLS[path]
     }
-    if any(symbol not in allowed_symbols for symbol in symbols):
+    allowed_constant_prefixes = tuple(
+        f"{path.removesuffix('.py').replace('/', '.')}." for path in paths
+    )
+    if any(
+        symbol not in allowed_symbols
+        and not any(
+            symbol.startswith(prefix)
+            and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix))
+            is not None
+            for prefix in allowed_constant_prefixes
+        )
+        for symbol in symbols
+    ):
         raise ValueError(f"{label} symbols are outside the editable scope")
 
 
@@ -1477,10 +1492,30 @@ def _apply_unified_diff(
     changed_lines = 0
     index = 0
     while index < len(lines):
+        if lines[index].startswith("diff --git "):
+            fields = lines[index].rstrip("\r\n").split(" ")
+            if (
+                len(fields) != 4
+                or not fields[2].startswith("a/")
+                or fields[3] != f"b/{fields[2][2:]}"
+            ):
+                raise ValueError("candidate unified diff Git header is invalid")
+            git_path = fields[2][2:]
+            index += 1
+            if index >= len(lines) or re.fullmatch(
+                r"index [0-9a-fA-F]+\.\.[0-9a-fA-F]+ 100644\r?\n?",
+                lines[index],
+            ) is None:
+                raise ValueError("candidate unified diff Git index is invalid")
+            index += 1
+        else:
+            git_path = None
         old_header = lines[index]
         if not old_header.startswith("--- a/"):
             raise ValueError("candidate unified diff old-file header is invalid")
         path = old_header[len("--- a/") :].rstrip("\r\n")
+        if git_path is not None and path != git_path:
+            raise ValueError("candidate unified diff Git path differs")
         index += 1
         if index >= len(lines) or lines[index].rstrip("\r\n") != f"+++ b/{path}":
             raise ValueError("candidate unified diff new-file header is invalid")
@@ -1492,7 +1527,9 @@ def _apply_unified_diff(
         result: list[str] = []
         source_index = 0
         file_hunks = 0
-        while index < len(lines) and not lines[index].startswith("--- a/"):
+        while index < len(lines) and not lines[index].startswith(
+            ("--- a/", "diff --git ")
+        ):
             header = lines[index]
             match = _HUNK_RE.fullmatch(header)
             if match is None:
@@ -1512,7 +1549,9 @@ def _apply_unified_diff(
             index += 1
             observed_old = 0
             observed_new = 0
-            while index < len(lines) and not lines[index].startswith(("@@ ", "--- a/")):
+            while index < len(lines) and not lines[index].startswith(
+                ("@@ ", "--- a/", "diff --git ")
+            ):
                 line = lines[index]
                 if line.startswith("\\ No newline at end of file"):
                     raise ValueError("candidate unified diff newline markers are unsupported")
@@ -1538,7 +1577,8 @@ def _apply_unified_diff(
             raise ValueError("candidate unified diff file has no hunks")
         result.extend(original[source_index:])
         output[path] = "".join(result)
-    stats = _PatchStats(tuple(paths), hunks, changed_lines, diff_bytes)
+    canonical_paths = tuple(path for path in _POLICY_EDITABLE_PATHS if path in paths)
+    stats = _PatchStats(canonical_paths, hunks, changed_lines, diff_bytes)
     _require_patch_bounds(stats, bounds)
     if all(output[path] == source_texts[path] for path in paths):
         raise ValueError("candidate unified diff is a no-op")
@@ -2886,10 +2926,8 @@ class InvestigatorInput(_V2Canonical):
         ):
             raise ValueError("investigator prior iterations may contain at most 8 summaries")
         iterations = tuple(item.iteration for item in self.prior_iterations)
-        if iterations != tuple(sorted(set(iterations))) or any(
-            item >= self.iteration for item in iterations
-        ):
-            raise ValueError("investigator prior iteration order is invalid")
+        if iterations != tuple(range(1, self.iteration)):
+            raise ValueError("investigator prior iterations must be a contiguous prefix")
         if len(_v2_canonical_bytes(self.prior_iterations)) > MAX_ITERATION_HISTORY_BYTES:
             raise ValueError("investigator iteration history exceeds its byte cap")
         if len(self.canonical_json_bytes()) > MAX_INVESTIGATOR_DYNAMIC_BYTES:

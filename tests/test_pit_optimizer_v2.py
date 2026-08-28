@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import hashlib
+import hmac
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict, fields, replace
@@ -12,6 +13,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
 import difflib
 from itertools import product
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -2449,8 +2451,12 @@ def _task5_incremental_diff(candidate: Path, path: str, old: str, new: str) -> s
     return raw
 
 
-def _task5_raw_author_diff(old: str, new: str) -> str:
-    path = "core/strategy_policy/entry.py"
+def _task5_raw_author_diff(
+    old: str,
+    new: str,
+    *,
+    path: str = "core/strategy_policy/entry.py",
+) -> str:
     return (
         f"diff --git a/{path} b/{path}\n"
         "index 1111111..2222222 100644\n"
@@ -2460,6 +2466,26 @@ def _task5_raw_author_diff(old: str, new: str) -> str:
         f"-{old}\n"
         f"+{new}\n"
     )
+
+
+def _task5_create_directory_link(target: Path, link: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except OSError as symlink_error:
+        if os.name != "nt":
+            pytest.skip(f"directory-link creation unavailable: {symlink_error}")
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(
+            "directory-link creation unavailable: "
+            f"{completed.stderr or completed.stdout}"
+        )
 
 
 def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
@@ -2511,7 +2537,7 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
         "core.strategy_policy.entry.evaluate_entry",
     )
     assert tuple(path for path, _digest in identity.editable_file_sha256s) == tuple(
-        sorted(_POLICY_PATHS)
+        _POLICY_PATHS
     )
 
     matching = contract.AuthorArtifact.from_json(
@@ -2534,6 +2560,242 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
     )
     with pytest.raises(ValueError, match="author_manifest_mismatch"):
         validate_author_manifest(mismatch, identity)
+
+
+def _task5_authenticated_identity(
+    tmp_path: Path,
+) -> tuple[object, contract.AuthorArtifact]:
+    from core.pit_optimizer_candidate import validate_candidate_diff
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    incremental = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(False, True, (None, None), ())",
+    )
+    identity, _cumulative = validate_candidate_diff(
+        authenticated_base_root=authenticated,
+        candidate_root=candidate_root,
+        incremental_diff=incremental,
+        git=git,
+        bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+        source_commit=_task5_git(authenticated, "rev-parse", "HEAD", text=True).strip(),
+        policy_interface_version=1,
+        immutable_constraints_sha256="a" * 64,
+        discovery_manifest_sha256="b" * 64,
+    )
+    author = contract.AuthorArtifact.from_json(
+        _canonical_text(
+            {
+                **_author_payload(),
+                "changed_paths": list(identity.changed_paths),
+                "changed_symbols": list(identity.changed_symbols),
+                "unified_diff": incremental,
+            }
+        ),
+        max_diff_bytes=64 * 1024,
+        max_total_bytes=72 * 1024,
+    )
+    return identity, author
+
+
+def test_candidate_identity_rejects_direct_unsealed_construction() -> None:
+    """Break caught: a caller could construct an identity without Git/source derivation."""
+    from core.pit_optimizer_candidate import CandidateIdentity
+
+    with pytest.raises(ValueError, match="controller derived"):
+        CandidateIdentity(
+            source_commit="a" * 40,
+            policy_interface_version=1,
+            cumulative_diff_sha256="b" * 64,
+            editable_file_sha256s=tuple(
+                (path, "c" * 64) for path in _POLICY_PATHS
+            ),
+            changed_paths=("core/strategy_policy/entry.py",),
+            changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
+            immutable_constraints_sha256="d" * 64,
+            discovery_manifest_sha256="e" * 64,
+            identity_sha256="f" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_commit", "f" * 40),
+        ("policy_interface_version", True),
+        ("cumulative_diff_sha256", "f" * 64),
+        (
+            "editable_file_sha256s",
+            tuple((path, "f" * 64) for path in _POLICY_PATHS),
+        ),
+        ("changed_paths", ("core/strategy_policy/risk.py",)),
+        ("changed_symbols", ("core.strategy_policy.risk.recommend_capacity",)),
+        ("immutable_constraints_sha256", "f" * 64),
+        ("discovery_manifest_sha256", "f" * 64),
+        ("identity_sha256", "f" * 64),
+    ),
+)
+def test_candidate_identity_tampering_fails_before_manifest_comparison(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    """Break caught: a mutated identity was trusted when advisory scope still matched."""
+    from core.pit_optimizer_candidate import validate_author_manifest
+
+    identity, author = _task5_authenticated_identity(tmp_path)
+    try:
+        tampered = replace(identity, **{field: value})
+    except ValueError as exc:
+        assert "candidate identity" in str(exc)
+        return
+    with pytest.raises(ValueError, match="candidate identity"):
+        validate_author_manifest(author, tampered)
+
+
+def test_candidate_identity_rejects_attacker_recomputed_digest(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a copied seal plus attacker-selected fields recreated a trusted identity."""
+    from core.pit_optimizer_candidate import validate_author_manifest
+
+    identity, author = _task5_authenticated_identity(tmp_path)
+    forged_fields = {
+        "source_commit": "f" * 40,
+        "policy_interface_version": identity.policy_interface_version,
+        "cumulative_diff_sha256": identity.cumulative_diff_sha256,
+        "editable_file_sha256s": identity.editable_file_sha256s,
+        "changed_paths": identity.changed_paths,
+        "changed_symbols": identity.changed_symbols,
+        "immutable_constraints_sha256": identity.immutable_constraints_sha256,
+        "discovery_manifest_sha256": identity.discovery_manifest_sha256,
+    }
+    recomputed = hashlib.sha256(
+        json.dumps(
+            forged_fields,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    ).hexdigest()
+    forged = replace(identity, **forged_fields, identity_sha256=recomputed)
+    with pytest.raises(ValueError, match="candidate identity"):
+        validate_author_manifest(author, forged)
+
+
+def test_candidate_identity_constant_symbol_is_author_representable(
+    tmp_path: Path,
+) -> None:
+    """Break caught: an AST-valid immutable constant could not appear in AuthorArtifact."""
+    from core.pit_optimizer_candidate import (
+        validate_author_manifest,
+        validate_candidate_diff,
+    )
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    incremental = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "from .contracts import EntryDecision, EntrySnapshot",
+        "ENTRY_FLOOR = 0.25\nfrom .contracts import EntryDecision, EntrySnapshot",
+    )
+    identity, _cumulative = validate_candidate_diff(
+        authenticated_base_root=authenticated,
+        candidate_root=candidate_root,
+        incremental_diff=incremental,
+        git=git,
+        bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+        source_commit=_task5_git(authenticated, "rev-parse", "HEAD", text=True).strip(),
+        policy_interface_version=1,
+        immutable_constraints_sha256="a" * 64,
+        discovery_manifest_sha256="b" * 64,
+    )
+    assert identity.changed_symbols == ("core.strategy_policy.entry.ENTRY_FLOOR",)
+    author = contract.AuthorArtifact.from_json(
+        _canonical_text(
+            {
+                **_author_payload(),
+                "changed_paths": list(identity.changed_paths),
+                "changed_symbols": list(identity.changed_symbols),
+                "unified_diff": incremental,
+            }
+        ),
+        max_diff_bytes=64 * 1024,
+        max_total_bytes=72 * 1024,
+    )
+    validate_author_manifest(author, identity)
+
+
+def test_candidate_identity_reverse_diff_sections_share_canonical_path_order(
+    tmp_path: Path,
+) -> None:
+    """Break caught: reverse section order made AuthorInput and Git identity contradictory."""
+    from core.pit_optimizer_candidate import (
+        build_policy_source_bundle,
+        validate_author_manifest,
+        validate_candidate_diff,
+    )
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    initial_bundle = build_policy_source_bundle(
+        candidate_root=candidate_root,
+        cumulative_diff="",
+        policy_interface_version=1,
+    )
+    entry_diff = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(False, True, (None, None), ())",
+    )
+    risk_diff = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/risk.py",
+        "return CapacityDecision(snapshot.configured_max_positions, False)",
+        "return CapacityDecision(None, False)",
+    )
+    reverse_diff = risk_diff + entry_diff
+    identity, _cumulative = validate_candidate_diff(
+        authenticated_base_root=authenticated,
+        candidate_root=candidate_root,
+        incremental_diff=reverse_diff,
+        git=git,
+        bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+        source_commit=_task5_git(authenticated, "rev-parse", "HEAD", text=True).strip(),
+        policy_interface_version=1,
+        immutable_constraints_sha256="a" * 64,
+        discovery_manifest_sha256="b" * 64,
+    )
+    assert identity.changed_paths == (
+        "core/strategy_policy/entry.py",
+        "core/strategy_policy/risk.py",
+    )
+    author = contract.AuthorArtifact.from_json(
+        _canonical_text(
+            {
+                **_author_payload(),
+                "changed_paths": list(identity.changed_paths),
+                "changed_symbols": list(identity.changed_symbols),
+                "unified_diff": reverse_diff,
+            }
+        ),
+        max_diff_bytes=64 * 1024,
+        max_total_bytes=72 * 1024,
+    )
+    author_input = contract.AuthorInput(
+        schema_version=2,
+        iteration=1,
+        policy_interface_version=1,
+        immutable_constraint_ids=("causal_only", "no_external_io"),
+        candidate_bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+        investigator=_investigator_artifact(),
+        source_bundle=initial_bundle,
+    )
+    author_input.validate_artifact(author)
+    validate_author_manifest(author, identity)
 
 
 def test_candidate_identity_rejects_git_derived_cumulative_scope_growth(
@@ -2619,6 +2881,173 @@ def test_candidate_identity_rejects_noop_or_non_applicable_incremental_diff(
         )
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        "core/strategy_policy/contracts.py",
+        "core/strategy_policy/runtime.py",
+        "core/strategy_policy/worker.py",
+        "core/strategy_policy/generated.py",
+    ),
+)
+def test_candidate_identity_rejects_protected_or_generated_paths(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    """Break caught: a policy diff could target protected infrastructure or generated code."""
+    from core.pit_optimizer_candidate import validate_candidate_diff
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    with pytest.raises(ValueError, match="editable|permanently denied|outside"):
+        validate_candidate_diff(
+            authenticated_base_root=authenticated,
+            candidate_root=candidate_root,
+            incremental_diff=_task5_raw_author_diff("old", "new", path=path),
+            git=git,
+            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+            source_commit=_task5_git(
+                authenticated, "rev-parse", "HEAD", text=True
+            ).strip(),
+            policy_interface_version=1,
+            immutable_constraints_sha256="a" * 64,
+            discovery_manifest_sha256="b" * 64,
+        )
+
+
+def test_candidate_identity_rejects_gitlink_index_mode(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a gitlink at an editable path could evade regular-source provenance."""
+    from core.pit_optimizer_candidate import validate_candidate_diff
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    incremental = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(False, True, (None, None), ())",
+    )
+    commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
+    _task5_git(
+        candidate_root,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{commit},core/strategy_policy/entry.py",
+    )
+
+    with pytest.raises(ValueError, match="100644|regular"):
+        validate_candidate_diff(
+            authenticated_base_root=authenticated,
+            candidate_root=candidate_root,
+            incremental_diff=incremental,
+            git=git,
+            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+            source_commit=commit,
+            policy_interface_version=1,
+            immutable_constraints_sha256="a" * 64,
+            discovery_manifest_sha256="b" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    (
+        ("hunks", "max_hunks"),
+        ("lines", "max_changed_lines"),
+        ("bytes", "max_diff_bytes"),
+    ),
+)
+def test_candidate_identity_rejects_cumulative_hunk_line_and_byte_growth(
+    tmp_path: Path,
+    field: str,
+    expected: str,
+) -> None:
+    """Break caught: an in-bounds generation could push cumulative state beyond its cap."""
+    from core.pit_optimizer_candidate import validate_candidate_diff
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    risk = candidate_root / "core/strategy_policy/risk.py"
+    risk.write_text(
+        risk.read_text("utf-8").replace(
+            "return CapacityDecision(snapshot.configured_max_positions, False)",
+            "return CapacityDecision(None, False)",
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    entry = candidate_root / "core/strategy_policy/entry.py"
+    before_entry = entry.read_bytes()
+    incremental = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(False, True, (None, None), ())",
+    )
+    bounds = {
+        "hunks": contract.PatchBounds(3, 1, 200, 64 * 1024),
+        "lines": contract.PatchBounds(3, 12, 2, 64 * 1024),
+        "bytes": contract.PatchBounds(3, 12, 200, len(incremental.encode("utf-8"))),
+    }[field]
+
+    with pytest.raises(ValueError, match=expected):
+        validate_candidate_diff(
+            authenticated_base_root=authenticated,
+            candidate_root=candidate_root,
+            incremental_diff=incremental,
+            git=git,
+            bounds=bounds,
+            source_commit=_task5_git(
+                authenticated, "rev-parse", "HEAD", text=True
+            ).strip(),
+            policy_interface_version=1,
+            immutable_constraints_sha256="a" * 64,
+            discovery_manifest_sha256="b" * 64,
+        )
+    assert entry.read_bytes() == before_entry
+
+
+@pytest.mark.parametrize("failure", (RuntimeError("fault"), KeyboardInterrupt()))
+def test_candidate_identity_rolls_back_after_fault_or_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    """Break caught: post-apply faults or cancellation left candidate policy bytes changed."""
+    import agent_loop
+    from core.pit_optimizer_candidate import validate_candidate_diff
+
+    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    entry = candidate_root / "core/strategy_policy/entry.py"
+    before_entry = entry.read_bytes()
+    incremental = _task5_incremental_diff(
+        candidate_root,
+        "core/strategy_policy/entry.py",
+        "return EntryDecision(True, True, (None, None), ())",
+        "return EntryDecision(False, True, (None, None), ())",
+    )
+
+    def fail_after_apply(**_kwargs: object) -> str:
+        raise failure
+
+    monkeypatch.setattr(agent_loop, "derive_authenticated_cumulative_diff", fail_after_apply)
+    with pytest.raises(type(failure), match="fault" if isinstance(failure, RuntimeError) else None):
+        validate_candidate_diff(
+            authenticated_base_root=authenticated,
+            candidate_root=candidate_root,
+            incremental_diff=incremental,
+            git=git,
+            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+            source_commit=_task5_git(
+                authenticated, "rev-parse", "HEAD", text=True
+            ).strip(),
+            policy_interface_version=1,
+            immutable_constraints_sha256="a" * 64,
+            discovery_manifest_sha256="b" * 64,
+        )
+    assert entry.read_bytes() == before_entry
+
+
 def test_changed_symbols_use_before_after_ast() -> None:
     """Break caught: author symbol claims were trusted instead of AST comparison."""
     from core.pit_optimizer_candidate import derive_changed_symbols
@@ -2656,6 +3085,8 @@ def _task5_entry_source(body: str, *, prelude: str = "") -> str:
         (_task5_entry_source("snapshot.market_is_bullish = True\nreturn EntryDecision(True, True, (None, None), ())"), "input"),
         (_task5_entry_source("snapshot[0] = True\nreturn EntryDecision(True, True, (None, None), ())"), "input"),
         (_task5_entry_source("evaluate_entry.cache = True\nreturn EntryDecision(True, True, (None, None), ())"), "function attribute"),
+        (_task5_entry_source("math.pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
+        (_task5_entry_source("EntryDecision.to_primitive = _helper\nreturn EntryDecision(True, True, (None, None), ())", prelude="\ndef _helper():\n    return None\n"), "mutation root"),
         (_task5_entry_source("value = getattr(snapshot, 'market_is_bullish')\nreturn EntryDecision(value, True, (None, None), ())"), "reflection"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport time\n"), "import"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport random\n"), "import"),
@@ -2668,6 +3099,7 @@ def _task5_entry_source(body: str, *, prelude: str = "") -> str:
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\ndef public_helper():\n    return True\n"), "public"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nfrom .contracts import _CanonicalContract\n"), "contract import"),
         ("FLOOR = 0.25\nfrom __future__ import annotations\nfrom .contracts import EntryDecision\n\ndef evaluate_entry(snapshot):\n    return EntryDecision(True, True, (None, None), ())\n", "syntax"),
+        (_task5_entry_source("selected = False\nfor value in {'first', 'second'}:\n    selected = bool(value)\n    break\nreturn EntryDecision(selected, True, (None, None), ())"), "unordered"),
     ),
 )
 def test_ast_purity_rejects_non_closed_policy_behavior(
@@ -2711,6 +3143,115 @@ def _task5_feedback(iteration: int) -> contract.IterationFeedbackSummary:
     )
 
 
+def _task5_investigator_input(
+    *,
+    iteration: int,
+    prior_iterations: tuple[contract.IterationFeedbackSummary, ...],
+) -> contract.InvestigatorInput:
+    return contract.InvestigatorInput(
+        schema_version=2,
+        iteration=iteration,
+        policy_interface_version=1,
+        immutable_constraint_ids=("causal_only", "no_external_io"),
+        candidate_bounds=contract.PatchBounds(3, 12, 80, 8 * 1024),
+        rule_summary=contract.StrategyRuleSummary(
+            records=(
+                contract.RuleSummaryRecord(
+                    "rule.entry",
+                    "Use causal entry inputs.",
+                ),
+            )
+        ),
+        source_bundle=_source_bundle(),
+        baseline_discovery=_discovery_summary(),
+        incumbent_summary=contract.IncumbentSummary(
+            candidate_identity_sha256=None,
+            accepted_iteration=None,
+            behavioral_summary="Authenticated fixed baseline.",
+            discovery=_discovery_summary(),
+        ),
+        prior_iterations=prior_iterations,
+    )
+
+
+@pytest.mark.parametrize(
+    ("iteration", "history"),
+    (
+        (2, ()),
+        (2, (_task5_feedback(2),)),
+        (3, (_task5_feedback(1),)),
+        (3, (_task5_feedback(2), _task5_feedback(1))),
+        (1, (_task5_feedback(1),)),
+    ),
+)
+def test_source_context_requires_exact_contiguous_feedback_lineage(
+    iteration: int,
+    history: tuple[contract.IterationFeedbackSummary, ...],
+) -> None:
+    """Break caught: a caller could silently omit, reorder, or relabel prior feedback."""
+    with pytest.raises(ValueError, match="contiguous"):
+        _task5_investigator_input(
+            iteration=iteration,
+            prior_iterations=history,
+        )
+
+
+def test_source_context_accepts_exact_general_feedback_prefix() -> None:
+    """Break caught: lineage hardening accidentally limited the general eight-summary contract."""
+    role_input = _task5_investigator_input(
+        iteration=5,
+        prior_iterations=tuple(_task5_feedback(index) for index in range(1, 5)),
+    )
+    assert tuple(item.iteration for item in role_input.prior_iterations) == (1, 2, 3, 4)
+
+
+def test_source_context_fit_measures_complete_canonical_unicode_role_input() -> None:
+    """Break caught: preflight measured two fields and ASCII escaping instead of the role contract."""
+    from core.pit_optimizer_candidate import require_source_context_fit
+
+    unicode_feedback = replace(
+        _task5_feedback(1),
+        author_summary="Réglage causal mesuré.",
+    )
+    role_input = _task5_investigator_input(
+        iteration=2,
+        prior_iterations=(unicode_feedback,),
+    )
+    rendered = role_input.canonical_json_bytes()
+    assert "Réglage".encode("utf-8") in rendered
+    static_bytes = len(
+        contract.PIT_OPTIMIZER_V2_SYSTEM_PROMPTS["investigator"].encode("utf-8")
+    ) + len(
+        json.dumps(
+            contract.pit_optimizer_response_format("investigator"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+    exact = contract.PitOptimizerCallBudget(
+        call_index=4,
+        iteration=2,
+        role="investigator",
+        model="deepseek/deepseek-r1",
+        max_static_input_bytes=static_bytes,
+        max_dynamic_input_bytes=len(rendered),
+        max_input_tokens=static_bytes + len(rendered),
+        max_output_tokens=1,
+        max_response_bytes=1,
+        max_usd=0.01,
+    )
+    assert require_source_context_fit(role_input=role_input, role_budget=exact) == rendered
+    too_small = replace(
+        exact,
+        max_dynamic_input_bytes=len(rendered) - 1,
+        max_input_tokens=static_bytes + len(rendered) - 1,
+    )
+    with pytest.raises(ValueError, match="context_budget_exhausted"):
+        require_source_context_fit(role_input=role_input, role_budget=too_small)
+
+
 def test_source_bundle_contains_only_complete_current_policy_context(
     tmp_path: Path,
 ) -> None:
@@ -2746,6 +3287,30 @@ def test_source_bundle_contains_only_complete_current_policy_context(
         assert forbidden not in rendered
 
 
+def test_source_bundle_rejects_intermediate_policy_directory_link(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a linked ``core`` directory escaped the candidate provenance root."""
+    from core.pit_optimizer_candidate import build_policy_source_bundle
+
+    source = Path(__file__).parents[1] / "core" / "strategy_policy"
+    outside_core = tmp_path / "outside-core"
+    outside_policy = outside_core / "strategy_policy"
+    outside_policy.mkdir(parents=True)
+    for name in ("entry.py", "risk.py", "exit.py"):
+        shutil.copyfile(source / name, outside_policy / name)
+    candidate = tmp_path / "linked-candidate"
+    candidate.mkdir()
+    _task5_create_directory_link(outside_core, candidate / "core")
+
+    with pytest.raises(ValueError, match="link|provenance"):
+        build_policy_source_bundle(
+            candidate_root=candidate,
+            cumulative_diff="",
+            policy_interface_version=1,
+        )
+
+
 def test_next_context_oversize_is_candidate_attributable_and_never_truncated(
     tmp_path: Path,
 ) -> None:
@@ -2767,19 +3332,13 @@ def test_next_context_oversize_is_candidate_attributable_and_never_truncated(
 
 
 def test_source_context_fit_preserves_all_feedback_and_enforces_precall_budget(
-    tmp_path: Path,
 ) -> None:
     """Break caught: later calls silently dropped history or exceeded their sealed input cap."""
-    from core.pit_optimizer_candidate import (
-        build_policy_source_bundle,
-        require_source_context_fit,
-    )
+    from core.pit_optimizer_candidate import require_source_context_fit
 
-    _authenticated, candidate_root, _git = _task5_policy_roots(tmp_path)
-    bundle = build_policy_source_bundle(
-        candidate_root=candidate_root,
-        cumulative_diff="",
-        policy_interface_version=1,
+    role_input = _task5_investigator_input(
+        iteration=2,
+        prior_iterations=(_task5_feedback(1),),
     )
     iteration_two = next(
         budget
@@ -2787,17 +3346,10 @@ def test_source_context_fit_preserves_all_feedback_and_enforces_precall_budget(
         if budget.role == "investigator" and budget.iteration == 2
     )
     require_source_context_fit(
-        source_bundle=bundle,
-        prior_iterations=(_task5_feedback(1),),
+        role_input=role_input,
         role_budget=iteration_two,
     )
 
-    with pytest.raises(ValueError, match="history"):
-        require_source_context_fit(
-            source_bundle=bundle,
-            prior_iterations=(_task5_feedback(1), _task5_feedback(2)),
-            role_budget=iteration_two,
-        )
     tiny = contract.PitOptimizerCallBudget(
         call_index=4,
         iteration=2,
@@ -2812,8 +3364,7 @@ def test_source_context_fit_preserves_all_feedback_and_enforces_precall_budget(
     )
     with pytest.raises(ValueError, match="context_budget_exhausted"):
         require_source_context_fit(
-            source_bundle=bundle,
-            prior_iterations=(_task5_feedback(1),),
+            role_input=role_input,
             role_budget=tiny,
         )
 
@@ -2843,6 +3394,93 @@ def test_worker_protocol_bootstrap_has_closed_shape_and_fresh_key_material() -> 
             interface_version=1,
             nonce_b64=base64.b64encode(b"short").decode("ascii"),
             hmac_key_b64=first.hmac_key_b64,
+        )
+    for scalar in (True, 1.0):
+        malformed = json.loads(first.to_json())
+        malformed["schema_version"] = scalar
+        with pytest.raises(ValueError, match="schema"):
+            WorkerBootstrap.from_json(_canonical_text(malformed))
+
+
+@pytest.mark.parametrize("sequence", (True, 1.0))
+def test_worker_protocol_rejects_reauthenticated_non_integer_sequences(
+    sequence: object,
+) -> None:
+    """Break caught: JSON booleans/floats compared equal to the expected integer sequence."""
+    from core.strategy_policy.contracts import CapacityDecision, CapacitySnapshot
+    from core.strategy_policy.worker import (
+        PolicyRequestEnvelope,
+        WorkerBootstrap,
+        decode_policy_request,
+        decode_policy_response,
+        encode_policy_request,
+        encode_policy_response,
+        initial_chain_sha256,
+    )
+
+    bootstrap = WorkerBootstrap.create(interface_version=1)
+    request_line, request = encode_policy_request(
+        bootstrap=bootstrap,
+        sequence=1,
+        previous_hmac_sha256=initial_chain_sha256(bootstrap),
+        method="recommend_capacity",
+        snapshot=CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+    )
+
+    def reauthenticate(raw: str, replacement: object) -> str:
+        value = json.loads(raw)
+        value["sequence"] = replacement
+        unsigned = {key: item for key, item in value.items() if key != "hmac_sha256"}
+        canonical = json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        value["hmac_sha256"] = hmac.new(
+            base64.b64decode(bootstrap.hmac_key_b64, validate=True),
+            base64.b64decode(bootstrap.nonce_b64, validate=True) + b"\n" + canonical,
+            hashlib.sha256,
+        ).hexdigest()
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+    with pytest.raises(ValueError, match="sequence"):
+        decode_policy_request(
+            reauthenticate(request_line, sequence),
+            bootstrap=bootstrap,
+            expected_sequence=1,
+            expected_previous_hmac_sha256=initial_chain_sha256(bootstrap),
+        )
+    response_line, _response = encode_policy_response(
+        bootstrap=bootstrap,
+        sequence=1,
+        request_hmac_sha256=request.hmac_sha256,
+        method="recommend_capacity",
+        decision=CapacityDecision(None, False),
+    )
+    with pytest.raises(ValueError, match="sequence"):
+        decode_policy_response(
+            reauthenticate(response_line, sequence),
+            bootstrap=bootstrap,
+            expected_sequence=1,
+            expected_request_hmac_sha256=request.hmac_sha256,
+            expected_method="recommend_capacity",
+        )
+    with pytest.raises(ValueError, match="sequence"):
+        PolicyRequestEnvelope(
+            sequence=sequence,  # type: ignore[arg-type]
+            previous_hmac_sha256=request.previous_hmac_sha256,
+            method=request.method,
+            payload_sha256=request.payload_sha256,
+            payload=request.payload,
+            hmac_sha256=request.hmac_sha256,
         )
 
 
@@ -2979,18 +3617,19 @@ def test_worker_protocol_rejects_malformed_oversized_or_mispaired_lines() -> Non
             )
 
 
-def test_worker_nondeterminism_detects_changed_probe_after_unrelated_call() -> None:
-    """Break caught: process-global state could alter repeated identical decisions."""
+def test_worker_determinism_observation_state_is_explicitly_bounded() -> None:
+    """Break caught: adversarial distinct snapshots grew controller state without limit."""
     from core.strategy_policy.contracts import CapacityDecision, CapacitySnapshot
     from core.strategy_policy.worker import DecisionDeterminismGuard
 
-    guard = DecisionDeterminismGuard()
-    repeated = CapacitySnapshot(None, 25, 0, 3, 1.0, False)
-    unrelated = CapacitySnapshot(5, 25, 2, 1, 0.5, True)
-    guard.observe("recommend_capacity", repeated, CapacityDecision(None, False))
-    guard.observe("recommend_capacity", unrelated, CapacityDecision(5, True))
-    with pytest.raises(ValueError, match="candidate_nondeterminism"):
-        guard.observe("recommend_capacity", repeated, CapacityDecision(5, False))
+    guard = DecisionDeterminismGuard(max_observations=2)
+    for count in range(3):
+        guard.observe(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, count, 3, 1.0, False),
+            CapacityDecision(None, False),
+        )
+    assert guard.observed_count == 2
 
 
 def test_worker_protocol_json_line_policy_client_dispatches_and_closes_once() -> None:

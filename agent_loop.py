@@ -4536,29 +4536,93 @@ def _approved_docker_executable(
     return canonical
 
 
-def _cleanup_unowned_policy_process(process: Any) -> None:
-    """Best-effort cleanup when launch succeeded but session ownership did not."""
-    try:
-        if process.stdin is not None and not getattr(process.stdin, "closed", False):
-            process.stdin.close()
-    except (OSError, ValueError):
-        pass
-    try:
-        if process.poll() is None:
-            process.terminate()
+@dataclass(frozen=True, slots=True)
+class _OwnedPolicyDaemon:
+    engine_path: Path
+    control_runner: ProcessRunner
+    environment: Mapping[str, str]
+    container_id: str
+    container_name: str
+    owner_token: str
+    image: str
+
+
+def _cleanup_unowned_policy_process(process: Any) -> list[BaseException]:
+    """Attempt every local-client cleanup action without masking the primary error."""
+    errors: list[BaseException] = []
+
+    def attempt(action: Callable[[], object]) -> None:
         try:
-            process.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            if process.poll() is None:
-                process.kill()
-            process.wait(timeout=5)
-    finally:
-        for stream in (process.stdout, process.stderr):
-            try:
-                if stream is not None and not getattr(stream, "closed", False):
-                    stream.close()
-            except (OSError, ValueError):
-                pass
+            action()
+        except BaseException as exc:
+            errors.append(exc)
+
+    stdin = getattr(process, "stdin", None)
+    if stdin is not None and not getattr(stdin, "closed", False):
+        attempt(stdin.close)
+    try:
+        running = process.poll() is None
+    except BaseException as exc:
+        errors.append(exc)
+        running = True
+    if running:
+        attempt(process.terminate)
+    attempt(lambda: process.wait(timeout=5))
+    try:
+        running = process.poll() is None
+    except BaseException as exc:
+        errors.append(exc)
+        running = True
+    if running:
+        attempt(process.kill)
+        attempt(lambda: process.wait(timeout=5))
+    for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
+        if stream is not None and not getattr(stream, "closed", False):
+            attempt(stream.close)
+    return errors
+
+
+def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseException]:
+    """Force-remove one authenticated daemon object and verify exact owner absence."""
+    errors: list[BaseException] = []
+
+    def control(*args: str) -> ProcessResult | None:
+        try:
+            result = daemon.control_runner(
+                (str(daemon.engine_path), *args),
+                env=daemon.environment,
+                timeout=10.0,
+                output_limit=64 * 1024,
+            )
+            if not isinstance(result, ProcessResult):
+                raise SandboxError("policy daemon control result is invalid")
+            return result
+        except BaseException as exc:
+            errors.append(exc)
+            return None
+
+    control("kill", "--signal", "KILL", daemon.container_id)
+    control("wait", daemon.container_id)
+    control("rm", "--force", daemon.container_id)
+    absence = control(
+        "container",
+        "ls",
+        "--all",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        f"id={daemon.container_id}",
+        "--filter",
+        f"label=pit-policy.owner={daemon.owner_token}",
+    )
+    if (
+        absence is None
+        or absence.timed_out
+        or absence.returncode != 0
+        or absence.stdout.strip()
+    ):
+        errors.append(SandboxError("owned policy daemon absence was not verified"))
+    return errors
 
 
 class PolicyWorkerSession:
@@ -4569,6 +4633,7 @@ class PolicyWorkerSession:
         *,
         process: Any,
         package_root: Path,
+        daemon: _OwnedPolicyDaemon,
         bootstrap: object,
         method_timeout_seconds: float,
         fold_timeout_seconds: float,
@@ -4582,6 +4647,7 @@ class PolicyWorkerSession:
             raise SandboxError("policy worker stdio is incomplete")
         self._process = process
         self.package_root = package_root
+        self._daemon = daemon
         self._bootstrap = bootstrap
         self._method_timeout_seconds = method_timeout_seconds
         self._fold_timeout_seconds = fold_timeout_seconds
@@ -4648,8 +4714,9 @@ class PolicyWorkerSession:
                 time.monotonic() - self._started_at
             )
             if remaining_fold <= 0:
-                self.close()
-                raise TimeoutError("policy worker fold timeout")
+                timeout_error = TimeoutError("policy worker fold timeout")
+                self.close(primary_error=timeout_error)
+                raise timeout_error
             request_line, request = encode_policy_request(
                 bootstrap=self._bootstrap,
                 sequence=self._sequence,
@@ -4687,37 +4754,50 @@ class PolicyWorkerSession:
                 self._previous_hmac = request.hmac_sha256
                 self._sequence += 1
                 return decision
-            except BaseException:
-                self.close()
+            except BaseException as exc:
+                self.close(primary_error=exc)
                 raise
 
-    def close(self) -> None:
+    def validate_determinism(self, probes: tuple[object, ...]) -> None:
+        from core.strategy_policy.worker import PolicyDeterminismProbe
+
+        if (
+            type(probes) is not tuple
+            or not 1 <= len(probes) <= 5
+            or any(not isinstance(item, PolicyDeterminismProbe) for item in probes)
+            or len({item.method for item in probes}) != len(probes)
+        ):
+            raise ValueError("policy determinism probes are invalid")
+        try:
+            for probe in probes:
+                self.call(probe.method, probe.repeated_snapshot)
+                self.call(probe.method, probe.unrelated_snapshot)
+                self.call(probe.method, probe.repeated_snapshot)
+        except BaseException as exc:
+            self.close(primary_error=exc)
+            raise
+
+    def close(self, *, primary_error: BaseException | None = None) -> None:
         if self._closed:
             return
         self._closed = True
-        process = self._process
-        try:
+        errors = _cleanup_unowned_policy_process(self._process)
+        for thread in (self._stdout_thread, self._stderr_thread):
             try:
-                if process.stdin is not None and not getattr(process.stdin, "closed", False):
-                    process.stdin.close()
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except (OSError, subprocess.TimeoutExpired):
-                    if process.poll() is None:
-                        process.kill()
-                    process.wait(timeout=5)
-        finally:
-            for stream in (process.stdout, process.stderr):
-                if stream is not None and not getattr(stream, "closed", False):
-                    stream.close()
-            self._stdout_thread.join(timeout=5)
-            self._stderr_thread.join(timeout=5)
-            temporary_root = self.package_root.parent
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    raise SandboxError("policy worker output thread did not stop")
+            except BaseException as exc:
+                errors.append(exc)
+        errors.extend(_cleanup_owned_policy_daemon(self._daemon))
+        temporary_root = self.package_root.parent
+        try:
             if temporary_root.exists():
                 _remove_private_tree(temporary_root)
+        except BaseException as exc:
+            errors.append(exc)
+        if errors and primary_error is None:
+            raise SandboxError("policy worker cleanup could not be fully verified") from errors[0]
 
 
 class PolicyWorkerRunner:
@@ -4730,6 +4810,7 @@ class PolicyWorkerRunner:
         engine: DockerCapability | None = None,
         injected_engine_path: Path | None = None,
         process_factory: Callable[..., Any] = subprocess.Popen,
+        control_runner: ProcessRunner = _bounded_process,
         temp_parent: Path | None = None,
         method_timeout_seconds: float = 1.0,
     ) -> None:
@@ -4743,9 +4824,14 @@ class PolicyWorkerRunner:
             raise SandboxError("policy worker method timeout is invalid")
         self.image = image
         self._process_factory = process_factory
+        self._control_runner = control_runner
         self._engine_capability = engine
         if process_factory is subprocess.Popen:
-            if engine is None or injected_engine_path is not None:
+            if (
+                engine is None
+                or injected_engine_path is not None
+                or control_runner is not _bounded_process
+            ):
                 raise SandboxError("production policy worker requires a Docker capability")
             self.engine_path = _approved_docker_executable(engine)
             if method_timeout_seconds != 1.0:
@@ -4754,6 +4840,7 @@ class PolicyWorkerRunner:
             if (
                 engine is not None
                 or injected_engine_path is None
+                or control_runner is _bounded_process
                 or not injected_engine_path.is_absolute()
                 or injected_engine_path.name.casefold() not in {"docker", "docker.exe"}
             ):
@@ -4766,32 +4853,109 @@ class PolicyWorkerRunner:
         self.method_timeout_seconds = float(method_timeout_seconds)
         self.fold_timeout_seconds = 900.0
 
+    def _control(
+        self,
+        environment: Mapping[str, str],
+        *args: str,
+    ) -> ProcessResult:
+        result = self._control_runner(
+            (str(self.engine_path), *args),
+            env=environment,
+            timeout=10.0,
+            output_limit=64 * 1024,
+        )
+        if (
+            not isinstance(result, ProcessResult)
+            or result.timed_out
+            or result.returncode != 0
+        ):
+            raise SandboxError("policy daemon control command failed")
+        return result
+
+    def _inspect_owned_daemon(
+        self,
+        *,
+        environment: Mapping[str, str],
+        container_id: str,
+        container_name: str,
+        owner_token: str,
+    ) -> _OwnedPolicyDaemon:
+        result = self._control(environment, "inspect", container_id)
+        try:
+            payload = json.loads(result.stdout)
+            item = payload[0]
+            config = item["Config"]
+            labels = config["Labels"]
+            valid = (
+                type(payload) is list
+                and len(payload) == 1
+                and type(item) is dict
+                and item.get("Id") == container_id
+                and item.get("Name") == "/" + container_name
+                and type(config) is dict
+                and config.get("Image") == self.image
+                and type(labels) is dict
+                and labels.get("pit-policy.owner") == owner_token
+            )
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise SandboxError("policy daemon identity or ownership is invalid")
+        return _OwnedPolicyDaemon(
+            engine_path=self.engine_path,
+            control_runner=self._control_runner,
+            environment=dict(environment),
+            container_id=container_id,
+            container_name=container_name,
+            owner_token=owner_token,
+            image=self.image,
+        )
+
+    def _discover_owned_daemon(
+        self,
+        *,
+        environment: Mapping[str, str],
+        container_name: str,
+        owner_token: str,
+    ) -> _OwnedPolicyDaemon | None:
+        result = self._control(
+            environment,
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            f"name=^/{re.escape(container_name)}$",
+            "--filter",
+            f"label=pit-policy.owner={owner_token}",
+        )
+        identities = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+        if not identities:
+            return None
+        if (
+            len(identities) != 1
+            or re.fullmatch(r"[0-9a-f]{64}", identities[0]) is None
+        ):
+            raise SandboxError("owned policy daemon discovery is ambiguous")
+        return self._inspect_owned_daemon(
+            environment=environment,
+            container_id=identities[0],
+            container_name=container_name,
+            owner_token=owner_token,
+        )
+
     @staticmethod
     def _candidate_sources(candidate_root: Path) -> dict[str, bytes]:
-        from core.pit_optimizer_candidate import EDITABLE_POLICY_PATHS, validate_policy_ast
+        from core.pit_optimizer_candidate import _read_policy_sources, validate_policy_ast
 
-        if (
-            not isinstance(candidate_root, Path)
-            or not candidate_root.is_absolute()
-            or not candidate_root.is_dir()
-            or candidate_root.is_symlink()
-            or _has_reparse_point(candidate_root)
-        ):
-            raise SandboxError("policy candidate root is invalid")
+        try:
+            policy_sources = _read_policy_sources(candidate_root)
+        except ValueError as exc:
+            raise SandboxError(str(exc)) from exc
         sources: dict[str, bytes] = {}
-        for relative in EDITABLE_POLICY_PATHS:
-            target = candidate_root / relative
-            if (
-                not target.is_file()
-                or target.is_symlink()
-                or _has_reparse_point(target)
-            ):
-                raise SandboxError("policy candidate source is not a regular file")
-            try:
-                content = target.read_bytes()
-                text = content.decode("utf-8", errors="strict")
-            except (OSError, UnicodeDecodeError) as exc:
-                raise SandboxError("policy candidate source is not bounded UTF-8") from exc
+        for relative, text in policy_sources.items():
+            content = text.encode("utf-8")
             if len(content) > 64 * 1024:
                 raise SandboxError("policy candidate source exceeds its cap")
             validate_policy_ast(path=relative, source=text)
@@ -4817,10 +4981,12 @@ class PolicyWorkerRunner:
                 encoding="utf-8",
                 newline="\n",
             )
-            trusted_root = Path(__file__).resolve().parent / "core" / "strategy_policy"
+            trusted_root = _existing_path_without_links(
+                Path(__file__).absolute().parent / "core" / "strategy_policy"
+            )
             for name in ("contracts.py", "worker.py"):
-                source = trusted_root / name
-                if not source.is_file() or source.is_symlink() or _has_reparse_point(source):
+                source = _existing_path_without_links(trusted_root / name)
+                if not stat.S_ISREG(source.lstat().st_mode):
                     raise SandboxError("trusted policy worker source is invalid")
                 (strategy_root / name).write_bytes(source.read_bytes())
             for relative, content in sources.items():
@@ -4874,6 +5040,7 @@ class PolicyWorkerRunner:
         temporary_root = package_root.parent
         process: Any | None = None
         session: PolicyWorkerSession | None = None
+        daemon: _OwnedPolicyDaemon | None = None
         try:
             if "," in str(package_root):
                 raise SandboxError("policy worker package path is not mount-safe")
@@ -4885,12 +5052,20 @@ class PolicyWorkerRunner:
                 )
             else:
                 engine_path = self.engine_path
-            argv = [
+            self.engine_path = engine_path
+            environment = self._engine_environment(temporary_root)
+            owner_token = secrets.token_hex(32)
+            container_name = f"pit-policy-{fold_run_id}-{secrets.token_hex(4)}"
+            create_argv = (
                 str(engine_path),
-                "run",
-                "--rm",
+                "create",
+                "--interactive",
                 "--name",
-                f"pit-policy-{fold_run_id}-{secrets.token_hex(4)}",
+                container_name,
+                "--label",
+                f"pit-policy.owner={owner_token}",
+                "--pull",
+                "never",
                 "--network",
                 "none",
                 "--read-only",
@@ -4908,6 +5083,8 @@ class PolicyWorkerRunner:
                 "1.0",
                 "--tmpfs",
                 "/tmp:rw,noexec,nosuid,size=16m",
+                "--env",
+                "PYTHONHASHSEED=0",
                 "--mount",
                 f"type=bind,src={package_root},dst=/workspace/policy,readonly",
                 "--workdir",
@@ -4917,6 +5094,61 @@ class PolicyWorkerRunner:
                 "-B",
                 "-m",
                 "core.strategy_policy.worker",
+            )
+            try:
+                created = self._control_runner(
+                    create_argv,
+                    env=environment,
+                    timeout=10.0,
+                    output_limit=64 * 1024,
+                )
+            except BaseException:
+                daemon = self._discover_owned_daemon(
+                    environment=environment,
+                    container_name=container_name,
+                    owner_token=owner_token,
+                )
+                raise
+            if (
+                not isinstance(created, ProcessResult)
+                or created.timed_out
+                or created.returncode != 0
+            ):
+                daemon = self._discover_owned_daemon(
+                    environment=environment,
+                    container_name=container_name,
+                    owner_token=owner_token,
+                )
+                raise SandboxError("policy daemon creation failed")
+            container_id = created.stdout.strip()
+            if re.fullmatch(r"[0-9a-f]{64}", container_id or "") is None:
+                daemon = self._discover_owned_daemon(
+                    environment=environment,
+                    container_name=container_name,
+                    owner_token=owner_token,
+                )
+                raise SandboxError("policy daemon returned an invalid full identity")
+            daemon = _OwnedPolicyDaemon(
+                engine_path=engine_path,
+                control_runner=self._control_runner,
+                environment=dict(environment),
+                container_id=container_id,
+                container_name=container_name,
+                owner_token=owner_token,
+                image=self.image,
+            )
+            daemon = self._inspect_owned_daemon(
+                environment=environment,
+                container_id=container_id,
+                container_name=container_name,
+                owner_token=owner_token,
+            )
+            argv = [
+                str(engine_path),
+                "start",
+                "--attach",
+                "--interactive",
+                container_id,
             ]
             process = self._process_factory(
                 argv,
@@ -4926,12 +5158,13 @@ class PolicyWorkerRunner:
                 shell=False,
                 close_fds=True,
                 bufsize=0,
-                env=self._engine_environment(temporary_root),
+                env=environment,
             )
             bootstrap = WorkerBootstrap.create(interface_version=interface_version)
             session = PolicyWorkerSession(
                 process=process,
                 package_root=package_root,
+                daemon=daemon,
                 bootstrap=bootstrap,
                 method_timeout_seconds=self.method_timeout_seconds,
                 fold_timeout_seconds=self.fold_timeout_seconds,
@@ -4939,15 +5172,20 @@ class PolicyWorkerRunner:
             try:
                 process.stdin.write(bootstrap.to_json().encode("utf-8") + b"\n")
                 process.stdin.flush()
-            except BaseException:
-                session.close()
+            except BaseException as exc:
+                session.close(primary_error=exc)
                 raise
             return session
         except BaseException:
             if process is not None and session is None:
                 _cleanup_unowned_policy_process(process)
-            if temporary_root.exists():
-                _remove_private_tree(temporary_root)
+            if daemon is not None and session is None:
+                _cleanup_owned_policy_daemon(daemon)
+            try:
+                if temporary_root.exists():
+                    _remove_private_tree(temporary_root)
+            except BaseException:
+                pass
             raise
 
     def client_factory(
@@ -4956,6 +5194,7 @@ class PolicyWorkerRunner:
         candidate_root: Path,
         interface_version: int,
         fold_run_id: str,
+        determinism_probes: tuple[object, ...],
     ) -> Callable[[], Any]:
         """Return a one-shot simulator factory for exactly one fresh fold session."""
         started = False
@@ -4974,6 +5213,7 @@ class PolicyWorkerRunner:
                 interface_version=interface_version,
                 fold_run_id=fold_run_id,
             )
+            session.validate_determinism(determinism_probes)
             return JsonLinePolicyClient(
                 session=session,
                 interface_version=interface_version,
