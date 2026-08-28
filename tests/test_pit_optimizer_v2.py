@@ -3872,7 +3872,7 @@ def test_pit_optimizer_v2_gateway_rejects_equal_shaped_foreign_source_pre_effect
         wall_deadline=10.0,
         monotonic=lambda: 1.0,
     )
-    lease = authorization.open_run_lease(
+    _lease = authorization.open_run_lease(
         window_id=window.window_id,
         authorization_requirement_sha256=(
             v2_manifest.authorization_requirement.sha256
@@ -3881,22 +3881,17 @@ def test_pit_optimizer_v2_gateway_rejects_equal_shaped_foreign_source_pre_effect
         frozen_pricing_sha256=pricing.pricing_sha256,
     )
 
+    foreign_input = _task6_manifest_investigator_input(
+        v2_manifest,
+        source_bundle=_task6_manifest_source_bundle(
+            v2_manifest,
+            alternate_same_size=True,
+        ),
+    )
     with pytest.raises(AuthorizationError, match="policy source"):
-        gateway.request_pit_optimizer_once(
-            "investigator",
-            _task6_manifest_investigator_input(
-                v2_manifest,
-                source_bundle=_task6_manifest_source_bundle(
-                    v2_manifest,
-                    alternate_same_size=True,
-                ),
-            ),
-            _task6_investigator_parser,
-            call_budget=v2_manifest.call_budgets[0],
-            authorization_lease=lease,
-            frozen_pricing=pricing,
-            wall_deadline=10.0,
-            monotonic=lambda: 1.0,
+        authorization.bind_controller_role_input(
+            foreign_input,
+            v2_manifest.call_budgets[0],
         )
 
     assert client.completions.calls == []
@@ -4015,26 +4010,17 @@ def test_pit_optimizer_v2_gateway_rejects_foreign_author_source_pre_effect(
     )
     before_records = len(ledger_path.read_bytes().splitlines())
 
+    foreign_input = _task6_manifest_author_input(
+        v2_manifest,
+        source_bundle=_task6_manifest_source_bundle(
+            v2_manifest,
+            alternate_same_size=True,
+        ),
+    )
     with pytest.raises(AuthorizationError, match="policy source"):
-        gateway.request_pit_optimizer_once(
-            "author",
-            _task6_manifest_author_input(
-                v2_manifest,
-                source_bundle=_task6_manifest_source_bundle(
-                    v2_manifest,
-                    alternate_same_size=True,
-                ),
-            ),
-            lambda raw: contract.AuthorArtifact.from_json(
-                raw,
-                max_diff_bytes=8 * 1024,
-                max_total_bytes=16 * 1024,
-            ),
-            call_budget=v2_manifest.call_budgets[1],
-            authorization_lease=lease,
-            frozen_pricing=pricing,
-            wall_deadline=10.0,
-            monotonic=lambda: 1.0,
+        authorization.bind_controller_role_input(
+            foreign_input,
+            v2_manifest.call_budgets[1],
         )
 
     assert client.completions.calls == []
@@ -4094,22 +4080,14 @@ def test_pit_optimizer_v2_gateway_rejects_cross_run_critic_summary_pre_effect(
         )
     before_records = len(ledger_path.read_bytes().splitlines())
 
+    foreign_input = _task6_manifest_critic_input(
+        v2_manifest,
+        run_manifest_sha256="f" * 64,
+    )
     with pytest.raises(AuthorizationError, match="run manifest"):
-        gateway.request_pit_optimizer_once(
-            "critic",
-            _task6_manifest_critic_input(
-                v2_manifest,
-                run_manifest_sha256="f" * 64,
-            ),
-            lambda raw: contract.CriticArtifact.from_json(
-                raw,
-                max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
-            ),
-            call_budget=v2_manifest.call_budgets[2],
-            authorization_lease=lease,
-            frozen_pricing=pricing,
-            wall_deadline=10.0,
-            monotonic=lambda: 1.0,
+        authorization.bind_controller_role_input(
+            foreign_input,
+            v2_manifest.call_budgets[2],
         )
 
     assert client.completions.calls == []
@@ -4138,15 +4116,63 @@ def test_pit_optimizer_v2_gateway_rejects_relabeled_foreign_critic_capability(
         tmp_path,
         v2_manifest,
         grant_id="grant-relabeled-critic",
-        outcomes=[_task6_fake_response(_canonical_text(_critic_payload()))],
+        outcomes=[
+            _task6_fake_response(_canonical_text(_investigator_payload())),
+            _task6_fake_response(
+                _canonical_text(
+                    {
+                        **_author_payload(),
+                        "unified_diff": (
+                            "--- a/core/strategy_policy/entry.py\n"
+                            "+++ b/core/strategy_policy/entry.py\n"
+                            "@@ -2,2 +2,2 @@\n"
+                            " def evaluate_entry(snapshot):\n"
+                            "-    return None\n"
+                            "+    return True\n"
+                        ),
+                    }
+                )
+            ),
+        ],
     )
-    for plan in v2_manifest.call_budgets[:2]:
-        reservation = authorization.reserve_call(lease, plan)
-        authorization.reconcile_call(
-            reservation,
-            _task6_provider_facts(reservation, pricing),
-            terminal_audit_sha256="b" * 64,
-        )
+    investigator_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(
+        investigator_input,
+        v2_manifest.call_budgets[0],
+    )
+    investigator_call = gateway.request_pit_optimizer_once(
+        "investigator",
+        investigator_input,
+        _task6_investigator_parser,
+        call_budget=v2_manifest.call_budgets[0],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    author_input = replace(
+        _task6_manifest_author_input(v2_manifest),
+        investigator=investigator_call.payload,
+    )
+    authorization.bind_controller_role_input(
+        author_input,
+        v2_manifest.call_budgets[1],
+        predecessor_calls=(investigator_call,),
+    )
+    author_call = gateway.request_pit_optimizer_once(
+        "author",
+        author_input,
+        lambda raw: contract.AuthorArtifact.from_json(
+            raw,
+            max_diff_bytes=8 * 1024,
+            max_total_bytes=16 * 1024,
+        ),
+        call_budget=v2_manifest.call_budgets[1],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
     foreign_manifest = replace(v2_manifest, run_id="pit-optimizer-foreign")
     foreign_input = _task6_manifest_critic_input(foreign_manifest)
     relabeled = replace(
@@ -4155,24 +4181,116 @@ def test_pit_optimizer_v2_gateway_rejects_relabeled_foreign_critic_capability(
     )
     before_records = len(ledger_path.read_bytes().splitlines())
 
-    with pytest.raises(AuthorizationError, match="(?:provenance|role input)"):
-        gateway.request_pit_optimizer_once(
-            "critic",
+    with pytest.raises(AuthorizationError, match="predecessor artifact"):
+        authorization.bind_controller_role_input(
             relabeled,
-            lambda raw: contract.CriticArtifact.from_json(
-                raw,
-                max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
-            ),
-            call_budget=v2_manifest.call_budgets[2],
-            authorization_lease=lease,
-            frozen_pricing=pricing,
-            wall_deadline=10.0,
-            monotonic=lambda: 1.0,
+            v2_manifest.call_budgets[2],
+            predecessor_calls=(investigator_call, author_call),
         )
 
-    assert client.completions.calls == []
-    assert budget.calls == 0
-    assert audit._events == []
+    assert len(client.completions.calls) == 2
+    assert budget.calls == 2
+    assert len(audit._events) == 6
+    assert len(ledger_path.read_bytes().splitlines()) == before_records
+
+
+def test_pit_optimizer_v2_role_input_binding_is_exclusive_per_manifest_plan(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: two distinct objects could mint capabilities for one call."""
+    from core.pit_optimizer_authorization import AuthorizationError
+
+    authorization, _ledger_path, _window = _task6_authorized_ledger(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-exclusive-role-snapshot",
+    )
+    plan = v2_manifest.call_budgets[0]
+    first = _task6_manifest_investigator_input(v2_manifest)
+    second = replace(first)
+
+    authorization.bind_controller_role_input(first, plan)
+    with pytest.raises(AuthorizationError, match="already bound"):
+        authorization.bind_controller_role_input(second, plan)
+
+
+def test_pit_optimizer_v2_role_input_snapshot_is_consumed_once(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: one controller snapshot could authorize repeated consumers."""
+    from core.pit_optimizer_authorization import AuthorizationError
+
+    authorization, _ledger_path, _window = _task6_authorized_ledger(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-consume-role-snapshot-once",
+    )
+    plan = v2_manifest.call_budgets[0]
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    expected = authorization.bind_controller_role_input(role_input, plan)
+
+    assert authorization.capture_controller_role_input(role_input, plan) == expected
+    with pytest.raises(AuthorizationError, match="already consumed"):
+        authorization.capture_controller_role_input(role_input, plan)
+
+
+def test_pit_optimizer_v2_author_binding_requires_exact_accepted_investigator(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: an author could cite a foreign artifact under a valid run tag."""
+    from core.pit_optimizer_authorization import AuthorizationError
+
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        _budget,
+        _audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-author-predecessor-lineage",
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+    )
+    investigator_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(
+        investigator_input,
+        v2_manifest.call_budgets[0],
+    )
+    investigator_call = gateway.request_pit_optimizer_once(
+        "investigator",
+        investigator_input,
+        _task6_investigator_parser,
+        call_budget=v2_manifest.call_budgets[0],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    foreign_investigator = replace(
+        investigator_call.payload,
+        causal_rationale="A foreign controller selected different causal evidence.",
+    )
+    foreign_author_input = replace(
+        _task6_manifest_author_input(v2_manifest),
+        investigator=foreign_investigator,
+    )
+    before_records = len(ledger_path.read_bytes().splitlines())
+
+    with pytest.raises(AuthorizationError, match="predecessor"):
+        authorization.bind_controller_role_input(
+            foreign_author_input,
+            v2_manifest.call_budgets[1],
+            predecessor_calls=(investigator_call,),
+        )
+
+    assert len(client.completions.calls) == 1
     assert len(ledger_path.read_bytes().splitlines()) == before_records
 
 
@@ -4334,6 +4452,75 @@ def test_pit_optimizer_v2_gateway_reauthenticates_live_cached_pricing_rates(
     assert audit._events == []
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
     assert not any(record["record_type"] == "reservation" for record in records)
+
+
+def test_pit_optimizer_v2_request_uses_manifest_plan_snapshot_after_clock_mutation(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: a later callback could enlarge the paid SDK token ceiling."""
+    live_plan = replace(v2_manifest.call_budgets[0])
+    original_max_output_tokens = live_plan.max_output_tokens
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        _budget,
+        _audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-call-plan-snapshot",
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, live_plan)
+    clock_calls = 0
+
+    def mutating_clock() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 4:
+            object.__setattr__(
+                live_plan,
+                "max_output_tokens",
+                original_max_output_tokens * 100,
+            )
+        return 1.0
+
+    result = gateway.request_pit_optimizer_once(
+        "investigator",
+        role_input,
+        _task6_investigator_parser,
+        call_budget=live_plan,
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=mutating_clock,
+    )
+
+    assert len(client.completions.calls) == 1
+    assert client.completions.calls[0]["max_tokens"] == original_max_output_tokens
+    assert result.plan == v2_manifest.call_budgets[0]
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    reservation = next(
+        record["reservation"]
+        for record in records
+        if record["record_type"] == "reservation"
+    )
+    reconciliation = next(
+        record
+        for record in records
+        if record["record_type"] == "reconciliation"
+    )
+    assert reservation["reserved_tokens"] == (
+        v2_manifest.call_budgets[0].max_input_tokens
+        + original_max_output_tokens
+    )
+    assert reconciliation["provider_facts"]["call_index"] == 1
 
 
 def test_pit_optimizer_v2_freeze_accepts_advertised_pricing_value() -> None:
@@ -5015,6 +5202,79 @@ def test_pit_optimizer_v2_postpublication_finalizer_failure_is_verified_once(
     assert records[-1]["terminal_code"] == "failed"
 
 
+def test_pit_optimizer_v2_accepted_publication_is_not_retroactively_cancelled(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: accepted publication unlocked plan two then claimed cancellation."""
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-accepted-publication-final",
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+    )
+    original_reconcile = authorization.reconcile_call
+    reentrant_reservations: list[bool] = []
+
+    def reconcile_reserve_then_interrupt(*args: object, **kwargs: object) -> None:
+        original_reconcile(*args, **kwargs)
+        try:
+            authorization.reserve_call(lease, v2_manifest.call_budgets[1])
+        except BaseException:
+            reentrant_reservations.append(False)
+        else:
+            reentrant_reservations.append(True)
+        raise KeyboardInterrupt("accepted-postpublication")
+
+    monkeypatch.setattr(
+        authorization,
+        "reconcile_call",
+        reconcile_reserve_then_interrupt,
+    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, v2_manifest.call_budgets[0])
+
+    with pytest.raises(KeyboardInterrupt, match="accepted-postpublication"):
+        gateway.request_pit_optimizer_once(
+            "investigator",
+            role_input,
+            _task6_investigator_parser,
+            call_budget=v2_manifest.call_budgets[0],
+            authorization_lease=lease,
+            frozen_pricing=pricing,
+            wall_deadline=10.0,
+            monotonic=lambda: 1.0,
+        )
+
+    assert reentrant_reservations == [True]
+    assert len(client.completions.calls) == 1
+    assert budget.calls == 1
+    assert audit._events[-1]["event"] == "provider_call_accepted"
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    assert [record["record_type"] for record in records[-3:]] == [
+        "reservation",
+        "reconciliation",
+        "reservation",
+    ]
+    assert any(
+        record["record_type"] == "reconciliation"
+        and record["provider_facts"]["outcome"] == "accepted"
+        for record in records
+    )
+    assert not any(record["record_type"] == "lease_close" for record in records)
+    assert records[-1]["reservation"]["call_index"] == 2
+
+
 def test_pit_optimizer_v2_deadline_expiry_after_start_intent_sends_nothing(
     tmp_path: Path,
     v2_manifest: contract.PitOptimizerRunManifest,
@@ -5223,11 +5483,336 @@ def test_pit_optimizer_v2_gateway_sends_one_all_r1_call_without_healing(
     audit_payload = json.loads(provider_path.read_text(encoding="utf-8"))
     assert (audit_payload["iteration"], audit_payload["role"]) == (1, "investigator")
     assert audit_payload["frozen_pricing_sha256"] == pricing.pricing_sha256
-    assert records[-1]["terminal_audit_sha256"] == hashlib.sha256(
-        provider_path.read_bytes()
-    ).hexdigest()
+    assert records[-1]["terminal_audit_receipt"]["provider_record_sha256"] == (
+        hashlib.sha256(provider_path.read_bytes()).hexdigest()
+    )
+    assert records[-1]["terminal_audit_sha256"] == audit._events[-1][
+        "event_sha256"
+    ]
     assert "causal_rationale" not in audit_payload
     assert "source_bundle" not in audit_payload
+
+
+def test_pit_optimizer_v2_authorization_binds_terminal_audit_event_receipt(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: authorization stored only the provider-file digest."""
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        _budget,
+        audit,
+        _client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-terminal-audit-receipt",
+        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, plan)
+
+    gateway.request_pit_optimizer_once(
+        "investigator",
+        role_input,
+        _task6_investigator_parser,
+        call_budget=plan,
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+
+    provider_path = audit.run_root / "provider-call-0001.json"
+    terminal_event = audit._events[-1]
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    reconciliation = records[-1]
+    receipt = reconciliation["terminal_audit_receipt"]
+    assert receipt == {
+        "audit_run_id": audit.run_id,
+        "run_manifest_sha256": v2_manifest.sha256,
+        "call_index": 1,
+        "iteration": 1,
+        "role": "investigator",
+        "outcome": "accepted",
+        "provider_record_sha256": hashlib.sha256(
+            provider_path.read_bytes()
+        ).hexdigest(),
+        "terminal_event_sha256": terminal_event["event_sha256"],
+        "payload_sha256": hashlib.sha256(
+            _investigator_artifact().canonical_json_bytes()
+        ).hexdigest(),
+    }
+    assert reconciliation["terminal_audit_sha256"] == terminal_event["event_sha256"]
+    reconciliation["terminal_audit_receipt"]["role"] = "author"
+    reconciliation["record_sha256"] = authorization._record_digest(reconciliation)
+    ledger_path.write_bytes(
+        b"".join(
+            (_canonical_text(record) + "\n").encode("utf-8")
+            for record in records
+        )
+    )
+    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+
+    with pytest.raises(AuthorizationError, match="receipt.*reservation"):
+        AuthorizationLedger(ledger_path, v2_manifest)
+
+
+def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: a crash after terminal audit permanently wedged the lease."""
+    import agent_loop
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-restart-finalizer",
+        outcomes=[],
+    )
+    budget_reservation = budget.reserve_pit_optimizer(
+        rendered_prompt_bytes=100,
+        max_output_tokens=plan.max_output_tokens,
+        conservative_cost_usd=Decimal("0.01"),
+    )
+    authorization_reservation = authorization.reserve_call(lease, plan)
+    audit.append_event(
+        agent_loop.LoopState.CALL_INVESTIGATOR,
+        "provider_call_reserved",
+        {"call_index": 1, "iteration": 1, "role": "investigator"},
+    )
+    started = audit.append_event(
+        agent_loop.LoopState.CALL_INVESTIGATOR,
+        "provider_call_started",
+        {
+            "call_index": 1,
+            "iteration": 1,
+            "role": "investigator",
+            "reservation_event_sha256": audit._events[-1]["event_sha256"],
+        },
+    )
+    usage = agent_loop.Usage(
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
+        cost_usd=0.001,
+    )
+    facts = replace(
+        _task6_provider_facts(
+            authorization_reservation,
+            pricing,
+            cost_usd=0.001,
+        ),
+        audit_sha256=started["event_sha256"],
+    )
+    budget.reconcile_pit_optimizer(
+        budget_reservation,
+        usage,
+        request_started=True,
+    )
+    payload_sha256 = hashlib.sha256(
+        _investigator_artifact().canonical_json_bytes()
+    ).hexdigest()
+    audit.write_provider_call_receipt(
+        gateway._pit_optimizer_record(facts, authorization_reservation),
+        run_manifest_sha256=v2_manifest.sha256,
+        payload_sha256=payload_sha256,
+    )
+    before_recovery = len(ledger_path.read_bytes().splitlines())
+
+    assert hasattr(agent_loop.AuditTrail, "open_existing")
+    reopened_audit = agent_loop.AuditTrail.open_existing(
+        audit.artifact_root,
+        audit.run_id,
+    )
+    from core.pit_optimizer_authorization import AuthorizationLedger
+
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    mismatched_budget_gateway = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=agent_loop.BudgetLedger(
+            max_usd=1.0,
+            max_calls=6,
+            max_tokens=448_000,
+        ),
+        authorization_ledger=reopened_authorization,
+        audit_trail=reopened_audit,
+        max_attempts=1,
+    )
+    with pytest.raises(agent_loop.AuditError, match="budget snapshot"):
+        mismatched_budget_gateway.recover_pit_optimizer_finalization(
+            authorization_lease=lease,
+            call_budget=plan,
+        )
+    assert reopened_authorization.recover_active_reservation(lease, plan) == (
+        authorization_reservation
+    )
+    restarted = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=budget,
+        authorization_ledger=reopened_authorization,
+        audit_trail=reopened_audit,
+        max_attempts=1,
+    )
+    restarted.recover_pit_optimizer_finalization(
+        authorization_lease=lease,
+        call_budget=plan,
+    )
+    restarted.recover_pit_optimizer_finalization(
+        authorization_lease=lease,
+        call_budget=plan,
+    )
+
+    assert client.completions.calls == []
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    assert len(records) == before_recovery + 1
+    assert records[-1]["record_type"] == "reconciliation"
+    assert records[-1]["terminal_audit_receipt"]["terminal_event_sha256"] == (
+        reopened_audit._events[-1]["event_sha256"]
+    )
+    next_reservation = reopened_authorization.reserve_call(
+        lease,
+        v2_manifest.call_budgets[1],
+    )
+    assert next_reservation.call_index == 2
+
+
+def test_pit_optimizer_v2_audit_replay_rejects_a_truncated_tail(
+    tmp_path: Path,
+) -> None:
+    """Break caught: replay accepted a hash-valid final line with lost framing."""
+    import agent_loop
+
+    audit = agent_loop.AuditTrail(tmp_path / "audit-replay-tail", "pit-replay-tail")
+    audit.append_event(
+        agent_loop.LoopState.CALL_INVESTIGATOR,
+        "provider_call_reserved",
+        {"call_index": 1, "iteration": 1, "role": "investigator"},
+    )
+    raw = audit.events_path.read_bytes()
+    assert raw.endswith(b"\n")
+    audit.events_path.write_bytes(raw[:-1])
+
+    with pytest.raises(agent_loop.AuditError, match="partial"):
+        agent_loop.AuditTrail.open_existing(audit.artifact_root, audit.run_id)
+
+
+def test_pit_optimizer_v2_restart_recovers_terminal_before_send_without_start_event(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: terminal recovery required a start event that never existed."""
+    import agent_loop
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-restart-before-send",
+        outcomes=[],
+    )
+    original_append = audit.append_event
+    failed_reserved_event = False
+
+    def fail_reserved_event_once(
+        state: object,
+        event: str,
+        details: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        nonlocal failed_reserved_event
+        if event == "provider_call_reserved" and not failed_reserved_event:
+            failed_reserved_event = True
+            raise RuntimeError("reservation-audit-crash")
+        return original_append(state, event, details)
+
+    monkeypatch.setattr(audit, "append_event", fail_reserved_event_once)
+    monkeypatch.setattr(
+        authorization,
+        "reconcile_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("authorization-publication-crash")
+        ),
+    )
+    role_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(role_input, plan)
+
+    with pytest.raises(RuntimeError, match="reservation-audit-crash"):
+        gateway.request_pit_optimizer_once(
+            "investigator",
+            role_input,
+            _task6_investigator_parser,
+            call_budget=plan,
+            authorization_lease=lease,
+            frozen_pricing=pricing,
+            wall_deadline=10.0,
+            monotonic=lambda: 1.0,
+        )
+
+    assert client.completions.calls == []
+    assert budget.calls == 0
+    assert [event["event"] for event in audit._events] == [
+        "provider_call_rejected"
+    ]
+    reopened_audit = agent_loop.AuditTrail.open_existing(
+        audit.artifact_root,
+        audit.run_id,
+    )
+    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    restarted = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=budget,
+        authorization_ledger=reopened_authorization,
+        audit_trail=reopened_audit,
+        max_attempts=1,
+    )
+    restarted.recover_pit_optimizer_finalization(
+        authorization_lease=lease,
+        call_budget=plan,
+    )
+
+    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+    assert [record["record_type"] for record in records[-2:]] == [
+        "reconciliation",
+        "lease_close",
+    ]
+    assert records[-2]["provider_facts"]["outcome"] == "failed_before_send"
+    assert records[-1]["terminal_code"] == "failed"
+    with pytest.raises(AuthorizationError, match="closed"):
+        reopened_authorization.reserve_call(
+            lease,
+            v2_manifest.call_budgets[1],
+        )
 
 
 def test_pit_optimizer_v2_role_profile_is_all_r1_without_legacy_drift() -> None:
@@ -5337,23 +5922,6 @@ def test_pit_optimizer_v2_gateway_accounts_all_three_r1_roles_in_order(
             "+    return True\n"
         ),
     }
-    inputs = (
-        _task6_manifest_investigator_input(v2_manifest),
-        _task6_manifest_author_input(v2_manifest),
-        _task6_manifest_critic_input(v2_manifest),
-    )
-    parsers = (
-        _task6_investigator_parser,
-        lambda raw: contract.AuthorArtifact.from_json(
-            raw,
-            max_diff_bytes=8 * 1024,
-            max_total_bytes=16 * 1024,
-        ),
-        lambda raw: contract.CriticArtifact.from_json(
-            raw,
-            max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
-        ),
-    )
     responses = (
         _investigator_payload(),
         author_payload,
@@ -5376,31 +5944,75 @@ def test_pit_optimizer_v2_gateway_accounts_all_three_r1_roles_in_order(
             _task6_fake_response(_canonical_text(payload)) for payload in responses
         ],
     )
-    for plan, role_input in zip(
-        v2_manifest.call_budgets[:3],
-        inputs,
-        strict=True,
-    ):
-        authorization.bind_controller_role_input(role_input, plan)
-
-    results = tuple(
-        gateway.request_pit_optimizer_once(
-            plan.role,
-            role_input,
-            parser,
-            call_budget=plan,
-            authorization_lease=lease,
-            frozen_pricing=pricing,
-            wall_deadline=10.0,
-            monotonic=lambda: 1.0,
-        )
-        for plan, role_input, parser in zip(
-            v2_manifest.call_budgets[:3],
-            inputs,
-            parsers,
-            strict=True,
-        )
+    investigator_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(
+        investigator_input,
+        v2_manifest.call_budgets[0],
     )
+    investigator_call = gateway.request_pit_optimizer_once(
+        "investigator",
+        investigator_input,
+        _task6_investigator_parser,
+        call_budget=v2_manifest.call_budgets[0],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    author_input = replace(
+        _task6_manifest_author_input(v2_manifest),
+        investigator=investigator_call.payload,
+    )
+    authorization.bind_controller_role_input(
+        author_input,
+        v2_manifest.call_budgets[1],
+        predecessor_calls=(investigator_call,),
+    )
+    author_call = gateway.request_pit_optimizer_once(
+        "author",
+        author_input,
+        lambda raw: contract.AuthorArtifact.from_json(
+            raw,
+            max_diff_bytes=8 * 1024,
+            max_total_bytes=16 * 1024,
+        ),
+        call_budget=v2_manifest.call_budgets[1],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    author_artifact = author_call.payload
+    assert isinstance(author_artifact, contract.AuthorArtifact)
+    critic_input = replace(
+        _task6_manifest_critic_input(v2_manifest),
+        investigator_summary=investigator_call.payload,
+        author_manifest=contract.AuthorManifestSummary(
+            hypothesis_id=author_artifact.hypothesis_id,
+            behavioral_summary=author_artifact.behavioral_summary,
+            changed_paths=author_artifact.changed_paths,
+            changed_symbols=author_artifact.changed_symbols,
+        ),
+    )
+    authorization.bind_controller_role_input(
+        critic_input,
+        v2_manifest.call_budgets[2],
+        predecessor_calls=(investigator_call, author_call),
+    )
+    critic_call = gateway.request_pit_optimizer_once(
+        "critic",
+        critic_input,
+        lambda raw: contract.CriticArtifact.from_json(
+            raw,
+            max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
+        ),
+        call_budget=v2_manifest.call_budgets[2],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    results = (investigator_call, author_call, critic_call)
     authorization.close_run_lease(lease, terminal_code="early_stop")
 
     assert tuple(result.plan.role for result in results) == contract.OPTIMIZER_V2_ROLES
@@ -5414,6 +6026,156 @@ def test_pit_optimizer_v2_gateway_accounts_all_three_r1_roles_in_order(
         call["extra_body"] == {"provider": {"require_parameters": True}}
         for call in client.completions.calls
     )
+
+
+def test_pit_optimizer_v2_next_investigator_requires_prior_iteration_receipts(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """Break caught: later investigator summaries could self-assert their lineage."""
+    from core.pit_optimizer_authorization import AuthorizationError
+
+    author_payload = {
+        **_author_payload(),
+        "unified_diff": (
+            "--- a/core/strategy_policy/entry.py\n"
+            "+++ b/core/strategy_policy/entry.py\n"
+            "@@ -2,2 +2,2 @@\n"
+            " def evaluate_entry(snapshot):\n"
+            "-    return None\n"
+            "+    return True\n"
+        ),
+    }
+    (
+        authorization,
+        _ledger_path,
+        lease,
+        pricing,
+        _budget,
+        _audit,
+        _client,
+        gateway,
+    ) = _task6_gateway_context(
+        tmp_path,
+        v2_manifest,
+        grant_id="grant-next-investigator-lineage",
+        outcomes=[
+            _task6_fake_response(_canonical_text(payload))
+            for payload in (
+                _investigator_payload(),
+                author_payload,
+                _critic_payload(),
+            )
+        ],
+    )
+    investigator_input = _task6_manifest_investigator_input(v2_manifest)
+    authorization.bind_controller_role_input(
+        investigator_input,
+        v2_manifest.call_budgets[0],
+    )
+    investigator_call = gateway.request_pit_optimizer_once(
+        "investigator",
+        investigator_input,
+        _task6_investigator_parser,
+        call_budget=v2_manifest.call_budgets[0],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    author_input = replace(
+        _task6_manifest_author_input(v2_manifest),
+        investigator=investigator_call.payload,
+    )
+    authorization.bind_controller_role_input(
+        author_input,
+        v2_manifest.call_budgets[1],
+        predecessor_calls=(investigator_call,),
+    )
+    author_call = gateway.request_pit_optimizer_once(
+        "author",
+        author_input,
+        lambda raw: contract.AuthorArtifact.from_json(
+            raw,
+            max_diff_bytes=8 * 1024,
+            max_total_bytes=16 * 1024,
+        ),
+        call_budget=v2_manifest.call_budgets[1],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    author_artifact = author_call.payload
+    assert isinstance(author_artifact, contract.AuthorArtifact)
+    critic_input = replace(
+        _task6_manifest_critic_input(v2_manifest),
+        investigator_summary=investigator_call.payload,
+        author_manifest=contract.AuthorManifestSummary(
+            hypothesis_id=author_artifact.hypothesis_id,
+            behavioral_summary=author_artifact.behavioral_summary,
+            changed_paths=author_artifact.changed_paths,
+            changed_symbols=author_artifact.changed_symbols,
+        ),
+    )
+    authorization.bind_controller_role_input(
+        critic_input,
+        v2_manifest.call_budgets[2],
+        predecessor_calls=(investigator_call, author_call),
+    )
+    critic_call = gateway.request_pit_optimizer_once(
+        "critic",
+        critic_input,
+        lambda raw: contract.CriticArtifact.from_json(
+            raw,
+            max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
+        ),
+        call_budget=v2_manifest.call_budgets[2],
+        authorization_lease=lease,
+        frozen_pricing=pricing,
+        wall_deadline=10.0,
+        monotonic=lambda: 1.0,
+    )
+    investigator_artifact = investigator_call.payload
+    critic_artifact = critic_call.payload
+    assert isinstance(investigator_artifact, contract.InvestigatorArtifact)
+    assert isinstance(critic_artifact, contract.CriticArtifact)
+    feedback = contract.IterationFeedbackSummary(
+        iteration=1,
+        hypothesis_id=investigator_artifact.hypothesis_id,
+        family=investigator_artifact.family,
+        author_summary=author_artifact.behavioral_summary,
+        validation_code="valid",
+        discovery_score=None,
+        critic_disposition=critic_artifact.disposition,
+        critic_next_direction=critic_artifact.next_direction,
+        incumbent_changed=False,
+    )
+    second_input = replace(
+        _task6_manifest_investigator_input(v2_manifest),
+        iteration=2,
+        prior_iterations=(feedback,),
+    )
+    predecessors = (investigator_call, author_call, critic_call)
+
+    with pytest.raises(AuthorizationError, match="predecessor artifact"):
+        authorization.bind_controller_role_input(
+            replace(
+                second_input,
+                prior_iterations=(
+                    replace(feedback, author_summary="foreign summary"),
+                ),
+            ),
+            v2_manifest.call_budgets[3],
+            predecessor_calls=predecessors,
+        )
+    snapshot = authorization.bind_controller_role_input(
+        second_input,
+        v2_manifest.call_budgets[3],
+        predecessor_calls=predecessors,
+    )
+
+    assert snapshot.canonical_bytes == second_input.canonical_json_bytes()
 
 
 @pytest.mark.parametrize(
