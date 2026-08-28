@@ -33,7 +33,7 @@ from core.pit_optimizer_evaluation import (
     FoldManifest,
     FoldSpec,
 )
-from core.pit_policy_parity import ParityAttestation
+from core.pit_policy_parity import ParityAttestation, ParityFoldEvidence
 
 
 _POLICY_PATHS = (
@@ -41,6 +41,91 @@ _POLICY_PATHS = (
     "core/strategy_policy/risk.py",
     "core/strategy_policy/exit.py",
 )
+
+
+@pytest.fixture
+def final_parity(tmp_path: Path) -> ParityAttestation:
+    """Two closed final-parity fold records for pure Task 7 projection tests."""
+
+    effective_policy_sha256 = "a" * 64
+
+    def evidence(fold_id: str, total_return_pct: float) -> ParityFoldEvidence:
+        aggregate = FoldAggregateSummary(
+            fold_id=fold_id,
+            total_return_pct=total_return_pct,
+            excess_total_return_pp=None,
+            max_drawdown_pct=-1.0,
+            sharpe_ratio=1.0,
+            closed_trades=3,
+            turnover_pct=10.0,
+            average_exposure_pct=25.0,
+            entry_funnel=(AggregateMetric("entries", 3),),
+            exit_attribution=(AggregateMetric("profit_target", 2),),
+        )
+        primitive = {
+            "fold_id": fold_id,
+            "transactions": [],
+            "entry_outcomes": [],
+            "equity": [],
+            "funnel": [asdict(item) for item in aggregate.entry_funnel],
+            "aggregate": asdict(aggregate),
+            "effective_policy_sha256": effective_policy_sha256,
+        }
+        digest = hashlib.sha256(_canonical_file_bytes(primitive)).hexdigest()
+        return ParityFoldEvidence(
+            fold_id=fold_id,
+            transactions=(),
+            entry_outcomes=(),
+            equity=(),
+            funnel=aggregate.entry_funnel,
+            aggregate=aggregate,
+            effective_policy_sha256=effective_policy_sha256,
+            evidence_sha256=digest,
+        )
+
+    evidence_values = (
+        evidence("discovery_1", 1.0),
+        evidence("discovery_2", 2.0),
+    )
+    return ParityAttestation(
+        schema_version=1,
+        reference_artifact_sha256="b" * 64,
+        reference_source_head="1" * 40,
+        final_source_head="2" * 40,
+        final_source_fingerprint_sha256="c" * 64,
+        pit_bundle_sha256="d" * 64,
+        baseline_manifest_sha256="e" * 64,
+        effective_policy_sha256=effective_policy_sha256,
+        discovery_fold_manifest_sha256="f" * 64,
+        policy_interface_version=1,
+        reference_output_sha256s=tuple(
+            (item.fold_id, item.evidence_sha256) for item in evidence_values
+        ),
+        final_output_sha256s=tuple(
+            (item.fold_id, item.evidence_sha256) for item in evidence_values
+        ),
+        final_discovery_evidence=evidence_values,
+        transactions_equal=True,
+        entry_outcomes_equal=True,
+        equity_equal=True,
+        funnels_equal=True,
+        effective_policy_equal=True,
+        artifact_path=(tmp_path / "final-parity.json").resolve(),
+        artifact_sha256="9" * 64,
+    )
+
+
+def test_prepare_baseline_comes_from_final_parity(final_parity: ParityAttestation) -> None:
+    """Break caught: prepare could substitute a non-attested discovery baseline."""
+    from core.pit_optimizer_controller import _baseline_from_parity
+
+    baseline = _baseline_from_parity(final_parity)
+    assert baseline.folds == tuple(
+        item.aggregate for item in final_parity.final_discovery_evidence
+    )
+    assert baseline.evidence_ids == tuple(
+        item.evidence_sha256 for item in final_parity.final_discovery_evidence
+    )
 
 
 def _canonical_text(value: object) -> str:

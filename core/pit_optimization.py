@@ -16,9 +16,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean, median
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from core.pit_optimizer_controller import (
+        PitOptimizerReadiness,
+        PitOptimizerResult,
+        PitOptimizerServices,
+    )
 
 from core.pit_optimization_contract import (
     BASELINE_MANIFEST_SHA256,
@@ -33,6 +40,7 @@ from core.pit_optimization_contract import (
     PIT_BUNDLE_SHA256,
     OptimizationComparison,
     OptimizationWindowMetrics,
+    PitOptimizerGateConfig,
     PitOptimizationCoding,
     PitOptimizationReasoning,
     PitOptimizationRoute,
@@ -3247,6 +3255,41 @@ def closed_window_metrics(window: Mapping[str, object]) -> OptimizationWindowMet
     if not isinstance(performance, Mapping):
         raise ValueError("optimization window lacks performance")
     return OptimizationWindowMetrics.from_mapping(performance)
+
+
+def prepare_pit_optimizer_v2(
+    config: PitOptimizerGateConfig,
+    *,
+    source_root: Path,
+    artifact_root: Path,
+    permanent_runtime_root: Path,
+    source_head: str,
+    source_fingerprint_sha256: str,
+) -> PitOptimizerReadiness:
+    """Provider-free public adapter for schema-v2 readiness preparation."""
+
+    from core.pit_optimizer_controller import prepare_pit_optimizer_v2 as prepare
+
+    return prepare(
+        config,
+        source_root=source_root,
+        artifact_root=artifact_root,
+        permanent_runtime_root=permanent_runtime_root,
+        source_head=source_head,
+        source_fingerprint_sha256=source_fingerprint_sha256,
+    )
+
+
+def run_pit_optimizer_v2(
+    *,
+    readiness: PitOptimizerReadiness,
+    services: PitOptimizerServices,
+) -> PitOptimizerResult:
+    """Public adapter for the injected schema-v2 incumbent loop."""
+
+    from core.pit_optimizer_controller import run_pit_optimizer_v2 as run
+
+    return run(readiness=readiness, services=services)
 
 
 if __name__ == "__main__":

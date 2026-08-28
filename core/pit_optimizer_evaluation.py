@@ -381,6 +381,133 @@ class HoldoutDecision:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class FoldEvaluationResult:
+    fold_id: str
+    engine_policy_sha256: str
+    candidate_identity_sha256: str
+    aggregate_metrics: FoldAggregateSummary
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fold_id, str) or not self.fold_id:
+            raise ValueError("fold evaluation ID is invalid")
+        _require_digest(self.engine_policy_sha256, "fold engine policy SHA-256")
+        _require_digest(
+            self.candidate_identity_sha256,
+            "fold candidate identity SHA-256",
+        )
+        if not isinstance(self.aggregate_metrics, FoldAggregateSummary):
+            raise ValueError("fold evaluation aggregate is invalid")
+        if self.aggregate_metrics.fold_id != self.fold_id:
+            raise ValueError("fold evaluation aggregate identity differs")
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryComparison:
+    candidate_vs_fixed_baseline: DiscoveryScore
+    candidate_vs_incumbent_diagnostics: DiscoveryScore
+    rankable: bool
+    strictly_improves_incumbent: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_vs_fixed_baseline, DiscoveryScore) or not isinstance(
+            self.candidate_vs_incumbent_diagnostics,
+            DiscoveryScore,
+        ):
+            raise ValueError("discovery comparison scores are invalid")
+        if type(self.rankable) is not bool or type(self.strictly_improves_incumbent) is not bool:
+            raise ValueError("discovery comparison flags are invalid")
+        if self.strictly_improves_incumbent and not self.rankable:
+            raise ValueError("an unrankable discovery candidate cannot improve")
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryEvaluation:
+    folds: tuple[FoldEvaluationResult, ...]
+    comparison: DiscoveryComparison
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.folds) is not tuple
+            or len(self.folds) != 2
+            or any(not isinstance(item, FoldEvaluationResult) for item in self.folds)
+        ):
+            raise ValueError("discovery evaluation folds are invalid")
+        if tuple(item.fold_id for item in self.folds) != (
+            "discovery_1",
+            "discovery_2",
+        ):
+            raise ValueError("discovery evaluation fold order is invalid")
+        if not isinstance(self.comparison, DiscoveryComparison):
+            raise ValueError("discovery evaluation comparison is invalid")
+        if len({item.engine_policy_sha256 for item in self.folds}) != 1 or len(
+            {item.candidate_identity_sha256 for item in self.folds}
+        ) != 1:
+            raise ValueError("discovery evaluation fold identities differ")
+
+
+@dataclass(frozen=True, slots=True)
+class DeterminismAttestation:
+    fold_id: str
+    expected_evidence_sha256: str
+    repeated_evidence_sha256: str
+    matched: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fold_id, str) or not self.fold_id:
+            raise ValueError("determinism fold ID is invalid")
+        _require_digest(
+            self.expected_evidence_sha256,
+            "determinism expected evidence SHA-256",
+        )
+        _require_digest(
+            self.repeated_evidence_sha256,
+            "determinism repeated evidence SHA-256",
+        )
+        if type(self.matched) is not bool:
+            raise ValueError("determinism match flag is invalid")
+        if self.matched is not (
+            self.expected_evidence_sha256 == self.repeated_evidence_sha256
+        ):
+            raise ValueError("determinism match flag differs from evidence")
+
+
+@dataclass(frozen=True, slots=True)
+class HiddenEvaluation:
+    baseline_aggregate: FoldAggregateSummary
+    candidate_aggregate: FoldAggregateSummary
+    decision: HoldoutDecision
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.baseline_aggregate, FoldAggregateSummary) or not isinstance(
+            self.candidate_aggregate,
+            FoldAggregateSummary,
+        ):
+            raise ValueError("hidden evaluation aggregates are invalid")
+        if self.baseline_aggregate.fold_id != self.candidate_aggregate.fold_id:
+            raise ValueError("hidden evaluation fold identities differ")
+        if not isinstance(self.decision, HoldoutDecision):
+            raise ValueError("hidden evaluation decision is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class PitOptimizerCleanup:
+    candidate_removed: bool
+    worker_stopped: bool
+    source_modified: bool
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not bool
+            for value in (
+                self.candidate_removed,
+                self.worker_stopped,
+                self.source_modified,
+            )
+        ):
+            raise ValueError("optimizer cleanup flags are invalid")
+
+
 def _require_digest(value: object, label: str) -> str:
     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f"{label} is invalid")
