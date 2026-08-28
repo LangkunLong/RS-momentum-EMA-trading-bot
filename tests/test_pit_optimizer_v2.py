@@ -3788,8 +3788,9 @@ def _task6_crash_after_terminal_audit(
     monkeypatch: pytest.MonkeyPatch,
     *,
     grant_id: str,
+    commit_terminal: bool = False,
 ) -> tuple[object, ...]:
-    """Publish genuine fake terminal evidence, then interrupt authorization append."""
+    """Publish fake terminal evidence, optionally commit it, then interrupt return."""
 
     context = _task6_gateway_context(
         tmp_path,
@@ -3800,12 +3801,20 @@ def _task6_crash_after_terminal_audit(
     authorization, _ledger_path, lease, pricing, _budget, _audit, _client, gateway = (
         context
     )
+    original_reconcile = authorization.reconcile_call
+
+    def interrupt_authorization_publication(
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if commit_terminal:
+            original_reconcile(*args, **kwargs)
+        raise KeyboardInterrupt("authorization-publication-crash")
+
     monkeypatch.setattr(
         authorization,
         "reconcile_call",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            KeyboardInterrupt("authorization-publication-crash")
-        ),
+        interrupt_authorization_publication,
     )
     plan = manifest.call_budgets[0]
     role_input = _task6_manifest_investigator_input(manifest)
@@ -4877,6 +4886,7 @@ class _Task6ExplodingResponse:
         ("reservation_audit", False),
         ("sdk_construction", False),
         ("start_audit", False),
+        ("start_commitment", True),
         ("sdk_invocation", True),
         ("response_processing", True),
     ),
@@ -4889,6 +4899,8 @@ def test_pit_optimizer_v2_keyboard_interrupt_finalizes_by_provider_phase(
     possibly_sent: bool,
 ) -> None:
     """Break caught: cancellation could strand an active reservation and one-shot lease."""
+    import agent_loop
+
     outcomes: list[object]
     if phase == "sdk_invocation":
         outcomes = [KeyboardInterrupt(phase)]
@@ -4947,6 +4959,25 @@ def test_pit_optimizer_v2_keyboard_interrupt_finalizes_by_provider_phase(
             "_append_pit_optimizer_lifecycle_event",
             interrupt_one_audit,
         )
+    elif phase == "start_commitment":
+        original_bind = authorization._bind_gateway_lifecycle_commitment
+        interrupted = False
+
+        def bind_then_interrupt(lifecycle: object) -> None:
+            nonlocal interrupted
+            original_bind(lifecycle)
+            if (
+                getattr(lifecycle, "started_event_sha256", None) is not None
+                and not interrupted
+            ):
+                interrupted = True
+                raise KeyboardInterrupt(phase)
+
+        monkeypatch.setattr(
+            authorization,
+            "_bind_gateway_lifecycle_commitment",
+            bind_then_interrupt,
+        )
     elif phase == "sdk_construction":
         monkeypatch.setattr(
             gateway,
@@ -4980,14 +5011,88 @@ def test_pit_optimizer_v2_keyboard_interrupt_finalizes_by_provider_phase(
     assert (audit.run_root / "provider-call-0001.json").is_file()
     assert audit._events[-1]["event"] == "provider_call_rejected"
     if possibly_sent:
+        retained_reservation = next(
+            iter(budget._pit_optimizer_reconciliations.values())
+        )[0]
         assert budget.calls == 1
         assert budget.incomplete_accounting_calls == 1
-        assert budget.retained_reservation_tokens > 0
-        assert len(client.completions.calls) == 1
+        assert (
+            budget.retained_reservation_tokens
+            == retained_reservation.token_upper_bound
+        )
+        assert budget.retained_reservation_usd == pytest.approx(
+            float(retained_reservation.amount_usd)
+        )
+        assert len(client.completions.calls) == (
+            0 if phase == "start_commitment" else 1
+        )
     else:
         assert budget.calls == 0
         assert budget.reserved_tokens == 0
         assert budget.committed_usd == pytest.approx(0.0)
+        assert client.completions.calls == []
+
+    if phase == "start_commitment":
+        from core.pit_optimizer_authorization import (
+            AuthorizationError,
+            AuthorizationLedger,
+        )
+
+        reconciliations = [
+            record for record in records if record["record_type"] == "reconciliation"
+        ]
+        assert len(reconciliations) == 1
+        assert reconciliations[0]["provider_facts"]["request_started"] is True
+        assert (
+            reconciliations[0]["provider_facts"]["outcome"]
+            == "uncertain_accounting"
+        )
+        assert len(
+            [
+                event
+                for event in audit._events
+                if event["event"] == "provider_call_rejected"
+                and event["details"]["request_started"] is True
+                and event["details"]["outcome"] == "uncertain_accounting"
+            ]
+        ) == 1
+        ledger_bytes = ledger_path.read_bytes()
+        reopened_audit = agent_loop.AuditTrail.open_existing(
+            audit.artifact_root,
+            audit.run_id,
+        )
+        reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+        fresh_budget = agent_loop.BudgetLedger(
+            max_usd=1.0,
+            max_calls=6,
+            max_tokens=448_000,
+        )
+        restarted = agent_loop.OpenRouterGateway(
+            client=client,
+            pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+            ledger=fresh_budget,
+            authorization_ledger=reopened_authorization,
+            audit_trail=reopened_audit,
+            max_attempts=1,
+        )
+        for _ in range(2):
+            restarted.recover_pit_optimizer_finalization(
+                authorization_lease=lease,
+                call_budget=v2_manifest.call_budgets[0],
+            )
+        assert ledger_path.read_bytes() == ledger_bytes
+        assert fresh_budget.calls == 1
+        assert fresh_budget.incomplete_accounting_calls == 1
+        assert (
+            fresh_budget.retained_reservation_tokens
+            == retained_reservation.token_upper_bound
+        )
+        assert fresh_budget.retained_reservation_usd == pytest.approx(
+            float(retained_reservation.amount_usd)
+        )
+        for blocked_plan in v2_manifest.call_budgets[:2]:
+            with pytest.raises(AuthorizationError):
+                reopened_authorization.reserve_call(lease, blocked_plan)
         assert client.completions.calls == []
 
 
@@ -5610,6 +5715,55 @@ def test_pit_optimizer_v2_gateway_sends_one_all_r1_call_without_healing(
     assert records[-1]["terminal_audit_sha256"] == audit._events[-1][
         "event_sha256"
     ]
+    terminal_commitment = records[-1]["gateway_terminal"]
+    authorization_reservation = next(
+        item["reservation"]
+        for item in records
+        if item["record_type"] == "reservation"
+    )
+    budget_path = audit.run_root / "provider-budget-0001.json"
+    assert terminal_commitment == {
+        "authorization_reservation_id": authorization_reservation["reservation_id"],
+        "authorization_reservation": authorization_reservation,
+        "authorization_reservation_sha256": hashlib.sha256(
+            (_canonical_text(authorization_reservation) + "\n").encode("utf-8")
+        ).hexdigest(),
+        "gateway_lifecycle_sha256": hashlib.sha256(
+            (_canonical_text(started_commitment) + "\n").encode("utf-8")
+        ).hexdigest(),
+        "provider_facts_sha256": hashlib.sha256(
+            (_canonical_text(records[-1]["provider_facts"]) + "\n").encode("utf-8")
+        ).hexdigest(),
+        "provider_record_sha256": hashlib.sha256(
+            provider_path.read_bytes()
+        ).hexdigest(),
+        "budget_recovery_sha256": hashlib.sha256(
+            budget_path.read_bytes()
+        ).hexdigest(),
+        "terminal_event_sha256": audit._events[-1]["event_sha256"],
+        "audit_run_id": audit.run_id,
+        "run_manifest_sha256": v2_manifest.sha256,
+        "call_index": 1,
+        "iteration": 1,
+        "role": "investigator",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+            "cost_usd": 0.001,
+            "retained_reservation_tokens": 0,
+            "retained_reservation_usd": 0.0,
+        },
+        "charged_calls": 1,
+        "charged_tokens": 150,
+        "charged_usd": "0.001",
+        "charge_basis": "authoritative",
+        "terminal_outcome": "accepted",
+        "terminal_code": None,
+        "payload_sha256": records[-1]["terminal_audit_receipt"][
+            "payload_sha256"
+        ],
+    }
     assert "causal_rationale" not in audit_payload
     assert "source_bundle" not in audit_payload
 
@@ -6328,12 +6482,16 @@ def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
         grant_id="grant-restart-finalizer",
         outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
     )
+    original_reconcile = authorization.reconcile_call
+
+    def reconcile_then_interrupt(*args: object, **kwargs: object) -> None:
+        original_reconcile(*args, **kwargs)
+        raise KeyboardInterrupt("authorization-publication-crash")
+
     monkeypatch.setattr(
         authorization,
         "reconcile_call",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            KeyboardInterrupt("authorization-publication-crash")
-        ),
+        reconcile_then_interrupt,
     )
     role_input = _task6_manifest_investigator_input(v2_manifest)
     authorization.bind_controller_role_input(role_input, plan)
@@ -6392,7 +6550,7 @@ def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
     assert fresh_budget._pit_optimizer_reservations == {}
     assert len(fresh_budget._pit_optimizer_reconciliations) == 1
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
-    assert len(records) == before_recovery + 1
+    assert len(records) == before_recovery
     assert records[-1]["record_type"] == "reconciliation"
     assert records[-1]["terminal_audit_receipt"]["terminal_event_sha256"] == (
         reopened_audit._events[-1]["event_sha256"]
@@ -6434,12 +6592,16 @@ def test_pit_optimizer_v2_fresh_restart_preserves_cancelled_terminal_code(
         "_get_client",
         lambda: (_ for _ in ()).throw(KeyboardInterrupt("operator-cancelled")),
     )
+    original_reconcile = authorization.reconcile_call
+
+    def reconcile_then_interrupt(*args: object, **kwargs: object) -> None:
+        original_reconcile(*args, **kwargs)
+        raise KeyboardInterrupt("authorization-publication-crash")
+
     monkeypatch.setattr(
         authorization,
         "reconcile_call",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            KeyboardInterrupt("authorization-publication-crash")
-        ),
+        reconcile_then_interrupt,
     )
     role_input = _task6_manifest_investigator_input(v2_manifest)
     authorization.bind_controller_role_input(role_input, plan)
@@ -6509,6 +6671,7 @@ def test_pit_optimizer_v2_recovery_authenticates_before_budget_restore(
         v2_manifest,
         monkeypatch,
         grant_id="grant-verify-before-restore",
+        commit_terminal=True,
     )
     provider_path = audit.run_root / "provider-call-0001.json"
     budget_path = audit.run_root / "provider-budget-0001.json"
@@ -6602,16 +6765,15 @@ def test_pit_optimizer_v2_recovery_authenticates_before_budget_restore(
         max_tokens=448_000,
     )
     zero_image = _task6_budget_image(fresh_budget)
-    restarted = agent_loop.OpenRouterGateway(
-        client=client,
-        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
-        ledger=fresh_budget,
-        authorization_ledger=tampered_authorization,
-        audit_trail=tampered_audit,
-        max_attempts=1,
-    )
-
     with pytest.raises((agent_loop.AuditError, AuthorizationError)):
+        restarted = agent_loop.OpenRouterGateway(
+            client=client,
+            pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+            ledger=fresh_budget,
+            authorization_ledger=tampered_authorization,
+            audit_trail=tampered_audit,
+            max_attempts=1,
+        )
         restarted.recover_pit_optimizer_finalization(
             authorization_lease=lease,
             call_budget=plan,
@@ -6635,6 +6797,10 @@ def test_pit_optimizer_v2_recovery_authenticates_before_budget_restore(
         authorization_lease=lease,
         call_budget=plan,
     )
+    retry.recover_pit_optimizer_finalization(
+        authorization_lease=lease,
+        call_budget=plan,
+    )
 
     assert fresh_budget.calls == 1
     assert fresh_budget.total_tokens == 150
@@ -6643,6 +6809,146 @@ def test_pit_optimizer_v2_recovery_authenticates_before_budget_restore(
         lease,
         v2_manifest.call_budgets[1],
     ).call_index == 2
+
+
+def test_pit_optimizer_v2_recovery_requires_trusted_terminal_commitment(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: audit-local hashes could replace the genuine terminal package."""
+    import agent_loop
+    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+
+    plan = v2_manifest.call_budgets[0]
+    (
+        authorization,
+        ledger_path,
+        lease,
+        pricing,
+        budget,
+        audit,
+        client,
+        gateway,
+    ) = _task6_crash_after_terminal_audit(
+        tmp_path,
+        v2_manifest,
+        monkeypatch,
+        grant_id="grant-trusted-terminal-commitment",
+    )
+    provider_path = audit.run_root / "provider-call-0001.json"
+    budget_path = audit.run_root / "provider-budget-0001.json"
+    authorization_records_before = ledger_path.read_bytes()
+
+    provider = json.loads(provider_path.read_bytes())
+    assert (
+        provider["prompt_tokens"],
+        provider["completion_tokens"],
+        provider["total_tokens"],
+        provider["cost_usd"],
+    ) == (100, 50, 150, 0.001)
+    changed_snapshot = {
+        **provider["ledger_snapshot"],
+        "prompt_tokens": 120,
+        "completion_tokens": 60,
+        "total_tokens": 180,
+        "reserved_tokens": 180,
+        "reserved_usd": 0.002,
+        "spent_usd": 0.002,
+        "authoritative_usd": 0.002,
+    }
+    provider.update(
+        {
+            "prompt_tokens": 120,
+            "completion_tokens": 60,
+            "total_tokens": 180,
+            "cost_usd": 0.002,
+            "ledger_snapshot": changed_snapshot,
+        }
+    )
+    changed_provider = (_canonical_text(provider) + "\n").encode("utf-8")
+    provider_path.write_bytes(changed_provider)
+
+    recovery = json.loads(budget_path.read_bytes())
+    recovery["snapshot"] = changed_snapshot
+    recovery["reserved_usd_decimal"] = "0.002"
+    recovery["reconciliations"][0]["usage"].update(
+        {
+            "prompt_tokens": 120,
+            "completion_tokens": 60,
+            "total_tokens": 180,
+            "cost_usd": 0.002,
+        }
+    )
+    changed_budget = (_canonical_text(recovery) + "\n").encode("utf-8")
+    budget_path.write_bytes(changed_budget)
+
+    genuine_event_lines = audit.events_path.read_bytes().splitlines(keepends=True)
+    assert len(genuine_event_lines) == 3
+    reserved_line, started_line, terminal_line = genuine_event_lines
+    terminal = json.loads(terminal_line)
+    terminal_details = dict(terminal["details"])
+    terminal_details.update(
+        {
+            "artifact_sha256": hashlib.sha256(changed_provider).hexdigest(),
+            "budget_recovery_sha256": hashlib.sha256(changed_budget).hexdigest(),
+            "ledger_snapshot": changed_snapshot,
+        }
+    )
+    terminal["details"] = terminal_details
+    terminal_core = {
+        key: value for key, value in terminal.items() if key != "event_sha256"
+    }
+    terminal["event_sha256"] = hashlib.sha256(
+        _canonical_text(terminal_core).encode("utf-8")
+    ).hexdigest()
+    audit.events_path.write_bytes(
+        reserved_line
+        + started_line
+        + (_canonical_text(terminal) + "\n").encode("utf-8")
+    )
+    rewritten_lines = audit.events_path.read_bytes().splitlines(keepends=True)
+    assert rewritten_lines[:2] == [reserved_line, started_line]
+
+    audit_root = audit.artifact_root
+    audit_run_id = audit.run_id
+    del gateway, budget, audit, authorization, pricing
+    rewritten_audit = agent_loop.AuditTrail.open_existing(audit_root, audit_run_id)
+    reopened_authorization = AuthorizationLedger(ledger_path, v2_manifest)
+    fresh_budget = agent_loop.BudgetLedger(
+        max_usd=1.0,
+        max_calls=6,
+        max_tokens=448_000,
+    )
+    zero_image = _task6_budget_image(fresh_budget)
+    restarted = agent_loop.OpenRouterGateway(
+        client=client,
+        pricing_loader=lambda _model: pytest.fail("recovery loaded pricing"),
+        ledger=fresh_budget,
+        authorization_ledger=reopened_authorization,
+        audit_trail=rewritten_audit,
+        max_attempts=1,
+    )
+
+    with pytest.raises((agent_loop.AuditError, AuthorizationError)):
+        restarted.recover_pit_optimizer_finalization(
+            authorization_lease=lease,
+            call_budget=plan,
+        )
+    assert _task6_budget_image(fresh_budget) == zero_image
+    assert ledger_path.read_bytes() == authorization_records_before
+    assert not any(
+        item["record_type"] == "reconciliation"
+        for item in (
+            json.loads(line) for line in ledger_path.read_bytes().splitlines()
+        )
+    )
+    with pytest.raises(AuthorizationError):
+        reopened_authorization.reserve_call(
+            lease,
+            v2_manifest.call_budgets[1],
+        )
+    assert len(client.completions.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -6991,12 +7297,16 @@ def test_pit_optimizer_v2_restart_recovers_terminal_before_send_without_start_ev
         "_append_pit_optimizer_lifecycle_event",
         fail_reserved_event_once,
     )
+    original_reconcile = authorization.reconcile_call
+
+    def reconcile_then_interrupt(*args: object, **kwargs: object) -> None:
+        original_reconcile(*args, **kwargs)
+        raise KeyboardInterrupt("authorization-publication-crash")
+
     monkeypatch.setattr(
         authorization,
         "reconcile_call",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            KeyboardInterrupt("authorization-publication-crash")
-        ),
+        reconcile_then_interrupt,
     )
     role_input = _task6_manifest_investigator_input(v2_manifest)
     authorization.bind_controller_role_input(role_input, plan)
@@ -7033,6 +7343,10 @@ def test_pit_optimizer_v2_restart_recovers_terminal_before_send_without_start_ev
         authorization_ledger=reopened_authorization,
         audit_trail=reopened_audit,
         max_attempts=1,
+    )
+    restarted.recover_pit_optimizer_finalization(
+        authorization_lease=lease,
+        call_budget=plan,
     )
     restarted.recover_pit_optimizer_finalization(
         authorization_lease=lease,

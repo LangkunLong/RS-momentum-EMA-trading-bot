@@ -3901,10 +3901,10 @@ class OpenRouterGateway:
             if first_postpublication_error is None:
                 first_postpublication_error = error
         try:
-            self.authorization_ledger.reconcile_call(
-                lifecycle.authorization_reservation,
+            self.authorization_ledger._commit_gateway_terminal_reconciliation(
+                lifecycle,
                 facts,
-                terminal_audit_receipt=terminal_audit_receipt,
+                terminal_audit_receipt,
                 terminal_code=lifecycle.terminal_code,
             )
         except BaseException as error:
@@ -3976,7 +3976,7 @@ class OpenRouterGateway:
             run_manifest_sha256=authorization_lease.run_manifest_sha256,
             audit_run_id=self.audit_trail.run_id,
         )
-        self.authorization_ledger.reconcile_call(
+        self.authorization_ledger.verify_reconciliation(
             reservation,
             facts,
             terminal_audit_receipt=receipt,
@@ -4485,6 +4485,8 @@ class OpenRouterGateway:
                         except BaseException:
                             lifecycle = None
                     if lifecycle is not None:
+                        if lifecycle.started_event_sha256 is not None:
+                            possibly_sent = True
                         try:
                             reserved_sha256 = (
                                 self._ensure_pit_optimizer_reserved_event(

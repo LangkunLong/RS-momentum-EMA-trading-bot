@@ -715,7 +715,7 @@ class AuthorizationLedger:
                     authorization_reservation=reservation,
                     provider_facts=facts,
                 )
-                self._require_gateway_lifecycle_commitment(
+                self._require_gateway_terminal_commitment(
                     records,
                     reservation,
                     facts,
@@ -735,6 +735,7 @@ class AuthorizationLedger:
         provider_facts: PitOptimizerProviderFacts,
         *,
         records: Sequence[dict[str, object]] | None = None,
+        require_terminal_commitment: bool = True,
     ) -> dict[str, object]:
         audit_trail = self._audit_trail
         if audit_trail is None:
@@ -771,13 +772,22 @@ class AuthorizationLedger:
                 authorization_reservation=durable_reservation,
                 provider_facts=provider_facts,
             )
-            self._require_gateway_lifecycle_commitment(
-                durable_records,
-                durable_reservation,
-                provider_facts,
-                receipt,
-                budget_state=budget_state,
-            )
+            if require_terminal_commitment:
+                self._require_gateway_terminal_commitment(
+                    durable_records,
+                    durable_reservation,
+                    provider_facts,
+                    receipt,
+                    budget_state=budget_state,
+                )
+            else:
+                self._require_gateway_lifecycle_commitment(
+                    durable_records,
+                    durable_reservation,
+                    provider_facts,
+                    receipt,
+                    budget_state=budget_state,
+                )
             return budget_state
         except Exception as exc:
             raise AuthorizationError(
@@ -1452,6 +1462,198 @@ class AuthorizationLedger:
             )
         return commitment
 
+    @staticmethod
+    def _gateway_terminal_commitment(
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+        receipt: TerminalAuditReceipt,
+        lifecycle_commitment: Mapping[str, object],
+        *,
+        budget_recovery_sha256: str,
+    ) -> dict[str, object]:
+        try:
+            budget_digest = _require_digest(
+                budget_recovery_sha256,
+                "authorization budget recovery SHA-256",
+            )
+        except ValueError as exc:
+            raise AuthorizationError(str(exc)) from exc
+        if not provider_facts.request_started:
+            charged_calls = 0
+            charged_tokens = 0
+            charged_usd = Decimal("0")
+            charge_basis = "before_send_release"
+        elif provider_facts.accounting_complete:
+            assert provider_facts.total_tokens is not None
+            assert provider_facts.cost_usd is not None
+            charged_calls = 1
+            charged_tokens = provider_facts.total_tokens
+            charged_usd = Decimal(str(provider_facts.cost_usd))
+            charge_basis = "authoritative"
+        else:
+            charged_calls = 1
+            charged_tokens = provider_facts.retained_reservation_tokens
+            charged_usd = Decimal(str(provider_facts.retained_reservation_usd))
+            charge_basis = "retained_reservation"
+        reservation_primitive = asdict(reservation)
+        facts_primitive = asdict(provider_facts)
+        return {
+            "authorization_reservation_id": reservation.reservation_id,
+            "authorization_reservation": reservation_primitive,
+            "authorization_reservation_sha256": hashlib.sha256(
+                _canonical_json_bytes(reservation_primitive)
+            ).hexdigest(),
+            "gateway_lifecycle_sha256": hashlib.sha256(
+                _canonical_json_bytes(dict(lifecycle_commitment))
+            ).hexdigest(),
+            "provider_facts_sha256": hashlib.sha256(
+                _canonical_json_bytes(facts_primitive)
+            ).hexdigest(),
+            "provider_record_sha256": receipt.provider_record_sha256,
+            "budget_recovery_sha256": budget_digest,
+            "terminal_event_sha256": receipt.terminal_event_sha256,
+            "audit_run_id": receipt.audit_run_id,
+            "run_manifest_sha256": receipt.run_manifest_sha256,
+            "call_index": receipt.call_index,
+            "iteration": receipt.iteration,
+            "role": receipt.role,
+            "usage": {
+                "prompt_tokens": provider_facts.prompt_tokens,
+                "completion_tokens": provider_facts.completion_tokens,
+                "total_tokens": provider_facts.total_tokens,
+                "cost_usd": provider_facts.cost_usd,
+                "retained_reservation_tokens": (
+                    provider_facts.retained_reservation_tokens
+                ),
+                "retained_reservation_usd": (
+                    provider_facts.retained_reservation_usd
+                ),
+            },
+            "charged_calls": charged_calls,
+            "charged_tokens": charged_tokens,
+            "charged_usd": _canonical_decimal_text(charged_usd),
+            "charge_basis": charge_basis,
+            "terminal_outcome": provider_facts.outcome,
+            "terminal_code": receipt.terminal_code,
+            "payload_sha256": receipt.payload_sha256,
+        }
+
+    def _require_gateway_terminal_commitment(
+        self,
+        records: Sequence[dict[str, object]],
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+        receipt: TerminalAuditReceipt,
+        *,
+        budget_state: Mapping[str, object],
+    ) -> dict[str, object]:
+        lifecycle_commitment = self._require_gateway_lifecycle_commitment(
+            records,
+            reservation,
+            provider_facts,
+            receipt,
+            budget_state=budget_state,
+        )
+        matches = [
+            item
+            for item in records
+            if item.get("record_type") == "reconciliation"
+            and item.get("reservation_id") == reservation.reservation_id
+        ]
+        if len(matches) != 1 or not isinstance(
+            matches[0].get("gateway_terminal"),
+            dict,
+        ):
+            raise AuthorizationError(
+                "authorization gateway terminal audit commitment is absent"
+            )
+        commitment = matches[0]["gateway_terminal"]
+        assert isinstance(commitment, dict)
+        expected = self._gateway_terminal_commitment(
+            reservation,
+            provider_facts,
+            receipt,
+            lifecycle_commitment,
+            budget_recovery_sha256=hashlib.sha256(
+                _canonical_json_bytes(dict(budget_state))
+            ).hexdigest(),
+        )
+        if commitment != expected:
+            raise AuthorizationError(
+                "authorization gateway terminal audit commitment differs"
+            )
+        self._verify_reconciliation_records(
+            records,
+            reservation,
+            provider_facts,
+            receipt.terminal_event_sha256,
+            receipt.terminal_code,
+            receipt,
+        )
+        return commitment
+
+    def _require_gateway_terminal_capability(
+        self,
+        lifecycle: object,
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+        receipt: TerminalAuditReceipt,
+    ) -> dict[str, object]:
+        from agent_loop import OpenRouterGateway, _PitOptimizerGatewayLifecycle
+
+        if not isinstance(lifecycle, _PitOptimizerGatewayLifecycle):
+            raise AuthorizationError(
+                "authorization gateway terminal lifecycle is required"
+            )
+        gateway = lifecycle.gateway
+        if not isinstance(gateway, OpenRouterGateway):
+            raise AuthorizationError(
+                "authorization gateway terminal lifecycle is invalid"
+            )
+        gateway._require_pit_optimizer_lifecycle(lifecycle)
+        if (
+            lifecycle.authorization_ledger is not self
+            or lifecycle.audit_trail is not self._audit_trail
+            or lifecycle.authorization_reservation != reservation
+            or lifecycle.facts != provider_facts
+            or lifecycle.terminal_receipt != receipt
+            or not isinstance(lifecycle.budget_state, dict)
+        ):
+            raise AuthorizationError(
+                "authorization gateway terminal lifecycle differs"
+            )
+        return dict(lifecycle.budget_state)
+
+    def _commit_gateway_terminal_reconciliation(
+        self,
+        lifecycle: object,
+        provider_facts: PitOptimizerProviderFacts,
+        receipt: TerminalAuditReceipt,
+        *,
+        terminal_code: str | None,
+    ) -> None:
+        """Atomically commit the gateway terminal package and reconciliation."""
+
+        from agent_loop import _PitOptimizerGatewayLifecycle
+
+        if not isinstance(lifecycle, _PitOptimizerGatewayLifecycle):
+            raise AuthorizationError(
+                "authorization gateway terminal lifecycle is required"
+            )
+        self._require_gateway_terminal_capability(
+            lifecycle,
+            lifecycle.authorization_reservation,
+            provider_facts,
+            receipt,
+        )
+        self.reconcile_call(
+            lifecycle.authorization_reservation,
+            provider_facts,
+            terminal_audit_receipt=receipt,
+            terminal_code=terminal_code,
+            _gateway_lifecycle=lifecycle,
+        )
+
     def _bind_gateway_lifecycle_commitment(self, lifecycle: object) -> None:
         """Durably bind one gateway-owned reserved/started transition."""
 
@@ -1780,6 +1982,14 @@ class AuthorizationLedger:
                             "terminal_audit_receipt",
                         }
                     ),
+                    frozenset(
+                        expected
+                        | {
+                            "terminal_audit_sha256",
+                            "terminal_audit_receipt",
+                            "gateway_terminal",
+                        }
+                    ),
                 }:
                     raise AuthorizationError("authorization reconciliation keys are invalid")
                 terminal_audit_sha256 = value.get("terminal_audit_sha256")
@@ -1792,6 +2002,7 @@ class AuthorizationLedger:
                     except ValueError as exc:
                         raise AuthorizationError(str(exc)) from exc
                 terminal_audit_receipt = value.get("terminal_audit_receipt")
+                lifecycle_commitment: dict[str, object] | None = None
                 if terminal_audit_receipt is not None:
                     if not isinstance(terminal_audit_receipt, dict):
                         raise AuthorizationError(
@@ -1881,6 +2092,7 @@ class AuthorizationLedger:
                             "authorization gateway lifecycle commitment is absent"
                         )
                     commitment = expected_commitments[0]
+                    lifecycle_commitment = commitment
                     if (
                         facts.audit_sha256
                         != (
@@ -1926,6 +2138,34 @@ class AuthorizationLedger:
                     ) from exc
                 if actual_charge != expected_charge:
                     raise AuthorizationError("authorization reconciliation charge is invalid")
+                terminal_commitment = value.get("gateway_terminal")
+                if terminal_commitment is not None:
+                    if (
+                        not isinstance(terminal_commitment, dict)
+                        or terminal_audit_receipt is None
+                        or lifecycle_commitment is None
+                    ):
+                        raise AuthorizationError(
+                            "authorization gateway terminal audit commitment is malformed"
+                        )
+                    try:
+                        budget_recovery_sha256 = _require_digest(
+                            terminal_commitment.get("budget_recovery_sha256"),
+                            "authorization budget recovery SHA-256",
+                        )
+                    except ValueError as exc:
+                        raise AuthorizationError(str(exc)) from exc
+                    expected_terminal = self._gateway_terminal_commitment(
+                        reservation,
+                        facts,
+                        replayed_receipt,
+                        lifecycle_commitment,
+                        budget_recovery_sha256=budget_recovery_sha256,
+                    )
+                    if terminal_commitment != expected_terminal:
+                        raise AuthorizationError(
+                            "authorization gateway terminal audit commitment differs"
+                        )
                 del active_reservations[lease_id]
                 reconciled_reservations.add(reservation.reservation_id)
             elif record_type == "lease_close":
@@ -2679,6 +2919,7 @@ class AuthorizationLedger:
         terminal_audit_sha256: str | None = None,
         terminal_audit_receipt: TerminalAuditReceipt | None = None,
         terminal_code: str | None = None,
+        _gateway_lifecycle: object | None = None,
     ) -> None:
         """Publish reconciliation and any terminal lease close as one transaction."""
 
@@ -2733,16 +2974,34 @@ class AuthorizationLedger:
             provider_facts,
             terminal_code,
         )
+        verified_budget_state: dict[str, object] | None = None
         if terminal_audit_receipt is not None:
             if terminal_audit_receipt.terminal_code != effective_terminal_code:
                 raise AuthorizationError(
                     "authorization terminal audit receipt code differs"
                 )
-            self._cross_verify_audit_receipt(
+            verified_budget_state = self._cross_verify_audit_receipt(
                 terminal_audit_receipt,
                 reservation,
                 provider_facts,
+                require_terminal_commitment=_gateway_lifecycle is None,
             )
+        lifecycle_budget_state: dict[str, object] | None = None
+        if _gateway_lifecycle is not None:
+            if terminal_audit_receipt is None:
+                raise AuthorizationError(
+                    "authorization gateway terminal receipt is required"
+                )
+            lifecycle_budget_state = self._require_gateway_terminal_capability(
+                _gateway_lifecycle,
+                reservation,
+                provider_facts,
+                terminal_audit_receipt,
+            )
+            if lifecycle_budget_state != verified_budget_state:
+                raise AuthorizationError(
+                    "authorization gateway terminal budget state differs"
+                )
         overage = False
         with _authorization_file_lock(self._lock_path):
             records = self._read_records()
@@ -2767,6 +3026,26 @@ class AuthorizationLedger:
                 raise AuthorizationError("authorization reservation record is invalid") from exc
             if stored_reservation != reservation:
                 raise AuthorizationError("authorization reservation identity mismatch")
+            gateway_terminal: dict[str, object] | None = None
+            if _gateway_lifecycle is not None:
+                assert terminal_audit_receipt is not None
+                assert verified_budget_state is not None
+                lifecycle_commitment = self._require_gateway_lifecycle_commitment(
+                    records,
+                    reservation,
+                    provider_facts,
+                    terminal_audit_receipt,
+                    budget_state=verified_budget_state,
+                )
+                gateway_terminal = self._gateway_terminal_commitment(
+                    reservation,
+                    provider_facts,
+                    terminal_audit_receipt,
+                    lifecycle_commitment,
+                    budget_recovery_sha256=hashlib.sha256(
+                        _canonical_json_bytes(verified_budget_state)
+                    ).hexdigest(),
+                )
             if reservation.reservation_id in self._reconciled_ids(records):
                 existing = next(
                     item
@@ -2782,6 +3061,11 @@ class AuthorizationLedger:
                         terminal_audit_receipt is not None
                         and existing.get("terminal_audit_receipt")
                         != terminal_audit_receipt.to_primitive()
+                    )
+                    or (
+                        gateway_terminal is not None
+                        and existing.get("gateway_terminal")
+                        != gateway_terminal
                     )
                 ):
                     raise AuthorizationError(
@@ -2894,6 +3178,8 @@ class AuthorizationLedger:
                 primitive["terminal_audit_receipt"] = (
                     terminal_audit_receipt.to_primitive()
                 )
+            if gateway_terminal is not None:
+                primitive["gateway_terminal"] = gateway_terminal
             reservations = self._reservation_records(records, lease.lease_id)
             prior_calls, prior_tokens, prior_usd = self._charged_totals(
                 records,
