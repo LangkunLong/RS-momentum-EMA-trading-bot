@@ -2616,40 +2616,42 @@ Every artifact has schema_version=2 and exact top-level keys:
 - Produces: focused compile/test/parity evidence and the unexecuted six-call canary handoff.
 - Consumes: only committed local source, sealed local inputs, ignored local artifacts, and synthetic worker snapshots. It consumes zero provider calls.
 
-- [ ] **Step 1: Compile only changed production modules.**
+- [x] **Step 1: Compile only changed production modules.**
 
       python -B -m compileall -q core/strategy_policy core/pit_optimizer_candidate.py core/pit_optimizer_evaluation.py core/pit_optimizer_authorization.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_policy_parity.py
       python -B -m py_compile agent_loop.py core/backtest_engine.py core/pit_optimization.py core/pit_optimization_contract.py
 
-- [ ] **Step 2: Run the focused architecture suite once.**
+- [x] **Step 2: Run the focused architecture suite once.**
 
       python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_pit_policy_parity.py tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py tests/test_backtest_engine.py tests/test_backtest_custom_strategy_contract.py tests/test_backtest_open_causality.py tests/test_task11_effective_policy_contract.py
 
-- [ ] **Step 3: Run only the optimizer-related agent-loop selection.**
+- [x] **Step 3: Run only the optimizer-related agent-loop selection.**
 
       python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimization_contract.py -k "pit_optimizer or pit_optimization or provider_call or budget_reservation or policy_worker"
 
-- [ ] **Step 4: Require a clean committed final HEAD, then run the exact final-side two-fold parity once.**
+- [x] **Step 4: Require a clean committed final HEAD, then run the exact final-side two-fold parity once.**
 
       git status --porcelain
       python -B -m core.pit_policy_parity verify --reference .artifacts/pit-policy-parity-v2/reference.json --pit-bundle .artifacts/task-4-regeneration-20260823T223000Z/pit-bundle/pit_baseline.sqlite3 --output .artifacts/pit-policy-parity-v2/verified-final.json
 
   Expected: the status command prints nothing, then `PIT_POLICY_PARITY matched=true`. The create-only attestation binds the intermediate reference HEAD, clean final implementation HEAD/fingerprint, bundle/baseline/fold identities, policy interface, exact discovery outputs, and unchanged schema-v1 effective policy. It evaluates no hidden prices/metrics and starts no provider or Docker process.
-- [ ] **Step 5: Build the real manifest from that same clean final HEAD.**
+- [x] **Step 5: Build the real manifest from that same clean final HEAD.**
 
       python -B -m core.pit_optimizer_evaluation build-subset-manifest --readiness C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\pit-optimizer-subset-performance-20260827T200714Z\pit-optimization-readiness-d3cbfcb22900\readiness.json --verified-parity C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\pit-policy-parity-v2\verified-final.json --pit-bundle C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\task-4-regeneration-20260823T223000Z\pit-bundle\pit_baseline.sqlite3 --baseline-run C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\task-11-prefix-replay-20260826T001500Z\run-20260826T002913Z-1af306ef1e46 --source-root C:\Projects\trading_bot\RS-momentum-EMA-trading-bot --permanent-runtime-root C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\pit-optimizer-v2\runtime --controller-temp-parent C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\pit-optimizer-v2\candidates --artifact-root C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\pit-optimizer-v2\runs --git-executable "C:\Program Files\Git\cmd\git.exe" --docker-executable C:\Users\llong\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe --sandbox-image localhost/rs-agent-loop@sha256:7ecfb4ebb3b327940bef347e4c82e82fb4a0e8b40fc63b92b2536fe8c83acf1c --iterations 2 --investigator-static-bytes 8000 --investigator-dynamic-bytes 80000 --investigator-input-tokens 88000 --investigator-output-tokens 4000 --investigator-response-bytes 8192 --investigator-max-usd 0.05 --author-static-bytes 12000 --author-dynamic-bytes 76000 --author-input-tokens 88000 --author-output-tokens 8000 --author-response-bytes 16384 --author-max-usd 0.10 --critic-static-bytes 8000 --critic-dynamic-bytes 24000 --critic-input-tokens 32000 --critic-output-tokens 4000 --critic-response-bytes 8192 --critic-max-usd 0.05 --max-files 3 --max-hunks 12 --max-changed-lines 80 --max-diff-bytes 8192 --output C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\pit-optimizer-v2\manifest.json
 
   Expected: `PIT_OPTIMIZER_MANIFEST` reports six calls, 448000 maximum tokens, USD 0.40, exact source/input/output/response/fold/final-parity/image identities, PolicySourceScope, candidate bounds, and AuthorizationRequirement; `PIT_OPTIMIZER_PREPARE_COMMAND` is exact. This queries only authenticated identities/session calendars and performs no pricing lookup/replay/provider call/grant creation.
-- [ ] **Step 6: Run exactly the emitted PIT_OPTIMIZER_PREPARE_COMMAND.** It authenticates verified-final.json and the entire identity graph, marks discovery exposure, reuses the attested discovery baselines, writes readiness, and prints the exact inert canary command with the requirement/window identifiers. It must not construct OpenRouterGateway, open an authorization lease, record a grant, replay a fold, or evaluate hidden_1.
-- [ ] **Step 7: Inspect the provider-free readiness package.** Confirm no hidden fold result exists, no provider/accounting call exists, schema-v1 policy digest matches, candidate paths are exactly the three pure modules, discovery windows are permanently marked non-hidden, and the source worktree is unchanged.
-- [ ] **Step 8: Check repository hygiene.**
+- [x] **Step 6: Run exactly the emitted PIT_OPTIMIZER_PREPARE_COMMAND.** It authenticates verified-final.json and the entire identity graph, marks discovery exposure, reuses the attested discovery baselines, writes readiness, and prints the exact inert canary command with the requirement/window identifiers. It must not construct OpenRouterGateway, open an authorization lease, record a grant, replay a fold, or evaluate hidden_1.
+- [x] **Step 7: Inspect the provider-free readiness package.** Confirm no hidden fold result exists, no provider/accounting call exists, schema-v1 policy digest matches, candidate paths are exactly the three pure modules, discovery windows are permanently marked non-hidden, and the source worktree is unchanged.
+- [x] **Step 8: Check repository hygiene.**
 
       git diff --check
       git status --short --branch
 
   Expected: no uncommitted implementation files after task commits; only explicitly retained local .artifacts remain ignored.
-- [ ] **Step 9: Report, but do not execute, the exact six-call subset canary command.** Report the exact PolicySourceScope digest/preimage summary, sealed per-role response/cost caps, and cumulative six-call/448000-token/USD-0.40 ceilings. Do not print/run a record-grant command or load live pricing. Stop for fresh explicit operator authorization of that scope plus calls/tokens/USD; live canary setup must still freeze pricing and may stop with zero calls if any conservative per-call cost exceeds its sealed cap.
-- [ ] **Step 10: Defer full-window parity and the long replay.** Full-window provider-free policy parity is required immediately before a later full optimizer/long replay, not during this subset architecture proof.
+- [x] **Step 9: Report, but do not execute, the exact six-call subset canary command.** Report the exact PolicySourceScope digest/preimage summary, sealed per-role response/cost caps, and cumulative six-call/448000-token/USD-0.40 ceilings. Do not print/run a record-grant command or load live pricing. Stop for fresh explicit operator authorization of that scope plus calls/tokens/USD; live canary setup must still freeze pricing and may stop with zero calls if any conservative per-call cost exceeds its sealed cap.
+- [x] **Step 10: Defer full-window parity and the long replay.** Full-window provider-free policy parity is required immediately before a later full optimizer/long replay, not during this subset architecture proof.
+
+Verification outcome: the corrected post-rounding engine was committed and reviewed, parity v4 was captured and verified on both discovery folds, the policy-digest manifest fix was committed and reviewed, and the current-source v6 manifest was built. The first v6 prepare was rejected before controller initialization because its controller-temp parent was under a dotenv-bearing repository ancestor; the exact provider-free prepare then succeeded with a dedicated system-temp parent. The resulting readiness and inert canary handoff are local-only. No canary, provider call, Docker run, hidden evaluation, or full replay was executed.
 
 ### Task 9A: Enforce the Rounded-Stop Risk Ceiling and Version Local Evidence
 
