@@ -1171,6 +1171,79 @@ def test_policy_allocation_rejects_unsafe_projected_transition(
         simulator._validate_entry_transition(projection, recommendation)
 
 
+def test_policy_allocation_clamps_quantity_to_cent_rounded_stop_risk() -> None:
+    """Break caught: stop rounding could exceed both risk budgets after sizing."""
+    simulator = PortfolioSimulator()
+    recommendation = AllocationDecision(0.01, 0.08, None)
+
+    adverse_rounding = ProjectedEntryTransition(
+        None,
+        None,
+        None,
+        100.10,
+        10_000.0,
+        10_000.0,
+        0.0,
+    )
+    transition = simulator._validate_entry_transition(
+        adverse_rounding,
+        recommendation,
+    )
+    rounded_loss = (
+        adverse_rounding.entry_open - transition.stop_price
+    ) * transition.quantity
+    recommended_budget = (
+        adverse_rounding.portfolio_equity_at_entry_open
+        * recommendation.risk_fraction
+    )
+    engine_budget = adverse_rounding.portfolio_equity_at_entry_open * 0.01
+    assert rounded_loss <= recommended_budget + 1e-9
+    assert rounded_loss <= engine_budget + 1e-9
+    assert transition.buy_notional == pytest.approx(
+        transition.quantity * adverse_rounding.entry_open
+    )
+    assert transition.quantity < (
+        adverse_rounding.portfolio_equity_at_entry_open
+        * recommendation.risk_fraction
+        / recommendation.stop_distance_fraction
+        / adverse_rounding.entry_open
+    )
+
+    exact_rounding = ProjectedEntryTransition(
+        None,
+        None,
+        None,
+        100.0,
+        10_000.0,
+        10_000.0,
+        0.0,
+    )
+    exact_transition = simulator._validate_entry_transition(
+        exact_rounding,
+        recommendation,
+    )
+    assert exact_transition.quantity == pytest.approx(12.5)
+    assert exact_transition.buy_notional == pytest.approx(1_250.0)
+
+    favorable_rounding = ProjectedEntryTransition(
+        None,
+        None,
+        None,
+        100.02,
+        10_000.0,
+        10_000.0,
+        0.0,
+    )
+    favorable_transition = simulator._validate_entry_transition(
+        favorable_rounding,
+        recommendation,
+    )
+    assert favorable_transition.buy_notional == pytest.approx(1_250.0)
+    assert favorable_transition.quantity == pytest.approx(
+        1_250.0 / favorable_rounding.entry_open
+    )
+
+
 @pytest.mark.parametrize(
     ("position_risk_pct", "stop_loss_pct", "message"),
     [

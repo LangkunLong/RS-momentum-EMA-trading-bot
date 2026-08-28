@@ -3040,6 +3040,47 @@ class PortfolioSimulator:
             buy_notional = min(buy_notional, engine_notional_cap)
         if not math.isfinite(buy_notional) or buy_notional <= 0:
             raise ValueError("buy notional is invalid")
+        stop_price = round(
+            projection.entry_open
+            * (1 - recommendation.stop_distance_fraction),
+            2,
+        )
+        if (
+            not math.isfinite(stop_price)
+            or stop_price <= 0
+            or stop_price >= projection.entry_open
+        ):
+            raise ValueError("derived entry stop is invalid")
+
+        loss_per_share = projection.entry_open - stop_price
+        recommended_budget = (
+            projection.portfolio_equity_at_entry_open
+            * recommendation.risk_fraction
+        )
+        engine_budget = projection.portfolio_equity_at_entry_open * risk_ceiling
+        if (
+            not math.isfinite(loss_per_share)
+            or loss_per_share <= 0
+            or not math.isfinite(recommended_budget)
+            or recommended_budget <= 0
+            or not math.isfinite(engine_budget)
+            or engine_budget <= 0
+        ):
+            raise ValueError("derived entry risk budget is invalid")
+
+        quantity = buy_notional / projection.entry_open
+        if not math.isfinite(quantity) or quantity <= 0:
+            raise ValueError("derived entry quantity is invalid")
+        quantity = min(
+            quantity,
+            recommended_budget / loss_per_share,
+            engine_budget / loss_per_share,
+        )
+        if not math.isfinite(quantity) or quantity <= 0:
+            raise ValueError("derived entry quantity is invalid")
+        buy_notional = quantity * projection.entry_open
+        if not math.isfinite(buy_notional) or buy_notional <= 0:
+            raise ValueError("buy notional is invalid")
         if projection.projected_cash + 1e-12 < buy_notional:
             raise ValueError("projected cash is below buy notional")
         if (
@@ -3048,26 +3089,7 @@ class PortfolioSimulator:
         ):
             raise ValueError("projected gross long notional exceeds equity")
 
-        quantity = buy_notional / projection.entry_open
-        stop_price = round(
-            projection.entry_open
-            * (1 - recommendation.stop_distance_fraction),
-            2,
-        )
-        if (
-            not math.isfinite(quantity)
-            or quantity <= 0
-            or not math.isfinite(stop_price)
-            or stop_price <= 0
-            or stop_price >= projection.entry_open
-        ):
-            raise ValueError("derived entry quantity or stop is invalid")
-        rounded_loss = (projection.entry_open - stop_price) * quantity
-        recommended_budget = (
-            projection.portfolio_equity_at_entry_open
-            * recommendation.risk_fraction
-        )
-        engine_budget = projection.portfolio_equity_at_entry_open * risk_ceiling
+        rounded_loss = loss_per_share * quantity
         if rounded_loss > recommended_budget + 1e-9:
             raise ValueError("rounded loss exceeds recommended risk budget")
         if rounded_loss > engine_budget + 1e-9:
