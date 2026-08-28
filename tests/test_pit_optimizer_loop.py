@@ -1193,6 +1193,9 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
             fold_id=baseline.fold_id,
             engine_policy_sha256=readiness.manifest.effective_policy_sha256,
             candidate_identity_sha256="a" * 64,
+            evidence_sha256=hashlib.sha256(
+                f"zero-trades-{baseline.fold_id}".encode()
+            ).hexdigest(),
             aggregate_metrics=replace(
                 baseline,
                 closed_trades=0,
@@ -1814,6 +1817,12 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
                 fold_id=baseline.fold_id,
                 engine_policy_sha256=readiness.manifest.effective_policy_sha256,
                 candidate_identity_sha256=identity.identity_sha256,
+                evidence_sha256=hashlib.sha256(
+                    (
+                        f"candidate-{evaluation_number}-full-evidence-"
+                        f"{baseline.fold_id}"
+                    ).encode()
+                ).hexdigest(),
                 aggregate_metrics=replace(
                     baseline,
                     total_return_pct=baseline.total_return_pct + increment,
@@ -1848,11 +1857,7 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
             incumbent_candidate_folds = tuple(
                 item.aggregate_metrics for item in folds
             )
-            incumbent_evidence_id = hashlib.sha256(
-                controller.canonical_json_bytes(
-                    {"aggregate": asdict(incumbent_candidate_folds[0])}
-                )
-            ).hexdigest()
+            incumbent_evidence_id = folds[0].evidence_sha256
         return DiscoveryEvaluation(
             folds,
             DiscoveryComparison(fixed, diagnostics, True, improves),
@@ -2043,6 +2048,344 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
         assert marker.encode("utf-8") not in persisted_and_public
 
 
+def test_dispatch_with_production_composition_completes_mocked_two_iteration_canary(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Break caught: unit fakes could mask production composition and evidence drift."""
+    import shutil
+    import tempfile
+    from types import SimpleNamespace
+
+    import agent_loop
+    from core.pit_optimizer_authorization import (
+        OperatorAuthorizationGrant,
+        record_authorized_grant,
+    )
+
+    inputs = _prepare_fixture(tmp_path)
+    source_root = Path(inputs["source_root"])
+    _git(source_root, "branch", "-m", "codex/task8-production-composition")
+    controller_temp_parent = Path(
+        tempfile.mkdtemp(prefix="task8-controller-")
+    ).resolve()
+    request.addfinalizer(
+        lambda: shutil.rmtree(controller_temp_parent, ignore_errors=True)
+    )
+    git_path = shutil.which("git")
+    assert git_path is not None
+    git_executable = Path(git_path).resolve()
+    git_capability = agent_loop.configure_git_executable(git_executable)
+    source_state = agent_loop.preflight_source(
+        source_root.resolve(),
+        permanent_runtime_root=Path(inputs["permanent_runtime_root"]),
+        acquire_lock=False,
+        controller_temp_parent=controller_temp_parent,
+        git=git_capability,
+    )
+    assert source_state.fingerprint is not None
+
+    universe = ("AAA",)
+    manifest = inputs["manifest"]
+    parity = inputs["parity"]
+    assert isinstance(manifest, contract.PitOptimizerRunManifest)
+    assert isinstance(parity, ParityAttestation)
+    fold_manifest = replace(
+        manifest.fold_manifest,
+        universe_sha256=hashlib.sha256(_canonical_bytes(list(universe))).hexdigest(),
+    )
+    parity = replace(
+        parity,
+        discovery_fold_manifest_sha256=fold_manifest.sha256,
+        artifact_sha256="0" * 64,
+    )
+    parity_primitive = asdict(parity)
+    parity_primitive.pop("artifact_path")
+    parity_primitive.pop("artifact_sha256")
+    parity.artifact_path.write_bytes(_canonical_bytes(parity_primitive))
+    parity = replace(
+        parity,
+        artifact_sha256=hashlib.sha256(parity.artifact_path.read_bytes()).hexdigest(),
+    )
+    manifest = replace(
+        manifest,
+        fold_manifest=fold_manifest,
+        parity_attestation_sha256=parity.artifact_sha256,
+    )
+    prepare_config = inputs["config"]
+    assert isinstance(prepare_config, contract.PitOptimizerGateConfig)
+    manifest_path = (tmp_path / "production-optimizer-manifest.json").resolve()
+    contract.write_optimizer_manifest(manifest, manifest_path)
+    prepare_config = replace(
+        prepare_config,
+        optimizer_manifest=manifest_path,
+        optimizer_manifest_sha256=manifest.sha256,
+        verified_parity_sha256=parity.artifact_sha256,
+    )
+    inputs.update(
+        {
+            "config": prepare_config,
+            "manifest": manifest,
+            "parity": parity,
+        }
+    )
+    readiness = _prepare(inputs)
+
+    docker_executable = (tmp_path / "docker.exe").resolve()
+    docker_executable.write_bytes(b"synthetic unused worker boundary")
+    canary_config = replace(
+        prepare_config,
+        phase="canary",
+        readiness_artifact=readiness.artifact_path,
+        readiness_sha256=readiness.readiness_sha256,
+        authorization_window_id=manifest.authorization_requirement.window_id,
+        source_transmission_authorized=True,
+        source_root=source_root.resolve(),
+        permanent_runtime_root=Path(inputs["permanent_runtime_root"]).resolve(),
+        controller_temp_parent=controller_temp_parent,
+        artifact_root=Path(inputs["artifact_root"]).resolve(),
+        git_executable=git_executable,
+        docker_executable=docker_executable,
+        sandbox_image=manifest.sandbox_image,
+    )
+    authorization_path = (
+        canary_config.permanent_runtime_root
+        / "pit_optimizer_authorization_ledger.jsonl"
+    )
+    record_authorized_grant(
+        ledger_path=authorization_path,
+        manifest_path=canary_config.optimizer_manifest,
+        manifest_sha256=manifest.sha256,
+        grant=OperatorAuthorizationGrant(
+            grant_id="grant_task8_integration",
+            additional_calls=6,
+            additional_tokens=448_000,
+            additional_usd=0.40,
+            policy_source_scope_sha256=manifest.policy_source_scope.sha256,
+        ),
+        operator_approval_reference="task8-local-mocked-authorization",
+    )
+
+    responses: list[str] = []
+    for iteration in (1, 2):
+        hypothesis_id = f"hypothesis_{iteration}"
+        responses.extend(
+            (
+                json.dumps(
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "family": "entry",
+                        "evidence_ids": [readiness.baseline_discovery.evidence_ids[0]],
+                        "causal_rationale": "Test one bounded entry change.",
+                        "target_paths": ["core/strategy_policy/entry.py"],
+                        "target_symbols": [
+                            "core.strategy_policy.entry.evaluate_entry"
+                        ],
+                        "expected_diagnostic_changes": ["entry selectivity"],
+                        "known_risks": ["lower participation"],
+                        "author_instructions": ["Change only the entry return."],
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "behavioral_summary": "Apply one bounded entry return change.",
+                        "changed_paths": ["core/strategy_policy/entry.py"],
+                        "changed_symbols": [
+                            "core.strategy_policy.entry.evaluate_entry"
+                        ],
+                        "unified_diff": (
+                            _entry_git_diff("None", "True")
+                            if iteration == 1
+                            else _entry_git_diff("True", "False")
+                        ),
+                        "assumptions": ["The synthetic fold ordering is stable."],
+                        "validation_suggestions": ["Evaluate both discovery folds."],
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "prediction_vs_observation": "The candidate was measured.",
+                        "causal_explanation": "Use fixed-baseline ranking only.",
+                        "evidence_ids": ["candidate.discovery.aggregate"],
+                        "disposition": "refine",
+                        "next_direction": "Keep the stronger bounded candidate.",
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+    class FakeCompletions:
+        def __init__(self, payloads: list[str]) -> None:
+            self.payloads = payloads
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            content = self.payloads.pop(0)
+            return SimpleNamespace(
+                id="synthetic-generation",
+                model=contract.PIT_OPTIMIZER_R1_MODEL,
+                error=None,
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=content, refusal=None),
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=100,
+                    completion_tokens=50,
+                    total_tokens=150,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+                    completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
+                    cost=0.001,
+                ),
+            )
+
+    completions = FakeCompletions(responses)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    gateways: list[object] = []
+
+    def gateway_factory(**kwargs: object) -> object:
+        gateway = agent_loop.OpenRouterGateway(
+            client=client,
+            pricing_loader=lambda _model: {
+                "prompt": Decimal("0"),
+                "completion": Decimal("0"),
+            },
+            **kwargs,
+        )
+        gateways.append(gateway)
+        return gateway
+
+    worker = object()
+    worker_factory_calls: list[dict[str, object]] = []
+
+    def worker_runner_factory(**kwargs: object) -> object:
+        worker_factory_calls.append(kwargs)
+        return worker
+
+    candidate_evaluations: list[tuple[Path, str, str, str]] = []
+    baseline_evaluations: list[str] = []
+    baseline_totals = {
+        item.fold_id: item.total_return_pct
+        for item in readiness.baseline_discovery.folds
+    }
+
+    def evaluate_candidate(
+        candidate_root: Path,
+        fold: object,
+        supplied_worker: object,
+        fold_run_id: str,
+    ) -> ParityFoldEvidence:
+        assert supplied_worker is worker
+        entry_text = (
+            candidate_root / "core/strategy_policy/entry.py"
+        ).read_text(encoding="utf-8")
+        candidate_kind = "first" if "return True" in entry_text else "second"
+        candidate_evaluations.append(
+            (candidate_root, str(fold.fold_id), fold_run_id, candidate_kind)
+        )
+        baseline_total = baseline_totals.get(str(fold.fold_id), 1.0)
+        increment = 1.0 if candidate_kind == "first" else 0.5
+        return _evidence(
+            fold,
+            effective_policy_sha256=manifest.effective_policy_sha256,
+            total_return=baseline_total + increment,
+        )
+
+    def evaluate_baseline(fold: object) -> ParityFoldEvidence:
+        baseline_evaluations.append(str(fold.fold_id))
+        return _evidence(
+            fold,
+            effective_policy_sha256=manifest.effective_policy_sha256,
+            total_return=1.0,
+        )
+
+    evaluator_factory_calls: list[dict[str, object]] = []
+
+    def evaluator_data_factory(**kwargs: object) -> object:
+        evaluator_factory_calls.append(kwargs)
+        return agent_loop._PitOptimizerEvaluatorData(
+            universe=universe,
+            evaluate_candidate=evaluate_candidate,
+            evaluate_baseline=evaluate_baseline,
+        )
+
+    result = agent_loop._dispatch_pit_optimizer_v2(
+        canary_config,
+        prepare=lambda _config: pytest.fail("canary dispatched prepare"),
+        build_live_services=lambda config: agent_loop._build_pit_optimizer_v2_live_run(
+            config,
+            source_state=source_state,
+            git_capability=git_capability,
+            api_timeout_seconds=30.0,
+            wall_timeout_seconds=600.0,
+            gateway_factory=gateway_factory,
+            worker_runner_factory=worker_runner_factory,
+            evaluator_data_factory=evaluator_data_factory,
+        ),
+    )
+
+    assert len(gateways) == 1
+    assert len(completions.calls) == 6, (
+        result.terminal_code,
+        result.terminal_detail,
+        tuple((fold_id, kind) for _root, fold_id, _run_id, kind in candidate_evaluations),
+    )
+    assert responses == []
+    assert len(worker_factory_calls) == 1
+    assert len(evaluator_factory_calls) == 1
+    candidate_roots = {item[0] for item in candidate_evaluations}
+    assert len(candidate_roots) == 2
+    assert all(not root.exists() for root in candidate_roots)
+    assert sum(
+        fold_id == "discovery_1" and candidate_kind == "first"
+        for _root, fold_id, _run_id, candidate_kind in candidate_evaluations
+    ) == 2
+    assert baseline_evaluations == [manifest.fold_manifest.hidden_fold.fold_id]
+    assert result.terminal_code == "iteration_limit"
+    assert result.status == "long_replay_eligible"
+    assert result.iterations_started == result.iterations_completed == 2
+    assert result.incumbent_updates == 1
+    assert result.hidden_validation_opened is True
+    assert result.long_replay_eligible is True
+    assert result.cleanup_complete is True
+    assert result.source_modified is False
+    assert not tuple(controller_temp_parent.glob("agent-loop-candidate-*"))
+    assert _git(source_root, "status", "--porcelain") == b""
+
+    authorization_records = [
+        json.loads(line) for line in authorization_path.read_bytes().splitlines()
+    ]
+    record_types = [item["record_type"] for item in authorization_records]
+    assert record_types.count("lease_open") == 1
+    assert record_types.count("reservation") == 6
+    assert record_types.count("reconciliation") == 6
+    assert record_types.count("lease_close") == 1
+    validation_path = (
+        canary_config.permanent_runtime_root / manifest.validation_ledger_name
+    )
+    validation_records = [
+        json.loads(line) for line in validation_path.read_bytes().splitlines()
+    ]
+    assert any(
+        item.get("metadata", {}).get("exposure_kind") == "hidden_validation"
+        for item in validation_records
+    )
+    assert any(item.get("record_type") == "outcome" for item in validation_records)
+    summary = agent_loop._pit_optimizer_v2_summary(result)
+    assert summary["status"] == "long_replay_eligible"
+    assert summary["hidden_validation_opened"] is True
+    assert summary["budget"]["api_calls"] == 6
+    assert not any("sha256" in key for key in summary)
+
+
 def _decision_calls(state: object, *, iteration: int):
     from unittest.mock import Mock
 
@@ -2134,18 +2477,27 @@ def test_incumbent_transition_replaces_diff_only_after_critic_and_fixed_score(
         ),
     )
     diagnostics = DiscoveryScore(Decimal("0.50"), Decimal("0.25"), Decimal("2.00"))
+    full_evidence_sha256s = tuple(
+        hashlib.sha256(f"full-evidence-{baseline.fold_id}".encode()).hexdigest()
+        for baseline in readiness.baseline_discovery.folds
+    )
     folds = tuple(
         FoldEvaluationResult(
             fold_id=baseline.fold_id,
             engine_policy_sha256=readiness.manifest.effective_policy_sha256,
             candidate_identity_sha256="a" * 64,
+            evidence_sha256=evidence_sha256,
             aggregate_metrics=replace(
                 baseline,
                 total_return_pct=baseline.total_return_pct + 1.0,
                 excess_total_return_pp=1.0,
             ),
         )
-        for baseline in readiness.baseline_discovery.folds
+        for baseline, evidence_sha256 in zip(
+            readiness.baseline_discovery.folds,
+            full_evidence_sha256s,
+            strict=True,
+        )
     )
     discovery = DiscoveryEvaluation(
         folds,
@@ -2183,6 +2535,7 @@ def test_incumbent_transition_replaces_diff_only_after_critic_and_fixed_score(
     assert outcome.incumbent_changed is True
     assert state.incumbent_cumulative_diff == "cumulative winning diff"
     assert state.incumbent_discovery.score == fixed_score
+    assert state.incumbent_discovery.evidence_ids == full_evidence_sha256s
     assert state.non_improving_streak == 0
 
 
@@ -2269,6 +2622,9 @@ def test_decision_durability_failure_preserves_prior_incumbent_capability(
             fold_id=baseline.fold_id,
             engine_policy_sha256=readiness.manifest.effective_policy_sha256,
             candidate_identity_sha256="a" * 64,
+            evidence_sha256=hashlib.sha256(
+                f"durability-{baseline.fold_id}".encode()
+            ).hexdigest(),
             aggregate_metrics=replace(
                 baseline,
                 total_return_pct=baseline.total_return_pct + 1.0,
@@ -2478,18 +2834,6 @@ def test_complete_three_role_context_preflight_stops_before_iteration_start(
 
     inputs = _prepare_fixture(tmp_path)
     readiness = _prepare(inputs)
-    narrowed = tuple(
-        replace(item, max_dynamic_input_bytes=1)
-        if item.iteration == 2 and item.role == "critic"
-        else item
-        for item in readiness.manifest.call_budgets
-    )
-    manifest = replace(readiness.manifest, call_budgets=narrowed)
-    readiness = replace(
-        readiness,
-        manifest=manifest,
-        manifest_sha256=manifest.sha256,
-    )
     services = Mock(spec=PitOptimizerServices)
     services.create_candidate.return_value = CandidateWorkspace(
         "workspace_context_preflight",
@@ -2497,6 +2841,16 @@ def test_complete_three_role_context_preflight_stops_before_iteration_start(
     )
     monkeypatch.setattr(controller, "_initialize_run_artifacts", lambda *args: None)
     monkeypatch.setattr(controller, "_pre_iteration_stop", lambda *args: None)
+
+    def reject_complete_context(**kwargs: object) -> object:
+        assert kwargs["call_budgets"] == readiness.manifest.call_budgets
+        raise ValueError("worst iteration-2 critic input exceeds dynamic cap")
+
+    monkeypatch.setattr(
+        controller,
+        "render_worst_iteration_two_role_inputs",
+        reject_complete_context,
+    )
     observed: dict[str, object] = {}
     sentinel = Mock()
 

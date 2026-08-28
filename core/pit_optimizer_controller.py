@@ -628,7 +628,11 @@ def _window_identity(
     manifest: PitOptimizerRunManifest,
     fold_index: int,
 ) -> ValidationWindowIdentity:
-    fold = manifest.fold_manifest.discovery_folds[fold_index]
+    folds = (
+        *manifest.fold_manifest.discovery_folds,
+        manifest.fold_manifest.hidden_fold,
+    )
+    fold = folds[fold_index]
     warmup_sha256 = hashlib.sha256(
         canonical_json_bytes(
             {
@@ -1733,12 +1737,7 @@ def _persist_iteration_decision(
         prospective_incumbent_discovery = DiscoveryEvidenceSummary(
             folds=candidate_folds,
             score=discovery.comparison.candidate_vs_fixed_baseline,
-            evidence_ids=tuple(
-                hashlib.sha256(
-                    canonical_json_bytes({"aggregate": asdict(item)})
-                ).hexdigest()
-                for item in candidate_folds
-            ),
+            evidence_ids=tuple(item.evidence_sha256 for item in discovery.folds),
         )
         prospective_incumbent_workspace = candidate_workspace
         prospective_incumbent_identity = candidate_identity

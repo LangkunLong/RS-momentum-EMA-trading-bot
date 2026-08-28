@@ -388,6 +388,7 @@ class FoldEvaluationResult:
     fold_id: str
     engine_policy_sha256: str
     candidate_identity_sha256: str
+    evidence_sha256: str
     aggregate_metrics: FoldAggregateSummary
 
     def __post_init__(self) -> None:
@@ -398,6 +399,7 @@ class FoldEvaluationResult:
             self.candidate_identity_sha256,
             "fold candidate identity SHA-256",
         )
+        _require_digest(self.evidence_sha256, "fold evidence SHA-256")
         if not isinstance(self.aggregate_metrics, FoldAggregateSummary):
             raise ValueError("fold evaluation aggregate is invalid")
         if self.aggregate_metrics.fold_id != self.fold_id:

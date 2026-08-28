@@ -5343,10 +5343,20 @@ def derive_authenticated_cumulative_diff(
     candidate_root: Path,
     editable_paths: tuple[str, ...],
 ) -> str:
-    """Derive a candidate diff from equal authenticated HEADs; never accept supplied text."""
-    base_head = _git_text(git, authenticated_base_root, "rev-parse", "HEAD").strip()
-    candidate_head = _git_text(git, candidate_root, "rev-parse", "HEAD").strip()
-    if base_head != candidate_head:
+    """Derive a diff from equal authenticated base trees; never accept supplied text."""
+    base_tree = _git_text(
+        git,
+        authenticated_base_root,
+        "rev-parse",
+        "HEAD^{tree}",
+    ).strip()
+    candidate_tree = _git_text(
+        git,
+        candidate_root,
+        "rev-parse",
+        "HEAD^{tree}",
+    ).strip()
+    if not hmac.compare_digest(base_tree, candidate_tree):
         raise ValueError("candidate base commit mismatch")
     return _git_text(
         git,
@@ -17929,7 +17939,31 @@ def build_parser() -> argparse.ArgumentParser:
 def _absolute_cli_path(value: object, field: str) -> Path:
     if not isinstance(value, Path) or not value.is_absolute():
         raise ConfigurationError(f"{field} must be an explicit absolute path")
-    return value.resolve(strict=False)
+    current = Path(value.anchor)
+    for part in value.parts[1:]:
+        if part == "..":
+            current = current.parent
+            continue
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ConfigurationError(
+                f"{field} path identity cannot be inspected"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or bool(
+            getattr(info, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            raise ConfigurationError(
+                f"{field} must not contain a link or reparse point"
+            )
+    try:
+        return value.resolve(strict=False)
+    except OSError as exc:
+        raise ConfigurationError(f"{field} path identity cannot be resolved") from exc
 
 
 def _build_pit_optimizer_v2_config(
@@ -18121,6 +18155,31 @@ class PitOptimizerLiveRun:
     optimizer_services: PitOptimizerServices
 
 
+@dataclass(frozen=True, slots=True)
+class _PitOptimizerEvaluatorData:
+    """Authenticated universe plus the two local evaluator capabilities."""
+
+    universe: tuple[str, ...]
+    evaluate_candidate: Callable[[Path, object, object, str], object]
+    evaluate_baseline: Callable[[object], object]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.universe) is not tuple
+            or not self.universe
+            or len(set(self.universe)) != len(self.universe)
+            or any(
+                not isinstance(symbol, str)
+                or not symbol
+                or symbol != symbol.strip()
+                for symbol in self.universe
+            )
+            or not callable(self.evaluate_candidate)
+            or not callable(self.evaluate_baseline)
+        ):
+            raise ConfigurationError("PIT optimizer evaluator data is invalid")
+
+
 def _preauthorize_pit_optimizer_v2_live_run(
     config: PitOptimizerGateConfig,
     *,
@@ -18170,6 +18229,9 @@ def _build_pit_optimizer_v2_live_run(
     git_capability: GitCapability,
     api_timeout_seconds: float,
     wall_timeout_seconds: float,
+    gateway_factory: Callable[..., OpenRouterGateway] | None = None,
+    worker_runner_factory: Callable[..., object] | None = None,
+    evaluator_data_factory: Callable[..., _PitOptimizerEvaluatorData] | None = None,
 ) -> PitOptimizerLiveRun:
     """Compose the production schema-v2 services behind opaque capabilities."""
     from core.backtest_engine import PortfolioSimulator
@@ -18190,6 +18252,7 @@ def _build_pit_optimizer_v2_live_run(
     from core.pit_optimizer_candidate import validate_candidate_diff
     from core.pit_optimizer_controller import (
         CandidateValidationOutcome,
+        PitOptimizerServices,
         _CandidateCapabilityRegistry,
         _folds_digest,
         _window_identity,
@@ -18209,12 +18272,25 @@ def _build_pit_optimizer_v2_live_run(
         discovery_score_from_folds,
         strictly_improves_discovery,
     )
-    from core.pit_policy_parity import build_fold_evidence
+    from core.pit_policy_parity import (
+        ParityFoldEvidence,
+        authenticated_source_identity,
+        build_fold_evidence,
+    )
     from core.strategy_policy.contracts import CapacitySnapshot
     from core.strategy_policy.worker import PolicyDeterminismProbe
 
     if not isinstance(source_state, SourceState) or source_state.fingerprint is None:
         raise ConfigurationError("PIT optimizer source capability is invalid")
+    if any(
+        factory is not None and not callable(factory)
+        for factory in (
+            gateway_factory,
+            worker_runner_factory,
+            evaluator_data_factory,
+        )
+    ):
+        raise ConfigurationError("PIT optimizer external boundary factory is invalid")
     readiness = load_pit_optimizer_v2_readiness(config)
     manifest = readiness.manifest
     runtime_root = config.permanent_runtime_root
@@ -18230,6 +18306,111 @@ def _build_pit_optimizer_v2_live_run(
         or config.controller_temp_parent is None
     ):
         raise ConfigurationError("PIT optimizer execution context is absent")
+
+    def production_worker_runner_factory(
+        *,
+        image: str,
+        docker_executable: Path,
+        source_root: Path,
+        controller_temp_parent: Path,
+        permanent_runtime_root: Path,
+    ) -> object:
+        docker = configure_docker_executable(
+            docker_executable,
+            source_root=source_root,
+            controller_root=controller_temp_parent,
+            permanent_runtime_root=permanent_runtime_root,
+        )
+        return PolicyWorkerRunner(
+            image=image,
+            engine=docker,
+            temp_parent=controller_temp_parent,
+        )
+
+    def production_evaluator_data_factory(
+        *,
+        pit_bundle: Path,
+        pit_bundle_sha256: str,
+        baseline_run: Path,
+    ) -> _PitOptimizerEvaluatorData:
+        with PITDataBundle(
+            pit_bundle,
+            expected_sha256=pit_bundle_sha256,
+        ) as bundle:
+            scope = _build_verification_scope(bundle, baseline_run)
+        universe = tuple(scope["symbols"])
+        probes = (
+            PolicyDeterminismProbe(
+                "recommend_capacity",
+                CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+                CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+            ),
+        )
+
+        def evaluate_candidate(
+            candidate_root: Path,
+            fold: object,
+            runner: object,
+            fold_run_id: str,
+        ) -> object:
+            client_factory = getattr(runner, "client_factory", None)
+            if not callable(client_factory):
+                raise CandidateMutationError(
+                    "candidate evaluator worker capability is invalid"
+                )
+            factory = client_factory(
+                candidate_root=candidate_root,
+                interface_version=manifest.policy_interface_version,
+                fold_run_id=fold_run_id,
+                determinism_probes=probes,
+            )
+            with PITDataBundle(
+                pit_bundle,
+                expected_sha256=pit_bundle_sha256,
+            ) as bundle:
+                simulator = PortfolioSimulator(
+                    pit_bundle=bundle,
+                    benchmark_symbol=manifest.fold_manifest.benchmark,
+                    signal_every_n_days=1,
+                    policy_client_factory=factory,
+                )
+                result = simulator.run(
+                    list(universe),
+                    start_date=fold.start_date,
+                    end_date=fold.end_date,
+                    history_start_date=(
+                        manifest.fold_manifest.warmup_start_date
+                    ),
+                    benchmark_symbol=manifest.fold_manifest.benchmark,
+                )
+            return build_fold_evidence(fold=fold, result=result)
+
+        def evaluate_baseline(fold: object) -> object:
+            with PITDataBundle(
+                pit_bundle,
+                expected_sha256=pit_bundle_sha256,
+            ) as bundle:
+                simulator = PortfolioSimulator(
+                    pit_bundle=bundle,
+                    benchmark_symbol=manifest.fold_manifest.benchmark,
+                    signal_every_n_days=1,
+                )
+                result = simulator.run(
+                    list(universe),
+                    start_date=fold.start_date,
+                    end_date=fold.end_date,
+                    history_start_date=(
+                        manifest.fold_manifest.warmup_start_date
+                    ),
+                    benchmark_symbol=manifest.fold_manifest.benchmark,
+                )
+            return build_fold_evidence(fold=fold, result=result)
+
+        return _PitOptimizerEvaluatorData(
+            universe=universe,
+            evaluate_candidate=evaluate_candidate,
+            evaluate_baseline=evaluate_baseline,
+        )
 
     authorization = AuthorizationLedger(
         runtime_root / "pit_optimizer_authorization_ledger.jsonl",
@@ -18256,7 +18437,8 @@ def _build_pit_optimizer_v2_live_run(
         manifest.run_id,
         known_secrets=known_secrets,
     )
-    gateway = OpenRouterGateway(
+    build_gateway = gateway_factory or OpenRouterGateway
+    gateway = build_gateway(
         run_id=manifest.run_id,
         ledger=budget,
         timeout_seconds=api_timeout_seconds,
@@ -18265,18 +18447,21 @@ def _build_pit_optimizer_v2_live_run(
         authorization_ledger=authorization,
         audit_trail=audit,
     )
+    if not isinstance(gateway, OpenRouterGateway):
+        raise ConfigurationError("PIT optimizer gateway capability is invalid")
     deadline = time.monotonic() + wall_timeout_seconds
     validation_ledger = ValidationLedger(
         runtime_root / manifest.validation_ledger_name
     )
     store = IncrementalArtifactStore(audit.run_root)
-    worker_box: dict[str, PolicyWorkerRunner] = {}
-    universe_box: dict[str, tuple[str, ...]] = {}
+    worker_box: dict[str, object] = {}
+    evaluator_box: dict[str, _PitOptimizerEvaluatorData] = {}
     incumbent_folds = list(readiness.baseline_discovery.folds)
     evidence_sha256s: dict[tuple[str, str], str] = {}
     worker_sequence = 0
     source_closed = False
     opened_lease: list[AuthorizationRunLease] = []
+    completed_role_calls: list[PitOptimizerRoleCall] = []
 
     def authenticate(
         supplied_config: PitOptimizerGateConfig,
@@ -18285,11 +18470,12 @@ def _build_pit_optimizer_v2_live_run(
         nonlocal worker_sequence
         if supplied_config is not config or supplied_readiness is not readiness:
             raise ConfigurationError("PIT optimizer authenticated inputs changed")
+        source_identity = authenticated_source_identity(config.source_root)
         if (
             source_state.head != manifest.source_head
-            or source_state.fingerprint is None
-            or source_state.fingerprint.sha256
-            != manifest.source_fingerprint_sha256
+            or source_identity
+            != (manifest.source_head, manifest.source_fingerprint_sha256)
+            or recheck_source_unchanged(source_state).source_modified
             or config.authorization_window_id
             != manifest.authorization_requirement.window_id
             or config.authorization_requirement_sha256
@@ -18302,14 +18488,18 @@ def _build_pit_optimizer_v2_live_run(
                 config.authorization_requirement_sha256
             ),
         )
-        with PITDataBundle(
-            config.pit_bundle,
-            expected_sha256=config.pit_bundle_sha256,
-        ) as bundle:
-            scope = _build_verification_scope(bundle, config.baseline_run)
-        universe = tuple(scope["symbols"])
+        build_evaluator = (
+            evaluator_data_factory or production_evaluator_data_factory
+        )
+        evaluator = build_evaluator(
+            pit_bundle=config.pit_bundle,
+            pit_bundle_sha256=config.pit_bundle_sha256,
+            baseline_run=config.baseline_run,
+        )
+        if not isinstance(evaluator, _PitOptimizerEvaluatorData):
+            raise ConfigurationError("PIT optimizer evaluator capability is invalid")
         universe_sha256 = hashlib.sha256(
-            _canonical_json_bytes(list(universe)) + b"\n"
+            _canonical_json_bytes(list(evaluator.universe)) + b"\n"
         ).hexdigest()
         if universe_sha256 != manifest.fold_manifest.universe_sha256:
             raise ConfigurationError("PIT optimizer universe identity differs")
@@ -18322,18 +18512,15 @@ def _build_pit_optimizer_v2_live_run(
                 != expected_sha256
             ):
                 raise ConfigurationError("PIT optimizer policy source differs")
-        docker = configure_docker_executable(
-            docker_executable,
+        build_worker = worker_runner_factory or production_worker_runner_factory
+        worker_box["runner"] = build_worker(
+            image=sandbox_image,
+            docker_executable=docker_executable,
             source_root=config.source_root,
-            controller_root=config.controller_temp_parent,
+            controller_temp_parent=config.controller_temp_parent,
             permanent_runtime_root=runtime_root,
         )
-        worker_box["runner"] = PolicyWorkerRunner(
-            image=sandbox_image,
-            engine=docker,
-            temp_parent=config.controller_temp_parent,
-        )
-        universe_box["symbols"] = universe
+        evaluator_box["data"] = evaluator
         worker_sequence = 0
 
     def freeze_pricing(model: str) -> FrozenModelPricing:
@@ -18397,11 +18584,11 @@ def _build_pit_optimizer_v2_live_run(
             supplied_readiness is not readiness
             or opened_lease != [lease]
             or "runner" not in worker_box
-            or "symbols" not in universe_box
+            or "data" not in evaluator_box
         ):
             raise ConfigurationError("PIT optimizer live services are unbound")
         runner = worker_box["runner"]
-        universe = universe_box["symbols"]
+        evaluator = evaluator_box["data"]
 
         def create_capability(cumulative_diff: str | None) -> Candidate:
             candidate = export_candidate(source_state)
@@ -18506,14 +18693,6 @@ def _build_pit_optimizer_v2_live_run(
             dispose_capability=dispose_capability,
         )
 
-        probes = (
-            PolicyDeterminismProbe(
-                "recommend_capacity",
-                CapacitySnapshot(None, 25, 0, 3, 1.0, False),
-                CapacitySnapshot(5, 25, 2, 1, 0.5, True),
-            ),
-        )
-
         def evaluate_fold(
             candidate_root: Path,
             fold: object,
@@ -18522,33 +18701,20 @@ def _build_pit_optimizer_v2_live_run(
             nonlocal worker_sequence
             worker_sequence += 1
             fold_id = str(fold.fold_id)
-            factory = runner.client_factory(
-                candidate_root=candidate_root,
-                interface_version=manifest.policy_interface_version,
-                fold_run_id=f"{fold_id}-{worker_sequence:02d}",
-                determinism_probes=probes,
+            evidence = evaluator.evaluate_candidate(
+                candidate_root,
+                fold,
+                runner,
+                f"{fold_id}-{worker_sequence:02d}",
             )
-            with PITDataBundle(
-                config.pit_bundle,
-                expected_sha256=config.pit_bundle_sha256,
-            ) as bundle:
-                simulator = PortfolioSimulator(
-                    pit_bundle=bundle,
-                    benchmark_symbol=manifest.fold_manifest.benchmark,
-                    signal_every_n_days=1,
-                    policy_client_factory=factory,
-                )
-                result = simulator.run(
-                    list(universe),
-                    start_date=fold.start_date,
-                    end_date=fold.end_date,
-                    history_start_date=manifest.fold_manifest.warmup_start_date,
-                    benchmark_symbol=manifest.fold_manifest.benchmark,
-                )
-            evidence = build_fold_evidence(fold=fold, result=result)
-            if evidence.effective_policy_sha256 != manifest.effective_policy_sha256:
+            if (
+                not isinstance(evidence, ParityFoldEvidence)
+                or evidence.fold_id != fold_id
+                or evidence.effective_policy_sha256
+                != manifest.effective_policy_sha256
+            ):
                 raise CandidateMutationError(
-                    "candidate evaluator engine policy identity differs"
+                    "candidate evaluator evidence identity differs"
                 )
             evidence_sha256s[(identity_sha256, fold_id)] = evidence.evidence_sha256
             return evidence
@@ -18607,6 +18773,7 @@ def _build_pit_optimizer_v2_live_run(
                     fold_id=item.fold_id,
                     engine_policy_sha256=manifest.effective_policy_sha256,
                     candidate_identity_sha256=identity.identity_sha256,
+                    evidence_sha256=item.evidence_sha256,
                     aggregate_metrics=item.aggregate,
                 )
                 for item in evidence
@@ -18657,26 +18824,15 @@ def _build_pit_optimizer_v2_live_run(
             )
 
         def baseline_hidden_evidence(fold: object) -> object:
-            with PITDataBundle(
-                config.pit_bundle,
-                expected_sha256=config.pit_bundle_sha256,
-            ) as bundle:
-                simulator = PortfolioSimulator(
-                    pit_bundle=bundle,
-                    benchmark_symbol=manifest.fold_manifest.benchmark,
-                    signal_every_n_days=1,
-                )
-                result = simulator.run(
-                    list(universe),
-                    start_date=fold.start_date,
-                    end_date=fold.end_date,
-                    history_start_date=manifest.fold_manifest.warmup_start_date,
-                    benchmark_symbol=manifest.fold_manifest.benchmark,
-                )
-            evidence = build_fold_evidence(fold=fold, result=result)
-            if evidence.effective_policy_sha256 != manifest.effective_policy_sha256:
+            evidence = evaluator.evaluate_baseline(fold)
+            if (
+                not isinstance(evidence, ParityFoldEvidence)
+                or evidence.fold_id != str(fold.fold_id)
+                or evidence.effective_policy_sha256
+                != manifest.effective_policy_sha256
+            ):
                 raise CandidateMutationError(
-                    "baseline hidden engine policy identity differs"
+                    "baseline hidden evidence identity differs"
                 )
             return evidence
 
@@ -18692,13 +18848,18 @@ def _build_pit_optimizer_v2_live_run(
                 fold,
                 identity.identity_sha256,
             )
+            hidden_excess = (
+                candidate.aggregate.total_return_pct
+                - baseline.aggregate.total_return_pct
+            )
+            candidate_aggregate = replace(
+                candidate.aggregate,
+                excess_total_return_pp=hidden_excess,
+            )
             accounting = _budget_snapshot(budget)
             decision = HoldoutDecision.from_result(
-                excess_total_return_pp=(
-                    candidate.aggregate.total_return_pct
-                    - baseline.aggregate.total_return_pct
-                ),
-                closed_trades=candidate.aggregate.closed_trades,
+                excess_total_return_pp=hidden_excess,
+                closed_trades=candidate_aggregate.closed_trades,
                 safety_complete=True,
                 integrity_complete=True,
                 accounting_complete=(
@@ -18727,7 +18888,7 @@ def _build_pit_optimizer_v2_live_run(
 
             evaluation = HiddenEvaluation(
                 baseline_aggregate=baseline.aggregate,
-                candidate_aggregate=candidate.aggregate,
+                candidate_aggregate=candidate_aggregate,
                 decision=decision,
             )
             return HiddenEvaluationAttestation.issue(
@@ -18782,6 +18943,41 @@ def _build_pit_optimizer_v2_live_run(
             lease_claimed = True
             return lease
 
+        def call_role(
+            plan: PitOptimizerCallBudget,
+            role_input: object,
+            parser: Callable[[str], object],
+            active: AuthorizationRunLease,
+            frozen: FrozenModelPricing,
+        ) -> PitOptimizerRoleCall:
+            if plan.call_index != len(completed_role_calls) + 1:
+                raise ConfigurationError(
+                    "PIT optimizer controller call sequence differs"
+                )
+            if plan.role == "investigator":
+                predecessors = tuple(completed_role_calls)
+            elif plan.role == "author":
+                predecessors = tuple(completed_role_calls[-1:])
+            else:
+                predecessors = tuple(completed_role_calls[-2:])
+            authorization.bind_controller_role_input(
+                role_input,
+                plan,
+                predecessor_calls=predecessors,
+            )
+            call = gateway.request_pit_optimizer_once(
+                plan.role,
+                role_input,
+                parser,
+                call_budget=plan,
+                authorization_lease=active,
+                frozen_pricing=frozen,
+                wall_deadline=deadline,
+                monotonic=time.monotonic,
+            )
+            completed_role_calls.append(call)
+            return call
+
         def verify_inputs(supplied: PitOptimizerReadiness) -> None:
             nonlocal source_closed
             try:
@@ -18808,18 +19004,7 @@ def _build_pit_optimizer_v2_live_run(
             freeze_pricing=cached_pricing,
             open_run_lease=cached_lease,
             close_run_lease=close_run_lease,
-            call_role=lambda plan, role_input, parser, active, frozen: (
-                gateway.request_pit_optimizer_once(
-                    plan.role,
-                    role_input,
-                    parser,
-                    call_budget=plan,
-                    authorization_lease=active,
-                    frozen_pricing=frozen,
-                    wall_deadline=deadline,
-                    monotonic=time.monotonic,
-                )
-            ),
+            call_role=call_role,
             recover_role_attempt=lambda plan, active: (
                 gateway.recover_pit_optimizer_finalization(
                     call_budget=plan,
@@ -18965,6 +19150,20 @@ def _build_cli_config(
         namespace.optimizer_authorization_window_id,
         namespace.optimizer_authorization_requirement_sha256,
     )
+    if (
+        namespace.gate != "pit_optimizer"
+        and (
+            any(value is not None for value in optimizer_v2_fields)
+            or namespace.authorize_policy_source_transmission
+        )
+    ) or (
+        namespace.gate == "pit_optimizer"
+        and namespace.optimization_phase != "canary"
+        and namespace.authorize_policy_source_transmission
+    ):
+        raise ConfigurationError(
+            "schema-v2 optimizer options are accepted only by optimizer canary"
+        )
     all_pit_fields = (
         *pit_shared_fields,
         *diagnosis_fields,
@@ -19069,14 +19268,6 @@ def _build_cli_config(
         if namespace.test_path or any(value is not None for value in backtest_fields):
             raise ConfigurationError(
                 "test/backtest options cannot be supplied to the PIT optimization gate"
-            )
-        if any(value is not None for value in optimizer_v2_fields):
-            raise ConfigurationError(
-                "schema-v2 optimizer options cannot be supplied to the legacy PIT optimization gate"
-            )
-        if namespace.authorize_policy_source_transmission:
-            raise ConfigurationError(
-                "schema-v2 source authorization cannot be supplied to the legacy PIT optimization gate"
             )
         if any(value is not None for value in diagnosis_fields):
             raise ConfigurationError(
@@ -19446,6 +19637,7 @@ def _execute_cli_run(
             PitOptimizerReadiness,
             PitOptimizerResult,
         )
+        from core.pit_policy_parity import authenticated_source_identity
 
         if isinstance(config.gate, PitOptimizerGateConfig):
             if state.fingerprint is None:
@@ -19456,13 +19648,23 @@ def _execute_cli_run(
             ) -> PitOptimizerReadiness:
                 nonlocal stage
                 stage = "pit_optimizer_prepare"
+                manifest_source_head, manifest_source_fingerprint = (
+                    authenticated_source_identity(config.source_root)
+                )
+                if (
+                    manifest_source_head != state.head
+                    or recheck_source_unchanged(state).source_modified
+                ):
+                    raise CandidateMutationError(
+                        "source changed before PIT optimizer readiness publication"
+                    )
                 return prepare_pit_optimizer_v2(
                     gate,
                     source_root=config.source_root,
                     artifact_root=config.artifact_root,
                     permanent_runtime_root=config.permanent_runtime_root,
-                    source_head=state.head,
-                    source_fingerprint_sha256=state.fingerprint.sha256,
+                    source_head=manifest_source_head,
+                    source_fingerprint_sha256=manifest_source_fingerprint,
                 )
 
             def build_v2(

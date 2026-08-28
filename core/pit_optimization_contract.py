@@ -727,6 +727,23 @@ class PitOptimizerRunManifest(_V2Canonical):
             > float(self.authorization_requirement.max_usd) + 1e-12
         ):
             raise ValueError("optimizer USD exceeds authorization")
+        _require_first_call_plan(
+            self.call_budgets,
+            max_iterations=self.max_iterations,
+        )
+        if (
+            self.authorization_requirement.max_calls != 6
+            or self.authorization_requirement.max_tokens != 448_000
+            or not math.isclose(
+                float(self.authorization_requirement.max_usd),
+                0.40,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "first subset canary authorization ceilings are invalid"
+            )
 
     @property
     def sha256(self) -> str:
@@ -854,7 +871,17 @@ class PitOptimizerGateConfig:
             )
             if path is not None
         )
-        if len(set(authenticated_files)) != len(authenticated_files):
+        try:
+            paths_overlap = any(
+                first == second or os.path.samefile(first, second)
+                for index, first in enumerate(authenticated_files)
+                for second in authenticated_files[index + 1 :]
+            )
+        except OSError as exc:
+            raise ValueError(
+                "optimizer gate authenticated input aliases cannot be verified"
+            ) from exc
+        if paths_overlap:
             raise ValueError("optimizer gate authenticated input paths overlap")
         for name in (
             "baseline_manifest_sha256",

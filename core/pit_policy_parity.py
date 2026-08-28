@@ -781,6 +781,12 @@ def _source_identity(source_root: Path) -> tuple[str, str]:
     return head, hashlib.sha256(tree).hexdigest()
 
 
+def authenticated_source_identity(source_root: Path) -> tuple[str, str]:
+    """Return the clean-HEAD/tree identity used by parity and optimizer manifests."""
+
+    return _source_identity(source_root)
+
+
 def _require_later_descendant_source(
     *,
     source_root: Path,

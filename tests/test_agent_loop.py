@@ -240,6 +240,82 @@ def test_pit_optimizer_v2_config_parser_has_a_separate_closed_route(
     ].choices
 
 
+def _minimal_gate_cli_argv(tmp_path: Path, gate: str) -> list[str]:
+    root = tmp_path.resolve()
+    return [
+        "--repo-root",
+        str(root / "source"),
+        "--permanent-runtime-root",
+        str(root / "runtime"),
+        "--git-executable",
+        str(root / "git.exe"),
+        "--controller-temp-parent",
+        str(root / "controller"),
+        "--artifact-root",
+        str(root / "artifacts"),
+        "--docker-executable",
+        str(root / "docker.exe"),
+        "--sandbox-image",
+        "example.invalid/worker@sha256:" + "1" * 64,
+        "--gate",
+        gate,
+        "--max-usd",
+        "0.40",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("gate", "extra"),
+    [
+        (gate, extra)
+        for gate in ("test", "backtest", "pit_diagnosis", "pit_optimization")
+        for extra in (
+            ("--optimizer-manifest", "C:/foreign/optimizer-manifest.json"),
+            ("--authorize-policy-source-transmission",),
+        )
+    ],
+)
+def test_schema_v2_options_are_rejected_outside_optimizer_canary(
+    tmp_path: Path,
+    gate: str,
+    extra: tuple[str, ...],
+) -> None:
+    """Break caught: a foreign route could silently carry schema-v2 authority."""
+    import agent_loop
+
+    namespace = agent_loop.build_parser().parse_args(
+        [*_minimal_gate_cli_argv(tmp_path, gate), *extra]
+    )
+
+    with pytest.raises(
+        agent_loop.ConfigurationError,
+        match="schema-v2 optimizer options are accepted only by optimizer canary",
+    ):
+        agent_loop._build_cli_config(namespace)
+
+
+def test_optimizer_prepare_rejects_source_transmission_authority(
+    tmp_path: Path,
+) -> None:
+    """Break caught: prepare could accept the canary-only transmission switch."""
+    import agent_loop
+
+    namespace = agent_loop.build_parser().parse_args(
+        [
+            *_minimal_gate_cli_argv(tmp_path, "pit_optimizer"),
+            "--optimization-phase",
+            "prepare",
+            "--authorize-policy-source-transmission",
+        ]
+    )
+
+    with pytest.raises(
+        agent_loop.ConfigurationError,
+        match="schema-v2 optimizer options are accepted only by optimizer canary",
+    ):
+        agent_loop._build_cli_config(namespace)
+
+
 @pytest.fixture
 def v2_gate(
     tmp_path: Path,

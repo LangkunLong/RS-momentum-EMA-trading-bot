@@ -1532,6 +1532,127 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
         )
 
 
+_FIRST_CANARY_MUTATIONS = (
+    "global_max_iterations",
+    "global_max_calls",
+    "global_max_tokens",
+    "global_max_usd",
+    "call_order",
+    *(
+        f"{role}_{field}"
+        for role in contract.OPTIMIZER_V2_ROLES
+        for field in (
+            "max_static_input_bytes",
+            "max_dynamic_input_bytes",
+            "max_input_tokens",
+            "max_output_tokens",
+            "max_response_bytes",
+            "max_usd",
+        )
+    ),
+)
+
+
+def _mutate_first_canary_primitive(
+    manifest: contract.PitOptimizerRunManifest,
+    mutation: str,
+) -> dict[str, object]:
+    primitive = json.loads(json.dumps(asdict(manifest)))
+    authorization = primitive["authorization_requirement"]
+    budgets = primitive["call_budgets"]
+    assert isinstance(authorization, dict)
+    assert isinstance(budgets, list)
+    if mutation == "global_max_iterations":
+        primitive["max_iterations"] = 3
+        scope = primitive["policy_source_scope"]
+        assert isinstance(scope, dict)
+        scope["max_iterations"] = 3
+    elif mutation == "global_max_calls":
+        authorization["max_calls"] = 7
+    elif mutation == "global_max_tokens":
+        authorization["max_tokens"] = 448_001
+    elif mutation == "global_max_usd":
+        authorization["max_usd"] = 0.41
+    elif mutation == "call_order":
+        budgets[0], budgets[1] = budgets[1], budgets[0]
+    else:
+        role, field = mutation.rsplit("_", 1)
+        for known_field in (
+            "max_static_input_bytes",
+            "max_dynamic_input_bytes",
+            "max_input_tokens",
+            "max_output_tokens",
+            "max_response_bytes",
+            "max_usd",
+        ):
+            suffix = f"_{known_field}"
+            if mutation.endswith(suffix):
+                role = mutation[: -len(suffix)]
+                field = known_field
+                break
+        role_indexes = [
+            index for index, budget in enumerate(budgets) if budget["role"] == role
+        ]
+        assert len(role_indexes) == 2
+        target = budgets[role_indexes[0]]
+        if field in {"max_input_tokens", "max_output_tokens"}:
+            target[field] += 1
+            budgets[role_indexes[1]][field] -= 1
+        elif field == "max_usd":
+            target[field] -= 0.001
+        else:
+            target[field] -= 1
+    return primitive
+
+
+@pytest.mark.parametrize("mutation", _FIRST_CANARY_MUTATIONS)
+def test_closed_manifest_rejects_every_first_canary_plan_mutation(
+    mutation: str,
+) -> None:
+    """Break caught: hand-authored canonical JSON could widen or reshape the first canary."""
+    primitive = _mutate_first_canary_primitive(_v2_manifest(), mutation)
+
+    with pytest.raises(ValueError, match="closed contract"):
+        contract._pit_optimizer_manifest_from_primitive(primitive)
+
+
+@pytest.mark.parametrize("mutation", _FIRST_CANARY_MUTATIONS)
+def test_direct_canary_rejects_every_first_canary_plan_mutation(
+    v2_gate: contract.PitOptimizerGateConfig,
+    mutation: str,
+) -> None:
+    """Break caught: direct canary validation could accept a noncanonical authority plan."""
+    manifest = contract._pit_optimizer_manifest_from_primitive(
+        json.loads(v2_gate.optimizer_manifest.read_bytes())
+    )
+    primitive = _mutate_first_canary_primitive(manifest, mutation)
+    manifest_bytes = _canonical_file_bytes(primitive)
+    v2_gate.optimizer_manifest.write_bytes(manifest_bytes)
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    readiness = json.loads(v2_gate.readiness_artifact.read_bytes())
+    readiness["manifest"] = primitive
+    readiness["manifest_sha256"] = manifest_sha256
+    readiness_bytes = _canonical_file_bytes(readiness)
+    v2_gate.readiness_artifact.write_bytes(readiness_bytes)
+    authorization = primitive["authorization_requirement"]
+    assert isinstance(authorization, dict)
+    mutated_gate = replace(
+        v2_gate,
+        optimizer_manifest_sha256=manifest_sha256,
+        readiness_sha256=hashlib.sha256(readiness_bytes).hexdigest(),
+        authorization_requirement_sha256=hashlib.sha256(
+            _canonical_file_bytes(authorization)
+        ).hexdigest(),
+        max_usd=float(authorization["max_usd"]),
+        max_api_calls=int(authorization["max_calls"]),
+        max_tokens=int(authorization["max_tokens"]),
+        max_iterations=int(primitive["max_iterations"]),
+    )
+
+    with pytest.raises(ValueError, match="closed contract"):
+        mutated_gate.validate()
+
+
 _PIT_METADATA = {
     "bundle_kind": "canslim_pit_v1",
     "schema_version": "1",
@@ -1912,6 +2033,119 @@ def v2_gate(
         docker_executable=docker_executable,
         sandbox_image=str(inputs["sandbox_image"]),
     )
+
+
+def _v2_gate_namespace(
+    gate: contract.PitOptimizerGateConfig,
+    **overrides: object,
+) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "optimization_phase": gate.phase,
+        "baseline_run": gate.baseline_run,
+        "baseline_manifest_sha256": gate.baseline_manifest_sha256,
+        "pit_bundle": gate.pit_bundle,
+        "pit_bundle_sha256": gate.pit_bundle_sha256,
+        "effective_policy_sha256": gate.effective_policy_sha256,
+        "optimizer_manifest": gate.optimizer_manifest,
+        "optimizer_manifest_sha256": gate.optimizer_manifest_sha256,
+        "verified_parity": gate.verified_parity_artifact,
+        "verified_parity_sha256": gate.verified_parity_sha256,
+        "readiness_sha256": gate.readiness_sha256,
+        "optimizer_authorization_window_id": gate.authorization_window_id,
+        "optimizer_authorization_requirement_sha256": (
+            gate.authorization_requirement_sha256
+        ),
+        "authorize_policy_source_transmission": (
+            gate.source_transmission_authorized
+        ),
+        "artifact_root": gate.artifact_root,
+        "repo_root": gate.source_root,
+        "permanent_runtime_root": gate.permanent_runtime_root,
+        "controller_temp_parent": gate.controller_temp_parent,
+        "git_executable": gate.git_executable,
+        "docker_executable": gate.docker_executable,
+        "sandbox_image": gate.sandbox_image,
+        "max_usd": gate.max_usd,
+        "max_api_calls": gate.max_api_calls,
+        "max_tokens": gate.max_tokens,
+        "max_iterations": gate.max_iterations,
+        "apply": gate.apply,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _make_symlink_or_skip(
+    link: Path,
+    target: Path,
+    *,
+    target_is_directory: bool,
+) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symbolic links are unavailable on this platform: {exc}")
+
+
+def test_v2_config_rejects_caller_supplied_file_link_before_resolution(
+    v2_gate: contract.PitOptimizerGateConfig,
+) -> None:
+    """Break caught: resolving a manifest link erased its caller-visible identity."""
+    import agent_loop
+
+    link = v2_gate.optimizer_manifest.with_name("optimizer-manifest-link.json")
+    _make_symlink_or_skip(
+        link,
+        v2_gate.optimizer_manifest,
+        target_is_directory=False,
+    )
+
+    with pytest.raises(agent_loop.ConfigurationError, match="link or reparse point"):
+        agent_loop._build_pit_optimizer_v2_config(
+            _v2_gate_namespace(v2_gate, optimizer_manifest=link)
+        )
+
+
+def test_v2_config_rejects_linked_directory_ancestor_before_resolution(
+    v2_gate: contract.PitOptimizerGateConfig,
+) -> None:
+    """Break caught: a directory link or junction could hide a sealed file's ancestry."""
+    import agent_loop
+
+    linked_parent = v2_gate.optimizer_manifest.parent / "linked-inputs"
+    _make_symlink_or_skip(
+        linked_parent,
+        v2_gate.optimizer_manifest.parent,
+        target_is_directory=True,
+    )
+    linked_manifest = linked_parent / v2_gate.optimizer_manifest.name
+
+    with pytest.raises(agent_loop.ConfigurationError, match="link or reparse point"):
+        agent_loop._build_pit_optimizer_v2_config(
+            _v2_gate_namespace(v2_gate, optimizer_manifest=linked_manifest)
+        )
+
+
+def test_v2_config_rejects_hard_link_alias_of_authenticated_target(
+    v2_gate: contract.PitOptimizerGateConfig,
+) -> None:
+    """Break caught: distinct path spellings could authenticate the same file identity twice."""
+    import agent_loop
+
+    alias = v2_gate.optimizer_manifest.with_name("optimizer-manifest-alias.json")
+    try:
+        os.link(v2_gate.optimizer_manifest, alias)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"hard links are unavailable on this platform: {exc}")
+
+    with pytest.raises(agent_loop.ConfigurationError, match="paths overlap"):
+        agent_loop._build_pit_optimizer_v2_config(
+            _v2_gate_namespace(
+                v2_gate,
+                verified_parity=alias,
+                verified_parity_sha256=v2_gate.optimizer_manifest_sha256,
+            )
+        )
 
 
 def test_pit_optimizer_v2_config_prepare_rejects_source_authorization_and_canary_requires_it(
@@ -4326,22 +4560,15 @@ def _task6_bind_role_input(
     return role_input
 
 
-def test_pit_optimizer_v2_exact_one_cent_preflight_has_zero_effects(
+def test_pit_optimizer_v2_exact_over_cap_preflight_has_zero_effects(
     tmp_path: Path,
     v2_manifest: contract.PitOptimizerRunManifest,
 ) -> None:
-    """Prove exact $0.010000 conservative cost rejects a $0.009999 sealed cap."""
+    """Prove an exact over-cap conservative cost has zero mutable effects."""
     import agent_loop
 
-    first_plan = replace(
-        v2_manifest.call_budgets[0],
-        max_usd=0.009999,
-    )
-    call_budgets = (first_plan, *v2_manifest.call_budgets[1:])
-    manifest = replace(
-        v2_manifest,
-        call_budgets=call_budgets,
-    )
+    manifest = v2_manifest
+    first_plan = manifest.call_budgets[0]
     (
         authorization,
         ledger_path,
@@ -4357,7 +4584,7 @@ def test_pit_optimizer_v2_exact_one_cent_preflight_has_zero_effects(
         grant_id="grant-exact-one-cent",
         outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
         prompt_rate=Decimal("0"),
-        completion_rate=Decimal("2.5"),
+        completion_rate=Decimal("12.50025"),
     )
 
     with pytest.raises(agent_loop.BudgetExceededError, match="per-call USD"):
