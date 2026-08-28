@@ -1191,8 +1191,10 @@ def _portfolio_checkpoint_fingerprint(
     universe: Iterable[str],
     simulator: "PortfolioSimulator",
     strategy_identity: Optional[dict[str, Any]] = None,
+    history_start_date: Optional[pd.Timestamp] = None,
 ) -> str:
     simulator._verify_effective_engine_policy()
+    effective_history_start = start_date if history_start_date is None else history_start_date
     config = {
         "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
         "bundle_sha256": bundle_sha256,
@@ -1214,6 +1216,7 @@ def _portfolio_checkpoint_fingerprint(
             if simulator.identity_transition_contract is not None else None
         ),
         "start_date": str(start_date.date()),
+        "history_start_date": str(effective_history_start.date()),
         "end_date": str(end_date.date()),
         "benchmark": benchmark,
         "universe": sorted(str(item).upper() for item in universe),
@@ -1431,6 +1434,7 @@ class PortfolioSimulator:
         self._ticker_industry: Dict[str, str] = {}
         self._execution_diagnostics = _new_execution_diagnostics()
         self._pending_entries_remaining = 0
+        self._policy_client = None
         self._strict_pit_pattern_histories: dict[str, _PreparedPatternHistory] = {}
         self._strict_pit_history_frames: dict[str, pd.DataFrame] = {}
         self._strict_pit_base_policy = BasePolicy.canonical_v1()
@@ -1520,6 +1524,7 @@ class PortfolioSimulator:
         *,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        history_start_date: Optional[str] = None,
         benchmark_symbol: Optional[str] = None,
         checkpoint_path: Optional[str | Path] = None,
         progress_log_path: Optional[str | Path] = None,
@@ -1531,25 +1536,23 @@ class PortfolioSimulator:
             raise ValueError("checkpoint_every_days must be positive")
         if resume and checkpoint_path is None:
             raise ValueError("resume requires checkpoint_path")
+        self._reset_run_state()
         self._capture_effective_engine_policy()
-        self._equity = self.initial_capital
-        self._open_positions = {}
-        self._trades = []
-        self._transactions = []
-        self._weekly_snapshots = []
-        self._signal_rows = []
-        self._entry_outcomes = []
-        self._execution_diagnostics = _new_execution_diagnostics()
-        self._pending_entries_remaining = 0
-        self._reset_strict_pit_pattern_cache()
 
         clear_session_cache()
         benchmark = str(benchmark_symbol or self.benchmark_symbol).upper()
-        start_ts, end_ts = _resolve_window(
+        trade_start, end_ts = _resolve_window(
             start_date=start_date,
             end_date=end_date,
             lookback_weeks=lookback_weeks,
         )
+        history_start = (
+            trade_start
+            if history_start_date is None
+            else pd.Timestamp(history_start_date).normalize()
+        )
+        if history_start > trade_start:
+            raise ValueError("history_start_date must not follow start_date")
 
         if self.pit_bundle is not None:
             bundle_symbols = set(self.pit_bundle.symbols())
@@ -1575,7 +1578,8 @@ class PortfolioSimulator:
         fingerprint = _portfolio_checkpoint_fingerprint(
             bundle_sha256=self.pit_bundle.sha256 if self.pit_bundle is not None else None,
             code_identity=checkpoint_code_identity,
-            start_date=start_ts,
+            start_date=trade_start,
+            history_start_date=history_start,
             end_date=end_ts,
             benchmark=benchmark,
             universe=all_tickers,
@@ -1641,17 +1645,18 @@ class PortfolioSimulator:
             _append_checkpoint_jsonl(progress, {
                 "phase": "resumed" if resume else "started",
                 "fingerprint": fingerprint,
-                "start_date": str(start_ts.date()),
+                "start_date": str(trade_start.date()),
+                "history_start_date": str(history_start.date()),
                 "end_date": str(end_ts.date()),
                 "universe_count": len(universe),
             }, sync=True)
 
         if self.pit_bundle is not None:
             print(f"Reading point-in-time price data for {len(all_tickers)} tickers...")
-            ticker_ohlcv = self.pit_bundle.fetch_price_data(all_tickers, start_ts, end_ts)
+            ticker_ohlcv = self.pit_bundle.fetch_price_data(all_tickers, history_start, end_ts)
         else:
             print(f"Downloading price data for {len(all_tickers)} tickers...")
-            ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, start_ts, end_ts)
+            ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, history_start, end_ts)
         if benchmark not in ticker_ohlcv:
             if state_stream is not None:
                 state_stream.close()
@@ -1660,13 +1665,18 @@ class PortfolioSimulator:
 
         if self.pit_bundle is not None:
             print(f"Reading point-in-time RS closes for {len(universe)} symbols...")
-            all_closes = self.pit_bundle.fetch_closes(universe, start_ts, end_ts)
+            all_closes = self.pit_bundle.fetch_closes(universe, history_start, end_ts)
         else:
             print(f"Downloading RS universe closes for {len(universe)} tickers...")
-            all_closes = self.data_fetcher.fetch_rs_universe_closes(universe, start_ts, end_ts)
+            all_closes = self.data_fetcher.fetch_rs_universe_closes(universe, history_start, end_ts)
 
         benchmark_df = ticker_ohlcv[benchmark]
-        trading_days = benchmark_df.loc[start_ts:end_ts].index
+        benchmark_sessions = benchmark_df.loc[history_start:end_ts].index
+        evaluation_sessions = tuple(
+            session for session in benchmark_sessions
+            if trade_start <= session <= end_ts
+        )
+        trading_days = pd.DatetimeIndex(evaluation_sessions)
         if len(trading_days) < 30:
             if state_stream is not None:
                 state_stream.close()
@@ -1724,7 +1734,7 @@ class PortfolioSimulator:
             }
         else:
             regime_tracker = MarketRegimeTracker()
-            regime_tracker.bootstrap(benchmark_df, start_ts)
+            regime_tracker.bootstrap(benchmark_df, trade_start)
             self._regime_tracker = regime_tracker
             next_day_index = 0
             equity_series = {}
@@ -1868,7 +1878,8 @@ class PortfolioSimulator:
             tickers=tickers,
             benchmark=benchmark,
             all_closes=all_closes,
-            start_ts=start_ts,
+            start_ts=trade_start,
+            history_start_ts=history_start,
             end_ts=end_ts,
             requested_entry_floors=(
                 origin_requested_min_rs_score,
@@ -1923,6 +1934,23 @@ class PortfolioSimulator:
         if state_stream is not None:
             state_stream.close()
         return result
+
+    def _reset_run_state(self) -> None:
+        """Restore all mutable per-run state before evaluating an independent fold."""
+
+        self._equity = self.initial_capital
+        self._open_positions = {}
+        self._trades = []
+        self._transactions = []
+        self._weekly_snapshots = []
+        self._signal_rows = []
+        self._entry_outcomes = []
+        self._ticker_industry = {}
+        self._execution_diagnostics = _new_execution_diagnostics()
+        self._pending_entries_remaining = 0
+        self._regime_tracker = MarketRegimeTracker()
+        self._policy_client = None
+        self._reset_strict_pit_pattern_cache()
 
     def _reset_strict_pit_pattern_cache(self) -> None:
         """Clear the built-in strict-PIT acceleration state before each run."""
@@ -2064,8 +2092,10 @@ class PortfolioSimulator:
         start_ts: pd.Timestamp,
         end_ts: pd.Timestamp,
         requested_entry_floors: tuple[float | None, float | None] | None = None,
+        history_start_ts: Optional[pd.Timestamp] = None,
     ) -> dict[str, Any]:
         self._verify_effective_engine_policy()
+        effective_history_start = start_ts if history_start_ts is None else history_start_ts
         requested_min_rs_score, requested_min_canslim_score = (
             requested_entry_floors
             if requested_entry_floors is not None
@@ -2119,6 +2149,7 @@ class PortfolioSimulator:
             "effective_engine_policy": self._effective_engine_policy,
             "effective_engine_policy_sha256": self._effective_engine_policy_sha256,
             "start_date": str(start_ts.date()),
+            "history_start_date": str(effective_history_start.date()),
             "end_date": str(end_ts.date()),
         }
 

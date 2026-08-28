@@ -92,6 +92,35 @@ class _StaticFetcher:
 
 
 @dataclass
+class _RecordingFetcher(_StaticFetcher):
+    price_windows: list[tuple[pd.Timestamp, pd.Timestamp]]
+    close_windows: list[tuple[pd.Timestamp, pd.Timestamp]]
+
+    def fetch_price_data(
+        self,
+        tickers: list[str],
+        start_date: pd.Timestamp,
+        end_date: pd.Timestamp,
+    ) -> dict[str, pd.DataFrame]:
+        self.price_windows.append((start_date, end_date))
+        return {
+            symbol: frame.loc[start_date:end_date]
+            for symbol, frame in super().fetch_price_data(tickers, start_date, end_date).items()
+        }
+
+    def fetch_rs_universe_closes(
+        self,
+        tickers: list[str],
+        start_date: pd.Timestamp,
+        end_date: pd.Timestamp,
+    ) -> pd.DataFrame:
+        self.close_windows.append((start_date, end_date))
+        return super().fetch_rs_universe_closes(tickers, start_date, end_date).loc[
+            start_date:end_date
+        ]
+
+
+@dataclass
 class _DatedSignals:
     signals: dict[tuple[str, pd.Timestamp], dict]
 
@@ -125,6 +154,93 @@ def test_public_rs_snapshot_matches_backtest_compatibility_delegate() -> None:
     day = closes.index[-1]
 
     assert calculate_rs_snapshot(closes, day) == _calculate_rs_snapshot(closes, day)
+
+
+def test_fold_history_is_visible_without_emitting_prefold_state_and_runs_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: warmup either leaks outputs or disappears on an isolated fold."""
+    evaluation_dates = pd.bdate_range("2026-05-04", periods=30)
+    warmup_dates = pd.bdate_range(
+        end=evaluation_dates[0] - pd.offsets.BDay(1),
+        periods=60,
+    )
+    all_dates = warmup_dates.append(evaluation_dates)
+    lead = _ohlcv(
+        all_dates,
+        opens=[100.0] * len(all_dates),
+        closes=[100.0] * len(all_dates),
+    )
+    lead.loc[evaluation_dates[0], "Close"] = 102.0
+    lead.loc[evaluation_dates[0], "High"] = 102.0
+    lead.loc[evaluation_dates[0], "Volume"] = 1_300_000.0
+    lead.loc[evaluation_dates[-1], "Close"] = 102.0
+    lead.loc[evaluation_dates[-1], "High"] = 102.0
+    lead.loc[evaluation_dates[-1], "Volume"] = 1_300_000.0
+    spy = _ohlcv(
+        all_dates,
+        opens=[100.0] * len(all_dates),
+        closes=[100.0] * len(all_dates),
+    )
+    fetcher = _RecordingFetcher(
+        prices={"LEAD": lead, "SPY": spy},
+        closes=pd.DataFrame({"LEAD": lead["Close"]}),
+        price_windows=[],
+        close_windows=[],
+    )
+    strategy = _DatedSignals(
+        {
+            ("LEAD", evaluation_dates[0]): _signal("LEAD", evaluation_dates[0]),
+            ("LEAD", evaluation_dates[-1]): _signal("LEAD", evaluation_dates[-1]),
+        }
+    )
+    simulator = PortfolioSimulator(
+        initial_capital=1_000.0,
+        position_risk_pct=0.01,
+        stop_loss_pct=0.10,
+        ma_consecutive=999,
+        signal_every_n_days=1,
+        technical_only=True,
+        stagnation_days=999,
+        data_fetcher=fetcher,
+        strategy=strategy,
+    )
+    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
+
+    results = [
+        simulator.run(
+            ["LEAD"],
+            start_date=str(evaluation_dates[0].date()),
+            end_date=str(evaluation_dates[-1].date()),
+            history_start_date=str(warmup_dates[0].date()),
+        )
+        for _ in range(2)
+    ]
+
+    expected_window = (warmup_dates[0], evaluation_dates[-1])
+    assert fetcher.price_windows == [expected_window, expected_window]
+    assert fetcher.close_windows == [expected_window, expected_window]
+    for result in results:
+        assert tuple(result.equity_curve.index) == tuple(
+            value.date().isoformat() for value in evaluation_dates
+        )
+        assert result.transaction_log["Date"].tolist() == [
+            str(evaluation_dates[1].date()),
+            str(evaluation_dates[-1].date()),
+        ]
+        assert result.transaction_log["Action"].tolist() == ["BUY", "SELL"]
+        assert result.transaction_log["Reason"].tolist()[-1] == "end_of_test"
+        assert len(result.entry_outcomes) == 1
+        assert result.entry_outcomes[0].signal_date == str(evaluation_dates[0].date())
+        assert all(
+            pd.Timestamp(value) >= evaluation_dates[0]
+            for value in result.transaction_log["Date"]
+        )
+        assert result.config["start_date"] == str(evaluation_dates[0].date())
+        assert result.config["history_start_date"] == str(warmup_dates[0].date())
+    assert results[0].transaction_log.to_dict("records") == results[1].transaction_log.to_dict("records")
+    assert results[0].entry_outcomes == results[1].entry_outcomes
+    assert results[0].equity_curve.to_dict() == results[1].equity_curve.to_dict()
 
 
 def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
