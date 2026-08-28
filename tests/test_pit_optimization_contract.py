@@ -226,6 +226,23 @@ def _canary_fixture(tmp_path: Path) -> tuple[
     baseline_full = asdict(_metrics())
     baseline_holdout = asdict(_metrics(annualized=1.0, drawdown=-5.0, total=4.0, trades=20))
     source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    evaluation_contract = optimization._evaluation_contract(
+        verification_subset=False,
+        verification_scope=None,
+    )
+    catalog_payload = [
+        {
+            "candidate_id": item.candidate_id,
+            "constant_name": item.constant_name,
+            "policy_field": item.policy_field,
+            "old_value": item.old_value,
+            "new_value": item.new_value,
+            "path": item.path,
+            "old_line": item.old_line,
+            "new_line": item.new_line,
+        }
+        for item in catalog.values()
+    ]
     primitive: dict[str, object] = {
         "schema_version": 1,
         "gate": "pit_optimization",
@@ -244,12 +261,15 @@ def _canary_fixture(tmp_path: Path) -> tuple[
             "apply": False,
             "provider_retries": 0,
         },
+        "evaluation_contract": evaluation_contract,
+        "candidate_catalog": catalog_payload,
         "effective_policy": effective_policy,
         "baseline": {
             "full": _aggregate_window(baseline_full),
             "holdout": _aggregate_window(baseline_holdout),
             "leader_basket": {},
         },
+        "prior_discovery_feedback": [],
         "evidence_ids": [
             "metric.full.cash",
             "metric.full.entry_funnel",
@@ -266,15 +286,7 @@ def _canary_fixture(tmp_path: Path) -> tuple[
             "invariant.point_in_time",
         ],
     }
-    provider_payload = {
-        "schema_version": 1,
-        "identities": primitive["identities"],
-        "baseline_metrics": primitive["baseline"],
-        "candidate_ids": list(catalog),
-        "evidence_ids": primitive["evidence_ids"],
-        "invariant_ids": primitive["invariant_ids"],
-        "editable_path": "core/canslim/entry_contract.py",
-    }
+    provider_payload = optimization._provider_payload(primitive)
     artifact_root.mkdir()
     readiness_bytes = _canonical_bytes(primitive)
     readiness_sha256 = hashlib.sha256(readiness_bytes).hexdigest()
@@ -892,7 +904,10 @@ def test_canary_rejects_open_citations_or_a_changed_coder_replacement_without_re
         "orchestrator": {
             "action": "continue",
             "domain": "return_drawdown",
-            "evidence_ids": ["metric.full.objective"],
+            "evidence_ids": [
+                "metric.full.objective",
+                "metric.holdout.objective",
+            ],
         },
         "reasoner": {
             "hypothesis": "Try one bounded controller candidate.",
@@ -976,7 +991,10 @@ def test_canary_rejects_readiness_or_sealed_input_mutation_before_another_call(
                 {
                     "action": "continue",
                     "domain": "return_drawdown",
-                    "evidence_ids": ["metric.full.objective"],
+                    "evidence_ids": [
+                        "metric.full.objective",
+                        "metric.holdout.objective",
+                    ],
                 }
             )
         )
@@ -1028,7 +1046,10 @@ def test_canary_requires_complete_monotonic_three_call_accounting_without_retry(
         {
             "action": "continue",
             "domain": "return_drawdown",
-            "evidence_ids": ["metric.full.objective"],
+            "evidence_ids": [
+                "metric.full.objective",
+                "metric.holdout.objective",
+            ],
         },
         {
             "hypothesis": "Try one bounded controller candidate.",
@@ -1273,6 +1294,9 @@ def test_optimizer_canary_has_a_separate_closed_audit_manifest(
         "max_usd": 0.5,
         "max_api_calls": 3,
         "max_iterations": 1,
+        "verification_subset": False,
+        "prior_discovery_feedback": None,
+        "prior_discovery_feedback_sha256": None,
         "apply": False,
     }
 

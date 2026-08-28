@@ -755,10 +755,72 @@ class PitOptimizerGateConfig:
     max_tokens: int
     max_iterations: int
     apply: bool
+    source_root: Path | None = None
+    permanent_runtime_root: Path | None = None
+    controller_temp_parent: Path | None = None
+    artifact_root: Path | None = None
+    git_executable: Path | None = None
+    docker_executable: Path | None = None
+    sandbox_image: str | None = None
 
     def validate(self) -> None:
-        if self.phase not in {"prepare", "run"}:
+        if self.phase not in {"prepare", "canary"}:
             raise ValueError("optimizer gate phase is invalid")
+        if self.phase == "prepare":
+            if self.source_transmission_authorized is not False:
+                raise ValueError(
+                    "prepare phase cannot authorize policy source transmission"
+                )
+            if self.authorization_window_id is not None:
+                raise ValueError("prepare phase cannot carry an authorization window")
+            if self.readiness_artifact is not None or self.readiness_sha256 is not None:
+                raise ValueError("prepare phase cannot carry a readiness identity")
+        else:
+            if self.source_transmission_authorized is not True:
+                raise ValueError(
+                    "canary phase policy source transmission must be authorized"
+                )
+            _v2_identifier(self.authorization_window_id, "authorization window ID")
+            if self.readiness_artifact is None or self.readiness_sha256 is None:
+                raise ValueError("canary phase requires authenticated readiness")
+        if self.apply is not False:
+            raise ValueError("optimizer gate apply must be false")
+        execution_context = (
+            self.source_root,
+            self.permanent_runtime_root,
+            self.controller_temp_parent,
+            self.artifact_root,
+            self.git_executable,
+            self.docker_executable,
+            self.sandbox_image,
+        )
+        if any(value is not None for value in execution_context):
+            if any(value is None for value in execution_context):
+                raise ValueError("optimizer gate execution context is incomplete")
+            assert self.source_root is not None
+            assert self.permanent_runtime_root is not None
+            assert self.controller_temp_parent is not None
+            assert self.artifact_root is not None
+            assert self.git_executable is not None
+            assert self.docker_executable is not None
+            assert self.sandbox_image is not None
+            _resolved_directory(self.source_root, "optimizer gate source root")
+            _resolved_directory(
+                self.permanent_runtime_root,
+                "optimizer gate permanent runtime root",
+            )
+            _resolved_directory(
+                self.controller_temp_parent,
+                "optimizer gate controller temp parent",
+            )
+            _resolved_directory(self.artifact_root, "optimizer gate artifact root")
+            _resolved_file(self.git_executable, "optimizer gate Git executable")
+            _resolved_file(self.docker_executable, "optimizer gate Docker executable")
+            if (
+                re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", self.sandbox_image)
+                is None
+            ):
+                raise ValueError("optimizer gate sandbox image is invalid")
         baseline = _resolved_directory(self.baseline_run, "optimizer gate baseline run")
         baseline_manifest = _resolved_file(
             baseline / "run_manifest.json",
@@ -773,6 +835,27 @@ class PitOptimizerGateConfig:
             self.verified_parity_artifact,
             "optimizer gate parity artifact",
         )
+        readiness_path = (
+            None
+            if self.readiness_artifact is None
+            else _resolved_file(
+                self.readiness_artifact,
+                "optimizer gate readiness artifact",
+            )
+        )
+        authenticated_files = tuple(
+            path
+            for path in (
+                baseline_manifest,
+                manifest_path,
+                bundle_path,
+                parity_path,
+                readiness_path,
+            )
+            if path is not None
+        )
+        if len(set(authenticated_files)) != len(authenticated_files):
+            raise ValueError("optimizer gate authenticated input paths overlap")
         for name in (
             "baseline_manifest_sha256",
             "pit_bundle_sha256",
@@ -809,6 +892,11 @@ class PitOptimizerGateConfig:
             raise ValueError("optimizer gate identities differ from manifest")
         if closed_manifest.parity_attestation_sha256 != self.verified_parity_sha256:
             raise ValueError("optimizer gate parity identity differs from manifest")
+        if (
+            self.sandbox_image is not None
+            and self.sandbox_image != closed_manifest.sandbox_image
+        ):
+            raise ValueError("optimizer gate sandbox image differs from manifest")
         authorization = primitive.get("authorization_requirement")
         if not isinstance(authorization, dict):
             raise ValueError("optimizer manifest authorization requirement is absent")
@@ -841,39 +929,42 @@ class PitOptimizerGateConfig:
             raise ValueError("optimizer gate ceilings differ from manifest")
         if authorization.get("apply") is not self.apply:
             raise ValueError("optimizer gate apply differs from authorization requirement")
-        if self.readiness_artifact is None or self.readiness_sha256 is None:
-            if self.readiness_artifact is not None or self.readiness_sha256 is not None:
-                raise ValueError("optimizer gate readiness identity is incomplete")
-            if self.phase != "prepare":
-                raise ValueError("run phase requires authenticated readiness")
-        else:
+        if readiness_path is not None:
+            assert self.readiness_sha256 is not None
             _require_digest(self.readiness_sha256, "optimizer gate readiness SHA-256")
-            readiness = _resolved_file(
-                self.readiness_artifact,
-                "optimizer gate readiness artifact",
-            )
-            if _sha256_file(readiness) != self.readiness_sha256:
+            raw_readiness = readiness_path.read_bytes()
+            if hashlib.sha256(raw_readiness).hexdigest() != self.readiness_sha256:
                 raise ValueError("optimizer gate readiness artifact digest differs")
-            if closed_manifest.legacy_readiness_sha256 != self.readiness_sha256:
-                raise ValueError("optimizer gate readiness identity differs from manifest")
-        if self.phase == "prepare":
-            if self.authorization_window_id is not None:
-                raise ValueError("prepare phase cannot carry an authorization window")
-            if self.source_transmission_authorized is not False:
-                raise ValueError("prepare phase source transmission is not authorized")
-            if self.apply is not False:
-                raise ValueError("prepare phase apply must be false")
-        else:
-            _v2_identifier(self.authorization_window_id, "authorization window ID")
+            try:
+                readiness = json.loads(raw_readiness)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("optimizer gate readiness artifact is invalid JSON") from exc
             if (
-                self.authorization_window_id
-                != closed_manifest.authorization_requirement.window_id
+                not isinstance(readiness, dict)
+                or set(readiness)
+                != {
+                    "schema_version",
+                    "manifest",
+                    "manifest_sha256",
+                    "parity",
+                    "baseline_discovery",
+                    "provider_seed",
+                }
+                or raw_readiness != _v2_canonical_bytes(readiness) + b"\n"
             ):
-                raise ValueError("optimizer gate authorization window differs from manifest")
-            if self.source_transmission_authorized is not True:
-                raise ValueError("run phase source transmission must be authorized")
-            if type(self.apply) is not bool:
-                raise ValueError("optimizer gate apply must be boolean")
+                raise ValueError("optimizer gate readiness artifact is not canonical")
+            if (
+                readiness.get("schema_version") != 2
+                or readiness.get("manifest_sha256") != closed_manifest.sha256
+                or readiness.get("manifest") != primitive
+            ):
+                raise ValueError("optimizer gate readiness identity differs from manifest")
+        if (
+            self.phase == "canary"
+            and self.authorization_window_id
+            != closed_manifest.authorization_requirement.window_id
+        ):
+            raise ValueError("optimizer gate authorization window differs from manifest")
 
 
 def _resolved_directory(path: Path, label: str) -> Path:
@@ -1347,17 +1438,29 @@ def build_prepare_command(
     arguments = [
         "python",
         "-B",
-        "-m",
-        "core.pit_optimization",
-        "prepare-v2",
+        str((repository / "agent_loop.py").resolve()),
+        "--repo-root",
+        str(repository),
+        "--permanent-runtime-root",
+        str(runtime_root),
+        "--git-executable",
+        str(git_path),
+        "--controller-temp-parent",
+        str(temp_parent),
+        "--artifact-root",
+        str(artifacts),
+        "--docker-executable",
+        str(docker_path),
+        "--sandbox-image",
+        sandbox_image,
+        "--gate",
+        "pit_optimizer",
+        "--optimization-phase",
+        "prepare",
         "--optimizer-manifest",
         str(optimizer_manifest),
         "--optimizer-manifest-sha256",
         manifest.sha256,
-        "--legacy-readiness",
-        str(legacy_readiness),
-        "--legacy-readiness-sha256",
-        manifest.legacy_readiness_sha256,
         "--verified-parity",
         str(verified_parity),
         "--verified-parity-sha256",
@@ -1370,22 +1473,18 @@ def build_prepare_command(
         str(baseline_run),
         "--baseline-manifest-sha256",
         manifest.baseline_manifest_sha256,
-        "--repo-root",
-        str(repository),
-        "--permanent-runtime-root",
-        str(runtime_root),
-        "--controller-temp-parent",
-        str(temp_parent),
-        "--artifact-root",
-        str(artifacts),
-        "--git-executable",
-        str(git_path),
-        "--docker-executable",
-        str(docker_path),
-        "--sandbox-image",
-        sandbox_image,
-        "--authorization-requirement-sha256",
+        "--effective-policy-sha256",
+        manifest.effective_policy_sha256,
+        "--optimizer-authorization-requirement-sha256",
         manifest.authorization_requirement.sha256,
+        "--max-usd",
+        "0.40",
+        "--max-api-calls",
+        "6",
+        "--max-tokens",
+        "448000",
+        "--max-iterations",
+        "2",
     ]
     return subprocess.list2cmdline(arguments)
 

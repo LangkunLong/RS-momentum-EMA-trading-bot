@@ -3280,6 +3280,56 @@ def prepare_pit_optimizer_v2(
     )
 
 
+def load_pit_optimizer_v2_readiness(
+    config: PitOptimizerGateConfig,
+) -> PitOptimizerReadiness:
+    """Load and reconstruct one previously prepared canonical readiness artifact."""
+
+    from core.pit_optimizer_artifacts import canonical_json_bytes
+    from core.pit_optimizer_controller import (
+        PitOptimizerReadiness,
+        _baseline_from_parity,
+        _load_manifest,
+        _load_parity,
+        _provider_seed_from_baseline,
+        _readiness_primitive,
+        _validate_parity_graph,
+    )
+
+    if not isinstance(config, PitOptimizerGateConfig) or config.phase != "canary":
+        raise ValueError("optimizer readiness load requires a canary gate")
+    config.validate()
+    if config.readiness_artifact is None or config.readiness_sha256 is None:
+        raise ValueError("optimizer canary readiness identity is absent")
+    manifest = _load_manifest(config.optimizer_manifest)
+    parity = _load_parity(config.verified_parity_artifact)
+    _validate_parity_graph(parity, manifest)
+    baseline = _baseline_from_parity(parity)
+    provider_seed = _provider_seed_from_baseline(baseline)
+    expected = _readiness_primitive(
+        manifest=manifest,
+        parity=parity,
+        baseline=baseline,
+        provider_seed=provider_seed,
+    )
+    raw = config.readiness_artifact.read_bytes()
+    if (
+        raw != canonical_json_bytes(expected)
+        or hashlib.sha256(raw).hexdigest() != config.readiness_sha256
+    ):
+        raise ValueError("optimizer readiness artifact differs from closed inputs")
+    return PitOptimizerReadiness(
+        schema_version=2,
+        manifest=manifest,
+        manifest_sha256=manifest.sha256,
+        readiness_sha256=config.readiness_sha256,
+        artifact_path=config.readiness_artifact.resolve(),
+        parity=parity,
+        baseline_discovery=baseline,
+        provider_seed=provider_seed,
+    )
+
+
 def run_pit_optimizer_v2(
     *,
     readiness: PitOptimizerReadiness,

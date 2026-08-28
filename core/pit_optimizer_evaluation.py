@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from contextlib import contextmanager
 from dataclasses import InitVar, asdict, dataclass
 from datetime import date
@@ -13,7 +14,8 @@ import os
 from pathlib import Path
 import re
 from itertools import pairwise
-from typing import Iterator
+import sys
+from typing import Iterator, Mapping, Sequence
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -1193,3 +1195,211 @@ class ValidationLedger:
                 outcome_record_sha256=record_sha256,
                 ledger_head_sha256=record_sha256,
             )
+
+
+def _absolute_cli_path(path: Path, label: str) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise ValueError(f"{label} must be an explicit absolute path")
+    if candidate.is_symlink():
+        raise ValueError(f"{label} must not be a symbolic link")
+    return candidate.resolve(strict=False)
+
+
+def _read_canonical_mapping(path: Path, label: str) -> Mapping[str, object]:
+    candidate = _absolute_cli_path(path, label)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError(f"{label} must be an existing regular non-link file")
+    raw = candidate.read_bytes()
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is invalid JSON") from exc
+    if not isinstance(value, dict) or raw != _canonical_json_bytes(value):
+        raise ValueError(f"{label} is not canonical JSON")
+    return value
+
+
+def _manifest_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m core.pit_optimizer_evaluation",
+        allow_abbrev=False,
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    build = commands.add_parser("build-subset-manifest", allow_abbrev=False)
+    for flag in (
+        "readiness",
+        "verified-parity",
+        "pit-bundle",
+        "baseline-run",
+        "source-root",
+        "permanent-runtime-root",
+        "controller-temp-parent",
+        "artifact-root",
+        "git-executable",
+        "docker-executable",
+        "output",
+    ):
+        build.add_argument(f"--{flag}", type=Path, required=True)
+    build.add_argument("--sandbox-image", required=True)
+    build.add_argument("--iterations", type=int, required=True)
+    for role in ("investigator", "author", "critic"):
+        for suffix in (
+            "static-bytes",
+            "dynamic-bytes",
+            "input-tokens",
+            "output-tokens",
+            "response-bytes",
+        ):
+            build.add_argument(f"--{role}-{suffix}", type=int, required=True)
+        build.add_argument(f"--{role}-max-usd", type=float, required=True)
+    build.add_argument("--max-files", type=int, required=True)
+    build.add_argument("--max-hunks", type=int, required=True)
+    build.add_argument("--max-changed-lines", type=int, required=True)
+    build.add_argument("--max-diff-bytes", type=int, required=True)
+    return parser
+
+
+def _call_budgets_from_namespace(namespace: argparse.Namespace) -> tuple[object, ...]:
+    from core.pit_optimization_contract import (
+        OPTIMIZER_V2_ROLES,
+        PIT_OPTIMIZER_R1_MODEL,
+        PitOptimizerCallBudget,
+    )
+
+    budgets = []
+    for iteration in range(1, namespace.iterations + 1):
+        for ordinal, role in enumerate(OPTIMIZER_V2_ROLES, start=1):
+            prefix = role.replace("-", "_")
+            budgets.append(
+                PitOptimizerCallBudget(
+                    call_index=(iteration - 1) * 3 + ordinal,
+                    iteration=iteration,
+                    role=role,
+                    model=PIT_OPTIMIZER_R1_MODEL,
+                    max_static_input_bytes=getattr(
+                        namespace,
+                        f"{prefix}_static_bytes",
+                    ),
+                    max_dynamic_input_bytes=getattr(
+                        namespace,
+                        f"{prefix}_dynamic_bytes",
+                    ),
+                    max_input_tokens=getattr(
+                        namespace,
+                        f"{prefix}_input_tokens",
+                    ),
+                    max_output_tokens=getattr(
+                        namespace,
+                        f"{prefix}_output_tokens",
+                    ),
+                    max_response_bytes=getattr(
+                        namespace,
+                        f"{prefix}_response_bytes",
+                    ),
+                    max_usd=getattr(namespace, f"{prefix}_max_usd"),
+                )
+            )
+    return tuple(budgets)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Build one provider-free schema-v2 subset manifest and prepare command."""
+    namespace = _manifest_cli_parser().parse_args(
+        list(sys.argv[1:] if argv is None else argv)
+    )
+    if namespace.command != "build-subset-manifest":
+        raise ValueError("unknown PIT optimizer evaluation command")
+    from core.pit_optimization_contract import (
+        PatchBounds,
+        build_prepare_command,
+        build_subset_manifest,
+        write_optimizer_manifest,
+    )
+    from core.pit_optimizer_controller import _load_parity
+
+    readiness_path = _absolute_cli_path(namespace.readiness, "readiness artifact")
+    parity_path = _absolute_cli_path(
+        namespace.verified_parity,
+        "verified parity artifact",
+    )
+    readiness = _read_canonical_mapping(readiness_path, "readiness artifact")
+    parity = _load_parity(parity_path)
+    manifest = build_subset_manifest(
+        legacy_readiness=readiness,
+        legacy_readiness_path=readiness_path,
+        parity_attestation=parity,
+        verified_parity_path=parity_path,
+        pit_bundle=_absolute_cli_path(namespace.pit_bundle, "PIT bundle"),
+        baseline_run=_absolute_cli_path(namespace.baseline_run, "baseline run"),
+        source_root=_absolute_cli_path(namespace.source_root, "source root"),
+        permanent_runtime_root=_absolute_cli_path(
+            namespace.permanent_runtime_root,
+            "permanent runtime root",
+        ),
+        controller_temp_parent=_absolute_cli_path(
+            namespace.controller_temp_parent,
+            "controller temporary parent",
+        ),
+        artifact_root=_absolute_cli_path(namespace.artifact_root, "artifact root"),
+        sandbox_image=namespace.sandbox_image,
+        call_budgets=_call_budgets_from_namespace(namespace),
+        candidate_bounds=PatchBounds(
+            namespace.max_files,
+            namespace.max_hunks,
+            namespace.max_changed_lines,
+            namespace.max_diff_bytes,
+        ),
+        max_iterations=namespace.iterations,
+    )
+    output = _absolute_cli_path(namespace.output, "optimizer manifest output")
+    written, digest = write_optimizer_manifest(manifest, output)
+    command = build_prepare_command(
+        manifest,
+        manifest_path=written,
+        legacy_readiness_path=readiness_path,
+        verified_parity_path=parity_path,
+        pit_bundle_path=_absolute_cli_path(namespace.pit_bundle, "PIT bundle"),
+        baseline_run_path=_absolute_cli_path(namespace.baseline_run, "baseline run"),
+        repo_root=_absolute_cli_path(namespace.source_root, "source root"),
+        permanent_runtime_root=_absolute_cli_path(
+            namespace.permanent_runtime_root,
+            "permanent runtime root",
+        ),
+        controller_temp_parent=_absolute_cli_path(
+            namespace.controller_temp_parent,
+            "controller temporary parent",
+        ),
+        artifact_root=_absolute_cli_path(namespace.artifact_root, "artifact root"),
+        git_executable=_absolute_cli_path(namespace.git_executable, "Git executable"),
+        docker_executable=_absolute_cli_path(
+            namespace.docker_executable,
+            "Docker executable",
+        ),
+        sandbox_image=namespace.sandbox_image,
+    )
+    print(
+        "PIT_OPTIMIZER_MANIFEST="
+        + json.dumps(
+            {
+                "artifact": str(written),
+                "sha256": digest,
+                "manifest": manifest.to_primitive(),
+                "authorization": {
+                    "max_calls": manifest.authorization_requirement.max_calls,
+                    "max_tokens": manifest.authorization_requirement.max_tokens,
+                    "max_usd": manifest.authorization_requirement.max_usd,
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    print("PIT_OPTIMIZER_PREPARE_COMMAND=" + command)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

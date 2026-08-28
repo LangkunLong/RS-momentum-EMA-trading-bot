@@ -2556,6 +2556,51 @@ class AuthorizationLedger:
                 ],
             )
 
+    def authenticate_window(
+        self,
+        *,
+        window_id: str,
+        authorization_requirement_sha256: str,
+    ) -> OperatorAuthorizationWindow:
+        """Return the exact authenticated window without mutating authority."""
+
+        try:
+            _require_id(window_id, "authorization window ID")
+            _require_digest(
+                authorization_requirement_sha256,
+                "authorization requirement SHA-256",
+            )
+        except ValueError as exc:
+            raise AuthorizationError(str(exc)) from exc
+        requirement = self._manifest.authorization_requirement
+        if authorization_requirement_sha256 != requirement.sha256:
+            raise AuthorizationError("authorization requirement mismatch")
+        if window_id != requirement.window_id:
+            raise AuthorizationError("authorization window ID mismatch")
+        with _authorization_file_lock(self._lock_path):
+            records = self._read_records()
+            matches = [
+                record
+                for record in records
+                if record.get("record_type") == "window"
+                and isinstance(record.get("window"), dict)
+                and record["window"].get("window_id") == window_id
+            ]
+        if len(matches) != 1:
+            raise AuthorizationError("authorization window is absent")
+        primitive = dict(matches[0]["window"])
+        primitive["grant_ids"] = tuple(primitive.get("grant_ids", ()))
+        try:
+            window = OperatorAuthorizationWindow(**primitive)
+        except (TypeError, ValueError) as exc:
+            raise AuthorizationError("authorization window record is invalid") from exc
+        require_authorized_policy_source_scope(
+            self._manifest,
+            requirement,
+            window,
+        )
+        return window
+
     def open_run_lease(
         self,
         *,

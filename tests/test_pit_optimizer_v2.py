@@ -1855,6 +1855,166 @@ def _patch_authenticated_readiness(
     monkeypatch.setattr(parity, "_authenticated_readiness", authenticate)
 
 
+@pytest.fixture
+def v2_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> contract.PitOptimizerGateConfig:
+    """Return one canonical, fully authenticated schema-v2 canary gate."""
+    inputs, _expected = _builder_fixture(tmp_path)
+    _patch_authenticated_readiness(monkeypatch, inputs)
+    manifest = contract.build_subset_manifest(**inputs)
+    manifest_path = tmp_path / "optimizer-manifest.json"
+    contract.write_optimizer_manifest(manifest, manifest_path)
+    readiness_path = Path(inputs["artifact_root"]) / (
+        f"{manifest.run_id}.readiness.json"
+    )
+    readiness = {
+        "schema_version": 2,
+        "manifest": asdict(manifest),
+        "manifest_sha256": manifest.sha256,
+        "parity": {},
+        "baseline_discovery": {},
+        "provider_seed": {},
+    }
+    readiness_path.write_bytes(_canonical_file_bytes(readiness))
+    readiness_sha256 = hashlib.sha256(readiness_path.read_bytes()).hexdigest()
+    git_executable = tmp_path / "git.exe"
+    docker_executable = tmp_path / "docker.exe"
+    git_executable.write_bytes(b"synthetic executable")
+    docker_executable.write_bytes(b"synthetic executable")
+    return contract.PitOptimizerGateConfig(
+        phase="canary",
+        baseline_run=Path(inputs["baseline_run"]),
+        baseline_manifest_sha256=manifest.baseline_manifest_sha256,
+        pit_bundle=Path(inputs["pit_bundle"]),
+        pit_bundle_sha256=manifest.pit_bundle_sha256,
+        effective_policy_sha256=manifest.effective_policy_sha256,
+        optimizer_manifest=manifest_path,
+        optimizer_manifest_sha256=manifest.sha256,
+        verified_parity_artifact=Path(inputs["verified_parity_path"]),
+        verified_parity_sha256=manifest.parity_attestation_sha256,
+        readiness_artifact=readiness_path,
+        readiness_sha256=readiness_sha256,
+        authorization_window_id=manifest.authorization_requirement.window_id,
+        authorization_requirement_sha256=manifest.authorization_requirement.sha256,
+        source_transmission_authorized=True,
+        max_usd=0.40,
+        max_api_calls=6,
+        max_tokens=448_000,
+        max_iterations=2,
+        apply=False,
+        source_root=Path(inputs["source_root"]),
+        permanent_runtime_root=Path(inputs["permanent_runtime_root"]),
+        controller_temp_parent=Path(inputs["controller_temp_parent"]),
+        artifact_root=Path(inputs["artifact_root"]),
+        git_executable=git_executable,
+        docker_executable=docker_executable,
+        sandbox_image=str(inputs["sandbox_image"]),
+    )
+
+
+def test_pit_optimizer_v2_config_prepare_rejects_source_authorization_and_canary_requires_it(
+    v2_gate: contract.PitOptimizerGateConfig,
+) -> None:
+    """Break caught: phase selection could silently grant source transmission."""
+    with pytest.raises(ValueError, match="prepare.*transmission"):
+        replace(
+            v2_gate,
+            phase="prepare",
+            source_transmission_authorized=True,
+        ).validate()
+    with pytest.raises(ValueError, match="source transmission"):
+        replace(
+            v2_gate,
+            phase="canary",
+            source_transmission_authorized=False,
+        ).validate()
+
+
+def test_pit_optimizer_v2_config_canary_requires_exact_sealed_authority(
+    v2_gate: contract.PitOptimizerGateConfig,
+) -> None:
+    """Break caught: a canary could widen or substitute its sealed authority."""
+    v2_gate.validate()
+    for changed, message in (
+        ({"authorization_window_id": "window_foreign"}, "authorization window"),
+        ({"authorization_requirement_sha256": "f" * 64}, "requirement"),
+        ({"max_iterations": 1}, "iterations|ceilings"),
+        ({"max_api_calls": 7}, "ceilings"),
+        ({"max_tokens": 448_001}, "ceilings"),
+        ({"max_usd": 0.41}, "ceilings"),
+        ({"apply": True}, "apply"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            replace(v2_gate, **changed).validate()
+
+
+def test_pit_optimizer_v2_config_builder_derives_prepare_and_requires_canary_identities(
+    v2_gate: contract.PitOptimizerGateConfig,
+) -> None:
+    """Break caught: CLI values could bypass manifest-owned identity and ceilings."""
+    import agent_loop
+
+    common = {
+        "optimization_phase": "prepare",
+        "baseline_run": v2_gate.baseline_run,
+        "baseline_manifest_sha256": v2_gate.baseline_manifest_sha256,
+        "pit_bundle": v2_gate.pit_bundle,
+        "pit_bundle_sha256": v2_gate.pit_bundle_sha256,
+        "effective_policy_sha256": v2_gate.effective_policy_sha256,
+        "optimizer_manifest": v2_gate.optimizer_manifest,
+        "optimizer_manifest_sha256": v2_gate.optimizer_manifest_sha256,
+        "verified_parity": v2_gate.verified_parity_artifact,
+        "verified_parity_sha256": v2_gate.verified_parity_sha256,
+        "readiness_sha256": None,
+        "optimizer_authorization_window_id": None,
+        "optimizer_authorization_requirement_sha256": None,
+        "authorize_policy_source_transmission": False,
+        "artifact_root": v2_gate.readiness_artifact.parent,
+        "repo_root": v2_gate.source_root,
+        "permanent_runtime_root": v2_gate.permanent_runtime_root,
+        "controller_temp_parent": v2_gate.controller_temp_parent,
+        "git_executable": v2_gate.git_executable,
+        "docker_executable": v2_gate.docker_executable,
+        "sandbox_image": v2_gate.sandbox_image,
+        "max_usd": 0.40,
+        "max_api_calls": 6,
+        "max_tokens": 448_000,
+        "max_iterations": 2,
+        "apply": False,
+    }
+    prepare = agent_loop._build_pit_optimizer_v2_config(
+        SimpleNamespace(**common)
+    )
+    assert prepare == replace(
+        v2_gate,
+        phase="prepare",
+        readiness_artifact=None,
+        readiness_sha256=None,
+        authorization_window_id=None,
+        source_transmission_authorized=False,
+    )
+
+    canary = agent_loop._build_pit_optimizer_v2_config(
+        SimpleNamespace(
+            **{
+                **common,
+                "optimization_phase": "canary",
+                "readiness_sha256": v2_gate.readiness_sha256,
+                "optimizer_authorization_window_id": (
+                    v2_gate.authorization_window_id
+                ),
+                "optimizer_authorization_requirement_sha256": (
+                    v2_gate.authorization_requirement_sha256
+                ),
+                "authorize_policy_source_transmission": True,
+            }
+        )
+    )
+    assert canary == v2_gate
+
+
 def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2036,6 +2196,200 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
         )
 
 
+def test_build_subset_manifest_cli_is_exact_and_provider_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Break caught: manifest construction could widen inputs or invoke live services."""
+    import agent_loop
+    import core.pit_optimizer_authorization as authorization
+    import core.pit_optimizer_controller as controller
+    import core.pit_policy_parity as parity
+
+    inputs, _expected = _builder_fixture(tmp_path)
+    _patch_authenticated_readiness(monkeypatch, inputs)
+    git_executable = tmp_path / "git.exe"
+    docker_executable = tmp_path / "docker.exe"
+    git_executable.write_bytes(b"synthetic executable")
+    docker_executable.write_bytes(b"synthetic executable")
+    output = tmp_path / "optimizer-manifest-cli.json"
+    events: list[str] = []
+    seen: dict[str, object] = {}
+    original_build = contract.build_subset_manifest
+    original_write = contract.write_optimizer_manifest
+    original_command = contract.build_prepare_command
+
+    def build(**kwargs: object) -> contract.PitOptimizerRunManifest:
+        events.append("build")
+        seen["build"] = kwargs
+        return original_build(**kwargs)
+
+    def write(
+        manifest: contract.PitOptimizerRunManifest,
+        path: Path,
+    ) -> tuple[Path, str]:
+        events.append("write")
+        seen["output"] = path
+        return original_write(manifest, path)
+
+    def command(
+        manifest: contract.PitOptimizerRunManifest,
+        **kwargs: object,
+    ) -> str:
+        events.append("command")
+        seen["command"] = kwargs
+        return original_command(manifest, **kwargs)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("provider, replay, grant, or hidden evaluation was invoked")
+
+    monkeypatch.setattr(contract, "build_subset_manifest", build)
+    monkeypatch.setattr(contract, "write_optimizer_manifest", write)
+    monkeypatch.setattr(contract, "build_prepare_command", command)
+    monkeypatch.setattr(agent_loop.OpenRouterGateway, "__init__", forbidden)
+    monkeypatch.setattr(
+        authorization.AuthorizationLedger,
+        "record_grant_and_window",
+        forbidden,
+    )
+    monkeypatch.setattr(parity, "capture_parity_reference", forbidden)
+    monkeypatch.setattr(parity, "verify_parity_reference", forbidden)
+    monkeypatch.setattr(controller, "_run_hidden_once", forbidden)
+
+    result = evaluation.main(
+        [
+            "build-subset-manifest",
+            "--readiness",
+            str(inputs["legacy_readiness_path"]),
+            "--verified-parity",
+            str(inputs["verified_parity_path"]),
+            "--pit-bundle",
+            str(inputs["pit_bundle"]),
+            "--baseline-run",
+            str(inputs["baseline_run"]),
+            "--source-root",
+            str(inputs["source_root"]),
+            "--permanent-runtime-root",
+            str(inputs["permanent_runtime_root"]),
+            "--controller-temp-parent",
+            str(inputs["controller_temp_parent"]),
+            "--artifact-root",
+            str(inputs["artifact_root"]),
+            "--git-executable",
+            str(git_executable),
+            "--docker-executable",
+            str(docker_executable),
+            "--sandbox-image",
+            str(inputs["sandbox_image"]),
+            "--iterations",
+            "2",
+            "--investigator-static-bytes",
+            "8000",
+            "--investigator-dynamic-bytes",
+            "80000",
+            "--investigator-input-tokens",
+            "88000",
+            "--investigator-output-tokens",
+            "4000",
+            "--investigator-response-bytes",
+            "8192",
+            "--investigator-max-usd",
+            "0.05",
+            "--author-static-bytes",
+            "12000",
+            "--author-dynamic-bytes",
+            "76000",
+            "--author-input-tokens",
+            "88000",
+            "--author-output-tokens",
+            "8000",
+            "--author-response-bytes",
+            "16384",
+            "--author-max-usd",
+            "0.10",
+            "--critic-static-bytes",
+            "8000",
+            "--critic-dynamic-bytes",
+            "24000",
+            "--critic-input-tokens",
+            "32000",
+            "--critic-output-tokens",
+            "4000",
+            "--critic-response-bytes",
+            "8192",
+            "--critic-max-usd",
+            "0.05",
+            "--max-files",
+            "3",
+            "--max-hunks",
+            "12",
+            "--max-changed-lines",
+            "80",
+            "--max-diff-bytes",
+            "8192",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    assert events == ["build", "write", "command"]
+    built = seen["build"]
+    assert isinstance(built, dict)
+    assert built == {
+        **inputs,
+        "call_budgets": _call_budgets(),
+        "candidate_bounds": contract.PatchBounds(3, 12, 80, 8 * 1024),
+        "max_iterations": 2,
+    }
+    assert seen["output"] == output.resolve()
+    manifest_bytes = output.read_bytes()
+    manifest_value = json.loads(manifest_bytes)
+    assert len(manifest_value["call_budgets"]) == 6
+    assert sum(
+        item["max_input_tokens"] + item["max_output_tokens"]
+        for item in manifest_value["call_budgets"]
+    ) == 448_000
+    assert sum(item["max_usd"] for item in manifest_value["call_budgets"]) == pytest.approx(
+        0.40
+    )
+    assert manifest_value["policy_source_scope"]["editable_paths"] == list(
+        contract.PolicySourceScope(
+            **{
+                **manifest_value["policy_source_scope"],
+                "initial_policy_source_sha256s": tuple(
+                    tuple(item)
+                    for item in manifest_value["policy_source_scope"][
+                        "initial_policy_source_sha256s"
+                    ]
+                ),
+                "editable_paths": tuple(
+                    manifest_value["policy_source_scope"]["editable_paths"]
+                ),
+                "hard_patch_bounds": contract.PatchBounds(
+                    **manifest_value["policy_source_scope"]["hard_patch_bounds"]
+                ),
+                "candidate_bounds": contract.PatchBounds(
+                    **manifest_value["policy_source_scope"]["candidate_bounds"]
+                ),
+            }
+        ).editable_paths
+    )
+    stdout = capsys.readouterr().out.splitlines()
+    assert tuple(line.split("=", 1)[0] for line in stdout) == (
+        "PIT_OPTIMIZER_MANIFEST",
+        "PIT_OPTIMIZER_PREPARE_COMMAND",
+    )
+    emitted = json.loads(stdout[0].split("=", 1)[1])
+    assert emitted["manifest"] == manifest_value
+    assert emitted["authorization"] == {
+        "max_calls": 6,
+        "max_tokens": 448_000,
+        "max_usd": 0.40,
+    }
+
+
 def test_manifest_builder_rejects_fabricated_non_git_source_identity(
     tmp_path: Path,
 ) -> None:
@@ -2118,11 +2472,26 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
             optimizer_manifest=parity_mismatch_path,
             optimizer_manifest_sha256=parity_mismatch.sha256,
         ).validate()
+    readiness_path = Path(inputs["artifact_root"]) / (
+        f"{manifest.run_id}.readiness.json"
+    )
+    readiness_path.write_bytes(
+        _canonical_file_bytes(
+            {
+                "schema_version": 2,
+                "manifest": asdict(manifest),
+                "manifest_sha256": manifest.sha256,
+                "parity": {},
+                "baseline_discovery": {},
+                "provider_seed": {},
+            }
+        )
+    )
     run_gate = replace(
         gate,
-        phase="run",
-        readiness_artifact=inputs["legacy_readiness_path"],
-        readiness_sha256=manifest.legacy_readiness_sha256,
+        phase="canary",
+        readiness_artifact=readiness_path,
+        readiness_sha256=hashlib.sha256(readiness_path.read_bytes()).hexdigest(),
         authorization_window_id=manifest.authorization_requirement.window_id,
         source_transmission_authorized=True,
     )
@@ -2161,10 +2530,11 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
         sandbox_image=inputs["sandbox_image"],
     )
 
-    assert "core.pit_optimization prepare-v2" in command
+    assert "agent_loop.py" in command
+    assert "--gate pit_optimizer" in command
+    assert "--optimization-phase prepare" in command
     for value in (
         manifest.sha256,
-        manifest.legacy_readiness_sha256,
         manifest.parity_attestation_sha256,
         manifest.pit_bundle_sha256,
         manifest.baseline_manifest_sha256,
@@ -2175,7 +2545,7 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
     ):
         assert value in command
     assert "authorization-window" not in command
-    assert "source-transmission-authorized" not in command
+    assert "authorize-policy-source-transmission" not in command
     assert "credential" not in command.lower()
 
 
@@ -2559,6 +2929,33 @@ def _task6_authorized_ledger(
         operator_approval_reference=f"approval-{grant_id}",
     )
     return AuthorizationLedger(ledger_path, manifest), ledger_path, window
+
+
+def test_pit_optimizer_v2_authorization_window_query_is_read_only(
+    tmp_path: Path,
+    v2_manifest: contract.PitOptimizerRunManifest,
+) -> None:
+    """The live builder authenticates authority without reading private records."""
+    from core.pit_optimizer_authorization import AuthorizationError
+
+    ledger, ledger_path, window = _task6_authorized_ledger(tmp_path, v2_manifest)
+    before = ledger_path.read_bytes()
+
+    authenticated = ledger.authenticate_window(
+        window_id=window.window_id,
+        authorization_requirement_sha256=(
+            v2_manifest.authorization_requirement.sha256
+        ),
+    )
+
+    assert authenticated == window
+    assert ledger_path.read_bytes() == before
+    with pytest.raises(AuthorizationError, match="requirement mismatch"):
+        ledger.authenticate_window(
+            window_id=window.window_id,
+            authorization_requirement_sha256="f" * 64,
+        )
+    assert ledger_path.read_bytes() == before
 
 
 def test_pit_optimizer_v2_frozen_pricing_has_one_canonical_decimal_identity() -> None:
@@ -9757,3 +10154,200 @@ def test_worker_protocol_json_line_policy_client_dispatches_and_closes_once() ->
     client.close()
     client.close()
     assert session.closed == 1
+
+
+def test_policy_worker_docker_smoke(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Run one synthetic policy package in the pinned, networkless worker."""
+    import agent_loop
+    from core.strategy_policy.contracts import CapacityDecision, CapacitySnapshot
+    from core.strategy_policy.worker import PolicyDeterminismProbe
+
+    if request.config.option.keyword != "policy_worker_docker_smoke":
+        pytest.skip("Docker smoke runs only through its prescribed exact selector")
+    image = (
+        "localhost/rs-agent-loop@sha256:"
+        "7ecfb4ebb3b327940bef347e4c82e82fb4a0e8b40fc63b92b2536fe8c83acf1c"
+    )
+    docker_value = shutil.which("docker")
+    if docker_value is None and os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidate = (
+                Path(local_app_data)
+                / "Programs"
+                / "DockerDesktop"
+                / "resources"
+                / "bin"
+                / "docker.exe"
+            )
+            if candidate.is_file():
+                docker_value = str(candidate)
+    if docker_value is None:
+        pytest.skip("Docker executable is unavailable for the policy-worker smoke")
+    docker = Path(docker_value).resolve()
+
+    docker_config = tmp_path / "docker-smoke-config"
+    docker_temp = tmp_path / "docker-smoke-temp"
+    docker_home = tmp_path / "docker-smoke-home"
+    for directory in (docker_config, docker_temp, docker_home):
+        directory.mkdir()
+    allowed = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
+    if os.name == "nt":
+        allowed.add("SYSTEMDRIVE")
+    environment = agent_loop._canonical_environment(os.environ, allowed)
+    environment.update(
+        {
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(docker_home),
+            "USERPROFILE": str(docker_home),
+            "TEMP": str(docker_temp),
+            "TMP": str(docker_temp),
+        }
+    )
+    version = agent_loop._bounded_process(
+        (str(docker), "version", "--format", "{{json .}}"),
+        env=environment,
+        timeout=15.0,
+        output_limit=64 * 1024,
+    )
+    if version.timed_out or version.returncode != 0:
+        pytest.skip("Docker daemon is unavailable for the policy-worker smoke")
+    image_check = agent_loop._bounded_process(
+        (str(docker), "image", "inspect", image),
+        env=environment,
+        timeout=15.0,
+        output_limit=64 * 1024,
+    )
+    if image_check.timed_out or image_check.returncode != 0:
+        pytest.skip("Pinned policy-worker image is unavailable; no pull was attempted")
+
+    source_root = Path(__file__).resolve().parents[1]
+    controller_root = (tmp_path / "controller").resolve()
+    runtime_root = (tmp_path / "runtime").resolve()
+    controller_root.mkdir()
+    runtime_root.mkdir()
+    policy_root = (tmp_path / "synthetic-policy").resolve()
+    for name in ("entry.py", "risk.py", "exit.py"):
+        target = policy_root / "core" / "strategy_policy" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_root / "core" / "strategy_policy" / name, target)
+    (policy_root / "credentials.env").write_text(
+        "SYNTHETIC_TOKEN=must-not-be-mounted\n",
+        encoding="utf-8",
+    )
+    (policy_root / "pit.sqlite3").write_bytes(b"synthetic sealed data")
+
+    capability = agent_loop.configure_docker_executable(
+        docker,
+        source_root=source_root,
+        controller_root=controller_root,
+        permanent_runtime_root=runtime_root,
+    )
+    runner = agent_loop.PolicyWorkerRunner(
+        image=image,
+        engine=capability,
+        temp_parent=controller_root,
+    )
+    repeated = CapacitySnapshot(None, 25, 0, 3, 1.0, False)
+    unrelated = CapacitySnapshot(5, 25, 2, 1, 0.5, True)
+    client = None
+    session = None
+    container_id = None
+    package_parent = None
+    try:
+        client = runner.client_factory(
+            candidate_root=policy_root,
+            interface_version=1,
+            fold_run_id="synthetic_smoke",
+            determinism_probes=(
+                PolicyDeterminismProbe(
+                    "recommend_capacity",
+                    repeated,
+                    unrelated,
+                ),
+            ),
+        )()
+        session = client._session
+        daemon = session._daemon
+        container_id = daemon.container_id
+        package_parent = session.package_root.parent
+        inspect = agent_loop._bounded_process(
+            (str(docker), "inspect", container_id),
+            env=environment,
+            timeout=15.0,
+            output_limit=64 * 1024,
+        )
+        if inspect.timed_out or inspect.returncode != 0:
+            raise AssertionError("task-created policy worker could not be inspected")
+        payload = json.loads(inspect.stdout)
+        if type(payload) is not list or len(payload) != 1:
+            raise AssertionError("task-created policy worker inspection is malformed")
+        item = payload[0]
+        host = item.get("HostConfig")
+        config = item.get("Config")
+        mounts = item.get("Mounts")
+        if not isinstance(host, dict) or not isinstance(config, dict):
+            raise AssertionError("task-created policy worker inspection is incomplete")
+        if (
+            host.get("NetworkMode") != "none"
+            or host.get("ReadonlyRootfs") is not True
+            or host.get("Memory") > 1024 * 1024 * 1024
+            or host.get("NanoCpus") > 1_000_000_000
+            or host.get("PidsLimit") > 32
+            or host.get("CapDrop") != ["ALL"]
+            or host.get("SecurityOpt") != ["no-new-privileges"]
+            or config.get("User") != "65532:65532"
+        ):
+            raise AssertionError("task-created policy worker limits are not closed")
+        if (
+            type(mounts) is not list
+            or len(mounts) != 1
+            or mounts[0].get("Type") != "bind"
+            or mounts[0].get("Destination") != "/workspace/policy"
+            or mounts[0].get("RW") is not False
+            or Path(mounts[0].get("Source", "")).resolve()
+            != session.package_root.resolve()
+        ):
+            raise AssertionError("task-created policy worker mount allowlist differs")
+        mounted_text = json.dumps(mounts, sort_keys=True)
+        if (
+            str(policy_root) in mounted_text
+            or "credentials.env" in mounted_text
+            or "pit.sqlite3" in mounted_text
+        ):
+            raise AssertionError("task-created policy worker received a forbidden mount")
+        decision = client.recommend_capacity(repeated)
+        if decision != CapacityDecision(None, False):
+            raise AssertionError("synthetic policy worker output is not deterministic")
+    finally:
+        if client is not None:
+            client.close()
+        if container_id is not None:
+            absence = agent_loop._bounded_process(
+                (
+                    str(docker),
+                    "container",
+                    "ls",
+                    "--all",
+                    "--quiet",
+                    "--no-trunc",
+                    "--filter",
+                    f"id={container_id}",
+                ),
+                env=environment,
+                timeout=15.0,
+                output_limit=64 * 1024,
+            )
+            if (
+                absence.timed_out
+                or absence.returncode != 0
+                or absence.stdout.strip()
+            ):
+                raise AssertionError("task-created policy worker cleanup is incomplete")
+        if package_parent is not None and package_parent.exists():
+            raise AssertionError("task-created policy package cleanup is incomplete")
+        if session is not None and session._process.poll() is None:
+            raise AssertionError("task-created policy process cleanup is incomplete")

@@ -188,6 +188,366 @@ def test_task3_state_and_terminal_status_values_are_closed() -> None:
     )
 
 
+def test_pit_optimizer_v2_config_parser_has_a_separate_closed_route(
+    tmp_path: Path,
+) -> None:
+    """Break caught: schema v2 could overwrite the legacy optimization route."""
+    import agent_loop
+
+    absolute = tmp_path.resolve()
+    namespace = agent_loop.build_parser().parse_args(
+        [
+            "--repo-root",
+            str(absolute),
+            "--permanent-runtime-root",
+            str(absolute),
+            "--git-executable",
+            str(absolute / "git.exe"),
+            "--controller-temp-parent",
+            str(absolute),
+            "--artifact-root",
+            str(absolute),
+            "--docker-executable",
+            str(absolute / "docker.exe"),
+            "--sandbox-image",
+            "example.invalid/worker@sha256:" + "1" * 64,
+            "--gate",
+            "pit_optimizer",
+            "--optimization-phase",
+            "prepare",
+            "--optimizer-manifest",
+            str(absolute / "manifest.json"),
+            "--optimizer-manifest-sha256",
+            "2" * 64,
+            "--verified-parity",
+            str(absolute / "parity.json"),
+            "--verified-parity-sha256",
+            "3" * 64,
+            "--optimizer-authorization-requirement-sha256",
+            "4" * 64,
+            "--max-usd",
+            "0.40",
+        ]
+    )
+
+    assert namespace.gate == "pit_optimizer"
+    assert namespace.optimizer_manifest == absolute / "manifest.json"
+    assert namespace.verified_parity == absolute / "parity.json"
+    assert namespace.optimizer_authorization_requirement_sha256 == "4" * 64
+    assert namespace.authorize_policy_source_transmission is False
+    assert "pit_optimization" in agent_loop.build_parser()._option_string_actions[
+        "--gate"
+    ].choices
+
+
+@pytest.fixture
+def v2_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """Provide a structurally real gate while isolating dispatch from file validation."""
+    from core.pit_optimization_contract import PitOptimizerGateConfig
+
+    monkeypatch.setattr(PitOptimizerGateConfig, "validate", lambda _self: None)
+    return PitOptimizerGateConfig(
+        phase="canary",
+        baseline_run=tmp_path / "baseline",
+        baseline_manifest_sha256="1" * 64,
+        pit_bundle=tmp_path / "pit.sqlite3",
+        pit_bundle_sha256="2" * 64,
+        effective_policy_sha256="3" * 64,
+        optimizer_manifest=tmp_path / "manifest.json",
+        optimizer_manifest_sha256="4" * 64,
+        verified_parity_artifact=tmp_path / "parity.json",
+        verified_parity_sha256="5" * 64,
+        readiness_artifact=tmp_path / "readiness.json",
+        readiness_sha256="6" * 64,
+        authorization_window_id="window_test",
+        authorization_requirement_sha256="7" * 64,
+        source_transmission_authorized=True,
+        max_usd=0.40,
+        max_api_calls=6,
+        max_tokens=448_000,
+        max_iterations=2,
+        apply=False,
+        source_root=tmp_path / "source",
+        permanent_runtime_root=tmp_path / "runtime",
+        controller_temp_parent=tmp_path / "controller",
+        artifact_root=tmp_path / "artifacts",
+        git_executable=tmp_path / "git.exe",
+        docker_executable=tmp_path / "docker.exe",
+        sandbox_image="example.invalid/worker@sha256:" + "8" * 64,
+    )
+
+
+def test_prepare_dispatch_never_builds_live_services(v2_gate: Any) -> None:
+    """Break caught: provider capabilities could be constructed before phase dispatch."""
+    import agent_loop
+
+    readiness = object()
+    events: list[str] = []
+    result = agent_loop._dispatch_pit_optimizer_v2(
+        replace(v2_gate, phase="prepare"),
+        prepare=lambda _config: events.append("prepare") or readiness,
+        build_live_services=lambda _config: pytest.fail(
+            "prepare constructed live services"
+        ),
+    )
+    assert result is readiness
+    assert events == ["prepare"]
+
+
+def test_canary_dispatch_authenticates_and_preflights_before_controller(
+    v2_gate: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a lease or controller could run before the whole plan fits."""
+    import agent_loop
+    import core.pit_optimization as optimization
+    from core.pit_optimization_contract import PIT_OPTIMIZER_R1_MODEL
+
+    events: list[str] = []
+    plans = tuple(
+        SimpleNamespace(call_index=index, model=PIT_OPTIMIZER_R1_MODEL)
+        for index in range(1, 7)
+    )
+    readiness = SimpleNamespace(
+        manifest=SimpleNamespace(
+            model=PIT_OPTIMIZER_R1_MODEL,
+            call_budgets=plans,
+        )
+    )
+    pricing = object()
+    lease = object()
+    optimizer_services = object()
+    expected = object()
+
+    def authenticate(config: Any, supplied: Any) -> None:
+        assert config.source_transmission_authorized is True
+        assert config.authorization_window_id == "window_test"
+        assert supplied is readiness
+        events.append("authenticate")
+
+    def freeze(model: str) -> object:
+        assert model == PIT_OPTIMIZER_R1_MODEL
+        events.append("freeze")
+        return pricing
+
+    def preflight(plan: Any, supplied: object) -> None:
+        assert supplied is pricing
+        events.append(f"preflight-{plan.call_index}")
+
+    def open_lease(config: Any, supplied: Any, frozen: object) -> object:
+        assert config is v2_gate
+        assert supplied is readiness
+        assert frozen is pricing
+        events.append("lease")
+        return lease
+
+    def build_services(
+        supplied: Any,
+        frozen: object,
+        opened: object,
+    ) -> object:
+        assert supplied is readiness
+        assert frozen is pricing
+        assert opened is lease
+        events.append("services")
+        return optimizer_services
+
+    def run(*, readiness: Any, services: object) -> object:
+        assert readiness is globals_readiness
+        assert services is optimizer_services
+        events.append("controller")
+        return expected
+
+    globals_readiness = readiness
+    monkeypatch.setattr(optimization, "run_pit_optimizer_v2", run)
+
+    result = agent_loop._dispatch_pit_optimizer_v2(
+        v2_gate,
+        prepare=lambda _config: pytest.fail("canary used prepare"),
+        build_live_services=lambda config: (
+            agent_loop._preauthorize_pit_optimizer_v2_live_run(
+                config,
+                readiness=readiness,
+                authenticate=authenticate,
+                freeze_pricing=freeze,
+                preflight_call=preflight,
+                open_run_lease=open_lease,
+                build_services=build_services,
+            )
+        ),
+    )
+
+    assert result is expected
+    assert events == [
+        "authenticate",
+        "freeze",
+        "preflight-1",
+        "preflight-2",
+        "preflight-3",
+        "preflight-4",
+        "preflight-5",
+        "preflight-6",
+        "lease",
+        "services",
+        "controller",
+    ]
+
+
+def test_pit_optimizer_v2_prepare_lines_seal_exact_canary_command(
+    v2_gate: Any,
+) -> None:
+    """Break caught: the handoff could omit authority or widen the sealed ceilings."""
+    import agent_loop
+    from core.pit_optimizer_controller import PitOptimizerReadiness
+
+    artifact_root = v2_gate.artifact_root
+    assert artifact_root is not None
+    artifact_root.mkdir()
+    readiness_path = artifact_root / "run_test.readiness.json"
+    readiness_path.write_bytes(b"synthetic readiness\n")
+    readiness = object.__new__(PitOptimizerReadiness)
+    manifest = SimpleNamespace(
+        run_id="run_test",
+        authorization_requirement=SimpleNamespace(
+            window_id="window_test",
+            sha256=v2_gate.authorization_requirement_sha256,
+        ),
+    )
+    for name, value in (
+        ("schema_version", 2),
+        ("manifest", manifest),
+        ("manifest_sha256", v2_gate.optimizer_manifest_sha256),
+        ("readiness_sha256", hashlib.sha256(readiness_path.read_bytes()).hexdigest()),
+        ("artifact_path", readiness_path.resolve()),
+        ("parity", object()),
+        ("baseline_discovery", object()),
+        ("provider_seed", object()),
+    ):
+        object.__setattr__(readiness, name, value)
+
+    lines = agent_loop._pit_optimizer_v2_prepare_lines(
+        replace(
+            v2_gate,
+            phase="prepare",
+            readiness_artifact=None,
+            readiness_sha256=None,
+            authorization_window_id=None,
+            source_transmission_authorized=False,
+        ),
+        readiness,
+    )
+
+    assert lines[0].startswith("PIT_OPTIMIZER_READY=")
+    assert lines[1].startswith("PIT_OPTIMIZER_CANARY_COMMAND=")
+    command = lines[1].split("=", 1)[1]
+    for fragment in (
+        "--gate pit_optimizer",
+        "--optimization-phase canary",
+        "--authorize-policy-source-transmission",
+        "--max-api-calls 6",
+        "--max-tokens 448000",
+        "--max-usd 0.40",
+        "--max-iterations 2",
+        v2_gate.optimizer_manifest_sha256,
+        readiness.readiness_sha256,
+        v2_gate.verified_parity_sha256,
+        v2_gate.authorization_requirement_sha256,
+        "window_test",
+    ):
+        assert fragment in command
+    assert "--apply" not in command
+
+    foreign_path = artifact_root / "foreign.readiness.json"
+    foreign_path.write_bytes(readiness_path.read_bytes())
+    object.__setattr__(readiness, "artifact_path", foreign_path.resolve())
+    with pytest.raises(agent_loop.ConfigurationError, match="derived readiness"):
+        agent_loop._pit_optimizer_v2_prepare_lines(
+            replace(
+                v2_gate,
+                phase="prepare",
+                readiness_artifact=None,
+                readiness_sha256=None,
+                authorization_window_id=None,
+                source_transmission_authorized=False,
+            ),
+            readiness,
+        )
+
+
+def test_pit_optimizer_v2_summary_excludes_provider_content_and_raw_hashes(
+    tmp_path: Path,
+) -> None:
+    """Break caught: the user summary could leak opaque identities or provider data."""
+    import agent_loop
+    from core.pit_optimizer_controller import (
+        OptimizerBudgetSummary,
+        PitOptimizerResult,
+    )
+
+    result = PitOptimizerResult(
+        schema_version=2,
+        phase="canary",
+        status="discovery_complete",
+        terminal_code="iteration_limit",
+        terminal_detail=None,
+        exit_code=0,
+        run_id="run_summary",
+        readiness_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        iterations_started=2,
+        iterations_completed=2,
+        valid_evaluations=2,
+        incumbent_updates=1,
+        non_improving_streak=1,
+        discovery_winner=SimpleNamespace(
+            changed_paths=("core/strategy_policy/entry.py",),
+            changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
+            identity_sha256="c" * 64,
+        ),
+        hidden_validation_opened=False,
+        validation_reservation_sha256=None,
+        long_replay_eligible=None,
+        budget=OptimizerBudgetSummary(6, 100, 50, 150, 0.25, 0, 0.0, 0),
+        artifact_root=tmp_path.resolve(),
+        artifact_paths=(),
+        source_modified=False,
+        cleanup_complete=True,
+    )
+
+    summary = agent_loop._pit_optimizer_v2_summary(result)
+
+    assert set(summary) == {
+        "schema_version",
+        "phase",
+        "status",
+        "terminal_code",
+        "exit_code",
+        "run_id",
+        "iterations_started",
+        "iterations_completed",
+        "valid_evaluations",
+        "incumbent_updates",
+        "incumbent",
+        "hidden_validation_opened",
+        "long_replay_eligible",
+        "budget",
+        "artifact_root",
+        "source_modified",
+        "cleanup_complete",
+    }
+    assert summary["incumbent"] == {
+        "changed_paths": ["core/strategy_policy/entry.py"],
+        "changed_symbols": ["core.strategy_policy.entry.evaluate_entry"],
+    }
+    encoded = json.dumps(summary, sort_keys=True)
+    assert result.manifest_sha256 not in encoded
+    assert result.readiness_sha256 not in encoded
+    assert result.discovery_winner.identity_sha256 not in encoded
+
+
 def _task5_raw_patch(
     *,
     path: str,
@@ -436,7 +796,7 @@ class _Task5FakeDockerControl:
             self.stored_owner = (
                 "0" * 64 if self.stored_owner_mismatch else self.owner
             )
-            self.image = args[-5]
+            self.image = args[args.index("--workdir") + 2]
             self.exists = True
             if self.raise_after_create is not None:
                 raise self.raise_after_create
@@ -694,6 +1054,10 @@ def test_policy_daemon_cleanup_checks_status_and_exact_id(
             failure_kind,
         )
     }
+    if operation == "kill" and failure_kind == "nonzero":
+        # A worker may consume EOF and stop before the force-cleanup command.
+        # Successful force-removal plus exact-ID absence is terminal proof.
+        expected = set()
     if operation == "rm":
         expected.add(("cleanup", "daemon_absence_verify", "present"))
     assert {
@@ -873,7 +1237,8 @@ def test_policy_worker_command_mount_allowlist_and_cleanup_use_only_fakes(
     for option, value in required_pairs:
         index = create.index(option)
         assert create[index + 1] == value
-    assert create[-4:] == ("python", "-B", "-m", "core.strategy_policy.worker")
+    assert create[create.index("--entrypoint") + 1] == "python"
+    assert create[-3:] == ("-B", "-m", "core.strategy_policy.worker")
     mount = create[create.index("--mount") + 1]
     assert mount.endswith(",dst=/workspace/policy,readonly")
     package_root = Path(mount.split(",src=", 1)[1].split(",dst=", 1)[0])
@@ -904,6 +1269,8 @@ def test_policy_worker_command_mount_allowlist_and_cleanup_use_only_fakes(
     environment = kwargs["env"]
     assert isinstance(environment, dict)
     assert "OPENROUTER_API_KEY" not in environment
+    if os.name == "nt":
+        assert environment["SYSTEMDRIVE"] == os.environ["SYSTEMDRIVE"]
     assert runner.method_timeout_seconds == 1.0
     assert runner.fold_timeout_seconds == 900.0
     assert create[create.index("--env") + 1] == "PYTHONHASHSEED=0"
