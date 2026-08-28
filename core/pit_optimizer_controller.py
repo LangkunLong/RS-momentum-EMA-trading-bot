@@ -32,11 +32,13 @@ from core.pit_optimization_contract import (
     _CANDIDATE_COMPARISON_SEAL,
     _VALIDATION_FAILURE_FLAGS,
     _pit_optimizer_manifest_from_primitive,
+    render_worst_iteration_two_role_inputs,
 )
 from core.pit_optimizer_artifacts import canonical_json_bytes, write_create_only_json
 from core.pit_optimizer_authorization import (
     AuthorizationRunLease,
     FrozenModelPricing,
+    PitOptimizerProviderFacts,
     PitOptimizerRoleCall,
 )
 from core.pit_optimizer_candidate import (
@@ -52,10 +54,12 @@ from core.pit_optimizer_evaluation import (
     DiscoveryEvaluation,
     FoldAggregateSummary,
     HiddenEvaluation,
+    HiddenEvaluationAttestation,
     HoldoutDecision,
     PitOptimizerCleanup,
     ValidationExposureMetadata,
     ValidationLedger,
+    ValidationOutcomeProof,
     ValidationReservation,
     ValidationWindowIdentity,
     discovery_score_from_folds,
@@ -134,6 +138,15 @@ class OptimizerBudgetSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProviderAttemptRecord:
+    """Closed facts for one authorized attempt, with a payload only on acceptance."""
+
+    plan: PitOptimizerCallBudget
+    facts: PitOptimizerProviderFacts
+    payload_sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class PitOptimizerServices:
     freeze_pricing: Callable[[str], FrozenModelPricing]
     open_run_lease: Callable[[PitOptimizerReadiness, FrozenModelPricing], AuthorizationRunLease]
@@ -148,6 +161,10 @@ class PitOptimizerServices:
         ],
         PitOptimizerRoleCall,
     ]
+    recover_role_attempt: Callable[
+        [PitOptimizerCallBudget, AuthorizationRunLease],
+        PitOptimizerProviderFacts,
+    ]
     create_candidate: Callable[[str | None], CandidateWorkspace]
     validate_and_apply: Callable[
         [CandidateWorkspace, AuthorArtifact, str | None], CandidateValidationOutcome
@@ -158,11 +175,17 @@ class PitOptimizerServices:
     ]
     reserve_hidden_validation: Callable[[CandidateIdentity], ValidationReservation]
     evaluate_hidden: Callable[
-        [CandidateWorkspace, CandidateIdentity, ValidationReservation], HiddenEvaluation
+        [CandidateWorkspace, CandidateIdentity, ValidationReservation],
+        HiddenEvaluationAttestation,
+    ]
+    record_hidden_outcome: Callable[
+        [ValidationReservation, bool, bool, str | None],
+        ValidationOutcomeProof,
     ]
     dispose_candidate: Callable[[CandidateWorkspace], PitOptimizerCleanup]
     verify_inputs: Callable[[PitOptimizerReadiness], None]
     cancellation_requested: Callable[[], bool]
+    prepare_iteration_artifacts: Callable[[int], Path]
     write_json_artifact: Callable[[str, Mapping[str, object]], tuple[Path, str]]
     write_diff_artifact: Callable[[str, str], tuple[Path, str]]
 
@@ -269,6 +292,7 @@ class _RunState:
     artifact_paths: list[tuple[Path, str]] = field(default_factory=list)
     artifact_root: Path | None = None
     call_records: list[PitOptimizerRoleCall] = field(default_factory=list)
+    provider_attempts: list[_ProviderAttemptRecord] = field(default_factory=list)
     iteration_workspace: CandidateWorkspace | None = None
     iteration_source_bundle: object | None = None
     prospective_source_bundle: object | None = None
@@ -281,6 +305,8 @@ class _RunState:
     hidden_validation_opened: bool = False
     validation_reservation: ValidationReservation | None = None
     hidden_evaluation: HiddenEvaluation | None = None
+    hidden_attestation: HiddenEvaluationAttestation | None = None
+    validation_outcome_proof: ValidationOutcomeProof | None = None
     evaluation_failure_code: str | None = None
     cleanup_observations: list[PitOptimizerCleanup] = field(default_factory=list)
     finalization_failures: list[str] = field(default_factory=list)
@@ -918,7 +944,7 @@ def _role_artifact(call: PitOptimizerRoleCall) -> dict[str, object]:
 
 
 def _budget_summary_from_calls(
-    calls: list[PitOptimizerRoleCall],
+    calls: list[PitOptimizerRoleCall] | list[_ProviderAttemptRecord],
 ) -> OptimizerBudgetSummary:
     facts = [item.facts for item in calls]
     return OptimizerBudgetSummary(
@@ -936,24 +962,25 @@ def _budget_summary_from_calls(
 
 
 def _current_accounting_artifact(state: _RunState) -> dict[str, object]:
-    summary = _budget_summary_from_calls(state.call_records)
+    attempts = state.provider_attempts
+    summary = _budget_summary_from_calls(attempts)
     lease = state.authorization_lease or state.lease_snapshot
     reserved_tokens = sum(
         item.plan.max_input_tokens + item.plan.max_output_tokens
-        for item in state.call_records
+        for item in attempts
     )
     reserved_usd = float(
-        sum(Decimal(str(item.plan.max_usd)) for item in state.call_records)
+        sum(Decimal(str(item.plan.max_usd)) for item in attempts)
     )
     return {
         "schema_version": 2,
         "call_records": [
             {
                 "plan": item.plan.to_primitive(),
-                "payload_sha256": _payload_sha256(item.payload),
+                "payload_sha256": item.payload_sha256,
                 "facts": asdict(item.facts),
             }
-            for item in state.call_records
+            for item in attempts
         ],
         "authorized_totals": {
             "calls": 0 if lease is None else lease.max_calls,
@@ -961,7 +988,7 @@ def _current_accounting_artifact(state: _RunState) -> dict[str, object]:
             "usd": 0.0 if lease is None else lease.max_usd,
         },
         "reserved_totals": {
-            "calls": len(state.call_records),
+            "calls": len(attempts),
             "tokens": reserved_tokens,
             "usd": reserved_usd,
         },
@@ -978,9 +1005,51 @@ def _current_accounting_artifact(state: _RunState) -> dict[str, object]:
             "retained_usd": summary.retained_reservation_usd,
         },
         "audit_chain_head": (
-            "0" * 64 if not state.call_records else state.call_records[-1].facts.audit_sha256
+            "0" * 64 if not attempts else attempts[-1].facts.audit_sha256
         ),
     }
+
+
+def _validate_attempt_facts(
+    state: _RunState,
+    plan: PitOptimizerCallBudget,
+    facts: PitOptimizerProviderFacts,
+) -> None:
+    if not isinstance(facts, PitOptimizerProviderFacts):
+        raise AuditFailure("provider attempt recovery did not return closed facts")
+    if (
+        facts.call_index,
+        facts.iteration,
+        facts.role,
+        facts.requested_model,
+    ) != (plan.call_index, plan.iteration, plan.role, plan.model):
+        raise AuditFailure("provider attempt facts differ from the authorized plan")
+    pricing = state.frozen_pricing
+    if pricing is None or facts.frozen_pricing_sha256 != pricing.pricing_sha256:
+        raise AuditFailure("provider attempt facts differ from frozen pricing")
+
+
+def _record_provider_attempt(
+    state: _RunState,
+    services: PitOptimizerServices,
+    plan: PitOptimizerCallBudget,
+    facts: PitOptimizerProviderFacts,
+    *,
+    payload_sha256: str | None,
+) -> None:
+    _validate_attempt_facts(state, plan, facts)
+    if any(item.plan.call_index == plan.call_index for item in state.provider_attempts):
+        raise AuditFailure("provider attempt was recorded more than once")
+    state.provider_attempts.append(_ProviderAttemptRecord(plan, facts, payload_sha256))
+    _replace_accounting_artifact(state, services)
+
+
+def _raise_failed_attempt(facts: PitOptimizerProviderFacts) -> None:
+    if not facts.accounting_complete:
+        raise ProviderAccountingFailure("provider accounting is incomplete")
+    if facts.outcome == "budget_exceeded":
+        raise AuthorizationExhausted("provider exceeded the authorized call budget")
+    raise ProviderProtocolFailure("provider role attempt failed closed validation")
 
 
 def _replace_accounting_artifact(
@@ -1012,13 +1081,24 @@ def _call_role(
         require_source_context_fit(role_input=role_input, role_budget=plan)
     except ValueError as exc:
         raise ContextBudgetExhausted("context_budget_exhausted") from exc
-    call = services.call_role(
-        plan,
-        role_input,
-        parser,
-        state.authorization_lease,
-        state.frozen_pricing,
-    )
+    try:
+        call = services.call_role(
+            plan,
+            role_input,
+            parser,
+            state.authorization_lease,
+            state.frozen_pricing,
+        )
+    except BaseException:
+        facts = services.recover_role_attempt(plan, state.authorization_lease)
+        _record_provider_attempt(
+            state,
+            services,
+            plan,
+            facts,
+            payload_sha256=None,
+        )
+        _raise_failed_attempt(facts)
     if not isinstance(call, PitOptimizerRoleCall) or call.plan != plan:
         raise ProviderProtocolFailure("provider returned a mismatched role call")
     try:
@@ -1030,7 +1110,13 @@ def _call_role(
     except (AttributeError, TypeError, ValueError) as exc:
         raise ProviderProtocolFailure("provider role artifact failed closed validation") from exc
     state.call_records.append(call)
-    _replace_accounting_artifact(state, services)
+    _record_provider_attempt(
+        state,
+        services,
+        plan,
+        call.facts,
+        payload_sha256=_payload_sha256(call.payload),
+    )
     return call
 
 
@@ -1058,12 +1144,38 @@ def _incumbent_summary(state: _RunState) -> IncumbentSummary:
     )
 
 
-def _run_investigator(
+def _require_complete_iteration_context(
+    readiness: PitOptimizerReadiness,
+    source_bundle: object,
+) -> None:
+    """Prove all three worst-case role inputs fit before any iteration call."""
+
+    files = getattr(source_bundle, "files", None)
+    if type(files) is not tuple:
+        raise IdentityDrift("iteration source bundle is not closed")
+    source_texts = {
+        getattr(item, "path", ""): getattr(item, "text", None) for item in files
+    }
+    if any(not isinstance(value, str) for value in source_texts.values()):
+        raise IdentityDrift("iteration source bundle text is invalid")
+    try:
+        render_worst_iteration_two_role_inputs(
+            scope=readiness.manifest.policy_source_scope,
+            source_texts=source_texts,  # type: ignore[arg-type]
+            immutable_constraint_ids=readiness.manifest.immutable_constraint_ids,
+            call_budgets=readiness.manifest.call_budgets,
+            prospective_source_bundle=source_bundle,  # type: ignore[arg-type]
+        )
+    except ValueError as exc:
+        raise ContextBudgetExhausted("context_budget_exhausted") from exc
+
+
+def _prepare_iteration_source(
     readiness: PitOptimizerReadiness,
     state: _RunState,
     services: PitOptimizerServices,
-) -> PitOptimizerRoleCall:
-    if state.iteration_workspace is not None:
+) -> None:
+    if state.iteration_workspace is not None or state.iteration_source_bundle is not None:
         raise SandboxIntegrityFailure("candidate workspace is already active")
     state.evaluation_failure_code = None
     workspace = services.create_candidate(state.incumbent_cumulative_diff or None)
@@ -1076,9 +1188,25 @@ def _run_investigator(
             cumulative_diff=state.incumbent_cumulative_diff,
             policy_interface_version=readiness.manifest.policy_interface_version,
         )
+        _require_complete_iteration_context(readiness, bundle)
     except ValueError as exc:
+        if str(exc) == "next_context_oversize":
+            raise ContextBudgetExhausted("context_budget_exhausted") from exc
         raise IdentityDrift("candidate source bundle could not be authenticated") from exc
     state.iteration_source_bundle = bundle
+
+
+def _run_investigator(
+    readiness: PitOptimizerReadiness,
+    state: _RunState,
+    services: PitOptimizerServices,
+) -> PitOptimizerRoleCall:
+    if state.iteration_workspace is None and state.iteration_source_bundle is None:
+        _prepare_iteration_source(readiness, state, services)
+    workspace = state.iteration_workspace
+    bundle = state.iteration_source_bundle
+    if workspace is None or bundle is None:
+        raise SandboxIntegrityFailure("candidate iteration context is incomplete")
     role_input = InvestigatorInput(
         schema_version=2,
         iteration=state.next_iteration,
@@ -1210,6 +1338,7 @@ def _validate_iteration_candidate(
     )
     if not isinstance(outcome, CandidateValidationOutcome):
         raise SandboxIntegrityFailure("candidate validation outcome is invalid")
+    author_manifest_matches = False
     if outcome.valid:
         if outcome.failure_code is not None or outcome.identity is None:
             raise SandboxIntegrityFailure("valid candidate outcome is inconsistent")
@@ -1218,14 +1347,35 @@ def _validate_iteration_candidate(
             validate_author_manifest(author.payload, outcome.identity)  # type: ignore[arg-type]
         except ValueError as exc:
             raise IdentityDrift("author manifest differs from candidate identity") from exc
+        author_manifest_matches = True
         try:
-            state.prospective_source_bundle = build_policy_source_bundle(
+            prospective_bundle = build_policy_source_bundle(
                 candidate_root=workspace.root,
                 cumulative_diff=outcome.cumulative_diff,
                 policy_interface_version=readiness.manifest.policy_interface_version,
             )
+            _require_complete_iteration_context(readiness, prospective_bundle)
         except ValueError as exc:
-            raise IdentityDrift("validated candidate source bundle differs") from exc
+            if str(exc) == "next_context_oversize":
+                outcome = replace(
+                    outcome,
+                    valid=False,
+                    failure_code="next_context_oversize",
+                    cumulative_diff=state.incumbent_cumulative_diff,
+                    identity=None,
+                )
+            else:
+                raise IdentityDrift("validated candidate source bundle differs") from exc
+        except ContextBudgetExhausted:
+            outcome = replace(
+                outcome,
+                valid=False,
+                failure_code="next_context_oversize",
+                cumulative_diff=state.incumbent_cumulative_diff,
+                identity=None,
+            )
+        else:
+            state.prospective_source_bundle = prospective_bundle
     elif outcome.failure_code is None or outcome.identity is not None:
         raise SandboxIntegrityFailure("invalid candidate outcome is inconsistent")
     _record_artifact(
@@ -1241,7 +1391,7 @@ def _validate_iteration_candidate(
         "candidate_identity": (
             None if outcome.identity is None else outcome.identity.to_primitive()
         ),
-        "author_manifest_matches": outcome.valid,
+        "author_manifest_matches": author_manifest_matches,
         "focused_checks": _focused_checks(outcome.changed_symbols),
         "worker_attestation": {
             "attempted": outcome.valid or outcome.failure_code in {"worker_failed", "replay_failed"},
@@ -1545,10 +1695,18 @@ def _persist_iteration_decision(
         else discovery.comparison.candidate_vs_fixed_baseline
     )
 
+    prospective_valid_evaluations = state.valid_evaluations + int(rankable)
+    prospective_non_improving_streak = state.non_improving_streak
     if rankable:
-        state.valid_evaluations += 1
-        state.non_improving_streak = 0 if improves else state.non_improving_streak + 1
-
+        prospective_non_improving_streak = (
+            0 if improves else state.non_improving_streak + 1
+        )
+    prospective_incumbent_discovery = state.incumbent_discovery
+    prospective_incumbent_workspace = state.incumbent_workspace
+    prospective_incumbent_identity = state.incumbent_identity
+    prospective_incumbent_diff = state.incumbent_cumulative_diff
+    prospective_incumbent_updates = state.incumbent_updates
+    prior_workspace = state.incumbent_workspace
     if improves:
         if candidate_identity is None or candidate_workspace is None:
             raise IdentityDrift("improving candidate identity or workspace is absent")
@@ -1570,19 +1728,9 @@ def _persist_iteration_decision(
                 or actual_file_sha256s != candidate_identity.editable_file_sha256s
             ):
                 raise IdentityDrift("prospective incumbent bundle differs from identity")
-        _record_artifact(
-            state,
-            services.write_diff_artifact(
-                "incumbent.diff",
-                validation.cumulative_diff,
-            ),
-        )
-        prior_workspace = state.incumbent_workspace
-        if prior_workspace is not None and prior_workspace != candidate_workspace:
-            services.dispose_candidate(prior_workspace)
         assert discovery is not None
         candidate_folds = tuple(item.aggregate_metrics for item in discovery.folds)
-        state.incumbent_discovery = DiscoveryEvidenceSummary(
+        prospective_incumbent_discovery = DiscoveryEvidenceSummary(
             folds=candidate_folds,
             score=discovery.comparison.candidate_vs_fixed_baseline,
             evidence_ids=tuple(
@@ -1592,12 +1740,10 @@ def _persist_iteration_decision(
                 for item in candidate_folds
             ),
         )
-        state.incumbent_workspace = candidate_workspace
-        state.incumbent_identity = candidate_identity
-        state.incumbent_cumulative_diff = validation.cumulative_diff
-        state.incumbent_updates += 1
-    elif candidate_workspace is not None and candidate_workspace != state.incumbent_workspace:
-        services.dispose_candidate(candidate_workspace)
+        prospective_incumbent_workspace = candidate_workspace
+        prospective_incumbent_identity = candidate_identity
+        prospective_incumbent_diff = validation.cumulative_diff
+        prospective_incumbent_updates += 1
 
     feedback = IterationFeedbackSummary(
         iteration=state.next_iteration,
@@ -1618,7 +1764,9 @@ def _persist_iteration_decision(
         incumbent_changed=improves,
     )
     new_identity = (
-        None if state.incumbent_identity is None else state.incumbent_identity.identity_sha256
+        None
+        if prospective_incumbent_identity is None
+        else prospective_incumbent_identity.identity_sha256
     )
     _record_artifact(
         state,
@@ -1634,6 +1782,36 @@ def _persist_iteration_decision(
             },
         ),
     )
+
+    # ``decision.json`` is the authoritative transition record.  No live
+    # incumbent state or capability ownership changes before it is durable.
+    if improves:
+        _record_artifact(
+            state,
+            services.write_diff_artifact(
+                "incumbent.diff",
+                validation.cumulative_diff,
+            ),
+        )
+    state.valid_evaluations = prospective_valid_evaluations
+    state.non_improving_streak = prospective_non_improving_streak
+    state.incumbent_discovery = prospective_incumbent_discovery
+    state.incumbent_workspace = prospective_incumbent_workspace
+    state.incumbent_identity = prospective_incumbent_identity
+    state.incumbent_cumulative_diff = prospective_incumbent_diff
+    state.incumbent_updates = prospective_incumbent_updates
+    if (
+        improves
+        and prior_workspace is not None
+        and prior_workspace != candidate_workspace
+    ):
+        services.dispose_candidate(prior_workspace)
+    elif (
+        not improves
+        and candidate_workspace is not None
+        and candidate_workspace != state.incumbent_workspace
+    ):
+        services.dispose_candidate(candidate_workspace)
     state.prior_iterations = (*state.prior_iterations, feedback)
     state.iterations_completed += 1
     state.next_iteration += 1
@@ -1694,7 +1872,7 @@ def _pre_iteration_stop(
     lease = state.authorization_lease
     if lease is None:
         return "authorization_exhausted", None
-    if _budget_summary_from_calls(state.call_records).incomplete_accounting_calls:
+    if _budget_summary_from_calls(state.provider_attempts).incomplete_accounting_calls:
         raise ProviderAccountingFailure("provider accounting is incomplete")
     next_plans = tuple(
         item
@@ -1707,7 +1885,7 @@ def _pre_iteration_stop(
         "critic",
     ):
         return "authorization_exhausted", None
-    spent = _budget_summary_from_calls(state.call_records)
+    spent = _budget_summary_from_calls(state.provider_attempts)
     if lease.max_calls - spent.api_calls < 3:
         return "budget_exhausted", "call_budget_exhausted"
     required_tokens = sum(
@@ -1796,6 +1974,26 @@ def _new_run_state(readiness: PitOptimizerReadiness) -> _RunState:
     )
 
 
+def _require_hidden_outcome_proof(
+    proof: ValidationOutcomeProof,
+    reservation: ValidationReservation,
+    *,
+    attempted: bool,
+    completed: bool,
+    failure_code: str | None,
+) -> None:
+    if not isinstance(proof, ValidationOutcomeProof):
+        raise AuditFailure("hidden validation outcome proof is invalid")
+    if (
+        proof.reservation_record_sha256 != reservation.reservation_record_sha256
+        or proof.attempted is not attempted
+        or proof.completed is not completed
+        or proof.failure_code != failure_code
+        or proof.outcome_record_sha256 != proof.ledger_head_sha256
+    ):
+        raise AuditFailure("hidden validation outcome proof differs")
+
+
 def _run_hidden_once(
     readiness: PitOptimizerReadiness,
     state: _RunState,
@@ -1817,77 +2015,164 @@ def _run_hidden_once(
     state.validation_reservation = reservation
     state.hidden_validation_opened = True
 
-    # This assignment is deliberately before the evaluator call.  The shared
-    # role-call path begins with this guard, so no later provider request can
-    # observe hidden-window identity, aggregates, or outcome.
+    # The shared role-call path begins with this guard, so no later provider
+    # request can observe hidden-window identity, aggregates, or outcome.
     state.provider_enabled = False
-    hidden = services.evaluate_hidden(workspace, identity, reservation)
-    if not isinstance(hidden, HiddenEvaluation):
-        raise EvidenceTampering("hidden evaluation is not closed")
-    hidden_fold_id = readiness.manifest.fold_manifest.hidden_fold.fold_id
-    if (
-        hidden.baseline_aggregate.fold_id != hidden_fold_id
-        or hidden.candidate_aggregate.fold_id != hidden_fold_id
-    ):
-        raise IdentityDrift("hidden evaluation fold identity differs")
+    attempted = False
+    outcome_recorded = False
+    failure_code = "not_attempted"
+    try:
+        attempted = True
+        failure_code = "replay_failed"
+        attestation = services.evaluate_hidden(workspace, identity, reservation)
+        failure_code = "integrity_failed"
+        if not isinstance(attestation, HiddenEvaluationAttestation):
+            raise EvidenceTampering("hidden evaluation attestation is not closed")
+        manifest = readiness.manifest
+        hidden_fold_id = manifest.fold_manifest.hidden_fold.fold_id
+        if attestation.reservation_record_sha256 != reservation.reservation_record_sha256:
+            raise EvidenceTampering("hidden attestation reservation differs")
+        if (
+            attestation.source_head != manifest.source_head
+            or attestation.source_fingerprint_sha256
+            != manifest.source_fingerprint_sha256
+            or attestation.baseline_policy_sha256 != manifest.effective_policy_sha256
+            or attestation.candidate_identity_sha256 != identity_sha256
+        ):
+            raise IdentityDrift("hidden attestation identity differs")
+        if attestation.fold_id != hidden_fold_id:
+            raise IdentityDrift("hidden attestation fold identity differs")
+        baseline_reset = attestation.baseline_reset
+        candidate_reset = attestation.candidate_reset
+        if (
+            baseline_reset.fold_id != hidden_fold_id
+            or baseline_reset.subject != "baseline"
+            or baseline_reset.subject_identity_sha256
+            != manifest.effective_policy_sha256
+            or candidate_reset.fold_id != hidden_fold_id
+            or candidate_reset.subject != "candidate"
+            or candidate_reset.subject_identity_sha256 != identity_sha256
+        ):
+            raise IdentityDrift("hidden reset receipt identity differs")
+        if baseline_reset.reset_receipt_sha256 == candidate_reset.reset_receipt_sha256:
+            raise EvidenceTampering("hidden baseline and candidate reused one reset")
 
-    expected_decision = HoldoutDecision.from_result(
-        excess_total_return_pp=(
-            Decimal(str(hidden.candidate_aggregate.total_return_pct))
-            - Decimal(str(hidden.baseline_aggregate.total_return_pct))
-        ),
-        closed_trades=hidden.candidate_aggregate.closed_trades,
-        safety_complete=hidden.decision.safety_complete,
-        integrity_complete=hidden.decision.integrity_complete,
-        accounting_complete=hidden.decision.accounting_complete,
-    )
-    if hidden.decision != expected_decision:
-        raise EvidenceTampering("hidden eligibility differs from trusted aggregates")
-    supplied_excess = hidden.candidate_aggregate.excess_total_return_pp
-    if supplied_excess is None or HoldoutDecision.from_result(
-        excess_total_return_pp=supplied_excess,
-        closed_trades=hidden.candidate_aggregate.closed_trades,
-        safety_complete=hidden.decision.safety_complete,
-        integrity_complete=hidden.decision.integrity_complete,
-        accounting_complete=hidden.decision.accounting_complete,
-    ).excess_total_return_pp != expected_decision.excess_total_return_pp:
-        raise EvidenceTampering("hidden candidate excess differs from trusted aggregates")
+        hidden = attestation.evaluation
+        if (
+            hidden.baseline_aggregate.fold_id != hidden_fold_id
+            or hidden.candidate_aggregate.fold_id != hidden_fold_id
+        ):
+            raise IdentityDrift("hidden evaluation fold identity differs")
 
-    state.hidden_evaluation = hidden
-    _record_artifact(
-        state,
-        services.write_json_artifact(
-            "holdout.json",
-            {
-                "schema_version": 2,
-                "consumed_validation_key_sha256": (
-                    reservation.consumption_key_sha256
-                ),
-                "validation_reservation_sha256": (
-                    reservation.reservation_record_sha256
-                ),
-                "baseline_aggregate": asdict(hidden.baseline_aggregate),
-                "candidate_aggregate": asdict(hidden.candidate_aggregate),
-                "baseline_identity_sha256": (
-                    readiness.manifest.effective_policy_sha256
-                ),
-                "candidate_identity_sha256": identity_sha256,
-                "eligibility_checks": {
-                    "excess_total_return_pp": str(
-                        expected_decision.excess_total_return_pp
+        expected_decision = HoldoutDecision.from_result(
+            excess_total_return_pp=(
+                Decimal(str(hidden.candidate_aggregate.total_return_pct))
+                - Decimal(str(hidden.baseline_aggregate.total_return_pct))
+            ),
+            closed_trades=hidden.candidate_aggregate.closed_trades,
+            safety_complete=hidden.decision.safety_complete,
+            integrity_complete=hidden.decision.integrity_complete,
+            accounting_complete=hidden.decision.accounting_complete,
+        )
+        if hidden.decision != expected_decision:
+            raise EvidenceTampering("hidden eligibility differs from trusted aggregates")
+        supplied_excess = hidden.candidate_aggregate.excess_total_return_pp
+        if supplied_excess is None or HoldoutDecision.from_result(
+            excess_total_return_pp=supplied_excess,
+            closed_trades=hidden.candidate_aggregate.closed_trades,
+            safety_complete=hidden.decision.safety_complete,
+            integrity_complete=hidden.decision.integrity_complete,
+            accounting_complete=hidden.decision.accounting_complete,
+        ).excess_total_return_pp != expected_decision.excess_total_return_pp:
+            raise EvidenceTampering("hidden candidate excess differs from trusted aggregates")
+
+        _record_artifact(
+            state,
+            services.write_json_artifact(
+                "holdout.json",
+                {
+                    "schema_version": 2,
+                    "consumed_validation_key_sha256": (
+                        reservation.consumption_key_sha256
                     ),
-                    "closed_trades": expected_decision.closed_trades,
-                    "safety_complete": expected_decision.safety_complete,
-                    "integrity_complete": expected_decision.integrity_complete,
-                    "accounting_complete": expected_decision.accounting_complete,
-                    "long_replay_eligible": (
-                        expected_decision.long_replay_eligible
+                    "validation_reservation_sha256": (
+                        reservation.reservation_record_sha256
                     ),
+                    "baseline_aggregate": asdict(hidden.baseline_aggregate),
+                    "candidate_aggregate": asdict(hidden.candidate_aggregate),
+                    "baseline_identity_sha256": (
+                        manifest.effective_policy_sha256
+                    ),
+                    "candidate_identity_sha256": identity_sha256,
+                    "eligibility_checks": {
+                        "excess_total_return_pp": str(
+                            expected_decision.excess_total_return_pp
+                        ),
+                        "closed_trades": expected_decision.closed_trades,
+                        "safety_complete": expected_decision.safety_complete,
+                        "integrity_complete": expected_decision.integrity_complete,
+                        "accounting_complete": expected_decision.accounting_complete,
+                        "long_replay_eligible": (
+                            expected_decision.long_replay_eligible
+                        ),
+                        "hidden_attestation_sha256": (
+                            attestation.attestation_sha256
+                        ),
+                        "baseline_reset_receipt_sha256": (
+                            baseline_reset.reset_receipt_sha256
+                        ),
+                        "candidate_reset_receipt_sha256": (
+                            candidate_reset.reset_receipt_sha256
+                        ),
+                    },
                 },
-            },
-        ),
-    )
-    return hidden
+            ),
+        )
+        outcome_recorded = True
+        try:
+            proof = services.record_hidden_outcome(
+                reservation,
+                True,
+                True,
+                None,
+            )
+        except BaseException as exc:
+            raise AuditFailure("hidden validation outcome was not durably closed") from exc
+        _require_hidden_outcome_proof(
+            proof,
+            reservation,
+            attempted=True,
+            completed=True,
+            failure_code=None,
+        )
+        state.validation_outcome_proof = proof
+        state.hidden_attestation = attestation
+        state.hidden_evaluation = hidden
+        return hidden
+    except BaseException as original:
+        if not outcome_recorded:
+            outcome_recorded = True
+            closed_failure_code = failure_code if attempted else "not_attempted"
+            try:
+                proof = services.record_hidden_outcome(
+                    reservation,
+                    attempted,
+                    False,
+                    closed_failure_code,
+                )
+                _require_hidden_outcome_proof(
+                    proof,
+                    reservation,
+                    attempted=attempted,
+                    completed=False,
+                    failure_code=closed_failure_code,
+                )
+                state.validation_outcome_proof = proof
+            except BaseException as outcome_error:
+                raise AuditFailure(
+                    "hidden validation failure outcome was not durably closed"
+                ) from outcome_error
+        raise original
 
 
 def _dispose_all_candidates_and_workers(
@@ -1945,7 +2230,7 @@ def _build_final_result(
         "stagnation_limit",
         "cancelled",
     }
-    budget = _budget_summary_from_calls(state.call_records)
+    budget = _budget_summary_from_calls(state.provider_attempts)
     cleanup_complete = (
         cleanup.candidate_removed
         and cleanup.worker_stopped
@@ -2129,6 +2414,16 @@ def run_pit_optimizer_v2(
                 terminal_code, terminal_detail = stop
                 state.terminal_detail = terminal_detail
                 break
+            _prepare_iteration_source(readiness, state, services)
+            iteration_directory = services.prepare_iteration_artifacts(
+                state.next_iteration
+            )
+            if (
+                not isinstance(iteration_directory, Path)
+                or not iteration_directory.is_absolute()
+                or not iteration_directory.is_dir()
+            ):
+                raise AuditFailure("iteration artifact directory is not durable")
             state.iterations_started += 1
             outcome = _run_iteration(readiness, state, services)
             if outcome.terminal_code is not None:

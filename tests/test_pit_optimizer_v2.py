@@ -6619,14 +6619,18 @@ def test_pit_optimizer_v2_reopens_audit_and_idempotently_finishes_active_call(
         audit_trail=reopened_audit,
         max_attempts=1,
     )
-    restarted.recover_pit_optimizer_finalization(
+    recovered_facts = restarted.recover_pit_optimizer_finalization(
         authorization_lease=lease,
         call_budget=plan,
     )
-    restarted.recover_pit_optimizer_finalization(
+    repeated_facts = restarted.recover_pit_optimizer_finalization(
         authorization_lease=lease,
         call_budget=plan,
     )
+
+    assert repeated_facts == recovered_facts
+    assert recovered_facts.outcome == "accepted"
+    assert recovered_facts.accounting_complete is True
 
     assert len(client.completions.calls) == 1
     assert fresh_budget.calls == 1
@@ -8215,12 +8219,17 @@ def test_validation_ledger_permanently_consumes_identity_before_outcome(
             completed=False,
             failure_code="invented_failure",
         )
-    ledger.record_outcome(
+    proof = ledger.record_outcome(
         hidden_reservation,
         attempted=True,
         completed=False,
         failure_code="worker_failed",
     )
+    assert proof.reservation_record_sha256 == hidden_reservation.reservation_record_sha256
+    assert proof.attempted is True
+    assert proof.completed is False
+    assert proof.failure_code == "worker_failed"
+    assert proof.outcome_record_sha256 == proof.ledger_head_sha256
 
     reopened = evaluation.ValidationLedger(ledger_path)
     with pytest.raises(ValueError, match="consumed"):

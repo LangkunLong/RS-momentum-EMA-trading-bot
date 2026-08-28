@@ -3933,13 +3933,14 @@ class OpenRouterGateway:
         *,
         authorization_lease: "AuthorizationRunLease",
         call_budget: "PitOptimizerCallBudget",
-    ) -> None:
-        """Idempotently complete authorization from replayed terminal audit facts."""
+    ) -> "PitOptimizerProviderFacts":
+        """Idempotently complete authorization and return verified terminal facts."""
 
         from core.pit_optimizer_authorization import (
             AuthorizationError,
             AuthorizationLedger,
             AuthorizationRunLease,
+            PitOptimizerProviderFacts,
         )
 
         if not isinstance(self.authorization_ledger, AuthorizationLedger):
@@ -3982,6 +3983,9 @@ class OpenRouterGateway:
             terminal_audit_receipt=receipt,
             terminal_code=receipt.terminal_code,
         )
+        if not isinstance(facts, PitOptimizerProviderFacts):
+            raise AuthorizationError("recovered optimizer facts are invalid")
+        return facts
 
     def request_pit_optimizer_once(
         self,

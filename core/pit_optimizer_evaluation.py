@@ -491,6 +491,136 @@ class HiddenEvaluation:
 
 
 @dataclass(frozen=True, slots=True)
+class HiddenResetReceipt:
+    """Content-free proof that one hidden subject began from a fresh reset."""
+
+    fold_id: str
+    subject: str
+    subject_identity_sha256: str
+    reset_receipt_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fold_id, str) or not self.fold_id:
+            raise ValueError("hidden reset fold ID is invalid")
+        if self.subject not in {"baseline", "candidate"}:
+            raise ValueError("hidden reset subject is invalid")
+        _require_digest(
+            self.subject_identity_sha256,
+            "hidden reset subject identity SHA-256",
+        )
+        _require_digest(self.reset_receipt_sha256, "hidden reset receipt SHA-256")
+
+
+def _hidden_attestation_digest(values: dict[str, object]) -> str:
+    evaluation = values["evaluation"]
+    assert isinstance(evaluation, HiddenEvaluation)
+    decision = evaluation.decision
+    primitive = {
+        key: (
+            asdict(value)
+            if isinstance(value, HiddenResetReceipt)
+            else value
+        )
+        for key, value in values.items()
+        if key != "evaluation"
+    }
+    primitive["evaluation"] = {
+        "baseline_aggregate": asdict(evaluation.baseline_aggregate),
+        "candidate_aggregate": asdict(evaluation.candidate_aggregate),
+        "decision": {
+            "excess_total_return_pp": str(decision.excess_total_return_pp),
+            "closed_trades": decision.closed_trades,
+            "safety_complete": decision.safety_complete,
+            "integrity_complete": decision.integrity_complete,
+            "accounting_complete": decision.accounting_complete,
+            "long_replay_eligible": decision.long_replay_eligible,
+        },
+    }
+    return hashlib.sha256(_canonical_json_bytes(primitive)).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class HiddenEvaluationAttestation:
+    """Authenticated binding for one independently reset hidden comparison."""
+
+    reservation_record_sha256: str
+    source_head: str
+    source_fingerprint_sha256: str
+    baseline_policy_sha256: str
+    candidate_identity_sha256: str
+    fold_id: str
+    baseline_reset: HiddenResetReceipt
+    candidate_reset: HiddenResetReceipt
+    evaluation: HiddenEvaluation
+    attestation_sha256: str
+
+    @classmethod
+    def issue(
+        cls,
+        *,
+        reservation_record_sha256: str,
+        source_head: str,
+        source_fingerprint_sha256: str,
+        baseline_policy_sha256: str,
+        candidate_identity_sha256: str,
+        fold_id: str,
+        baseline_reset: HiddenResetReceipt,
+        candidate_reset: HiddenResetReceipt,
+        evaluation: HiddenEvaluation,
+    ) -> "HiddenEvaluationAttestation":
+        values: dict[str, object] = {
+            "reservation_record_sha256": reservation_record_sha256,
+            "source_head": source_head,
+            "source_fingerprint_sha256": source_fingerprint_sha256,
+            "baseline_policy_sha256": baseline_policy_sha256,
+            "candidate_identity_sha256": candidate_identity_sha256,
+            "fold_id": fold_id,
+            "baseline_reset": baseline_reset,
+            "candidate_reset": candidate_reset,
+            "evaluation": evaluation,
+        }
+        return cls(**values, attestation_sha256=_hidden_attestation_digest(values))
+
+    def __post_init__(self) -> None:
+        _require_digest(
+            self.reservation_record_sha256,
+            "hidden attestation reservation SHA-256",
+        )
+        if not isinstance(self.source_head, str) or re.fullmatch(
+            r"[0-9a-f]{40}", self.source_head
+        ) is None:
+            raise ValueError("hidden attestation source HEAD is invalid")
+        for value, label in (
+            (self.source_fingerprint_sha256, "source fingerprint"),
+            (self.baseline_policy_sha256, "baseline policy"),
+            (self.candidate_identity_sha256, "candidate identity"),
+            (self.attestation_sha256, "attestation"),
+        ):
+            _require_digest(value, f"hidden {label} SHA-256")
+        if not isinstance(self.fold_id, str) or not self.fold_id:
+            raise ValueError("hidden attestation fold ID is invalid")
+        if not isinstance(self.baseline_reset, HiddenResetReceipt) or not isinstance(
+            self.candidate_reset, HiddenResetReceipt
+        ):
+            raise ValueError("hidden attestation reset receipts are invalid")
+        if not isinstance(self.evaluation, HiddenEvaluation):
+            raise ValueError("hidden attestation evaluation is invalid")
+        values: dict[str, object] = {
+            "reservation_record_sha256": self.reservation_record_sha256,
+            "source_head": self.source_head,
+            "source_fingerprint_sha256": self.source_fingerprint_sha256,
+            "baseline_policy_sha256": self.baseline_policy_sha256,
+            "candidate_identity_sha256": self.candidate_identity_sha256,
+            "fold_id": self.fold_id,
+            "baseline_reset": self.baseline_reset,
+            "candidate_reset": self.candidate_reset,
+            "evaluation": self.evaluation,
+        }
+        if self.attestation_sha256 != _hidden_attestation_digest(values):
+            raise ValueError("hidden attestation digest differs")
+
+
+@dataclass(frozen=True, slots=True)
 class PitOptimizerCleanup:
     candidate_removed: bool
     worker_stopped: bool
@@ -593,6 +723,31 @@ class ValidationReservation:
         _require_digest(
             self.reservation_record_sha256,
             "validation reservation record SHA-256",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationOutcomeProof:
+    """Content-free durable completion proof for one consumed reservation."""
+
+    reservation_record_sha256: str
+    attempted: bool
+    completed: bool
+    failure_code: str | None
+    outcome_record_sha256: str
+    ledger_head_sha256: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.reservation_record_sha256, "reservation"),
+            (self.outcome_record_sha256, "outcome record"),
+            (self.ledger_head_sha256, "ledger head"),
+        ):
+            _require_digest(value, f"validation outcome {label} SHA-256")
+        ValidationLedger._validate_outcome_fields(
+            attempted=self.attempted,
+            completed=self.completed,
+            failure_code=self.failure_code,
         )
 
 
@@ -988,7 +1143,7 @@ class ValidationLedger:
         attempted: bool,
         completed: bool,
         failure_code: str | None,
-    ) -> None:
+    ) -> ValidationOutcomeProof:
         if not isinstance(reservation, ValidationReservation):
             raise ValueError("validation outcome requires a closed reservation")
         self._validate_outcome_fields(
@@ -1019,7 +1174,7 @@ class ValidationLedger:
                 for record in records
             ):
                 raise ValueError("validation reservation outcome is already recorded")
-            self._append_record(
+            record = self._append_record(
                 records,
                 {
                     "record_type": "outcome",
@@ -1028,4 +1183,13 @@ class ValidationLedger:
                     "completed": completed,
                     "failure_code": failure_code,
                 },
+            )
+            record_sha256 = str(record["record_sha256"])
+            return ValidationOutcomeProof(
+                reservation_record_sha256=reservation.reservation_record_sha256,
+                attempted=attempted,
+                completed=completed,
+                failure_code=failure_code,
+                outcome_record_sha256=record_sha256,
+                ledger_head_sha256=record_sha256,
             )

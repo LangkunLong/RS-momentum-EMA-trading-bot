@@ -666,6 +666,77 @@ def test_artifact_failure_removes_an_uncommitted_create(
     assert not target.exists()
 
 
+def test_iteration_directory_is_durable_before_investigator_authority_and_retained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: an investigator failure could leave no partial iteration layout."""
+    from unittest.mock import Mock
+
+    import core.pit_optimizer_controller as controller
+    from core.pit_optimizer_artifacts import IncrementalArtifactStore
+    from core.pit_optimizer_controller import (
+        PitOptimizerReadiness,
+        PitOptimizerServices,
+        ProviderProtocolFailure,
+        run_pit_optimizer_v2,
+    )
+
+    root = (tmp_path / "run").resolve()
+    root.mkdir()
+    store = IncrementalArtifactStore(root)
+    readiness = Mock(spec=PitOptimizerReadiness)
+    readiness.manifest.run_id = "run_task7"
+    readiness.baseline_discovery = Mock()
+    services = Mock(spec=PitOptimizerServices)
+    events: list[str] = []
+    services.prepare_iteration_artifacts.side_effect = lambda iteration: (
+        events.append(f"prepare:{iteration}") or store.prepare_iteration(iteration)
+    )
+    monkeypatch.setattr(controller, "_initialize_run_artifacts", lambda *args: None)
+    monkeypatch.setattr(controller, "_pre_iteration_stop", lambda *args: None)
+    monkeypatch.setattr(controller, "_prepare_iteration_source", lambda *args: None)
+
+    def fail_investigator(*args: object) -> object:
+        events.append("investigator")
+        assert (root / "iterations" / "001").is_dir()
+        raise ProviderProtocolFailure("injected investigator failure")
+
+    monkeypatch.setattr(controller, "_run_iteration", fail_investigator)
+    sentinel = Mock()
+    monkeypatch.setattr(
+        controller,
+        "_finalize_result",
+        lambda *args: sentinel,
+    )
+
+    assert run_pit_optimizer_v2(readiness=readiness, services=services) is sentinel
+    assert events == ["prepare:1", "investigator"]
+    assert (root / "iterations" / "001").is_dir()
+
+
+def test_artifact_store_rejects_nested_link_before_any_outside_mutation(
+    tmp_path: Path,
+) -> None:
+    """Break caught: an intermediate iterations link could redirect artifact creation."""
+    from core.pit_optimizer_artifacts import IncrementalArtifactStore
+
+    root = (tmp_path / "run").resolve()
+    outside = (tmp_path / "outside").resolve()
+    root.mkdir()
+    outside.mkdir()
+    try:
+        (root / "iterations").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+
+    store = IncrementalArtifactStore(root)
+    with pytest.raises(ValueError, match="link|reparse|parent"):
+        store.prepare_iteration(1)
+
+    assert list(outside.iterdir()) == []
+
+
 def test_artifact_initialization_candidate_capability_is_keyed_only_by_workspace_id(
     tmp_path: Path,
 ) -> None:
@@ -763,8 +834,13 @@ def test_single_iteration_orders_critic_before_decision(
     assert events == ["investigator", "author", "validate", "discovery", "critic", "decision"]
 
 
+@pytest.mark.parametrize(
+    "failure_code",
+    sorted(contract.CANDIDATE_VALIDATION_FAILURE_CODES - {"no_discovery_trades"}),
+)
 def test_invalid_author_still_receives_critic_before_a_retain_decision(
     monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
 ) -> None:
     """Break caught: static/syntax rejection could silently skip critic feedback."""
     from unittest.mock import Mock
@@ -775,7 +851,7 @@ def test_invalid_author_still_receives_critic_before_a_retain_decision(
     events: list[str] = []
     validation = CandidateValidationOutcome(
         valid=False,
-        failure_code="syntax_failed",
+        failure_code=failure_code,
         incremental_diff="candidate diff",
         cumulative_diff="",
         identity=None,
@@ -1002,7 +1078,11 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
     ]
 
 
-def _role_facts(plan: contract.PitOptimizerCallBudget):
+def _role_facts(
+    plan: contract.PitOptimizerCallBudget,
+    *,
+    frozen_pricing_sha256: str = "8" * 64,
+):
     from core.pit_optimizer_authorization import PitOptimizerProviderFacts
 
     return PitOptimizerProviderFacts(
@@ -1011,7 +1091,7 @@ def _role_facts(plan: contract.PitOptimizerCallBudget):
         role=plan.role,
         requested_model=plan.model,
         returned_model=plan.model,
-        frozen_pricing_sha256="8" * 64,
+        frozen_pricing_sha256=frozen_pricing_sha256,
         outcome="accepted",
         request_started=True,
         response_received=True,
@@ -1028,6 +1108,151 @@ def _role_facts(plan: contract.PitOptimizerCallBudget):
     )
 
 
+def _failed_role_facts(
+    plan: contract.PitOptimizerCallBudget,
+    *,
+    outcome: str,
+    frozen_pricing_sha256: str,
+):
+    from core.pit_optimizer_authorization import PitOptimizerProviderFacts
+
+    uncertain = outcome == "uncertain_accounting"
+    return PitOptimizerProviderFacts(
+        call_index=plan.call_index,
+        iteration=plan.iteration,
+        role=plan.role,
+        requested_model=plan.model,
+        returned_model=plan.model,
+        frozen_pricing_sha256=frozen_pricing_sha256,
+        outcome=outcome,
+        request_started=True,
+        response_received=True,
+        finish_reason="unknown" if uncertain else "stop",
+        response_schema_valid=False,
+        accounting_complete=not uncertain,
+        prompt_tokens=None if uncertain else 17,
+        completion_tokens=None if uncertain else 3,
+        total_tokens=None if uncertain else 20,
+        cost_usd=None if uncertain else 0.0125,
+        retained_reservation_tokens=(
+            plan.max_input_tokens + plan.max_output_tokens if uncertain else 0
+        ),
+        retained_reservation_usd=plan.max_usd if uncertain else 0.0,
+        audit_sha256=hashlib.sha256(
+            f"audit-{plan.call_index}-{outcome}".encode()
+        ).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_exception"),
+    [
+        ("schema_invalid", "ProviderProtocolFailure"),
+        ("uncertain_accounting", "ProviderAccountingFailure"),
+    ],
+)
+def test_failed_provider_attempt_is_durable_and_retained_in_exact_accounting(
+    tmp_path: Path,
+    outcome: str,
+    expected_exception: str,
+) -> None:
+    """Break caught: finalized failed calls vanished when the gateway raised."""
+    from unittest.mock import Mock
+
+    import core.pit_optimizer_controller as controller
+    from core.pit_optimizer_controller import (
+        CandidateWorkspace,
+        PitOptimizerServices,
+        _run_investigator,
+    )
+
+    inputs = _prepare_fixture(tmp_path)
+    readiness = _prepare(inputs)
+    state = _run_state(readiness)
+    pricing, lease = _pricing_and_lease(readiness.manifest)
+    state.frozen_pricing = pricing
+    state.authorization_lease = lease
+    plan = readiness.manifest.call_budgets[0]
+    facts = _failed_role_facts(
+        plan,
+        outcome=outcome,
+        frozen_pricing_sha256=pricing.pricing_sha256,
+    )
+    services = Mock(spec=PitOptimizerServices)
+    services.create_candidate.return_value = CandidateWorkspace(
+        "workspace_failed_attempt",
+        Path(inputs["source_root"]).resolve(),
+    )
+    services.call_role.side_effect = RuntimeError("injected gateway failure")
+    services.recover_role_attempt.return_value = facts
+    accounting: list[Mapping[str, object]] = []
+
+    def write(name: str, value: Mapping[str, object]) -> tuple[Path, str]:
+        if name == "accounting.json":
+            accounting.append(value)
+        path = (tmp_path / "run" / name).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path, hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+    services.write_json_artifact.side_effect = write
+
+    with pytest.raises(getattr(controller, expected_exception)):
+        _run_investigator(readiness, state, services)
+
+    services.recover_role_attempt.assert_called_once_with(plan, lease)
+    assert len(accounting) == 1
+    record = accounting[0]["call_records"][0]
+    assert record["plan"] == plan.to_primitive()
+    assert record["payload_sha256"] is None
+    assert record["facts"] == asdict(facts)
+    assert accounting[0]["actual_totals"] == {
+        "calls": 1,
+        "prompt_tokens": 0 if outcome == "uncertain_accounting" else 17,
+        "completion_tokens": 0 if outcome == "uncertain_accounting" else 3,
+        "total_tokens": 0 if outcome == "uncertain_accounting" else 20,
+        "usd": 0.0 if outcome == "uncertain_accounting" else 0.0125,
+    }
+    assert accounting[0]["incomplete_exposure"] == {
+        "calls": 1 if outcome == "uncertain_accounting" else 0,
+        "retained_tokens": (
+            plan.max_input_tokens + plan.max_output_tokens
+            if outcome == "uncertain_accounting"
+            else 0
+        ),
+        "retained_usd": plan.max_usd if outcome == "uncertain_accounting" else 0.0,
+    }
+    from core.pit_optimizer_evaluation import PitOptimizerCleanup
+
+    result = controller._build_final_result(
+        readiness=readiness,
+        state=state,
+        terminal_code=(
+            "provider_accounting_failure"
+            if outcome == "uncertain_accounting"
+            else "provider_protocol_failure"
+        ),
+        cleanup=PitOptimizerCleanup(True, True, False),
+    )
+    assert asdict(result.budget) == {
+        "api_calls": 1,
+        "prompt_tokens": 0 if outcome == "uncertain_accounting" else 17,
+        "completion_tokens": 0 if outcome == "uncertain_accounting" else 3,
+        "total_tokens": 0 if outcome == "uncertain_accounting" else 20,
+        "authoritative_usd": 0.0 if outcome == "uncertain_accounting" else 0.0125,
+        "retained_reservation_tokens": (
+            plan.max_input_tokens + plan.max_output_tokens
+            if outcome == "uncertain_accounting"
+            else 0
+        ),
+        "retained_reservation_usd": (
+            plan.max_usd if outcome == "uncertain_accounting" else 0.0
+        ),
+        "incomplete_accounting_calls": (
+            1 if outcome == "uncertain_accounting" else 0
+        ),
+    }
+
+
 def _entry_diff(old: str, new: str) -> str:
     return (
         "--- a/core/strategy_policy/entry.py\n"
@@ -1036,6 +1261,14 @@ def _entry_diff(old: str, new: str) -> str:
         " def evaluate_entry(snapshot):\n"
         f"-    return {old}\n"
         f"+    return {new}\n"
+    )
+
+
+def _entry_git_diff(old: str, new: str) -> str:
+    return (
+        "diff --git a/core/strategy_policy/entry.py b/core/strategy_policy/entry.py\n"
+        "index 1111111..2222222 100644\n"
+        + _entry_diff(old, new)
     )
 
 
@@ -1119,9 +1352,9 @@ def test_two_iteration_role_lineage_is_exact_and_provider_seed_stays_hidden(
                 changed_paths=("core/strategy_policy/entry.py",),
                 changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
                 unified_diff=(
-                    _entry_diff("None", "True")
-                    if plan.iteration == 1
-                    else _entry_diff("True", "False")
+                        _entry_diff("None", "True")
+                        if plan.iteration == 1
+                        else _entry_diff("True", "False")
                 ),
                 assumptions=(),
                 validation_suggestions=(),
@@ -1135,7 +1368,11 @@ def test_two_iteration_role_lineage_is_exact_and_provider_seed_stays_hidden(
                 disposition="refine",
                 next_direction=f"direction {plan.iteration}",
             )
-        return PitOptimizerRoleCall(plan, payload, _role_facts(plan))
+        return PitOptimizerRoleCall(
+            plan,
+            payload,
+            _role_facts(plan, frozen_pricing_sha256=pricing.pricing_sha256),
+        )
 
     services = Mock(spec=PitOptimizerServices)
     services.create_candidate.side_effect = create_candidate
@@ -1215,6 +1452,389 @@ def test_two_iteration_role_lineage_is_exact_and_provider_seed_stays_hidden(
         for item in role_inputs
     )
     assert _git(Path(inputs["source_root"]), "status", "--porcelain") == source_before == b""
+
+
+def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks(
+    tmp_path: Path,
+) -> None:
+    """Break caught: mocked stage tests could hide defects in the real loop path."""
+    import shutil
+
+    import agent_loop
+    from core import pit_optimizer_controller as controller
+    from core.pit_optimization_contract import (
+        AuthorArtifact,
+        CriticArtifact,
+        InvestigatorArtifact,
+    )
+    from core.pit_optimizer_artifacts import IncrementalArtifactStore
+    from core.pit_optimizer_authorization import PitOptimizerRoleCall
+    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_controller import (
+        CandidateValidationOutcome,
+        CandidateWorkspace,
+        PitOptimizerServices,
+        run_pit_optimizer_v2,
+    )
+    from core.pit_optimizer_evaluation import (
+        DeterminismAttestation,
+        DiscoveryComparison,
+        DiscoveryEvaluation,
+        FoldEvaluationResult,
+        PitOptimizerCleanup,
+        ValidationReservation,
+    )
+
+    inputs = _prepare_fixture(tmp_path)
+    readiness = _prepare(inputs)
+    git_path = shutil.which("git")
+    assert git_path is not None
+    git_capability = agent_loop.configure_git_executable(Path(git_path).resolve())
+    run_root = (tmp_path / "run").resolve()
+    run_root.mkdir()
+    store = IncrementalArtifactStore(run_root)
+    pricing, lease = _pricing_and_lease(readiness.manifest)
+    initial_bundle = controller.build_policy_source_bundle(
+        candidate_root=Path(inputs["source_root"]).resolve(),
+        cumulative_diff="",
+        policy_interface_version=readiness.manifest.policy_interface_version,
+    )
+    controller._require_complete_iteration_context(readiness, initial_bundle)
+    live: dict[str, Path] = {}
+    candidate_number = 0
+    evaluation_number = 0
+    role_inputs: list[object] = []
+    disposed: list[str] = []
+
+    def create_candidate(cumulative_diff: str | None) -> CandidateWorkspace:
+        nonlocal candidate_number
+        candidate_number += 1
+        workspace_id = f"workspace_actual_{candidate_number}"
+        root = (tmp_path / workspace_id).resolve()
+        shutil.copytree(Path(inputs["source_root"]), root)
+        if cumulative_diff:
+            agent_loop._git(
+                root,
+                "apply",
+                "--whitespace=error-all",
+                "-",
+                input_bytes=cumulative_diff.encode("utf-8"),
+                git=git_capability,
+            )
+        live[workspace_id] = root
+        return CandidateWorkspace(workspace_id, root)
+
+    def call_role(
+        plan: contract.PitOptimizerCallBudget,
+        role_input: object,
+        parser: object,
+        authorization_lease: object,
+        frozen_pricing: object,
+    ) -> PitOptimizerRoleCall:
+        assert authorization_lease == lease
+        assert frozen_pricing == pricing
+        role_inputs.append(role_input)
+        hypothesis = f"actual_hypothesis_{plan.iteration}"
+        if plan.role == "investigator":
+            payload = InvestigatorArtifact(
+                hypothesis_id=hypothesis,
+                family="entry",
+                evidence_ids=(readiness.baseline_discovery.evidence_ids[0],),
+                causal_rationale="Test one bounded entry-policy change.",
+                target_paths=("core/strategy_policy/entry.py",),
+                target_symbols=("core.strategy_policy.entry.evaluate_entry",),
+                expected_diagnostic_changes=("entries",),
+                known_risks=(),
+                author_instructions=("Change only the literal return value.",),
+            )
+        elif plan.role == "author":
+            payload = AuthorArtifact(
+                hypothesis_id=hypothesis,
+                behavioral_summary=f"bounded entry change {plan.iteration}",
+                changed_paths=("core/strategy_policy/entry.py",),
+                changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
+                unified_diff=(
+                    _entry_git_diff("None", "True")
+                    if plan.iteration == 1
+                    else _entry_git_diff("True", "False")
+                ),
+                assumptions=(),
+                validation_suggestions=(),
+            )
+        else:
+            payload = CriticArtifact(
+                hypothesis_id=hypothesis,
+                prediction_vs_observation="The closed discovery evidence was evaluated.",
+                causal_explanation="Only fixed-baseline strict improvement can replace the incumbent.",
+                evidence_ids=(readiness.baseline_discovery.evidence_ids[0],),
+                disposition="refine",
+                next_direction=f"bounded direction {plan.iteration}",
+            )
+        return PitOptimizerRoleCall(
+            plan,
+            payload,
+            _role_facts(plan, frozen_pricing_sha256=pricing.pricing_sha256),
+        )
+
+    def validate(
+        workspace: CandidateWorkspace,
+        author: AuthorArtifact,
+        cumulative_diff: str | None,
+    ) -> CandidateValidationOutcome:
+        assert live[workspace.workspace_id] == workspace.root
+        identity, authenticated_cumulative = validate_candidate_diff(
+            authenticated_base_root=Path(inputs["source_root"]).resolve(),
+            candidate_root=workspace.root,
+            incremental_diff=author.unified_diff,
+            git=git_capability,
+            bounds=readiness.manifest.candidate_bounds,
+            source_commit=readiness.manifest.source_head,
+            policy_interface_version=readiness.manifest.policy_interface_version,
+            immutable_constraints_sha256=(
+                readiness.manifest.immutable_constraints_sha256
+            ),
+            discovery_manifest_sha256=readiness.manifest.fold_manifest.sha256,
+        )
+        return CandidateValidationOutcome(
+            True,
+            None,
+            author.unified_diff,
+            authenticated_cumulative,
+            identity,
+            identity.changed_paths,
+            identity.changed_symbols,
+        )
+
+    incumbent_candidate_folds: tuple[FoldAggregateSummary, ...] | None = None
+    incumbent_evidence_id: str | None = None
+
+    def evaluate(
+        workspace: CandidateWorkspace,
+        identity: object,
+    ) -> DiscoveryEvaluation:
+        nonlocal evaluation_number, incumbent_candidate_folds, incumbent_evidence_id
+        assert live[workspace.workspace_id] == workspace.root
+        evaluation_number += 1
+        increment = 1.0 if evaluation_number == 1 else 0.5
+        folds = tuple(
+            FoldEvaluationResult(
+                fold_id=baseline.fold_id,
+                engine_policy_sha256=readiness.manifest.effective_policy_sha256,
+                candidate_identity_sha256=identity.identity_sha256,
+                aggregate_metrics=replace(
+                    baseline,
+                    total_return_pct=baseline.total_return_pct + increment,
+                    excess_total_return_pp=increment,
+                ),
+            )
+            for baseline in readiness.baseline_discovery.folds
+        )
+        baseline_sha256 = controller._folds_digest(
+            readiness.baseline_discovery.folds
+        )
+        fixed = controller.discovery_score_from_folds(
+            tuple(item.aggregate_metrics for item in folds),
+            readiness.baseline_discovery.folds,
+            original_baseline_sha256=baseline_sha256,
+            expected_original_baseline_sha256=baseline_sha256,
+        )
+        incumbent_folds = (
+            readiness.baseline_discovery.folds
+            if incumbent_candidate_folds is None
+            else incumbent_candidate_folds
+        )
+        incumbent_sha256 = controller._folds_digest(incumbent_folds)
+        diagnostics = controller.discovery_score_from_folds(
+            tuple(item.aggregate_metrics for item in folds),
+            incumbent_folds,
+            original_baseline_sha256=incumbent_sha256,
+            expected_original_baseline_sha256=incumbent_sha256,
+        )
+        improves = evaluation_number == 1
+        if improves:
+            incumbent_candidate_folds = tuple(
+                item.aggregate_metrics for item in folds
+            )
+            incumbent_evidence_id = hashlib.sha256(
+                controller.canonical_json_bytes(
+                    {"aggregate": asdict(incumbent_candidate_folds[0])}
+                )
+            ).hexdigest()
+        return DiscoveryEvaluation(
+            folds,
+            DiscoveryComparison(fixed, diagnostics, True, improves),
+        )
+
+    def dispose(workspace: CandidateWorkspace) -> PitOptimizerCleanup:
+        assert live.pop(workspace.workspace_id) == workspace.root
+        disposed.append(workspace.workspace_id)
+        return PitOptimizerCleanup(True, True, False)
+
+    reservation = ValidationReservation("b" * 64, "c" * 64)
+
+    def reserve(identity: object) -> ValidationReservation:
+        assert identity.identity_sha256
+        return reservation
+
+    def hidden_evaluate(
+        workspace: CandidateWorkspace,
+        identity: object,
+        reserved: ValidationReservation,
+    ) -> object:
+        assert live[workspace.workspace_id] == workspace.root
+        hidden = _hidden_result(
+            readiness.manifest.fold_manifest.hidden_fold.fold_id
+        )
+        return _hidden_attestation(
+            readiness,
+            identity.identity_sha256,
+            reserved,
+            hidden,
+        )
+
+    services = PitOptimizerServices(
+        freeze_pricing=lambda model: pricing,
+        open_run_lease=lambda ready, frozen: lease,
+        close_run_lease=lambda active, terminal: None,
+        call_role=call_role,
+        recover_role_attempt=lambda plan, active: (_ for _ in ()).throw(
+            AssertionError("accepted calls must not recover")
+        ),
+        create_candidate=create_candidate,
+        validate_and_apply=validate,
+        evaluate_discovery=evaluate,
+        confirm_discovery=lambda workspace, identity, fold_id: DeterminismAttestation(
+            fold_id=fold_id,
+            expected_evidence_sha256=incumbent_evidence_id,
+            repeated_evidence_sha256=incumbent_evidence_id,
+            matched=True,
+        ),
+        reserve_hidden_validation=reserve,
+        evaluate_hidden=hidden_evaluate,
+        record_hidden_outcome=lambda reserved, attempted, completed, failure: (
+            _hidden_outcome_proof(
+                reserved,
+                attempted=attempted,
+                completed=completed,
+                failure_code=failure,
+            )
+        ),
+        dispose_candidate=dispose,
+        verify_inputs=lambda ready: None,
+        cancellation_requested=lambda: False,
+        prepare_iteration_artifacts=store.prepare_iteration,
+        write_json_artifact=store.write_json_artifact,
+        write_diff_artifact=store.write_diff_artifact,
+    )
+    result = run_pit_optimizer_v2(readiness=readiness, services=services)
+
+    assert result.terminal_code == "iteration_limit"
+    assert result.status == "long_replay_eligible"
+    assert result.iterations_started == result.iterations_completed == 2
+    assert result.incumbent_updates == 1
+    assert result.valid_evaluations == 2
+    assert result.non_improving_streak == 1
+    assert len(role_inputs) == 6
+    assert [item.__class__.__name__ for item in role_inputs] == [
+        "InvestigatorInput",
+        "AuthorInput",
+        "CriticInput",
+    ] * 2
+    assert role_inputs[3].prior_iterations == (role_inputs[3].prior_iterations[0],)
+    assert role_inputs[3].prior_iterations[0].incumbent_changed is True
+    assert sorted(disposed) == ["workspace_actual_1", "workspace_actual_2"]
+    expected_files = {
+        "run.json",
+        "baseline.json",
+        "accounting.json",
+        "incumbent.diff",
+        "holdout.json",
+        "summary.json",
+        *{
+            f"iterations/{iteration:03d}/{name}"
+            for iteration in (1, 2)
+            for name in (
+                "investigator.json",
+                "author.json",
+                "candidate.diff",
+                "validation.json",
+                "discovery.json",
+                "critic.json",
+                "decision.json",
+            )
+        },
+    }
+    assert {
+        path.relative_to(run_root).as_posix()
+        for path in run_root.rglob("*")
+        if path.is_file()
+    } == expected_files
+    expected_json_keys = {
+        "run.json": {
+            "schema_version", "run_id", "manifest_sha256", "readiness_sha256",
+            "source", "pit_bundle_sha256", "baseline_manifest_sha256",
+            "effective_policy_sha256", "parity_attestation_sha256",
+            "fold_manifest_sha256", "fold_identities", "policy_interface_version",
+            "candidate_bounds", "authorization", "frozen_pricing_sha256", "status",
+        },
+        "baseline.json": {
+            "schema_version", "fold_ids", "fold_aggregates", "evidence_ids",
+            "universe_sha256", "warmup_start_date", "engine_policy_sha256",
+            "parity_attestation_sha256",
+        },
+        "accounting.json": {
+            "schema_version", "call_records", "authorized_totals", "reserved_totals",
+            "actual_totals", "incomplete_exposure", "audit_chain_head",
+        },
+        "holdout.json": {
+            "schema_version", "consumed_validation_key_sha256",
+            "validation_reservation_sha256", "baseline_aggregate",
+            "candidate_aggregate", "baseline_identity_sha256",
+            "candidate_identity_sha256", "eligibility_checks",
+        },
+        "summary.json": {
+            "schema_version", "phase", "status", "terminal", "run_id",
+            "readiness_sha256", "manifest_sha256", "iterations", "incumbent",
+            "discovery_outcome", "hidden_outcome", "accounting", "cleanup",
+            "artifact_digests",
+        },
+    }
+    for name, keys in expected_json_keys.items():
+        assert set(json.loads((run_root / name).read_bytes())) == keys
+    role_keys = {
+        "schema_version", "call_index", "iteration", "role",
+        "payload_sha256", "payload",
+    }
+    for role_name in ("investigator", "author", "critic"):
+        assert set(
+            json.loads(
+                (run_root / f"iterations/001/{role_name}.json").read_bytes()
+            )
+        ) == role_keys
+    assert set(json.loads((run_root / "iterations/001/validation.json").read_bytes())) == {
+        "schema_version", "failure_code", "candidate_identity",
+        "author_manifest_matches", "focused_checks", "worker_attestation",
+        "changed_paths", "changed_symbols",
+    }
+    assert set(json.loads((run_root / "iterations/001/discovery.json").read_bytes())) == {
+        "schema_version", "fixed_baseline_comparison", "incumbent_diagnostics",
+        "rankable", "strictly_improves_incumbent", "folds",
+        "engine_policy_sha256", "candidate_identity_sha256",
+    }
+    assert set(json.loads((run_root / "iterations/001/decision.json").read_bytes())) == {
+        "schema_version", "rankable", "quantized_score",
+        "prior_incumbent_identity_sha256", "new_incumbent_identity_sha256", "decision",
+    }
+    durable = b"\n".join(
+        path.read_bytes() for path in run_root.rglob("*") if path.is_file()
+    )
+    for sentinel in (
+        b"RAW_PROVIDER_SECRET_SENTINEL",
+        b"SYSTEM_PROMPT_SECRET_SENTINEL",
+        b"OPERATOR_APPROVAL_SECRET_SENTINEL",
+        b"AUTHORIZATION_HEADER_SECRET_SENTINEL",
+    ):
+        assert sentinel not in durable
 
 
 def _decision_calls(state: object, *, iteration: int):
@@ -1326,6 +1946,11 @@ def test_incumbent_transition_replaces_diff_only_after_critic_and_fixed_score(
         DiscoveryComparison(fixed_score, diagnostics, True, True),
     )
     critic = _decision_calls(state, iteration=1)
+    critic.plan = next(
+        item
+        for item in readiness.manifest.call_budgets
+        if item.iteration == 1 and item.role == "critic"
+    )
     events = ["critic"]
     services = Mock(spec=PitOptimizerServices)
     services.write_diff_artifact.side_effect = lambda name, value: (
@@ -1348,11 +1973,145 @@ def test_incumbent_transition_replaces_diff_only_after_critic_and_fixed_score(
         services,
     )
 
-    assert events == ["critic", "incumbent.diff", "iterations/001/decision.json"]
+    assert events == ["critic", "iterations/001/decision.json", "incumbent.diff"]
     assert outcome.incumbent_changed is True
     assert state.incumbent_cumulative_diff == "cumulative winning diff"
     assert state.incumbent_discovery.score == fixed_score
     assert state.non_improving_streak == 0
+
+
+@pytest.mark.parametrize("failure_kind", ["write", "directory_sync"])
+def test_decision_durability_failure_preserves_prior_incumbent_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    """Break caught: state/capability could advance before decision durability."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import core.pit_optimizer_artifacts as artifacts
+    import core.pit_optimizer_controller as controller
+    from core.pit_optimizer_artifacts import IncrementalArtifactStore
+    from core.pit_optimizer_controller import (
+        CandidateValidationOutcome,
+        CandidateWorkspace,
+        PitOptimizerServices,
+        _persist_iteration_decision,
+    )
+    from core.pit_optimizer_evaluation import (
+        DiscoveryComparison,
+        DiscoveryEvaluation,
+        FoldEvaluationResult,
+    )
+
+    readiness = _prepare(_prepare_fixture(tmp_path))
+    state = _run_state(readiness)
+    root = (tmp_path / "run").resolve()
+    root.mkdir()
+    store = IncrementalArtifactStore(root)
+    store.prepare_iteration(1)
+    critic_path, critic_digest = store.write_json_artifact(
+        "iterations/001/critic.json",
+        {"schema_version": 2},
+    )
+    state.artifact_root = root
+    state.artifact_paths.append((critic_path, critic_digest))
+    prior_root = (tmp_path / "prior").resolve()
+    candidate_root = (tmp_path / "candidate").resolve()
+    prior_root.mkdir()
+    candidate_root.mkdir()
+    prior_workspace = CandidateWorkspace("workspace_prior", prior_root)
+    candidate_workspace = CandidateWorkspace("workspace_candidate", candidate_root)
+    prior_identity = Mock()
+    prior_identity.identity_sha256 = "b" * 64
+    candidate_identity = Mock()
+    candidate_identity.identity_sha256 = "a" * 64
+    candidate_identity.cumulative_diff_sha256 = hashlib.sha256(
+        b"cumulative winning diff"
+    ).hexdigest()
+    candidate_identity.editable_file_sha256s = ()
+    state.incumbent_workspace = prior_workspace
+    state.incumbent_identity = prior_identity
+    state.incumbent_cumulative_diff = "prior incumbent diff"
+    state.iteration_workspace = candidate_workspace
+    state.prospective_source_bundle = SimpleNamespace(files=())
+    validation = CandidateValidationOutcome(
+        True,
+        None,
+        "incremental diff",
+        "cumulative winning diff",
+        candidate_identity,
+        ("core/strategy_policy/entry.py",),
+        ("core.strategy_policy.entry.evaluate_entry",),
+    )
+    fixed_score = controller.discovery_score_from_folds(
+        tuple(
+            replace(fold, total_return_pct=fold.total_return_pct + 1.0)
+            for fold in readiness.baseline_discovery.folds
+        ),
+        readiness.baseline_discovery.folds,
+        original_baseline_sha256=controller._folds_digest(
+            readiness.baseline_discovery.folds
+        ),
+        expected_original_baseline_sha256=controller._folds_digest(
+            readiness.baseline_discovery.folds
+        ),
+    )
+    folds = tuple(
+        FoldEvaluationResult(
+            fold_id=baseline.fold_id,
+            engine_policy_sha256=readiness.manifest.effective_policy_sha256,
+            candidate_identity_sha256="a" * 64,
+            aggregate_metrics=replace(
+                baseline,
+                total_return_pct=baseline.total_return_pct + 1.0,
+                excess_total_return_pp=1.0,
+            ),
+        )
+        for baseline in readiness.baseline_discovery.folds
+    )
+    discovery = DiscoveryEvaluation(
+        folds,
+        DiscoveryComparison(fixed_score, fixed_score, True, True),
+    )
+    critic = _decision_calls(state, iteration=1)
+    services = Mock(spec=PitOptimizerServices)
+    services.write_diff_artifact.side_effect = store.write_diff_artifact
+    if failure_kind == "write":
+        services.write_json_artifact.side_effect = OSError(
+            "injected decision write failure"
+        )
+    else:
+        services.write_json_artifact.side_effect = store.write_json_artifact
+        original_sync = artifacts._fsync_directory
+
+        def fail_iteration_sync(path: Path) -> None:
+            if path.name == "001":
+                raise OSError("injected decision directory sync failure")
+            original_sync(path)
+
+        monkeypatch.setattr(artifacts, "_fsync_directory", fail_iteration_sync)
+    monkeypatch.setattr(controller, "validate_candidate_identity", lambda item: None)
+
+    with pytest.raises(OSError, match="injected decision"):
+        _persist_iteration_decision(
+            readiness,
+            state,
+            validation,
+            discovery,
+            critic,
+            services,
+        )
+
+    assert state.incumbent_workspace is prior_workspace
+    assert state.incumbent_identity is prior_identity
+    assert state.incumbent_cumulative_diff == "prior incumbent diff"
+    assert state.incumbent_updates == 0
+    assert state.valid_evaluations == 0
+    assert state.iterations_completed == 0
+    services.dispose_candidate.assert_not_called()
+    services.write_diff_artifact.assert_not_called()
 
 
 def test_next_context_oversize_keeps_prior_incumbent_without_stagnation_count(
@@ -1404,6 +2163,158 @@ def test_next_context_oversize_keeps_prior_incumbent_without_stagnation_count(
     assert state.non_improving_streak == 0
     services.write_diff_artifact.assert_not_called()
     assert writes == ["iterations/001/decision.json"]
+
+
+def test_real_next_context_oversize_becomes_safe_invalid_and_reaches_critic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: real cumulative overflow became terminal identity drift."""
+    from unittest.mock import Mock
+
+    import core.pit_optimizer_controller as controller
+    from core.pit_optimizer_controller import (
+        CandidateValidationOutcome,
+        CandidateWorkspace,
+        PitOptimizerServices,
+        _run_critic,
+        _validate_iteration_candidate,
+    )
+
+    inputs = _prepare_fixture(tmp_path)
+    readiness = _prepare(inputs)
+    state = _run_state(readiness)
+    state.iteration_workspace = CandidateWorkspace(
+        "workspace_context_overflow",
+        Path(inputs["source_root"]).resolve(),
+    )
+    critic = _decision_calls(state, iteration=1)
+    critic.plan = next(
+        item
+        for item in readiness.manifest.call_budgets
+        if item.iteration == 1 and item.role == "critic"
+    )
+    candidate_identity = Mock()
+    oversized = "x" * (64 * 1024 + 1)
+    supplied = CandidateValidationOutcome(
+        True,
+        None,
+        "incremental candidate diff",
+        oversized,
+        candidate_identity,
+        ("core/strategy_policy/entry.py",),
+        ("core.strategy_policy.entry.evaluate_entry",),
+    )
+    services = Mock(spec=PitOptimizerServices)
+    services.validate_and_apply.return_value = supplied
+    payloads: dict[str, Mapping[str, object]] = {}
+    services.write_diff_artifact.side_effect = lambda name, value: (
+        (tmp_path / name).resolve(),
+        hashlib.sha256(value.encode()).hexdigest(),
+    )
+    services.write_json_artifact.side_effect = lambda name, value: (
+        payloads.setdefault(name, value) and (tmp_path / name).resolve(),
+        hashlib.sha256(_canonical_bytes(value)).hexdigest(),
+    )
+    monkeypatch.setattr(controller, "_require_identity_graph", lambda *args: None)
+    monkeypatch.setattr(controller, "validate_author_manifest", lambda *args: None)
+    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
+
+    validation = _validate_iteration_candidate(
+        readiness,
+        state,
+        state.last_author,
+        services,
+    )
+
+    assert validation.valid is False
+    assert validation.failure_code == "next_context_oversize"
+    assert validation.identity is None
+    assert state.prospective_source_bundle is None
+    assert payloads["iterations/001/validation.json"]["author_manifest_matches"] is True
+    captured: list[object] = []
+    monkeypatch.setattr(
+        controller,
+        "_call_role",
+        lambda ready, current, service_values, plan, role_input, parser: (
+            captured.append(role_input) or critic
+        ),
+    )
+
+    assert (
+        _run_critic(
+            readiness,
+            state,
+            state.last_investigator,
+            state.last_author,
+            validation,
+            None,
+            services,
+        )
+        is critic
+    )
+    assert captured[0].validation.failure_code == "next_context_oversize"
+
+
+def test_complete_three_role_context_preflight_stops_before_iteration_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: investigator authority could be spent before later context overflow."""
+    from unittest.mock import Mock
+
+    import core.pit_optimizer_controller as controller
+    from core.pit_optimizer_controller import (
+        CandidateWorkspace,
+        PitOptimizerServices,
+        run_pit_optimizer_v2,
+    )
+
+    inputs = _prepare_fixture(tmp_path)
+    readiness = _prepare(inputs)
+    narrowed = tuple(
+        replace(item, max_dynamic_input_bytes=1)
+        if item.iteration == 2 and item.role == "critic"
+        else item
+        for item in readiness.manifest.call_budgets
+    )
+    manifest = replace(readiness.manifest, call_budgets=narrowed)
+    readiness = replace(
+        readiness,
+        manifest=manifest,
+        manifest_sha256=manifest.sha256,
+    )
+    services = Mock(spec=PitOptimizerServices)
+    services.create_candidate.return_value = CandidateWorkspace(
+        "workspace_context_preflight",
+        Path(inputs["source_root"]).resolve(),
+    )
+    monkeypatch.setattr(controller, "_initialize_run_artifacts", lambda *args: None)
+    monkeypatch.setattr(controller, "_pre_iteration_stop", lambda *args: None)
+    observed: dict[str, object] = {}
+    sentinel = Mock()
+
+    def finalize(
+        ready: object,
+        state: object,
+        service_values: object,
+        terminal_code: str,
+    ) -> object:
+        observed["started"] = state.iterations_started
+        observed["terminal_code"] = terminal_code
+        observed["detail"] = state.terminal_detail
+        return sentinel
+
+    monkeypatch.setattr(controller, "_finalize_result", finalize)
+
+    assert run_pit_optimizer_v2(readiness=readiness, services=services) is sentinel
+    assert observed == {
+        "started": 0,
+        "terminal_code": "budget_exhausted",
+        "detail": "context_budget_exhausted",
+    }
+    services.prepare_iteration_artifacts.assert_not_called()
+    services.call_role.assert_not_called()
 
 
 def test_stop_condition_precedence_and_complete_iteration_budget(
@@ -1485,6 +2396,7 @@ def test_terminal_boundary_classification_is_closed(
 
 
 def test_terminal_boundary_run_routes_partial_iteration_to_common_finalizer(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Break caught: a partial protocol failure could bypass lease cleanup/final evidence."""
@@ -1511,6 +2423,10 @@ def test_terminal_boundary_run_routes_partial_iteration_to_common_finalizer(
         lambda *args: events.append("initialize"),
     )
     monkeypatch.setattr(controller, "_pre_iteration_stop", lambda *args: None)
+    monkeypatch.setattr(controller, "_prepare_iteration_source", lambda *args: None)
+    iteration_directory = (tmp_path / "iterations" / "001").resolve()
+    iteration_directory.mkdir(parents=True)
+    services.prepare_iteration_artifacts.return_value = iteration_directory
     monkeypatch.setattr(
         controller,
         "_run_iteration",
@@ -1607,6 +2523,73 @@ def _hidden_result(
     )
 
 
+def _hidden_attestation(
+    readiness: object,
+    identity_sha256: str,
+    reservation: object,
+    hidden: object,
+    *,
+    attested_candidate_identity_sha256: str | None = None,
+    reuse_reset: bool = False,
+):
+    from core.pit_optimizer_evaluation import (
+        HiddenEvaluationAttestation,
+        HiddenResetReceipt,
+    )
+
+    fold_id = readiness.manifest.fold_manifest.hidden_fold.fold_id
+    baseline_reset = HiddenResetReceipt(
+        fold_id=fold_id,
+        subject="baseline",
+        subject_identity_sha256=readiness.manifest.effective_policy_sha256,
+        reset_receipt_sha256="d" * 64,
+    )
+    candidate_reset = HiddenResetReceipt(
+        fold_id=fold_id,
+        subject="candidate",
+        subject_identity_sha256=(
+            identity_sha256
+            if attested_candidate_identity_sha256 is None
+            else attested_candidate_identity_sha256
+        ),
+        reset_receipt_sha256="d" * 64 if reuse_reset else "e" * 64,
+    )
+    return HiddenEvaluationAttestation.issue(
+        reservation_record_sha256=reservation.reservation_record_sha256,
+        source_head=readiness.manifest.source_head,
+        source_fingerprint_sha256=readiness.manifest.source_fingerprint_sha256,
+        baseline_policy_sha256=readiness.manifest.effective_policy_sha256,
+        candidate_identity_sha256=(
+            identity_sha256
+            if attested_candidate_identity_sha256 is None
+            else attested_candidate_identity_sha256
+        ),
+        fold_id=fold_id,
+        baseline_reset=baseline_reset,
+        candidate_reset=candidate_reset,
+        evaluation=hidden,
+    )
+
+
+def _hidden_outcome_proof(
+    reservation: object,
+    *,
+    attempted: bool,
+    completed: bool,
+    failure_code: str | None,
+):
+    from core.pit_optimizer_evaluation import ValidationOutcomeProof
+
+    return ValidationOutcomeProof(
+        reservation_record_sha256=reservation.reservation_record_sha256,
+        attempted=attempted,
+        completed=completed,
+        failure_code=failure_code,
+        outcome_record_sha256="f" * 64,
+        ledger_head_sha256="f" * 64,
+    )
+
+
 def test_provider_call_is_impossible_after_hidden_boundary() -> None:
     """Break caught: a role call could observe or react to hidden validation."""
     from unittest.mock import Mock
@@ -1643,6 +2626,12 @@ def test_hidden_boundary_reserves_once_closes_provider_then_writes_holdout(
     state.incumbent_workspace = CandidateWorkspace("workspace_hidden", tmp_path.resolve())
     reservation = ValidationReservation("b" * 64, "c" * 64)
     hidden = _hidden_result(readiness.manifest.fold_manifest.hidden_fold.fold_id)
+    attestation = _hidden_attestation(
+        readiness,
+        identity.identity_sha256,
+        reservation,
+        hidden,
+    )
     services = Mock(spec=PitOptimizerServices)
     events: list[str] = []
     services.reserve_hidden_validation.side_effect = (
@@ -1654,9 +2643,18 @@ def test_hidden_boundary_reserves_once_closes_provider_then_writes_holdout(
         assert state.provider_enabled is False
         with pytest.raises(RuntimeError, match="provider capability is closed"):
             _call_role(readiness, state, services, Mock(), Mock(), Mock())
-        return hidden
+        return attestation
 
     services.evaluate_hidden.side_effect = evaluate
+    services.record_hidden_outcome.side_effect = (
+        lambda reserved, attempted, completed, failure_code: events.append("outcome")
+        or _hidden_outcome_proof(
+            reserved,
+            attempted=attempted,
+            completed=completed,
+            failure_code=failure_code,
+        )
+    )
     holdout_payloads: list[Mapping[str, object]] = []
 
     def write(name: str, value: Mapping[str, object]) -> tuple[Path, str]:
@@ -1669,7 +2667,7 @@ def test_hidden_boundary_reserves_once_closes_provider_then_writes_holdout(
 
     assert _run_hidden_once(readiness, state, services) is hidden
 
-    assert events == ["reserve", "evaluate", "holdout.json"]
+    assert events == ["reserve", "evaluate", "holdout.json", "outcome"]
     services.reserve_hidden_validation.assert_called_once_with(identity)
     services.evaluate_hidden.assert_called_once_with(
         state.incumbent_workspace,
@@ -1679,6 +2677,12 @@ def test_hidden_boundary_reserves_once_closes_provider_then_writes_holdout(
     assert state.hidden_validation_opened is True
     assert state.validation_reservation is reservation
     assert state.hidden_evaluation is hidden
+    services.record_hidden_outcome.assert_called_once_with(
+        reservation,
+        True,
+        True,
+        None,
+    )
     assert holdout_payloads[0]["consumed_validation_key_sha256"] == "b" * 64
     assert holdout_payloads[0]["candidate_identity_sha256"] == "a" * 64
 
@@ -1714,14 +2718,27 @@ def test_hidden_qualification_is_quantized_and_complete(
     state.incumbent_identity = identity
     state.incumbent_workspace = CandidateWorkspace("workspace_hidden", tmp_path.resolve())
     services = Mock(spec=PitOptimizerServices)
-    services.reserve_hidden_validation.return_value = ValidationReservation("b" * 64, "c" * 64)
-    services.evaluate_hidden.return_value = _hidden_result(
+    reservation = ValidationReservation("b" * 64, "c" * 64)
+    services.reserve_hidden_validation.return_value = reservation
+    hidden = _hidden_result(
         readiness.manifest.fold_manifest.hidden_fold.fold_id,
         candidate_return=candidate_return,
         closed_trades=closed_trades,
         safety_complete=complete,
         integrity_complete=complete,
         accounting_complete=complete,
+    )
+    services.evaluate_hidden.return_value = _hidden_attestation(
+        readiness,
+        identity.identity_sha256,
+        reservation,
+        hidden,
+    )
+    services.record_hidden_outcome.return_value = _hidden_outcome_proof(
+        reservation,
+        attempted=True,
+        completed=True,
+        failure_code=None,
     )
     services.write_json_artifact.side_effect = lambda name, value: (
         (tmp_path / name).resolve(),
@@ -1732,6 +2749,187 @@ def test_hidden_qualification_is_quantized_and_complete(
     result = _run_hidden_once(readiness, state, services)
 
     assert result.decision.long_replay_eligible is expected
+
+
+@pytest.mark.parametrize("failure_kind", ["wrong_identity", "reset_reuse"])
+def test_hidden_attestation_rejects_wrong_identity_or_reused_reset_and_closes_outcome(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    """Break caught: unbound or non-independent hidden evidence could qualify replay."""
+    from unittest.mock import Mock
+
+    from core.pit_optimizer_controller import (
+        CandidateWorkspace,
+        EvidenceTampering,
+        IdentityDrift,
+        PitOptimizerServices,
+        _run_hidden_once,
+    )
+    from core.pit_optimizer_evaluation import ValidationReservation
+
+    readiness = _prepare(_prepare_fixture(tmp_path))
+    state = _run_state(readiness)
+    identity = Mock()
+    identity.identity_sha256 = "a" * 64
+    state.incumbent_identity = identity
+    state.incumbent_workspace = CandidateWorkspace(
+        "workspace_hidden_binding",
+        tmp_path.resolve(),
+    )
+    reservation = ValidationReservation("b" * 64, "c" * 64)
+    hidden = _hidden_result(readiness.manifest.fold_manifest.hidden_fold.fold_id)
+    attestation = _hidden_attestation(
+        readiness,
+        identity.identity_sha256,
+        reservation,
+        hidden,
+        attested_candidate_identity_sha256=(
+            "9" * 64 if failure_kind == "wrong_identity" else None
+        ),
+        reuse_reset=failure_kind == "reset_reuse",
+    )
+    services = Mock(spec=PitOptimizerServices)
+    services.reserve_hidden_validation.return_value = reservation
+    services.evaluate_hidden.return_value = attestation
+    services.record_hidden_outcome.return_value = _hidden_outcome_proof(
+        reservation,
+        attempted=True,
+        completed=False,
+        failure_code="integrity_failed",
+    )
+
+    expected = IdentityDrift if failure_kind == "wrong_identity" else EvidenceTampering
+    with pytest.raises(expected):
+        _run_hidden_once(readiness, state, services)
+
+    services.record_hidden_outcome.assert_called_once_with(
+        reservation,
+        True,
+        False,
+        "integrity_failed",
+    )
+    services.write_json_artifact.assert_not_called()
+    assert state.hidden_evaluation is None
+
+
+def test_hidden_evaluation_failure_records_content_free_outcome(
+    tmp_path: Path,
+) -> None:
+    """Break caught: an evaluation exception could leave a permanent reservation open."""
+    from unittest.mock import Mock
+
+    from core.pit_optimizer_controller import (
+        CandidateWorkspace,
+        PitOptimizerServices,
+        _run_hidden_once,
+    )
+    from core.pit_optimizer_evaluation import ValidationReservation
+
+    readiness = _prepare(_prepare_fixture(tmp_path))
+    state = _run_state(readiness)
+    identity = Mock()
+    identity.identity_sha256 = "a" * 64
+    state.incumbent_identity = identity
+    state.incumbent_workspace = CandidateWorkspace(
+        "workspace_hidden_failure",
+        tmp_path.resolve(),
+    )
+    reservation = ValidationReservation("b" * 64, "c" * 64)
+    services = Mock(spec=PitOptimizerServices)
+    services.reserve_hidden_validation.return_value = reservation
+    services.evaluate_hidden.side_effect = RuntimeError("injected hidden replay failure")
+    services.record_hidden_outcome.return_value = _hidden_outcome_proof(
+        reservation,
+        attempted=True,
+        completed=False,
+        failure_code="replay_failed",
+    )
+
+    with pytest.raises(RuntimeError, match="injected hidden replay failure"):
+        _run_hidden_once(readiness, state, services)
+
+    services.record_hidden_outcome.assert_called_once_with(
+        reservation,
+        True,
+        False,
+        "replay_failed",
+    )
+    services.write_json_artifact.assert_not_called()
+    assert state.hidden_evaluation is None
+
+
+@pytest.mark.parametrize("failure_kind", ["write", "directory_sync"])
+def test_holdout_durability_failure_preserves_uncommitted_hidden_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    """Break caught: hidden eligibility could advance without durable holdout evidence."""
+    from unittest.mock import Mock
+
+    import core.pit_optimizer_artifacts as artifacts
+    from core.pit_optimizer_artifacts import IncrementalArtifactStore
+    from core.pit_optimizer_controller import (
+        CandidateWorkspace,
+        PitOptimizerServices,
+        _run_hidden_once,
+    )
+    from core.pit_optimizer_evaluation import ValidationReservation
+
+    readiness = _prepare(_prepare_fixture(tmp_path))
+    state = _run_state(readiness)
+    identity = Mock()
+    identity.identity_sha256 = "a" * 64
+    state.incumbent_identity = identity
+    state.incumbent_workspace = CandidateWorkspace(
+        "workspace_hidden_durability",
+        tmp_path.resolve(),
+    )
+    reservation = ValidationReservation("b" * 64, "c" * 64)
+    hidden = _hidden_result(readiness.manifest.fold_manifest.hidden_fold.fold_id)
+    services = Mock(spec=PitOptimizerServices)
+    services.reserve_hidden_validation.return_value = reservation
+    services.evaluate_hidden.return_value = _hidden_attestation(
+        readiness,
+        identity.identity_sha256,
+        reservation,
+        hidden,
+    )
+    services.record_hidden_outcome.return_value = _hidden_outcome_proof(
+        reservation,
+        attempted=True,
+        completed=False,
+        failure_code="integrity_failed",
+    )
+    if failure_kind == "write":
+        services.write_json_artifact.side_effect = OSError(
+            "injected holdout write failure"
+        )
+    else:
+        root = (tmp_path / "run").resolve()
+        root.mkdir()
+        store = IncrementalArtifactStore(root)
+        services.write_json_artifact.side_effect = store.write_json_artifact
+        original_sync = artifacts._fsync_directory
+
+        def fail_root_sync(path: Path) -> None:
+            if path == root:
+                raise OSError("injected holdout directory sync failure")
+            original_sync(path)
+
+        monkeypatch.setattr(artifacts, "_fsync_directory", fail_root_sync)
+
+    with pytest.raises(OSError, match="injected holdout"):
+        _run_hidden_once(readiness, state, services)
+
+    assert state.hidden_evaluation is None
+    services.record_hidden_outcome.assert_called_once_with(
+        reservation,
+        True,
+        False,
+        "integrity_failed",
+    )
 
 
 def test_hidden_boundary_provider_projectable_inputs_omit_hidden_identity_and_results(
