@@ -11,6 +11,7 @@ import json
 import math
 import re
 import subprocess
+from types import MappingProxyType
 from typing import Callable, Iterable, Mapping, Sequence
 
 from core.pit_optimizer_evaluation import (
@@ -182,6 +183,8 @@ class ParityReference:
             _require_digest(getattr(self, name), name)
         if not isinstance(self.fold_manifest, FoldManifest):
             raise ValueError("parity reference fold manifest is invalid")
+        if self.fold_manifest.data_identity_sha256 != self.pit_bundle_sha256:
+            raise ValueError("parity reference data identity differs from PIT bundle")
         if (
             type(self.universe) is not tuple
             or not self.universe
@@ -190,6 +193,8 @@ class ParityReference:
             raise ValueError("parity reference universe is invalid")
         if len(set(self.universe)) != len(self.universe):
             raise ValueError("parity reference universe contains duplicates")
+        if self.fold_manifest.universe_sha256 != _digest(list(self.universe)):
+            raise ValueError("parity reference universe identity mismatch")
         if type(self.discovery_evidence) is not tuple or len(self.discovery_evidence) != 2:
             raise ValueError("parity reference requires two discovery evidence records")
         expected_ids = tuple(fold.fold_id for fold in self.fold_manifest.discovery_folds)
@@ -202,6 +207,22 @@ class ParityReference:
             evidence.effective_policy_sha256 != self.effective_policy_sha256 for evidence in self.discovery_evidence
         ):
             raise ValueError("parity reference effective policy differs by fold")
+        for fold, evidence in zip(
+            self.fold_manifest.discovery_folds,
+            self.discovery_evidence,
+            strict=True,
+        ):
+            if tuple(point.session for point in evidence.equity) != fold.sessions:
+                raise ValueError("parity evidence equity sessions differ from fold")
+            if evidence.funnel != evidence.aggregate.entry_funnel:
+                raise ValueError("parity evidence entry funnel differs from aggregate")
+            sessions = frozenset(fold.sessions)
+            if any(transaction.date not in sessions for transaction in evidence.transactions):
+                raise ValueError("parity transaction date is outside its fold")
+            if any(outcome.signal_date not in sessions for outcome in evidence.entry_outcomes):
+                raise ValueError("parity entry outcome signal date is outside its fold")
+            if any(outcome.entry_date not in sessions for outcome in evidence.entry_outcomes):
+                raise ValueError("parity entry outcome entry date is outside its fold")
         if not isinstance(self.artifact_path, Path) or not self.artifact_path.is_absolute():
             raise ValueError("parity reference artifact path is invalid")
 
@@ -403,7 +424,10 @@ def verify_parity_evidence(
     final_source_fingerprint_sha256: str,
     policy_interface_version: int,
     final_discovery_evidence: tuple[ParityFoldEvidence, ...],
+    pre_persist_check: Callable[[], None],
 ) -> ParityAttestation:
+    if final_source_head == reference.reference_source_head:
+        raise ValueError("parity verification requires a later source HEAD")
     if tuple(item.fold_id for item in final_discovery_evidence) != tuple(
         item.fold_id for item in reference.discovery_evidence
     ):
@@ -440,6 +464,7 @@ def verify_parity_evidence(
     ]
     if failures:
         raise ValueError("parity differs in " + ", ".join(failures))
+    pre_persist_check()
     final_output_sha256s = tuple((item.fold_id, item.evidence_sha256) for item in final_discovery_evidence)
     path = Path(output).resolve()
     provisional = ParityAttestation(
@@ -666,6 +691,7 @@ def capture_from_authenticated_inputs(
     benchmark_sessions: Iterable[str],
     output: Path,
     evaluate_discovery_fold: Callable[[FoldSpec, tuple[str, ...], str], ParityFoldEvidence],
+    pre_persist_check: Callable[[], None],
 ) -> ParityReference:
     """Compose a reference after callers authenticate source, readiness, and bundle."""
 
@@ -691,6 +717,7 @@ def capture_from_authenticated_inputs(
     )
     if any(item.effective_policy_sha256 != effective_policy_sha256 for item in evidence):
         raise ValueError("captured fold effective policy differs from readiness")
+    pre_persist_check()
     return persist_parity_reference(
         output=Path(output),
         reference_source_head=reference_source_head,
@@ -741,12 +768,47 @@ def _source_identity(source_root: Path) -> tuple[str, str]:
         )
         return completed.stdout
 
-    if git("status", "--porcelain", "--untracked-files=no").strip():
+    if git("status", "--porcelain", "--untracked-files=all").strip():
         raise ValueError("parity capture requires a clean committed source")
     head = git("rev-parse", "HEAD").decode("ascii").strip()
     _require_head(head, "source head")
     tree = git("ls-tree", "-r", "--full-tree", "HEAD")
     return head, hashlib.sha256(tree).hexdigest()
+
+
+def _require_later_descendant_source(
+    *,
+    source_root: Path,
+    reference_head: str,
+    final_head: str,
+) -> None:
+    _require_head(reference_head, "reference source head")
+    _require_head(final_head, "final source head")
+    if final_head == reference_head:
+        raise ValueError("parity verification requires a later source HEAD")
+    completed = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", reference_head, final_head],
+        cwd=Path(source_root).resolve(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode == 1:
+        raise ValueError("final source HEAD is not a descendant of the reference")
+    if completed.returncode != 0:
+        raise ValueError("source ancestry could not be verified")
+
+
+def _require_unchanged_source(
+    *,
+    source_root: Path,
+    expected_head: str,
+    expected_fingerprint_sha256: str,
+) -> None:
+    if _source_identity(source_root) != (
+        expected_head,
+        expected_fingerprint_sha256,
+    ):
+        raise ValueError("source changed during parity evaluation")
 
 
 def _benchmark_calendar(bundle: object, benchmark: str) -> tuple[str, ...]:
@@ -763,17 +825,176 @@ def _benchmark_calendar(bundle: object, benchmark: str) -> tuple[str, ...]:
     return sessions
 
 
-def _authenticated_readiness(path: Path) -> tuple[dict[str, object], str]:
-    _, readiness, readiness_sha256 = _canonical_object(path, "readiness artifact")
+def _authenticated_readiness(
+    path: Path,
+    *,
+    source_root: Path,
+) -> tuple[dict[str, object], str]:
+    artifact_path, readiness, readiness_sha256 = _canonical_object(
+        path, "readiness artifact"
+    )
+    expected_top_level = {
+        "baseline",
+        "budget_contract",
+        "candidate_catalog",
+        "date_contract",
+        "effective_policy",
+        "evaluation_contract",
+        "evidence_ids",
+        "gate",
+        "identities",
+        "invariant_ids",
+        "phase",
+        "prior_discovery_feedback",
+        "schema_version",
+        "sealed_inputs",
+    }
+    if (
+        set(readiness) != expected_top_level
+        or readiness.get("schema_version") != 1
+        or readiness.get("gate") != "pit_optimization"
+        or readiness.get("phase") != "ready"
+    ):
+        raise ValueError("readiness is not the closed readiness contract")
     identities = readiness.get("identities")
+    sealed_inputs = readiness.get("sealed_inputs")
     effective_policy = readiness.get("effective_policy")
-    if not isinstance(identities, Mapping) or not isinstance(effective_policy, Mapping):
+    expected_identity_keys = {
+        "baseline_manifest_sha256",
+        "baseline_source_commit",
+        "effective_policy_sha256",
+        "entry_contract_source_sha256",
+        "pit_bundle_sha256",
+        "prior_discovery_feedback_sha256",
+        "source_fingerprint_sha256",
+        "source_head",
+    }
+    if (
+        not isinstance(identities, dict)
+        or set(identities) != expected_identity_keys
+        or not isinstance(sealed_inputs, dict)
+        or set(sealed_inputs)
+        != {
+            "baseline_artifact_sha256",
+            "pit_bundle_sha256",
+            "prior_discovery_feedback_sha256",
+        }
+        or not isinstance(effective_policy, Mapping)
+    ):
         raise ValueError("readiness identity graph is incomplete")
+    from core.pit_optimization import (
+        BASELINE_MANIFEST_SHA256,
+        BASELINE_SOURCE_COMMIT,
+        FULL_END_DATE,
+        FULL_START_DATE,
+        HOLDOUT_END_DATE,
+        HOLDOUT_START_DATE,
+        PIT_BUNDLE_SHA256,
+        PitOptimizationReadiness,
+        _INVARIANT_IDS,
+        _VERIFICATION_EVIDENCE_IDS,
+        _provider_payload,
+        _readiness_identity,
+        _verify_policy_catalog,
+        candidate_catalog,
+    )
+
+    for name in (
+        "source_fingerprint_sha256",
+        "entry_contract_source_sha256",
+        "pit_bundle_sha256",
+        "baseline_manifest_sha256",
+        "effective_policy_sha256",
+    ):
+        _require_digest(identities.get(name), f"readiness {name}")
+    _require_head(identities.get("source_head"), "readiness source head")
+    prior_sha256 = identities.get("prior_discovery_feedback_sha256")
+    if prior_sha256 is not None:
+        _require_digest(prior_sha256, "readiness prior feedback digest")
+    if (
+        identities.get("pit_bundle_sha256") != PIT_BUNDLE_SHA256
+        or identities.get("baseline_manifest_sha256") != BASELINE_MANIFEST_SHA256
+        or identities.get("baseline_source_commit") != BASELINE_SOURCE_COMMIT
+    ):
+        raise ValueError("readiness fixed authority identity changed")
+    baseline_artifacts = sealed_inputs.get("baseline_artifact_sha256")
+    if (
+        sealed_inputs.get("pit_bundle_sha256") != identities["pit_bundle_sha256"]
+        or sealed_inputs.get("prior_discovery_feedback_sha256") != prior_sha256
+        or not isinstance(baseline_artifacts, dict)
+        or not baseline_artifacts
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+            for name, digest in baseline_artifacts.items()
+        )
+        or baseline_artifacts.get("run_manifest.json")
+        != identities["baseline_manifest_sha256"]
+    ):
+        raise ValueError("readiness sealed input identity changed")
+    if readiness.get("date_contract") != {
+        "full_start": FULL_START_DATE,
+        "full_end": FULL_END_DATE,
+        "holdout_start": HOLDOUT_START_DATE,
+        "holdout_end": HOLDOUT_END_DATE,
+    }:
+        raise ValueError("readiness date contract changed")
+    if readiness.get("evidence_ids") != list(_VERIFICATION_EVIDENCE_IDS) or readiness.get(
+        "invariant_ids"
+    ) != list(_INVARIANT_IDS):
+        raise ValueError("readiness evidence contract changed")
+    prior_feedback = readiness.get("prior_discovery_feedback")
+    if not isinstance(prior_feedback, list) or any(
+        not isinstance(item, Mapping)
+        or not isinstance(item.get("candidate_id"), str)
+        for item in prior_feedback
+    ):
+        raise ValueError("readiness prior discovery feedback is malformed")
+    tested_candidate_ids = {
+        str(item["candidate_id"])
+        for item in prior_feedback
+    }
+    expected_catalog = [
+        {
+            "candidate_id": item.candidate_id,
+            "constant_name": item.constant_name,
+            "policy_field": item.policy_field,
+            "old_value": item.old_value,
+            "new_value": item.new_value,
+            "path": item.path,
+            "old_line": item.old_line,
+            "new_line": item.new_line,
+        }
+        for item in candidate_catalog().values()
+        if item.candidate_id not in tested_candidate_ids
+    ]
+    if readiness.get("candidate_catalog") != expected_catalog:
+        raise ValueError("readiness candidate catalog changed")
+
     from core.engine_policy import effective_engine_policy_sha256
 
     expected_policy_sha256 = identities.get("effective_policy_sha256")
     if effective_engine_policy_sha256(effective_policy) != expected_policy_sha256:
         raise ValueError("readiness effective policy digest mismatch")
+    _verify_policy_catalog(effective_policy)
+    provider_payload = _provider_payload(readiness)
+    authenticated = PitOptimizationReadiness(
+        readiness_sha256=readiness_sha256,
+        artifact_path=artifact_path,
+        artifact_sha256=readiness_sha256,
+        effective_policy_sha256=expected_policy_sha256,
+        provider_payload=MappingProxyType(provider_payload),
+        primitive=MappingProxyType(readiness),
+    )
+    _readiness_identity(
+        authenticated,
+        expected_readiness_sha256=readiness_sha256,
+        expected_effective_policy_sha256=expected_policy_sha256,
+        source_root=Path(source_root).resolve(),
+        candidate_root=None,
+    )
     return readiness, readiness_sha256
 
 
@@ -806,7 +1027,10 @@ def capture_parity_reference(
 
     root = Path(source_root or Path(__file__).resolve().parents[1]).resolve()
     source_head, source_fingerprint = _source_identity(root)
-    readiness, readiness_sha256 = _authenticated_readiness(Path(readiness_path))
+    readiness, readiness_sha256 = _authenticated_readiness(
+        Path(readiness_path),
+        source_root=root,
+    )
     identities = readiness["identities"]
     if not isinstance(identities, Mapping):
         raise ValueError("readiness identities are absent")
@@ -853,6 +1077,11 @@ def capture_parity_reference(
             benchmark_sessions=calendar,
             output=Path(output),
             evaluate_discovery_fold=evaluate,
+            pre_persist_check=lambda: _require_unchanged_source(
+                source_root=root,
+                expected_head=source_head,
+                expected_fingerprint_sha256=source_fingerprint,
+            ),
         )
 
 
@@ -868,6 +1097,11 @@ def verify_parity_reference(
     root = Path(source_root or Path(__file__).resolve().parents[1]).resolve()
     final_head, final_fingerprint = _source_identity(root)
     reference = load_parity_reference(Path(reference_path))
+    _require_later_descendant_source(
+        source_root=root,
+        reference_head=reference.reference_source_head,
+        final_head=final_head,
+    )
     bundle_path = Path(pit_bundle_path)
     if bundle_path.is_symlink() or not bundle_path.is_file():
         raise ValueError("PIT bundle must be a regular non-link file")
@@ -904,6 +1138,11 @@ def verify_parity_reference(
         final_source_fingerprint_sha256=final_fingerprint,
         policy_interface_version=POLICY_INTERFACE_VERSION,
         final_discovery_evidence=evidence,
+        pre_persist_check=lambda: _require_unchanged_source(
+            source_root=root,
+            expected_head=final_head,
+            expected_fingerprint_sha256=final_fingerprint,
+        ),
     )
 
 

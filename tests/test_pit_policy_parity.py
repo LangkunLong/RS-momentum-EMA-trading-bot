@@ -6,10 +6,12 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 
 import pandas as pd
 import pytest
 
+import core.pit_policy_parity as parity
 from core.backtest_engine import EntryAttemptOutcome, SimulationResult, Trade
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
@@ -62,8 +64,12 @@ def _fold(fold_id: str, purpose: str, start: str) -> FoldSpec:
     )
 
 
-def _aggregate(fold_id: str) -> FoldAggregateSummary:
-    funnel = (AggregateMetric("entries_executed", 1),)
+def _aggregate(
+    fold_id: str,
+    *,
+    funnel: tuple[AggregateMetric, ...] | None = None,
+) -> FoldAggregateSummary:
+    funnel = funnel or (AggregateMetric("entries_executed", 1),)
     exits = (AggregateMetric("end_of_test", 1),)
     return FoldAggregateSummary(
         fold_id=fold_id,
@@ -79,9 +85,30 @@ def _aggregate(fold_id: str) -> FoldAggregateSummary:
     )
 
 
-def _evidence(fold_id: str, *, equity: float = 1_010.0) -> ParityFoldEvidence:
+def _json_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+            "utf-8"
+        )
+        + b"\n"
+    ).hexdigest()
+
+
+def _evidence(
+    fold: FoldSpec,
+    *,
+    equity: float = 1_010.0,
+    equity_sessions: tuple[str, ...] | None = None,
+    transaction_date: str | None = None,
+    signal_date: str | None = None,
+    entry_date: str | None = None,
+    aggregate_funnel: tuple[AggregateMetric, ...] | None = None,
+) -> ParityFoldEvidence:
+    transaction_date = transaction_date or fold.sessions[1]
+    signal_date = signal_date or fold.sessions[0]
+    entry_date = entry_date or fold.sessions[1]
     transaction = ParityTransaction(
-        date="2021-01-05",
+        date=transaction_date,
         symbol="AAA",
         from_symbol=None,
         action="BUY",
@@ -92,35 +119,38 @@ def _evidence(fold_id: str, *, equity: float = 1_010.0) -> ParityFoldEvidence:
     )
     outcome = ParityEntryOutcome(
         symbol="AAA",
-        signal_date="2021-01-04",
-        entry_date="2021-01-05",
+        signal_date=signal_date,
+        entry_date=entry_date,
         pivot=None,
         buy_zone_lower=None,
         buy_zone_upper=None,
         entry_open=100.0,
         outcome="entries_executed",
     )
+    funnel = (AggregateMetric("entries_executed", 1),)
+    equity_points = tuple(
+        ParityEquityPoint(session, equity)
+        for session in (equity_sessions or fold.sessions)
+    )
     fields = {
-        "fold_id": fold_id,
+        "fold_id": fold.fold_id,
         "transactions": (transaction,),
         "entry_outcomes": (outcome,),
-        "equity": (ParityEquityPoint("2021-01-05", equity),),
-        "funnel": (AggregateMetric("entries_executed", 1),),
-        "aggregate": _aggregate(fold_id),
+        "equity": equity_points,
+        "funnel": funnel,
+        "aggregate": _aggregate(fold.fold_id, funnel=aggregate_funnel),
         "effective_policy_sha256": "d" * 64,
     }
     primitive = {
-        "fold_id": fold_id,
+        "fold_id": fold.fold_id,
         "transactions": [asdict(transaction)],
         "entry_outcomes": [asdict(outcome)],
-        "equity": [asdict(fields["equity"][0])],
-        "funnel": [asdict(fields["funnel"][0])],
+        "equity": [asdict(point) for point in equity_points],
+        "funnel": [asdict(metric) for metric in funnel],
         "aggregate": asdict(fields["aggregate"]),
         "effective_policy_sha256": "d" * 64,
     }
-    digest = hashlib.sha256(
-        json.dumps(primitive, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
-    ).hexdigest()
+    digest = _json_digest(primitive)
     return ParityFoldEvidence(**fields, evidence_sha256=digest)
 
 
@@ -146,8 +176,8 @@ def test_fold_manifest_requires_two_chronological_discovery_folds_before_hidden(
     second = _fold("discovery_2", "discovery", "2021-04-01")
     hidden = _fold("hidden_1", "hidden", "2022-01-03")
     manifest = FoldManifest(
-        data_identity_sha256="a" * 64,
-        universe_sha256="b" * 64,
+        data_identity_sha256="4" * 64,
+        universe_sha256=_json_digest(["AAA", "BBB"]),
         benchmark="SPY",
         warmup_start_date="2020-01-02",
         discovery_folds=(first, second),
@@ -165,15 +195,15 @@ def test_reference_persists_canonical_nested_evidence_and_is_create_only(tmp_pat
     first = _fold("discovery_1", "discovery", "2021-01-04")
     second = _fold("discovery_2", "discovery", "2021-04-01")
     manifest = FoldManifest(
-        data_identity_sha256="a" * 64,
-        universe_sha256="b" * 64,
+        data_identity_sha256="4" * 64,
+        universe_sha256=_json_digest(["AAA", "BBB"]),
         benchmark="SPY",
         warmup_start_date="2020-01-02",
         discovery_folds=(first, second),
         hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
     )
     output = tmp_path / "reference.json"
-    evidence = (_evidence("discovery_1"), _evidence("discovery_2"))
+    evidence = (_evidence(first), _evidence(second))
 
     reference = persist_parity_reference(
         output=output,
@@ -213,15 +243,15 @@ def test_attestation_is_not_written_when_any_retrievable_evidence_differs(tmp_pa
     first = _fold("discovery_1", "discovery", "2021-01-04")
     second = _fold("discovery_2", "discovery", "2021-04-01")
     manifest = FoldManifest(
-        data_identity_sha256="a" * 64,
-        universe_sha256="b" * 64,
+        data_identity_sha256="4" * 64,
+        universe_sha256=_json_digest(["AAA", "BBB"]),
         benchmark="SPY",
         warmup_start_date="2020-01-02",
         discovery_folds=(first, second),
         hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
     )
     reference_path = tmp_path / "reference.json"
-    reference_evidence = (_evidence("discovery_1"), _evidence("discovery_2"))
+    reference_evidence = (_evidence(first), _evidence(second))
     persist_parity_reference(
         output=reference_path,
         reference_source_head="1" * 40,
@@ -244,9 +274,10 @@ def test_attestation_is_not_written_when_any_retrievable_evidence_differs(tmp_pa
             final_source_fingerprint_sha256="7" * 64,
             policy_interface_version=1,
             final_discovery_evidence=(
-                _evidence("discovery_1", equity=999.0),
+                _evidence(first, equity=999.0),
                 reference_evidence[1],
             ),
+            pre_persist_check=lambda: None,
         )
     assert not output.exists()
 
@@ -390,7 +421,7 @@ def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Pa
 
     def evaluate(fold: FoldSpec, _universe: tuple[str, ...], _warmup: str) -> ParityFoldEvidence:
         evaluated.append(fold.fold_id)
-        return _evidence(fold.fold_id)
+        return _evidence(fold)
 
     reference = capture_from_authenticated_inputs(
         readiness=readiness,
@@ -401,6 +432,7 @@ def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Pa
         benchmark_sessions=sessions,
         output=tmp_path / "reference.json",
         evaluate_discovery_fold=evaluate,
+        pre_persist_check=lambda: None,
     )
 
     assert evaluated == ["discovery_1", "discovery_2"]
@@ -424,3 +456,382 @@ def test_capture_simulator_binds_authenticated_signal_cadence() -> None:
     }
 
     assert simulator_kwargs_from_readiness(readiness) == {"signal_every_n_days": 1}
+
+
+def test_attestation_rejects_the_reference_source_head(tmp_path: Path) -> None:
+    """Break caught: capture HEAD could immediately attest itself as post-extraction."""
+    first = _fold("discovery_1", "discovery", "2021-01-04")
+    second = _fold("discovery_2", "discovery", "2021-04-01")
+    reference_path = tmp_path / "reference.json"
+    reference = persist_parity_reference(
+        output=reference_path,
+        reference_source_head="1" * 40,
+        reference_source_fingerprint_sha256="2" * 64,
+        readiness_sha256="3" * 64,
+        pit_bundle_sha256="4" * 64,
+        baseline_manifest_sha256="5" * 64,
+        effective_policy_sha256="d" * 64,
+        fold_manifest=FoldManifest(
+            data_identity_sha256="4" * 64,
+            universe_sha256=_json_digest(["AAA", "BBB"]),
+            benchmark="SPY",
+            warmup_start_date="2020-01-02",
+            discovery_folds=(first, second),
+            hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
+        ),
+        universe=("AAA", "BBB"),
+        discovery_evidence=(_evidence(first), _evidence(second)),
+    )
+
+    with pytest.raises(ValueError, match="later source HEAD"):
+        verify_parity_evidence(
+            reference=reference,
+            output=tmp_path / "attestation.json",
+            final_source_head=reference.reference_source_head,
+            final_source_fingerprint_sha256="7" * 64,
+            policy_interface_version=1,
+            final_discovery_evidence=reference.discovery_evidence,
+            pre_persist_check=lambda: None,
+        )
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_verification_rejects_a_non_descendant_source_head(tmp_path: Path) -> None:
+    """Break caught: an unrelated commit could be called the final extracted source."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+
+    git("init")
+    git("config", "user.name", "Parity Test")
+    git("config", "user.email", "parity@example.invalid")
+    (repository / "tracked.txt").write_text("reference\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-m", "reference")
+    reference_head = git("rev-parse", "HEAD")
+    git("switch", "--orphan", "unrelated")
+    (repository / "other.txt").write_text("unrelated\n", encoding="utf-8")
+    git("add", "other.txt")
+    git("commit", "-m", "unrelated")
+    final_head = git("rev-parse", "HEAD")
+
+    with pytest.raises(ValueError, match="descendant"):
+        parity._require_later_descendant_source(
+            source_root=repository,
+            reference_head=reference_head,
+            final_head=final_head,
+        )
+
+
+def test_readiness_authentication_rejects_a_canonical_incomplete_contract(
+    tmp_path: Path,
+) -> None:
+    """Break caught: canonical bytes alone could masquerade as closed readiness."""
+    policy = {"schema_version": 1}
+    policy_sha256 = hashlib.sha256(
+        json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    ).hexdigest()
+    readiness = {
+        "effective_policy": policy,
+        "identities": {"effective_policy_sha256": policy_sha256},
+    }
+    path = tmp_path / "readiness.json"
+    path.write_bytes(
+        json.dumps(readiness, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    with pytest.raises(ValueError, match="closed readiness contract"):
+        parity._authenticated_readiness(
+            path,
+            source_root=Path(__file__).resolve().parents[1],
+        )
+
+
+def test_readiness_authentication_rejects_tampered_candidate_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: known candidate IDs could carry unauthenticated edit records."""
+    import core.pit_optimization as optimization
+    from core.engine_policy import effective_engine_policy_sha256
+
+    policy = {"schema_version": 1}
+    policy_sha256 = effective_engine_policy_sha256(policy)
+    readiness = {
+        "schema_version": 1,
+        "gate": "pit_optimization",
+        "phase": "ready",
+        "identities": {
+            "source_head": "1" * 40,
+            "source_fingerprint_sha256": "2" * 64,
+            "entry_contract_source_sha256": "3" * 64,
+            "pit_bundle_sha256": optimization.PIT_BUNDLE_SHA256,
+            "baseline_manifest_sha256": optimization.BASELINE_MANIFEST_SHA256,
+            "baseline_source_commit": optimization.BASELINE_SOURCE_COMMIT,
+            "effective_policy_sha256": policy_sha256,
+            "prior_discovery_feedback_sha256": None,
+        },
+        "sealed_inputs": {
+            "pit_bundle_sha256": optimization.PIT_BUNDLE_SHA256,
+            "baseline_artifact_sha256": {
+                "run_manifest.json": optimization.BASELINE_MANIFEST_SHA256
+            },
+            "prior_discovery_feedback_sha256": None,
+        },
+        "date_contract": {
+            "full_start": optimization.FULL_START_DATE,
+            "full_end": optimization.FULL_END_DATE,
+            "holdout_start": optimization.HOLDOUT_START_DATE,
+            "holdout_end": optimization.HOLDOUT_END_DATE,
+        },
+        "budget_contract": {},
+        "evaluation_contract": {},
+        "candidate_catalog": [
+            {"candidate_id": "min_rs_score_075", "new_line": "TAMPERED = True"}
+        ],
+        "effective_policy": policy,
+        "baseline": {},
+        "prior_discovery_feedback": [],
+        "evidence_ids": list(optimization._VERIFICATION_EVIDENCE_IDS),
+        "invariant_ids": list(optimization._INVARIANT_IDS),
+    }
+    path = tmp_path / "readiness.json"
+    path.write_bytes(
+        json.dumps(readiness, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+    monkeypatch.setattr(optimization, "_verify_policy_catalog", lambda _policy: None)
+    monkeypatch.setattr(optimization, "_provider_payload", lambda _readiness: {})
+    monkeypatch.setattr(optimization, "_readiness_identity", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(ValueError, match="candidate catalog changed"):
+        parity._authenticated_readiness(path, source_root=tmp_path)
+
+
+def test_source_identity_rejects_nonignored_untracked_files(tmp_path: Path) -> None:
+    """Break caught: untracked executable input was compatible with a clean source claim."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    git("init")
+    git("config", "user.name", "Parity Test")
+    git("config", "user.email", "parity@example.invalid")
+    (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-m", "tracked")
+    (repository / "runtime_policy.py").write_text("ACTIVE = True\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="clean committed source"):
+        parity._source_identity(repository)
+
+
+def test_capture_rechecks_source_after_evaluation_before_write(tmp_path: Path) -> None:
+    """Break caught: capture could publish after source changed during evaluation."""
+    closures = {
+        "2021-07-05",
+        "2021-09-06",
+        "2021-11-25",
+        "2021-12-24",
+        "2022-01-17",
+        "2022-02-21",
+    }
+    sessions = tuple(
+        value.date().isoformat()
+        for value in pd.bdate_range("2021-06-25", "2022-03-11")
+        if value.date().isoformat() not in closures
+    )
+    readiness = {
+        "evaluation_contract": {
+            "verification_only": True,
+            "scope": {
+                "benchmark": "SPY",
+                "discovery_start": "2021-06-25",
+                "discovery_end": "2021-09-20",
+                "holdout_start": "2021-09-21",
+                "holdout_end": "2021-12-14",
+                "warmup_start": "2021-01-01",
+                "session_count": 60,
+                "symbol_count": 2,
+                "symbols": ["AAA", "BBB"],
+            },
+        },
+        "identities": {
+            "pit_bundle_sha256": "4" * 64,
+            "baseline_manifest_sha256": "5" * 64,
+            "effective_policy_sha256": "d" * 64,
+        },
+    }
+
+    def reject_drift() -> None:
+        raise ValueError("source changed during parity evaluation")
+
+    output = tmp_path / "reference.json"
+    with pytest.raises(ValueError, match="source changed"):
+        capture_from_authenticated_inputs(
+            readiness=readiness,
+            readiness_sha256="3" * 64,
+            pit_bundle_sha256="4" * 64,
+            reference_source_head="1" * 40,
+            reference_source_fingerprint_sha256="2" * 64,
+            benchmark_sessions=sessions,
+            output=output,
+            evaluate_discovery_fold=lambda fold, _universe, _warmup: _evidence(
+                fold
+            ),
+            pre_persist_check=reject_drift,
+        )
+    assert not output.exists()
+
+
+def test_attestation_rechecks_source_after_evaluation_before_write(tmp_path: Path) -> None:
+    """Break caught: verification could publish after source changed during evaluation."""
+    first = _fold("discovery_1", "discovery", "2021-01-04")
+    second = _fold("discovery_2", "discovery", "2021-04-01")
+    reference = persist_parity_reference(
+        output=tmp_path / "reference.json",
+        reference_source_head="1" * 40,
+        reference_source_fingerprint_sha256="2" * 64,
+        readiness_sha256="3" * 64,
+        pit_bundle_sha256="4" * 64,
+        baseline_manifest_sha256="5" * 64,
+        effective_policy_sha256="d" * 64,
+        fold_manifest=FoldManifest(
+            data_identity_sha256="4" * 64,
+            universe_sha256=_json_digest(["AAA", "BBB"]),
+            benchmark="SPY",
+            warmup_start_date="2020-01-02",
+            discovery_folds=(first, second),
+            hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
+        ),
+        universe=("AAA", "BBB"),
+        discovery_evidence=(_evidence(first), _evidence(second)),
+    )
+
+    def reject_drift() -> None:
+        raise ValueError("source changed during parity evaluation")
+
+    output = tmp_path / "attestation.json"
+    with pytest.raises(ValueError, match="source changed"):
+        verify_parity_evidence(
+            reference=reference,
+            output=output,
+            final_source_head="6" * 40,
+            final_source_fingerprint_sha256="7" * 64,
+            policy_interface_version=1,
+            final_discovery_evidence=reference.discovery_evidence,
+            pre_persist_check=reject_drift,
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("data_identity_sha256", "universe_sha256", "message"),
+    [
+        ("a" * 64, _json_digest(["AAA", "BBB"]), "data identity"),
+        ("4" * 64, "b" * 64, "universe identity"),
+    ],
+)
+def test_reference_rejects_manifest_identity_crosslink_mismatch(
+    tmp_path: Path,
+    data_identity_sha256: str,
+    universe_sha256: str,
+    message: str,
+) -> None:
+    """Break caught: embedded evidence could be attributed to different sealed inputs."""
+    first = _fold("discovery_1", "discovery", "2021-01-04")
+    second = _fold("discovery_2", "discovery", "2021-04-01")
+
+    with pytest.raises(ValueError, match=message):
+        persist_parity_reference(
+            output=tmp_path / "reference.json",
+            reference_source_head="1" * 40,
+            reference_source_fingerprint_sha256="2" * 64,
+            readiness_sha256="3" * 64,
+            pit_bundle_sha256="4" * 64,
+            baseline_manifest_sha256="5" * 64,
+            effective_policy_sha256="d" * 64,
+            fold_manifest=FoldManifest(
+                data_identity_sha256=data_identity_sha256,
+                universe_sha256=universe_sha256,
+                benchmark="SPY",
+                warmup_start_date="2020-01-02",
+                discovery_folds=(first, second),
+                hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
+            ),
+            universe=("AAA", "BBB"),
+            discovery_evidence=(_evidence(first), _evidence(second)),
+        )
+    assert not (tmp_path / "reference.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("equity", "equity sessions"),
+        ("funnel", "entry funnel"),
+        ("transaction", "transaction date"),
+        ("signal", "signal date"),
+        ("entry", "entry date"),
+    ],
+)
+def test_reference_rejects_fold_evidence_crosslink_mismatch(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    """Break caught: self-consistent evidence could be attached to the wrong fold."""
+    first = _fold("discovery_1", "discovery", "2021-01-04")
+    second = _fold("discovery_2", "discovery", "2021-04-01")
+    kwargs: dict[str, object] = {}
+    if mutation == "equity":
+        kwargs["equity_sessions"] = first.sessions[:-1]
+    elif mutation == "funnel":
+        kwargs["aggregate_funnel"] = (AggregateMetric("other", 1),)
+    elif mutation == "transaction":
+        kwargs["transaction_date"] = "2020-12-31"
+    elif mutation == "signal":
+        kwargs["signal_date"] = "2020-12-31"
+    else:
+        kwargs["entry_date"] = "2020-12-31"
+
+    with pytest.raises(ValueError, match=message):
+        persist_parity_reference(
+            output=tmp_path / "reference.json",
+            reference_source_head="1" * 40,
+            reference_source_fingerprint_sha256="2" * 64,
+            readiness_sha256="3" * 64,
+            pit_bundle_sha256="4" * 64,
+            baseline_manifest_sha256="5" * 64,
+            effective_policy_sha256="d" * 64,
+            fold_manifest=FoldManifest(
+                data_identity_sha256="4" * 64,
+                universe_sha256=_json_digest(["AAA", "BBB"]),
+                benchmark="SPY",
+                warmup_start_date="2020-01-02",
+                discovery_folds=(first, second),
+                hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
+            ),
+            universe=("AAA", "BBB"),
+            discovery_evidence=(_evidence(first, **kwargs), _evidence(second)),
+        )
+    assert not (tmp_path / "reference.json").exists()
