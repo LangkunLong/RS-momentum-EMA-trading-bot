@@ -1729,10 +1729,10 @@ class PortfolioSimulator:
         checkpoint_code_identity: Optional[str] = None,
     ) -> SimulationResult:
         client = self._policy_client_factory()
-        if client.interface_version != POLICY_INTERFACE_VERSION:
-            raise ValueError("policy interface version mismatch")
-        self._policy_client = client
         try:
+            self._policy_client = client
+            if client.interface_version != POLICY_INTERFACE_VERSION:
+                raise ValueError("policy interface version mismatch")
             return self._run_with_policy_client_active(
                 tickers,
                 lookback_weeks,
@@ -2690,8 +2690,14 @@ class PortfolioSimulator:
 
     def _capacity_state(self, pending: PendingEntry) -> tuple[bool, bool]:
         limit = pending.capacity.max_positions
-        full = limit is not None and len(self._open_positions) >= limit
-        return full, bool(full and pending.capacity.eviction_enabled)
+        open_position_count = len(self._open_positions)
+        full = limit is not None and open_position_count >= limit
+        eviction_enabled = bool(
+            limit is not None
+            and open_position_count == limit
+            and pending.capacity.eviction_enabled
+        )
+        return full, eviction_enabled
 
     def _evaluate_signals(
         self,
@@ -2859,7 +2865,11 @@ class PortfolioSimulator:
                 0,
             )
             candidate_limit = open_slots
-            if candidate_limit == 0 and capacity.eviction_enabled:
+            if (
+                candidate_limit == 0
+                and len(self._open_positions) == capacity.max_positions
+                and capacity.eviction_enabled
+            ):
                 candidate_limit = 1
         self._execution_diagnostics["capacity_truncated_signals"] += max(
             len(signals) - candidate_limit,
@@ -3180,7 +3190,6 @@ class PortfolioSimulator:
         ticker_ohlcv: Dict[str, pd.DataFrame],
         entry_date: pd.Timestamp,
     ) -> None:
-        direct_legacy_entry = not isinstance(pending, PendingEntry)
         if not isinstance(pending, PendingEntry):
             pending = PendingEntry(
                 signal=dict(pending),
@@ -3317,24 +3326,8 @@ class PortfolioSimulator:
             capacity_is_uncapped=pending.capacity.max_positions is None,
             configured_position_risk_pct=self.position_risk_pct,
             configured_stop_loss_pct=self.stop_loss_pct,
-            maximum_position_risk_fraction=(
-                max(self.position_risk_pct, 0.01)
-                if direct_legacy_entry
-                or (
-                    self._strategy_was_injected
-                    and type(self._policy_client) is InProcessPolicyClient
-                )
-                else 0.01
-            ),
-            maximum_stop_fraction=(
-                max(self.stop_loss_pct, 0.08)
-                if direct_legacy_entry
-                or (
-                    self._strategy_was_injected
-                    and type(self._policy_client) is InProcessPolicyClient
-                )
-                else 0.08
-            ),
+            maximum_position_risk_fraction=0.01,
+            maximum_stop_fraction=0.08,
             canslim_score=_finite_signal_number(signal.get("canslim_score")),
             rs_score=_finite_signal_number(signal.get("rs_score")),
         )

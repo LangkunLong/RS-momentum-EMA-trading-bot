@@ -196,8 +196,8 @@ def test_fold_history_is_visible_without_emitting_prefold_state_and_runs_reset(
     )
     simulator = PortfolioSimulator(
         initial_capital=1_000.0,
-        position_risk_pct=0.01,
-        stop_loss_pct=0.10,
+        position_risk_pct=0.008,
+        stop_loss_pct=0.08,
         ma_consecutive=999,
         signal_every_n_days=1,
         technical_only=True,
@@ -275,8 +275,8 @@ def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytes
     )
     simulator = PortfolioSimulator(
         initial_capital=1_000.0,
-        position_risk_pct=0.08,
-        stop_loss_pct=0.08,
+        position_risk_pct=0.01,
+        stop_loss_pct=0.0101,
         signal_every_n_days=1,
         technical_only=True,
         stagnation_days=999,
@@ -323,7 +323,7 @@ def test_new_open_position_still_observes_same_day_stop(monkeypatch: pytest.Monk
     strategy = _DatedSignals({("NEW", dates[0]): _signal("NEW", dates[0])})
     simulator = PortfolioSimulator(
         initial_capital=1_000.0,
-        position_risk_pct=0.08,
+        position_risk_pct=0.01,
         stop_loss_pct=0.08,
         signal_every_n_days=1,
         technical_only=True,
@@ -358,8 +358,8 @@ def test_entry_sizing_marks_holdings_at_open_then_strictly_prior_close() -> None
     )
     simulator = PortfolioSimulator(
         initial_capital=1_000.0,
-        position_risk_pct=0.01,
-        stop_loss_pct=0.10,
+        position_risk_pct=0.008,
+        stop_loss_pct=0.08,
         technical_only=True,
     )
     simulator._equity = 1_000.0
@@ -391,8 +391,8 @@ def test_capped_eviction_selects_and_sells_using_causal_open_price() -> None:
     simulator = PortfolioSimulator(
         initial_capital=1_000.0,
         max_positions=2,
-        position_risk_pct=0.01,
-        stop_loss_pct=0.10,
+        position_risk_pct=0.008,
+        stop_loss_pct=0.08,
         technical_only=True,
         enable_eviction=True,
     )

@@ -48,6 +48,16 @@ class _CountingClient(InProcessPolicyClient):
         self._closed_events.append(1)
 
 
+class _MismatchedVersionClient(_CountingClient):
+    interface_version = 2
+
+
+class _RaisingVersionClient(_CountingClient):
+    @property
+    def interface_version(self) -> int:
+        raise RuntimeError("injected interface version failure")
+
+
 def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
     made: list[_CountingClient] = []
     closed: list[int] = []
@@ -70,6 +80,36 @@ def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
             )
     assert len({id(client) for client in made}) == 2
     assert closed == [1, 1]
+    assert simulator._policy_client is None
+
+
+@pytest.mark.parametrize(
+    ("client_type", "error_type", "message"),
+    [
+        (_MismatchedVersionClient, ValueError, "policy interface version mismatch"),
+        (_RaisingVersionClient, RuntimeError, "injected interface version failure"),
+    ],
+)
+def test_policy_client_interface_validation_failure_closes_and_clears(
+    client_type: type[_CountingClient],
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    """Break caught: interface validation could bypass factory-client cleanup."""
+    closed: list[int] = []
+    simulator = PortfolioSimulator(
+        data_fetcher=_ExplodingFetcher(),
+        policy_client_factory=lambda: client_type(closed),
+    )
+
+    with pytest.raises(error_type, match=message):
+        simulator.run(
+            ["AAPL"],
+            start_date="2021-06-25",
+            end_date="2021-09-20",
+        )
+
+    assert closed == [1]
     assert simulator._policy_client is None
 
 
@@ -919,18 +959,50 @@ def test_policy_capacity_pending_entry_round_trip_and_carried_capacity() -> None
 
 def test_policy_capacity_lowered_below_holdings_blocks_without_liquidation() -> None:
     """Break caught: lowering a policy cap could force unrequested liquidation."""
+    class Client(InProcessPolicyClient):
+        def recommend_capacity(self, _snapshot):
+            return CapacityDecision(1, True)
+
     simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
     positions = {
-        "OLD1": Trade("OLD1", "2026-01-01", 100.0, 1.0, 92.0),
-        "OLD2": Trade("OLD2", "2026-01-01", 100.0, 1.0, 92.0),
+        "OLD1": Trade("OLD1", "2026-01-01", 100.0, 1.0, 92.0, rs_score=60.0),
+        "OLD2": Trade("OLD2", "2026-01-01", 100.0, 1.0, 92.0, rs_score=70.0),
     }
     simulator._open_positions = dict(positions)
-    pending = PendingEntry(
-        signal={"symbol": "NEW", "rs_score": 99.0},
-        capacity=CapacityDecision(1, False),
+    simulator._policy_client = Client()
+    simulator._regime_tracker = SimpleNamespace(allows_entries=True)
+    simulator._ticker_industry = {}
+    frame = _make_canonical_entry_ohlcv(120.0)
+    simulator.strategy = SimpleNamespace(
+        evaluate_symbol=lambda **_kwargs: _canonical_full_signal(
+            "NEW", rs_score=99.0, canslim_score=90.0
+        )
     )
+
+    assert simulator._evaluate_signals(
+        tickers=["NEW"],
+        ticker_ohlcv={"OLD1": frame, "OLD2": frame, "NEW": frame},
+        all_closes=pd.DataFrame(index=frame.index),
+        eval_date=frame.index[-1],
+        market_state={"market_is_bullish": True},
+    ) == []
+
+    pending = PendingEntry(
+        signal={"symbol": "NEW", "rs_score": 99.0, "canslim_score": 90.0},
+        capacity=CapacityDecision(1, True),
+    )
+
     assert simulator._capacity_state(pending) == (True, False)
+    simulator._enter_position(
+        pending,
+        {"OLD1": frame, "OLD2": frame, "NEW": frame},
+        frame.index[-1],
+    )
+
     assert simulator._open_positions == positions
+    assert simulator._trades == []
+    assert simulator._transactions == []
+    assert simulator._entry_outcomes[-1].outcome == "entry_rejected_capacity"
 
 
 def test_policy_capacity_evaluate_signals_carries_one_batch_decision() -> None:
@@ -1097,6 +1169,34 @@ def test_policy_allocation_rejects_unsafe_projected_transition(
     simulator = PortfolioSimulator()
     with pytest.raises(ValueError, match=message):
         simulator._validate_entry_transition(projection, recommendation)
+
+
+@pytest.mark.parametrize(
+    ("position_risk_pct", "stop_loss_pct", "message"),
+    [
+        (0.02, 0.08, "risk_fraction"),
+        (0.01, 0.10, "stop_distance_fraction"),
+    ],
+)
+def test_policy_allocation_fixed_engine_ceilings_apply_to_direct_entry(
+    position_risk_pct: float,
+    stop_loss_pct: float,
+    message: str,
+) -> None:
+    """Break caught: compatibility entry paths could relax fixed safety ceilings."""
+    simulator = PortfolioSimulator(
+        initial_capital=1_000.0,
+        position_risk_pct=position_risk_pct,
+        stop_loss_pct=stop_loss_pct,
+    )
+    frame = _make_ohlcv(n=2, close_value=100.0)
+
+    with pytest.raises(ValueError, match=message):
+        simulator._enter_position(
+            {"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
+            {"NEW": frame},
+            frame.index[-1],
+        )
 
 
 def test_projected_entry_transition_failed_allocation_is_byte_stable() -> None:
