@@ -2666,7 +2666,7 @@ must not be started by this task.
  - [x] Add adverse, exact, and favorable cent-rounding regression coverage.
  - [x] Implement and independently review the engine-owned post-rounding clamp.
  - [x] Capture and verify the corrected two-fold subset reference under a new local
-       artifact version; do not evaluate the hidden fold.
+       artifact version (`pit-policy-parity-v4`); do not evaluate the hidden fold.
 
 ## Completion Criteria
 
