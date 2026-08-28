@@ -1148,15 +1148,26 @@ def _require_first_call_plan(
     *,
     max_iterations: int,
 ) -> None:
-    expected_caps = {
-        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
-        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
-        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
-    }
+    expected_profiles = (
+        {
+            "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
+            "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
+            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
+        },
+        {
+            # The current R1 price schedule makes the original investigator
+            # slice too small for its sealed prompt/output maximum.  This
+            # alternate profile still totals exactly USD 0.40 across two
+            # iterations while preserving the complete 448,000-token
+            # envelope and zero-retry call order.
+            "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.08),
+            "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.09),
+            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
+        },
+    )
     if max_iterations != 2 or len(call_budgets) != 6:
         raise ValueError("first subset canary requires two complete iterations")
     for budget in call_budgets:
-        expected = expected_caps.get(budget.role)
         actual = (
             budget.max_static_input_bytes,
             budget.max_dynamic_input_bytes,
@@ -1165,7 +1176,9 @@ def _require_first_call_plan(
             budget.max_response_bytes,
             float(budget.max_usd),
         )
-        if budget.model != PIT_OPTIMIZER_R1_MODEL or actual != expected:
+        if budget.model != PIT_OPTIMIZER_R1_MODEL or not any(
+            actual == profile.get(budget.role) for profile in expected_profiles
+        ):
             raise ValueError("first subset canary call caps are invalid")
 
 
