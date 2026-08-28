@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -619,7 +620,6 @@ def test_policy_daemon_cleanup_checks_status_and_exact_id(
 ) -> None:
     """Break caught: a label-filtered query hid a known full-ID daemon after rm failed."""
     from agent_loop import (
-        SandboxError,
         _OwnedPolicyDaemon,
         _cleanup_owned_policy_daemon,
     )
@@ -650,9 +650,23 @@ def test_policy_daemon_cleanup_checks_status_and_exact_id(
     errors = _cleanup_owned_policy_daemon(daemon)
 
     assert control.exists is (operation == "rm")
-    assert all(isinstance(error, SandboxError) for error in errors)
-    assert any(operation in str(error) for error in errors)
-    assert any("absence" in str(error) for error in errors) is (operation == "rm")
+    expected = {
+        (
+            "cleanup",
+            {
+                "kill": "daemon_kill",
+                "wait": "daemon_wait",
+                "rm": "daemon_rm",
+            }[operation],
+            failure_kind,
+        )
+    }
+    if operation == "rm":
+        expected.add(("cleanup", "daemon_absence_verify", "present"))
+    assert {
+        (error.phase.value, error.action.value, error.reason.value)
+        for error in errors
+    } == expected
     absence_query = control.calls[-1]
     assert f"id={control.container_id}" in absence_query
     assert not any("label=" in value for value in absence_query)
@@ -1139,18 +1153,48 @@ def test_policy_worker_cleanup_faults_preserve_primary_and_attempt_every_owner_a
             "recommend_capacity",
             CapacitySnapshot(None, 25, 0, 3, 1.0, False),
         )
-    notes = getattr(captured.value, "__notes__", ())
-    for evidence in (
-        "stdin close fault",
-        "terminate fault",
-        "wait fault",
-        "kill fault",
-        "stdout close fault",
-        "stderr close fault",
-        "thread join fault",
-        "private removal fault",
-    ):
-        assert any(evidence in note for note in notes)
+    assert set(getattr(captured.value, "__notes__", ())) >= {
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=stdin_close reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=process_terminate reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=process_wait reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=process_kill reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=stdout_close reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=stderr_close reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=stdout_thread_join reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=private_tree_remove reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_kill reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_wait reason=exception"
+        ),
+    }
     assert local_actions == [
         "stdin",
         "terminate",
@@ -1170,6 +1214,206 @@ def test_policy_worker_cleanup_faults_preserve_primary_and_attempt_every_owner_a
     ]
     assert not control.exists
     assert not package_parent.exists()
+
+
+def test_policy_worker_cleanup_evidence_never_stringifies_secondary_error(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a hostile cleanup __str__ replaced malformed-protocol primary."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+
+    class BrokenStringCleanupError(BaseException):
+        def __str__(self) -> str:
+            raise RuntimeError("secondary stringification escaped")
+
+    control = _Task5FakeDockerControl(
+        failures={"kill": BrokenStringCleanupError()}
+    )
+    process = _Task5FakeProcess()
+    writes = 0
+
+    def malformed_after_bootstrap(_value: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            process.stdout.values.put(b"{}\n")
+
+    process.stdin.callback = malformed_after_bootstrap
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id="broken_cleanup_string",
+    )
+
+    with pytest.raises(ValueError) as captured:
+        session.call(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        )
+
+    assert type(captured.value) is ValueError
+    assert captured.value.args == ("policy JSON fields are invalid",)
+    assert getattr(captured.value, "__notes__", ()) == [
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_kill reason=exception"
+        )
+    ]
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert not control.exists
+    assert not tuple(tmp_path.glob("pw-*"))
+
+
+def test_policy_worker_cleanup_evidence_bypasses_cancellation_add_note_override(
+    tmp_path: Path,
+) -> None:
+    """Break caught: virtual add_note dispatch replaced a cancellation primary."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+
+    class HostileCancellation(KeyboardInterrupt):
+        def add_note(self, note: str) -> None:
+            del note
+            raise RuntimeError("virtual add_note escaped")
+
+    primary = HostileCancellation("cancel primary")
+    control = _Task5FakeDockerControl(nonzero_operations=frozenset({"rm"}))
+    process = _Task5FakeProcess()
+    writes = 0
+
+    def cancel_after_bootstrap(_value: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            raise primary
+
+    process.stdin.callback = cancel_after_bootstrap
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id="hostile_cancel_note",
+    )
+
+    with pytest.raises(HostileCancellation) as captured:
+        session.call(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        )
+
+    assert captured.value is primary
+    assert captured.value.args == ("cancel primary",)
+    assert set(getattr(captured.value, "__notes__", ())) == {
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_rm reason=nonzero"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_absence_verify reason=present"
+        ),
+    }
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert control.exists
+    assert not tuple(tmp_path.glob("pw-*"))
+    control.exists = False
+
+
+def test_policy_worker_cleanup_evidence_redacts_timeout_capability_values(
+    tmp_path: Path,
+) -> None:
+    """Break caught: TimeoutExpired argv and secrets leaked through primary notes."""
+    from agent_loop import PolicyWorkerRunner
+    from core.strategy_policy.contracts import CapacitySnapshot
+
+    sentinels = (
+        "C:/host/private/sentinel-docker.exe",
+        "d" * 64,
+        "sentinel-secret-token",
+        "sentinel-stderr-value",
+    )
+    timeout = subprocess.TimeoutExpired(
+        cmd=[sentinels[0], "rm", sentinels[1], "--token", sentinels[2]],
+        timeout=5,
+        stderr=sentinels[3].encode("utf-8"),
+    )
+    control = _Task5FakeDockerControl(failures={"rm": timeout})
+    process = _Task5FakeProcess()
+    writes = 0
+
+    def malformed_after_bootstrap(_value: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            process.stdout.values.put(b"{}\n")
+
+    process.stdin.callback = malformed_after_bootstrap
+    runner = PolicyWorkerRunner(
+        image="example.invalid/policy@sha256:" + "a" * 64,
+        injected_engine_path=Path("C:/fake/docker.exe"),
+        process_factory=lambda _argv, **_kwargs: process,
+        control_runner=control,
+        temp_parent=tmp_path,
+    )
+    session = runner.start(
+        candidate_root=_task5_policy_candidate(tmp_path),
+        interface_version=1,
+        fold_run_id="timeout_redaction",
+    )
+
+    with pytest.raises(ValueError) as captured:
+        session.call(
+            "recommend_capacity",
+            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+        )
+
+    rendered = "".join(traceback.format_exception(captured.value))
+    assert all(sentinel not in rendered for sentinel in sentinels)
+    notes = getattr(captured.value, "__notes__", ())
+    assert set(notes) == {
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_rm reason=exception"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_absence_verify reason=present"
+        ),
+    }
+    assert all(len(note.encode("utf-8")) <= 128 for note in notes)
+    assert [call[1] for call in control.calls][-4:] == [
+        "kill",
+        "wait",
+        "rm",
+        "container",
+    ]
+    assert control.exists
+    assert not tuple(tmp_path.glob("pw-*"))
+    control.exists = False
 
 
 def test_policy_worker_protocol_primary_retains_unverified_daemon_cleanup(
@@ -1211,8 +1455,16 @@ def test_policy_worker_protocol_primary_retains_unverified_daemon_cleanup(
         )
 
     notes = getattr(captured.value, "__notes__", ())
-    assert any("rm" in note for note in notes)
-    assert any("absence" in note for note in notes)
+    assert set(notes) == {
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_rm reason=nonzero"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_absence_verify reason=present"
+        ),
+    }
     assert control.exists
     assert [call[1] for call in control.calls][-4:] == [
         "kill",
@@ -1263,8 +1515,16 @@ def test_policy_worker_cancellation_retains_unverified_daemon_cleanup(
         )
 
     notes = getattr(captured.value, "__notes__", ())
-    assert any("rm" in note for note in notes)
-    assert any("absence" in note for note in notes)
+    assert set(notes) == {
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_rm reason=nonzero"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_absence_verify reason=present"
+        ),
+    }
     assert control.exists
     assert [call[1] for call in control.calls][-4:] == [
         "kill",
@@ -1511,7 +1771,12 @@ def test_policy_worker_create_primary_survives_discovery_inspection_failure(
             interface_version=1,
             fold_run_id=f"inspect_{inspect_mode}",
         )
-    assert any("inspect" in note for note in getattr(captured.value, "__notes__", ()))
+    assert getattr(captured.value, "__notes__", ()) == [
+        (
+            "policy_worker_secondary_failure phase=inspect "
+            "action=daemon_inspect reason=exception"
+        )
+    ]
     assert not control.exists
     assert [call[1] for call in control.calls][-4:] == [
         "kill",
@@ -1547,7 +1812,12 @@ def test_policy_worker_create_primary_survives_discovery_list_failure(
             interface_version=1,
             fold_run_id="list_fault",
         )
-    assert any("discovery" in note for note in getattr(captured.value, "__notes__", ()))
+    assert getattr(captured.value, "__notes__", ()) == [
+        (
+            "policy_worker_secondary_failure phase=discovery "
+            "action=daemon_discover reason=exception"
+        )
+    ]
     assert not control.exists
     assert not tuple(tmp_path.glob("pw-*"))
 
@@ -1575,7 +1845,12 @@ def test_policy_worker_invalid_create_identity_retains_tentative_owner(
             interface_version=1,
             fold_run_id="invalid_identity",
         )
-    assert any("inspect" in note for note in getattr(captured.value, "__notes__", ()))
+    assert getattr(captured.value, "__notes__", ()) == [
+        (
+            "policy_worker_secondary_failure phase=inspect "
+            "action=daemon_inspect reason=exception"
+        )
+    ]
     assert not control.exists
     assert [call[1] for call in control.calls][-4:] == [
         "kill",
@@ -1619,7 +1894,28 @@ def test_policy_worker_create_primary_records_cleanup_failure(
             fold_run_id=f"cleanup_{cleanup_operation}",
         )
     notes = getattr(captured.value, "__notes__", ())
-    assert any("cleanup" in note for note in notes)
+    if cleanup_operation == "rm":
+        assert set(notes) == {
+            (
+                "policy_worker_secondary_failure phase=cleanup "
+                "action=daemon_rm reason=exception"
+            ),
+            (
+                "policy_worker_secondary_failure phase=cleanup "
+                "action=daemon_absence_verify reason=present"
+            ),
+        }
+    else:
+        assert set(notes) == {
+            (
+                "policy_worker_secondary_failure phase=cleanup "
+                "action=daemon_absence_query reason=exception"
+            ),
+            (
+                "policy_worker_secondary_failure phase=cleanup "
+                "action=daemon_absence_verify reason=unverified"
+            ),
+        }
     assert [call[1] for call in control.calls][-4:] == [
         "kill",
         "wait",
@@ -1772,8 +2068,16 @@ def test_policy_worker_tampered_identity_primary_retains_live_daemon_evidence(
         )
 
     notes = getattr(captured.value, "__notes__", ())
-    assert any("rm" in note for note in notes)
-    assert any("absence" in note for note in notes)
+    assert set(notes) == {
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_rm reason=nonzero"
+        ),
+        (
+            "policy_worker_secondary_failure phase=cleanup "
+            "action=daemon_absence_verify reason=present"
+        ),
+    }
     cleanup_query = control.calls[-1]
     assert f"id={control.container_id}" in cleanup_query
     assert not any("label=" in value for value in cleanup_query)

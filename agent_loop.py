@@ -4547,46 +4547,128 @@ class _OwnedPolicyDaemon:
     image: str
 
 
-def _cleanup_unowned_policy_process(process: Any) -> list[BaseException]:
-    """Attempt every local-client cleanup action without masking the primary error."""
-    errors: list[BaseException] = []
+class _PolicySecondaryPhase(Enum):
+    CLEANUP = "cleanup"
+    DISCOVERY = "discovery"
+    INSPECT = "inspect"
 
-    def attempt(action: Callable[[], object]) -> None:
+
+class _PolicySecondaryAction(Enum):
+    STDIN_CLOSE = "stdin_close"
+    PROCESS_POLL = "process_poll"
+    PROCESS_TERMINATE = "process_terminate"
+    PROCESS_WAIT = "process_wait"
+    PROCESS_KILL = "process_kill"
+    STDOUT_CLOSE = "stdout_close"
+    STDERR_CLOSE = "stderr_close"
+    STDOUT_THREAD_JOIN = "stdout_thread_join"
+    STDERR_THREAD_JOIN = "stderr_thread_join"
+    DAEMON_DISCOVER = "daemon_discover"
+    DAEMON_INSPECT = "daemon_inspect"
+    DAEMON_KILL = "daemon_kill"
+    DAEMON_WAIT = "daemon_wait"
+    DAEMON_RM = "daemon_rm"
+    DAEMON_ABSENCE_QUERY = "daemon_absence_query"
+    DAEMON_ABSENCE_VERIFY = "daemon_absence_verify"
+    PRIVATE_TREE_REMOVE = "private_tree_remove"
+
+
+class _PolicySecondaryReason(Enum):
+    EXCEPTION = "exception"
+    INVALID_RESULT = "invalid_result"
+    TIMEOUT = "timeout"
+    NONZERO = "nonzero"
+    STILL_RUNNING = "still_running"
+    PRESENT = "present"
+    UNVERIFIED = "unverified"
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicySecondaryFailure:
+    phase: _PolicySecondaryPhase
+    action: _PolicySecondaryAction
+    reason: _PolicySecondaryReason
+
+
+_MAX_POLICY_SECONDARY_NOTES = 32
+_MAX_POLICY_SECONDARY_NOTE_BYTES = 128
+
+
+def _cleanup_unowned_policy_process(process: Any) -> list[_PolicySecondaryFailure]:
+    """Attempt every local-client cleanup action without masking the primary error."""
+    errors: list[_PolicySecondaryFailure] = []
+
+    def attempt(
+        action: _PolicySecondaryAction,
+        operation: Callable[[], object],
+    ) -> None:
         try:
-            action()
-        except BaseException as exc:
-            errors.append(exc)
+            operation()
+        except BaseException:
+            errors.append(
+                _PolicySecondaryFailure(
+                    _PolicySecondaryPhase.CLEANUP,
+                    action,
+                    _PolicySecondaryReason.EXCEPTION,
+                )
+            )
 
     stdin = getattr(process, "stdin", None)
     if stdin is not None and not getattr(stdin, "closed", False):
-        attempt(stdin.close)
+        attempt(_PolicySecondaryAction.STDIN_CLOSE, stdin.close)
     try:
         running = process.poll() is None
-    except BaseException as exc:
-        errors.append(exc)
+    except BaseException:
+        errors.append(
+            _PolicySecondaryFailure(
+                _PolicySecondaryPhase.CLEANUP,
+                _PolicySecondaryAction.PROCESS_POLL,
+                _PolicySecondaryReason.EXCEPTION,
+            )
+        )
         running = True
     if running:
-        attempt(process.terminate)
-    attempt(lambda: process.wait(timeout=5))
+        attempt(_PolicySecondaryAction.PROCESS_TERMINATE, process.terminate)
+    attempt(
+        _PolicySecondaryAction.PROCESS_WAIT,
+        lambda: process.wait(timeout=5),
+    )
     try:
         running = process.poll() is None
-    except BaseException as exc:
-        errors.append(exc)
+    except BaseException:
+        errors.append(
+            _PolicySecondaryFailure(
+                _PolicySecondaryPhase.CLEANUP,
+                _PolicySecondaryAction.PROCESS_POLL,
+                _PolicySecondaryReason.EXCEPTION,
+            )
+        )
         running = True
     if running:
-        attempt(process.kill)
-        attempt(lambda: process.wait(timeout=5))
-    for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
+        attempt(_PolicySecondaryAction.PROCESS_KILL, process.kill)
+        attempt(
+            _PolicySecondaryAction.PROCESS_WAIT,
+            lambda: process.wait(timeout=5),
+        )
+    for stream, action in (
+        (getattr(process, "stdout", None), _PolicySecondaryAction.STDOUT_CLOSE),
+        (getattr(process, "stderr", None), _PolicySecondaryAction.STDERR_CLOSE),
+    ):
         if stream is not None and not getattr(stream, "closed", False):
-            attempt(stream.close)
+            attempt(action, stream.close)
     return errors
 
 
-def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseException]:
+def _cleanup_owned_policy_daemon(
+    daemon: _OwnedPolicyDaemon,
+) -> list[_PolicySecondaryFailure]:
     """Force-remove one authenticated daemon object and verify exact owner absence."""
-    errors: list[BaseException] = []
+    errors: list[_PolicySecondaryFailure] = []
 
-    def control(*args: str) -> ProcessResult | None:
+    def control(
+        action: _PolicySecondaryAction,
+        *args: str,
+    ) -> ProcessResult | None:
         try:
             result = daemon.control_runner(
                 (str(daemon.engine_path), *args),
@@ -4594,21 +4676,62 @@ def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseExcepti
                 timeout=10.0,
                 output_limit=64 * 1024,
             )
-            if not isinstance(result, ProcessResult):
-                raise SandboxError("policy daemon control result is invalid")
-            if result.timed_out or result.returncode != 0:
-                errors.append(
-                    SandboxError(f"policy daemon {args[0]} action failed")
+        except BaseException:
+            errors.append(
+                _PolicySecondaryFailure(
+                    _PolicySecondaryPhase.CLEANUP,
+                    action,
+                    _PolicySecondaryReason.EXCEPTION,
                 )
-            return result
-        except BaseException as exc:
-            errors.append(exc)
+            )
             return None
+        if not isinstance(result, ProcessResult):
+            errors.append(
+                _PolicySecondaryFailure(
+                    _PolicySecondaryPhase.CLEANUP,
+                    action,
+                    _PolicySecondaryReason.INVALID_RESULT,
+                )
+            )
+            return None
+        if result.timed_out:
+            errors.append(
+                _PolicySecondaryFailure(
+                    _PolicySecondaryPhase.CLEANUP,
+                    action,
+                    _PolicySecondaryReason.TIMEOUT,
+                )
+            )
+        elif result.returncode != 0:
+            errors.append(
+                _PolicySecondaryFailure(
+                    _PolicySecondaryPhase.CLEANUP,
+                    action,
+                    _PolicySecondaryReason.NONZERO,
+                )
+            )
+        return result
 
-    control("kill", "--signal", "KILL", daemon.container_id)
-    control("wait", daemon.container_id)
-    control("rm", "--force", daemon.container_id)
+    control(
+        _PolicySecondaryAction.DAEMON_KILL,
+        "kill",
+        "--signal",
+        "KILL",
+        daemon.container_id,
+    )
+    control(
+        _PolicySecondaryAction.DAEMON_WAIT,
+        "wait",
+        daemon.container_id,
+    )
+    control(
+        _PolicySecondaryAction.DAEMON_RM,
+        "rm",
+        "--force",
+        daemon.container_id,
+    )
     absence = control(
+        _PolicySecondaryAction.DAEMON_ABSENCE_QUERY,
         "container",
         "ls",
         "--all",
@@ -4621,22 +4744,47 @@ def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseExcepti
         absence is None
         or absence.timed_out
         or absence.returncode != 0
-        or absence.stdout.strip()
     ):
-        errors.append(SandboxError("owned policy daemon absence was not verified"))
+        errors.append(
+            _PolicySecondaryFailure(
+                _PolicySecondaryPhase.CLEANUP,
+                _PolicySecondaryAction.DAEMON_ABSENCE_VERIFY,
+                _PolicySecondaryReason.UNVERIFIED,
+            )
+        )
+    elif absence.stdout.strip():
+        errors.append(
+            _PolicySecondaryFailure(
+                _PolicySecondaryPhase.CLEANUP,
+                _PolicySecondaryAction.DAEMON_ABSENCE_VERIFY,
+                _PolicySecondaryReason.PRESENT,
+            )
+        )
     return errors
 
 
 def _record_policy_secondary_errors(
     primary: BaseException,
-    phase: str,
-    errors: Sequence[BaseException],
+    errors: Sequence[_PolicySecondaryFailure],
 ) -> None:
-    for error in errors:
-        primary.add_note(
-            "policy daemon "
-            f"{phase} secondary failure: {type(error).__name__}: {error}"
-        )
+    try:
+        for index, error in enumerate(errors):
+            if index >= _MAX_POLICY_SECONDARY_NOTES:
+                break
+            try:
+                note = (
+                    "policy_worker_secondary_failure "
+                    f"phase={error.phase.value} "
+                    f"action={error.action.value} "
+                    f"reason={error.reason.value}"
+                )
+                if len(note.encode("ascii")) > _MAX_POLICY_SECONDARY_NOTE_BYTES:
+                    continue
+                BaseException.add_note(primary, note)
+            except BaseException:
+                continue
+    except BaseException:
+        return
 
 
 class PolicyWorkerSession:
@@ -4790,27 +4938,66 @@ class PolicyWorkerSession:
             return
         self._closed = True
         errors = _cleanup_unowned_policy_process(self._process)
-        for thread in (self._stdout_thread, self._stderr_thread):
+        for thread, action in (
+            (
+                self._stdout_thread,
+                _PolicySecondaryAction.STDOUT_THREAD_JOIN,
+            ),
+            (
+                self._stderr_thread,
+                _PolicySecondaryAction.STDERR_THREAD_JOIN,
+            ),
+        ):
             try:
                 thread.join(timeout=5)
-                if thread.is_alive():
-                    raise SandboxError("policy worker output thread did not stop")
-            except BaseException as exc:
-                errors.append(exc)
+            except BaseException:
+                errors.append(
+                    _PolicySecondaryFailure(
+                        _PolicySecondaryPhase.CLEANUP,
+                        action,
+                        _PolicySecondaryReason.EXCEPTION,
+                    )
+                )
+            else:
+                try:
+                    alive = thread.is_alive()
+                except BaseException:
+                    errors.append(
+                        _PolicySecondaryFailure(
+                            _PolicySecondaryPhase.CLEANUP,
+                            action,
+                            _PolicySecondaryReason.EXCEPTION,
+                        )
+                    )
+                else:
+                    if alive:
+                        errors.append(
+                            _PolicySecondaryFailure(
+                                _PolicySecondaryPhase.CLEANUP,
+                                action,
+                                _PolicySecondaryReason.STILL_RUNNING,
+                            )
+                        )
         errors.extend(_cleanup_owned_policy_daemon(self._daemon))
         temporary_root = self.package_root.parent
         try:
             if temporary_root.exists():
                 _remove_private_tree(temporary_root)
-        except BaseException as exc:
-            errors.append(exc)
+        except BaseException:
+            errors.append(
+                _PolicySecondaryFailure(
+                    _PolicySecondaryPhase.CLEANUP,
+                    _PolicySecondaryAction.PRIVATE_TREE_REMOVE,
+                    _PolicySecondaryReason.EXCEPTION,
+                )
+            )
         if errors:
             if primary_error is not None:
-                _record_policy_secondary_errors(primary_error, "cleanup", errors)
+                _record_policy_secondary_errors(primary_error, errors)
             else:
                 raise SandboxError(
                     "policy worker cleanup could not be fully verified"
-                ) from errors[0]
+                ) from None
 
 
 class PolicyWorkerRunner:
@@ -5142,11 +5329,16 @@ class PolicyWorkerRunner:
                         container_name=container_name,
                         owner_token=owner_token,
                     )
-                except BaseException as discovery_error:
+                except BaseException:
                     _record_policy_secondary_errors(
                         primary_error,
-                        "discovery",
-                        (discovery_error,),
+                        (
+                            _PolicySecondaryFailure(
+                                _PolicySecondaryPhase.DISCOVERY,
+                                _PolicySecondaryAction.DAEMON_DISCOVER,
+                                _PolicySecondaryReason.EXCEPTION,
+                            ),
+                        ),
                     )
                     return None
                 if tentative is not None:
@@ -5157,11 +5349,16 @@ class PolicyWorkerRunner:
                             container_name=container_name,
                             owner_token=owner_token,
                         )
-                    except BaseException as inspect_error:
+                    except BaseException:
                         _record_policy_secondary_errors(
                             primary_error,
-                            "inspect",
-                            (inspect_error,),
+                            (
+                                _PolicySecondaryFailure(
+                                    _PolicySecondaryPhase.INSPECT,
+                                    _PolicySecondaryAction.DAEMON_INSPECT,
+                                    _PolicySecondaryReason.EXCEPTION,
+                                ),
+                            ),
                         )
                 return tentative
 
@@ -5242,7 +5439,7 @@ class PolicyWorkerRunner:
                 raise
             return session
         except BaseException as primary_error:
-            cleanup_errors: list[BaseException] = []
+            cleanup_errors: list[_PolicySecondaryFailure] = []
             if process is not None and session is None:
                 cleanup_errors.extend(_cleanup_unowned_policy_process(process))
             if daemon is not None and session is None:
@@ -5250,11 +5447,16 @@ class PolicyWorkerRunner:
             try:
                 if temporary_root.exists():
                     _remove_private_tree(temporary_root)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
+            except BaseException:
+                cleanup_errors.append(
+                    _PolicySecondaryFailure(
+                        _PolicySecondaryPhase.CLEANUP,
+                        _PolicySecondaryAction.PRIVATE_TREE_REMOVE,
+                        _PolicySecondaryReason.EXCEPTION,
+                    )
+                )
             _record_policy_secondary_errors(
                 primary_error,
-                "cleanup",
                 cleanup_errors,
             )
             raise
