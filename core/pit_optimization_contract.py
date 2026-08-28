@@ -23,6 +23,8 @@ from core.pit_optimizer_evaluation import (
     DiscoveryScore,
     FoldAggregateSummary,
     FoldManifest,
+    ValidationExposureMetadata,
+    ValidationWindowIdentity,
     discovery_score_from_folds,
 )
 
@@ -1466,12 +1468,16 @@ def _apply_unified_diff(
                 raise ValueError("candidate unified diff hunk header is invalid")
             old_start = int(match.group(1))
             old_count = int(match.group(2) or "1")
+            new_start = int(match.group(3))
             new_count = int(match.group(4) or "1")
-            target_index = max(old_start - 1, 0)
+            target_index = old_start if old_count == 0 else max(old_start - 1, 0)
             if target_index < source_index or target_index > len(original):
                 raise ValueError("candidate unified diff hunk location is invalid")
             result.extend(original[source_index:target_index])
             source_index = target_index
+            expected_new_start = len(result) + (0 if new_count == 0 else 1)
+            if new_start != expected_new_start:
+                raise ValueError("candidate unified diff new hunk location is invalid")
             index += 1
             observed_old = 0
             observed_new = 0
@@ -2575,6 +2581,8 @@ def materialize_policy_source_descendant(
     initial_bundle: PolicySourceBundle,
     current_bundle: PolicySourceBundle,
     artifact: AuthorArtifact,
+    immutable_constraint_ids: tuple[str, ...],
+    call_budgets: tuple[PitOptimizerCallBudget, ...],
 ) -> PolicySourceMaterialization:
     if not isinstance(artifact, AuthorArtifact):
         raise ValueError("policy source materialization author artifact is invalid")
@@ -2619,18 +2627,7 @@ def materialize_policy_source_descendant(
         "files": records,
     }
     if len(_v2_canonical_bytes(primitive)) > scope.max_policy_source_bundle_bytes:
-        return PolicySourceMaterialization(
-            bundle=None,
-            validation=CandidateValidationSummary(
-                failure_code="next_context_oversize",
-                syntax_ok=True,
-                imports_ok=True,
-                purity_ok=True,
-                deterministic_ok=True,
-                worker_ok=True,
-                replay_attempted=True,
-            ),
-        )
+        return _next_context_oversize_materialization()
     bundle = PolicySourceBundle(
         **primitive,
         _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
@@ -2640,9 +2637,36 @@ def materialize_policy_source_descendant(
         initial_bundle=initial_bundle,
         bundle=bundle,
     )
+    try:
+        render_worst_iteration_two_role_inputs(
+            scope=scope,
+            source_texts=resulting_texts,
+            immutable_constraint_ids=immutable_constraint_ids,
+            call_budgets=call_budgets,
+            prospective_source_bundle=bundle,
+        )
+    except ValueError as exc:
+        if str(exc).startswith("worst iteration-2"):
+            return _next_context_oversize_materialization()
+        raise
     return PolicySourceMaterialization(
         bundle=bundle,
         validation=_successful_candidate_validation(),
+    )
+
+
+def _next_context_oversize_materialization() -> PolicySourceMaterialization:
+    return PolicySourceMaterialization(
+        bundle=None,
+        validation=CandidateValidationSummary(
+            failure_code="next_context_oversize",
+            syntax_ok=True,
+            imports_ok=True,
+            purity_ok=True,
+            deterministic_ok=True,
+            worker_ok=True,
+            replay_attempted=True,
+        ),
     )
 
 
@@ -2689,11 +2713,31 @@ def candidate_comparison_from_fixed_baseline(
     original_baseline_sha256: str,
     expected_original_baseline_sha256: str,
     discovery_exposure: DiscoveryExposureProof,
+    expected_window_identities: tuple[
+        ValidationWindowIdentity,
+        ValidationWindowIdentity,
+    ],
+    expected_metadata: ValidationExposureMetadata,
     diagnostics: tuple[AggregateMetric, ...],
     supplied_score: DiscoveryScore | None = None,
 ) -> CandidateComparisonSummary:
     if not isinstance(discovery_exposure, DiscoveryExposureProof):
         raise ValueError("candidate comparison discovery exposure is invalid")
+    if (
+        type(expected_window_identities) is not tuple
+        or len(expected_window_identities) != 2
+        or any(
+            not isinstance(item, ValidationWindowIdentity)
+            for item in expected_window_identities
+        )
+        or discovery_exposure.window_identities != expected_window_identities
+    ):
+        raise ValueError("candidate comparison expected window identities differ")
+    if (
+        not isinstance(expected_metadata, ValidationExposureMetadata)
+        or discovery_exposure.metadata != expected_metadata
+    ):
+        raise ValueError("candidate comparison expected metadata lineage differs")
     if tuple(item.fold_id for item in candidate_folds) != discovery_exposure.fold_ids:
         raise ValueError("candidate comparison folds differ from ledger exposure")
     score = discovery_score_from_folds(
@@ -2915,6 +2959,7 @@ def render_worst_iteration_two_role_inputs(
     source_texts: Mapping[str, str],
     immutable_constraint_ids: tuple[str, ...],
     call_budgets: tuple[PitOptimizerCallBudget, ...],
+    prospective_source_bundle: PolicySourceBundle | None = None,
 ) -> Mapping[str, bytes]:
     """Render complete bounded iteration-2 role inputs before a manifest is sealed."""
 
@@ -2923,16 +2968,12 @@ def render_worst_iteration_two_role_inputs(
     _v2_string_tuple(immutable_constraint_ids, "worst role immutable constraints")
     if tuple(source_texts) != scope.editable_paths:
         raise ValueError("worst role source paths differ from scope")
-    grown_texts = dict(source_texts)
-    grown_texts[scope.editable_paths[0]] += "s" * scope.candidate_bounds.max_diff_bytes
-    cumulative_diff = "d" * scope.candidate_bounds.max_diff_bytes
-    source_bundle = PolicySourceBundle(
-        policy_interface_version=scope.policy_interface_version,
-        cumulative_diff_sha256=hashlib.sha256(
-            cumulative_diff.encode("utf-8")
-        ).hexdigest(),
-        cumulative_diff=cumulative_diff,
-        files=tuple(
+    if prospective_source_bundle is None:
+        grown_texts = dict(source_texts)
+        worst_escaped_bytes = "\\" * scope.candidate_bounds.max_diff_bytes
+        grown_texts[scope.editable_paths[0]] += worst_escaped_bytes
+        cumulative_diff = worst_escaped_bytes
+        source_records = tuple(
             PolicySourceRecord(
                 path=path,
                 sha256=hashlib.sha256(grown_texts[path].encode("utf-8")).hexdigest(),
@@ -2940,15 +2981,45 @@ def render_worst_iteration_two_role_inputs(
                 text=grown_texts[path],
             )
             for path in scope.editable_paths
-        ),
-        _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
-    )
-    rule_summary = StrategyRuleSummary(
-        records=(
-            RuleSummaryRecord("rule_1", "r" * 3_800),
-            RuleSummaryRecord("rule_2", "s" * 3_800),
         )
-    )
+        source_primitive = {
+            "policy_interface_version": scope.policy_interface_version,
+            "cumulative_diff_sha256": hashlib.sha256(
+                cumulative_diff.encode("utf-8")
+            ).hexdigest(),
+            "cumulative_diff": cumulative_diff,
+            "files": source_records,
+        }
+        if (
+            len(_v2_canonical_bytes(source_primitive))
+            > scope.max_policy_source_bundle_bytes
+        ):
+            raise ValueError("worst iteration-2 source bundle exceeds source cap")
+        source_bundle = PolicySourceBundle(
+            **source_primitive,
+            _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
+        )
+    else:
+        if not isinstance(prospective_source_bundle, PolicySourceBundle):
+            raise ValueError("worst role prospective source bundle is invalid")
+        if (
+            prospective_source_bundle.policy_interface_version
+            != scope.policy_interface_version
+            or tuple(record.path for record in prospective_source_bundle.files)
+            != scope.editable_paths
+            or {
+                record.path: record.text
+                for record in prospective_source_bundle.files
+            }
+            != dict(source_texts)
+        ):
+            raise ValueError("worst role prospective source bundle differs from source")
+        if (
+            len(prospective_source_bundle.canonical_json_bytes())
+            > scope.max_policy_source_bundle_bytes
+        ):
+            raise ValueError("worst iteration-2 source bundle exceeds source cap")
+        source_bundle = prospective_source_bundle
     folds = tuple(
         FoldAggregateSummary(
             fold_id=fold_id,
@@ -2964,48 +3035,90 @@ def render_worst_iteration_two_role_inputs(
         )
         for fold_id in ("discovery_1", "discovery_2")
     )
-    discovery = DiscoveryEvidenceSummary(
-        folds=folds,
-        score=None,
-        evidence_ids=("e" * 3_000, "f" * 3_000),
+
+    def maximize_contract(factory: object, cap: int) -> object:
+        if not callable(factory):
+            raise ValueError("worst role section factory is invalid")
+        best: object | None = None
+        best_size = -1
+        low = 0
+        high = MAX_ROLE_TEXT_BYTES
+        while low <= high:
+            count = (low + high) // 2
+            try:
+                candidate = factory(count)
+                size = len(_v2_canonical_bytes(candidate))
+            except ValueError:
+                size = cap + 1
+                candidate = None
+            if size <= cap:
+                best = candidate
+                best_size = size
+                low = count + 1
+            else:
+                high = count - 1
+        if best is None or best_size < cap - 1:
+            raise ValueError("worst role section cannot reach its canonical cap")
+        return best
+
+    def escaped(count: int) -> str:
+        return "\\" * count
+    rule_summary = maximize_contract(
+        lambda count: StrategyRuleSummary(
+            records=(RuleSummaryRecord("rule_1", "r" + escaped(count)),)
+        ),
+        MAX_DISCOVERY_EVIDENCE_BYTES,
+    )
+    discovery = maximize_contract(
+        lambda count: DiscoveryEvidenceSummary(
+            folds=folds,
+            score=None,
+            evidence_ids=("e" + escaped(count), "evidence_2"),
+        ),
+        MAX_DISCOVERY_EVIDENCE_BYTES,
     )
     incumbent = IncumbentSummary(
         candidate_identity_sha256="1" * 64,
         accepted_iteration=1,
-        behavioral_summary="b" * 3_000,
+        behavioral_summary="\\" * MAX_ROLE_TEXT_BYTES,
         discovery=discovery,
     )
-    feedback = IterationFeedbackSummary(
-        iteration=1,
-        hypothesis_id="hypothesis_1",
-        family="entry",
-        author_summary="a" * 1_700,
-        validation_code="valid",
-        discovery_score=None,
-        critic_disposition="refine",
-        critic_next_direction="n" * 1_700,
-        incumbent_changed=True,
+    feedback = maximize_contract(
+        lambda count: IterationFeedbackSummary(
+            iteration=1,
+            hypothesis_id="hypothesis_1",
+            family="entry",
+            author_summary="a" + escaped(count),
+            validation_code="valid",
+            discovery_score=None,
+            critic_disposition="refine",
+            critic_next_direction="next",
+            incumbent_changed=True,
+        ),
+        scope.max_iteration_feedback_bytes,
     )
-    investigator_artifact = InvestigatorArtifact(
-        hypothesis_id="hypothesis_2",
-        family="entry",
-        evidence_ids=("evidence_1",),
-        causal_rationale="c" * 3_000,
-        target_paths=(scope.editable_paths[0],),
-        target_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
-        expected_diagnostic_changes=("d" * 1_000,),
-        known_risks=("k" * 1_000,),
-        author_instructions=("i" * 1_000,),
+    investigator_artifact = maximize_contract(
+        lambda count: InvestigatorArtifact(
+            hypothesis_id="hypothesis_2",
+            family="entry",
+            evidence_ids=("evidence_1",),
+            causal_rationale="c" + escaped(count),
+            target_paths=(scope.editable_paths[0],),
+            target_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
+            expected_diagnostic_changes=("diagnostic",),
+            known_risks=("risk",),
+            author_instructions=("instruction",),
+        ),
+        MAX_INVESTIGATOR_ARTIFACT_BYTES,
     )
-    author_manifest = AuthorManifestSummary(
-        hypothesis_id=investigator_artifact.hypothesis_id,
-        behavioral_summary="b" * 4_000,
-        changed_paths=(scope.editable_paths[0],),
-        changed_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
-    )
-    diagnostics = tuple(
-        AggregateMetric(f"diagnostic_{index:02d}_" + ("x" * 80), index)
-        for index in range(MAX_ROLE_LIST_ITEMS)
+    author_manifest = maximize_contract(
+        lambda count: AuthorManifestSummary(
+            hypothesis_id=investigator_artifact.hypothesis_id,
+            behavioral_summary="b" + escaped(count),
+            changed_paths=(scope.editable_paths[0],),
+            changed_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
+        ),
+        MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES,
     )
     synthetic_baseline_sha256 = hashlib.sha256(
         _v2_canonical_bytes([_v2_primitive(item) for item in folds]) + b"\n"
@@ -3016,11 +3129,14 @@ def render_worst_iteration_two_role_inputs(
         original_baseline_sha256=synthetic_baseline_sha256,
         expected_original_baseline_sha256=synthetic_baseline_sha256,
     )
-    comparison = CandidateComparisonSummary(
-        folds=folds,
-        score=comparison_score,
-        diagnostics=diagnostics,
-        _controller_seal=_CANDIDATE_COMPARISON_SEAL,
+    comparison = maximize_contract(
+        lambda count: CandidateComparisonSummary(
+            folds=folds,
+            score=comparison_score,
+            diagnostics=(AggregateMetric("d" + escaped(count), 1),),
+            _controller_seal=_CANDIDATE_COMPARISON_SEAL,
+        ),
+        MAX_CANDIDATE_COMPARISON_BYTES,
     )
     validation = _successful_candidate_validation()
     dynamic_values = {

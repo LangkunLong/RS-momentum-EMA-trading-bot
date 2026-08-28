@@ -472,6 +472,8 @@ class ValidationReservation:
 @dataclass(frozen=True, slots=True)
 class DiscoveryExposureProof:
     fold_ids: tuple[str, str]
+    window_identities: tuple[ValidationWindowIdentity, ValidationWindowIdentity]
+    metadata: ValidationExposureMetadata
     reservation_record_sha256s: tuple[str, str]
     ledger_head_sha256: str
     _controller_seal: InitVar[object] = None
@@ -481,6 +483,30 @@ class DiscoveryExposureProof:
             raise ValueError("discovery exposure proof must be ledger derived")
         if self.fold_ids != ("discovery_1", "discovery_2"):
             raise ValueError("discovery exposure proof fold IDs are invalid")
+        if (
+            type(self.window_identities) is not tuple
+            or len(self.window_identities) != 2
+            or any(
+                not isinstance(item, ValidationWindowIdentity)
+                for item in self.window_identities
+            )
+        ):
+            raise ValueError("discovery exposure proof window identities are invalid")
+        if not isinstance(self.metadata, ValidationExposureMetadata):
+            raise ValueError("discovery exposure proof metadata is invalid")
+        left, right = self.window_identities
+        if (
+            left.pit_bundle_sha256,
+            left.universe_sha256,
+            left.benchmark,
+            left.warmup_contract_sha256,
+        ) != (
+            right.pit_bundle_sha256,
+            right.universe_sha256,
+            right.benchmark,
+            right.warmup_contract_sha256,
+        ):
+            raise ValueError("discovery exposure proof window lineage is inconsistent")
         if type(self.reservation_record_sha256s) is not tuple:
             raise ValueError("discovery exposure proof reservations are invalid")
         for digest in (*self.reservation_record_sha256s, self.ledger_head_sha256):
@@ -751,6 +777,8 @@ class ValidationLedger:
         with _validation_file_lock(self._lock_path):
             records = self._read_records()
             selected: list[dict[str, object]] = []
+            selected_identities: list[ValidationWindowIdentity] = []
+            selected_metadata: list[ValidationExposureMetadata] = []
             for fold, reservation in zip(
                 fold_manifest.discovery_folds,
                 reservations,
@@ -791,13 +819,34 @@ class ValidationLedger:
                     or identity.get("last_session") != fold.end_date
                 ):
                     raise ValueError("discovery exposure reservation differs from fold")
+                closed_identity = ValidationWindowIdentity(**identity)
+                closed_metadata = ValidationExposureMetadata(**metadata)
                 selected.append(record)
+                selected_identities.append(closed_identity)
+                selected_metadata.append(closed_metadata)
             if not records:
                 raise ValueError("discovery exposure ledger is empty")
+            left, right = selected_identities
+            if (
+                left.pit_bundle_sha256,
+                left.universe_sha256,
+                left.benchmark,
+                left.warmup_contract_sha256,
+            ) != (
+                right.pit_bundle_sha256,
+                right.universe_sha256,
+                right.benchmark,
+                right.warmup_contract_sha256,
+            ):
+                raise ValueError("discovery exposure window lineage differs")
+            if selected_metadata[0] != selected_metadata[1]:
+                raise ValueError("discovery exposure metadata lineage differs")
             return DiscoveryExposureProof(
                 fold_ids=tuple(
                     fold.fold_id for fold in fold_manifest.discovery_folds
                 ),
+                window_identities=tuple(selected_identities),
+                metadata=selected_metadata[0],
                 reservation_record_sha256s=tuple(
                     str(item["record_sha256"]) for item in selected
                 ),
