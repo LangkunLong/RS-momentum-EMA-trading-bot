@@ -4285,7 +4285,13 @@ class OpenRouterGateway:
                     max_tokens=plan_snapshot.max_output_tokens,
                     timeout=min(self.timeout_seconds, remaining),
                     extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
-                    extra_body={"provider": {"require_parameters": True}},
+                    extra_body={
+                        "provider": {"require_parameters": True},
+                        # DeepSeek R1 keeps its reasoning budget, but returns the
+                        # reasoning trace separately so ``message.content`` can
+                        # remain the strict JSON role payload we validate.
+                        "reasoning": {"exclude": True},
+                    },
                 )
             except Exception as exc:
                 lifecycle.response_processed = True

@@ -6418,7 +6418,10 @@ def test_pit_optimizer_v2_gateway_sends_one_all_r1_call_without_healing(
     assert sent["max_tokens"] == plan.max_output_tokens
     assert sent["messages"][1]["content"] == snapshot.canonical_bytes.decode("utf-8")
     assert sent["stream"] is False
-    assert sent["extra_body"] == {"provider": {"require_parameters": True}}
+    assert sent["extra_body"] == {
+        "provider": {"require_parameters": True},
+        "reasoning": {"exclude": True},
+    }
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
     assert [item["record_type"] for item in records[-4:]] == [
         "reservation",
@@ -8327,7 +8330,11 @@ def test_pit_optimizer_v2_gateway_accounts_all_three_r1_roles_in_order(
         "deepseek/deepseek-r1",
     ]
     assert all(
-        call["extra_body"] == {"provider": {"require_parameters": True}}
+        call["extra_body"]
+        == {
+            "provider": {"require_parameters": True},
+            "reasoning": {"exclude": True},
+        }
         for call in client.completions.calls
     )
 
