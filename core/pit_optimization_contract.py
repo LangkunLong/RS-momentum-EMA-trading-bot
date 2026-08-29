@@ -1013,6 +1013,25 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _committed_policy_source_text(source_root: Path, relative: str) -> str:
+    """Read the exact policy text a candidate export receives from HEAD."""
+
+    _resolved_file(source_root / Path(relative), f"policy source {relative}")
+    try:
+        completed = subprocess.run(
+            ["git", "show", f"HEAD:{relative}"],
+            cwd=source_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return completed.stdout.decode("utf-8")
+    except (OSError, UnicodeDecodeError, subprocess.CalledProcessError) as exc:
+        raise ValueError(
+            "committed policy source must be readable as UTF-8 text"
+        ) from exc
+
+
 def _pit_optimizer_manifest_from_primitive(
     primitive: Mapping[str, object],
 ) -> PitOptimizerRunManifest:
@@ -1315,20 +1334,7 @@ def build_subset_manifest(
     source_texts: dict[str, str] = {}
     source_sha256s: list[tuple[str, str]] = []
     for relative in _POLICY_EDITABLE_PATHS:
-        _resolved_file(source / Path(relative), f"policy source {relative}")
-        try:
-            completed = subprocess.run(
-                ["git", "show", f"HEAD:{relative}"],
-                cwd=source,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            text = completed.stdout.decode("utf-8")
-        except (OSError, UnicodeDecodeError, subprocess.CalledProcessError) as exc:
-            raise ValueError(
-                "committed policy source must be readable as UTF-8 text"
-            ) from exc
+        text = _committed_policy_source_text(source, relative)
         source_texts[relative] = text
         source_sha256s.append((relative, hashlib.sha256(text.encode("utf-8")).hexdigest()))
 
@@ -1491,8 +1497,8 @@ def build_prepare_command(
     if _sha256_file(baseline_manifest) != manifest.baseline_manifest_sha256:
         raise ValueError("baseline run differs from manifest")
     for relative, expected_sha256 in manifest.policy_source_sha256s:
-        path = _resolved_file(repository / relative, f"policy source {relative}")
-        if _sha256_file(path) != expected_sha256:
+        source_text = _committed_policy_source_text(repository, relative)
+        if hashlib.sha256(source_text.encode("utf-8")).hexdigest() != expected_sha256:
             raise ValueError("repository policy source differs from manifest")
     if sandbox_image != manifest.sandbox_image:
         raise ValueError("prepare sandbox image differs from manifest")
