@@ -1,4 +1,4 @@
-"""Crash-safe, incremental local artifacts for the schema-v2 PIT optimizer."""
+"""Crash-safe, incremental local artifacts for the schema-v3 PIT optimizer."""
 
 from __future__ import annotations
 
@@ -586,7 +586,7 @@ class IncrementalArtifactStore:
         name: str,
         value: Mapping[str, object],
     ) -> tuple[Path, str]:
-        if not isinstance(value, Mapping) or value.get("schema_version") != 2:
+        if not isinstance(value, Mapping) or value.get("schema_version") != 3:
             raise ValueError("optimizer JSON artifact schema is invalid")
         parent_parts, target_name = self._target(name, json_artifact=True)
         payload = canonical_json_bytes(value)

@@ -10281,6 +10281,59 @@ class LoopLimits:
 
 
 @dataclass(frozen=True)
+class PitOptimizerLoopLimits:
+    """Optimizer-only hard calls/tokens and execution ceilings."""
+
+    max_iterations: int
+    max_api_calls: int
+    max_tokens: int
+    api_timeout_seconds: float
+    child_timeout_seconds: float
+    wall_timeout_seconds: float
+    output_limit_bytes: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.max_iterations) is not int
+            or not 0 <= self.max_iterations <= MAX_ITERATIONS
+        ):
+            raise ConfigurationError(
+                f"max iterations must be between 0 and {MAX_ITERATIONS}"
+            )
+        if (
+            type(self.max_api_calls) is not int
+            or not 1 <= self.max_api_calls <= MAX_BATCH_CALLS
+        ):
+            raise ConfigurationError(
+                "max_api_calls is outside the hard controller limit"
+            )
+        if (
+            type(self.max_tokens) is not int
+            or not 1 <= self.max_tokens <= MAX_BATCH_TOKENS
+        ):
+            raise ConfigurationError(
+                "max_tokens is outside the hard controller limit"
+            )
+        _finite_positive(self.api_timeout_seconds, "API timeout")
+        child_timeout = _finite_positive(
+            self.child_timeout_seconds,
+            "child timeout",
+        )
+        if child_timeout > MAX_CHILD_TIMEOUT_SECONDS:
+            raise ConfigurationError(
+                "child timeout exceeds the hard controller limit"
+            )
+        _finite_positive(self.wall_timeout_seconds, "wall timeout")
+        if (
+            type(self.output_limit_bytes) is not int
+            or not 1 <= self.output_limit_bytes <= 4 * 1024 * 1024
+        ):
+            raise ConfigurationError(
+                "output_limit_bytes is outside the hard controller limit"
+            )
+
+
+@dataclass(frozen=True)
 class ProposalBatchLimits:
     """Hard canary-first limits for independent proposal samples against one sealed gate."""
 
@@ -11540,7 +11593,7 @@ class LoopConfig:
     mode: ExecutionMode
     gate: TestGateConfig | BacktestGateConfig | Any
     models: ModelConfig
-    limits: LoopLimits
+    limits: LoopLimits | PitOptimizerLoopLimits
 
     def __post_init__(self) -> None:
         source = _absolute_configuration_path(self.source_root, "source_root")
@@ -11646,8 +11699,18 @@ class LoopConfig:
                     raise ConfigurationError(
                         "PIT optimizer execution context differs from LoopConfig"
                     )
-        if not isinstance(self.models, ModelConfig) or not isinstance(self.limits, LoopLimits):
-            raise ConfigurationError("models and limits must be validated configs")
+        if not isinstance(self.models, ModelConfig):
+            raise ConfigurationError("models must be a validated config")
+        if optimization_gate_type and isinstance(
+            self.gate,
+            PitOptimizerGateConfig,
+        ):
+            if not isinstance(self.limits, PitOptimizerLoopLimits):
+                raise ConfigurationError(
+                    "PIT optimizer requires optimizer-specific limits"
+                )
+        elif not isinstance(self.limits, LoopLimits):
+            raise ConfigurationError("legacy route requires USD-enforcing limits")
         object.__setattr__(self, "source_root", source)
         object.__setattr__(self, "permanent_runtime_root", runtime)
         object.__setattr__(self, "git_executable", git)
@@ -18243,7 +18306,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-sharpe-ratio", type=float)
     parser.add_argument("--maximum-drawdown-magnitude", type=float)
     parser.add_argument("--minimum-closed-trades", type=int)
-    parser.add_argument("--max-usd", type=float, required=True)
+    parser.add_argument(
+        "--max-usd",
+        type=float,
+        help="Required USD ceiling for every route except pit_optimizer.",
+    )
     parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
     parser.add_argument(
         "--max-api-calls",
@@ -18305,10 +18372,10 @@ def _absolute_cli_path(value: object, field: str) -> Path:
         raise ConfigurationError(f"{field} path identity cannot be resolved") from exc
 
 
-def _build_pit_optimizer_v2_config(
+def _build_pit_optimizer_v3_config(
     namespace: argparse.Namespace,
 ) -> PitOptimizerGateConfig:
-    """Build and validate one closed schema-v2 optimizer gate configuration."""
+    """Build and validate one closed schema-v3 optimizer gate configuration."""
     from core.pit_optimization_contract import (
         PitOptimizerGateConfig,
         _pit_optimizer_manifest_from_primitive,
@@ -18487,7 +18554,7 @@ def _build_pit_optimizer_v2_config(
 
 @dataclass(frozen=True, slots=True)
 class PitOptimizerLiveRun:
-    """Authenticated schema-v2 readiness paired with injected live capabilities."""
+    """Authenticated schema-v3 readiness paired with injected live capabilities."""
 
     readiness: PitOptimizerReadiness
     optimizer_services: PitOptimizerServices
@@ -18518,7 +18585,7 @@ class _PitOptimizerEvaluatorData:
             raise ConfigurationError("PIT optimizer evaluator data is invalid")
 
 
-def _preauthorize_pit_optimizer_v2_live_run(
+def _preauthorize_pit_optimizer_v3_live_run(
     config: PitOptimizerGateConfig,
     *,
     readiness: PitOptimizerReadiness,
@@ -18582,7 +18649,7 @@ def _preauthorize_pit_optimizer_v2_live_run(
     )
 
 
-def _build_pit_optimizer_v2_live_run(
+def _build_pit_optimizer_v3_live_run(
     config: PitOptimizerGateConfig,
     *,
     source_state: SourceState,
@@ -18593,12 +18660,12 @@ def _build_pit_optimizer_v2_live_run(
     worker_runner_factory: Callable[..., object] | None = None,
     evaluator_data_factory: Callable[..., _PitOptimizerEvaluatorData] | None = None,
 ) -> PitOptimizerLiveRun:
-    """Compose the production schema-v2 services behind opaque capabilities."""
+    """Compose the production schema-v3 services behind opaque capabilities."""
     from core.backtest_engine import PortfolioSimulator
     from core.pit_data import PITDataBundle
     from core.pit_optimization import (
         _build_verification_scope,
-        load_pit_optimizer_v2_readiness,
+        load_pit_optimizer_v3_readiness,
     )
     from core.pit_optimization_contract import (
         AuthorArtifact,
@@ -18647,7 +18714,7 @@ def _build_pit_optimizer_v2_live_run(
         )
     ):
         raise ConfigurationError("PIT optimizer external boundary factory is invalid")
-    readiness = load_pit_optimizer_v2_readiness(config)
+    readiness = load_pit_optimizer_v3_readiness(config)
     manifest = readiness.manifest
     runtime_root = config.permanent_runtime_root
     artifact_root = config.artifact_root
@@ -19352,7 +19419,7 @@ def _build_pit_optimizer_v2_live_run(
                         "PIT optimizer readiness capability changed"
                     )
                 config.validate()
-                reloaded = load_pit_optimizer_v2_readiness(config)
+                reloaded = load_pit_optimizer_v3_readiness(config)
                 if (
                     reloaded.manifest_sha256 != readiness.manifest_sha256
                     or reloaded.readiness_sha256 != readiness.readiness_sha256
@@ -19400,7 +19467,7 @@ def _build_pit_optimizer_v2_live_run(
         )
 
     try:
-        return _preauthorize_pit_optimizer_v2_live_run(
+        return _preauthorize_pit_optimizer_v3_live_run(
             config,
             readiness=readiness,
             authenticate=authenticate,
@@ -19421,7 +19488,7 @@ def _build_pit_optimizer_v2_live_run(
         raise
 
 
-def _dispatch_pit_optimizer_v2(
+def _dispatch_pit_optimizer_v3(
     config: PitOptimizerGateConfig,
     *,
     prepare: Callable[[PitOptimizerGateConfig], PitOptimizerReadiness],
@@ -19436,9 +19503,9 @@ def _dispatch_pit_optimizer_v2(
     live = build_live_services(config)
     if not isinstance(live, PitOptimizerLiveRun):
         raise ConfigurationError("PIT optimizer live services are invalid")
-    from core.pit_optimization import run_pit_optimizer_v2
+    from core.pit_optimization import run_pit_optimizer_v3
 
-    return run_pit_optimizer_v2(
+    return run_pit_optimizer_v3(
         readiness=live.readiness,
         services=live.optimizer_services,
     )
@@ -19447,6 +19514,14 @@ def _dispatch_pit_optimizer_v2(
 def _build_cli_config(
     namespace: argparse.Namespace,
 ) -> tuple[LoopConfig, Path, str]:
+    max_usd = getattr(namespace, "max_usd", None)
+    if namespace.gate == "pit_optimizer":
+        if max_usd is not None:
+            raise ConfigurationError(
+                "pit_optimizer does not accept --max-usd"
+            )
+    elif max_usd is None:
+        raise ConfigurationError(f"{namespace.gate} requires --max-usd")
     max_api_calls = namespace.max_api_calls
     if max_api_calls is None:
         max_api_calls = (
@@ -19508,7 +19583,7 @@ def _build_cli_config(
         namespace.optimization_prior_discovery_feedback,
         namespace.optimization_prior_discovery_feedback_sha256,
     )
-    optimizer_v2_fields = (
+    optimizer_v3_fields = (
         namespace.optimizer_manifest,
         namespace.optimizer_manifest_sha256,
         namespace.verified_parity,
@@ -19519,7 +19594,7 @@ def _build_cli_config(
     if (
         namespace.gate != "pit_optimizer"
         and (
-            any(value is not None for value in optimizer_v2_fields)
+            any(value is not None for value in optimizer_v3_fields)
             or namespace.authorize_policy_source_transmission
         )
     ) or (
@@ -19528,13 +19603,13 @@ def _build_cli_config(
         and namespace.authorize_policy_source_transmission
     ):
         raise ConfigurationError(
-            "schema-v2 optimizer options are accepted only by optimizer canary"
+            "schema-v3 optimizer options are accepted only by optimizer canary"
         )
     all_pit_fields = (
         *pit_shared_fields,
         *diagnosis_fields,
         *optimization_fields,
-        *optimizer_v2_fields,
+        *optimizer_v3_fields,
     )
     if namespace.gate == "test":
         if any(value is not None for value in backtest_fields):
@@ -19705,7 +19780,30 @@ def _build_cli_config(
                 "proposal samples are not supported by the PIT optimizer gate"
             )
         namespace.max_api_calls = max_api_calls
-        gate = _build_pit_optimizer_v2_config(namespace)
+        gate = _build_pit_optimizer_v3_config(namespace)
+    limits: LoopLimits | PitOptimizerLoopLimits
+    if namespace.gate == "pit_optimizer":
+        limits = PitOptimizerLoopLimits(
+            max_iterations=namespace.max_iterations,
+            max_api_calls=max_api_calls,
+            max_tokens=namespace.max_tokens,
+            api_timeout_seconds=namespace.api_timeout_seconds,
+            child_timeout_seconds=namespace.child_timeout_seconds,
+            wall_timeout_seconds=namespace.wall_timeout_seconds,
+            output_limit_bytes=namespace.output_limit_bytes,
+        )
+    else:
+        assert max_usd is not None
+        limits = LoopLimits(
+            max_usd=max_usd,
+            max_iterations=namespace.max_iterations,
+            max_api_calls=max_api_calls,
+            max_tokens=namespace.max_tokens,
+            api_timeout_seconds=namespace.api_timeout_seconds,
+            child_timeout_seconds=namespace.child_timeout_seconds,
+            wall_timeout_seconds=namespace.wall_timeout_seconds,
+            output_limit_bytes=namespace.output_limit_bytes,
+        )
     config = LoopConfig(
         source_root=_absolute_cli_path(namespace.repo_root, "repository root"),
         permanent_runtime_root=_absolute_cli_path(
@@ -19721,16 +19819,7 @@ def _build_cli_config(
         mode=ExecutionMode(apply=namespace.apply),
         gate=gate,
         models=ModelConfig(),
-        limits=LoopLimits(
-            max_usd=namespace.max_usd,
-            max_iterations=namespace.max_iterations,
-            max_api_calls=max_api_calls,
-            max_tokens=namespace.max_tokens,
-            api_timeout_seconds=namespace.api_timeout_seconds,
-            child_timeout_seconds=namespace.child_timeout_seconds,
-            wall_timeout_seconds=namespace.wall_timeout_seconds,
-            output_limit_bytes=namespace.output_limit_bytes,
-        ),
+        limits=limits,
     )
     return config, docker_executable, sandbox_image
 
@@ -19993,7 +20082,7 @@ def _execute_cli_run(
             PitOptimizationGateConfig,
             PitOptimizationLoopResult,
             PitOptimizationRoleCall,
-            prepare_pit_optimizer_v2,
+            prepare_pit_optimizer_v3,
             prepare_pit_optimization,
             run_pit_optimization_canary,
             verify_sealed_baseline_artifacts,
@@ -20007,16 +20096,16 @@ def _execute_cli_run(
             if state.fingerprint is None:
                 raise ConfigurationError("preflight source fingerprint is absent")
 
-            def v2_source_identity(root: Path) -> tuple[str, str]:
+            def v3_source_identity(root: Path) -> tuple[str, str]:
                 return _pit_optimizer_source_identity(root, git_capability)
 
-            def prepare_v2(
+            def prepare_v3(
                 gate: PitOptimizerGateConfig,
             ) -> PitOptimizerReadiness:
                 nonlocal stage
                 stage = "pit_optimizer_prepare"
                 manifest_source_head, manifest_source_fingerprint = (
-                    v2_source_identity(config.source_root)
+                    v3_source_identity(config.source_root)
                 )
                 if (
                     manifest_source_head != state.head
@@ -20025,22 +20114,22 @@ def _execute_cli_run(
                     raise CandidateMutationError(
                         "source changed before PIT optimizer readiness publication"
                     )
-                return prepare_pit_optimizer_v2(
+                return prepare_pit_optimizer_v3(
                     gate,
                     source_root=config.source_root,
                     artifact_root=config.artifact_root,
                     permanent_runtime_root=config.permanent_runtime_root,
                     source_head=manifest_source_head,
                     source_fingerprint_sha256=manifest_source_fingerprint,
-                    source_identity=v2_source_identity,
+                    source_identity=v3_source_identity,
                 )
 
-            def build_v2(
+            def build_v3(
                 gate: PitOptimizerGateConfig,
             ) -> PitOptimizerLiveRun:
                 nonlocal stage
                 stage = "pit_optimizer_canary"
-                return _build_pit_optimizer_v2_live_run(
+                return _build_pit_optimizer_v3_live_run(
                     gate,
                     source_state=state,
                     git_capability=git_capability,
@@ -20048,22 +20137,22 @@ def _execute_cli_run(
                     wall_timeout_seconds=config.limits.wall_timeout_seconds,
                 )
 
-            v2_result = _dispatch_pit_optimizer_v2(
+            v3_result = _dispatch_pit_optimizer_v3(
                 config.gate,
-                prepare=prepare_v2,
-                build_live_services=build_v2,
+                prepare=prepare_v3,
+                build_live_services=build_v3,
             )
-            if isinstance(v2_result, PitOptimizerReadiness):
+            if isinstance(v3_result, PitOptimizerReadiness):
                 if recheck_source_unchanged(state).source_modified:
                     raise CandidateMutationError(
                         "source changed during PIT optimizer readiness publication"
                     )
-            elif not isinstance(v2_result, PitOptimizerResult):
+            elif not isinstance(v3_result, PitOptimizerResult):
                 raise ConfigurationError("PIT optimizer returned an invalid result")
             state.close()
             state = None
             loop_returned = True
-            return v2_result
+            return v3_result
 
         if (
             isinstance(config.gate, PitOptimizationGateConfig)
@@ -20731,10 +20820,10 @@ def _pit_optimization_summary(result: Any) -> dict[str, object]:
     }
 
 
-def _pit_optimizer_v2_summary(
+def _pit_optimizer_v3_summary(
     result: PitOptimizerResult,
 ) -> dict[str, object]:
-    """Project one schema-v2 result without provider content or opaque digests."""
+    """Project one schema-v3 result without provider content or opaque digests."""
     from core.pit_optimizer_controller import PitOptimizerResult
 
     if not isinstance(result, PitOptimizerResult):
@@ -20751,7 +20840,7 @@ def _pit_optimizer_v2_summary(
         }
     )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "phase": result.phase,
         "status": result.status,
         "terminal_code": result.terminal_code,
@@ -20771,7 +20860,7 @@ def _pit_optimizer_v2_summary(
     }
 
 
-def _pit_optimizer_v2_prepare_lines(
+def _pit_optimizer_v3_prepare_lines(
     config: PitOptimizerGateConfig,
     readiness: PitOptimizerReadiness,
 ) -> tuple[str, str]:
@@ -20786,7 +20875,7 @@ def _pit_optimizer_v2_prepare_lines(
         or readiness.manifest_sha256 != config.optimizer_manifest_sha256
     ):
         raise ConfigurationError(
-            "prepare output requires authenticated schema-v2 readiness"
+            "prepare output requires authenticated schema-v3 readiness"
         )
     config.validate()
     context = (
@@ -20817,13 +20906,12 @@ def _pit_optimizer_v2_prepare_lines(
         != hashlib.sha256(supplied_readiness.read_bytes()).hexdigest()
     ):
         raise ConfigurationError(
-            "prepare output requires authenticated schema-v2 readiness"
+            "prepare output requires authenticated schema-v3 readiness"
         )
     authorization = manifest.authorization_requirement
     if (
         config.max_api_calls != 6
         or config.max_tokens != 448_000
-        or not math.isclose(config.max_usd, 0.40, rel_tol=0.0, abs_tol=1e-12)
         or config.max_iterations != 2
         or config.apply is not False
     ):
@@ -20875,8 +20963,6 @@ def _pit_optimizer_v2_prepare_lines(
         "--optimizer-authorization-requirement-sha256",
         authorization.sha256,
         "--authorize-policy-source-transmission",
-        "--max-usd",
-        "0.40",
         "--max-api-calls",
         "6",
         "--max-tokens",
@@ -20886,7 +20972,7 @@ def _pit_optimizer_v2_prepare_lines(
     )
     command = subprocess.list2cmdline(argv)
     ready = {
-        "schema_version": 2,
+        "schema_version": 3,
         "phase": "ready",
         "run_id": manifest.run_id,
         "readiness_artifact": str(readiness.artifact_path),
@@ -21048,10 +21134,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(result, PitDiagnosisLoopResult)
             else _pit_optimization_summary(result)
             if isinstance(result, PitOptimizationLoopResult)
-            else _pit_optimizer_v2_summary(result)
+            else _pit_optimizer_v3_summary(result)
             if isinstance(result, PitOptimizerResult)
             else {
-                "schema_version": 2,
+                "schema_version": 3,
                 "phase": "prepare",
                 "status": "ready",
                 "terminal_code": "prepared",
@@ -21069,10 +21155,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
                     "total_tokens": 0,
-                    "authoritative_usd": 0.0,
+                    "authoritative_usd": "0",
+                    "projected_plan_usd": None,
+                    "pricing_status": "not_initialized",
                     "retained_reservation_tokens": 0,
-                    "retained_reservation_usd": 0.0,
                     "incomplete_accounting_calls": 0,
+                    "accounting_complete": True,
                 },
                 "artifact_root": str(result.artifact_path.parent),
                 "source_modified": False,
@@ -21093,7 +21181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if isinstance(result, PitOptimizerReadiness):
         if not isinstance(config.gate, PitOptimizerGateConfig):
             raise ConfigurationError("PIT optimizer readiness gate is invalid")
-        for line in _pit_optimizer_v2_prepare_lines(config.gate, result):
+        for line in _pit_optimizer_v3_prepare_lines(config.gate, result):
             print(line)
     print(
         "AGENT_LOOP_SUMMARY="

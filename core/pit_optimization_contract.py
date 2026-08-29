@@ -945,7 +945,7 @@ class PitOptimizerGateConfig:
             ):
                 raise ValueError("optimizer gate readiness artifact is not canonical")
             if (
-                readiness.get("schema_version") != 2
+                readiness.get("schema_version") != 3
                 or readiness.get("manifest_sha256") != closed_manifest.sha256
                 or readiness.get("manifest") != primitive
             ):

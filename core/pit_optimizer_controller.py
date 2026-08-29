@@ -1,13 +1,13 @@
-"""Provider-free orchestration for the schema-v2 PIT optimizer."""
+"""Provider-free orchestration for the schema-v3 PIT optimizer."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 import uuid
 
 from core.pit_optimization_contract import (
@@ -37,7 +37,7 @@ from core.pit_optimization_contract import (
 from core.pit_optimizer_artifacts import canonical_json_bytes, write_create_only_json
 from core.pit_optimizer_authorization import (
     AuthorizationRunLease,
-    FrozenModelPricing,
+    OptimizerPricingSnapshot,
     PitOptimizerProviderFacts,
     PitOptimizerRoleCall,
 )
@@ -86,7 +86,7 @@ class PitOptimizerReadiness:
     provider_seed: ProviderSeed
 
     def __post_init__(self) -> None:
-        if self.schema_version != 2:
+        if self.schema_version != 3:
             raise ValueError("optimizer readiness schema is unsupported")
         if not isinstance(self.manifest, PitOptimizerRunManifest):
             raise ValueError("optimizer readiness manifest is invalid")
@@ -124,16 +124,88 @@ class CandidateValidationOutcome:
     changed_symbols: tuple[str, ...]
 
 
+def _canonical_decimal_text(value: Decimal) -> str:
+    """Render one finite non-negative amount as canonical decimal text."""
+
+    if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+        raise ValueError("optimizer USD amount is invalid")
+    if value.is_zero():
+        return "0"
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
+
+
 @dataclass(frozen=True, slots=True)
 class OptimizerBudgetSummary:
     api_calls: int
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
-    authoritative_usd: float
+    authoritative_usd: str
+    projected_plan_usd: str | None
+    pricing_status: str
     retained_reservation_tokens: int
-    retained_reservation_usd: float
     incomplete_accounting_calls: int
+    accounting_complete: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "api_calls",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "retained_reservation_tokens",
+            "incomplete_accounting_calls",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"optimizer budget {name} is invalid")
+        if self.total_tokens != self.prompt_tokens + self.completion_tokens:
+            raise ValueError("optimizer authoritative token total is inconsistent")
+        try:
+            authoritative = Decimal(self.authoritative_usd)
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("optimizer authoritative USD is invalid") from exc
+        if (
+            not isinstance(self.authoritative_usd, str)
+            or _canonical_decimal_text(authoritative) != self.authoritative_usd
+        ):
+            raise ValueError("optimizer authoritative USD is invalid")
+        if self.projected_plan_usd is not None:
+            try:
+                projected = Decimal(self.projected_plan_usd)
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError("optimizer projected plan USD is invalid") from exc
+            if (
+                not isinstance(self.projected_plan_usd, str)
+                or _canonical_decimal_text(projected) != self.projected_plan_usd
+            ):
+                raise ValueError("optimizer projected plan USD is invalid")
+        if self.pricing_status not in {
+            "available",
+            "unavailable",
+            "not_initialized",
+        }:
+            raise ValueError("optimizer pricing status is invalid")
+        if (self.pricing_status == "available") != (
+            self.projected_plan_usd is not None
+        ):
+            raise ValueError("optimizer pricing projection is inconsistent")
+        if self.incomplete_accounting_calls > self.api_calls:
+            raise ValueError("optimizer incomplete accounting calls are invalid")
+        if self.accounting_complete is not (
+            self.incomplete_accounting_calls == 0
+        ):
+            raise ValueError("optimizer accounting completeness is inconsistent")
+        if self.accounting_complete and self.retained_reservation_tokens:
+            raise ValueError("complete optimizer accounting retained tokens")
+        if (
+            not self.accounting_complete
+            and self.retained_reservation_tokens == 0
+        ):
+            raise ValueError("incomplete optimizer accounting lacks retained tokens")
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +219,11 @@ class _ProviderAttemptRecord:
 
 @dataclass(frozen=True, slots=True)
 class PitOptimizerServices:
-    freeze_pricing: Callable[[str], FrozenModelPricing]
-    open_run_lease: Callable[[PitOptimizerReadiness, FrozenModelPricing], AuthorizationRunLease]
+    freeze_pricing: Callable[[str], OptimizerPricingSnapshot]
+    open_run_lease: Callable[
+        [PitOptimizerReadiness, OptimizerPricingSnapshot],
+        AuthorizationRunLease,
+    ]
     close_run_lease: Callable[[AuthorizationRunLease, str], None]
     call_role: Callable[
         [
@@ -156,7 +231,7 @@ class PitOptimizerServices:
             InvestigatorInput | AuthorInput | CriticInput,
             Callable[[str], object],
             AuthorizationRunLease,
-            FrozenModelPricing,
+            OptimizerPricingSnapshot,
         ],
         PitOptimizerRoleCall,
     ]
@@ -286,7 +361,7 @@ class _RunState:
     incumbent_updates: int
     non_improving_streak: int
     provider_enabled: bool
-    frozen_pricing: FrozenModelPricing | None
+    pricing_snapshot: OptimizerPricingSnapshot | None
     authorization_lease: AuthorizationRunLease | None
     artifact_paths: list[tuple[Path, str]] = field(default_factory=list)
     artifact_root: Path | None = None
@@ -444,7 +519,7 @@ def _readiness_primitive(
     provider_seed: ProviderSeed,
 ) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest": manifest.to_primitive(),
         "manifest_sha256": manifest.sha256,
         "parity": _parity_primitive(parity),
@@ -667,7 +742,7 @@ def _window_identity(
     )
 
 
-def prepare_pit_optimizer_v2(
+def prepare_pit_optimizer_v3(
     config: PitOptimizerGateConfig,
     *,
     source_root: Path,
@@ -732,7 +807,7 @@ def prepare_pit_optimizer_v2(
     output = artifacts.resolve() / f"{manifest.run_id}.readiness.json"
     artifact_path, readiness_sha256 = write_create_only_json(output, primitive)
     return PitOptimizerReadiness(
-        schema_version=2,
+        schema_version=3,
         manifest=manifest,
         manifest_sha256=manifest.sha256,
         readiness_sha256=readiness_sha256,
@@ -750,7 +825,7 @@ def _initialize_provider(
 ) -> None:
     pricing = services.freeze_pricing(readiness.manifest.model)
     lease = services.open_run_lease(readiness, pricing)
-    state.frozen_pricing = pricing
+    state.pricing_snapshot = pricing
     state.authorization_lease = lease
     state.lease_snapshot = lease
 
@@ -780,11 +855,11 @@ def _run_artifact(
     state: _RunState,
 ) -> dict[str, object]:
     manifest = readiness.manifest
-    if state.authorization_lease is None or state.frozen_pricing is None:
+    if state.authorization_lease is None or state.pricing_snapshot is None:
         raise RuntimeError("provider capability is not initialized")
     folds = (*manifest.fold_manifest.discovery_folds, manifest.fold_manifest.hidden_fold)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": manifest.run_id,
         "manifest_sha256": readiness.manifest_sha256,
         "readiness_sha256": readiness.readiness_sha256,
@@ -825,7 +900,9 @@ def _run_artifact(
             "window_id": manifest.authorization_requirement.window_id,
             "lease_id": state.authorization_lease.lease_id,
         },
-        "frozen_pricing_sha256": state.frozen_pricing.pricing_sha256,
+        "pricing_snapshot_sha256": (
+            state.pricing_snapshot.pricing_payload_sha256
+        ),
         "status": "initialized",
     }
 
@@ -833,7 +910,7 @@ def _run_artifact(
 def _baseline_artifact(readiness: PitOptimizerReadiness) -> dict[str, object]:
     manifest = readiness.manifest
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "fold_ids": [item.fold_id for item in readiness.baseline_discovery.folds],
         "fold_aggregates": [
             item.to_primitive() if hasattr(item, "to_primitive") else asdict(item)
@@ -850,30 +927,7 @@ def _baseline_artifact(readiness: PitOptimizerReadiness) -> dict[str, object]:
 def _accounting_artifact(
     state: _RunState,
 ) -> dict[str, object]:
-    lease = state.authorization_lease or state.lease_snapshot
-    return {
-        "schema_version": 2,
-        "call_records": [],
-        "authorized_totals": {
-            "calls": 0 if lease is None else lease.max_calls,
-            "tokens": 0 if lease is None else lease.max_tokens,
-            "usd": 0.0 if lease is None else lease.max_usd,
-        },
-        "reserved_totals": {"calls": 0, "tokens": 0, "usd": 0.0},
-        "actual_totals": {
-            "calls": 0,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "usd": 0.0,
-        },
-        "incomplete_exposure": {
-            "calls": 0,
-            "retained_tokens": 0,
-            "retained_usd": 0.0,
-        },
-        "audit_chain_head": "0" * 64,
-    }
+    return _current_accounting_artifact(state)
 
 
 def _initialize_run_artifacts(
@@ -940,7 +994,7 @@ def _role_artifact(call: PitOptimizerRoleCall) -> dict[str, object]:
     if not callable(primitive):
         raise ProviderProtocolFailure("provider payload is not serializable")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "call_index": call.plan.call_index,
         "iteration": call.plan.iteration,
         "role": call.plan.role,
@@ -950,53 +1004,78 @@ def _role_artifact(call: PitOptimizerRoleCall) -> dict[str, object]:
 
 
 def _budget_summary_from_calls(
-    calls: list[PitOptimizerRoleCall] | list[_ProviderAttemptRecord],
+    calls: Sequence[PitOptimizerRoleCall | _ProviderAttemptRecord],
+    lease: AuthorizationRunLease | None,
 ) -> OptimizerBudgetSummary:
+    if lease is not None and not isinstance(lease, AuthorizationRunLease):
+        raise ValueError("optimizer accounting lease is invalid")
     facts = [item.facts for item in calls]
+    authoritative_usd = sum(
+        (
+            Decimal(str(item.cost_usd))
+            for item in facts
+            if item.accounting_complete and item.cost_usd is not None
+        ),
+        Decimal("0"),
+    )
+    incomplete_calls = sum(1 for item in facts if not item.accounting_complete)
     return OptimizerBudgetSummary(
         api_calls=sum(1 for item in facts if item.request_started),
         prompt_tokens=sum(item.prompt_tokens or 0 for item in facts),
         completion_tokens=sum(item.completion_tokens or 0 for item in facts),
         total_tokens=sum(item.total_tokens or 0 for item in facts),
-        authoritative_usd=float(sum(Decimal(str(item.cost_usd or 0)) for item in facts)),
-        retained_reservation_tokens=sum(item.retained_reservation_tokens for item in facts),
-        retained_reservation_usd=float(
-            sum(Decimal(str(item.retained_reservation_usd)) for item in facts)
+        authoritative_usd=_canonical_decimal_text(authoritative_usd),
+        projected_plan_usd=(
+            None if lease is None else lease.projected_plan_usd
         ),
-        incomplete_accounting_calls=sum(1 for item in facts if not item.accounting_complete),
+        pricing_status=(
+            "not_initialized" if lease is None else lease.pricing_status
+        ),
+        retained_reservation_tokens=sum(item.retained_reservation_tokens for item in facts),
+        incomplete_accounting_calls=incomplete_calls,
+        accounting_complete=incomplete_calls == 0,
     )
+
+
+def _accounting_facts_primitive(
+    facts: PitOptimizerProviderFacts,
+) -> dict[str, object]:
+    """Return provider accounting facts without raw evidence identities."""
+
+    primitive = asdict(facts)
+    primitive.pop("pricing_snapshot_sha256")
+    primitive.pop("audit_sha256")
+    return primitive
 
 
 def _current_accounting_artifact(state: _RunState) -> dict[str, object]:
     attempts = state.provider_attempts
-    summary = _budget_summary_from_calls(attempts)
     lease = state.authorization_lease or state.lease_snapshot
+    summary = _budget_summary_from_calls(attempts, lease)
     reserved_tokens = sum(
         item.plan.max_input_tokens + item.plan.max_output_tokens
         for item in attempts
     )
-    reserved_usd = float(
-        sum(Decimal(str(item.plan.max_usd)) for item in attempts)
-    )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "call_records": [
             {
                 "plan": item.plan.to_primitive(),
-                "payload_sha256": item.payload_sha256,
-                "facts": asdict(item.facts),
+                "facts": _accounting_facts_primitive(item.facts),
             }
             for item in attempts
         ],
         "authorized_totals": {
             "calls": 0 if lease is None else lease.max_calls,
             "tokens": 0 if lease is None else lease.max_tokens,
-            "usd": 0.0 if lease is None else lease.max_usd,
         },
         "reserved_totals": {
             "calls": len(attempts),
             "tokens": reserved_tokens,
-            "usd": reserved_usd,
+        },
+        "pricing_advisory": {
+            "status": summary.pricing_status,
+            "projected_plan_usd": summary.projected_plan_usd,
         },
         "actual_totals": {
             "calls": summary.api_calls,
@@ -1008,11 +1087,8 @@ def _current_accounting_artifact(state: _RunState) -> dict[str, object]:
         "incomplete_exposure": {
             "calls": summary.incomplete_accounting_calls,
             "retained_tokens": summary.retained_reservation_tokens,
-            "retained_usd": summary.retained_reservation_usd,
         },
-        "audit_chain_head": (
-            "0" * 64 if not attempts else attempts[-1].facts.audit_sha256
-        ),
+        "accounting_complete": summary.accounting_complete,
     }
 
 
@@ -1030,9 +1106,12 @@ def _validate_attempt_facts(
         facts.requested_model,
     ) != (plan.call_index, plan.iteration, plan.role, plan.model):
         raise AuditFailure("provider attempt facts differ from the authorized plan")
-    pricing = state.frozen_pricing
-    if pricing is None or facts.frozen_pricing_sha256 != pricing.pricing_sha256:
-        raise AuditFailure("provider attempt facts differ from frozen pricing")
+    pricing = state.pricing_snapshot
+    if (
+        pricing is None
+        or facts.pricing_snapshot_sha256 != pricing.pricing_payload_sha256
+    ):
+        raise AuditFailure("provider attempt facts differ from pricing snapshot")
 
 
 def _record_provider_attempt(
@@ -1081,7 +1160,7 @@ def _call_role(
 ) -> PitOptimizerRoleCall:
     if not state.provider_enabled:
         raise RuntimeError("provider capability is closed")
-    if state.authorization_lease is None or state.frozen_pricing is None:
+    if state.authorization_lease is None or state.pricing_snapshot is None:
         raise RuntimeError("provider capability is not initialized")
     try:
         require_source_context_fit(role_input=role_input, role_budget=plan)
@@ -1093,7 +1172,7 @@ def _call_role(
             role_input,
             parser,
             state.authorization_lease,
-            state.frozen_pricing,
+            state.pricing_snapshot,
         )
     except BaseException:
         facts = services.recover_role_attempt(plan, state.authorization_lease)
@@ -1392,7 +1471,7 @@ def _validate_iteration_candidate(
         ),
     )
     primitive = {
-        "schema_version": 2,
+        "schema_version": 3,
         "failure_code": outcome.failure_code,
         "candidate_identity": (
             None if outcome.identity is None else outcome.identity.to_primitive()
@@ -1471,7 +1550,7 @@ def _evaluate_iteration_candidate(
             services.write_json_artifact(
                 _iteration_name(state, "discovery.json"),
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "failure_code": "no_discovery_trades",
                     "fixed_baseline_comparison": None,
                     "incumbent_diagnostics": None,
@@ -1545,7 +1624,7 @@ def _evaluate_iteration_candidate(
         services.write_json_artifact(
             _iteration_name(state, "discovery.json"),
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "fixed_baseline_comparison": _score_primitive(fixed_score),
                 "incumbent_diagnostics": _score_primitive(incumbent_diagnostics),
                 "rankable": comparison.rankable,
@@ -1774,7 +1853,7 @@ def _persist_iteration_decision(
         services.write_json_artifact(
             _iteration_name(state, "decision.json"),
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "rankable": bool(rankable),
                 "quantized_score": None if score is None else _score_primitive(score),
                 "prior_incumbent_identity_sha256": prior_identity,
@@ -1873,7 +1952,8 @@ def _pre_iteration_stop(
     lease = state.authorization_lease
     if lease is None:
         return "authorization_exhausted", None
-    if _budget_summary_from_calls(state.provider_attempts).incomplete_accounting_calls:
+    spent = _budget_summary_from_calls(state.provider_attempts, lease)
+    if spent.incomplete_accounting_calls:
         raise ProviderAccountingFailure("provider accounting is incomplete")
     next_plans = tuple(
         item
@@ -1886,7 +1966,6 @@ def _pre_iteration_stop(
         "critic",
     ):
         return "authorization_exhausted", None
-    spent = _budget_summary_from_calls(state.provider_attempts)
     if lease.max_calls - spent.api_calls < 3:
         return "budget_exhausted", "call_budget_exhausted"
     required_tokens = sum(
@@ -1895,12 +1974,6 @@ def _pre_iteration_stop(
     charged_tokens = spent.total_tokens + spent.retained_reservation_tokens
     if lease.max_tokens - charged_tokens < required_tokens:
         return "budget_exhausted", "token_budget_exhausted"
-    required_usd = sum(Decimal(str(item.max_usd)) for item in next_plans)
-    charged_usd = Decimal(str(spent.authoritative_usd)) + Decimal(
-        str(spent.retained_reservation_usd)
-    )
-    if Decimal(str(lease.max_usd)) - charged_usd < required_usd:
-        return "budget_exhausted", "cost_budget_exhausted"
     return None
 
 
@@ -1970,7 +2043,7 @@ def _new_run_state(readiness: PitOptimizerReadiness) -> _RunState:
         incumbent_updates=0,
         non_improving_streak=0,
         provider_enabled=True,
-        frozen_pricing=None,
+        pricing_snapshot=None,
         authorization_lease=None,
     )
 
@@ -2092,7 +2165,7 @@ def _run_hidden_once(
             services.write_json_artifact(
                 "holdout.json",
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "consumed_validation_key_sha256": (
                         reservation.consumption_key_sha256
                     ),
@@ -2231,7 +2304,10 @@ def _build_final_result(
         "stagnation_limit",
         "cancelled",
     }
-    budget = _budget_summary_from_calls(state.provider_attempts)
+    budget = _budget_summary_from_calls(
+        state.provider_attempts,
+        state.authorization_lease or state.lease_snapshot,
+    )
     cleanup_complete = (
         cleanup.candidate_removed
         and cleanup.worker_stopped
@@ -2266,7 +2342,7 @@ def _build_final_result(
         root = (readiness.artifact_path.parent / state.run_id).resolve()
     reservation = state.validation_reservation
     return PitOptimizerResult(
-        schema_version=2,
+        schema_version=3,
         phase="run",
         status=status,
         terminal_code=terminal_code,
@@ -2398,7 +2474,7 @@ def _finalize_result(
     return replace(result, artifact_paths=tuple(state.artifact_paths))
 
 
-def run_pit_optimizer_v2(
+def run_pit_optimizer_v3(
     *,
     readiness: PitOptimizerReadiness,
     services: PitOptimizerServices,
@@ -2430,9 +2506,7 @@ def run_pit_optimizer_v2(
             if outcome.terminal_code is not None:
                 terminal_code = outcome.terminal_code
                 break
-        repeated = _finish_discovery(readiness, state, services)
-        if repeated is not None:
-            _run_hidden_once(readiness, state, services)
+        _finish_discovery(readiness, state, services)
     except BaseException as exc:
         terminal_code, terminal_detail = _terminal_from_exception(exc)
         state.terminal_detail = terminal_detail

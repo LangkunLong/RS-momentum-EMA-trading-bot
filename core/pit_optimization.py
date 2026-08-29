@@ -3257,7 +3257,7 @@ def closed_window_metrics(window: Mapping[str, object]) -> OptimizationWindowMet
     return OptimizationWindowMetrics.from_mapping(performance)
 
 
-def prepare_pit_optimizer_v2(
+def prepare_pit_optimizer_v3(
     config: PitOptimizerGateConfig,
     *,
     source_root: Path,
@@ -3267,9 +3267,9 @@ def prepare_pit_optimizer_v2(
     source_fingerprint_sha256: str,
     source_identity: Callable[[Path], tuple[str, str]],
 ) -> PitOptimizerReadiness:
-    """Provider-free public adapter for schema-v2 readiness preparation."""
+    """Provider-free public adapter for schema-v3 readiness preparation."""
 
-    from core.pit_optimizer_controller import prepare_pit_optimizer_v2 as prepare
+    from core.pit_optimizer_controller import prepare_pit_optimizer_v3 as prepare
 
     return prepare(
         config,
@@ -3282,7 +3282,7 @@ def prepare_pit_optimizer_v2(
     )
 
 
-def load_pit_optimizer_v2_readiness(
+def load_pit_optimizer_v3_readiness(
     config: PitOptimizerGateConfig,
 ) -> PitOptimizerReadiness:
     """Load and reconstruct one previously prepared canonical readiness artifact."""
@@ -3321,7 +3321,7 @@ def load_pit_optimizer_v2_readiness(
     ):
         raise ValueError("optimizer readiness artifact differs from closed inputs")
     return PitOptimizerReadiness(
-        schema_version=2,
+        schema_version=3,
         manifest=manifest,
         manifest_sha256=manifest.sha256,
         readiness_sha256=config.readiness_sha256,
@@ -3332,14 +3332,14 @@ def load_pit_optimizer_v2_readiness(
     )
 
 
-def run_pit_optimizer_v2(
+def run_pit_optimizer_v3(
     *,
     readiness: PitOptimizerReadiness,
     services: PitOptimizerServices,
 ) -> PitOptimizerResult:
-    """Public adapter for the injected schema-v2 incumbent loop."""
+    """Public adapter for the injected schema-v3 incumbent loop."""
 
-    from core.pit_optimizer_controller import run_pit_optimizer_v2 as run
+    from core.pit_optimizer_controller import run_pit_optimizer_v3 as run
 
     return run(readiness=readiness, services=services)
 
