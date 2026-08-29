@@ -9,6 +9,7 @@ import math
 import os
 import re
 import stat
+import subprocess
 import uuid
 from dataclasses import InitVar, dataclass, fields, is_dataclass, replace
 from decimal import Decimal
@@ -1306,14 +1307,28 @@ def build_subset_manifest(
     ):
         raise ValueError("verified parity differs from the authenticated identity graph")
 
+    # Candidates are exported from the committed tree, not copied from the
+    # checkout.  Seal those exact Git blob bytes here as well: a Windows
+    # checkout may materialize CRLF while the exported candidate uses the
+    # committed LF blob, and hashing the checkout would make every policy
+    # scope fail before the first authorized role call.
     source_texts: dict[str, str] = {}
     source_sha256s: list[tuple[str, str]] = []
     for relative in _POLICY_EDITABLE_PATHS:
-        source_file = _resolved_file(source / Path(relative), f"policy source {relative}")
+        _resolved_file(source / Path(relative), f"policy source {relative}")
         try:
-            text = source_file.read_bytes().decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("policy source must be UTF-8 text") from exc
+            completed = subprocess.run(
+                ["git", "show", f"HEAD:{relative}"],
+                cwd=source,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            text = completed.stdout.decode("utf-8")
+        except (OSError, UnicodeDecodeError, subprocess.CalledProcessError) as exc:
+            raise ValueError(
+                "committed policy source must be readable as UTF-8 text"
+            ) from exc
         source_texts[relative] = text
         source_sha256s.append((relative, hashlib.sha256(text.encode("utf-8")).hexdigest()))
 
