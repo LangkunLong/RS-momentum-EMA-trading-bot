@@ -497,6 +497,7 @@ class PitOptimizerProviderFacts:
     request_failure_class: str | None = None
     request_failure_status_code: int | None = None
     response_validation_code: str | None = None
+    accounting_source: str | None = None
 
     def __post_init__(self) -> None:
         _positive_int(self.call_index, "optimizer provider call index")
@@ -548,6 +549,10 @@ class PitOptimizerProviderFacts:
             raise ValueError("optimizer response validation code is invalid")
         if type(self.response_schema_valid) is not bool or type(self.accounting_complete) is not bool:
             raise ValueError("optimizer provider validation/accounting facts are invalid")
+        if self.accounting_source not in {None, "inline", "generation_endpoint"}:
+            raise ValueError("optimizer accounting source is invalid")
+        if not self.accounting_complete and self.accounting_source is not None:
+            raise ValueError("incomplete optimizer accounting cannot name a source")
         if self.request_failure_class is not None and not (
             self.outcome == "uncertain_accounting"
             and self.request_started

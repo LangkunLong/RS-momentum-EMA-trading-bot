@@ -1533,7 +1533,7 @@ class ProviderCallRecord:
             elif (
                 self.outcome == "failed_before_send"
                 or not self.locally_accounted
-                or self.accounting_source != "inline"
+                or self.accounting_source not in {"inline", "generation_endpoint"}
             ):
                 raise ConfigurationError("optimizer authoritative accounting is not local")
         else:
@@ -1689,7 +1689,7 @@ class ProviderCallRecord:
             elif (
                 self.outcome == "failed_before_send"
                 or not self.locally_accounted
-                or self.accounting_source != "inline"
+                or self.accounting_source not in {"inline", "generation_endpoint"}
             ):
                 raise ConfigurationError(
                     "optimizer authoritative accounting is not local"
@@ -4221,7 +4221,7 @@ class OpenRouterGateway:
             total_tokens=facts.total_tokens,
             cost_usd=facts.cost_usd,
             accounting_source=(
-                "inline"
+                facts.accounting_source or "inline"
                 if facts.accounting_complete and facts.request_started
                 else None
             ),
@@ -4556,6 +4556,7 @@ class OpenRouterGateway:
             request_failure_class: str | None = None,
             request_failure_status_code: int | None = None,
             response_validation_code: str | None = None,
+            accounting_source: str | None = None,
         ) -> PitOptimizerProviderFacts:
             assert authorization_reservation is not None
             complete = usage is not None
@@ -4587,6 +4588,7 @@ class OpenRouterGateway:
                 request_failure_class=request_failure_class,
                 request_failure_status_code=request_failure_status_code,
                 response_validation_code=response_validation_code,
+                accounting_source=accounting_source,
             )
 
         def finalize(
@@ -4737,9 +4739,39 @@ class OpenRouterGateway:
                 if raw_finish_reason is not None
                 else "unknown"
             )
+            recovered_semantics_valid = True
             try:
                 usage = _usage_from_response(response, require_complete=True)
-            except (AccountingValidationError, ResponseValidationError) as exc:
+            except AccountingValidationError:
+                try:
+                    usage, recovered_semantics_valid = (
+                        self._recover_pit_optimizer_generation_usage_once(
+                            response,
+                            REASONER_MODEL,
+                            wall_deadline=float(wall_deadline),
+                            monotonic=monotonic,
+                        )
+                    )
+                except AccountingValidationError as recovery_exc:
+                    facts = provider_facts(
+                        outcome="uncertain_accounting",
+                        request_started=True,
+                        response_received=True,
+                        returned_model=returned_model,
+                        finish_reason=finish_reason,
+                        response_schema_valid=False,
+                        usage=None,
+                    )
+                    finalize(facts, Usage())
+                    raise AccountingValidationError(
+                        "optimizer response accounting is uncertain",
+                        code=recovery_exc.code,
+                        generation_attempts=recovery_exc.generation_attempts,
+                        recovery_usage_diagnostic=(
+                            recovery_exc.recovery_usage_diagnostic
+                        ),
+                    ) from recovery_exc
+            except ResponseValidationError as exc:
                 facts = provider_facts(
                     outcome="uncertain_accounting",
                     request_started=True,
@@ -4779,6 +4811,7 @@ class OpenRouterGateway:
                     finish_reason=finish_reason,
                     response_schema_valid=False,
                     usage=usage,
+                    accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage, terminal_code="budget_exhausted")
                 raise BudgetExceededError("optimizer per-call provider cap exceeded")
@@ -4788,6 +4821,11 @@ class OpenRouterGateway:
                 else None
             )
             try:
+                if not recovered_semantics_valid:
+                    raise ClosedResponseValidationError(
+                        "generation response semantics are not acceptable",
+                        ProtocolFailureCode.RESPONSE_SEMANTICS_INVALID,
+                    )
                 if (
                     not isinstance(content, str)
                     or len(content.encode("utf-8")) > plan_snapshot.max_response_bytes
@@ -4812,6 +4850,7 @@ class OpenRouterGateway:
                     finish_reason=finish_reason,
                     response_schema_valid=False,
                     usage=usage,
+                    accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
                 raise
@@ -4830,6 +4869,7 @@ class OpenRouterGateway:
                     response_schema_valid=False,
                     usage=usage,
                     response_validation_code=response_validation_code,
+                    accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
                 raise ResponseValidationError(
@@ -4852,6 +4892,7 @@ class OpenRouterGateway:
                     response_validation_code=(
                         ProtocolFailureCode.VALIDATOR_BOUNDARY_INVALID.value
                     ),
+                    accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
                 raise ResponseValidationError(
@@ -4871,6 +4912,7 @@ class OpenRouterGateway:
                     response_validation_code=(
                         ProtocolFailureCode.PAYLOAD_FIELD_INVALID.value
                     ),
+                    accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
                 raise ResponseValidationError(
@@ -4884,6 +4926,7 @@ class OpenRouterGateway:
                 finish_reason=finish_reason,
                 response_schema_valid=True,
                 usage=usage,
+                accounting_source=usage.accounting_source,
             )
             payload_digest = hashlib.sha256(
                 completion.payload.canonical_json_bytes()
@@ -5239,6 +5282,97 @@ class OpenRouterGateway:
             )
             return usage, semantics_valid
         raise AssertionError("generation accounting retry loop exhausted")
+
+    def _recover_pit_optimizer_generation_usage_once(
+        self,
+        response: object,
+        expected_model: str,
+        *,
+        wall_deadline: float,
+        monotonic: Callable[[], float],
+    ) -> tuple[Usage, bool]:
+        """Fetch one authenticated receipt without issuing a second completion.
+
+        PIT canaries have an explicit zero-retry contract.  The generic gateway's
+        recovery helper is intentionally multi-polling, so it cannot be reused
+        here: this path permits exactly one bounded generation-record lookup for
+        the response already received, and never retries either request type.
+        """
+
+        generation_id = _safe_generation_id(response)
+        if self._generation_loader is None and not self._generation_loader_is_builtin:
+            raise AccountingValidationError(
+                "generation accounting recovery is unavailable",
+                code=AccountingFailureCode.RECOVERY_UNAVAILABLE,
+            )
+        remaining = _remaining_wall_seconds(wall_deadline, monotonic)
+        if remaining <= 0:
+            raise AccountingValidationError(
+                "generation accounting recovery reached the wall deadline",
+                code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
+                generation_attempts=0,
+            )
+        try:
+            payload = (
+                self._load_generation_accounting(
+                    generation_id,
+                    timeout_seconds=remaining,
+                )
+                if self._generation_loader_is_builtin
+                else self._generation_loader(generation_id)  # type: ignore[misc]
+            )
+        except GatewayError as exc:
+            raise AccountingValidationError(
+                "generation accounting recovery failed",
+                code=(
+                    AccountingFailureCode.RECOVERY_HTTP_TERMINAL
+                    if type(exc.status_code) is int
+                    else AccountingFailureCode.RECOVERY_TRANSPORT_FAILED
+                ),
+                generation_attempts=1,
+            ) from exc
+        except AccountingValidationError as exc:
+            loader_validation_codes = {
+                AccountingFailureCode.RECOVERY_PAYLOAD_INVALID,
+                AccountingFailureCode.RECOVERY_IDENTITY_INVALID,
+                AccountingFailureCode.RECOVERY_USAGE_INVALID,
+            }
+            recovery_code = (
+                exc.code
+                if exc.code in loader_validation_codes
+                else AccountingFailureCode.RECOVERY_PAYLOAD_INVALID
+            )
+            recovery_usage_diagnostic = (
+                exc.recovery_usage_diagnostic
+                if recovery_code is AccountingFailureCode.RECOVERY_USAGE_INVALID
+                else None
+            )
+            raise AccountingValidationError(
+                "generation accounting loader failed validation",
+                code=recovery_code,
+                generation_attempts=1,
+                recovery_usage_diagnostic=recovery_usage_diagnostic,
+            ) from exc
+        try:
+            usage = _usage_from_generation_record(
+                payload,
+                generation_id=generation_id,
+            )
+        except AccountingValidationError as exc:
+            raise AccountingValidationError(
+                "generation accounting record failed validation",
+                code=exc.code,
+                generation_attempts=1,
+                recovery_usage_diagnostic=exc.recovery_usage_diagnostic,
+            ) from exc
+        data = payload["data"]
+        assert isinstance(data, Mapping)
+        semantics_valid = (
+            data.get("model") == expected_model
+            and data.get("finish_reason") == "stop"
+            and data.get("cancelled") is False
+        )
+        return usage, semantics_valid
 
     def _request_with_retries(
         self,
@@ -13467,6 +13601,7 @@ class AuditTrail:
             request_failure_class=record.request_failure_class,
             request_failure_status_code=record.request_failure_status_code,
             response_validation_code=record.response_validation_code,
+            accounting_source=record.accounting_source,
         )
 
     @staticmethod
