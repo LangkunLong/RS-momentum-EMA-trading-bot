@@ -737,24 +737,18 @@ class PitOptimizerRunManifest(_V2Canonical):
         )
         if total_tokens > self.authorization_requirement.max_tokens:
             raise ValueError("optimizer tokens exceed authorization")
-        if (
-            total_tokens != 448_000
-            or self.authorization_requirement.max_tokens != 448_000
-        ):
-            if total_tokens == self.authorization_requirement.max_tokens:
-                raise ValueError("first subset canary tokens must be exactly 448000")
         if total_tokens != self.authorization_requirement.max_tokens:
             raise ValueError("optimizer tokens must exactly consume authorization")
-        _require_first_call_plan(
+        _require_subset_canary_call_plan(
             self.call_budgets,
             max_iterations=self.max_iterations,
         )
         if (
-            self.authorization_requirement.max_calls != 6
-            or self.authorization_requirement.max_tokens != 448_000
+            self.authorization_requirement.max_calls != len(self.call_budgets)
+            or self.authorization_requirement.max_tokens != total_tokens
         ):
             raise ValueError(
-                "first subset canary authorization limits are invalid"
+                "subset canary authorization limits are invalid"
             )
 
     @property
@@ -1140,18 +1134,33 @@ def _source_bundle_envelope_bytes(
     return initial_bytes, envelope_bytes
 
 
-def _require_first_call_plan(
+def _require_subset_canary_call_plan(
     call_budgets: tuple[PitOptimizerCallBudget, ...],
     *,
     max_iterations: int,
 ) -> None:
-    expected_profile = {
+    """Require one of the explicitly bounded subset-canary profiles.
+
+    The single-iteration profile exercises every optimizer role and its local
+    candidate/evaluation path before a second round of model work is allowed.
+    """
+
+    fast_e2e_profile = {
+        "investigator": (8_000, 78_000, 86_000, 8_000, 8 * 1024),
+        "author": (12_000, 48_500, 72_000, 8_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
+    }
+    extended_profile = {
         "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
         "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
         "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
-    if max_iterations != 2 or len(call_budgets) != 6:
-        raise ValueError("first subset canary requires two complete iterations")
+    if (max_iterations, len(call_budgets)) == (1, 3):
+        expected_profile = fast_e2e_profile
+    elif (max_iterations, len(call_budgets)) == (2, 6):
+        expected_profile = extended_profile
+    else:
+        raise ValueError("subset canary iteration profile is unsupported")
     for budget in call_budgets:
         actual = (
             budget.max_static_input_bytes,
@@ -1163,7 +1172,7 @@ def _require_first_call_plan(
         if budget.model != PIT_OPTIMIZER_R1_MODEL or actual != expected_profile.get(
             budget.role
         ):
-            raise ValueError("first subset canary call caps are invalid")
+            raise ValueError("subset canary call caps are invalid")
 
 
 def build_subset_manifest(
@@ -1325,7 +1334,7 @@ def build_subset_manifest(
         not isinstance(item, PitOptimizerCallBudget) for item in call_budgets
     ):
         raise ValueError("optimizer call budgets are invalid")
-    _require_first_call_plan(call_budgets, max_iterations=max_iterations)
+    _require_subset_canary_call_plan(call_budgets, max_iterations=max_iterations)
     constraint_ids_value = legacy_readiness.get("invariant_ids")
     if not isinstance(constraint_ids_value, list):
         raise ValueError("legacy readiness invariant IDs are absent")
@@ -1359,8 +1368,11 @@ def build_subset_manifest(
     )
     authorization = AuthorizationRequirement(
         window_id=f"window_{uuid.uuid4().hex}",
-        max_calls=6,
-        max_tokens=448_000,
+        max_calls=len(call_budgets),
+        max_tokens=sum(
+            item.max_input_tokens + item.max_output_tokens
+            for item in call_budgets
+        ),
         policy_source_scope_sha256=scope.sha256,
         provider_retries=0,
         apply=False,
@@ -1508,11 +1520,11 @@ def build_prepare_command(
         "--optimizer-authorization-requirement-sha256",
         manifest.authorization_requirement.sha256,
         "--max-api-calls",
-        "6",
+        str(manifest.authorization_requirement.max_calls),
         "--max-tokens",
-        "448000",
+        str(manifest.authorization_requirement.max_tokens),
         "--max-iterations",
-        "2",
+        str(manifest.max_iterations),
     ]
     return render_pit_optimizer_v3_command(arguments)
 
@@ -3251,6 +3263,10 @@ def render_worst_iteration_two_role_inputs(
     _v2_string_tuple(immutable_constraint_ids, "worst role immutable constraints")
     if tuple(source_texts) != scope.editable_paths:
         raise ValueError("worst role source paths differ from scope")
+    if scope.max_iterations == 1:
+        if any(budget.iteration != 1 for budget in call_budgets):
+            raise ValueError("single-iteration call plan contains a later iteration")
+        return MappingProxyType({})
     if prospective_source_bundle is None:
         grown_texts = dict(source_texts)
         worst_raw_text = _v2_max_canonical_text(

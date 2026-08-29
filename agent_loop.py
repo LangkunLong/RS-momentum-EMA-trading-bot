@@ -98,6 +98,8 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CALLS = 30
 DEFAULT_MAX_TOKENS = 131_072
 MAX_CHILD_TIMEOUT_SECONDS = 7_200
+PIT_OPTIMIZER_MIN_API_TIMEOUT_SECONDS = 600.0
+PIT_OPTIMIZER_MIN_WALL_TIMEOUT_SECONDS = 7_200.0
 MAX_PROPOSAL_SAMPLES = 50
 MAX_BATCH_CALLS = 150
 MAX_BATCH_TOKENS = 2_000_000
@@ -18861,7 +18863,7 @@ def _preauthorize_pit_optimizer_v3_live_run(
     plans = tuple(manifest.call_budgets)
     if (
         manifest.model != PIT_OPTIMIZER_R1_MODEL
-        or len(plans) != 6
+        or len(plans) != 3 * manifest.max_iterations
         or any(plan.model != PIT_OPTIMIZER_R1_MODEL for plan in plans)
     ):
         raise ConfigurationError("PIT optimizer live call plan is invalid")
@@ -20093,13 +20095,26 @@ def _build_cli_config(
         gate = _build_pit_optimizer_v3_config(namespace)
     limits: LoopLimits | PitOptimizerLoopLimits
     if namespace.gate == "pit_optimizer":
+        # DeepSeek R1 is a mandatory-reasoning model.  A short generic HTTP
+        # idle timeout can outlive a partial proxy response yet still abort
+        # before a complete, accountably usable completion arrives.  Keep the
+        # provider one-shot/no-retry rule, but give the bounded optimizer
+        # profile a realistic request and controller window.
+        api_timeout_seconds = max(
+            namespace.api_timeout_seconds,
+            PIT_OPTIMIZER_MIN_API_TIMEOUT_SECONDS,
+        )
+        wall_timeout_seconds = max(
+            namespace.wall_timeout_seconds,
+            PIT_OPTIMIZER_MIN_WALL_TIMEOUT_SECONDS,
+        )
         limits = PitOptimizerLoopLimits(
             max_iterations=namespace.max_iterations,
             max_api_calls=max_api_calls,
             max_tokens=namespace.max_tokens,
-            api_timeout_seconds=namespace.api_timeout_seconds,
+            api_timeout_seconds=api_timeout_seconds,
             child_timeout_seconds=namespace.child_timeout_seconds,
-            wall_timeout_seconds=namespace.wall_timeout_seconds,
+            wall_timeout_seconds=wall_timeout_seconds,
             output_limit_bytes=namespace.output_limit_bytes,
         )
     else:
@@ -21254,9 +21269,9 @@ def _pit_optimizer_v3_prepare_lines(
         )
     authorization = manifest.authorization_requirement
     if (
-        config.max_api_calls != 6
-        or config.max_tokens != 448_000
-        or config.max_iterations != 2
+        config.max_api_calls != authorization.max_calls
+        or config.max_tokens != authorization.max_tokens
+        or config.max_iterations != manifest.max_iterations
         or limits.max_api_calls != config.max_api_calls
         or limits.max_tokens != config.max_tokens
         or limits.max_iterations != config.max_iterations
