@@ -48,6 +48,13 @@ OPTIMIZER_V2_ROLES = ("investigator", "author", "critic")
 PIT_OPTIMIZER_R1_MODEL = "deepseek/deepseek-r1"
 MAX_ROLE_TEXT_BYTES = 4 * 1024
 MAX_ROLE_LIST_ITEMS = 16
+# Provider-facing investigator output is intentionally smaller than the broad
+# controller-context limits above.  Those bounds are sized for authenticated
+# local artifacts; model output must fit the investigator's 8 KiB artifact
+# envelope before it reaches the local parser.
+MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS = 4
+MAX_INVESTIGATOR_RATIONALE_CHARS = 256
+MAX_INVESTIGATOR_LIST_ITEM_CHARS = 96
 MAX_AUTHOR_DIFF_BYTES = 64 * 1024
 MAX_POLICY_SOURCE_BUNDLE_BYTES = 64 * 1024
 MAX_DISCOVERY_EVIDENCE_BYTES = 8 * 1024
@@ -127,23 +134,30 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "You are the PIT optimizer investigator. Use only the supplied bounded source, "
             "rules, aggregate discovery evidence, incumbent summary, and prior summaries. "
             "Return one compact strict schema-v2 investigator object, JSON only: no markdown, "
-            "chain-of-thought, or extra keys. Keep every text value concise (under 512 bytes), "
-            "use at most four items per list, copy evidence IDs and editable paths/symbols "
-            "verbatim from the supplied input, and keep the whole object under 8 KiB. Never "
-            "request hidden data, credentials, local paths, raw trades, holdings, or provider "
-            "audit material."
+            "chain-of-thought, or extra keys. The response schema is authoritative: use at most "
+            "four items per list, copy evidence IDs and editable paths/symbols verbatim from the "
+            "supplied input, keep causal_rationale to 256 characters, and keep each diagnostic, "
+            "risk, and author-instruction item to 96 characters. Make the object compact enough "
+            "for the 8 KiB envelope. Never request hidden data, credentials, local paths, raw "
+            "trades, holdings, or provider audit material."
         ),
         "author": (
             "You are the PIT optimizer author. Implement only the supplied investigator "
             "hypothesis within the immutable constraints and patch bounds. Return one strict "
-            "schema-v2 author object containing a unified diff; do not execute code or access "
-            "hidden data, credentials, local paths, or unrelated source."
+            "schema-v2 author object containing a unified diff; the response schema is "
+            "authoritative. Copy changed paths and symbols verbatim from the supplied scope, use "
+            "at most four assumption or validation-suggestion items, keep every such item to 96 "
+            "characters and behavioral_summary to 256 characters, and keep unified_diff within "
+            "the supplied candidate diff bound. Do not execute code or access hidden data, "
+            "credentials, local paths, or unrelated source."
         ),
         "critic": (
             "You are the PIT optimizer critic. Analyze only the supplied sanitized validation "
-            "and aggregate discovery comparisons. Return one strict schema-v2 advisory object. "
-            "You cannot accept a candidate and must not request hidden results, credentials, "
-            "local paths, raw trades, holdings, or provider audit material."
+            "and aggregate discovery comparisons. Return one strict schema-v2 advisory object; "
+            "the response schema is authoritative. Copy at most four evidence IDs verbatim from "
+            "the supplied aggregates and keep every free-text field to 256 characters. You cannot "
+            "accept a candidate and must not request hidden results, credentials, local paths, "
+            "raw trades, holdings, or provider audit material."
         ),
     }
 )
@@ -3451,17 +3465,101 @@ def render_worst_iteration_two_role_inputs(
     return MappingProxyType(rendered)
 
 
-def _v2_string_schema() -> dict[str, object]:
-    return {"type": "string", "maxLength": MAX_ROLE_TEXT_BYTES}
+def _v2_string_schema(
+    *,
+    max_length: int = MAX_ROLE_TEXT_BYTES,
+    min_length: int | None = None,
+    pattern: str | None = None,
+    description: str | None = None,
+) -> dict[str, object]:
+    """Build a provider-facing string schema with explicit compact bounds."""
+
+    if type(max_length) is not int or max_length < 1:
+        raise ValueError("response schema string maximum is invalid")
+    if min_length is not None and (
+        type(min_length) is not int or min_length < 0 or min_length > max_length
+    ):
+        raise ValueError("response schema string minimum is invalid")
+    value: dict[str, object] = {"type": "string", "maxLength": max_length}
+    if min_length is not None:
+        value["minLength"] = min_length
+    if pattern is not None:
+        value["pattern"] = pattern
+    if description is not None:
+        value["description"] = description
+    return value
 
 
-def _v2_list_schema() -> dict[str, object]:
-    return {
+def _v2_list_schema(
+    *,
+    max_items: int = MAX_ROLE_LIST_ITEMS,
+    min_items: int | None = None,
+    items: dict[str, object] | None = None,
+    description: str | None = None,
+) -> dict[str, object]:
+    """Build a provider-facing unique-list schema with explicit item bounds."""
+
+    if type(max_items) is not int or max_items < 1:
+        raise ValueError("response schema list maximum is invalid")
+    if min_items is not None and (
+        type(min_items) is not int or min_items < 0 or min_items > max_items
+    ):
+        raise ValueError("response schema list minimum is invalid")
+    value: dict[str, object] = {
         "type": "array",
-        "maxItems": MAX_ROLE_LIST_ITEMS,
+        "maxItems": max_items,
         "uniqueItems": True,
-        "items": _v2_string_schema(),
+        "items": items or _v2_string_schema(),
     }
+    if min_items is not None:
+        value["minItems"] = min_items
+    if description is not None:
+        value["description"] = description
+    return value
+
+
+def _v2_identifier_schema(description: str) -> dict[str, object]:
+    return _v2_string_schema(
+        max_length=128,
+        min_length=1,
+        pattern=r"^[a-z][a-z0-9_.-]{0,127}$",
+        description=description,
+    )
+
+
+def _v2_compact_text_list_schema(
+    description: str,
+    *,
+    allow_empty: bool = False,
+) -> dict[str, object]:
+    return _v2_list_schema(
+        max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
+        min_items=0 if allow_empty else 1,
+        items=_v2_string_schema(
+            max_length=MAX_INVESTIGATOR_LIST_ITEM_CHARS,
+            min_length=1,
+            description="One concise controller-safe item.",
+        ),
+        description=description,
+    )
+
+
+def _v2_scoped_name_list_schema(
+    names: tuple[str, ...],
+    description: str,
+    *,
+    max_items: int = MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
+) -> dict[str, object]:
+    return _v2_list_schema(
+        max_items=max_items,
+        min_items=1,
+        items={
+            "type": "string",
+            "enum": list(names),
+            "description": "One value copied verbatim from the supplied scope.",
+        },
+        description=description,
+    )
 
 
 _V2_RESPONSE_SCHEMAS = MappingProxyType(
@@ -3481,15 +3579,53 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                 "author_instructions",
             ],
             "properties": {
-                "hypothesis_id": _v2_string_schema(),
-                "family": {"type": "string", "enum": list(_INVESTIGATOR_FAMILIES)},
-                "evidence_ids": _v2_list_schema(),
-                "causal_rationale": _v2_string_schema(),
-                "target_paths": _v2_list_schema(),
-                "target_symbols": _v2_list_schema(),
-                "expected_diagnostic_changes": _v2_list_schema(),
-                "known_risks": _v2_list_schema(),
-                "author_instructions": _v2_list_schema(),
+                "hypothesis_id": _v2_identifier_schema(
+                    "A stable lower-case identifier for this hypothesis."
+                ),
+                "family": {
+                    "type": "string",
+                    "enum": list(_INVESTIGATOR_FAMILIES),
+                    "description": "The one editable strategy family to investigate.",
+                },
+                "evidence_ids": _v2_list_schema(
+                    max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
+                    min_items=1,
+                    items=_v2_identifier_schema(
+                        "An evidence ID copied verbatim from the supplied aggregate evidence."
+                    ),
+                    description="Unique aggregate-evidence IDs supporting the hypothesis.",
+                ),
+                "causal_rationale": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                    description="A concise causal explanation grounded in the supplied aggregates.",
+                ),
+                "target_paths": _v2_scoped_name_list_schema(
+                    _POLICY_EDITABLE_PATHS,
+                    "Editable policy paths selected from the supplied source scope.",
+                ),
+                "target_symbols": _v2_scoped_name_list_schema(
+                    tuple(
+                        sorted(
+                            {
+                                symbol
+                                for symbols in _POLICY_DECLARED_SYMBOLS.values()
+                                for symbol in symbols
+                            }
+                        )
+                    ),
+                    "Declared policy symbols selected from the supplied source scope.",
+                ),
+                "expected_diagnostic_changes": _v2_compact_text_list_schema(
+                    "Concrete aggregate diagnostics expected to change if the hypothesis is right."
+                ),
+                "known_risks": _v2_compact_text_list_schema(
+                    "Known aggregate-only risks; use an empty list when none apply.",
+                    allow_empty=True,
+                ),
+                "author_instructions": _v2_compact_text_list_schema(
+                    "Bounded implementation instructions for the author role."
+                ),
             },
         },
         "author": {
@@ -3505,16 +3641,47 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                 "validation_suggestions",
             ],
             "properties": {
-                "hypothesis_id": _v2_string_schema(),
-                "behavioral_summary": _v2_string_schema(),
-                "changed_paths": _v2_list_schema(),
-                "changed_symbols": _v2_list_schema(),
+                "hypothesis_id": _v2_identifier_schema(
+                    "The investigator hypothesis ID copied verbatim."
+                ),
+                "behavioral_summary": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                    description="A concise summary of the resulting policy behavior.",
+                ),
+                "changed_paths": _v2_scoped_name_list_schema(
+                    _POLICY_EDITABLE_PATHS,
+                    "Editable paths changed by unified_diff.",
+                    max_items=3,
+                ),
+                "changed_symbols": _v2_scoped_name_list_schema(
+                    tuple(
+                        sorted(
+                            {
+                                symbol
+                                for symbols in _POLICY_DECLARED_SYMBOLS.values()
+                                for symbol in symbols
+                            }
+                        )
+                    ),
+                    "Declared symbols changed by unified_diff.",
+                ),
                 "unified_diff": {
                     "type": "string",
                     "maxLength": MAX_AUTHOR_DIFF_BYTES,
+                    "minLength": 1,
+                    "description": (
+                        "A unified diff limited by the supplied candidate_bounds.max_diff_bytes."
+                    ),
                 },
-                "assumptions": _v2_list_schema(),
-                "validation_suggestions": _v2_list_schema(),
+                "assumptions": _v2_compact_text_list_schema(
+                    "Optional bounded assumptions; use an empty list when none apply.",
+                    allow_empty=True,
+                ),
+                "validation_suggestions": _v2_compact_text_list_schema(
+                    "Optional bounded validation checks; use an empty list when none apply.",
+                    allow_empty=True,
+                ),
             },
         },
         "critic": {
@@ -3529,15 +3696,37 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                 "next_direction",
             ],
             "properties": {
-                "hypothesis_id": _v2_string_schema(),
-                "prediction_vs_observation": _v2_string_schema(),
-                "causal_explanation": _v2_string_schema(),
-                "evidence_ids": _v2_list_schema(),
+                "hypothesis_id": _v2_identifier_schema(
+                    "The investigator hypothesis ID copied verbatim."
+                ),
+                "prediction_vs_observation": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                    description="A concise comparison of the prediction and observed aggregates.",
+                ),
+                "causal_explanation": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                    description="A concise causal explanation grounded in the supplied aggregates.",
+                ),
+                "evidence_ids": _v2_list_schema(
+                    max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
+                    min_items=1,
+                    items=_v2_identifier_schema(
+                        "An evidence ID copied verbatim from the supplied aggregate evidence."
+                    ),
+                    description="Unique aggregate-evidence IDs supporting the critique.",
+                ),
                 "disposition": {
                     "type": "string",
                     "enum": list(_CRITIC_DISPOSITIONS),
+                    "description": "The controller-safe advisory disposition.",
                 },
-                "next_direction": _v2_string_schema(),
+                "next_direction": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                    description="One concise aggregate-only next direction.",
+                ),
             },
         },
     }
