@@ -1970,6 +1970,11 @@ class AuthorizationLedger:
         closed_leases: set[str] = set()
         charged_by_lease: dict[str, tuple[int, int]] = {}
         overage_leases: set[str] = set()
+        reconciliations_by_lease: dict[
+            str,
+            list[tuple[AuthorizationCallReservation, PitOptimizerProviderFacts]],
+        ] = {}
+        pending_terminal_closes: dict[str, frozenset[str]] = {}
         gateway_lifecycles: dict[str, list[dict[str, object]]] = {}
         for index, line in enumerate(raw.splitlines(keepends=True), start=1):
             try:
@@ -1995,6 +2000,19 @@ class AuthorizationLedger:
             if digest != self._record_digest(value):
                 raise AuthorizationError("authorization ledger record digest differs")
             record_type = value.get("record_type")
+            if pending_terminal_closes:
+                if len(pending_terminal_closes) != 1:
+                    raise AuthorizationError(
+                        "authorization terminal reconciliation state is ambiguous"
+                    )
+                pending_lease_id = next(iter(pending_terminal_closes))
+                if (
+                    record_type != "lease_close"
+                    or value.get("lease_id") != pending_lease_id
+                ):
+                    raise AuthorizationError(
+                        "authorization terminal reconciliation is not closed"
+                    )
             expected_common = {
                 "schema_version",
                 "record_type",
@@ -2439,6 +2457,7 @@ class AuthorizationLedger:
                     or total_tokens > lease.max_tokens
                 ):
                     overage_leases.add(lease_id)
+                resource_overage = lease_id in overage_leases
                 terminal_commitment = value.get("gateway_terminal")
                 if terminal_commitment is not None:
                     if (
@@ -2467,6 +2486,32 @@ class AuthorizationLedger:
                         raise AuthorizationError(
                             "authorization gateway terminal audit commitment differs"
                         )
+                reconciliations_by_lease.setdefault(lease_id, []).append(
+                    (reservation, facts)
+                )
+                receipt_terminal_code = (
+                    replayed_receipt.terminal_code
+                    if terminal_audit_receipt is not None
+                    else None
+                )
+                if resource_overage:
+                    if receipt_terminal_code not in {None, "budget_exhausted"}:
+                        raise AuthorizationError(
+                            "authorization resource overage terminal receipt differs"
+                        )
+                    pending_terminal_closes[lease_id] = frozenset(
+                        {"budget_exhausted"}
+                    )
+                elif receipt_terminal_code is not None:
+                    pending_terminal_closes[lease_id] = frozenset(
+                        {receipt_terminal_code}
+                    )
+                elif facts.outcome != "accepted":
+                    # Without a terminal receipt, an explicit caller-supplied
+                    # failed/cancelled/budget code is not otherwise persisted.
+                    pending_terminal_closes[lease_id] = frozenset(
+                        {"failed", "cancelled", "budget_exhausted"}
+                    )
                 del active_reservations[lease_id]
                 reconciled_reservations.add(reservation.reservation_id)
             elif record_type == "lease_close":
@@ -2490,6 +2535,45 @@ class AuthorizationLedger:
                     raise AuthorizationError(
                         "authorization resource overage is not fail-closed"
                     )
+                expected_terminal_codes = pending_terminal_closes.get(str(lease_id))
+                if (
+                    expected_terminal_codes is not None
+                    and terminal_code not in expected_terminal_codes
+                ):
+                    raise AuthorizationError(
+                        "authorization terminal reconciliation close differs"
+                    )
+                if terminal_code in {"completed", "early_stop"}:
+                    reconciliations = reconciliations_by_lease.get(str(lease_id), [])
+                    for offset, (reservation, facts) in enumerate(reconciliations):
+                        if offset >= len(self._call_plan_snapshots):
+                            raise AuthorizationError(
+                                "authorization completed plan has excess calls"
+                            )
+                        plan = self._call_plan_snapshots[offset]
+                        if (
+                            reservation.call_index,
+                            reservation.iteration,
+                            reservation.role,
+                        ) != (plan.call_index, plan.iteration, plan.role) or not (
+                            self._provider_facts_accept_plan(facts, plan)
+                        ):
+                            raise AuthorizationError(
+                                "authorization completed plan has a non-accepted call"
+                            )
+                    if terminal_code == "completed" and len(reconciliations) != len(
+                        self._call_plan_snapshots
+                    ):
+                        raise AuthorizationError(
+                            "authorization completed lease requires the exact call plan"
+                        )
+                    if terminal_code == "early_stop" and not (
+                        0 < len(reconciliations) < len(self._call_plan_snapshots)
+                    ):
+                        raise AuthorizationError(
+                            "authorization early stop requires an accepted partial plan"
+                        )
+                pending_terminal_closes.pop(str(lease_id), None)
                 closed_leases.add(str(lease_id))
             else:
                 raise AuthorizationError("authorization ledger record type is invalid")
@@ -2510,6 +2594,10 @@ class AuthorizationLedger:
         if not overage_leases.issubset(closed_leases):
             raise AuthorizationError(
                 "authorization resource overage has an open lease"
+            )
+        if pending_terminal_closes:
+            raise AuthorizationError(
+                "authorization terminal reconciliation is not closed"
             )
         return records
 
@@ -3114,6 +3202,22 @@ class AuthorizationLedger:
             return "budget_exhausted"
         return "failed"
 
+    @staticmethod
+    def _provider_facts_accept_plan(
+        facts: PitOptimizerProviderFacts,
+        plan: PitOptimizerCallBudget,
+    ) -> bool:
+        return (
+            facts.outcome == "accepted"
+            and facts.request_started
+            and facts.response_received
+            and facts.finish_reason == "stop"
+            and facts.returned_model == plan.model
+            and facts.requested_model == plan.model
+            and facts.response_schema_valid
+            and facts.accounting_complete
+        )
+
     def _verify_reconciliation_records(
         self,
         records: Sequence[dict[str, object]],
@@ -3468,7 +3572,6 @@ class AuthorizationLedger:
             and provider_facts.request_started
             and provider_facts.total_tokens is not None
             and provider_facts.total_tokens > reservation.reserved_tokens
-            and effective_terminal_code is None
         ):
             terminal_code = "budget_exhausted"
             effective_terminal_code = "budget_exhausted"
@@ -3705,6 +3808,19 @@ class AuthorizationLedger:
     ) -> None:
         """Verify the exact durable postcondition after an interrupted publication."""
 
+        if not isinstance(reservation, AuthorizationCallReservation) or not isinstance(
+            provider_facts, PitOptimizerProviderFacts
+        ):
+            raise AuthorizationError(
+                "authorization reconciliation verification contracts are invalid"
+            )
+        if (
+            provider_facts.accounting_complete
+            and provider_facts.request_started
+            and provider_facts.total_tokens is not None
+            and provider_facts.total_tokens > reservation.reserved_tokens
+        ):
+            terminal_code = "budget_exhausted"
         if self._audit_trail is not None and terminal_audit_receipt is None:
             raise AuthorizationError(
                 "authorization terminal audit receipt is required"
@@ -3901,16 +4017,7 @@ class AuthorizationLedger:
                             "authorization provider facts are invalid"
                         )
                     facts = PitOptimizerProviderFacts(**facts_primitive)
-                    if not (
-                        facts.outcome == "accepted"
-                        and facts.request_started
-                        and facts.response_received
-                        and facts.finish_reason == "stop"
-                        and facts.returned_model == plan.model
-                        and facts.requested_model == plan.model
-                        and facts.response_schema_valid
-                        and facts.accounting_complete
-                    ):
+                    if not self._provider_facts_accept_plan(facts, plan):
                         raise AuthorizationError(
                             "authorization completed plan has a non-accepted call"
                         )
