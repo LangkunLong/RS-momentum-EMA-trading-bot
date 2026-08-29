@@ -1835,8 +1835,8 @@ class AuthorizationLedger:
         """Durably bind one gateway-owned reserved/started transition."""
 
         from agent_loop import (
-            BudgetLedger,
             OpenRouterGateway,
+            PitOptimizerResourceLedger,
             _PitOptimizerGatewayLifecycle,
         )
 
@@ -1860,8 +1860,10 @@ class AuthorizationLedger:
             raise AuthorizationError(
                 "authorization gateway lifecycle reservation is invalid"
             )
-        budget_primitive = BudgetLedger._pit_optimizer_reservation_primitive(
-            lifecycle.budget_reservation
+        budget_primitive = (
+            PitOptimizerResourceLedger._pit_optimizer_reservation_primitive(
+                lifecycle.budget_reservation
+            )
         )
         commitment = {
             "authorization_reservation_id": reservation.reservation_id,

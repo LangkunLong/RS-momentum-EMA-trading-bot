@@ -66,7 +66,7 @@ if TYPE_CHECKING:
         AuthorizationCallReservation,
         AuthorizationLedger,
         AuthorizationRunLease,
-        FrozenModelPricing,
+        OptimizerPricingSnapshot,
         PitOptimizerProviderFacts,
         PitOptimizerRoleCall,
         TerminalAuditReceipt,
@@ -1193,11 +1193,12 @@ class ProviderCallRecord:
     maximum_exposure_usd: float | None = None
     maximum_exposure_tokens: int | None = None
     exposure_basis: str | None = None
-    ledger_snapshot: BudgetSnapshot | None = None
+    ledger_snapshot: BudgetSnapshot | PitOptimizerResourceSnapshot | None = None
     frozen_pricing_sha256: str | None = None
+    pricing_snapshot_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 2}:
+        if self.schema_version not in {1, 2, 3}:
             raise ConfigurationError("provider call schema version is invalid")
         if type(self.call_index) is not int or self.call_index < 1:
             raise ConfigurationError("provider call index must be positive")
@@ -1211,9 +1212,9 @@ class ProviderCallRecord:
             if self.role not in legacy_roles:
                 raise ConfigurationError("version 1 provider call role is invalid")
             allowed_outcomes = {"accepted", "protocol_invalid", "budget_exceeded"}
-        elif self.role in legacy_roles:
+        elif self.schema_version == 2 and self.role in legacy_roles:
             allowed_outcomes = {"failed"}
-        else:
+        elif self.role in optimizer_roles:
             allowed_outcomes = {
                 "accepted",
                 "schema_invalid",
@@ -1222,6 +1223,8 @@ class ProviderCallRecord:
                 "uncertain_accounting",
                 "provider_failed",
             }
+        else:
+            raise ConfigurationError("version 3 provider call role is invalid")
         if self.api_backend != "openrouter" or self.outcome not in allowed_outcomes:
             raise ConfigurationError("provider call backend/outcome is invalid")
         if self.finish_reason not in {"stop", "non_stop", "unknown"}:
@@ -1239,10 +1242,16 @@ class ProviderCallRecord:
         if self.schema_version == 2 and self.role in optimizer_roles:
             self._validate_optimizer_record()
             return
+        if self.schema_version == 3:
+            self._validate_optimizer_resource_record()
+            return
         if self.schema_version == 2:
             self._validate_failure_record()
             return
-        if self.frozen_pricing_sha256 is not None:
+        if (
+            self.frozen_pricing_sha256 is not None
+            or self.pricing_snapshot_sha256 is not None
+        ):
             raise ConfigurationError("version 1 provider call has optimizer pricing")
         if self.accounting_complete is not True:
             raise ConfigurationError("provider call must have complete validated accounting")
@@ -1305,7 +1314,10 @@ class ProviderCallRecord:
             raise ConfigurationError("provider call token total is inconsistent")
 
     def _validate_failure_record(self) -> None:
-        if self.frozen_pricing_sha256 is not None:
+        if (
+            self.frozen_pricing_sha256 is not None
+            or self.pricing_snapshot_sha256 is not None
+        ):
             raise ConfigurationError("legacy failed provider call has optimizer pricing")
         if not isinstance(self.failure_phase, PitProviderFailurePhase):
             raise ConfigurationError("failed provider call requires a closed phase")
@@ -1414,6 +1426,7 @@ class ProviderCallRecord:
         if (
             self.frozen_pricing_sha256 is None
             or _SHA256_RE.fullmatch(self.frozen_pricing_sha256) is None
+            or self.pricing_snapshot_sha256 is not None
         ):
             raise ConfigurationError("optimizer provider call requires frozen pricing")
         if (
@@ -1527,6 +1540,140 @@ class ProviderCallRecord:
         if self.outcome == "schema_invalid" and self.response_schema_valid:
             raise ConfigurationError("invalid optimizer response cannot be schema-valid")
 
+    def _validate_optimizer_resource_record(self) -> None:
+        """Validate schema-v3 optimizer accounting without any USD authority fields."""
+
+        if (
+            self.pricing_snapshot_sha256 is None
+            or _SHA256_RE.fullmatch(self.pricing_snapshot_sha256) is None
+            or self.frozen_pricing_sha256 is not None
+        ):
+            raise ConfigurationError(
+                "optimizer provider call requires a pricing snapshot"
+            )
+        if (
+            type(self.request_started) is not bool
+            or type(self.response_received) is not bool
+            or type(self.locally_accounted) is not bool
+            or type(self.authoritative_spend_known) is not bool
+            or not isinstance(
+                self.ledger_snapshot,
+                PitOptimizerResourceSnapshot,
+            )
+        ):
+            raise ConfigurationError("optimizer provider lifecycle facts are invalid")
+        if self.response_received and not self.request_started:
+            raise ConfigurationError("optimizer response cannot precede request start")
+        if self.failure_phase is not None or self.protocol_failure_code is not None:
+            raise ConfigurationError("optimizer provider record has legacy failure fields")
+        if self.accounting_complete is not self.authoritative_spend_known:
+            raise ConfigurationError("optimizer provider accounting completeness differs")
+        if (
+            self.maximum_exposure_usd is not None
+            or self.retained_reservation_usd is not None
+            or type(self.maximum_exposure_tokens) is not int
+            or self.maximum_exposure_tokens < 1
+        ):
+            raise ConfigurationError(
+                "optimizer provider resource exposure is invalid"
+            )
+        if self.accounting_complete:
+            if any(
+                value is None
+                for value in (
+                    self.prompt_tokens,
+                    self.completion_tokens,
+                    self.total_tokens,
+                    self.cost_usd,
+                )
+            ):
+                raise ConfigurationError("optimizer authoritative usage is incomplete")
+            assert self.prompt_tokens is not None
+            assert self.completion_tokens is not None
+            assert self.total_tokens is not None
+            assert self.cost_usd is not None
+            Usage(
+                prompt_tokens=self.prompt_tokens,
+                cached_tokens=self.cached_tokens,
+                completion_tokens=self.completion_tokens,
+                reasoning_tokens=self.reasoning_tokens,
+                total_tokens=self.total_tokens,
+                cost_usd=self.cost_usd,
+            )
+            if self.total_tokens != self.prompt_tokens + self.completion_tokens:
+                raise ConfigurationError(
+                    "optimizer provider token total is inconsistent"
+                )
+            if (
+                self.retained_reservation_tokens is not None
+                or self.exposure_basis != "authoritative"
+            ):
+                raise ConfigurationError(
+                    "optimizer authoritative exposure is inconsistent"
+                )
+            if not self.request_started:
+                if (
+                    self.outcome != "failed_before_send"
+                    or self.response_received
+                    or self.total_tokens != 0
+                    or self.cost_usd != 0
+                    or self.locally_accounted
+                    or self.accounting_source is not None
+                ):
+                    raise ConfigurationError(
+                        "optimizer before-send facts are inconsistent"
+                    )
+            elif (
+                self.outcome == "failed_before_send"
+                or not self.locally_accounted
+                or self.accounting_source != "inline"
+            ):
+                raise ConfigurationError(
+                    "optimizer authoritative accounting is not local"
+                )
+        else:
+            if self.outcome != "uncertain_accounting" or not self.request_started:
+                raise ConfigurationError(
+                    "optimizer incomplete accounting is inconsistent"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.prompt_tokens,
+                    self.cached_tokens,
+                    self.completion_tokens,
+                    self.reasoning_tokens,
+                    self.total_tokens,
+                    self.cost_usd,
+                    self.accounting_source,
+                )
+            ):
+                raise ConfigurationError("optimizer uncertain call claims exact usage")
+            if (
+                self.retained_reservation_tokens != self.maximum_exposure_tokens
+                or self.exposure_basis != "retained_reservation_tokens"
+            ):
+                raise ConfigurationError(
+                    "optimizer uncertain token reservation is inconsistent"
+                )
+        if self.outcome == "accepted" and not self.response_schema_valid:
+            raise ConfigurationError("accepted optimizer response must be schema-valid")
+        if self.outcome == "accepted" and not (
+            self.request_started
+            and self.response_received
+            and self.returned_model == self.requested_model
+            and self.finish_reason == "stop"
+            and self.response_schema_valid
+            and self.accounting_complete
+            and self.locally_accounted
+            and self.authoritative_spend_known
+        ):
+            raise ConfigurationError(
+                "accepted optimizer provider record is not fully closed"
+            )
+        if self.outcome == "schema_invalid" and self.response_schema_valid:
+            raise ConfigurationError("invalid optimizer response cannot be schema-valid")
+
 
 @dataclass(frozen=True)
 class Pricing:
@@ -1550,13 +1697,33 @@ class Pricing:
         return cls(prompt, completion)
 
 
+def _provider_call_record_primitive(
+    record: ProviderCallRecord,
+) -> dict[str, object]:
+    """Serialize legacy records unchanged and omit retired optimizer-v3 fields."""
+
+    primitive = asdict(record)
+    if record.schema_version == 3:
+        for retired in (
+            "protocol_failure_code",
+            "failure_phase",
+            "retained_reservation_usd",
+            "maximum_exposure_usd",
+            "frozen_pricing_sha256",
+        ):
+            primitive.pop(retired)
+    else:
+        primitive.pop("pricing_snapshot_sha256")
+    return primitive
+
+
 def freeze_pricing_record(
     model: str,
     value: Mapping[str, Any] | Pricing,
-) -> "FrozenModelPricing":
+) -> "OptimizerPricingSnapshot":
     """Normalize one provider price response into an immutable Decimal identity."""
 
-    from core.pit_optimizer_authorization import FrozenModelPricing
+    from core.pit_optimizer_authorization import OptimizerPricingSnapshot
 
     if isinstance(value, Pricing):
         raw_rates: tuple[object, object] = (
@@ -1603,10 +1770,10 @@ def freeze_pricing_record(
         exact_decimal(raw, allow_legacy_float=isinstance(value, Pricing))
         for raw in raw_rates
     )
-    return FrozenModelPricing.from_rates(
+    return OptimizerPricingSnapshot.available(
         model=model,
-        prompt_per_million=prompt,
-        completion_per_million=completion,
+        prompt=prompt,
+        completion=completion,
     )
 
 
@@ -1614,34 +1781,36 @@ def conservative_call_cost_usd(
     *,
     rendered_prompt_bytes: int,
     max_output_tokens: int,
-    pricing: "FrozenModelPricing",
-) -> Decimal:
+    pricing: "OptimizerPricingSnapshot",
+) -> Decimal | None:
     """Price the byte-as-token input bound and full output allowance exactly."""
 
-    from core.pit_optimizer_authorization import FrozenModelPricing
+    from core.pit_optimizer_authorization import OptimizerPricingSnapshot
 
     if (
         type(rendered_prompt_bytes) is not int
         or rendered_prompt_bytes < 0
         or type(max_output_tokens) is not int
         or max_output_tokens <= 0
-        or not isinstance(pricing, FrozenModelPricing)
+        or not isinstance(pricing, OptimizerPricingSnapshot)
     ):
         raise ConfigurationError("optimizer conservative pricing inputs are invalid")
     try:
-        snapshot = FrozenModelPricing.from_rates(
+        snapshot = OptimizerPricingSnapshot(
             model=pricing.model,
+            lookup_status=pricing.lookup_status,
             prompt_per_million=pricing.prompt_per_million,
             completion_per_million=pricing.completion_per_million,
+            pricing_payload_sha256=pricing.pricing_payload_sha256,
         )
     except (TypeError, ValueError) as exc:
         raise ConfigurationError("optimizer pricing snapshot is invalid") from exc
-    if snapshot.pricing_sha256 != pricing.pricing_sha256:
+    if snapshot != pricing:
         raise ConfigurationError("optimizer pricing snapshot digest differs")
-    return (
-        Decimal(rendered_prompt_bytes) * snapshot.prompt_per_million
-        + Decimal(max_output_tokens) * snapshot.completion_per_million
-    ) / Decimal(1_000_000)
+    return snapshot.projected_call_usd(
+        rendered_prompt_bytes,
+        max_output_tokens,
+    )
 
 
 def preflight_pit_optimizer_call(
@@ -1650,15 +1819,15 @@ def preflight_pit_optimizer_call(
     dynamic_bytes: bytes,
     call_budget: "PitOptimizerCallBudget",
     lease: "AuthorizationRunLease",
-    pricing: "FrozenModelPricing",
-) -> Decimal:
+    pricing: "OptimizerPricingSnapshot",
+) -> Decimal | None:
     """Validate the sealed optimizer call before any mutable or provider effect."""
 
     from core.pit_optimization_contract import PitOptimizerCallBudget
     from core.pit_optimizer_authorization import (
         AuthorizationError,
         AuthorizationRunLease,
-        FrozenModelPricing,
+        OptimizerPricingSnapshot,
     )
 
     if (
@@ -1666,23 +1835,39 @@ def preflight_pit_optimizer_call(
         or type(dynamic_bytes) is not bytes
         or not isinstance(call_budget, PitOptimizerCallBudget)
         or not isinstance(lease, AuthorizationRunLease)
-        or not isinstance(pricing, FrozenModelPricing)
+        or not isinstance(pricing, OptimizerPricingSnapshot)
     ):
         raise ConfigurationError("optimizer call preflight inputs are invalid")
     try:
-        pricing_snapshot = FrozenModelPricing.from_rates(
+        pricing_snapshot = OptimizerPricingSnapshot(
             model=pricing.model,
+            lookup_status=pricing.lookup_status,
             prompt_per_million=pricing.prompt_per_million,
             completion_per_million=pricing.completion_per_million,
+            pricing_payload_sha256=pricing.pricing_payload_sha256,
         )
     except (TypeError, ValueError) as exc:
-        raise AuthorizationError("frozen pricing snapshot is invalid") from exc
-    if pricing_snapshot.pricing_sha256 != pricing.pricing_sha256:
-        raise AuthorizationError("frozen pricing snapshot digest differs")
-    if call_budget.model != pricing_snapshot.model:
-        raise AuthorizationError("frozen pricing model mismatch")
-    if lease.frozen_pricing_sha256 != pricing_snapshot.pricing_sha256:
-        raise AuthorizationError("frozen pricing identity drift")
+        raise AuthorizationError("optimizer pricing snapshot is invalid") from exc
+    if pricing_snapshot != pricing:
+        raise AuthorizationError("optimizer pricing snapshot digest differs")
+    if (
+        call_budget.role not in {"investigator", "author", "critic"}
+        or call_budget.model != REASONER_MODEL
+        or call_budget.model != pricing_snapshot.model
+    ):
+        raise AuthorizationError("optimizer role/model plan identity differs")
+    if (
+        lease.pricing_snapshot_sha256
+        != pricing_snapshot.pricing_payload_sha256
+        or lease.pricing_status != pricing_snapshot.lookup_status
+    ):
+        raise AuthorizationError("optimizer pricing identity drift")
+    if (
+        call_budget.call_index > lease.max_calls
+        or call_budget.max_input_tokens + call_budget.max_output_tokens
+        > lease.max_tokens
+    ):
+        raise AuthorizationError("optimizer plan exceeds the run lease")
     if len(static_bytes) > call_budget.max_static_input_bytes:
         raise BudgetExceededError("static input byte cap exceeded")
     if len(dynamic_bytes) > call_budget.max_dynamic_input_bytes:
@@ -1690,14 +1875,11 @@ def preflight_pit_optimizer_call(
     prompt_bytes = len(static_bytes) + len(dynamic_bytes)
     if prompt_bytes > call_budget.max_input_tokens:
         raise BudgetExceededError("conservative input-token cap exceeded")
-    cost = conservative_call_cost_usd(
+    return conservative_call_cost_usd(
         rendered_prompt_bytes=prompt_bytes,
         max_output_tokens=call_budget.max_output_tokens,
         pricing=pricing_snapshot,
     )
-    if cost > Decimal(str(call_budget.max_usd)):
-        raise BudgetExceededError("per-call USD cap exceeded")
-    return cost
 
 
 @dataclass(frozen=True)
@@ -1710,15 +1892,117 @@ class BudgetReservation:
     token_upper_bound: int
 
 
+def _canonical_optimizer_decimal_text(value: Decimal) -> str:
+    """Render one finite non-negative optimizer amount as canonical JSON text."""
+
+    if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+        raise ConfigurationError(
+            "optimizer projected cost must be a finite non-negative Decimal"
+        )
+    if value.is_zero():
+        return "0"
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
+
+
 @dataclass(frozen=True)
-class PitOptimizerBudgetReservation:
-    """One exact Decimal reservation for an optimizer-v2 provider call."""
+class PitOptimizerResourceReservation:
+    """One calls/tokens reservation with an optional advisory cost projection."""
 
     reservation_id: str
-    amount_usd: Decimal
+    projected_cost_usd: Decimal | None
     prompt_bytes: int
     completion_allowance: int
     token_upper_bound: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.reservation_id, str)
+            or re.fullmatch(
+                r"optimizer_budget_[0-9a-f]{32}",
+                self.reservation_id,
+            )
+            is None
+            or type(self.prompt_bytes) is not int
+            or self.prompt_bytes < 0
+            or type(self.completion_allowance) is not int
+            or self.completion_allowance <= 0
+            or self.token_upper_bound
+            != self.prompt_bytes + self.completion_allowance
+        ):
+            raise ConfigurationError("optimizer resource reservation is invalid")
+        if self.projected_cost_usd is not None:
+            _canonical_optimizer_decimal_text(self.projected_cost_usd)
+
+
+@dataclass(frozen=True)
+class PitOptimizerResourceSnapshot:
+    """Closed calls/tokens accounting image for optimizer audit and recovery."""
+
+    api_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    reserved_tokens: int
+    authoritative_usd: float
+    retained_reservation_tokens: int
+    incomplete_accounting_calls: int
+    accounting_basis: str
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("api_calls", self.api_calls),
+            ("prompt_tokens", self.prompt_tokens),
+            ("completion_tokens", self.completion_tokens),
+            ("total_tokens", self.total_tokens),
+            ("reserved_tokens", self.reserved_tokens),
+            ("retained_reservation_tokens", self.retained_reservation_tokens),
+            ("incomplete_accounting_calls", self.incomplete_accounting_calls),
+        ):
+            if type(value) is not int or value < 0:
+                raise ConfigurationError(f"{field} must be a nonnegative integer")
+        if (
+            self.total_tokens
+            != self.prompt_tokens
+            + self.completion_tokens
+            + self.retained_reservation_tokens
+            or self.reserved_tokens < self.total_tokens
+        ):
+            raise ConfigurationError(
+                "optimizer resource token components are inconsistent"
+            )
+        if self.incomplete_accounting_calls > self.api_calls:
+            raise ConfigurationError(
+                "incomplete accounting calls cannot exceed optimizer calls"
+            )
+        if (
+            type(self.authoritative_usd) not in {int, float}
+            or not math.isfinite(self.authoritative_usd)
+            or self.authoritative_usd < 0
+        ):
+            raise ConfigurationError(
+                "optimizer authoritative USD must be finite and nonnegative"
+            )
+        expected_basis = (
+            "authoritative"
+            if self.incomplete_accounting_calls == 0
+            else "authoritative_plus_retained_tokens"
+        )
+        if self.accounting_basis != expected_basis:
+            raise ConfigurationError(
+                "optimizer resource accounting basis is inconsistent"
+            )
+        if self.incomplete_accounting_calls == 0:
+            if self.retained_reservation_tokens != 0:
+                raise ConfigurationError(
+                    "authoritative optimizer accounting cannot retain tokens"
+                )
+        elif self.retained_reservation_tokens == 0:
+            raise ConfigurationError(
+                "incomplete optimizer accounting must retain tokens"
+            )
 
 
 @dataclass(frozen=True)
@@ -1779,12 +2063,6 @@ class BudgetLedger:
         self.retained_reservation_usd = 0.0
         self.retained_reservation_tokens = 0
         self.incomplete_accounting_calls = 0
-        self._pit_optimizer_reservations: dict[
-            str, PitOptimizerBudgetReservation
-        ] = {}
-        self._pit_optimizer_reconciliations: dict[
-            str, tuple[PitOptimizerBudgetReservation, Usage, bool]
-        ] = {}
 
     @property
     def committed_usd(self) -> float:
@@ -1844,525 +2122,6 @@ class BudgetLedger:
         self.calls += 1
         return BudgetReservation(amount, prompt_bytes, completion_allowance, token_upper_bound)
 
-    def reserve_pit_optimizer(
-        self,
-        *,
-        rendered_prompt_bytes: int,
-        max_output_tokens: int,
-        conservative_cost_usd: Decimal,
-    ) -> PitOptimizerBudgetReservation:
-        """Reserve one already-preflighted optimizer call using exact Decimal cost."""
-
-        if (
-            type(rendered_prompt_bytes) is not int
-            or rendered_prompt_bytes < 0
-            or type(max_output_tokens) is not int
-            or max_output_tokens <= 0
-            or not isinstance(conservative_cost_usd, Decimal)
-            or not conservative_cost_usd.is_finite()
-            or conservative_cost_usd < 0
-        ):
-            raise ConfigurationError("optimizer budget reservation is invalid")
-        token_upper_bound = rendered_prompt_bytes + max_output_tokens
-        prospective_usd = self._reserved_usd_decimal + conservative_cost_usd
-        if self.calls >= self.max_calls:
-            raise BudgetExceededError("call budget cannot reserve another provider call")
-        if self.reserved_tokens + token_upper_bound > self.max_tokens:
-            raise BudgetExceededError("token budget cannot reserve this provider call")
-        if prospective_usd > Decimal(str(self.max_usd)):
-            raise BudgetExceededError("USD budget cannot reserve this provider call")
-        reservation = PitOptimizerBudgetReservation(
-            reservation_id=f"optimizer_budget_{secrets.token_hex(16)}",
-            amount_usd=conservative_cost_usd,
-            prompt_bytes=rendered_prompt_bytes,
-            completion_allowance=max_output_tokens,
-            token_upper_bound=token_upper_bound,
-        )
-        self._pit_optimizer_reservations[reservation.reservation_id] = reservation
-        self.reserved_usd = float(prospective_usd)
-        self._reserved_usd_decimal = prospective_usd
-        self.reserved_tokens += token_upper_bound
-        self.calls += 1
-        return reservation
-
-    def reconcile_pit_optimizer(
-        self,
-        reservation: PitOptimizerBudgetReservation,
-        usage: Usage,
-        *,
-        request_started: bool,
-    ) -> None:
-        """Release before-send failures or durably retain/commit one started call."""
-
-        if (
-            not isinstance(reservation, PitOptimizerBudgetReservation)
-            or not isinstance(usage, Usage)
-            or type(request_started) is not bool
-        ):
-            raise ConfigurationError("optimizer budget reconciliation is invalid")
-        prior = self._pit_optimizer_reconciliations.get(reservation.reservation_id)
-        if prior is not None:
-            if prior == (reservation, usage, request_started):
-                return
-            raise ConfigurationError("optimizer budget reconciliation differs from prior facts")
-        if (
-            self._pit_optimizer_reservations.get(reservation.reservation_id)
-            != reservation
-        ):
-            raise ConfigurationError("optimizer budget reconciliation is invalid")
-        if not request_started:
-            if any(
-                value is not None
-                for value in (
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                    usage.cost_usd,
-                )
-            ):
-                raise ConfigurationError("before-send reconciliation cannot claim usage")
-            del self._pit_optimizer_reservations[reservation.reservation_id]
-            self.calls -= 1
-            self.reserved_tokens -= reservation.token_upper_bound
-            self._reserved_usd_decimal -= reservation.amount_usd
-            self.reserved_usd = float(self._reserved_usd_decimal)
-            self._pit_optimizer_reconciliations[reservation.reservation_id] = (
-                reservation,
-                usage,
-                request_started,
-            )
-            return
-
-        complete = all(
-            value is not None
-            for value in (
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.total_tokens,
-                usage.cost_usd,
-            )
-        )
-        if complete:
-            assert usage.prompt_tokens is not None
-            assert usage.completion_tokens is not None
-            assert usage.total_tokens is not None
-            assert usage.cost_usd is not None
-            if usage.total_tokens != usage.prompt_tokens + usage.completion_tokens:
-                raise ResponseValidationError("provider token accounting is inconsistent")
-            charged_usd = Decimal(str(usage.cost_usd))
-            charged_tokens = usage.total_tokens
-        else:
-            if any(
-                value is not None
-                for value in (
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                    usage.cost_usd,
-                )
-            ):
-                raise ResponseValidationError("provider accounting is incomplete")
-            charged_usd = reservation.amount_usd
-            charged_tokens = reservation.token_upper_bound
-
-        del self._pit_optimizer_reservations[reservation.reservation_id]
-        self._reserved_usd_decimal = (
-            self._reserved_usd_decimal - reservation.amount_usd + charged_usd
-        )
-        self.reserved_usd = float(self._reserved_usd_decimal)
-        self.reserved_tokens += charged_tokens - reservation.token_upper_bound
-        self.spent_usd += float(charged_usd)
-        self.total_tokens += charged_tokens
-        if complete:
-            self.authoritative_usd += float(charged_usd)
-            assert usage.prompt_tokens is not None
-            assert usage.completion_tokens is not None
-            self.prompt_tokens += usage.prompt_tokens
-            self.completion_tokens += usage.completion_tokens
-        else:
-            self.retained_reservation_usd += float(charged_usd)
-            self.retained_reservation_tokens += charged_tokens
-            self.incomplete_accounting_calls += 1
-        self._pit_optimizer_reconciliations[reservation.reservation_id] = (
-            reservation,
-            usage,
-            request_started,
-        )
-
-        # The call already started: authoritative overage stays committed before
-        # fail-closed termination, and uncertainty retains the full reservation.
-        if self.reserved_usd > self.max_usd:
-            raise BudgetExceededError("provider reported cost exceeds the hard USD budget")
-        if self.reserved_tokens > self.max_tokens:
-            raise BudgetExceededError("provider reported tokens exceed the hard token budget")
-
-    def verify_pit_optimizer_reconciliation(
-        self,
-        reservation: PitOptimizerBudgetReservation,
-        usage: Usage,
-        *,
-        request_started: bool,
-    ) -> None:
-        """Verify an exact in-memory reconciliation after an interrupted return."""
-
-        if (
-            self._pit_optimizer_reconciliations.get(reservation.reservation_id)
-            != (reservation, usage, request_started)
-            or reservation.reservation_id in self._pit_optimizer_reservations
-        ):
-            raise ConfigurationError(
-                "optimizer budget reconciliation postcondition is absent"
-            )
-
-    @staticmethod
-    def _pit_optimizer_reservation_primitive(
-        reservation: PitOptimizerBudgetReservation,
-    ) -> dict[str, object]:
-        return {
-            "reservation_id": reservation.reservation_id,
-            "amount_usd": str(reservation.amount_usd),
-            "prompt_bytes": reservation.prompt_bytes,
-            "completion_allowance": reservation.completion_allowance,
-            "token_upper_bound": reservation.token_upper_bound,
-        }
-
-    @classmethod
-    def _pit_optimizer_reservation_from_primitive(
-        cls,
-        value: object,
-    ) -> PitOptimizerBudgetReservation:
-        if not isinstance(value, dict) or set(value) != {
-            "reservation_id",
-            "amount_usd",
-            "prompt_bytes",
-            "completion_allowance",
-            "token_upper_bound",
-        }:
-            raise AuditError("optimizer budget recovery reservation is malformed")
-        try:
-            amount = Decimal(value["amount_usd"])
-            reservation = PitOptimizerBudgetReservation(
-                reservation_id=value["reservation_id"],
-                amount_usd=amount,
-                prompt_bytes=value["prompt_bytes"],
-                completion_allowance=value["completion_allowance"],
-                token_upper_bound=value["token_upper_bound"],
-            )
-        except (InvalidOperation, TypeError, ValueError) as exc:
-            raise AuditError(
-                "optimizer budget recovery reservation is invalid"
-            ) from exc
-        if (
-            not isinstance(reservation.reservation_id, str)
-            or re.fullmatch(r"optimizer_budget_[0-9a-f]{32}", reservation.reservation_id)
-            is None
-            or not reservation.amount_usd.is_finite()
-            or reservation.amount_usd < 0
-            or type(reservation.prompt_bytes) is not int
-            or reservation.prompt_bytes < 0
-            or type(reservation.completion_allowance) is not int
-            or reservation.completion_allowance <= 0
-            or reservation.token_upper_bound
-            != reservation.prompt_bytes + reservation.completion_allowance
-        ):
-            raise AuditError("optimizer budget recovery reservation is invalid")
-        return reservation
-
-    @staticmethod
-    def _validate_pit_optimizer_recovery_components(
-        *,
-        snapshot: "BudgetSnapshot",
-        reserved_decimal: Decimal,
-        active: Mapping[str, PitOptimizerBudgetReservation],
-        reconciliations: Mapping[
-            str,
-            tuple[PitOptimizerBudgetReservation, Usage, bool],
-        ],
-    ) -> None:
-        """Recompute the aggregate image from exact optimizer transitions."""
-
-        calls = len(active)
-        prompt_tokens = 0
-        completion_tokens = 0
-        total_tokens = 0
-        reserved_tokens = sum(item.token_upper_bound for item in active.values())
-        reserved_usd = sum(
-            (item.amount_usd for item in active.values()),
-            Decimal("0"),
-        )
-        spent_usd = Decimal("0")
-        authoritative_usd = Decimal("0")
-        retained_usd = Decimal("0")
-        retained_tokens = 0
-        incomplete_calls = 0
-        for reservation, usage, request_started in reconciliations.values():
-            values = (
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.total_tokens,
-                usage.cost_usd,
-            )
-            if not request_started:
-                if any(value is not None for value in values):
-                    raise AuditError(
-                        "optimizer budget recovery before-send usage is invalid"
-                    )
-                continue
-            calls += 1
-            if all(value is not None for value in values):
-                assert usage.prompt_tokens is not None
-                assert usage.completion_tokens is not None
-                assert usage.total_tokens is not None
-                assert usage.cost_usd is not None
-                if (
-                    usage.total_tokens
-                    != usage.prompt_tokens + usage.completion_tokens
-                ):
-                    raise AuditError(
-                        "optimizer budget recovery token accounting differs"
-                    )
-                charge_usd = Decimal(str(usage.cost_usd))
-                if not charge_usd.is_finite() or charge_usd < 0:
-                    raise AuditError(
-                        "optimizer budget recovery cost accounting is invalid"
-                    )
-                prompt_tokens += usage.prompt_tokens
-                completion_tokens += usage.completion_tokens
-                charged_tokens = usage.total_tokens
-                authoritative_usd += charge_usd
-            elif all(value is None for value in values):
-                charge_usd = reservation.amount_usd
-                charged_tokens = reservation.token_upper_bound
-                retained_usd += charge_usd
-                retained_tokens += charged_tokens
-                incomplete_calls += 1
-            else:
-                raise AuditError(
-                    "optimizer budget recovery usage is partially accounted"
-                )
-            total_tokens += charged_tokens
-            reserved_tokens += charged_tokens
-            reserved_usd += charge_usd
-            spent_usd += charge_usd
-        expected = BudgetSnapshot(
-            api_calls=calls,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            reserved_tokens=reserved_tokens,
-            reserved_usd=float(reserved_usd),
-            spent_usd=float(spent_usd),
-            authoritative_usd=float(authoritative_usd),
-            retained_reservation_usd=float(retained_usd),
-            retained_reservation_tokens=retained_tokens,
-            incomplete_accounting_calls=incomplete_calls,
-            accounting_basis=(
-                "authoritative"
-                if incomplete_calls == 0
-                else "authoritative_plus_retained_reservations"
-            ),
-        )
-        if snapshot != expected or reserved_decimal != reserved_usd:
-            raise AuditError("optimizer budget recovery aggregate differs")
-
-    def _pit_optimizer_recovery_state(
-        self,
-        *,
-        run_manifest_sha256: str,
-        audit_run_id: str,
-    ) -> dict[str, object]:
-        """Return the closed exact state image embedded by the live gateway."""
-
-        if (
-            _SHA256_RE.fullmatch(run_manifest_sha256) is None
-            or _RUN_ID_RE.fullmatch(audit_run_id) is None
-        ):
-            raise AuditError("optimizer budget recovery identity is invalid")
-        snapshot = _budget_snapshot(self)
-        self._validate_pit_optimizer_recovery_components(
-            snapshot=snapshot,
-            reserved_decimal=self._reserved_usd_decimal,
-            active=self._pit_optimizer_reservations,
-            reconciliations=self._pit_optimizer_reconciliations,
-        )
-        return {
-            "schema_version": 1,
-            "run_manifest_sha256": run_manifest_sha256,
-            "audit_run_id": audit_run_id,
-            "limits": {
-                "max_usd": self.max_usd,
-                "max_calls": self.max_calls,
-                "max_tokens": self.max_tokens,
-            },
-            "snapshot": asdict(snapshot),
-            "reserved_usd_decimal": str(self._reserved_usd_decimal),
-            "active_reservations": [
-                self._pit_optimizer_reservation_primitive(item)
-                for item in self._pit_optimizer_reservations.values()
-            ],
-            "reconciliations": [
-                {
-                    "reservation": self._pit_optimizer_reservation_primitive(
-                        reservation
-                    ),
-                    "usage": asdict(usage),
-                    "request_started": request_started,
-                }
-                for reservation, usage, request_started in (
-                    self._pit_optimizer_reconciliations.values()
-                )
-            ],
-        }
-
-    def _restore_pit_optimizer_recovery_state(
-        self,
-        value: object,
-        *,
-        run_manifest_sha256: str,
-        audit_run_id: str,
-    ) -> None:
-        """Restore one authenticated terminal state image idempotently."""
-
-        expected_keys = {
-            "schema_version",
-            "run_manifest_sha256",
-            "audit_run_id",
-            "limits",
-            "snapshot",
-            "reserved_usd_decimal",
-            "active_reservations",
-            "reconciliations",
-        }
-        if not isinstance(value, dict) or set(value) != expected_keys:
-            raise AuditError("optimizer budget recovery state is malformed")
-        if (
-            value.get("schema_version") != 1
-            or value.get("run_manifest_sha256") != run_manifest_sha256
-            or value.get("audit_run_id") != audit_run_id
-        ):
-            raise AuditError("optimizer budget recovery identity differs")
-        limits = value.get("limits")
-        if limits != {
-            "max_usd": self.max_usd,
-            "max_calls": self.max_calls,
-            "max_tokens": self.max_tokens,
-        }:
-            raise AuditError("optimizer budget recovery limits differ")
-        snapshot_value = value.get("snapshot")
-        try:
-            if not isinstance(snapshot_value, dict):
-                raise TypeError("snapshot is not a mapping")
-            snapshot = BudgetSnapshot(**snapshot_value)
-            reserved_decimal = Decimal(value["reserved_usd_decimal"])
-        except (InvalidOperation, TypeError, ValueError) as exc:
-            raise AuditError("optimizer budget recovery snapshot is invalid") from exc
-        if (
-            not reserved_decimal.is_finite()
-            or reserved_decimal < 0
-            or float(reserved_decimal) != snapshot.reserved_usd
-        ):
-            raise AuditError("optimizer budget recovery Decimal snapshot differs")
-        active_value = value.get("active_reservations")
-        reconciliation_value = value.get("reconciliations")
-        if not isinstance(active_value, list) or not isinstance(
-            reconciliation_value, list
-        ):
-            raise AuditError("optimizer budget recovery entries are malformed")
-        active: dict[str, PitOptimizerBudgetReservation] = {}
-        for primitive in active_value:
-            reservation = self._pit_optimizer_reservation_from_primitive(primitive)
-            if reservation.reservation_id in active:
-                raise AuditError("optimizer budget recovery reservation is repeated")
-            active[reservation.reservation_id] = reservation
-        reconciliations: dict[
-            str,
-            tuple[PitOptimizerBudgetReservation, Usage, bool],
-        ] = {}
-        for item in reconciliation_value:
-            if not isinstance(item, dict) or set(item) != {
-                "reservation",
-                "usage",
-                "request_started",
-            }:
-                raise AuditError(
-                    "optimizer budget recovery reconciliation is malformed"
-                )
-            reservation = self._pit_optimizer_reservation_from_primitive(
-                item["reservation"]
-            )
-            usage_value = item.get("usage")
-            try:
-                if not isinstance(usage_value, dict):
-                    raise TypeError("usage is not a mapping")
-                usage = Usage(**usage_value)
-            except (ProtocolValidationError, TypeError, ValueError) as exc:
-                raise AuditError(
-                    "optimizer budget recovery usage is invalid"
-                ) from exc
-            request_started = item.get("request_started")
-            if type(request_started) is not bool:
-                raise AuditError(
-                    "optimizer budget recovery lifecycle is invalid"
-                )
-            if (
-                reservation.reservation_id in active
-                or reservation.reservation_id in reconciliations
-            ):
-                raise AuditError(
-                    "optimizer budget recovery reservation is repeated"
-                )
-            reconciliations[reservation.reservation_id] = (
-                reservation,
-                usage,
-                request_started,
-            )
-        self._validate_pit_optimizer_recovery_components(
-            snapshot=snapshot,
-            reserved_decimal=reserved_decimal,
-            active=active,
-            reconciliations=reconciliations,
-        )
-        current_state = self._pit_optimizer_recovery_state(
-            run_manifest_sha256=run_manifest_sha256,
-            audit_run_id=audit_run_id,
-        )
-        if current_state == value:
-            return
-        if (
-            _budget_snapshot(self)
-            != BudgetSnapshot(
-                api_calls=0,
-                prompt_tokens=0,
-                completion_tokens=0,
-                total_tokens=0,
-                reserved_tokens=0,
-                reserved_usd=0.0,
-                spent_usd=0.0,
-                authoritative_usd=0.0,
-                retained_reservation_usd=0.0,
-                retained_reservation_tokens=0,
-                incomplete_accounting_calls=0,
-                accounting_basis="authoritative",
-            )
-            or self._pit_optimizer_reservations
-            or self._pit_optimizer_reconciliations
-        ):
-            raise AuditError("optimizer budget recovery target is not fresh")
-        self.calls = snapshot.api_calls
-        self.prompt_tokens = snapshot.prompt_tokens
-        self.completion_tokens = snapshot.completion_tokens
-        self.total_tokens = snapshot.total_tokens
-        self.reserved_tokens = snapshot.reserved_tokens
-        self.reserved_usd = snapshot.reserved_usd
-        self._reserved_usd_decimal = reserved_decimal
-        self.spent_usd = snapshot.spent_usd
-        self.authoritative_usd = snapshot.authoritative_usd
-        self.retained_reservation_usd = snapshot.retained_reservation_usd
-        self.retained_reservation_tokens = snapshot.retained_reservation_tokens
-        self.incomplete_accounting_calls = snapshot.incomplete_accounting_calls
-        self._pit_optimizer_reservations = active
-        self._pit_optimizer_reconciliations = reconciliations
-
     def reconcile(
         self,
         reservation: BudgetReservation,
@@ -2416,17 +2175,518 @@ class BudgetLedger:
             raise BudgetExceededError("provider reported tokens exceed the hard token budget")
 
 
+class PitOptimizerResourceLedger:
+    """Tracks only optimizer calls/tokens while retaining actual USD as audit data."""
+
+    def __init__(self, *, max_calls: int, max_tokens: int) -> None:
+        if type(max_calls) is not int or max_calls < 1:
+            raise ConfigurationError("max_calls must be a positive integer")
+        if type(max_tokens) is not int or max_tokens < 1:
+            raise ConfigurationError("max_tokens must be a positive integer")
+        self.max_calls = max_calls
+        self.max_tokens = max_tokens
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.reserved_tokens = 0
+        self.authoritative_usd = 0.0
+        self.retained_reservation_tokens = 0
+        self.incomplete_accounting_calls = 0
+        self._pit_optimizer_reservations: dict[
+            str, PitOptimizerResourceReservation
+        ] = {}
+        self._pit_optimizer_reconciliations: dict[
+            str, tuple[PitOptimizerResourceReservation, Usage, bool]
+        ] = {}
+
+    def reserve_pit_optimizer(
+        self,
+        rendered_prompt_bytes: int,
+        max_output_tokens: int,
+        projected_cost_usd: Decimal | None,
+    ) -> PitOptimizerResourceReservation:
+        """Reserve one preflighted optimizer call using calls/tokens only."""
+
+        if (
+            type(rendered_prompt_bytes) is not int
+            or rendered_prompt_bytes < 0
+            or type(max_output_tokens) is not int
+            or max_output_tokens <= 0
+        ):
+            raise ConfigurationError("optimizer resource reservation is invalid")
+        if projected_cost_usd is not None:
+            _canonical_optimizer_decimal_text(projected_cost_usd)
+        token_upper_bound = rendered_prompt_bytes + max_output_tokens
+        if self.incomplete_accounting_calls:
+            raise AccountingValidationError(
+                "optimizer accounting is terminally incomplete"
+            )
+        if self.calls >= self.max_calls:
+            raise BudgetExceededError("call budget cannot reserve another provider call")
+        if self.reserved_tokens + token_upper_bound > self.max_tokens:
+            raise BudgetExceededError("token budget cannot reserve this provider call")
+        reservation = PitOptimizerResourceReservation(
+            reservation_id=f"optimizer_budget_{secrets.token_hex(16)}",
+            projected_cost_usd=projected_cost_usd,
+            prompt_bytes=rendered_prompt_bytes,
+            completion_allowance=max_output_tokens,
+            token_upper_bound=token_upper_bound,
+        )
+        self._pit_optimizer_reservations[reservation.reservation_id] = reservation
+        self.reserved_tokens += token_upper_bound
+        self.calls += 1
+        return reservation
+
+    def reconcile_pit_optimizer(
+        self,
+        reservation: PitOptimizerResourceReservation,
+        usage: Usage,
+        request_started: bool,
+    ) -> None:
+        """Release before-send failures or durably retain/commit one started call."""
+
+        if (
+            not isinstance(reservation, PitOptimizerResourceReservation)
+            or not isinstance(usage, Usage)
+            or type(request_started) is not bool
+        ):
+            raise ConfigurationError("optimizer budget reconciliation is invalid")
+        prior = self._pit_optimizer_reconciliations.get(reservation.reservation_id)
+        if prior is not None:
+            if prior == (reservation, usage, request_started):
+                return
+            raise ConfigurationError("optimizer budget reconciliation differs from prior facts")
+        if (
+            self._pit_optimizer_reservations.get(reservation.reservation_id)
+            != reservation
+        ):
+            raise ConfigurationError("optimizer budget reconciliation is invalid")
+        if not request_started:
+            if any(
+                value is not None
+                for value in (
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.total_tokens,
+                    usage.cost_usd,
+                )
+            ):
+                raise ConfigurationError("before-send reconciliation cannot claim usage")
+            del self._pit_optimizer_reservations[reservation.reservation_id]
+            self.calls -= 1
+            self.reserved_tokens -= reservation.token_upper_bound
+            self._pit_optimizer_reconciliations[reservation.reservation_id] = (
+                reservation,
+                usage,
+                request_started,
+            )
+            return
+
+        complete = all(
+            value is not None
+            for value in (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                usage.cost_usd,
+            )
+        )
+        if complete:
+            assert usage.prompt_tokens is not None
+            assert usage.completion_tokens is not None
+            assert usage.total_tokens is not None
+            assert usage.cost_usd is not None
+            if usage.total_tokens != usage.prompt_tokens + usage.completion_tokens:
+                raise ResponseValidationError("provider token accounting is inconsistent")
+            charged_usd = Decimal(str(usage.cost_usd))
+            if not charged_usd.is_finite() or charged_usd < 0:
+                raise ResponseValidationError(
+                    "provider cost must be finite and non-negative"
+                )
+            charged_tokens = usage.total_tokens
+        else:
+            if any(
+                value is not None
+                for value in (
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.total_tokens,
+                    usage.cost_usd,
+                )
+            ):
+                raise ResponseValidationError("provider accounting is incomplete")
+            charged_tokens = reservation.token_upper_bound
+
+        del self._pit_optimizer_reservations[reservation.reservation_id]
+        self.reserved_tokens += charged_tokens - reservation.token_upper_bound
+        self.total_tokens += charged_tokens
+        if complete:
+            self.authoritative_usd += float(charged_usd)
+            assert usage.prompt_tokens is not None
+            assert usage.completion_tokens is not None
+            self.prompt_tokens += usage.prompt_tokens
+            self.completion_tokens += usage.completion_tokens
+        else:
+            self.retained_reservation_tokens += charged_tokens
+            self.incomplete_accounting_calls += 1
+        self._pit_optimizer_reconciliations[reservation.reservation_id] = (
+            reservation,
+            usage,
+            request_started,
+        )
+
+        # The call already started: authoritative overage stays committed before
+        # fail-closed termination, and uncertainty retains the full reservation.
+        if self.reserved_tokens > self.max_tokens:
+            raise BudgetExceededError("provider reported tokens exceed the hard token budget")
+
+    def verify_pit_optimizer_reconciliation(
+        self,
+        reservation: PitOptimizerResourceReservation,
+        usage: Usage,
+        request_started: bool,
+    ) -> None:
+        """Verify an exact in-memory reconciliation after an interrupted return."""
+
+        if (
+            self._pit_optimizer_reconciliations.get(reservation.reservation_id)
+            != (reservation, usage, request_started)
+            or reservation.reservation_id in self._pit_optimizer_reservations
+        ):
+            raise ConfigurationError(
+                "optimizer budget reconciliation postcondition is absent"
+            )
+
+    @staticmethod
+    def _pit_optimizer_reservation_primitive(
+        reservation: PitOptimizerResourceReservation,
+    ) -> dict[str, object]:
+        return {
+            "reservation_id": reservation.reservation_id,
+            "projected_cost_usd": (
+                None
+                if reservation.projected_cost_usd is None
+                else _canonical_optimizer_decimal_text(
+                    reservation.projected_cost_usd
+                )
+            ),
+            "prompt_bytes": reservation.prompt_bytes,
+            "completion_allowance": reservation.completion_allowance,
+            "token_upper_bound": reservation.token_upper_bound,
+        }
+
+    @classmethod
+    def _pit_optimizer_reservation_from_primitive(
+        cls,
+        value: object,
+    ) -> PitOptimizerResourceReservation:
+        if not isinstance(value, dict) or set(value) != {
+            "reservation_id",
+            "projected_cost_usd",
+            "prompt_bytes",
+            "completion_allowance",
+            "token_upper_bound",
+        }:
+            raise AuditError("optimizer resource recovery reservation is malformed")
+        try:
+            projected_raw = value["projected_cost_usd"]
+            projected = (
+                None
+                if projected_raw is None
+                else Decimal(projected_raw)
+            )
+            if projected is not None and (
+                not isinstance(projected_raw, str)
+                or _canonical_optimizer_decimal_text(projected)
+                != projected_raw
+            ):
+                raise ValueError("projection is not canonical decimal text")
+            reservation = PitOptimizerResourceReservation(
+                reservation_id=value["reservation_id"],
+                projected_cost_usd=projected,
+                prompt_bytes=value["prompt_bytes"],
+                completion_allowance=value["completion_allowance"],
+                token_upper_bound=value["token_upper_bound"],
+            )
+        except (ConfigurationError, InvalidOperation, TypeError, ValueError) as exc:
+            raise AuditError(
+                "optimizer resource recovery reservation is invalid"
+            ) from exc
+        return reservation
+
+    @staticmethod
+    def _validate_pit_optimizer_recovery_components(
+        *,
+        snapshot: PitOptimizerResourceSnapshot,
+        active: Mapping[str, PitOptimizerResourceReservation],
+        reconciliations: Mapping[
+            str,
+            tuple[PitOptimizerResourceReservation, Usage, bool],
+        ],
+    ) -> None:
+        """Recompute the aggregate image from exact optimizer transitions."""
+
+        calls = len(active)
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        reserved_tokens = sum(item.token_upper_bound for item in active.values())
+        authoritative_usd = 0.0
+        retained_tokens = 0
+        incomplete_calls = 0
+        for reservation, usage, request_started in reconciliations.values():
+            values = (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                usage.cost_usd,
+            )
+            if not request_started:
+                if any(value is not None for value in values):
+                    raise AuditError(
+                        "optimizer budget recovery before-send usage is invalid"
+                    )
+                continue
+            calls += 1
+            if all(value is not None for value in values):
+                assert usage.prompt_tokens is not None
+                assert usage.completion_tokens is not None
+                assert usage.total_tokens is not None
+                assert usage.cost_usd is not None
+                if (
+                    usage.total_tokens
+                    != usage.prompt_tokens + usage.completion_tokens
+                ):
+                    raise AuditError(
+                        "optimizer budget recovery token accounting differs"
+                    )
+                charge_usd = float(usage.cost_usd)
+                if not math.isfinite(charge_usd) or charge_usd < 0:
+                    raise AuditError(
+                        "optimizer resource recovery cost accounting is invalid"
+                    )
+                prompt_tokens += usage.prompt_tokens
+                completion_tokens += usage.completion_tokens
+                charged_tokens = usage.total_tokens
+                authoritative_usd += charge_usd
+            elif all(value is None for value in values):
+                charged_tokens = reservation.token_upper_bound
+                retained_tokens += charged_tokens
+                incomplete_calls += 1
+            else:
+                raise AuditError(
+                    "optimizer budget recovery usage is partially accounted"
+                )
+            total_tokens += charged_tokens
+            reserved_tokens += charged_tokens
+        expected = PitOptimizerResourceSnapshot(
+            api_calls=calls,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            reserved_tokens=reserved_tokens,
+            authoritative_usd=authoritative_usd,
+            retained_reservation_tokens=retained_tokens,
+            incomplete_accounting_calls=incomplete_calls,
+            accounting_basis=(
+                "authoritative"
+                if incomplete_calls == 0
+                else "authoritative_plus_retained_tokens"
+            ),
+        )
+        if snapshot != expected:
+            raise AuditError("optimizer resource recovery aggregate differs")
+
+    def _pit_optimizer_recovery_state(
+        self,
+        *,
+        run_manifest_sha256: str,
+        audit_run_id: str,
+    ) -> dict[str, object]:
+        """Return the closed exact state image embedded by the live gateway."""
+
+        if (
+            _SHA256_RE.fullmatch(run_manifest_sha256) is None
+            or _RUN_ID_RE.fullmatch(audit_run_id) is None
+        ):
+            raise AuditError("optimizer budget recovery identity is invalid")
+        snapshot = _pit_optimizer_resource_snapshot(self)
+        self._validate_pit_optimizer_recovery_components(
+            snapshot=snapshot,
+            active=self._pit_optimizer_reservations,
+            reconciliations=self._pit_optimizer_reconciliations,
+        )
+        return {
+            "schema_version": 3,
+            "run_manifest_sha256": run_manifest_sha256,
+            "audit_run_id": audit_run_id,
+            "limits": {
+                "max_calls": self.max_calls,
+                "max_tokens": self.max_tokens,
+            },
+            "snapshot": asdict(snapshot),
+            "active_reservations": [
+                self._pit_optimizer_reservation_primitive(item)
+                for item in self._pit_optimizer_reservations.values()
+            ],
+            "reconciliations": [
+                {
+                    "reservation": self._pit_optimizer_reservation_primitive(
+                        reservation
+                    ),
+                    "usage": asdict(usage),
+                    "request_started": request_started,
+                }
+                for reservation, usage, request_started in (
+                    self._pit_optimizer_reconciliations.values()
+                )
+            ],
+        }
+
+    def _restore_pit_optimizer_recovery_state(
+        self,
+        value: object,
+        *,
+        run_manifest_sha256: str,
+        audit_run_id: str,
+    ) -> None:
+        """Restore one authenticated terminal state image idempotently."""
+
+        expected_keys = {
+            "schema_version",
+            "run_manifest_sha256",
+            "audit_run_id",
+            "limits",
+            "snapshot",
+            "active_reservations",
+            "reconciliations",
+        }
+        if not isinstance(value, dict) or set(value) != expected_keys:
+            raise AuditError("optimizer budget recovery state is malformed")
+        if (
+            value.get("schema_version") != 3
+            or value.get("run_manifest_sha256") != run_manifest_sha256
+            or value.get("audit_run_id") != audit_run_id
+        ):
+            raise AuditError("optimizer budget recovery identity differs")
+        limits = value.get("limits")
+        if limits != {
+            "max_calls": self.max_calls,
+            "max_tokens": self.max_tokens,
+        }:
+            raise AuditError("optimizer resource recovery limits differ")
+        snapshot_value = value.get("snapshot")
+        try:
+            if not isinstance(snapshot_value, dict):
+                raise TypeError("snapshot is not a mapping")
+            snapshot = PitOptimizerResourceSnapshot(**snapshot_value)
+        except (TypeError, ValueError) as exc:
+            raise AuditError("optimizer resource recovery snapshot is invalid") from exc
+        active_value = value.get("active_reservations")
+        reconciliation_value = value.get("reconciliations")
+        if not isinstance(active_value, list) or not isinstance(
+            reconciliation_value, list
+        ):
+            raise AuditError("optimizer budget recovery entries are malformed")
+        active: dict[str, PitOptimizerResourceReservation] = {}
+        for primitive in active_value:
+            reservation = self._pit_optimizer_reservation_from_primitive(primitive)
+            if reservation.reservation_id in active:
+                raise AuditError("optimizer budget recovery reservation is repeated")
+            active[reservation.reservation_id] = reservation
+        reconciliations: dict[
+            str,
+            tuple[PitOptimizerResourceReservation, Usage, bool],
+        ] = {}
+        for item in reconciliation_value:
+            if not isinstance(item, dict) or set(item) != {
+                "reservation",
+                "usage",
+                "request_started",
+            }:
+                raise AuditError(
+                    "optimizer budget recovery reconciliation is malformed"
+                )
+            reservation = self._pit_optimizer_reservation_from_primitive(
+                item["reservation"]
+            )
+            usage_value = item.get("usage")
+            try:
+                if not isinstance(usage_value, dict):
+                    raise TypeError("usage is not a mapping")
+                usage = Usage(**usage_value)
+            except (ProtocolValidationError, TypeError, ValueError) as exc:
+                raise AuditError(
+                    "optimizer budget recovery usage is invalid"
+                ) from exc
+            request_started = item.get("request_started")
+            if type(request_started) is not bool:
+                raise AuditError(
+                    "optimizer budget recovery lifecycle is invalid"
+                )
+            if (
+                reservation.reservation_id in active
+                or reservation.reservation_id in reconciliations
+            ):
+                raise AuditError(
+                    "optimizer budget recovery reservation is repeated"
+                )
+            reconciliations[reservation.reservation_id] = (
+                reservation,
+                usage,
+                request_started,
+            )
+        self._validate_pit_optimizer_recovery_components(
+            snapshot=snapshot,
+            active=active,
+            reconciliations=reconciliations,
+        )
+        current_state = self._pit_optimizer_recovery_state(
+            run_manifest_sha256=run_manifest_sha256,
+            audit_run_id=audit_run_id,
+        )
+        if current_state == value:
+            return
+        if (
+            _pit_optimizer_resource_snapshot(self)
+            != PitOptimizerResourceSnapshot(
+                api_calls=0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                reserved_tokens=0,
+                authoritative_usd=0.0,
+                retained_reservation_tokens=0,
+                incomplete_accounting_calls=0,
+                accounting_basis="authoritative",
+            )
+            or self._pit_optimizer_reservations
+            or self._pit_optimizer_reconciliations
+        ):
+            raise AuditError("optimizer budget recovery target is not fresh")
+        self.calls = snapshot.api_calls
+        self.prompt_tokens = snapshot.prompt_tokens
+        self.completion_tokens = snapshot.completion_tokens
+        self.total_tokens = snapshot.total_tokens
+        self.reserved_tokens = snapshot.reserved_tokens
+        self.authoritative_usd = snapshot.authoritative_usd
+        self.retained_reservation_tokens = snapshot.retained_reservation_tokens
+        self.incomplete_accounting_calls = snapshot.incomplete_accounting_calls
+        self._pit_optimizer_reservations = active
+        self._pit_optimizer_reconciliations = reconciliations
+
 @dataclass
 class _PitOptimizerGatewayLifecycle:
     """Live plan-exclusive authority for one gateway-owned optimizer transition."""
 
     gateway: object
     audit_trail: object
-    budget_ledger: BudgetLedger
+    budget_ledger: PitOptimizerResourceLedger
     authorization_ledger: object
     authorization_lease: object
     call_budget: object
-    budget_reservation: PitOptimizerBudgetReservation
+    budget_reservation: PitOptimizerResourceReservation
     authorization_reservation: object
     reserved_event_sha256: str | None = None
     started_event_sha256: str | None = None
@@ -3175,6 +3435,7 @@ class OpenRouterGateway:
         run_id: str = "agent-loop",
         pricing_loader: Callable[[str], Mapping[str, Any] | Pricing] | None = None,
         ledger: BudgetLedger | None = None,
+        pit_optimizer_ledger: PitOptimizerResourceLedger | None = None,
         app_url: str | None = None,
         app_name: str | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
@@ -3194,6 +3455,11 @@ class OpenRouterGateway:
             or max_attempts not in {1, 2}
         ):
             raise ConfigurationError("gateway run_id, timeout, and attempts must be valid")
+        if pit_optimizer_ledger is not None and not isinstance(
+            pit_optimizer_ledger,
+            PitOptimizerResourceLedger,
+        ):
+            raise ConfigurationError("gateway optimizer resource ledger is invalid")
         self._client = client
         self.api_key = api_key
         self.controller_root = (controller_root or Path(__file__).resolve().parent).resolve()
@@ -3216,6 +3482,13 @@ class OpenRouterGateway:
         self._pricing_loader_is_builtin = pricing_loader is None
         self.pricing_loader = pricing_loader or _load_current_pricing
         self.ledger = ledger or BudgetLedger(max_usd=1.0)
+        self.pit_optimizer_ledger = (
+            pit_optimizer_ledger
+            or PitOptimizerResourceLedger(
+                max_calls=DEFAULT_MAX_CALLS,
+                max_tokens=DEFAULT_MAX_TOKENS,
+            )
+        )
         self.app_url = app_url
         self.app_name = app_name
         self.timeout_seconds = timeout_seconds
@@ -3226,10 +3499,10 @@ class OpenRouterGateway:
         self._generation_sleeper = generation_sleeper
         self.authorization_ledger = authorization_ledger
         self.audit_trail = audit_trail
-        self._pit_optimizer_frozen_pricing: "FrozenModelPricing | None" = None
-        self._pit_optimizer_frozen_pricing_commitment: str | None = None
-        self._pit_optimizer_frozen_manifest_sha256: str | None = None
-        self._pit_optimizer_frozen_authorization_ledger: object | None = None
+        self._pit_optimizer_pricing_snapshot: "OptimizerPricingSnapshot | None" = None
+        self._pit_optimizer_pricing_commitment: str | None = None
+        self._pit_optimizer_pricing_manifest_sha256: str | None = None
+        self._pit_optimizer_pricing_authorization_ledger: object | None = None
         self._pit_optimizer_lifecycles: dict[
             tuple[str, int],
             _PitOptimizerGatewayLifecycle,
@@ -3425,10 +3698,13 @@ class OpenRouterGateway:
         model: str,
         wall_deadline: float,
         monotonic: Callable[[], float],
-    ) -> "FrozenModelPricing":
-        """Load and freeze the sole R1 price identity without constructing the SDK."""
+    ) -> "OptimizerPricingSnapshot":
+        """Freeze one best-effort, run-bound advisory pricing snapshot."""
 
-        from core.pit_optimizer_authorization import AuthorizationError, FrozenModelPricing
+        from core.pit_optimizer_authorization import (
+            AuthorizationError,
+            OptimizerPricingSnapshot,
+        )
 
         if (
             model != REASONER_MODEL
@@ -3439,31 +3715,33 @@ class OpenRouterGateway:
             raise ConfigurationError("optimizer pricing freeze inputs are invalid")
         if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
             raise BudgetExceededError("PIT optimizer pricing deadline reached")
-        frozen = self._pit_optimizer_frozen_pricing
+        snapshot = self._pit_optimizer_pricing_snapshot
         if (
-            frozen is not None
-            and self._pit_optimizer_frozen_authorization_ledger
+            snapshot is not None
+            and self._pit_optimizer_pricing_authorization_ledger
             is not self.authorization_ledger
         ):
-            frozen = None
-            self._pit_optimizer_frozen_pricing = None
-            self._pit_optimizer_frozen_pricing_commitment = None
-            self._pit_optimizer_frozen_manifest_sha256 = None
-            self._pit_optimizer_frozen_authorization_ledger = None
-        if frozen is not None:
-            verified = FrozenModelPricing.from_rates(
-                model=frozen.model,
-                prompt_per_million=frozen.prompt_per_million,
-                completion_per_million=frozen.completion_per_million,
+            snapshot = None
+            self._pit_optimizer_pricing_snapshot = None
+            self._pit_optimizer_pricing_commitment = None
+            self._pit_optimizer_pricing_manifest_sha256 = None
+            self._pit_optimizer_pricing_authorization_ledger = None
+        if snapshot is not None:
+            verified = OptimizerPricingSnapshot(
+                model=snapshot.model,
+                lookup_status=snapshot.lookup_status,
+                prompt_per_million=snapshot.prompt_per_million,
+                completion_per_million=snapshot.completion_per_million,
+                pricing_payload_sha256=snapshot.pricing_payload_sha256,
             )
             if (
-                frozen.model != model
-                or verified.pricing_sha256 != frozen.pricing_sha256
-                or verified.pricing_sha256
-                != self._pit_optimizer_frozen_pricing_commitment
+                snapshot.model != model
+                or verified != snapshot
+                or verified.pricing_payload_sha256
+                != self._pit_optimizer_pricing_commitment
             ):
-                raise AuthorizationError("frozen pricing model mismatch")
-            return frozen
+                raise AuthorizationError("optimizer pricing snapshot mismatch")
+            return snapshot
         remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
         try:
             if self._pricing_loader_is_builtin:
@@ -3480,56 +3758,65 @@ class OpenRouterGateway:
         except Exception as exc:
             if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
                 raise BudgetExceededError("PIT optimizer pricing deadline reached") from exc
-            raise
+            snapshot = OptimizerPricingSnapshot.unavailable(model=model)
+        else:
+            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+                raise BudgetExceededError("PIT optimizer pricing deadline reached")
+            snapshot = freeze_pricing_record(model, value)
         if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
             raise BudgetExceededError("PIT optimizer pricing deadline reached")
-        frozen = freeze_pricing_record(model, value)
-        self._pit_optimizer_frozen_pricing = frozen
-        self._pit_optimizer_frozen_pricing_commitment = frozen.pricing_sha256
+        self._pit_optimizer_pricing_snapshot = snapshot
+        self._pit_optimizer_pricing_commitment = (
+            snapshot.pricing_payload_sha256
+        )
         ledger = self.authorization_ledger
-        self._pit_optimizer_frozen_authorization_ledger = ledger
-        self._pit_optimizer_frozen_manifest_sha256 = (
+        self._pit_optimizer_pricing_authorization_ledger = ledger
+        self._pit_optimizer_pricing_manifest_sha256 = (
             ledger.manifest.sha256
             if ledger is not None and hasattr(ledger, "manifest")
             else None
         )
-        return frozen
+        return snapshot
 
     def _verified_pit_optimizer_pricing_snapshot(
         self,
-        supplied: "FrozenModelPricing",
+        supplied: "OptimizerPricingSnapshot",
         lease: "AuthorizationRunLease",
-    ) -> "FrozenModelPricing":
+    ) -> "OptimizerPricingSnapshot":
         """Copy and reauthenticate the exact live rates consumed by preflight."""
 
         from core.pit_optimizer_authorization import (
             AuthorizationError,
             AuthorizationRunLease,
-            FrozenModelPricing,
+            OptimizerPricingSnapshot,
         )
 
-        if not isinstance(supplied, FrozenModelPricing) or not isinstance(
+        if not isinstance(supplied, OptimizerPricingSnapshot) or not isinstance(
             lease, AuthorizationRunLease
         ):
-            raise AuthorizationError("optimizer frozen pricing contract is invalid")
-        live = self._pit_optimizer_frozen_pricing
+            raise AuthorizationError("optimizer pricing snapshot contract is invalid")
+        live = self._pit_optimizer_pricing_snapshot
         if live is None or supplied is not live:
-            raise AuthorizationError("gateway run-local frozen pricing is required")
+            raise AuthorizationError("gateway run-local pricing snapshot is required")
         try:
-            snapshot = FrozenModelPricing.from_rates(
+            snapshot = OptimizerPricingSnapshot(
                 model=live.model,
+                lookup_status=live.lookup_status,
                 prompt_per_million=live.prompt_per_million,
                 completion_per_million=live.completion_per_million,
+                pricing_payload_sha256=live.pricing_payload_sha256,
             )
         except (TypeError, ValueError) as exc:
-            raise AuthorizationError("gateway frozen pricing snapshot is invalid") from exc
+            raise AuthorizationError("gateway pricing snapshot is invalid") from exc
         if (
-            snapshot.pricing_sha256 != live.pricing_sha256
-            or snapshot.pricing_sha256
-            != self._pit_optimizer_frozen_pricing_commitment
-            or snapshot.pricing_sha256 != lease.frozen_pricing_sha256
+            snapshot != live
+            or snapshot.pricing_payload_sha256
+            != self._pit_optimizer_pricing_commitment
+            or snapshot.pricing_payload_sha256
+            != lease.pricing_snapshot_sha256
+            or snapshot.lookup_status != lease.pricing_status
         ):
-            raise AuthorizationError("gateway frozen pricing commitment differs")
+            raise AuthorizationError("gateway pricing commitment differs")
         return snapshot
 
     @staticmethod
@@ -3560,7 +3847,7 @@ class OpenRouterGateway:
         *,
         authorization_lease: "AuthorizationRunLease",
         plan: "PitOptimizerCallBudget",
-        budget_reservation: PitOptimizerBudgetReservation,
+        budget_reservation: PitOptimizerResourceReservation,
         authorization_reservation: "AuthorizationCallReservation",
     ) -> _PitOptimizerGatewayLifecycle:
         if not isinstance(self.audit_trail, AuditTrail):
@@ -3573,7 +3860,7 @@ class OpenRouterGateway:
         lifecycle = _PitOptimizerGatewayLifecycle(
             gateway=self,
             audit_trail=self.audit_trail,
-            budget_ledger=self.ledger,
+            budget_ledger=self.pit_optimizer_ledger,
             authorization_ledger=self.authorization_ledger,
             authorization_lease=authorization_lease,
             call_budget=plan,
@@ -3594,7 +3881,7 @@ class OpenRouterGateway:
             not isinstance(lifecycle, _PitOptimizerGatewayLifecycle)
             or lifecycle.gateway is not self
             or lifecycle.audit_trail is not self.audit_trail
-            or lifecycle.budget_ledger is not self.ledger
+            or lifecycle.budget_ledger is not self.pit_optimizer_ledger
             or lifecycle.authorization_ledger is not self.authorization_ledger
             or self._pit_optimizer_lifecycles.get(key) is not lifecycle
         ):
@@ -3619,7 +3906,7 @@ class OpenRouterGateway:
             "budget_reservation_id": budget_reservation.reservation_id,
             "budget_reservation_sha256": hashlib.sha256(
                 _canonical_json_bytes(
-                    BudgetLedger._pit_optimizer_reservation_primitive(
+                    PitOptimizerResourceLedger._pit_optimizer_reservation_primitive(
                         budget_reservation
                     )
                 )
@@ -3721,7 +4008,7 @@ class OpenRouterGateway:
                 raise AuditError("optimizer accepted artifact digest is invalid")
         elif payload_sha256 is not None:
             raise AuditError("optimizer rejected lifecycle cannot bind an artifact")
-        self.ledger.verify_pit_optimizer_reconciliation(
+        self.pit_optimizer_ledger.verify_pit_optimizer_reconciliation(
             lifecycle.budget_reservation,
             usage,
             request_started=facts.request_started,
@@ -3740,7 +4027,7 @@ class OpenRouterGateway:
             facts,
             lifecycle.authorization_reservation,
         )
-        budget_state = self.ledger._pit_optimizer_recovery_state(
+        budget_state = self.pit_optimizer_ledger._pit_optimizer_recovery_state(
             run_manifest_sha256=lifecycle.authorization_lease.run_manifest_sha256,
             audit_run_id=self.audit_trail.run_id,
         )
@@ -3811,7 +4098,7 @@ class OpenRouterGateway:
         """Project content-free optimizer facts into the durable provider schema."""
 
         return ProviderCallRecord(
-            schema_version=2,
+            schema_version=3,
             call_index=facts.call_index,
             iteration=facts.iteration,
             role=facts.role,
@@ -3837,25 +4124,21 @@ class OpenRouterGateway:
             response_received=facts.response_received,
             locally_accounted=facts.request_started,
             authoritative_spend_known=facts.accounting_complete,
-            retained_reservation_usd=(
-                facts.retained_reservation_usd
-                if not facts.accounting_complete
-                else None
-            ),
             retained_reservation_tokens=(
                 facts.retained_reservation_tokens
                 if not facts.accounting_complete
                 else None
             ),
-            maximum_exposure_usd=reservation.reserved_usd,
             maximum_exposure_tokens=reservation.reserved_tokens,
             exposure_basis=(
                 "authoritative"
                 if facts.accounting_complete
-                else "retained_reservation"
+                else "retained_reservation_tokens"
             ),
-            ledger_snapshot=_budget_snapshot(self.ledger),
-            frozen_pricing_sha256=facts.frozen_pricing_sha256,
+            ledger_snapshot=_pit_optimizer_resource_snapshot(
+                self.pit_optimizer_ledger
+            ),
+            pricing_snapshot_sha256=facts.pricing_snapshot_sha256,
         )
 
     def _finalize_pit_optimizer_call(
@@ -3874,14 +4157,14 @@ class OpenRouterGateway:
         expected_overage = False
         first_postpublication_error: BaseException | None = None
         try:
-            self.ledger.reconcile_pit_optimizer(
+            self.pit_optimizer_ledger.reconcile_pit_optimizer(
                 lifecycle.budget_reservation,
                 usage,
                 request_started=facts.request_started,
             )
         except BaseException as error:
             try:
-                self.ledger.verify_pit_optimizer_reconciliation(
+                self.pit_optimizer_ledger.verify_pit_optimizer_reconciliation(
                     lifecycle.budget_reservation,
                     usage,
                     request_started=facts.request_started,
@@ -3991,7 +4274,7 @@ class OpenRouterGateway:
                 receipt,
             )
         )
-        self.ledger._restore_pit_optimizer_recovery_state(
+        self.pit_optimizer_ledger._restore_pit_optimizer_recovery_state(
             budget_recovery_state,
             run_manifest_sha256=authorization_lease.run_manifest_sha256,
             audit_run_id=self.audit_trail.run_id,
@@ -4014,11 +4297,11 @@ class OpenRouterGateway:
         *,
         call_budget: "PitOptimizerCallBudget",
         authorization_lease: "AuthorizationRunLease",
-        frozen_pricing: "FrozenModelPricing",
+        frozen_pricing: "OptimizerPricingSnapshot",
         wall_deadline: float,
         monotonic: Callable[[], float],
     ) -> "PitOptimizerRoleCall":
-        """Perform exactly one all-R1 schema-v2 call with durable accounting."""
+        """Perform exactly one all-R1 schema-v3 call with durable accounting."""
 
         from core.pit_optimization_contract import (
             AuthorArtifact,
@@ -4036,7 +4319,7 @@ class OpenRouterGateway:
             AuthorizationCallReservation,
             AuthorizationLedger,
             AuthorizationRunLease,
-            FrozenModelPricing,
+            OptimizerPricingSnapshot,
             PitOptimizerProviderFacts,
             PitOptimizerRoleCall,
         )
@@ -4054,7 +4337,7 @@ class OpenRouterGateway:
             or not isinstance(dynamic_input, role_inputs[role])
             or dynamic_input.iteration != call_budget.iteration
             or not isinstance(authorization_lease, AuthorizationRunLease)
-            or not isinstance(frozen_pricing, FrozenModelPricing)
+            or not isinstance(frozen_pricing, OptimizerPricingSnapshot)
             or type(wall_deadline) not in {int, float}
             or not math.isfinite(wall_deadline)
             or not callable(monotonic)
@@ -4072,13 +4355,13 @@ class OpenRouterGateway:
         if authorization_lease.run_manifest_sha256 != manifest.sha256:
             raise AuthorizationError("authorization lease run manifest mismatch")
         if (
-            self._pit_optimizer_frozen_pricing is None
-            or frozen_pricing is not self._pit_optimizer_frozen_pricing
-            or self._pit_optimizer_frozen_manifest_sha256 != manifest.sha256
-            or self._pit_optimizer_frozen_authorization_ledger
+            self._pit_optimizer_pricing_snapshot is None
+            or frozen_pricing is not self._pit_optimizer_pricing_snapshot
+            or self._pit_optimizer_pricing_manifest_sha256 != manifest.sha256
+            or self._pit_optimizer_pricing_authorization_ledger
             is not self.authorization_ledger
         ):
-            raise AuthorizationError("gateway run-local frozen pricing is required")
+            raise AuthorizationError("gateway run-local pricing snapshot is required")
         pricing_snapshot = self._verified_pit_optimizer_pricing_snapshot(
             frozen_pricing,
             authorization_lease,
@@ -4099,7 +4382,7 @@ class OpenRouterGateway:
             authorization_lease,
         )
         if recaptured_pricing != pricing_snapshot:
-            raise AuthorizationError("optimizer frozen pricing changed after authentication")
+            raise AuthorizationError("optimizer pricing changed after authentication")
 
         response_format = pit_optimizer_response_format(role)
         static_bytes = PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role].encode("utf-8")
@@ -4117,7 +4400,7 @@ class OpenRouterGateway:
             lease=authorization_lease,
             pricing=pricing_snapshot,
         )
-        budget_reservation: PitOptimizerBudgetReservation | None = None
+        budget_reservation: PitOptimizerResourceReservation | None = None
         authorization_reservation: AuthorizationCallReservation | None = None
         lifecycle: _PitOptimizerGatewayLifecycle | None = None
         audit_sha256 = hashlib.sha256(
@@ -4157,7 +4440,9 @@ class OpenRouterGateway:
                 role=role,
                 requested_model=REASONER_MODEL,
                 returned_model=returned_model,
-                frozen_pricing_sha256=pricing_snapshot.pricing_sha256,
+                pricing_snapshot_sha256=(
+                    pricing_snapshot.pricing_payload_sha256
+                ),
                 outcome=outcome,
                 request_started=request_started,
                 response_received=response_received,
@@ -4172,9 +4457,6 @@ class OpenRouterGateway:
                 cost_usd=usage.cost_usd if usage is not None else None,
                 retained_reservation_tokens=(
                     0 if usage is not None else authorization_reservation.reserved_tokens
-                ),
-                retained_reservation_usd=(
-                    0.0 if usage is not None else authorization_reservation.reserved_usd
                 ),
                 audit_sha256=audit_sha256,
             )
@@ -4206,7 +4488,7 @@ class OpenRouterGateway:
                 )
             except BaseException:
                 try:
-                    self.ledger.verify_pit_optimizer_reconciliation(
+                    self.pit_optimizer_ledger.verify_pit_optimizer_reconciliation(
                         budget_reservation,
                         usage,
                         request_started=facts.request_started,
@@ -4233,14 +4515,15 @@ class OpenRouterGateway:
                 finalized = True
 
         try:
-            budget_reservation = self.ledger.reserve_pit_optimizer(
+            budget_reservation = self.pit_optimizer_ledger.reserve_pit_optimizer(
                 rendered_prompt_bytes=len(static_bytes) + len(dynamic_bytes),
                 max_output_tokens=plan_snapshot.max_output_tokens,
-                conservative_cost_usd=conservative_cost,
+                projected_cost_usd=conservative_cost,
             )
             authorization_reservation = self.authorization_ledger.reserve_call(
                 authorization_lease,
                 plan_snapshot,
+                projected_call_usd=conservative_cost,
             )
             assert isinstance(authorization_reservation, AuthorizationCallReservation)
             lifecycle = self._register_pit_optimizer_lifecycle(
@@ -4342,13 +4625,8 @@ class OpenRouterGateway:
             assert usage.completion_tokens is not None
             assert usage.total_tokens is not None
             assert usage.cost_usd is not None
-            prospective_ledger_usd = (
-                self.ledger._reserved_usd_decimal
-                - budget_reservation.amount_usd
-                + Decimal(str(usage.cost_usd))
-            )
             prospective_ledger_tokens = (
-                self.ledger.reserved_tokens
+                self.pit_optimizer_ledger.reserved_tokens
                 - budget_reservation.token_upper_bound
                 + usage.total_tokens
             )
@@ -4357,9 +4635,8 @@ class OpenRouterGateway:
                 or usage.completion_tokens > plan_snapshot.max_output_tokens
                 or usage.total_tokens
                 > plan_snapshot.max_input_tokens + plan_snapshot.max_output_tokens
-                or Decimal(str(usage.cost_usd)) > Decimal(str(plan_snapshot.max_usd))
-                or prospective_ledger_usd > Decimal(str(self.ledger.max_usd))
-                or prospective_ledger_tokens > self.ledger.max_tokens
+                or prospective_ledger_tokens
+                > self.pit_optimizer_ledger.max_tokens
             ):
                 facts = provider_facts(
                     outcome="budget_exceeded",
@@ -4488,7 +4765,7 @@ class OpenRouterGateway:
                         authorization_reservation = None
                 if authorization_reservation is None:
                     try:
-                        self.ledger.reconcile_pit_optimizer(
+                        self.pit_optimizer_ledger.reconcile_pit_optimizer(
                             budget_reservation,
                             Usage(),
                             request_started=False,
@@ -12437,7 +12714,7 @@ class AuditTrail:
         """Persist one exact paid-call record without any provider content or headers."""
         if not isinstance(record, ProviderCallRecord):
             raise AuditError("provider call audit requires a validated record")
-        optimizer_record = record.schema_version == 2 and record.role in {
+        optimizer_record = record.schema_version == 3 and record.role in {
             "investigator",
             "author",
             "critic",
@@ -12460,7 +12737,7 @@ class AuditTrail:
                 or lifecycle.budget_state is None
             ):
                 raise AuditError("optimizer gateway lifecycle is not sealed")
-            gateway.ledger.verify_pit_optimizer_reconciliation(
+            gateway.pit_optimizer_ledger.verify_pit_optimizer_reconciliation(
                 lifecycle.budget_reservation,
                 lifecycle.usage,
                 request_started=lifecycle.facts.request_started,
@@ -12488,7 +12765,10 @@ class AuditTrail:
         path = self.run_root / f"provider-call-{record.call_index:04d}.json"
         budget_recovery_sha256: str | None = None
         try:
-            primitive = _sanitize_audit_value(asdict(record), self._known_secrets)
+            primitive = _sanitize_audit_value(
+                _provider_call_record_primitive(record),
+                self._known_secrets,
+            )
             if path.exists() or path.is_symlink():
                 existing, digest = self._read_protected_json(
                     path,
@@ -12562,7 +12842,7 @@ class AuditTrail:
             details["run_manifest_sha256"] = run_manifest_sha256
         if lifecycle_audit_sha256 is not None:
             details["lifecycle_audit_sha256"] = lifecycle_audit_sha256
-        if record.schema_version == 2 and record.role in {
+        if record.schema_version == 3 and record.role in {
             "investigator",
             "author",
             "critic",
@@ -12575,9 +12855,8 @@ class AuditTrail:
                     "locally_accounted": record.locally_accounted,
                     "authoritative_spend_known": record.authoritative_spend_known,
                     "exposure_basis": record.exposure_basis,
-                    "maximum_exposure_usd": record.maximum_exposure_usd,
                     "maximum_exposure_tokens": record.maximum_exposure_tokens,
-                    "frozen_pricing_sha256": record.frozen_pricing_sha256,
+                    "pricing_snapshot_sha256": record.pricing_snapshot_sha256,
                     "ledger_snapshot": asdict(record.ledger_snapshot),
                 }
             )
@@ -12594,7 +12873,7 @@ class AuditTrail:
                     ),
                     "budget_reservation_sha256": hashlib.sha256(
                         _canonical_json_bytes(
-                            BudgetLedger._pit_optimizer_reservation_primitive(
+                            PitOptimizerResourceLedger._pit_optimizer_reservation_primitive(
                                 _optimizer_lifecycle.budget_reservation
                             )
                         )
@@ -12611,8 +12890,7 @@ class AuditTrail:
                     "budget_recovery_sha256": budget_recovery_sha256,
                 }
             )
-            if record.retained_reservation_usd is not None:
-                details["retained_reservation_usd"] = record.retained_reservation_usd
+            if record.retained_reservation_tokens is not None:
                 details["retained_reservation_tokens"] = record.retained_reservation_tokens
         elif record.schema_version == 2:
             details.update(
@@ -12689,7 +12967,10 @@ class AuditTrail:
         ):
             raise AuditError("provider call lifecycle audit digest is invalid")
         path = self.run_root / f"provider-call-{record.call_index:04d}.json"
-        primitive = _sanitize_audit_value(asdict(record), self._known_secrets)
+        primitive = _sanitize_audit_value(
+            _provider_call_record_primitive(record),
+            self._known_secrets,
+        )
         try:
             existing, digest = self._read_protected_json(
                 path,
@@ -12723,7 +13004,7 @@ class AuditTrail:
             details["run_manifest_sha256"] = run_manifest_sha256
         if lifecycle_audit_sha256 is not None:
             details["lifecycle_audit_sha256"] = lifecycle_audit_sha256
-        if record.schema_version == 2 and record.role in {
+        if record.schema_version == 3 and record.role in {
             "investigator",
             "author",
             "critic",
@@ -12736,16 +13017,12 @@ class AuditTrail:
                     "locally_accounted": record.locally_accounted,
                     "authoritative_spend_known": record.authoritative_spend_known,
                     "exposure_basis": record.exposure_basis,
-                    "maximum_exposure_usd": record.maximum_exposure_usd,
                     "maximum_exposure_tokens": record.maximum_exposure_tokens,
-                    "frozen_pricing_sha256": record.frozen_pricing_sha256,
+                    "pricing_snapshot_sha256": record.pricing_snapshot_sha256,
                     "ledger_snapshot": asdict(record.ledger_snapshot),
                 }
             )
-            if record.retained_reservation_usd is not None:
-                details["retained_reservation_usd"] = (
-                    record.retained_reservation_usd
-                )
+            if record.retained_reservation_tokens is not None:
                 details["retained_reservation_tokens"] = (
                     record.retained_reservation_tokens
                 )
@@ -12797,7 +13074,9 @@ class AuditTrail:
             ledger_snapshot = values.get("ledger_snapshot")
             if not isinstance(ledger_snapshot, dict):
                 raise AuditError("optimizer provider ledger snapshot is malformed")
-            values["ledger_snapshot"] = BudgetSnapshot(**ledger_snapshot)
+            values["ledger_snapshot"] = PitOptimizerResourceSnapshot(
+                **ledger_snapshot
+            )
             if values.get("protocol_failure_code") is not None:
                 values["protocol_failure_code"] = ProtocolFailureCode(
                     values["protocol_failure_code"]
@@ -12807,7 +13086,7 @@ class AuditTrail:
                     values["failure_phase"]
                 )
             record = ProviderCallRecord(**values)
-            if record.schema_version != 2 or record.role not in {
+            if record.schema_version != 3 or record.role not in {
                 "investigator",
                 "author",
                 "critic",
@@ -12834,7 +13113,7 @@ class AuditTrail:
             returned_model=(
                 None if record.returned_model == "unknown" else record.returned_model
             ),
-            frozen_pricing_sha256=str(record.frozen_pricing_sha256),
+            pricing_snapshot_sha256=str(record.pricing_snapshot_sha256),
             outcome=record.outcome,
             request_started=bool(record.request_started),
             response_received=bool(record.response_received),
@@ -12848,7 +13127,6 @@ class AuditTrail:
             total_tokens=record.total_tokens,
             cost_usd=record.cost_usd,
             retained_reservation_tokens=(record.retained_reservation_tokens or 0),
-            retained_reservation_usd=(record.retained_reservation_usd or 0.0),
             audit_sha256=lifecycle_audit_sha256,
         )
 
@@ -12895,8 +13173,7 @@ class AuditTrail:
         if not isinstance(limits, dict):
             raise AuditError("optimizer budget recovery limits are absent")
         try:
-            verifier = BudgetLedger(
-                max_usd=limits["max_usd"],
+            verifier = PitOptimizerResourceLedger(
                 max_calls=limits["max_calls"],
                 max_tokens=limits["max_tokens"],
             )
@@ -12907,7 +13184,7 @@ class AuditTrail:
             )
         except (AuditError, ConfigurationError, KeyError, TypeError, ValueError) as exc:
             raise AuditError("optimizer budget recovery evidence is invalid") from exc
-        if _budget_snapshot(verifier) != record.ledger_snapshot:
+        if _pit_optimizer_resource_snapshot(verifier) != record.ledger_snapshot:
             raise AuditError("optimizer budget recovery snapshot differs")
         budget_reservation_id = details.get("budget_reservation_id")
         reconciliations = state.get("reconciliations")
@@ -13144,9 +13421,8 @@ class AuditTrail:
             "locally_accounted": record.locally_accounted,
             "authoritative_spend_known": record.authoritative_spend_known,
             "exposure_basis": record.exposure_basis,
-            "maximum_exposure_usd": record.maximum_exposure_usd,
             "maximum_exposure_tokens": record.maximum_exposure_tokens,
-            "frozen_pricing_sha256": record.frozen_pricing_sha256,
+            "pricing_snapshot_sha256": record.pricing_snapshot_sha256,
             "ledger_snapshot": asdict(record.ledger_snapshot),
             "audit_run_id": self.run_id,
             "terminal_code": terminal_code,
@@ -13162,10 +13438,7 @@ class AuditTrail:
         }
         if payload_sha256 is not None:
             expected_details["payload_sha256"] = payload_sha256
-        if record.retained_reservation_usd is not None:
-            expected_details["retained_reservation_usd"] = (
-                record.retained_reservation_usd
-            )
+        if record.retained_reservation_tokens is not None:
             expected_details["retained_reservation_tokens"] = (
                 record.retained_reservation_tokens
             )
@@ -13244,8 +13517,6 @@ class AuditTrail:
             != authorization_reservation.reservation_id
             or record.maximum_exposure_tokens
             != authorization_reservation.reserved_tokens
-            or Decimal(str(record.maximum_exposure_usd))
-            != Decimal(str(authorization_reservation.reserved_usd))
         ):
             raise AuditError("optimizer terminal audit receipt differs")
         return budget_state
@@ -14148,6 +14419,28 @@ def _budget_snapshot(ledger: BudgetLedger) -> BudgetSnapshot:
             "authoritative"
             if ledger.incomplete_accounting_calls == 0
             else "authoritative_plus_retained_reservations"
+        ),
+    )
+
+
+def _pit_optimizer_resource_snapshot(
+    ledger: PitOptimizerResourceLedger,
+) -> PitOptimizerResourceSnapshot:
+    if not isinstance(ledger, PitOptimizerResourceLedger):
+        raise ConfigurationError("optimizer resource ledger is invalid")
+    return PitOptimizerResourceSnapshot(
+        api_calls=ledger.calls,
+        prompt_tokens=ledger.prompt_tokens,
+        completion_tokens=ledger.completion_tokens,
+        total_tokens=ledger.total_tokens,
+        reserved_tokens=ledger.reserved_tokens,
+        authoritative_usd=ledger.authoritative_usd,
+        retained_reservation_tokens=ledger.retained_reservation_tokens,
+        incomplete_accounting_calls=ledger.incomplete_accounting_calls,
+        accounting_basis=(
+            "authoritative"
+            if ledger.incomplete_accounting_calls == 0
+            else "authoritative_plus_retained_tokens"
         ),
     )
 
@@ -18137,7 +18430,6 @@ def _build_pit_optimizer_v2_config(
                 "authorize_policy_source_transmission",
                 False,
             ),
-            max_usd=getattr(namespace, "max_usd", None),
             max_api_calls=max_api_calls,
             max_tokens=getattr(namespace, "max_tokens", None),
             max_iterations=getattr(namespace, "max_iterations", None),
@@ -18212,14 +18504,22 @@ def _preauthorize_pit_optimizer_v2_live_run(
     *,
     readiness: PitOptimizerReadiness,
     authenticate: Callable[[PitOptimizerGateConfig, PitOptimizerReadiness], None],
-    freeze_pricing: Callable[[str], FrozenModelPricing],
-    preflight_call: Callable[[PitOptimizerCallBudget, FrozenModelPricing], None],
+    freeze_pricing: Callable[[str], OptimizerPricingSnapshot],
+    preflight_call: Callable[
+        [PitOptimizerCallBudget, OptimizerPricingSnapshot],
+        Decimal | None,
+    ],
     open_run_lease: Callable[
-        [PitOptimizerGateConfig, PitOptimizerReadiness, FrozenModelPricing],
+        [
+            PitOptimizerGateConfig,
+            PitOptimizerReadiness,
+            OptimizerPricingSnapshot,
+            Decimal | None,
+        ],
         AuthorizationRunLease,
     ],
     build_services: Callable[
-        [PitOptimizerReadiness, FrozenModelPricing, AuthorizationRunLease],
+        [PitOptimizerReadiness, OptimizerPricingSnapshot, AuthorizationRunLease],
         PitOptimizerServices,
     ],
 ) -> PitOptimizerLiveRun:
@@ -18239,9 +18539,23 @@ def _preauthorize_pit_optimizer_v2_live_run(
     ):
         raise ConfigurationError("PIT optimizer live call plan is invalid")
     pricing = freeze_pricing(manifest.model)
-    for plan in plans:
-        preflight_call(plan, pricing)
-    lease = open_run_lease(config, readiness, pricing)
+    projections = tuple(preflight_call(plan, pricing) for plan in plans)
+    if pricing.lookup_status == "available":
+        if any(value is None for value in projections):
+            raise ConfigurationError(
+                "available optimizer pricing lacks a plan projection"
+            )
+        projected_plan_usd: Decimal | None = sum(
+            (value for value in projections if value is not None),
+            Decimal("0"),
+        )
+    else:
+        if any(value is not None for value in projections):
+            raise ConfigurationError(
+                "unavailable optimizer pricing produced a plan projection"
+            )
+        projected_plan_usd = None
+    lease = open_run_lease(config, readiness, pricing, projected_plan_usd)
     services = build_services(readiness, pricing, lease)
     return PitOptimizerLiveRun(
         readiness=readiness,
@@ -18439,8 +18753,7 @@ def _build_pit_optimizer_v2_live_run(
         runtime_root / "pit_optimizer_authorization_ledger.jsonl",
         manifest,
     )
-    budget = BudgetLedger(
-        max_usd=config.max_usd,
+    budget = PitOptimizerResourceLedger(
         max_calls=config.max_api_calls,
         max_tokens=config.max_tokens,
     )
@@ -18463,7 +18776,7 @@ def _build_pit_optimizer_v2_live_run(
     build_gateway = gateway_factory or OpenRouterGateway
     gateway = build_gateway(
         run_id=manifest.run_id,
-        ledger=budget,
+        pit_optimizer_ledger=budget,
         timeout_seconds=api_timeout_seconds,
         max_attempts=1,
         controller_root=config.source_root,
@@ -18549,7 +18862,7 @@ def _build_pit_optimizer_v2_live_run(
         evaluator_box["data"] = evaluator
         worker_sequence = 0
 
-    def freeze_pricing(model: str) -> FrozenModelPricing:
+    def freeze_pricing(model: str) -> OptimizerPricingSnapshot:
         return gateway.freeze_pit_optimizer_pricing(
             model=model,
             wall_deadline=deadline,
@@ -18558,8 +18871,8 @@ def _build_pit_optimizer_v2_live_run(
 
     def preflight_call(
         plan: PitOptimizerCallBudget,
-        pricing: FrozenModelPricing,
-    ) -> None:
+        pricing: OptimizerPricingSnapshot,
+    ) -> Decimal | None:
         static_bytes = PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[plan.role].encode("utf-8")
         static_bytes += json.dumps(
             pit_optimizer_response_format(plan.role),
@@ -18568,7 +18881,7 @@ def _build_pit_optimizer_v2_live_run(
             ensure_ascii=False,
         ).encode("utf-8")
         rendered_bytes = len(static_bytes) + plan.max_dynamic_input_bytes
-        conservative_cost = conservative_call_cost_usd(
+        projected_cost = conservative_call_cost_usd(
             rendered_prompt_bytes=rendered_bytes,
             max_output_tokens=plan.max_output_tokens,
             pricing=pricing,
@@ -18576,16 +18889,17 @@ def _build_pit_optimizer_v2_live_run(
         if (
             len(static_bytes) > plan.max_static_input_bytes
             or rendered_bytes > plan.max_input_tokens
-            or conservative_cost > Decimal(str(plan.max_usd))
         ):
             raise BudgetExceededError(
                 "PIT optimizer complete call plan exceeds a sealed cap"
             )
+        return projected_cost
 
     def open_run_lease(
         supplied_config: PitOptimizerGateConfig,
         supplied_readiness: PitOptimizerReadiness,
-        pricing: FrozenModelPricing,
+        pricing: OptimizerPricingSnapshot,
+        projected_plan_usd: Decimal | None,
     ) -> AuthorizationRunLease:
         if supplied_config is not config or supplied_readiness is not readiness:
             raise ConfigurationError("PIT optimizer lease inputs changed")
@@ -18595,14 +18909,15 @@ def _build_pit_optimizer_v2_live_run(
                 manifest.authorization_requirement.sha256
             ),
             run_manifest_sha256=manifest.sha256,
-            frozen_pricing_sha256=pricing.pricing_sha256,
+            pricing_snapshot=pricing,
+            projected_plan_usd=projected_plan_usd,
         )
         opened_lease.append(lease)
         return lease
 
     def build_services(
         supplied_readiness: PitOptimizerReadiness,
-        pricing: FrozenModelPricing,
+        pricing: OptimizerPricingSnapshot,
         lease: AuthorizationRunLease,
     ) -> PitOptimizerServices:
         nonlocal worker_sequence
@@ -18882,7 +19197,7 @@ def _build_pit_optimizer_v2_live_run(
                 candidate.aggregate,
                 excess_total_return_pp=hidden_excess,
             )
-            accounting = _budget_snapshot(budget)
+            accounting = _pit_optimizer_resource_snapshot(budget)
             decision = HoldoutDecision.from_result(
                 excess_total_return_pp=hidden_excess,
                 closed_trades=candidate_aggregate.closed_trades,
@@ -18958,7 +19273,7 @@ def _build_pit_optimizer_v2_live_run(
         pricing_claimed = False
         lease_claimed = False
 
-        def cached_pricing(model: str) -> FrozenModelPricing:
+        def cached_pricing(model: str) -> OptimizerPricingSnapshot:
             nonlocal pricing_claimed
             if pricing_claimed or model != manifest.model:
                 raise ConfigurationError("PIT optimizer pricing capability was reused")
@@ -18967,7 +19282,7 @@ def _build_pit_optimizer_v2_live_run(
 
         def cached_lease(
             supplied: PitOptimizerReadiness,
-            frozen: FrozenModelPricing,
+            frozen: OptimizerPricingSnapshot,
         ) -> AuthorizationRunLease:
             nonlocal lease_claimed
             if lease_claimed or supplied is not readiness or frozen is not pricing:
@@ -18980,7 +19295,7 @@ def _build_pit_optimizer_v2_live_run(
             role_input: object,
             parser: Callable[[str], object],
             active: AuthorizationRunLease,
-            frozen: FrozenModelPricing,
+            frozen: OptimizerPricingSnapshot,
         ) -> PitOptimizerRoleCall:
             if plan.call_index != len(completed_role_calls) + 1:
                 raise ConfigurationError(
