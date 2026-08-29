@@ -12611,7 +12611,14 @@ class AuditTrail:
                 if not root.is_dir():
                     raise AuditError("audit run directory is absent")
             else:
-                root.mkdir(mode=0o700)
+                # Windows maps 0o700 to a process-isolated ACL in this desktop
+                # environment, which prevents a later controller process from
+                # replaying or reconciling the durable audit trail.  Inherit
+                # the already authenticated artifact-root ACL instead.
+                if os.name == "nt":
+                    root.mkdir()
+                else:
+                    root.mkdir(mode=0o700)
         except (OSError, AuditError) as exc:
             raise AuditError("audit run directory could not be created privately") from exc
         if root.is_symlink() or _has_reparse_point(root) or not root.is_dir():
