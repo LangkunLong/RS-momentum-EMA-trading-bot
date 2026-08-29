@@ -1173,6 +1173,15 @@ def _require_first_call_plan(
             "author": (12_000, 76_000, 88_000, 4_000, 16 * 1024, 0.09),
             "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
         },
+        {
+            # The observed R1 reasoning envelope can exceed 8k completion
+            # tokens.  Tighten the conservative dynamic-input slices (still
+            # above the sealed worst-case render) to fund a 16k investigator
+            # output cap without changing the 448,000-token aggregate.
+            "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024, 0.08),
+            "author": (12_000, 70_000, 82_000, 4_000, 16 * 1024, 0.09),
+            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
+        },
     )
     if max_iterations != 2 or len(call_budgets) != 6:
         raise ValueError("first subset canary requires two complete iterations")
