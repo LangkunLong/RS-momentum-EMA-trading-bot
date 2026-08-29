@@ -1192,11 +1192,12 @@ def _require_first_call_plan(
             # iteration so that this complete plan passes its conservative
             # preflight without changing the token envelope or call order.
             # R1 author responses can include a larger reasoning envelope than
-            # the requested output cap; reserve the same headroom used by the
-            # investigator while tightening the author input slice to the
-            # measured worst-case render (48,289 bytes plus static context).
+            # the requested output cap.  Keep a 14k completion envelope while
+            # tightening the author input slice to the measured worst-case
+            # render (48,289 bytes plus static context); the resulting
+            # conservative cost stays within the $0.07 author cap.
             "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024, 0.10),
-            "author": (12_000, 58_000, 70_000, 16_000, 16 * 1024, 0.07),
+            "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024, 0.07),
             "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
         },
     )
