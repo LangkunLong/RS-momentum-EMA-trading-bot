@@ -1,7 +1,7 @@
 # PIT Optimizer Audit-Only USD Design
 
 **Date:** 2026-08-28
-**Status:** Approved in chat; awaiting written-spec review
+**Status:** Approved
 **Supersedes:** The independently enforced USD ceilings in
 `2026-08-27-model-authored-pit-optimizer-design.md`
 
@@ -149,12 +149,19 @@ policy behavior:
 
 - `core/pit_optimization_contract.py`: schema and role-plan validation;
 - `core/pit_optimizer_authorization.py`: grant/window/lease and reconciliation;
+- `core/pit_optimizer_evaluation.py`: provider-free manifest CLI envelopes;
+- `core/pit_optimizer_controller.py`: call/token stop conditions and accounting
+  summaries;
+- `core/pit_optimizer_artifacts.py`: schema-v3 artifact admission;
+- `core/pit_optimization.py`: schema-v3 readiness construction and loading;
 - `agent_loop.py`: pricing preflight, budget ledger, CLI summaries, and live
   service composition;
 - optimizer-focused tests and fixture builders that encode schema-v2 USD gates.
 
-Candidate patch bounds, editable policy paths, scoring, replay evaluation, and
-promotion rules do not change.
+Candidate patch bounds, editable policy paths, discovery scoring, hidden
+eligibility criteria, and replay evaluation logic do not change. The subset
+controller defers hidden-evaluation invocation so the architecture canary ends
+with discovery eligibility and keeps the hidden fold sealed.
 
 This is a PIT optimizer schema-v3 change only. Legacy diagnosis and proposal
 routes retain their existing cost controls; shared ledger code must not make
