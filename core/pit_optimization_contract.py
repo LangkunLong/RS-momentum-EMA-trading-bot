@@ -467,7 +467,6 @@ class PitOptimizerCallBudget(_V2Canonical):
     max_input_tokens: int
     max_output_tokens: int
     max_response_bytes: int
-    max_usd: float
 
     def __post_init__(self) -> None:
         _require_positive_int(self.call_index, "optimizer call index")
@@ -485,13 +484,6 @@ class PitOptimizerCallBudget(_V2Canonical):
             _require_positive_int(getattr(self, name), f"optimizer call {name}")
         if self.max_static_input_bytes + self.max_dynamic_input_bytes > self.max_input_tokens:
             raise ValueError("optimizer call input sections exceed the input token cap")
-        if (
-            isinstance(self.max_usd, bool)
-            or type(self.max_usd) not in {int, float}
-            or not math.isfinite(float(self.max_usd))
-            or float(self.max_usd) <= 0
-        ):
-            raise ValueError("optimizer call USD cap must be positive and finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,7 +550,6 @@ class AuthorizationRequirement(_V2Canonical):
     window_id: str
     max_calls: int
     max_tokens: int
-    max_usd: float
     policy_source_scope_sha256: str
     provider_retries: int
     apply: bool
@@ -567,13 +558,6 @@ class AuthorizationRequirement(_V2Canonical):
         _v2_identifier(self.window_id, "authorization window ID")
         _require_positive_int(self.max_calls, "authorization call cap")
         _require_positive_int(self.max_tokens, "authorization token cap")
-        if (
-            isinstance(self.max_usd, bool)
-            or type(self.max_usd) not in {int, float}
-            or not math.isfinite(float(self.max_usd))
-            or float(self.max_usd) <= 0
-        ):
-            raise ValueError("authorization USD cap must be positive and finite")
         _require_digest(
             self.policy_source_scope_sha256,
             "authorization policy source scope SHA-256",
@@ -617,7 +601,7 @@ class PitOptimizerRunManifest(_V2Canonical):
     authorization_requirement: AuthorizationRequirement
 
     def __post_init__(self) -> None:
-        if self.schema_version != 2:
+        if self.schema_version != 3:
             raise ValueError("optimizer run manifest schema is unsupported")
         _v2_identifier(self.run_id, "optimizer run ID")
         if self.run_kind != "subset_canary":
@@ -727,11 +711,6 @@ class PitOptimizerRunManifest(_V2Canonical):
                 raise ValueError("first subset canary tokens must be exactly 448000")
         if total_tokens != self.authorization_requirement.max_tokens:
             raise ValueError("optimizer tokens must exactly consume authorization")
-        if (
-            sum(float(item.max_usd) for item in self.call_budgets)
-            > float(self.authorization_requirement.max_usd) + 1e-12
-        ):
-            raise ValueError("optimizer USD exceeds authorization")
         _require_first_call_plan(
             self.call_budgets,
             max_iterations=self.max_iterations,
@@ -739,15 +718,9 @@ class PitOptimizerRunManifest(_V2Canonical):
         if (
             self.authorization_requirement.max_calls != 6
             or self.authorization_requirement.max_tokens != 448_000
-            or not math.isclose(
-                float(self.authorization_requirement.max_usd),
-                0.40,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
         ):
             raise ValueError(
-                "first subset canary authorization ceilings are invalid"
+                "first subset canary authorization limits are invalid"
             )
 
     @property
@@ -772,7 +745,6 @@ class PitOptimizerGateConfig:
     authorization_window_id: str | None
     authorization_requirement_sha256: str
     source_transmission_authorized: bool
-    max_usd: float
     max_api_calls: int
     max_tokens: int
     max_iterations: int
@@ -941,21 +913,8 @@ class PitOptimizerGateConfig:
         _require_positive_int(self.max_tokens, "optimizer gate token cap")
         _require_positive_int(self.max_iterations, "optimizer gate iteration cap")
         if (
-            isinstance(self.max_usd, bool)
-            or type(self.max_usd) not in {int, float}
-            or not math.isfinite(float(self.max_usd))
-            or float(self.max_usd) <= 0
-        ):
-            raise ValueError("optimizer gate USD cap is invalid")
-        if (
             authorization.get("max_calls") != self.max_api_calls
             or authorization.get("max_tokens") != self.max_tokens
-            or not math.isclose(
-                float(authorization.get("max_usd", -1)),
-                float(self.max_usd),
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
             or primitive.get("max_iterations") != self.max_iterations
         ):
             raise ValueError("optimizer gate ceilings differ from manifest")
@@ -1152,55 +1111,11 @@ def _require_first_call_plan(
     *,
     max_iterations: int,
 ) -> None:
-    expected_profiles = (
-        {
-            "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
-            "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
-        },
-        {
-            # The current R1 price schedule makes the original investigator
-            # slice too small for its sealed prompt/output maximum.  This
-            # alternate profile still totals exactly USD 0.40 across two
-            # iterations while preserving the complete 448,000-token
-            # envelope and zero-retry call order.
-            "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.08),
-            "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.09),
-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
-        },
-        {
-            # DeepSeek R1 may account a small reasoning suffix beyond the
-            # request's nominal output cap.  Give the investigator enough
-            # sealed headroom while moving the same output allowance from
-            # the author, keeping the aggregate 448,000-token ceiling intact.
-            "investigator": (8_000, 80_000, 88_000, 8_000, 8 * 1024, 0.08),
-            "author": (12_000, 76_000, 88_000, 4_000, 16 * 1024, 0.09),
-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
-        },
-        {
-            # The observed R1 reasoning envelope can exceed 8k completion
-            # tokens.  Tighten the conservative dynamic-input slices (still
-            # above the sealed worst-case render) to fund a 16k investigator
-            # output cap without changing the 448,000-token aggregate.
-            "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024, 0.08),
-            "author": (12_000, 70_000, 82_000, 4_000, 16 * 1024, 0.09),
-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
-        },
-        {
-            # The sealed investigator envelope costs just under ten cents at
-            # the frozen R1 schedule.  Rebalance the same USD 0.20 per
-            # iteration so that this complete plan passes its conservative
-            # preflight without changing the token envelope or call order.
-            # R1 author responses can include a larger reasoning envelope than
-            # the requested output cap.  Keep a 14k completion envelope while
-            # tightening the author input slice to the measured worst-case
-            # render (48,289 bytes plus static context); the resulting
-            # conservative cost stays within the $0.07 author cap.
-            "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024, 0.10),
-            "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024, 0.07),
-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
-        },
-    )
+    expected_profile = {
+        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
+        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
+    }
     if max_iterations != 2 or len(call_budgets) != 6:
         raise ValueError("first subset canary requires two complete iterations")
     for budget in call_budgets:
@@ -1210,10 +1125,9 @@ def _require_first_call_plan(
             budget.max_input_tokens,
             budget.max_output_tokens,
             budget.max_response_bytes,
-            float(budget.max_usd),
         )
-        if budget.model != PIT_OPTIMIZER_R1_MODEL or not any(
-            actual == profile.get(budget.role) for profile in expected_profiles
+        if budget.model != PIT_OPTIMIZER_R1_MODEL or actual != expected_profile.get(
+            budget.role
         ):
             raise ValueError("first subset canary call caps are invalid")
 
@@ -1405,13 +1319,12 @@ def build_subset_manifest(
         window_id=f"window_{uuid.uuid4().hex}",
         max_calls=6,
         max_tokens=448_000,
-        max_usd=0.40,
         policy_source_scope_sha256=scope.sha256,
         provider_retries=0,
         apply=False,
     )
     return PitOptimizerRunManifest(
-        schema_version=2,
+        schema_version=3,
         run_id=f"run_{uuid.uuid4().hex}",
         run_kind="subset_canary",
         model=PIT_OPTIMIZER_R1_MODEL,
@@ -1552,8 +1465,6 @@ def build_prepare_command(
         manifest.effective_policy_sha256,
         "--optimizer-authorization-requirement-sha256",
         manifest.authorization_requirement.sha256,
-        "--max-usd",
-        "0.40",
         "--max-api-calls",
         "6",
         "--max-tokens",

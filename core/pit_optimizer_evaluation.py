@@ -1254,7 +1254,6 @@ def _manifest_cli_parser() -> argparse.ArgumentParser:
             "response-bytes",
         ):
             build.add_argument(f"--{role}-{suffix}", type=int, required=True)
-        build.add_argument(f"--{role}-max-usd", type=float, required=True)
     build.add_argument("--max-files", type=int, required=True)
     build.add_argument("--max-hunks", type=int, required=True)
     build.add_argument("--max-changed-lines", type=int, required=True)
@@ -1299,14 +1298,13 @@ def _call_budgets_from_namespace(namespace: argparse.Namespace) -> tuple[object,
                         namespace,
                         f"{prefix}_response_bytes",
                     ),
-                    max_usd=getattr(namespace, f"{prefix}_max_usd"),
                 )
             )
     return tuple(budgets)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Build one provider-free schema-v2 subset manifest and prepare command."""
+    """Build one provider-free schema-v3 subset manifest and prepare command."""
     namespace = _manifest_cli_parser().parse_args(
         list(sys.argv[1:] if argv is None else argv)
     )
@@ -1390,7 +1388,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "authorization": {
                     "max_calls": manifest.authorization_requirement.max_calls,
                     "max_tokens": manifest.authorization_requirement.max_tokens,
-                    "max_usd": manifest.authorization_requirement.max_usd,
                 },
             },
             sort_keys=True,
