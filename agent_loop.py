@@ -18940,6 +18940,12 @@ def _build_pit_optimizer_v2_live_run(
                 "stagnation_limit": "early_stop",
                 "cancelled": "cancelled",
                 "budget_exhausted": "budget_exhausted",
+                # A provider-side per-call cap rejection is durably reconciled
+                # with the budget terminal code before control returns here.
+                # Keep finalization idempotent instead of attempting a
+                # conflicting generic failure close on the already-closed
+                # one-shot lease.
+                "authorization_exhausted": "budget_exhausted",
             }.get(terminal_code, "failed")
             authorization.close_run_lease(active, terminal_code=mapped)
 
