@@ -1,4 +1,4 @@
-"""Explicit, append-only authorization for schema-v2 PIT optimizer runs.
+"""Explicit, append-only authorization for schema-v3 PIT optimizer runs.
 
 Preparing a manifest never calls this module.  Authority is created only by an
 explicit ``record-grant`` API/CLI invocation against an authenticated manifest.
@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import threading
+from types import MappingProxyType
 from typing import Iterator, Mapping, Sequence
 
 from core.pit_optimization_contract import (
@@ -72,15 +73,6 @@ def _positive_int(value: object, label: str) -> int:
     return value
 
 
-def _positive_usd(value: object, label: str) -> float:
-    if isinstance(value, bool) or type(value) not in {int, float}:
-        raise ValueError(f"{label} must be positive and finite")
-    normalized = float(value)
-    if not math.isfinite(normalized) or normalized <= 0:
-        raise ValueError(f"{label} must be positive and finite")
-    return normalized
-
-
 def _canonical_json_bytes(value: object) -> bytes:
     return (
         json.dumps(
@@ -103,24 +95,31 @@ def _canonical_decimal_text(value: Decimal) -> str:
     return rendered
 
 
-def _frozen_pricing_digest(
+def _optimizer_pricing_digest(
     model: str,
-    prompt_per_million: Decimal,
-    completion_per_million: Decimal,
+    lookup_status: str,
+    prompt: Decimal | None,
+    completion: Decimal | None,
 ) -> str:
     payload = {
         "model": model,
-        "prompt_per_million": _canonical_decimal_text(prompt_per_million),
-        "completion_per_million": _canonical_decimal_text(completion_per_million),
+        "lookup_status": lookup_status,
+        "prompt_per_million": (
+            None if prompt is None else _canonical_decimal_text(prompt)
+        ),
+        "completion_per_million": (
+            None if completion is None else _canonical_decimal_text(completion)
+        ),
     }
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def _canonical_optional_decimal(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+        raise ValueError(f"{label} must be a finite non-negative Decimal or null")
+    return _canonical_decimal_text(value)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -145,19 +144,87 @@ def _approval_reference_sha256(value: object) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _authorization_record_digest(record: Mapping[str, object]) -> str:
+    preimage = dict(record)
+    preimage.pop("record_sha256", None)
+    return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
+
+
+def _freeze_json_value(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {str(key): _freeze_json_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json_value(item) for item in value)
+    return value
+
+
+def read_legacy_authorization_history(
+    path: Path,
+) -> tuple[Mapping[str, object], ...]:
+    """Verify and expose schema-v2 records as immutable, non-resumable history."""
+
+    candidate = Path(path)
+    if (
+        not candidate.is_absolute()
+        or not candidate.is_file()
+        or candidate.is_symlink()
+    ):
+        raise AuthorizationError("legacy authorization history path is invalid")
+    raw = candidate.read_bytes()
+    if raw and not raw.endswith(b"\n"):
+        raise AuthorizationError("legacy authorization history has a partial record")
+    records: list[Mapping[str, object]] = []
+    previous = _ZERO_SHA256
+    for index, line in enumerate(raw.splitlines(keepends=True), start=1):
+        try:
+            value = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
+        except (UnicodeDecodeError, json.JSONDecodeError, AuthorizationError) as exc:
+            raise AuthorizationError(
+                "legacy authorization history contains invalid JSON"
+            ) from exc
+        if not isinstance(value, dict) or line != _canonical_json_bytes(value):
+            raise AuthorizationError(
+                "legacy authorization history record is not canonical JSON"
+            )
+        if value.get("schema_version") != 2 or value.get("record_index") != index:
+            raise AuthorizationError(
+                "legacy authorization history record index is invalid"
+            )
+        if value.get("previous_record_sha256") != previous:
+            raise AuthorizationError(
+                "legacy authorization history hash chain is broken"
+            )
+        try:
+            digest = _require_digest(
+                value.get("record_sha256"),
+                "legacy authorization history record SHA-256",
+            )
+        except ValueError as exc:
+            raise AuthorizationError(str(exc)) from exc
+        if digest != _authorization_record_digest(value):
+            raise AuthorizationError(
+                "legacy authorization history record digest differs"
+            )
+        frozen = _freeze_json_value(value)
+        assert isinstance(frozen, Mapping)
+        records.append(frozen)
+        previous = digest
+    return tuple(records)
+
+
 @dataclass(frozen=True, slots=True)
 class OperatorAuthorizationGrant:
     grant_id: str
     additional_calls: int
     additional_tokens: int
-    additional_usd: float
     policy_source_scope_sha256: str
 
     def __post_init__(self) -> None:
         _require_id(self.grant_id, "authorization grant ID")
         _positive_int(self.additional_calls, "authorization grant additional calls")
         _positive_int(self.additional_tokens, "authorization grant additional tokens")
-        _positive_usd(self.additional_usd, "authorization grant additional USD")
         _require_digest(
             self.policy_source_scope_sha256,
             "authorization grant policy source scope SHA-256",
@@ -171,7 +238,6 @@ class OperatorAuthorizationWindow:
     authorization_requirement_sha256: str
     max_calls: int
     max_tokens: int
-    max_usd: float
     policy_source_scope_sha256: str
 
     def __post_init__(self) -> None:
@@ -190,7 +256,6 @@ class OperatorAuthorizationWindow:
         )
         _positive_int(self.max_calls, "authorization window call cap")
         _positive_int(self.max_tokens, "authorization window token cap")
-        _positive_usd(self.max_usd, "authorization window USD cap")
         _require_digest(
             self.policy_source_scope_sha256,
             "authorization window policy source scope SHA-256",
@@ -198,48 +263,144 @@ class OperatorAuthorizationWindow:
 
 
 @dataclass(frozen=True, slots=True)
-class FrozenModelPricing:
+class OptimizerPricingSnapshot:
     model: str
-    prompt_per_million: Decimal
-    completion_per_million: Decimal
+    lookup_status: str
+    prompt_per_million: Decimal | None
+    completion_per_million: Decimal | None
     pricing_payload_sha256: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or _MODEL_RE.fullmatch(self.model) is None:
-            raise ValueError("frozen pricing model is invalid")
-        for value in (self.prompt_per_million, self.completion_per_million):
-            if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
-                raise ValueError("frozen pricing rates must be finite non-negative Decimals")
-        _require_digest(self.pricing_payload_sha256, "frozen pricing payload SHA-256")
-        if self.pricing_payload_sha256 != _frozen_pricing_digest(
+            raise ValueError("optimizer pricing model is invalid")
+        if self.lookup_status not in {"available", "unavailable"}:
+            raise ValueError("optimizer pricing lookup status is invalid")
+        if self.lookup_status == "available":
+            for value in (self.prompt_per_million, self.completion_per_million):
+                if (
+                    not isinstance(value, Decimal)
+                    or not value.is_finite()
+                    or value < 0
+                ):
+                    raise ValueError(
+                        "available optimizer pricing rates must be finite "
+                        "non-negative Decimals"
+                    )
+        elif self.prompt_per_million is not None or self.completion_per_million is not None:
+            raise ValueError("unavailable optimizer pricing cannot contain rates")
+        _require_digest(self.pricing_payload_sha256, "optimizer pricing payload SHA-256")
+        if self.pricing_payload_sha256 != _optimizer_pricing_digest(
             self.model,
+            self.lookup_status,
             self.prompt_per_million,
             self.completion_per_million,
         ):
-            raise ValueError("frozen pricing digest differs from model and rates")
+            raise ValueError("optimizer pricing digest differs from its closed payload")
 
     @classmethod
-    def from_rates(
+    def available(
         cls,
         *,
         model: str,
-        prompt_per_million: Decimal,
-        completion_per_million: Decimal,
-    ) -> "FrozenModelPricing":
+        prompt: Decimal,
+        completion: Decimal,
+    ) -> "OptimizerPricingSnapshot":
         return cls(
             model=model,
-            prompt_per_million=prompt_per_million,
-            completion_per_million=completion_per_million,
-            pricing_payload_sha256=_frozen_pricing_digest(
+            lookup_status="available",
+            prompt_per_million=prompt,
+            completion_per_million=completion,
+            pricing_payload_sha256=_optimizer_pricing_digest(
                 model,
-                prompt_per_million,
-                completion_per_million,
+                "available",
+                prompt,
+                completion,
             ),
         )
 
-    @property
-    def pricing_sha256(self) -> str:
-        return self.pricing_payload_sha256
+    @classmethod
+    def unavailable(cls, *, model: str) -> "OptimizerPricingSnapshot":
+        return cls(
+            model=model,
+            lookup_status="unavailable",
+            prompt_per_million=None,
+            completion_per_million=None,
+            pricing_payload_sha256=_optimizer_pricing_digest(
+                model,
+                "unavailable",
+                None,
+                None,
+            ),
+        )
+
+    def projected_call_usd(
+        self,
+        prompt_bytes: int,
+        output_tokens: int,
+    ) -> Decimal | None:
+        if (
+            type(prompt_bytes) is not int
+            or prompt_bytes < 0
+            or type(output_tokens) is not int
+            or output_tokens < 0
+        ):
+            raise ValueError("optimizer pricing projection bounds are invalid")
+        if self.lookup_status == "unavailable":
+            return None
+        assert self.prompt_per_million is not None
+        assert self.completion_per_million is not None
+        return (
+            Decimal(prompt_bytes) * self.prompt_per_million
+            + Decimal(output_tokens) * self.completion_per_million
+        ) / Decimal(1_000_000)
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "model": self.model,
+            "lookup_status": self.lookup_status,
+            "prompt_per_million": (
+                None
+                if self.prompt_per_million is None
+                else _canonical_decimal_text(self.prompt_per_million)
+            ),
+            "completion_per_million": (
+                None
+                if self.completion_per_million is None
+                else _canonical_decimal_text(self.completion_per_million)
+            ),
+            "pricing_payload_sha256": self.pricing_payload_sha256,
+        }
+
+
+def _pricing_snapshot_from_primitive(value: object) -> OptimizerPricingSnapshot:
+    expected = {
+        "model",
+        "lookup_status",
+        "prompt_per_million",
+        "completion_per_million",
+        "pricing_payload_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("optimizer pricing snapshot keys are invalid")
+
+    def rate(name: str) -> Decimal | None:
+        raw = value.get(name)
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise ValueError("optimizer pricing rate is not canonical text")
+        parsed = Decimal(raw)
+        if _canonical_decimal_text(parsed) != raw:
+            raise ValueError("optimizer pricing rate is not canonical text")
+        return parsed
+
+    return OptimizerPricingSnapshot(
+        model=value.get("model"),
+        lookup_status=value.get("lookup_status"),
+        prompt_per_million=rate("prompt_per_million"),
+        completion_per_million=rate("completion_per_million"),
+        pricing_payload_sha256=value.get("pricing_payload_sha256"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,20 +409,36 @@ class AuthorizationRunLease:
     one_shot_key_sha256: str
     window_id: str
     run_manifest_sha256: str
-    frozen_pricing_sha256: str
+    pricing_snapshot_sha256: str
+    pricing_status: str
+    projected_plan_usd: str | None
     max_calls: int
     max_tokens: int
-    max_usd: float
 
     def __post_init__(self) -> None:
         _require_id(self.lease_id, "authorization lease ID")
         _require_digest(self.one_shot_key_sha256, "authorization one-shot key SHA-256")
         _require_id(self.window_id, "authorization lease window ID")
         _require_digest(self.run_manifest_sha256, "authorization lease manifest SHA-256")
-        _require_digest(self.frozen_pricing_sha256, "authorization lease pricing SHA-256")
+        _require_digest(self.pricing_snapshot_sha256, "authorization lease pricing SHA-256")
+        if self.pricing_status not in {"available", "unavailable"}:
+            raise ValueError("authorization lease pricing status is invalid")
+        if self.projected_plan_usd is not None:
+            try:
+                projected = Decimal(self.projected_plan_usd)
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError("authorization lease projection is invalid") from exc
+            if (
+                not isinstance(self.projected_plan_usd, str)
+                or not projected.is_finite()
+                or projected < 0
+                or _canonical_decimal_text(projected) != self.projected_plan_usd
+            ):
+                raise ValueError("authorization lease projection is invalid")
+        if (self.projected_plan_usd is None) is (self.pricing_status == "available"):
+            raise ValueError("authorization lease pricing projection is inconsistent")
         _positive_int(self.max_calls, "authorization lease call cap")
         _positive_int(self.max_tokens, "authorization lease token cap")
-        _positive_usd(self.max_usd, "authorization lease USD cap")
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +449,7 @@ class AuthorizationCallReservation:
     iteration: int
     role: str
     reserved_tokens: int
-    reserved_usd: float
+    projected_call_usd: str | None
 
     def __post_init__(self) -> None:
         _require_id(self.reservation_id, "authorization reservation ID")
@@ -282,7 +459,18 @@ class AuthorizationCallReservation:
         if self.role not in OPTIMIZER_V2_ROLES:
             raise ValueError("authorization reservation role is invalid")
         _positive_int(self.reserved_tokens, "authorization reservation token cap")
-        _positive_usd(self.reserved_usd, "authorization reservation USD cap")
+        if self.projected_call_usd is not None:
+            try:
+                projected = Decimal(self.projected_call_usd)
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError("authorization reservation projection is invalid") from exc
+            if (
+                not isinstance(self.projected_call_usd, str)
+                or not projected.is_finite()
+                or projected < 0
+                or _canonical_decimal_text(projected) != self.projected_call_usd
+            ):
+                raise ValueError("authorization reservation projection is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +480,7 @@ class PitOptimizerProviderFacts:
     role: str
     requested_model: str
     returned_model: str | None
-    frozen_pricing_sha256: str
+    pricing_snapshot_sha256: str
     outcome: str
     request_started: bool
     response_received: bool
@@ -304,7 +492,6 @@ class PitOptimizerProviderFacts:
     total_tokens: int | None
     cost_usd: float | None
     retained_reservation_tokens: int
-    retained_reservation_usd: float
     audit_sha256: str
 
     def __post_init__(self) -> None:
@@ -316,7 +503,7 @@ class PitOptimizerProviderFacts:
             raise ValueError("optimizer requested model is invalid")
         if self.returned_model is not None and _MODEL_RE.fullmatch(self.returned_model) is None:
             raise ValueError("optimizer returned model is invalid")
-        _require_digest(self.frozen_pricing_sha256, "optimizer frozen pricing SHA-256")
+        _require_digest(self.pricing_snapshot_sha256, "optimizer pricing snapshot SHA-256")
         if self.outcome not in {
             "accepted",
             "schema_invalid",
@@ -337,9 +524,6 @@ class PitOptimizerProviderFacts:
         if (
             type(self.retained_reservation_tokens) is not int
             or self.retained_reservation_tokens < 0
-            or type(self.retained_reservation_usd) not in {int, float}
-            or not math.isfinite(float(self.retained_reservation_usd))
-            or self.retained_reservation_usd < 0
         ):
             raise ValueError("optimizer retained reservation is invalid")
         if self.accounting_complete:
@@ -357,7 +541,7 @@ class PitOptimizerProviderFacts:
                 or self.cost_usd < 0
             ):
                 raise ValueError("optimizer authoritative cost is invalid")
-            if self.retained_reservation_tokens != 0 or self.retained_reservation_usd != 0:
+            if self.retained_reservation_tokens != 0:
                 raise ValueError("authoritative optimizer facts cannot retain a reservation")
         else:
             if any(
@@ -372,7 +556,7 @@ class PitOptimizerProviderFacts:
                 raise ValueError("incomplete optimizer accounting cannot claim exact usage")
             if not self.request_started or self.outcome != "uncertain_accounting":
                 raise ValueError("incomplete optimizer accounting lifecycle is inconsistent")
-            if self.retained_reservation_tokens <= 0 or self.retained_reservation_usd <= 0:
+            if self.retained_reservation_tokens <= 0:
                 raise ValueError("incomplete optimizer accounting must retain its reservation")
         if not self.request_started:
             if (
@@ -1224,9 +1408,7 @@ class AuthorizationLedger:
 
     @staticmethod
     def _record_digest(record: dict[str, object]) -> str:
-        preimage = dict(record)
-        preimage.pop("record_sha256", None)
-        return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
+        return _authorization_record_digest(record)
 
     @staticmethod
     def _gateway_lifecycle_base(
@@ -1321,14 +1503,12 @@ class AuthorizationLedger:
                 plan.iteration,
                 plan.role,
                 plan.max_input_tokens + plan.max_output_tokens,
-                Decimal(str(plan.max_usd)),
             )
             != (
                 reservation.call_index,
                 reservation.iteration,
                 reservation.role,
                 reservation.reserved_tokens,
-                Decimal(str(reservation.reserved_usd)),
             )
             or run_manifest_sha256 != lease.run_manifest_sha256
             or not isinstance(audit_run_id, str)
@@ -1481,20 +1661,20 @@ class AuthorizationLedger:
         if not provider_facts.request_started:
             charged_calls = 0
             charged_tokens = 0
-            charged_usd = Decimal("0")
-            charge_basis = "before_send_release"
+            actual_cost_usd: float | None = 0.0
+            cost_accounting_status = "not_started"
         elif provider_facts.accounting_complete:
             assert provider_facts.total_tokens is not None
             assert provider_facts.cost_usd is not None
             charged_calls = 1
             charged_tokens = provider_facts.total_tokens
-            charged_usd = Decimal(str(provider_facts.cost_usd))
-            charge_basis = "authoritative"
+            actual_cost_usd = float(provider_facts.cost_usd)
+            cost_accounting_status = "authoritative"
         else:
             charged_calls = 1
             charged_tokens = provider_facts.retained_reservation_tokens
-            charged_usd = Decimal(str(provider_facts.retained_reservation_usd))
-            charge_basis = "retained_reservation"
+            actual_cost_usd = None
+            cost_accounting_status = "unavailable"
         reservation_primitive = asdict(reservation)
         facts_primitive = asdict(provider_facts)
         return {
@@ -1525,14 +1705,11 @@ class AuthorizationLedger:
                 "retained_reservation_tokens": (
                     provider_facts.retained_reservation_tokens
                 ),
-                "retained_reservation_usd": (
-                    provider_facts.retained_reservation_usd
-                ),
             },
             "charged_calls": charged_calls,
             "charged_tokens": charged_tokens,
-            "charged_usd": _canonical_decimal_text(charged_usd),
-            "charge_basis": charge_basis,
+            "actual_cost_usd": actual_cost_usd,
+            "cost_accounting_status": cost_accounting_status,
             "terminal_outcome": provider_facts.outcome,
             "terminal_code": receipt.terminal_code,
             "payload_sha256": receipt.payload_sha256,
@@ -1785,11 +1962,14 @@ class AuthorizationLedger:
         previous = _ZERO_SHA256
         grants: dict[str, OperatorAuthorizationGrant] = {}
         windows: dict[str, OperatorAuthorizationWindow] = {}
+        pricing_snapshots: dict[str, OptimizerPricingSnapshot] = {}
         leases: dict[str, AuthorizationRunLease] = {}
         one_shot_keys: set[str] = set()
         active_reservations: dict[str, AuthorizationCallReservation] = {}
         reconciled_reservations: set[str] = set()
         closed_leases: set[str] = set()
+        charged_by_lease: dict[str, tuple[int, int]] = {}
+        overage_leases: set[str] = set()
         gateway_lifecycles: dict[str, list[dict[str, object]]] = {}
         for index, line in enumerate(raw.splitlines(keepends=True), start=1):
             try:
@@ -1798,7 +1978,12 @@ class AuthorizationLedger:
                 raise AuthorizationError("authorization ledger contains invalid JSON") from exc
             if not isinstance(value, dict) or line != _canonical_json_bytes(value):
                 raise AuthorizationError("authorization ledger record is not canonical JSON")
-            if value.get("schema_version") != 2 or value.get("record_index") != index:
+            if value.get("schema_version") == 2:
+                raise AuthorizationError(
+                    "schema-v2 authorization history is not resumable; "
+                    "use read_legacy_authorization_history"
+                )
+            if value.get("schema_version") != 3 or value.get("record_index") != index:
                 raise AuthorizationError("authorization ledger record index is invalid")
             if value.get("previous_record_sha256") != previous:
                 raise AuthorizationError("authorization ledger hash chain is broken")
@@ -1830,6 +2015,16 @@ class AuthorizationLedger:
                     grant = OperatorAuthorizationGrant(**primitive)
                 except (TypeError, ValueError) as exc:
                     raise AuthorizationError("authorization grant record is invalid") from exc
+                requirement = self._manifest.authorization_requirement
+                if (
+                    grant.policy_source_scope_sha256
+                    != self._manifest.policy_source_scope.sha256
+                    or grant.additional_calls > requirement.max_calls
+                    or grant.additional_tokens > requirement.max_tokens
+                ):
+                    raise AuthorizationError(
+                        "authorization grant differs from manifest authority"
+                    )
                 if grant.grant_id in grants:
                     raise AuthorizationError("authorization grant ID is already recorded")
                 grants[grant.grant_id] = grant
@@ -1853,6 +2048,7 @@ class AuthorizationLedger:
                 if any(grant_id not in grants for grant_id in window.grant_ids):
                     raise AuthorizationError("authorization window names an absent grant")
                 selected = tuple(grants[grant_id] for grant_id in window.grant_ids)
+                requirement = self._manifest.authorization_requirement
                 if any(
                     grant.policy_source_scope_sha256
                     != window.policy_source_scope_sha256
@@ -1864,13 +2060,34 @@ class AuthorizationLedger:
                     > sum(grant.additional_calls for grant in selected)
                     or window.max_tokens
                     > sum(grant.additional_tokens for grant in selected)
-                    or Decimal(str(window.max_usd))
-                    > sum(
-                        Decimal(str(grant.additional_usd)) for grant in selected
-                    )
+                    or window.window_id != requirement.window_id
+                    or window.authorization_requirement_sha256
+                    != requirement.sha256
+                    or window.policy_source_scope_sha256
+                    != requirement.policy_source_scope_sha256
+                    or window.max_calls > requirement.max_calls
+                    or window.max_tokens > requirement.max_tokens
                 ):
                     raise AuthorizationError("authorization window exceeds named grants")
                 windows[window.window_id] = window
+            elif record_type == "pricing_snapshot":
+                if set(value) != expected_common | {"pricing_snapshot"}:
+                    raise AuthorizationError(
+                        "authorization pricing snapshot record keys are invalid"
+                    )
+                try:
+                    snapshot = _pricing_snapshot_from_primitive(
+                        value.get("pricing_snapshot")
+                    )
+                except (InvalidOperation, TypeError, ValueError) as exc:
+                    raise AuthorizationError(
+                        "authorization pricing snapshot record is invalid"
+                    ) from exc
+                if snapshot.pricing_payload_sha256 in pricing_snapshots:
+                    raise AuthorizationError(
+                        "authorization pricing snapshot is already recorded"
+                    )
+                pricing_snapshots[snapshot.pricing_payload_sha256] = snapshot
             elif record_type == "lease_open":
                 if set(value) != expected_common | {"lease"}:
                     raise AuthorizationError("authorization lease record keys are invalid")
@@ -1885,6 +2102,47 @@ class AuthorizationLedger:
                     raise AuthorizationError("authorization one-shot lease is repeated")
                 if lease.window_id not in windows:
                     raise AuthorizationError("authorization lease window is absent")
+                snapshot = pricing_snapshots.get(lease.pricing_snapshot_sha256)
+                expected_one_shot_key = hashlib.sha256(
+                    _canonical_json_bytes(
+                        {
+                            "window_id": lease.window_id,
+                            "run_manifest_sha256": lease.run_manifest_sha256,
+                        }
+                    )
+                ).hexdigest()
+                if (
+                    snapshot is None
+                    or snapshot.lookup_status != lease.pricing_status
+                    or snapshot.model != self._manifest.model
+                    or lease.run_manifest_sha256 != self._manifest.sha256
+                    or lease.one_shot_key_sha256 != expected_one_shot_key
+                    or not records
+                    or records[-1].get("record_type") != "pricing_snapshot"
+                    or not isinstance(records[-1].get("pricing_snapshot"), dict)
+                    or records[-1]["pricing_snapshot"].get(
+                        "pricing_payload_sha256"
+                    )
+                    != lease.pricing_snapshot_sha256
+                ):
+                    raise AuthorizationError(
+                        "authorization lease pricing or manifest identity differs"
+                    )
+                window = windows[lease.window_id]
+                grant_calls, grant_tokens = self._remaining_grant_capacity(
+                    records,
+                    window.grant_ids,
+                )
+                requirement = self._manifest.authorization_requirement
+                if (
+                    lease.max_calls
+                    != min(requirement.max_calls, window.max_calls, grant_calls)
+                    or lease.max_tokens
+                    != min(requirement.max_tokens, window.max_tokens, grant_tokens)
+                ):
+                    raise AuthorizationError(
+                        "authorization lease exceeds its window"
+                    )
                 leases[lease.lease_id] = lease
                 one_shot_keys.add(lease.one_shot_key_sha256)
             elif record_type == "reservation":
@@ -1899,6 +2157,39 @@ class AuthorizationLedger:
                     raise AuthorizationError("authorization reservation record is invalid") from exc
                 if reservation.lease_id not in leases:
                     raise AuthorizationError("authorization reservation lease is absent")
+                lease = leases[reservation.lease_id]
+                prior_reservations = [
+                    record
+                    for record in records
+                    if record.get("record_type") == "reservation"
+                    and isinstance(record.get("reservation"), dict)
+                    and record["reservation"].get("lease_id")
+                    == reservation.lease_id
+                ]
+                if (
+                    (reservation.projected_call_usd is not None)
+                    != (lease.pricing_status == "available")
+                    or reservation.call_index > len(self._call_plan_snapshots)
+                    or reservation.call_index != len(prior_reservations) + 1
+                ):
+                    raise AuthorizationError(
+                        "authorization reservation pricing or plan is invalid"
+                    )
+                plan = self._call_plan_snapshots[reservation.call_index - 1]
+                if (
+                    reservation.call_index,
+                    reservation.iteration,
+                    reservation.role,
+                    reservation.reserved_tokens,
+                ) != (
+                    plan.call_index,
+                    plan.iteration,
+                    plan.role,
+                    plan.max_input_tokens + plan.max_output_tokens,
+                ):
+                    raise AuthorizationError(
+                        "authorization reservation differs from sealed plan"
+                    )
                 if reservation.lease_id in closed_leases:
                     raise AuthorizationError("closed authorization lease has a reservation")
                 if reservation.lease_id in active_reservations:
@@ -1969,11 +2260,10 @@ class AuthorizationLedger:
                     "provider_facts",
                     "charged_calls",
                     "charged_tokens",
-                    "charged_usd",
-                    "charge_basis",
+                    "actual_cost_usd",
+                    "cost_accounting_status",
                 }
                 if frozenset(value) not in {
-                    frozenset(expected),
                     frozenset(expected | {"terminal_audit_sha256"}),
                     frozenset(
                         expected
@@ -1993,14 +2283,13 @@ class AuthorizationLedger:
                 }:
                     raise AuthorizationError("authorization reconciliation keys are invalid")
                 terminal_audit_sha256 = value.get("terminal_audit_sha256")
-                if terminal_audit_sha256 is not None:
-                    try:
-                        _require_digest(
-                            terminal_audit_sha256,
-                            "authorization terminal audit SHA-256",
-                        )
-                    except ValueError as exc:
-                        raise AuthorizationError(str(exc)) from exc
+                try:
+                    _require_digest(
+                        terminal_audit_sha256,
+                        "authorization terminal audit SHA-256",
+                    )
+                except ValueError as exc:
+                    raise AuthorizationError(str(exc)) from exc
                 terminal_audit_receipt = value.get("terminal_audit_receipt")
                 lifecycle_commitment: dict[str, object] | None = None
                 if terminal_audit_receipt is not None:
@@ -2045,6 +2334,10 @@ class AuthorizationLedger:
                 if (
                     (facts.call_index, facts.iteration, facts.role)
                     != (reservation.call_index, reservation.iteration, reservation.role)
+                    or facts.requested_model
+                    != self._call_plan_snapshots[facts.call_index - 1].model
+                    or facts.pricing_snapshot_sha256
+                    != leases[lease_id].pricing_snapshot_sha256
                 ):
                     raise AuthorizationError("authorization provider facts differ from reservation")
                 if terminal_audit_receipt is not None:
@@ -2108,36 +2401,44 @@ class AuthorizationLedger:
                             "authorization gateway lifecycle commitment differs"
                         )
                 if not facts.request_started:
-                    expected_charge = (0, 0, Decimal("0"), "before_send_release")
+                    expected_charge = (0, 0, 0.0, "not_started")
                 elif facts.accounting_complete:
                     assert facts.total_tokens is not None
                     assert facts.cost_usd is not None
                     expected_charge = (
                         1,
                         facts.total_tokens,
-                        Decimal(str(facts.cost_usd)),
+                        float(facts.cost_usd),
                         "authoritative",
                     )
                 else:
                     expected_charge = (
                         1,
                         facts.retained_reservation_tokens,
-                        Decimal(str(facts.retained_reservation_usd)),
-                        "retained_reservation",
+                        None,
+                        "unavailable",
                     )
-                try:
-                    actual_charge = (
-                        value.get("charged_calls"),
-                        value.get("charged_tokens"),
-                        Decimal(str(value.get("charged_usd"))),
-                        value.get("charge_basis"),
-                    )
-                except (InvalidOperation, TypeError, ValueError) as exc:
-                    raise AuthorizationError(
-                        "authorization reconciliation charge is invalid"
-                    ) from exc
+                actual_charge = (
+                    value.get("charged_calls"),
+                    value.get("charged_tokens"),
+                    value.get("actual_cost_usd"),
+                    value.get("cost_accounting_status"),
+                )
                 if actual_charge != expected_charge:
                     raise AuthorizationError("authorization reconciliation charge is invalid")
+                prior_calls, prior_tokens = charged_by_lease.get(lease_id, (0, 0))
+                charged_calls = int(actual_charge[0])
+                charged_tokens = int(actual_charge[1])
+                total_calls = prior_calls + charged_calls
+                total_tokens = prior_tokens + charged_tokens
+                charged_by_lease[lease_id] = (total_calls, total_tokens)
+                lease = leases[lease_id]
+                if (
+                    charged_tokens > reservation.reserved_tokens
+                    or total_calls > lease.max_calls
+                    or total_tokens > lease.max_tokens
+                ):
+                    overage_leases.add(lease_id)
                 terminal_commitment = value.get("gateway_terminal")
                 if terminal_commitment is not None:
                     if (
@@ -2176,7 +2477,8 @@ class AuthorizationLedger:
                     raise AuthorizationError("authorization lease close is invalid")
                 if lease_id in active_reservations:
                     raise AuthorizationError("authorization lease closed with an active reservation")
-                if value.get("terminal_code") not in {
+                terminal_code = value.get("terminal_code")
+                if terminal_code not in {
                     "completed",
                     "failed",
                     "cancelled",
@@ -2184,6 +2486,10 @@ class AuthorizationLedger:
                     "budget_exhausted",
                 }:
                     raise AuthorizationError("authorization lease terminal code is invalid")
+                if lease_id in overage_leases and terminal_code != "budget_exhausted":
+                    raise AuthorizationError(
+                        "authorization resource overage is not fail-closed"
+                    )
                 closed_leases.add(str(lease_id))
             else:
                 raise AuthorizationError("authorization ledger record type is invalid")
@@ -2195,6 +2501,16 @@ class AuthorizationLedger:
                     raise AuthorizationError(str(exc)) from exc
             previous = str(digest)
             records.append(value)
+        if set(pricing_snapshots) != {
+            lease.pricing_snapshot_sha256 for lease in leases.values()
+        }:
+            raise AuthorizationError(
+                "authorization pricing snapshot is not bound to exactly one lease"
+            )
+        if not overage_leases.issubset(closed_leases):
+            raise AuthorizationError(
+                "authorization resource overage has an open lease"
+            )
         return records
 
     def _build_record(
@@ -2203,7 +2519,7 @@ class AuthorizationLedger:
         primitive: dict[str, object],
     ) -> dict[str, object]:
         record = {
-            "schema_version": 2,
+            "schema_version": 3,
             "record_index": len(records) + 1,
             "previous_record_sha256": (
                 _ZERO_SHA256 if not records else records[-1]["record_sha256"]
@@ -2285,7 +2601,6 @@ class AuthorizationLedger:
         if (
             grant.additional_calls > requirement.max_calls
             or grant.additional_tokens > requirement.max_tokens
-            or Decimal(str(grant.additional_usd)) > Decimal(str(requirement.max_usd))
         ):
             raise AuthorizationError("authorization grant exceeds manifest ceilings")
         if any(
@@ -2335,15 +2650,13 @@ class AuthorizationLedger:
             for grant in selected
         ):
             raise AuthorizationError("policy source scope mismatch")
-        grant_calls, grant_tokens, grant_usd = self._remaining_grant_capacity(
+        grant_calls, grant_tokens = self._remaining_grant_capacity(
             records,
             window.grant_ids,
         )
         if (
             window.max_calls > min(requirement.max_calls, grant_calls)
             or window.max_tokens > min(requirement.max_tokens, grant_tokens)
-            or Decimal(str(window.max_usd))
-            > min(Decimal(str(requirement.max_usd)), grant_usd)
         ):
             raise AuthorizationError("authorization window exceeds effective ceilings")
 
@@ -2352,7 +2665,7 @@ class AuthorizationLedger:
         cls,
         records: Sequence[dict[str, object]],
         grant_ids: Sequence[str],
-    ) -> tuple[int, int, Decimal]:
+    ) -> tuple[int, int]:
         """Return conservative remaining capacity for an explicitly named grant pool."""
 
         selected_ids = set(grant_ids)
@@ -2396,7 +2709,6 @@ class AuthorizationLedger:
         }
         spent_calls = 0
         spent_tokens = 0
-        spent_usd = Decimal("0")
         for record in records:
             if (
                 record.get("record_type") != "reconciliation"
@@ -2406,8 +2718,7 @@ class AuthorizationLedger:
             try:
                 calls = record["charged_calls"]
                 tokens = record["charged_tokens"]
-                usd = Decimal(str(record["charged_usd"]))
-            except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+            except (KeyError, TypeError, ValueError) as exc:
                 raise AuthorizationError(
                     "authorization reconciliation totals are invalid"
                 ) from exc
@@ -2416,25 +2727,17 @@ class AuthorizationLedger:
                 or calls not in {0, 1}
                 or type(tokens) is not int
                 or tokens < 0
-                or not usd.is_finite()
-                or usd < 0
             ):
                 raise AuthorizationError(
                     "authorization reconciliation totals are invalid"
                 )
             spent_calls += calls
             spent_tokens += tokens
-            spent_usd += usd
         total_calls = sum(grant.additional_calls for grant in grants.values())
         total_tokens = sum(grant.additional_tokens for grant in grants.values())
-        total_usd = sum(
-            (Decimal(str(grant.additional_usd)) for grant in grants.values()),
-            start=Decimal("0"),
-        )
         return (
             max(0, total_calls - spent_calls),
             max(0, total_tokens - spent_tokens),
-            max(Decimal("0"), total_usd - spent_usd),
         )
 
     def append_grant(
@@ -2607,7 +2910,8 @@ class AuthorizationLedger:
         window_id: str,
         authorization_requirement_sha256: str,
         run_manifest_sha256: str,
-        frozen_pricing_sha256: str,
+        pricing_snapshot: OptimizerPricingSnapshot,
+        projected_plan_usd: Decimal | None,
     ) -> AuthorizationRunLease:
         """Atomically acquire the manifest/window once without debiting allowance."""
 
@@ -2618,7 +2922,17 @@ class AuthorizationLedger:
                 "authorization lease requirement SHA-256",
             )
             _require_digest(run_manifest_sha256, "authorization lease manifest SHA-256")
-            _require_digest(frozen_pricing_sha256, "authorization lease pricing SHA-256")
+            if not isinstance(pricing_snapshot, OptimizerPricingSnapshot):
+                raise ValueError("authorization lease pricing snapshot is invalid")
+            canonical_pricing = _pricing_snapshot_from_primitive(
+                pricing_snapshot.to_primitive()
+            )
+            if canonical_pricing != pricing_snapshot:
+                raise ValueError("authorization lease pricing snapshot differs")
+            projected_plan_text = _canonical_optional_decimal(
+                projected_plan_usd,
+                "authorization lease projected plan USD",
+            )
         except ValueError as exc:
             raise AuthorizationError(str(exc)) from exc
         requirement = self._manifest.authorization_requirement
@@ -2626,6 +2940,14 @@ class AuthorizationLedger:
             raise AuthorizationError("authorization requirement mismatch")
         if run_manifest_sha256 != self._manifest.sha256:
             raise AuthorizationError("authorization run manifest mismatch")
+        if canonical_pricing.model != self._manifest.model:
+            raise AuthorizationError("authorization pricing model differs from manifest")
+        if (
+            canonical_pricing.lookup_status == "available"
+        ) != (projected_plan_text is not None):
+            raise AuthorizationError(
+                "authorization pricing availability differs from plan projection"
+            )
         one_shot_key = hashlib.sha256(
             _canonical_json_bytes(
                 {
@@ -2685,7 +3007,7 @@ class AuthorizationLedger:
                 and isinstance(record.get("lease"), dict)
             ):
                 raise AuthorizationError("authorization grants have an active run lease")
-            grant_calls, grant_tokens, grant_usd = self._remaining_grant_capacity(
+            grant_calls, grant_tokens = self._remaining_grant_capacity(
                 records,
                 window.grant_ids,
             )
@@ -2694,13 +3016,9 @@ class AuthorizationLedger:
                 item.max_input_tokens + item.max_output_tokens
                 for item in self._manifest.call_budgets
             )
-            planned_usd = sum(
-                Decimal(str(item.max_usd)) for item in self._manifest.call_budgets
-            )
             if (
                 planned_calls > min(window.max_calls, grant_calls)
                 or planned_tokens > min(window.max_tokens, grant_tokens)
-                or planned_usd > min(Decimal(str(window.max_usd)), grant_usd)
             ):
                 raise AuthorizationError("authorization window cannot cover the complete call plan")
             lease = AuthorizationRunLease(
@@ -2708,20 +3026,21 @@ class AuthorizationLedger:
                 one_shot_key_sha256=one_shot_key,
                 window_id=window.window_id,
                 run_manifest_sha256=run_manifest_sha256,
-                frozen_pricing_sha256=frozen_pricing_sha256,
+                pricing_snapshot_sha256=canonical_pricing.pricing_payload_sha256,
+                pricing_status=canonical_pricing.lookup_status,
+                projected_plan_usd=projected_plan_text,
                 max_calls=min(requirement.max_calls, window.max_calls, grant_calls),
                 max_tokens=min(requirement.max_tokens, window.max_tokens, grant_tokens),
-                max_usd=float(
-                    min(
-                        Decimal(str(requirement.max_usd)),
-                        Decimal(str(window.max_usd)),
-                        grant_usd,
-                    )
-                ),
             )
             self._append_records(
                 records,
-                [{"record_type": "lease_open", "lease": asdict(lease)}],
+                [
+                    {
+                        "record_type": "pricing_snapshot",
+                        "pricing_snapshot": canonical_pricing.to_primitive(),
+                    },
+                    {"record_type": "lease_open", "lease": asdict(lease)},
+                ],
             )
             return lease
 
@@ -2973,14 +3292,13 @@ class AuthorizationLedger:
     def _charged_totals(
         records: Sequence[dict[str, object]],
         reservation_records: Sequence[dict[str, object]],
-    ) -> tuple[int, int, Decimal]:
+    ) -> tuple[int, int]:
         reservation_ids = {
             str(item["reservation"]["reservation_id"])
             for item in reservation_records
         }
         calls = 0
         tokens = 0
-        usd = Decimal("0")
         for item in records:
             if (
                 item.get("record_type") == "reconciliation"
@@ -2988,30 +3306,34 @@ class AuthorizationLedger:
             ):
                 charged_calls = item.get("charged_calls")
                 charged_tokens = item.get("charged_tokens")
-                charged_usd = item.get("charged_usd")
                 if (
                     type(charged_calls) is not int
                     or charged_calls not in {0, 1}
                     or type(charged_tokens) is not int
                     or charged_tokens < 0
-                    or type(charged_usd) not in {int, float}
-                    or not math.isfinite(float(charged_usd))
-                    or charged_usd < 0
                 ):
                     raise AuthorizationError("authorization reconciliation totals are invalid")
                 calls += charged_calls
                 tokens += charged_tokens
-                usd += Decimal(str(charged_usd))
-        return calls, tokens, usd
+        return calls, tokens
 
     def reserve_call(
         self,
         lease: AuthorizationRunLease,
         plan: PitOptimizerCallBudget,
+        *,
+        projected_call_usd: Decimal | None,
     ) -> AuthorizationCallReservation:
-        """Reserve only the next sealed call's exact token/USD maxima."""
+        """Reserve the next sealed call's tokens and retain cost as advisory."""
 
         canonical_plan = self.snapshot_call_plan(plan)
+        try:
+            projected_call_text = _canonical_optional_decimal(
+                projected_call_usd,
+                "authorization call projected USD",
+            )
+        except ValueError as exc:
+            raise AuthorizationError(str(exc)) from exc
         with _authorization_file_lock(self._lock_path):
             records = self._read_records()
             stored_lease = self._lease_from_records(records, lease)
@@ -3050,13 +3372,17 @@ class AuthorizationLedger:
                 raise AuthorizationError("authorization call is not the next sealed plan")
             if stored_lease.run_manifest_sha256 != self._manifest.sha256:
                 raise AuthorizationError("authorization lease manifest is stale")
+            if (
+                stored_lease.pricing_status == "available"
+            ) != (projected_call_text is not None):
+                raise AuthorizationError(
+                    "authorization pricing availability differs from call projection"
+                )
             reserved_tokens = canonical_plan.max_input_tokens + canonical_plan.max_output_tokens
-            calls, tokens, usd = self._charged_totals(records, reservations)
+            calls, tokens = self._charged_totals(records, reservations)
             if (
                 calls + 1 > stored_lease.max_calls
                 or tokens + reserved_tokens > stored_lease.max_tokens
-                or usd + Decimal(str(canonical_plan.max_usd))
-                > Decimal(str(stored_lease.max_usd))
             ):
                 raise AuthorizationError("authorization call exceeds remaining lease ceilings")
             reservation = AuthorizationCallReservation(
@@ -3066,7 +3392,7 @@ class AuthorizationLedger:
                 iteration=canonical_plan.iteration,
                 role=canonical_plan.role,
                 reserved_tokens=reserved_tokens,
-                reserved_usd=float(canonical_plan.max_usd),
+                projected_call_usd=projected_call_text,
             )
             self._append_records(
                 records,
@@ -3137,6 +3463,15 @@ class AuthorizationLedger:
             provider_facts,
             terminal_code,
         )
+        if (
+            provider_facts.accounting_complete
+            and provider_facts.request_started
+            and provider_facts.total_tokens is not None
+            and provider_facts.total_tokens > reservation.reserved_tokens
+            and effective_terminal_code is None
+        ):
+            terminal_code = "budget_exhausted"
+            effective_terminal_code = "budget_exhausted"
         verified_budget_state: dict[str, object] | None = None
         if terminal_audit_receipt is not None:
             if terminal_audit_receipt.terminal_code != effective_terminal_code:
@@ -3286,55 +3621,48 @@ class AuthorizationLedger:
                     reservation.iteration,
                     reservation.role,
                     reservation.reserved_tokens,
-                    Decimal(str(reservation.reserved_usd)),
                 )
                 != (
                     plan.call_index,
                     plan.iteration,
                     plan.role,
                     plan.max_input_tokens + plan.max_output_tokens,
-                    Decimal(str(plan.max_usd)),
                 )
                 or
                 (provider_facts.call_index, provider_facts.iteration, provider_facts.role)
                 != (reservation.call_index, reservation.iteration, reservation.role)
                 or provider_facts.requested_model != plan.model
-                or provider_facts.frozen_pricing_sha256
-                != lease.frozen_pricing_sha256
+                or provider_facts.pricing_snapshot_sha256
+                != lease.pricing_snapshot_sha256
             ):
                 raise AuthorizationError("optimizer provider facts differ from reservation")
             if not provider_facts.request_started:
                 charged_calls = 0
                 charged_tokens = 0
-                charged_usd = Decimal("0")
-                charge_basis = "before_send_release"
+                actual_cost_usd: float | None = 0.0
+                cost_accounting_status = "not_started"
             elif provider_facts.accounting_complete:
                 assert provider_facts.total_tokens is not None
                 assert provider_facts.cost_usd is not None
                 charged_calls = 1
                 charged_tokens = provider_facts.total_tokens
-                charged_usd = Decimal(str(provider_facts.cost_usd))
-                charge_basis = "authoritative"
+                actual_cost_usd = float(provider_facts.cost_usd)
+                cost_accounting_status = "authoritative"
             else:
-                if (
-                    provider_facts.retained_reservation_tokens
-                    != reservation.reserved_tokens
-                    or Decimal(str(provider_facts.retained_reservation_usd))
-                    != Decimal(str(reservation.reserved_usd))
-                ):
+                if provider_facts.retained_reservation_tokens != reservation.reserved_tokens:
                     raise AuthorizationError("uncertain accounting must retain the full reservation")
                 charged_calls = 1
                 charged_tokens = reservation.reserved_tokens
-                charged_usd = Decimal(str(reservation.reserved_usd))
-                charge_basis = "retained_reservation"
+                actual_cost_usd = None
+                cost_accounting_status = "unavailable"
             primitive = {
                 "record_type": "reconciliation",
                 "reservation_id": reservation.reservation_id,
                 "provider_facts": asdict(provider_facts),
                 "charged_calls": charged_calls,
                 "charged_tokens": charged_tokens,
-                "charged_usd": float(charged_usd),
-                "charge_basis": charge_basis,
+                "actual_cost_usd": actual_cost_usd,
+                "cost_accounting_status": cost_accounting_status,
                 "terminal_audit_sha256": terminal_audit_sha256,
             }
             if terminal_audit_receipt is not None:
@@ -3344,16 +3672,14 @@ class AuthorizationLedger:
             if gateway_terminal is not None:
                 primitive["gateway_terminal"] = gateway_terminal
             reservations = self._reservation_records(records, lease.lease_id)
-            prior_calls, prior_tokens, prior_usd = self._charged_totals(
+            prior_calls, prior_tokens = self._charged_totals(
                 records,
                 reservations,
             )
             overage = (
                 charged_tokens > reservation.reserved_tokens
-                or charged_usd > Decimal(str(reservation.reserved_usd))
                 or prior_calls + charged_calls > lease.max_calls
                 or prior_tokens + charged_tokens > lease.max_tokens
-                or prior_usd + charged_usd > Decimal(str(lease.max_usd))
             )
             primitives = [primitive]
             if effective_terminal_code is not None:
@@ -3662,7 +3988,6 @@ def record_authorized_grant(
     if (
         grant.additional_calls > requirement.max_calls
         or grant.additional_tokens > requirement.max_tokens
-        or Decimal(str(grant.additional_usd)) > Decimal(str(requirement.max_usd))
     ):
         raise AuthorizationError("authorization grant exceeds manifest ceilings")
     window = OperatorAuthorizationWindow(
@@ -3671,9 +3996,6 @@ def record_authorized_grant(
         authorization_requirement_sha256=requirement.sha256,
         max_calls=min(requirement.max_calls, grant.additional_calls),
         max_tokens=min(requirement.max_tokens, grant.additional_tokens),
-        max_usd=float(
-            min(Decimal(str(requirement.max_usd)), Decimal(str(grant.additional_usd)))
-        ),
         policy_source_scope_sha256=manifest.policy_source_scope.sha256,
     )
     ledger = AuthorizationLedger(Path(ledger_path), manifest)
@@ -3696,7 +4018,6 @@ def _argument_parser() -> argparse.ArgumentParser:
     record.add_argument("--grant-id", required=True)
     record.add_argument("--additional-calls", type=int, required=True)
     record.add_argument("--additional-tokens", type=int, required=True)
-    record.add_argument("--additional-usd", type=Decimal, required=True)
     record.add_argument("--policy-source-scope-sha256", required=True)
     record.add_argument("--operator-approval-reference", required=True)
     return parser
@@ -3706,15 +4027,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _argument_parser().parse_args(argv)
     if args.command != "record-grant":  # pragma: no cover - argparse closes this branch
         raise AuthorizationError("authorization command is invalid")
-    try:
-        additional_usd = float(args.additional_usd)
-    except (InvalidOperation, OverflowError, ValueError) as exc:
-        raise AuthorizationError("authorization grant additional USD is invalid") from exc
     grant = OperatorAuthorizationGrant(
         grant_id=args.grant_id,
         additional_calls=args.additional_calls,
         additional_tokens=args.additional_tokens,
-        additional_usd=additional_usd,
         policy_source_scope_sha256=args.policy_source_scope_sha256,
     )
     record_authorized_grant(
