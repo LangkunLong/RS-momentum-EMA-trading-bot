@@ -1166,7 +1166,11 @@ def build_subset_manifest(
         Path(verified_parity_path),
     )
     source = _resolved_directory(Path(source_root), "source root")
-    from core.pit_policy_parity import _authenticated_readiness, _source_identity
+    from core.pit_policy_parity import (
+        _authenticated_readiness,
+        _require_later_descendant_source,
+        _source_identity,
+    )
 
     actual_source_head, actual_source_fingerprint = _source_identity(source)
     authenticated_readiness, authenticated_readiness_sha256 = _authenticated_readiness(
@@ -1199,12 +1203,17 @@ def build_subset_manifest(
     evaluation = legacy_readiness.get("evaluation_contract")
     if not isinstance(identities, Mapping) or not isinstance(sealed_inputs, Mapping):
         raise ValueError("legacy readiness identities are absent")
-    if (
-        identities.get("source_head") != actual_source_head
-        or identities.get("source_fingerprint_sha256")
-        != actual_source_fingerprint
-    ):
-        raise ValueError("legacy readiness source identity differs from source root")
+    parity = parity_attestation
+    _require_later_descendant_source(
+        source_root=source,
+        reference_head=identities.get("source_head"),
+        final_head=parity.reference_source_head,
+    )
+    _require_later_descendant_source(
+        source_root=source,
+        reference_head=parity.reference_source_head,
+        final_head=parity.final_source_head,
+    )
     if not isinstance(evaluation, Mapping) or evaluation.get("verification_only") is not True:
         raise ValueError("legacy readiness evaluation contract is invalid")
 
@@ -1242,15 +1251,14 @@ def build_subset_manifest(
         data_identity_sha256=bundle_sha256,
     )
 
-    parity = parity_attestation
     if (
         parity.pit_bundle_sha256 != bundle_sha256
         or parity.baseline_manifest_sha256 != baseline_sha256
         or parity.effective_policy_sha256 != effective_policy_sha256
         or parity.discovery_fold_manifest_sha256 != fold_manifest.sha256
-        or parity.final_source_head != identities.get("source_head")
+        or parity.final_source_head != actual_source_head
         or parity.final_source_fingerprint_sha256
-        != identities.get("source_fingerprint_sha256")
+        != actual_source_fingerprint
     ):
         raise ValueError("verified parity differs from the authenticated identity graph")
 
@@ -1331,8 +1339,8 @@ def build_subset_manifest(
         run_id=f"run_{uuid.uuid4().hex}",
         run_kind="subset_canary",
         model=PIT_OPTIMIZER_R1_MODEL,
-        source_head=str(identities["source_head"]),
-        source_fingerprint_sha256=str(identities["source_fingerprint_sha256"]),
+        source_head=actual_source_head,
+        source_fingerprint_sha256=actual_source_fingerprint,
         legacy_readiness_sha256=readiness_sha256,
         pit_bundle_sha256=bundle_sha256,
         baseline_manifest_sha256=baseline_sha256,
