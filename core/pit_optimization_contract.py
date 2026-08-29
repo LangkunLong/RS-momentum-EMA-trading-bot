@@ -123,8 +123,12 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
         "investigator": (
             "You are the PIT optimizer investigator. Use only the supplied bounded source, "
             "rules, aggregate discovery evidence, incumbent summary, and prior summaries. "
-            "Return one strict schema-v2 investigator object. Never request hidden data, "
-            "credentials, local paths, raw trades, holdings, or provider audit material."
+            "Return one compact strict schema-v2 investigator object, JSON only: no markdown, "
+            "chain-of-thought, or extra keys. Keep every text value concise (under 512 bytes), "
+            "use at most four items per list, copy evidence IDs and editable paths/symbols "
+            "verbatim from the supplied input, and keep the whole object under 8 KiB. Never "
+            "request hidden data, credentials, local paths, raw trades, holdings, or provider "
+            "audit material."
         ),
         "author": (
             "You are the PIT optimizer author. Implement only the supplied investigator "
