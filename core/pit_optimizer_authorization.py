@@ -49,6 +49,7 @@ _UNSAFE_APPROVAL_RE = re.compile(
     re.IGNORECASE,
 )
 _ZERO_SHA256 = "0" * 64
+_GATEWAY_TERMINAL_RECOVERY_SEAL = object()
 
 
 class AuthorizationError(RuntimeError):
@@ -3556,6 +3557,7 @@ class AuthorizationLedger:
         terminal_audit_receipt: TerminalAuditReceipt | None = None,
         terminal_code: str | None = None,
         _gateway_lifecycle: object | None = None,
+        _recovery_seal: object | None = None,
     ) -> None:
         """Publish reconciliation and any terminal lease close as one transaction."""
 
@@ -3563,6 +3565,17 @@ class AuthorizationLedger:
             provider_facts, PitOptimizerProviderFacts
         ):
             raise AuthorizationError("authorization reconciliation contracts are invalid")
+        recovering_gateway_terminal = (
+            _recovery_seal is _GATEWAY_TERMINAL_RECOVERY_SEAL
+        )
+        if (
+            (_recovery_seal is not None and not recovering_gateway_terminal)
+            or (_gateway_lifecycle is not None and recovering_gateway_terminal)
+        ):
+            raise AuthorizationError("authorization recovery capability is invalid")
+        terminal_commit_in_progress = (
+            _gateway_lifecycle is not None or recovering_gateway_terminal
+        )
         if self._audit_trail is not None and terminal_audit_receipt is None:
             raise AuthorizationError(
                 "authorization terminal audit receipt is required"
@@ -3628,7 +3641,7 @@ class AuthorizationLedger:
                 terminal_audit_receipt,
                 reservation,
                 provider_facts,
-                require_terminal_commitment=_gateway_lifecycle is None,
+                require_terminal_commitment=not terminal_commit_in_progress,
             )
         lifecycle_budget_state: dict[str, object] | None = None
         if _gateway_lifecycle is not None:
@@ -3671,7 +3684,7 @@ class AuthorizationLedger:
             if stored_reservation != reservation:
                 raise AuthorizationError("authorization reservation identity mismatch")
             gateway_terminal: dict[str, object] | None = None
-            if _gateway_lifecycle is not None:
+            if terminal_commit_in_progress:
                 assert terminal_audit_receipt is not None
                 assert verified_budget_state is not None
                 lifecycle_commitment = self._require_gateway_lifecycle_commitment(
@@ -3839,6 +3852,22 @@ class AuthorizationLedger:
             self._append_records(records, primitives)
         if overage:
             raise AuthorizationError("authoritative provider overage was committed")
+
+    def _recover_gateway_terminal_reconciliation(
+        self,
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+        receipt: TerminalAuditReceipt,
+    ) -> None:
+        """Finish a receipt-authenticated terminal commit after a process interruption."""
+
+        self.reconcile_call(
+            reservation,
+            provider_facts,
+            terminal_audit_receipt=receipt,
+            terminal_code=receipt.terminal_code,
+            _recovery_seal=_GATEWAY_TERMINAL_RECOVERY_SEAL,
+        )
 
     def verify_reconciliation(
         self,

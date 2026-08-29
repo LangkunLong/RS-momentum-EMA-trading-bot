@@ -4375,24 +4375,36 @@ class OpenRouterGateway:
                 call_budget=plan_snapshot,
             )
         )
-        budget_recovery_state = (
-            self.authorization_ledger.verify_terminal_audit_receipt(
-                reservation,
-                facts,
-                receipt,
-            )
+        budget_recovery_state = self.authorization_ledger._cross_verify_audit_receipt(
+            receipt,
+            reservation,
+            facts,
+            require_terminal_commitment=False,
         )
         self.pit_optimizer_ledger._restore_pit_optimizer_recovery_state(
             budget_recovery_state,
             run_manifest_sha256=authorization_lease.run_manifest_sha256,
             audit_run_id=self.audit_trail.run_id,
         )
-        self.authorization_ledger.verify_reconciliation(
-            reservation,
-            facts,
-            terminal_audit_receipt=receipt,
-            terminal_code=receipt.terminal_code,
-        )
+        try:
+            self.authorization_ledger.verify_reconciliation(
+                reservation,
+                facts,
+                terminal_audit_receipt=receipt,
+                terminal_code=receipt.terminal_code,
+            )
+        except AuthorizationError:
+            self.authorization_ledger._recover_gateway_terminal_reconciliation(
+                reservation,
+                facts,
+                receipt,
+            )
+            self.authorization_ledger.verify_reconciliation(
+                reservation,
+                facts,
+                terminal_audit_receipt=receipt,
+                terminal_code=receipt.terminal_code,
+            )
         if not isinstance(facts, PitOptimizerProviderFacts):
             raise AuthorizationError("recovered optimizer facts are invalid")
         return facts
@@ -13761,6 +13773,10 @@ class AuditTrail:
         }
         if payload_sha256 is not None:
             expected_details["payload_sha256"] = payload_sha256
+        if record.response_validation_code is not None:
+            expected_details["response_validation_code"] = (
+                record.response_validation_code
+            )
         if record.retained_reservation_tokens is not None:
             expected_details["retained_reservation_tokens"] = (
                 record.retained_reservation_tokens
