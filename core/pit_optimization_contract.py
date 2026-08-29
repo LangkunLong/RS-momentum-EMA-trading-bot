@@ -3735,6 +3735,12 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
 
 
 def pit_optimizer_response_format(role: str) -> dict[str, object]:
+    if role == "author":
+        # The Author is the only role that returns a sizeable unified diff.  Its
+        # complete artifact is parsed and scope-validated locally before it can
+        # reach candidate evaluation, so provider-side JSON Schema enforcement
+        # adds a brittle transport dependency without adding a trust boundary.
+        return {"type": "json_object"}
     try:
         schema = _V2_RESPONSE_SCHEMAS[role]
     except KeyError as exc:

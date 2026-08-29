@@ -1213,6 +1213,8 @@ class ProviderCallRecord:
     ledger_snapshot: BudgetSnapshot | PitOptimizerResourceSnapshot | None = None
     frozen_pricing_sha256: str | None = None
     pricing_snapshot_sha256: str | None = None
+    request_failure_class: str | None = None
+    request_failure_status_code: int | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version not in {1, 2, 3}:
@@ -1265,6 +1267,11 @@ class ProviderCallRecord:
         if self.schema_version == 2:
             self._validate_failure_record()
             return
+        if (
+            self.request_failure_class is not None
+            or self.request_failure_status_code is not None
+        ):
+            raise ConfigurationError("legacy provider call has request failure provenance")
         if (
             self.frozen_pricing_sha256 is not None
             or self.pricing_snapshot_sha256 is not None
@@ -1458,6 +1465,11 @@ class ProviderCallRecord:
             raise ConfigurationError("optimizer response cannot precede request start")
         if self.failure_phase is not None or self.protocol_failure_code is not None:
             raise ConfigurationError("optimizer provider record has legacy failure fields")
+        if (
+            self.request_failure_class is not None
+            or self.request_failure_status_code is not None
+        ):
+            raise ConfigurationError("schema-v2 optimizer record has request provenance")
         if self.accounting_complete is not self.authoritative_spend_known:
             raise ConfigurationError("optimizer provider accounting completeness differs")
         if (
@@ -1583,6 +1595,24 @@ class ProviderCallRecord:
             raise ConfigurationError("optimizer response cannot precede request start")
         if self.failure_phase is not None or self.protocol_failure_code is not None:
             raise ConfigurationError("optimizer provider record has legacy failure fields")
+        if self.request_failure_class not in {
+            None,
+            "provider_http",
+            "transport",
+            "unknown",
+        }:
+            raise ConfigurationError("optimizer request failure class is invalid")
+        if self.request_failure_class is None:
+            if self.request_failure_status_code is not None:
+                raise ConfigurationError("optimizer request failure status is inconsistent")
+        elif self.request_failure_class == "provider_http":
+            if (
+                type(self.request_failure_status_code) is not int
+                or not 100 <= self.request_failure_status_code <= 599
+            ):
+                raise ConfigurationError("optimizer provider HTTP status is invalid")
+        elif self.request_failure_status_code is not None:
+            raise ConfigurationError("optimizer non-HTTP failure cannot carry a status")
         if self.accounting_complete is not self.authoritative_spend_known:
             raise ConfigurationError("optimizer provider accounting completeness differs")
         if (
@@ -1673,6 +1703,13 @@ class ProviderCallRecord:
                 raise ConfigurationError(
                     "optimizer uncertain token reservation is inconsistent"
                 )
+        if self.request_failure_class is not None and not (
+            self.outcome == "uncertain_accounting"
+            and self.request_started
+            and not self.response_received
+            and not self.accounting_complete
+        ):
+            raise ConfigurationError("optimizer request failure provenance is inconsistent")
         if self.outcome == "accepted" and not self.response_schema_valid:
             raise ConfigurationError("accepted optimizer response must be schema-valid")
         if self.outcome == "accepted" and not (
@@ -1731,6 +1768,8 @@ def _provider_call_record_primitive(
             primitive.pop(retired)
     else:
         primitive.pop("pricing_snapshot_sha256")
+        primitive.pop("request_failure_class")
+        primitive.pop("request_failure_status_code")
     return primitive
 
 
@@ -3068,6 +3107,21 @@ def _is_openai_transport_error(error: BaseException) -> bool:
     )
 
 
+def _pit_optimizer_request_failure_provenance(
+    error: BaseException,
+) -> tuple[str, int | None]:
+    """Return only audit-safe request provenance; never retain provider text."""
+
+    status_code = _status_code(error)
+    if type(status_code) is int and 100 <= status_code <= 599:
+        return "provider_http", status_code
+    if isinstance(error, (ConnectionError, TimeoutError)) or _is_openai_transport_error(
+        error
+    ):
+        return "transport", None
+    return "unknown", None
+
+
 def _is_retryable(error: BaseException) -> bool:
     return (
         isinstance(error, (ConnectionError, TimeoutError))
@@ -4166,6 +4220,8 @@ class OpenRouterGateway:
                 self.pit_optimizer_ledger
             ),
             pricing_snapshot_sha256=facts.pricing_snapshot_sha256,
+            request_failure_class=facts.request_failure_class,
+            request_failure_status_code=facts.request_failure_status_code,
         )
 
     def _finalize_pit_optimizer_call(
@@ -4437,6 +4493,8 @@ class OpenRouterGateway:
         response_received = False
         returned_model: str | None = None
         finish_reason: str | None = None
+        request_failure_class: str | None = None
+        request_failure_status_code: int | None = None
         finalized = False
         pending_facts: PitOptimizerProviderFacts | None = None
         pending_usage = Usage()
@@ -4458,6 +4516,8 @@ class OpenRouterGateway:
             finish_reason: str | None,
             response_schema_valid: bool,
             usage: Usage | None,
+            request_failure_class: str | None = None,
+            request_failure_status_code: int | None = None,
         ) -> PitOptimizerProviderFacts:
             assert authorization_reservation is not None
             complete = usage is not None
@@ -4486,6 +4546,8 @@ class OpenRouterGateway:
                     0 if usage is not None else authorization_reservation.reserved_tokens
                 ),
                 audit_sha256=audit_sha256,
+                request_failure_class=request_failure_class,
+                request_failure_status_code=request_failure_status_code,
             )
 
         def finalize(
@@ -4606,6 +4668,10 @@ class OpenRouterGateway:
                 )
             except Exception as exc:
                 lifecycle.response_processed = True
+                (
+                    request_failure_class,
+                    request_failure_status_code,
+                ) = _pit_optimizer_request_failure_provenance(exc)
                 raise GatewayError(
                     "OpenRouter request accounting is uncertain",
                     status_code=_status_code(exc),
@@ -4848,6 +4914,12 @@ class OpenRouterGateway:
                             finish_reason=(finish_reason if possibly_sent else None),
                             response_schema_valid=False,
                             usage=None if possibly_sent else zero_usage,
+                            request_failure_class=(
+                                request_failure_class if possibly_sent else None
+                            ),
+                            request_failure_status_code=(
+                                request_failure_status_code if possibly_sent else None
+                            ),
                         )
                         pending_usage = Usage()
                         pending_terminal_code = outer_terminal_code
@@ -13333,6 +13405,8 @@ class AuditTrail:
             cost_usd=record.cost_usd,
             retained_reservation_tokens=(record.retained_reservation_tokens or 0),
             audit_sha256=lifecycle_audit_sha256,
+            request_failure_class=record.request_failure_class,
+            request_failure_status_code=record.request_failure_status_code,
         )
 
     @staticmethod

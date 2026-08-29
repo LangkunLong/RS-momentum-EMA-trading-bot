@@ -338,9 +338,9 @@ def test_role_schema_author_output_has_independent_diff_and_metadata_caps() -> N
     assert artifact.changed_symbols == (
         "core.strategy_policy.entry.evaluate_entry",
     )
-    schema = contract.pit_optimizer_response_format("author")["json_schema"]["schema"]
-    assert schema["additionalProperties"] is False
-    assert set(schema["required"]) == set(payload)
+    assert contract.pit_optimizer_response_format("author") == {
+        "type": "json_object"
+    }
 
     with pytest.raises(ValueError, match="diff"):
         contract.AuthorArtifact.from_json(

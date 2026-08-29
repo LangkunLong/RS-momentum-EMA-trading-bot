@@ -493,6 +493,8 @@ class PitOptimizerProviderFacts:
     cost_usd: float | None
     retained_reservation_tokens: int
     audit_sha256: str
+    request_failure_class: str | None = None
+    request_failure_status_code: int | None = None
 
     def __post_init__(self) -> None:
         _positive_int(self.call_index, "optimizer provider call index")
@@ -519,8 +521,33 @@ class PitOptimizerProviderFacts:
             raise ValueError("optimizer provider response cannot precede request start")
         if self.finish_reason not in {None, "stop", "non_stop", "unknown"}:
             raise ValueError("optimizer provider finish reason is invalid")
+        if self.request_failure_class not in {
+            None,
+            "provider_http",
+            "transport",
+            "unknown",
+        }:
+            raise ValueError("optimizer request failure class is invalid")
+        if self.request_failure_class is None:
+            if self.request_failure_status_code is not None:
+                raise ValueError("optimizer request failure status is inconsistent")
+        elif self.request_failure_class == "provider_http":
+            if (
+                type(self.request_failure_status_code) is not int
+                or not 100 <= self.request_failure_status_code <= 599
+            ):
+                raise ValueError("optimizer provider HTTP status is invalid")
+        elif self.request_failure_status_code is not None:
+            raise ValueError("optimizer non-HTTP failure cannot carry a status")
         if type(self.response_schema_valid) is not bool or type(self.accounting_complete) is not bool:
             raise ValueError("optimizer provider validation/accounting facts are invalid")
+        if self.request_failure_class is not None and not (
+            self.outcome == "uncertain_accounting"
+            and self.request_started
+            and not self.response_received
+            and not self.accounting_complete
+        ):
+            raise ValueError("optimizer request failure provenance is inconsistent")
         if (
             type(self.retained_reservation_tokens) is not int
             or self.retained_reservation_tokens < 0
