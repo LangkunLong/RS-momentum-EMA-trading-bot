@@ -1897,7 +1897,7 @@ def _canonical_optimizer_decimal_text(value: Decimal) -> str:
 
     if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
         raise ConfigurationError(
-            "optimizer projected cost must be a finite non-negative Decimal"
+            "optimizer USD amount must be a finite non-negative Decimal"
         )
     if value.is_zero():
         return "0"
@@ -1946,7 +1946,7 @@ class PitOptimizerResourceSnapshot:
     completion_tokens: int
     total_tokens: int
     reserved_tokens: int
-    authoritative_usd: float
+    authoritative_usd: str
     retained_reservation_tokens: int
     incomplete_accounting_calls: int
     accounting_basis: str
@@ -1977,13 +1977,21 @@ class PitOptimizerResourceSnapshot:
             raise ConfigurationError(
                 "incomplete accounting calls cannot exceed optimizer calls"
             )
+        try:
+            authoritative_usd = Decimal(self.authoritative_usd)
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ConfigurationError(
+                "optimizer authoritative USD must be canonical decimal text"
+            ) from exc
         if (
-            type(self.authoritative_usd) not in {int, float}
-            or not math.isfinite(self.authoritative_usd)
-            or self.authoritative_usd < 0
+            not isinstance(self.authoritative_usd, str)
+            or not authoritative_usd.is_finite()
+            or authoritative_usd < 0
+            or _canonical_optimizer_decimal_text(authoritative_usd)
+            != self.authoritative_usd
         ):
             raise ConfigurationError(
-                "optimizer authoritative USD must be finite and nonnegative"
+                "optimizer authoritative USD must be canonical decimal text"
             )
         expected_basis = (
             "authoritative"
@@ -2190,7 +2198,7 @@ class PitOptimizerResourceLedger:
         self.completion_tokens = 0
         self.total_tokens = 0
         self.reserved_tokens = 0
-        self.authoritative_usd = 0.0
+        self.authoritative_usd = Decimal("0")
         self.retained_reservation_tokens = 0
         self.incomplete_accounting_calls = 0
         self._pit_optimizer_reservations: dict[
@@ -2283,46 +2291,50 @@ class PitOptimizerResourceLedger:
             )
             return
 
-        complete = all(
-            value is not None
-            for value in (
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.total_tokens,
-                usage.cost_usd,
-            )
+        values = (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+            usage.cost_usd,
         )
+        complete = all(value is not None for value in values)
+        accounting_error: ResponseValidationError | None = None
+        charged_usd: Decimal | None = None
         if complete:
             assert usage.prompt_tokens is not None
             assert usage.completion_tokens is not None
             assert usage.total_tokens is not None
             assert usage.cost_usd is not None
             if usage.total_tokens != usage.prompt_tokens + usage.completion_tokens:
-                raise ResponseValidationError("provider token accounting is inconsistent")
-            charged_usd = Decimal(str(usage.cost_usd))
-            if not charged_usd.is_finite() or charged_usd < 0:
-                raise ResponseValidationError(
-                    "provider cost must be finite and non-negative"
+                complete = False
+                accounting_error = ResponseValidationError(
+                    "provider token accounting is inconsistent"
                 )
-            charged_tokens = usage.total_tokens
+            else:
+                charged_usd = Decimal(str(usage.cost_usd))
+                if not charged_usd.is_finite() or charged_usd < 0:
+                    complete = False
+                    accounting_error = ResponseValidationError(
+                        "provider cost must be finite and non-negative"
+                    )
         else:
-            if any(
-                value is not None
-                for value in (
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                    usage.cost_usd,
+            if any(value is not None for value in values):
+                accounting_error = ResponseValidationError(
+                    "provider accounting is incomplete"
                 )
-            ):
-                raise ResponseValidationError("provider accounting is incomplete")
-            charged_tokens = reservation.token_upper_bound
+
+        charged_tokens = (
+            usage.total_tokens
+            if complete and usage.total_tokens is not None
+            else reservation.token_upper_bound
+        )
 
         del self._pit_optimizer_reservations[reservation.reservation_id]
         self.reserved_tokens += charged_tokens - reservation.token_upper_bound
         self.total_tokens += charged_tokens
         if complete:
-            self.authoritative_usd += float(charged_usd)
+            assert charged_usd is not None
+            self.authoritative_usd += charged_usd
             assert usage.prompt_tokens is not None
             assert usage.completion_tokens is not None
             self.prompt_tokens += usage.prompt_tokens
@@ -2335,6 +2347,9 @@ class PitOptimizerResourceLedger:
             usage,
             request_started,
         )
+
+        if accounting_error is not None:
+            raise accounting_error
 
         # The call already started: authoritative overage stays committed before
         # fail-closed termination, and uncertainty retains the full reservation.
@@ -2432,7 +2447,7 @@ class PitOptimizerResourceLedger:
         completion_tokens = 0
         total_tokens = 0
         reserved_tokens = sum(item.token_upper_bound for item in active.values())
-        authoritative_usd = 0.0
+        authoritative_usd = Decimal("0")
         retained_tokens = 0
         incomplete_calls = 0
         for reservation, usage, request_started in reconciliations.values():
@@ -2449,20 +2464,23 @@ class PitOptimizerResourceLedger:
                     )
                 continue
             calls += 1
-            if all(value is not None for value in values):
+            complete = all(value is not None for value in values)
+            if complete:
                 assert usage.prompt_tokens is not None
                 assert usage.completion_tokens is not None
                 assert usage.total_tokens is not None
                 assert usage.cost_usd is not None
-                if (
+                complete = (
                     usage.total_tokens
-                    != usage.prompt_tokens + usage.completion_tokens
-                ):
-                    raise AuditError(
-                        "optimizer budget recovery token accounting differs"
-                    )
-                charge_usd = float(usage.cost_usd)
-                if not math.isfinite(charge_usd) or charge_usd < 0:
+                    == usage.prompt_tokens + usage.completion_tokens
+                )
+            if complete:
+                assert usage.prompt_tokens is not None
+                assert usage.completion_tokens is not None
+                assert usage.total_tokens is not None
+                assert usage.cost_usd is not None
+                charge_usd = Decimal(str(usage.cost_usd))
+                if not charge_usd.is_finite() or charge_usd < 0:
                     raise AuditError(
                         "optimizer resource recovery cost accounting is invalid"
                     )
@@ -2470,14 +2488,10 @@ class PitOptimizerResourceLedger:
                 completion_tokens += usage.completion_tokens
                 charged_tokens = usage.total_tokens
                 authoritative_usd += charge_usd
-            elif all(value is None for value in values):
+            else:
                 charged_tokens = reservation.token_upper_bound
                 retained_tokens += charged_tokens
                 incomplete_calls += 1
-            else:
-                raise AuditError(
-                    "optimizer budget recovery usage is partially accounted"
-                )
             total_tokens += charged_tokens
             reserved_tokens += charged_tokens
         expected = PitOptimizerResourceSnapshot(
@@ -2486,7 +2500,9 @@ class PitOptimizerResourceLedger:
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             reserved_tokens=reserved_tokens,
-            authoritative_usd=authoritative_usd,
+            authoritative_usd=_canonical_optimizer_decimal_text(
+                authoritative_usd
+            ),
             retained_reservation_tokens=retained_tokens,
             incomplete_accounting_calls=incomplete_calls,
             accounting_basis=(
@@ -2656,7 +2672,7 @@ class PitOptimizerResourceLedger:
                 completion_tokens=0,
                 total_tokens=0,
                 reserved_tokens=0,
-                authoritative_usd=0.0,
+                authoritative_usd="0",
                 retained_reservation_tokens=0,
                 incomplete_accounting_calls=0,
                 accounting_basis="authoritative",
@@ -2670,7 +2686,7 @@ class PitOptimizerResourceLedger:
         self.completion_tokens = snapshot.completion_tokens
         self.total_tokens = snapshot.total_tokens
         self.reserved_tokens = snapshot.reserved_tokens
-        self.authoritative_usd = snapshot.authoritative_usd
+        self.authoritative_usd = Decimal(snapshot.authoritative_usd)
         self.retained_reservation_tokens = snapshot.retained_reservation_tokens
         self.incomplete_accounting_calls = snapshot.incomplete_accounting_calls
         self._pit_optimizer_reservations = active
@@ -4555,10 +4571,11 @@ class OpenRouterGateway:
             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
             if remaining <= 0:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
+            remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
+            if remaining <= 0:
+                raise BudgetExceededError("PIT optimizer wall deadline reached")
             audit_sha256 = self._ensure_pit_optimizer_started_event(lifecycle)
             possibly_sent = True
-            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
-                raise BudgetExceededError("PIT optimizer wall deadline reached")
             try:
                 response = client.chat.completions.create(
                     model=REASONER_MODEL,
@@ -14434,7 +14451,9 @@ def _pit_optimizer_resource_snapshot(
         completion_tokens=ledger.completion_tokens,
         total_tokens=ledger.total_tokens,
         reserved_tokens=ledger.reserved_tokens,
-        authoritative_usd=ledger.authoritative_usd,
+        authoritative_usd=_canonical_optimizer_decimal_text(
+            ledger.authoritative_usd
+        ),
         retained_reservation_tokens=ledger.retained_reservation_tokens,
         incomplete_accounting_calls=ledger.incomplete_accounting_calls,
         accounting_basis=(
