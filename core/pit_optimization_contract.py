@@ -1191,8 +1191,12 @@ def _require_first_call_plan(
             # the frozen R1 schedule.  Rebalance the same USD 0.20 per
             # iteration so that this complete plan passes its conservative
             # preflight without changing the token envelope or call order.
+            # R1 author responses can include a larger reasoning envelope than
+            # the requested output cap; reserve the same headroom used by the
+            # investigator while tightening the author input slice to the
+            # measured worst-case render (48,289 bytes plus static context).
             "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024, 0.10),
-            "author": (12_000, 70_000, 82_000, 4_000, 16 * 1024, 0.07),
+            "author": (12_000, 58_000, 70_000, 16_000, 16 * 1024, 0.07),
             "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
         },
     )
