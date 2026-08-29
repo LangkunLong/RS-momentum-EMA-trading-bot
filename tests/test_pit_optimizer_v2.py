@@ -260,12 +260,9 @@ def test_role_schema_investigator_output_is_closed_and_bounded() -> None:
 
     assert artifact.hypothesis_id == "hypothesis_1"
     assert artifact.family == "entry"
-    schema = contract.pit_optimizer_response_format("investigator")
-    assert schema["json_schema"]["name"] == "pit_optimizer_investigator_v2"
-    body = schema["json_schema"]["schema"]
-    assert body["additionalProperties"] is False
-    assert set(body["required"]) == set(payload)
-    assert body["properties"]["family"]["enum"] == ["entry", "exit", "risk_sizing"]
+    assert contract.pit_optimizer_response_format("investigator") == {
+        "type": "json_object"
+    }
 
     with pytest.raises(ValueError, match="invalid keys"):
         contract.InvestigatorArtifact.from_json(
@@ -389,14 +386,7 @@ def test_role_schema_critic_output_is_advisory_closed_and_bounded() -> None:
     )
 
     assert artifact.disposition == "refine"
-    schema = contract.pit_optimizer_response_format("critic")["json_schema"]["schema"]
-    assert schema["additionalProperties"] is False
-    assert set(schema["required"]) == set(payload)
-    assert schema["properties"]["disposition"]["enum"] == [
-        "refine",
-        "abandon",
-        "change_family",
-    ]
+    assert contract.pit_optimizer_response_format("critic") == {"type": "json_object"}
 
     with pytest.raises(ValueError, match="disposition"):
         contract.CriticArtifact.from_json(
@@ -8490,19 +8480,27 @@ def test_pit_optimizer_v2_next_investigator_requires_prior_iteration_receipts(
 
 
 @pytest.mark.parametrize(
-    ("outcome", "provider_outcome", "error_type", "charge_basis"),
+    (
+        "outcome",
+        "provider_outcome",
+        "error_type",
+        "charge_basis",
+        "response_validation_code",
+    ),
     (
         (
             _task6_fake_response("{}"),
             "schema_invalid",
             "ResponseValidationError",
             "authoritative",
+            "payload_schema_invalid",
         ),
         (
             RuntimeError("synthetic post-send transport failure"),
             "uncertain_accounting",
             "GatewayError",
             "retained_reservation",
+            None,
         ),
     ),
 )
@@ -8513,6 +8511,7 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
     provider_outcome: str,
     error_type: str,
     charge_basis: str,
+    response_validation_code: str | None,
 ) -> None:
     """Break caught: malformed/uncertain calls could leak a reservation or retry."""
     import agent_loop
@@ -8554,6 +8553,10 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
     assert records[-2]["record_type"] == "reconciliation"
     assert records[-2]["provider_facts"]["outcome"] == provider_outcome
     assert records[-2]["charge_basis"] == charge_basis
+    assert (
+        records[-2]["provider_facts"]["response_validation_code"]
+        == response_validation_code
+    )
     assert records[-1]["record_type"] == "lease_close"
     assert audit._events[-1]["event"] == "provider_call_rejected"
 

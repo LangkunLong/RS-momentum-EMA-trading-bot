@@ -45,6 +45,22 @@ MAX_CANARY_CALLS = 3
 MAX_CANARY_USD = 0.50
 
 OPTIMIZER_V2_ROLES = ("investigator", "author", "critic")
+# Content-free validation stages which may be retained in schema-v3 audit
+# records.  These classify a locally rejected response without retaining any
+# provider text, prompt text, or parser exception detail.
+PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES = frozenset(
+    {
+        "response_semantics_invalid",
+        "refusal",
+        "content_shape_invalid",
+        "payload_schema_invalid",
+        "payload_json_invalid",
+        "payload_keys_invalid",
+        "payload_field_invalid",
+        "model_mismatch",
+        "validator_boundary_invalid",
+    }
+)
 PIT_OPTIMIZER_R1_MODEL = "deepseek/deepseek-r1"
 MAX_ROLE_TEXT_BYTES = 4 * 1024
 MAX_ROLE_LIST_ITEMS = 16
@@ -133,8 +149,8 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
         "investigator": (
             "You are the PIT optimizer investigator. Use only the supplied bounded source, "
             "rules, aggregate discovery evidence, incumbent summary, and prior summaries. "
-            "Return one compact strict schema-v2 investigator object, JSON only: no markdown, "
-            "chain-of-thought, or extra keys. The response schema is authoritative: use at most "
+            "Return one compact schema-v2 investigator object, JSON only: no markdown, "
+            "chain-of-thought, or extra keys. The local response schema is authoritative: use at most "
             "four items per list, copy evidence IDs and editable paths/symbols verbatim from the "
             "supplied input, keep causal_rationale to 256 characters, and keep each diagnostic, "
             "risk, and author-instruction item to 96 characters. Make the object compact enough "
@@ -144,7 +160,7 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
         "author": (
             "You are the PIT optimizer author. Implement only the supplied investigator "
             "hypothesis within the immutable constraints and patch bounds. Return one strict "
-            "schema-v2 author object containing a unified diff; the response schema is "
+            "schema-v2 author object containing a unified diff; the local response schema is "
             "authoritative. Copy hypothesis_id verbatim from the investigator. List only paths and "
             "declared symbols actually changed by unified_diff, using their exact supplied values; "
             "do not list the whole editable scope. Use at most four assumption or validation-suggestion items, keep every such item to 96 "
@@ -154,8 +170,8 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
         ),
         "critic": (
             "You are the PIT optimizer critic. Analyze only the supplied sanitized validation "
-            "and aggregate discovery comparisons. Return one strict schema-v2 advisory object; "
-            "the response schema is authoritative. Copy at most four evidence IDs verbatim from "
+            "and aggregate discovery comparisons. Return one schema-v2 advisory object; "
+            "the local response schema is authoritative. Copy at most four evidence IDs verbatim from "
             "the supplied aggregates and keep every free-text field to 256 characters. You cannot "
             "accept a candidate and must not request hidden results, credentials, local paths, "
             "raw trades, holdings, or provider audit material."
@@ -3735,11 +3751,11 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
 
 
 def pit_optimizer_response_format(role: str) -> dict[str, object]:
-    if role == "author":
-        # The Author is the only role that returns a sizeable unified diff.  Its
-        # complete artifact is parsed and scope-validated locally before it can
-        # reach candidate evaluation, so provider-side JSON Schema enforcement
-        # adds a brittle transport dependency without adding a trust boundary.
+    if role in OPTIMIZER_V2_ROLES:
+        # Every role is parsed, bounded, and input-bound locally before the
+        # controller can consume it.  Provider-side JSON Schema is therefore a
+        # brittle transport constraint, not a trust boundary.  Request JSON
+        # objects and retain the same strict local acceptance checks.
         return {"type": "json_object"}
     try:
         schema = _V2_RESPONSE_SCHEMAS[role]

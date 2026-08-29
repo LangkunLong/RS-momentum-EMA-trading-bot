@@ -1215,6 +1215,7 @@ class ProviderCallRecord:
     pricing_snapshot_sha256: str | None = None
     request_failure_class: str | None = None
     request_failure_status_code: int | None = None
+    response_validation_code: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version not in {1, 2, 3}:
@@ -1267,6 +1268,8 @@ class ProviderCallRecord:
         if self.schema_version == 2:
             self._validate_failure_record()
             return
+        if self.response_validation_code is not None:
+            raise ConfigurationError("legacy provider call has response validation code")
         if (
             self.request_failure_class is not None
             or self.request_failure_status_code is not None
@@ -1465,6 +1468,8 @@ class ProviderCallRecord:
             raise ConfigurationError("optimizer response cannot precede request start")
         if self.failure_phase is not None or self.protocol_failure_code is not None:
             raise ConfigurationError("optimizer provider record has legacy failure fields")
+        if self.response_validation_code is not None:
+            raise ConfigurationError("schema-v2 optimizer record has response validation code")
         if (
             self.request_failure_class is not None
             or self.request_failure_status_code is not None
@@ -1595,6 +1600,15 @@ class ProviderCallRecord:
             raise ConfigurationError("optimizer response cannot precede request start")
         if self.failure_phase is not None or self.protocol_failure_code is not None:
             raise ConfigurationError("optimizer provider record has legacy failure fields")
+        from core.pit_optimization_contract import (
+            PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES,
+        )
+
+        if self.response_validation_code not in {
+            None,
+            *PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES,
+        }:
+            raise ConfigurationError("optimizer response validation code is invalid")
         if self.request_failure_class not in {
             None,
             "provider_http",
@@ -1727,6 +1741,14 @@ class ProviderCallRecord:
             )
         if self.outcome == "schema_invalid" and self.response_schema_valid:
             raise ConfigurationError("invalid optimizer response cannot be schema-valid")
+        if self.response_validation_code is not None and not (
+            self.outcome == "schema_invalid"
+            and self.request_started
+            and self.response_received
+            and not self.response_schema_valid
+            and self.accounting_complete
+        ):
+            raise ConfigurationError("optimizer response validation code is inconsistent")
 
 
 @dataclass(frozen=True)
@@ -4222,6 +4244,7 @@ class OpenRouterGateway:
             pricing_snapshot_sha256=facts.pricing_snapshot_sha256,
             request_failure_class=facts.request_failure_class,
             request_failure_status_code=facts.request_failure_status_code,
+            response_validation_code=facts.response_validation_code,
         )
 
     def _finalize_pit_optimizer_call(
@@ -4518,6 +4541,7 @@ class OpenRouterGateway:
             usage: Usage | None,
             request_failure_class: str | None = None,
             request_failure_status_code: int | None = None,
+            response_validation_code: str | None = None,
         ) -> PitOptimizerProviderFacts:
             assert authorization_reservation is not None
             complete = usage is not None
@@ -4548,6 +4572,7 @@ class OpenRouterGateway:
                 audit_sha256=audit_sha256,
                 request_failure_class=request_failure_class,
                 request_failure_status_code=request_failure_status_code,
+                response_validation_code=response_validation_code,
             )
 
         def finalize(
@@ -4753,8 +4778,9 @@ class OpenRouterGateway:
                     not isinstance(content, str)
                     or len(content.encode("utf-8")) > plan_snapshot.max_response_bytes
                 ):
-                    raise ResponseValidationError(
-                        "optimizer response byte cap exceeded"
+                    raise ClosedResponseValidationError(
+                        "optimizer response byte cap exceeded",
+                        ProtocolFailureCode.CONTENT_SHAPE_INVALID,
                     )
                 completion = self._validate_response(
                     response,
@@ -4776,6 +4802,11 @@ class OpenRouterGateway:
                 finalize(facts, usage)
                 raise
             except (ResponseValidationError, ValueError, TypeError) as exc:
+                response_validation_code = (
+                    exc.code.value
+                    if isinstance(exc, ClosedResponseValidationError)
+                    else ProtocolFailureCode.VALIDATOR_BOUNDARY_INVALID.value
+                )
                 facts = provider_facts(
                     outcome="schema_invalid",
                     request_started=True,
@@ -4784,6 +4815,7 @@ class OpenRouterGateway:
                     finish_reason=finish_reason,
                     response_schema_valid=False,
                     usage=usage,
+                    response_validation_code=response_validation_code,
                 )
                 finalize(facts, usage)
                 raise ResponseValidationError(
@@ -4803,6 +4835,9 @@ class OpenRouterGateway:
                     finish_reason=finish_reason,
                     response_schema_valid=False,
                     usage=usage,
+                    response_validation_code=(
+                        ProtocolFailureCode.VALIDATOR_BOUNDARY_INVALID.value
+                    ),
                 )
                 finalize(facts, usage)
                 raise ResponseValidationError(
@@ -4819,6 +4854,9 @@ class OpenRouterGateway:
                     finish_reason=finish_reason,
                     response_schema_valid=False,
                     usage=usage,
+                    response_validation_code=(
+                        ProtocolFailureCode.PAYLOAD_FIELD_INVALID.value
+                    ),
                 )
                 finalize(facts, usage)
                 raise ResponseValidationError(
@@ -5527,6 +5565,11 @@ class OpenRouterGateway:
         except ProtocolValidationError as exc:
             raise ClosedResponseValidationError(
                 "response protocol validation failed",
+                ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
+            ) from exc
+        except (ValueError, TypeError) as exc:
+            raise ClosedResponseValidationError(
+                "response payload validation failed",
                 ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
             ) from exc
         normalized_usage = usage or _usage_from_response(
@@ -13113,6 +13156,8 @@ class AuditTrail:
         }
         if record.protocol_failure_code is not None:
             details["protocol_failure_code"] = record.protocol_failure_code.value
+        if record.response_validation_code is not None:
+            details["response_validation_code"] = record.response_validation_code
         if payload_sha256 is not None:
             details["payload_sha256"] = payload_sha256
         if run_manifest_sha256 is not None:
@@ -13407,6 +13452,7 @@ class AuditTrail:
             audit_sha256=lifecycle_audit_sha256,
             request_failure_class=record.request_failure_class,
             request_failure_status_code=record.request_failure_status_code,
+            response_validation_code=record.response_validation_code,
         )
 
     @staticmethod

@@ -495,6 +495,7 @@ class PitOptimizerProviderFacts:
     audit_sha256: str
     request_failure_class: str | None = None
     request_failure_status_code: int | None = None
+    response_validation_code: str | None = None
 
     def __post_init__(self) -> None:
         _positive_int(self.call_index, "optimizer provider call index")
@@ -539,6 +540,11 @@ class PitOptimizerProviderFacts:
                 raise ValueError("optimizer provider HTTP status is invalid")
         elif self.request_failure_status_code is not None:
             raise ValueError("optimizer non-HTTP failure cannot carry a status")
+        if self.response_validation_code not in {
+            None,
+            *_contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES,
+        }:
+            raise ValueError("optimizer response validation code is invalid")
         if type(self.response_schema_valid) is not bool or type(self.accounting_complete) is not bool:
             raise ValueError("optimizer provider validation/accounting facts are invalid")
         if self.request_failure_class is not None and not (
@@ -548,6 +554,14 @@ class PitOptimizerProviderFacts:
             and not self.accounting_complete
         ):
             raise ValueError("optimizer request failure provenance is inconsistent")
+        if self.response_validation_code is not None and not (
+            self.outcome == "schema_invalid"
+            and self.request_started
+            and self.response_received
+            and not self.response_schema_valid
+            and self.accounting_complete
+        ):
+            raise ValueError("optimizer response validation code is inconsistent")
         if (
             type(self.retained_reservation_tokens) is not int
             or self.retained_reservation_tokens < 0
