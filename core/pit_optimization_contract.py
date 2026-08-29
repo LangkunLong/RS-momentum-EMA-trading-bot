@@ -1164,6 +1164,15 @@ def _require_first_call_plan(
             "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.09),
             "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
         },
+        {
+            # DeepSeek R1 may account a small reasoning suffix beyond the
+            # request's nominal output cap.  Give the investigator enough
+            # sealed headroom while moving the same amount from its input
+            # envelope, keeping the aggregate 448,000-token ceiling intact.
+            "investigator": (8_000, 80_000, 84_000, 8_000, 8 * 1024, 0.08),
+            "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.09),
+            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
+        },
     )
     if max_iterations != 2 or len(call_budgets) != 6:
         raise ValueError("first subset canary requires two complete iterations")
