@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -1070,6 +1070,23 @@ class Usage:
             raise ProtocolValidationError("usage cost must be a finite non-negative number")
         if self.accounting_source not in {"inline", "generation_endpoint"}:
             raise ProtocolValidationError("usage accounting source is invalid")
+
+
+_CANONICAL_USAGE_KEYS = frozenset(item.name for item in fields(Usage))
+
+
+def _pit_optimizer_usage_from_recovery_primitive(value: object) -> Usage:
+    """Parse only the exact Usage primitive emitted by durable v3 recovery."""
+
+    if type(value) is not dict or set(value) != _CANONICAL_USAGE_KEYS:
+        raise AuditError("optimizer budget recovery usage is noncanonical")
+    try:
+        usage = Usage(**value)
+    except (ProtocolValidationError, TypeError, ValueError) as exc:
+        raise AuditError("optimizer budget recovery usage is invalid") from exc
+    if value != asdict(usage):
+        raise AuditError("optimizer budget recovery usage is noncanonical")
+    return usage
 
 
 PayloadT = TypeVar("PayloadT")
@@ -2627,15 +2644,9 @@ class PitOptimizerResourceLedger:
             reservation = self._pit_optimizer_reservation_from_primitive(
                 item["reservation"]
             )
-            usage_value = item.get("usage")
-            try:
-                if not isinstance(usage_value, dict):
-                    raise TypeError("usage is not a mapping")
-                usage = Usage(**usage_value)
-            except (ProtocolValidationError, TypeError, ValueError) as exc:
-                raise AuditError(
-                    "optimizer budget recovery usage is invalid"
-                ) from exc
+            usage = _pit_optimizer_usage_from_recovery_primitive(
+                item.get("usage")
+            )
             request_started = item.get("request_started")
             if type(request_started) is not bool:
                 raise AuditError(
@@ -13405,13 +13416,9 @@ class AuditTrail:
                 total_tokens=record.total_tokens,
                 cost_usd=record.cost_usd,
             )
-        usage_primitive = target.get("usage")
-        try:
-            if not isinstance(usage_primitive, dict):
-                raise TypeError("usage is not a mapping")
-            replayed_usage = Usage(**usage_primitive)
-        except (ProtocolValidationError, TypeError, ValueError) as exc:
-            raise AuditError("optimizer budget recovery usage is invalid") from exc
+        replayed_usage = _pit_optimizer_usage_from_recovery_primitive(
+            target.get("usage")
+        )
         if (
             replayed_usage.prompt_tokens,
             replayed_usage.completion_tokens,
@@ -19246,7 +19253,21 @@ def _build_pit_optimizer_v3_live_run(
 
         def dispose_capability(candidate: Candidate) -> PitOptimizerCleanup:
             root = candidate.root
-            dispose_candidate(candidate)
+            if root.exists() or root.is_symlink():
+                dispose_candidate(candidate)
+            else:
+                # A prior cleanup may have removed the root before a later
+                # verification step raised.  Revoke that already-absent
+                # capability without recreating validation authority.
+                retained = _CANDIDATE_CAPABILITIES.get(root)
+                if (
+                    retained is not None
+                    and retained is not candidate._controller_capability
+                ):
+                    raise ConfigurationError(
+                        "absent candidate cleanup capability differs"
+                    )
+                _CANDIDATE_CAPABILITIES.pop(root, None)
             modified = recheck_source_unchanged(source_state).source_modified
             return PitOptimizerCleanup(
                 candidate_removed=not root.exists(),
@@ -21057,6 +21078,10 @@ def _pit_optimizer_v3_prepare_lines(
 ) -> tuple[str, str]:
     """Render the authenticated readiness record and inert canary command."""
     from core.pit_optimization_contract import PitOptimizerGateConfig
+    from core.pit_optimizer_command import (
+        authenticated_python_executable,
+        render_pit_optimizer_v3_command,
+    )
     from core.pit_optimizer_controller import PitOptimizerReadiness
 
     if (
@@ -21112,7 +21137,7 @@ def _pit_optimizer_v3_prepare_lines(
     ):
         raise ConfigurationError("PIT optimizer prepare ceilings are invalid")
     argv = (
-        sys.executable,
+        authenticated_python_executable(),
         "-B",
         str((config.source_root / "agent_loop.py").resolve()),  # type: ignore[operator]
         "--repo-root",
@@ -21160,7 +21185,7 @@ def _pit_optimizer_v3_prepare_lines(
         "--authorize-policy-source-transmission",
         *_pit_optimizer_v3_execution_limit_args(limits),
     )
-    command = subprocess.list2cmdline(argv)
+    command = render_pit_optimizer_v3_command(argv)
     ready = {
         "schema_version": 3,
         "phase": "ready",

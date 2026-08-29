@@ -9,7 +9,6 @@ import math
 import os
 import re
 import stat
-import subprocess
 import uuid
 from dataclasses import InitVar, dataclass, fields, is_dataclass, replace
 from decimal import Decimal
@@ -18,6 +17,10 @@ from types import MappingProxyType
 from typing import Mapping
 
 from core.engine_policy import effective_engine_policy_sha256
+from core.pit_optimizer_command import (
+    authenticated_python_executable,
+    render_pit_optimizer_v3_command,
+)
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
     DiscoveryExposureProof,
@@ -1424,7 +1427,7 @@ def build_prepare_command(
     if sandbox_image != manifest.sandbox_image:
         raise ValueError("prepare sandbox image differs from manifest")
     arguments = [
-        "python",
+        authenticated_python_executable(),
         "-B",
         str((repository / "agent_loop.py").resolve()),
         "--repo-root",
@@ -1472,7 +1475,7 @@ def build_prepare_command(
         "--max-iterations",
         "2",
     ]
-    return subprocess.list2cmdline(arguments)
+    return render_pit_optimizer_v3_command(arguments)
 
 
 @dataclass(frozen=True, slots=True)

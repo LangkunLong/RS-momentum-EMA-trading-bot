@@ -383,6 +383,7 @@ class _RunState:
     validation_outcome_proof: ValidationOutcomeProof | None = None
     evaluation_failure_code: str | None = None
     cleanup_observations: list[PitOptimizerCleanup] = field(default_factory=list)
+    pending_retired_workspaces: list[CandidateWorkspace] = field(default_factory=list)
     finalization_failures: list[str] = field(default_factory=list)
 
 
@@ -466,7 +467,14 @@ class _CandidateCapabilityRegistry:
         self._create_capability = create_capability
         self._validate_capability = validate_capability
         self._dispose_capability = dispose_capability
-        self._entries: dict[str, tuple[CandidateWorkspace, object]] = {}
+        self._validation_entries: dict[
+            str,
+            tuple[CandidateWorkspace, object],
+        ] = {}
+        self._cleanup_entries: dict[
+            str,
+            tuple[CandidateWorkspace, object],
+        ] = {}
 
     def create_candidate(self, cumulative_diff: str | None) -> CandidateWorkspace:
         capability = self._create_capability(cumulative_diff)
@@ -477,13 +485,19 @@ class _CandidateCapabilityRegistry:
             workspace_id=f"workspace_{uuid.uuid4().hex}",
             root=root.resolve(),
         )
-        self._entries[workspace.workspace_id] = (workspace, capability)
+        entry = (workspace, capability)
+        self._validation_entries[workspace.workspace_id] = entry
+        self._cleanup_entries[workspace.workspace_id] = entry
         return workspace
 
-    def _resolve(self, workspace: CandidateWorkspace) -> object:
+    @staticmethod
+    def _resolve(
+        entries: Mapping[str, tuple[CandidateWorkspace, object]],
+        workspace: CandidateWorkspace,
+    ) -> object:
         if not isinstance(workspace, CandidateWorkspace):
             raise RuntimeError("unknown candidate workspace")
-        entry = self._entries.get(workspace.workspace_id)
+        entry = entries.get(workspace.workspace_id)
         if entry is None or entry[0] != workspace:
             raise RuntimeError("unknown candidate workspace")
         return entry[1]
@@ -494,15 +508,24 @@ class _CandidateCapabilityRegistry:
         artifact: AuthorArtifact,
         cumulative_diff: str | None,
     ) -> CandidateValidationOutcome:
-        capability = self._resolve(workspace)
-        return self._validate_capability(capability, artifact, cumulative_diff)
+        capability = self._resolve(self._validation_entries, workspace)
+        return self._validate_capability(
+            capability,
+            artifact,
+            cumulative_diff,
+        )
 
     def dispose_candidate(self, workspace: CandidateWorkspace) -> PitOptimizerCleanup:
-        capability = self._resolve(workspace)
-        # Revoke before invoking cleanup so even a failing disposer cannot be retried
-        # through a stale root reference.
-        self._entries.pop(workspace.workspace_id)
-        return self._dispose_capability(capability)
+        capability = self._resolve(self._cleanup_entries, workspace)
+        # Cleanup begins with one-way validation revocation.  The internal
+        # cleanup-only capability remains reachable until disposal is complete.
+        self._validation_entries.pop(workspace.workspace_id, None)
+        cleanup = self._dispose_capability(capability)
+        if not isinstance(cleanup, PitOptimizerCleanup):
+            raise RuntimeError("candidate cleanup result is invalid")
+        if cleanup.candidate_removed and cleanup.worker_stopped:
+            self._cleanup_entries.pop(workspace.workspace_id)
+        return cleanup
 
 
 def _parity_primitive(parity: ParityAttestation) -> dict[str, object]:
@@ -1738,6 +1761,54 @@ def _run_critic(
     return call
 
 
+def _retain_pending_retired_workspace(
+    state: _RunState,
+    workspace: CandidateWorkspace,
+) -> None:
+    for retained in state.pending_retired_workspaces:
+        if retained.workspace_id == workspace.workspace_id:
+            if retained != workspace:
+                raise SandboxIntegrityFailure(
+                    "retired candidate workspace identity differs"
+                )
+            return
+    state.pending_retired_workspaces.append(workspace)
+
+
+def _dispose_intermediate_candidate(
+    state: _RunState,
+    services: PitOptimizerServices,
+    workspace: CandidateWorkspace,
+) -> None:
+    """Revoke one retired workspace and fail closed on any cleanup doubt."""
+
+    failed = PitOptimizerCleanup(False, False, False)
+    try:
+        cleanup = services.dispose_candidate(workspace)
+    except BaseException as exc:
+        state.cleanup_observations.append(failed)
+        _retain_pending_retired_workspace(state, workspace)
+        raise SandboxIntegrityFailure(
+            "intermediate candidate cleanup failed"
+        ) from exc
+    if not isinstance(cleanup, PitOptimizerCleanup):
+        state.cleanup_observations.append(failed)
+        _retain_pending_retired_workspace(state, workspace)
+        raise SandboxIntegrityFailure(
+            "intermediate candidate cleanup result is invalid"
+        )
+    state.cleanup_observations.append(cleanup)
+    if not cleanup.candidate_removed or not cleanup.worker_stopped:
+        _retain_pending_retired_workspace(state, workspace)
+        raise SandboxIntegrityFailure(
+            "intermediate candidate cleanup is incomplete"
+        )
+    if cleanup.source_modified:
+        raise SandboxIntegrityFailure(
+            "intermediate candidate cleanup observed source modification"
+        )
+
+
 def _persist_iteration_decision(
     readiness: PitOptimizerReadiness,
     state: _RunState,
@@ -1885,13 +1956,13 @@ def _persist_iteration_decision(
         and prior_workspace is not None
         and prior_workspace != candidate_workspace
     ):
-        services.dispose_candidate(prior_workspace)
+        _dispose_intermediate_candidate(state, services, prior_workspace)
     elif (
         not improves
         and candidate_workspace is not None
         and candidate_workspace != state.incumbent_workspace
     ):
-        services.dispose_candidate(candidate_workspace)
+        _dispose_intermediate_candidate(state, services, candidate_workspace)
     state.prior_iterations = (*state.prior_iterations, feedback)
     state.iterations_completed += 1
     state.next_iteration += 1
@@ -2257,7 +2328,11 @@ def _dispose_all_candidates_and_workers(
 
     workspaces: list[CandidateWorkspace] = []
     seen: set[str] = set()
-    for workspace in (state.iteration_workspace, state.incumbent_workspace):
+    for workspace in (
+        state.iteration_workspace,
+        state.incumbent_workspace,
+        *state.pending_retired_workspaces,
+    ):
         if workspace is not None and workspace.workspace_id not in seen:
             seen.add(workspace.workspace_id)
             workspaces.append(workspace)
@@ -2278,12 +2353,16 @@ def _dispose_all_candidates_and_workers(
     state.cleanup_observations.extend(observations)
     state.iteration_workspace = None
     state.incumbent_workspace = None
+    state.pending_retired_workspaces.clear()
     state.iteration_source_bundle = None
     state.prospective_source_bundle = None
+    all_observations = state.cleanup_observations
     return PitOptimizerCleanup(
-        candidate_removed=all(item.candidate_removed for item in observations),
-        worker_stopped=all(item.worker_stopped for item in observations),
-        source_modified=any(item.source_modified for item in observations),
+        candidate_removed=all(
+            item.candidate_removed for item in all_observations
+        ),
+        worker_stopped=all(item.worker_stopped for item in all_observations),
+        source_modified=any(item.source_modified for item in all_observations),
     )
 
 
