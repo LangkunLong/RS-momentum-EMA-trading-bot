@@ -105,7 +105,10 @@ MAX_BATCH_CALLS = 150
 MAX_BATCH_TOKENS = 2_000_000
 GENERATION_ACCOUNTING_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0)
 GENERATION_ACCOUNTING_ATTEMPTS = len(GENERATION_ACCOUNTING_DELAYS_SECONDS) + 1
-PIT_OPTIMIZER_GENERATION_PUBLICATION_WAIT_SECONDS = 5.0
+# PIT canaries permit one generation-receipt lookup only.  Give OpenRouter's
+# asynchronously published receipt a bounded chance to appear before that
+# lookup; this is a pre-lookup settle period, not a provider retry.
+PIT_OPTIMIZER_GENERATION_PUBLICATION_WAIT_SECONDS = 30.0
 
 _MAX_FILES = 8
 _MAX_LIST_ITEMS = 16
