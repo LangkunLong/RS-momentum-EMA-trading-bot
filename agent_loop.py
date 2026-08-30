@@ -105,6 +105,7 @@ MAX_BATCH_CALLS = 150
 MAX_BATCH_TOKENS = 2_000_000
 GENERATION_ACCOUNTING_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0)
 GENERATION_ACCOUNTING_ATTEMPTS = len(GENERATION_ACCOUNTING_DELAYS_SECONDS) + 1
+PIT_OPTIMIZER_GENERATION_PUBLICATION_WAIT_SECONDS = 5.0
 
 _MAX_FILES = 8
 _MAX_LIST_ITEMS = 16
@@ -5340,6 +5341,18 @@ class OpenRouterGateway:
                 code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
                 generation_attempts=0,
             )
+        # A completed non-streaming response can precede publication of its
+        # generation record.  Wait once before the canary's single permitted
+        # lookup; this does not retry a completion or issue a second lookup.
+        if remaining <= PIT_OPTIMIZER_GENERATION_PUBLICATION_WAIT_SECONDS:
+            raise AccountingValidationError(
+                "generation accounting recovery reached the wall deadline",
+                code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
+                generation_attempts=0,
+            )
+        self._generation_sleeper(
+            PIT_OPTIMIZER_GENERATION_PUBLICATION_WAIT_SECONDS
+        )
         try:
             payload = (
                 self._load_generation_accounting(
