@@ -55,6 +55,10 @@ _DECLARED_SYMBOLS = {
     ),
 }
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_AUTHOR_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(0|[1-9][0-9]*)(?:,([0-9]+))? "
+    r"\+(0|[1-9][0-9]*)(?:,([0-9]+))? @@((?: .*)?)\n$"
+)
 _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL = object()
 _CONTRACT_IMPORTS = frozenset(
     {
@@ -664,6 +668,60 @@ def validate_candidate_identity(candidate: CandidateIdentity) -> None:
         raise ValueError("candidate identity is not authenticated")
 
 
+def _normalize_author_diff_transport(raw: str) -> str:
+    """Repair only transport delimiters and hunk count metadata before Git checks.
+
+    The model-authored file bodies, paths, hunk start coordinates, and context are
+    left untouched.  A later strict parser and ``git apply --check`` remain the
+    authority for every semantic and applicability property of the candidate.
+    """
+
+    if not isinstance(raw, str) or not raw:
+        return raw
+    candidate = raw if raw.endswith("\n") else raw + "\n"
+    if "\r" in candidate or "\x00" in candidate:
+        return candidate
+    lines = candidate.splitlines(keepends=True)
+    normalized: list[str] = []
+    index = 0
+    while index < len(lines):
+        header = _AUTHOR_HUNK_HEADER_RE.fullmatch(lines[index])
+        if header is None:
+            normalized.append(lines[index])
+            index += 1
+            continue
+        old_count = 0
+        new_count = 0
+        body_index = index + 1
+        while body_index < len(lines):
+            line = lines[body_index]
+            if line.startswith(("@@ ", "diff --git ", "--- a/")):
+                break
+            if line.startswith(" "):
+                old_count += 1
+                new_count += 1
+            elif line.startswith("-"):
+                old_count += 1
+            elif line.startswith("+"):
+                new_count += 1
+            elif line != "\\ No newline at end of file\n":
+                # Do not make a malformed body look valid.  The strict parser
+                # below will reject this unchanged candidate.
+                return candidate
+            body_index += 1
+        declared_old = int(header.group(2) or "1")
+        declared_new = int(header.group(4) or "1")
+        if (declared_old, declared_new) == (old_count, new_count):
+            normalized.append(lines[index])
+        else:
+            normalized.append(
+                f"@@ -{header.group(1)},{old_count} "
+                f"+{header.group(3)},{new_count} @@{header.group(5)}\n"
+            )
+        index += 1
+    return "".join(normalized)
+
+
 def validate_candidate_diff(
     *,
     authenticated_base_root: Path,
@@ -703,16 +761,7 @@ def validate_candidate_diff(
     before_bytes = {
         path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
     }
-    candidate_diff = incremental_diff
-    if (
-        isinstance(candidate_diff, str)
-        and candidate_diff
-        and not candidate_diff.endswith("\n")
-    ):
-        # JSON transport can omit only the terminal textual delimiter of an
-        # otherwise valid unified diff.  Normalize that delimiter locally;
-        # Git still authenticates the exact applied candidate state below.
-        candidate_diff += "\n"
+    candidate_diff = _normalize_author_diff_transport(incremental_diff)
     applied = False
     try:
         # The author contract permits both conventional Git diffs and standard
