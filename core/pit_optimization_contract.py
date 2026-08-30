@@ -361,6 +361,21 @@ def _v2_text(value: object, field: str, *, allow_empty: bool = False) -> str:
     return value
 
 
+def _v2_response_text(value: object, field: str, *, allow_empty: bool = False) -> str:
+    """Normalize harmless outer whitespace in model-authored text fields.
+
+    Provider JSON is untrusted, but outer whitespace has no strategy meaning once
+    the response is converted into a canonical local artifact.  Tolerating that
+    one formatting variation avoids discarding an otherwise valid role result;
+    types, control characters, emptiness, byte caps, and all subsequent binding
+    checks remain enforced by ``_v2_text``.
+    """
+
+    if not isinstance(value, str):
+        return _v2_text(value, field, allow_empty=allow_empty)
+    return _v2_text(value.strip(), field, allow_empty=allow_empty)
+
+
 def _v2_string_list(
     value: object,
     field: str,
@@ -372,6 +387,26 @@ def _v2_string_list(
     if len(value) > MAX_ROLE_LIST_ITEMS:
         raise ValueError(f"{field} may contain at most {MAX_ROLE_LIST_ITEMS} items")
     normalized = tuple(_v2_text(item, field) for item in value)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{field} must contain unique values")
+    if not allow_empty and not normalized:
+        raise ValueError(f"{field} cannot be empty")
+    return normalized
+
+
+def _v2_response_string_list(
+    value: object,
+    field: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    """Parse a model-authored list while canonicalizing only outer whitespace."""
+
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{field} must be a JSON string array")
+    if len(value) > MAX_ROLE_LIST_ITEMS:
+        raise ValueError(f"{field} may contain at most {MAX_ROLE_LIST_ITEMS} items")
+    normalized = tuple(_v2_response_text(item, field) for item in value)
     if len(normalized) != len(set(normalized)):
         raise ValueError(f"{field} must contain unique values")
     if not allow_empty and not normalized:
@@ -392,6 +427,15 @@ def _v2_string_tuple(
 
 def _v2_identifier(value: object, field: str) -> str:
     text = _v2_text(value, field)
+    if _ID_RE.fullmatch(text) is None:
+        raise ValueError(f"{field} is invalid")
+    return text
+
+
+def _v2_response_identifier(value: object, field: str) -> str:
+    """Validate a model-authored identifier after harmless outer trimming."""
+
+    text = _v2_response_text(value, field)
     if _ID_RE.fullmatch(text) is None:
         raise ValueError(f"{field} is invalid")
     return text
@@ -2622,31 +2666,31 @@ class InvestigatorArtifact(_V2Canonical):
             max_total_bytes=max_total_bytes,
             optional_keys=frozenset({"target_paths", "target_symbols"}),
         )
-        family = _v2_text(value["family"], "investigator family")
+        family = _v2_response_text(value["family"], "investigator family")
         if family not in _INVESTIGATOR_FAMILIES:
             raise ValueError("investigator family is invalid")
         target_paths, target_symbols = _controller_scope_for_family(family)
         return cls(
-            hypothesis_id=_v2_identifier(
+            hypothesis_id=_v2_response_identifier(
                 value["hypothesis_id"], "investigator hypothesis ID"
             ),
             family=family,
-            evidence_ids=_v2_string_list(
+            evidence_ids=_v2_response_string_list(
                 value["evidence_ids"], "investigator evidence IDs"
             ),
-            causal_rationale=_v2_text(
+            causal_rationale=_v2_response_text(
                 value["causal_rationale"], "investigator causal rationale"
             ),
             target_paths=target_paths,
             target_symbols=target_symbols,
-            expected_diagnostic_changes=_v2_string_list(
+            expected_diagnostic_changes=_v2_response_string_list(
                 value["expected_diagnostic_changes"],
                 "investigator expected diagnostic changes",
             ),
-            known_risks=_v2_string_list(
+            known_risks=_v2_response_string_list(
                 value["known_risks"], "investigator known risks", allow_empty=True
             ),
-            author_instructions=_v2_string_list(
+            author_instructions=_v2_response_string_list(
                 value["author_instructions"], "investigator author instructions"
             ),
         )
@@ -2736,14 +2780,16 @@ class AuthorArtifact(_V2Canonical):
             changed_symbols = _v2_string_tuple(
                 controller_symbols, "author controller symbols"
             )
-        hypothesis_id = _v2_identifier(value["hypothesis_id"], "author hypothesis ID")
-        behavioral_summary = _v2_text(
+        hypothesis_id = _v2_response_identifier(
+            value["hypothesis_id"], "author hypothesis ID"
+        )
+        behavioral_summary = _v2_response_text(
             value["behavioral_summary"], "author behavioral summary"
         )
-        assumptions = _v2_string_list(
+        assumptions = _v2_response_string_list(
             value["assumptions"], "author assumptions", allow_empty=True
         )
-        validation_suggestions = _v2_string_list(
+        validation_suggestions = _v2_response_string_list(
             value["validation_suggestions"],
             "author validation suggestions",
             allow_empty=True,
@@ -2814,21 +2860,27 @@ class CriticArtifact(_V2Canonical):
             ),
             max_total_bytes=max_total_bytes,
         )
-        disposition = _v2_text(value["disposition"], "critic disposition")
+        disposition = _v2_response_text(value["disposition"], "critic disposition")
         if disposition not in _CRITIC_DISPOSITIONS:
             raise ValueError("critic disposition is invalid")
         return cls(
-            hypothesis_id=_v2_identifier(value["hypothesis_id"], "critic hypothesis ID"),
-            prediction_vs_observation=_v2_text(
+            hypothesis_id=_v2_response_identifier(
+                value["hypothesis_id"], "critic hypothesis ID"
+            ),
+            prediction_vs_observation=_v2_response_text(
                 value["prediction_vs_observation"],
                 "critic prediction versus observation",
             ),
-            causal_explanation=_v2_text(
+            causal_explanation=_v2_response_text(
                 value["causal_explanation"], "critic causal explanation"
             ),
-            evidence_ids=_v2_string_list(value["evidence_ids"], "critic evidence IDs"),
+            evidence_ids=_v2_response_string_list(
+                value["evidence_ids"], "critic evidence IDs"
+            ),
             disposition=disposition,
-            next_direction=_v2_text(value["next_direction"], "critic next direction"),
+            next_direction=_v2_response_text(
+                value["next_direction"], "critic next direction"
+            ),
         )
 
 
