@@ -4830,14 +4830,21 @@ class OpenRouterGateway:
                     raw_response = raw_create(**request_kwargs)
                     parse = getattr(raw_response, "parse", None)
                     headers = getattr(raw_response, "headers", None)
+                    http_response = getattr(raw_response, "http_response", None)
+                    if headers is None:
+                        headers = getattr(http_response, "headers", None)
                     header_get = getattr(headers, "get", None)
                     if callable(header_get):
                         header_value = header_get("x-generation-id")
                         if header_value is not None:
                             generation_id_from_header = header_value
-                    if not callable(parse):
-                        raise GatewayError("OpenRouter raw response is invalid")
-                    response = parse()
+                    raw_json = getattr(http_response, "json", None)
+                    if callable(raw_json):
+                        response = raw_json()
+                    else:
+                        if not callable(parse):
+                            raise GatewayError("OpenRouter raw response is invalid")
+                        response = parse()
             except Exception as exc:
                 lifecycle.response_processed = True
                 (
