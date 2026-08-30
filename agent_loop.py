@@ -19063,6 +19063,7 @@ def _build_pit_optimizer_v3_live_run(
     from core.pit_optimization_contract import (
         AuthorArtifact,
         PIT_OPTIMIZER_V2_SYSTEM_PROMPTS,
+        _committed_policy_source_text,
         pit_optimizer_response_format,
     )
     from core.pit_optimizer_artifacts import IncrementalArtifactStore
@@ -19351,11 +19352,17 @@ def _build_pit_optimizer_v3_live_run(
         if universe_sha256 != manifest.fold_manifest.universe_sha256:
             raise ConfigurationError("PIT optimizer universe identity differs")
         for relative, expected_sha256 in manifest.policy_source_sha256s:
-            path = config.source_root / relative
+            try:
+                source_text = _committed_policy_source_text(
+                    config.source_root,
+                    relative,
+                )
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "PIT optimizer policy source differs"
+                ) from exc
             if (
-                path.is_symlink()
-                or not path.is_file()
-                or hashlib.sha256(path.read_bytes()).hexdigest()
+                hashlib.sha256(source_text.encode("utf-8")).hexdigest()
                 != expected_sha256
             ):
                 raise ConfigurationError("PIT optimizer policy source differs")
