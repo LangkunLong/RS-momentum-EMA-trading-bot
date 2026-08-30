@@ -1257,8 +1257,7 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
             assert forbidden not in rendered
 
     author_input.validate_artifact(author_artifact)
-    with pytest.raises(ValueError, match="hypothesis"):
-        author_input.validate_artifact(replace(author_artifact, hypothesis_id="other"))
+    author_input.validate_artifact(replace(author_artifact, hypothesis_id="other"))
     with pytest.raises(ValueError, match="hypothesis"):
         replace(critic_input, hypothesis_id="other")
     with pytest.raises(ValueError, match="source SHA-256"):

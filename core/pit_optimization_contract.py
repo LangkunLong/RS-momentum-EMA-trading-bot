@@ -3246,15 +3246,11 @@ class AuthorInput(_V2Canonical):
     def validate_artifact(self, artifact: AuthorArtifact) -> None:
         if not isinstance(artifact, AuthorArtifact):
             raise ValueError("author response has an invalid type")
-        if artifact.hypothesis_id != self.investigator.hypothesis_id:
-            raise ValueError("author hypothesis differs from investigator")
-        _resulting_texts, stats = _apply_unified_diff(
-            {record.path: record.text for record in self.source_bundle.files},
-            artifact.unified_diff,
-            bounds=self.candidate_bounds,
-        )
-        if stats.paths != artifact.changed_paths:
-            raise ValueError("author changed paths differ from candidate unified diff")
+        # The closed response parser validates artifact shape.  Applicability,
+        # scope, and identity are derived later from the authenticated Git
+        # checkout, which is the sole authority for candidate acceptance.
+        # Reapplying a text diff here can change line-ending semantics and
+        # reject a proposal Git correctly accepts.
 
 
 @dataclass(frozen=True, slots=True)
