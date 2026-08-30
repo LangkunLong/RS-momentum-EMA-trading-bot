@@ -3256,6 +3256,22 @@ def _pit_optimizer_request_failure_provenance(
     return "unknown", None
 
 
+def _pit_optimizer_unexpected_accounting_code(error: BaseException) -> str:
+    """Return a closed, provider-content-free code for an unclassified receipt failure."""
+
+    if isinstance(error, AssertionError):
+        return "accounting_unexpected_assertion"
+    if isinstance(error, KeyError):
+        return "accounting_unexpected_key"
+    if isinstance(error, TypeError):
+        return "accounting_unexpected_type"
+    if isinstance(error, ValueError):
+        return "accounting_unexpected_value"
+    if isinstance(error, GatewayError):
+        return "accounting_unexpected_gateway"
+    return "accounting_unexpected_internal"
+
+
 def _is_retryable(error: BaseException) -> bool:
     return (
         isinstance(error, (ConnectionError, TimeoutError))
@@ -5152,6 +5168,11 @@ class OpenRouterGateway:
                             ),
                             request_failure_status_code=(
                                 request_failure_status_code if possibly_sent else None
+                            ),
+                            accounting_failure_code=(
+                                _pit_optimizer_unexpected_accounting_code(original)
+                                if possibly_sent and response_received
+                                else None
                             ),
                         )
                         pending_usage = Usage()
