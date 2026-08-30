@@ -6331,6 +6331,8 @@ class SourceLock:
             stream = os.fdopen(descriptor, "r+b")
         except PreflightError:
             raise
+        except PermissionError as exc:
+            raise PreflightError("source lock permission denied") from exc
         except OSError as exc:
             raise PreflightError("source lock cannot be opened without following links") from exc
         try:

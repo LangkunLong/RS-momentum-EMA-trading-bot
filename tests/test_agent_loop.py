@@ -10447,6 +10447,22 @@ def test_round3_source_lock_rejects_symlink_without_touching_target(tmp_path: Pa
     assert outside.read_bytes() == b""
 
 
+def test_round3_source_lock_reports_write_permission_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a sandbox denial is misreported as a competing optimizer lock."""
+    import agent_loop
+    from agent_loop import PreflightError, SourceLock
+
+    def deny_open(*_args: object, **_kwargs: object) -> int:
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(agent_loop.os, "open", deny_open)
+    with pytest.raises(PreflightError, match="source lock permission denied"):
+        SourceLock(tmp_path / "agent-loop.lock").acquire()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group containment")
 def test_round3_posix_tree_helper_reaps_leader_before_absence_poll(
     monkeypatch: pytest.MonkeyPatch,
