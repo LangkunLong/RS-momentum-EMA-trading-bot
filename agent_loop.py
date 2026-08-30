@@ -1247,6 +1247,7 @@ class ProviderCallRecord:
     request_failure_class: str | None = None
     request_failure_status_code: int | None = None
     response_validation_code: str | None = None
+    accounting_failure_code: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version not in {1, 2, 3}:
@@ -1640,6 +1641,12 @@ class ProviderCallRecord:
             *PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES,
         }:
             raise ConfigurationError("optimizer response validation code is invalid")
+        if self.accounting_failure_code is not None and (
+            not isinstance(self.accounting_failure_code, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{2,63}", self.accounting_failure_code)
+            is None
+        ):
+            raise ConfigurationError("optimizer accounting failure code is invalid")
         if self.request_failure_class not in {
             None,
             "provider_http",
@@ -1780,6 +1787,13 @@ class ProviderCallRecord:
             and self.accounting_complete
         ):
             raise ConfigurationError("optimizer response validation code is inconsistent")
+        if self.accounting_failure_code is not None and not (
+            self.outcome == "uncertain_accounting"
+            and self.request_started
+            and self.response_received
+            and not self.accounting_complete
+        ):
+            raise ConfigurationError("optimizer accounting failure code is inconsistent")
 
 
 @dataclass(frozen=True)
@@ -4276,6 +4290,7 @@ class OpenRouterGateway:
             request_failure_class=facts.request_failure_class,
             request_failure_status_code=facts.request_failure_status_code,
             response_validation_code=facts.response_validation_code,
+            accounting_failure_code=facts.accounting_failure_code,
         )
 
     def _finalize_pit_optimizer_call(
@@ -4585,6 +4600,7 @@ class OpenRouterGateway:
             request_failure_class: str | None = None,
             request_failure_status_code: int | None = None,
             response_validation_code: str | None = None,
+            accounting_failure_code: str | None = None,
             accounting_source: str | None = None,
         ) -> PitOptimizerProviderFacts:
             assert authorization_reservation is not None
@@ -4617,6 +4633,7 @@ class OpenRouterGateway:
                 request_failure_class=request_failure_class,
                 request_failure_status_code=request_failure_status_code,
                 response_validation_code=response_validation_code,
+                accounting_failure_code=accounting_failure_code,
                 accounting_source=accounting_source,
             )
 
@@ -4790,6 +4807,7 @@ class OpenRouterGateway:
                         finish_reason=finish_reason,
                         response_schema_valid=False,
                         usage=None,
+                        accounting_failure_code=recovery_exc.code.value,
                     )
                     finalize(facts, Usage())
                     raise AccountingValidationError(
@@ -13347,6 +13365,8 @@ class AuditTrail:
             details["protocol_failure_code"] = record.protocol_failure_code.value
         if record.response_validation_code is not None:
             details["response_validation_code"] = record.response_validation_code
+        if record.accounting_failure_code is not None:
+            details["accounting_failure_code"] = record.accounting_failure_code
         if payload_sha256 is not None:
             details["payload_sha256"] = payload_sha256
         if run_manifest_sha256 is not None:
@@ -13642,6 +13662,7 @@ class AuditTrail:
             request_failure_class=record.request_failure_class,
             request_failure_status_code=record.request_failure_status_code,
             response_validation_code=record.response_validation_code,
+            accounting_failure_code=record.accounting_failure_code,
             accounting_source=record.accounting_source,
         )
 
@@ -13952,6 +13973,10 @@ class AuditTrail:
         if record.response_validation_code is not None:
             expected_details["response_validation_code"] = (
                 record.response_validation_code
+            )
+        if record.accounting_failure_code is not None:
+            expected_details["accounting_failure_code"] = (
+                record.accounting_failure_code
             )
         if record.retained_reservation_tokens is not None:
             expected_details["retained_reservation_tokens"] = (

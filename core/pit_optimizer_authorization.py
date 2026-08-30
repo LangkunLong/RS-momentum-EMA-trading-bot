@@ -497,6 +497,7 @@ class PitOptimizerProviderFacts:
     request_failure_class: str | None = None
     request_failure_status_code: int | None = None
     response_validation_code: str | None = None
+    accounting_failure_code: str | None = None
     accounting_source: str | None = None
 
     def __post_init__(self) -> None:
@@ -547,6 +548,12 @@ class PitOptimizerProviderFacts:
             *_contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES,
         }:
             raise ValueError("optimizer response validation code is invalid")
+        if self.accounting_failure_code is not None and (
+            not isinstance(self.accounting_failure_code, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{2,63}", self.accounting_failure_code)
+            is None
+        ):
+            raise ValueError("optimizer accounting failure code is invalid")
         if type(self.response_schema_valid) is not bool or type(self.accounting_complete) is not bool:
             raise ValueError("optimizer provider validation/accounting facts are invalid")
         if self.accounting_source not in {None, "inline", "generation_endpoint"}:
@@ -568,6 +575,13 @@ class PitOptimizerProviderFacts:
             and self.accounting_complete
         ):
             raise ValueError("optimizer response validation code is inconsistent")
+        if self.accounting_failure_code is not None and not (
+            self.outcome == "uncertain_accounting"
+            and self.request_started
+            and self.response_received
+            and not self.accounting_complete
+        ):
+            raise ValueError("optimizer accounting failure code is inconsistent")
         if (
             type(self.retained_reservation_tokens) is not int
             or self.retained_reservation_tokens < 0
