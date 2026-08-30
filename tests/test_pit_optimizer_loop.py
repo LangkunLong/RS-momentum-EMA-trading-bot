@@ -1360,11 +1360,12 @@ def test_focused_candidate_checks_persist_only_controller_derived_scope(
     ]
 
 
-def test_no_discovery_trades_becomes_safe_critic_feedback(
+def test_no_discovery_trades_preserves_aggregate_critic_feedback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Break caught: zero trades could be misclassified as evidence tampering."""
+    """Break caught: zero-trade discovery evidence was discarded before critique."""
+    from types import SimpleNamespace
     from unittest.mock import Mock
 
     import core.pit_optimizer_controller as controller
@@ -1381,14 +1382,19 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
         FoldEvaluationResult,
     )
 
-    readiness = _prepare(_prepare_fixture(tmp_path))
-    state = _run_state(readiness)
-    state.iteration_workspace = CandidateWorkspace(
-        "workspace_zero_trades",
-        tmp_path.resolve(),
+    effective_policy_sha256 = "3" * 64
+    readiness = SimpleNamespace(
+        manifest=SimpleNamespace(effective_policy_sha256=effective_policy_sha256)
     )
-    identity = Mock()
-    identity.identity_sha256 = "a" * 64
+    state = SimpleNamespace(
+        iteration_workspace=CandidateWorkspace(
+            "workspace_zero_trades",
+            tmp_path.resolve(),
+        ),
+        evaluation_failure_code=None,
+        next_iteration=1,
+    )
+    identity = SimpleNamespace(identity_sha256="a" * 64)
     validation = CandidateValidationOutcome(
         True,
         None,
@@ -1401,25 +1407,26 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
     zero = DiscoveryScore(Decimal("0.00"), Decimal("0.00"), Decimal("0.00"))
     folds = tuple(
         FoldEvaluationResult(
-            fold_id=baseline.fold_id,
-            engine_policy_sha256=readiness.manifest.effective_policy_sha256,
+            fold_id=fold_id,
+            engine_policy_sha256=effective_policy_sha256,
             candidate_identity_sha256="a" * 64,
             evidence_sha256=hashlib.sha256(
-                f"zero-trades-{baseline.fold_id}".encode()
+                f"zero-trades-{fold_id}".encode()
             ).hexdigest(),
             aggregate_metrics=replace(
-                baseline,
+                _aggregate(fold_id, total_return),
                 closed_trades=0,
                 excess_total_return_pp=0.0,
             ),
         )
-        for baseline in readiness.baseline_discovery.folds
+        for fold_id, total_return in (("discovery_1", 1.0), ("discovery_2", 2.0))
     )
     services = Mock(spec=PitOptimizerServices)
-    services.evaluate_discovery.return_value = DiscoveryEvaluation(
+    evaluation = DiscoveryEvaluation(
         folds,
         DiscoveryComparison(zero, zero, False, False),
     )
+    services.evaluate_discovery.return_value = evaluation
     payloads: list[Mapping[str, object]] = []
     services.write_json_artifact.side_effect = lambda name, value: (
         payloads.append(value) or (tmp_path / name).resolve(),
@@ -1427,11 +1434,11 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
     )
     monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
 
-    assert _evaluate_iteration_candidate(readiness, state, validation, services) is None
+    assert _evaluate_iteration_candidate(readiness, state, validation, services) is evaluation
     assert state.evaluation_failure_code == "no_discovery_trades"
     assert payloads == [
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "failure_code": "no_discovery_trades",
             "fixed_baseline_comparison": None,
             "incumbent_diagnostics": None,
@@ -1444,7 +1451,7 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
                 }
                 for item in folds
             ],
-            "engine_policy_sha256": readiness.manifest.effective_policy_sha256,
+            "engine_policy_sha256": effective_policy_sha256,
             "candidate_identity_sha256": "a" * 64,
         }
     ]

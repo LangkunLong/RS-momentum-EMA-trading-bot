@@ -1591,7 +1591,11 @@ def _evaluate_iteration_candidate(
                 },
             ),
         )
-        return None
+        # The candidate is ineligible for selection, but its aggregate folds are
+        # still the critic's only evidence for why tradeability disappeared.
+        # Preserve the unrankable evaluation for feedback while the decision
+        # path continues to require rankable=True before any acceptance.
+        return supplied
     baseline_folds = readiness.baseline_discovery.folds
     baseline_sha256 = _folds_digest(baseline_folds)
     try:
