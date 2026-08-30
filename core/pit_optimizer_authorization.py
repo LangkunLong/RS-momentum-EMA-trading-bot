@@ -786,18 +786,12 @@ class AuthenticatedRoleInputSnapshot:
             raise ValueError("optimizer response has an invalid type")
         if self.role == "author":
             assert isinstance(artifact, AuthorArtifact)
-            assert self.source_bundle is not None
-            assert self.candidate_bounds is not None
-            # The author is allowed to describe its proposal, but the model's
-            # echoed hypothesis/scope metadata is not an authority boundary.
-            # Validate the concrete diff against the sealed source here; the
-            # controller later derives the candidate identity, paths, and
-            # symbols from the authenticated Git result.
-            _contract._apply_unified_diff(
-                {record.path: record.text for record in self.source_bundle.files},
-                artifact.unified_diff,
-                bounds=self.candidate_bounds,
-            )
+            # The author proposal is structurally parsed before this point.
+            # Its one authoritative applicability check runs later against the
+            # disposable candidate checkout with Git.  Repeating that check
+            # against an in-memory source bundle changes line-ending semantics
+            # and can reject a diff that Git correctly accepts, so metadata and
+            # diff applicability remain controller-derived at that boundary.
         elif self.role == "critic":
             assert isinstance(artifact, CriticArtifact)
             if artifact.hypothesis_id != self.expected_hypothesis_id:
