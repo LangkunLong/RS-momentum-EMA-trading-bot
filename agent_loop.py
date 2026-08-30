@@ -4888,7 +4888,12 @@ class OpenRouterGateway:
                     usage,
                     pricing_snapshot,
                 )
-            except AccountingValidationError:
+            except (AccountingValidationError, ResponseValidationError):
+                # A received response can be billable even when its inline
+                # usage object is absent or malformed.  Both accounting and
+                # usage-shape failures must take the same single bounded
+                # generation-receipt recovery path; otherwise an inline
+                # parsing exception skips the only authoritative recovery.
                 try:
                     usage, recovered_semantics_valid = (
                         self._recover_pit_optimizer_generation_usage_once(
@@ -4919,21 +4924,6 @@ class OpenRouterGateway:
                             recovery_exc.recovery_usage_diagnostic
                         ),
                     ) from recovery_exc
-            except ResponseValidationError as exc:
-                facts = provider_facts(
-                    outcome="uncertain_accounting",
-                    request_started=True,
-                    response_received=True,
-                    returned_model=returned_model,
-                    finish_reason=finish_reason,
-                    response_schema_valid=False,
-                    usage=None,
-                )
-                finalize(facts, Usage())
-                raise AccountingValidationError(
-                    "optimizer response accounting is uncertain",
-                    code=AccountingFailureCode.INLINE_USAGE_INVALID,
-                ) from exc
             assert usage.prompt_tokens is not None
             assert usage.completion_tokens is not None
             assert usage.total_tokens is not None
