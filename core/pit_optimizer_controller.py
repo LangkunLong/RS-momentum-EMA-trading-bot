@@ -1380,6 +1380,8 @@ def _run_author(
             raw,
             max_diff_bytes=readiness.manifest.candidate_bounds.max_diff_bytes,
             max_total_bytes=plan.max_response_bytes,
+            controller_paths=investigator.payload.target_paths,
+            controller_symbols=investigator.payload.target_symbols,
         ),
     )
     _record_artifact(

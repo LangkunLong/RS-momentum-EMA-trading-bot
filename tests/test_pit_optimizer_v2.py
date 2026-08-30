@@ -302,6 +302,25 @@ def test_role_schema_investigator_output_is_closed_and_bounded() -> None:
         )
 
 
+def test_investigator_parser_derives_scope_instead_of_trusting_model_echo() -> None:
+    """Break caught: harmless model path aliases could abort before any candidate exists."""
+    payload = {
+        **_investigator_payload(),
+        "target_paths": ["entry.py"],
+        "target_symbols": ["evaluate_entry"],
+    }
+
+    artifact = contract.InvestigatorArtifact.from_json(
+        _canonical_text(payload),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+
+    assert artifact.target_paths == ("core/strategy_policy/entry.py",)
+    assert artifact.target_symbols == (
+        "core.strategy_policy.entry.evaluate_entry",
+    )
+
+
 def _author_payload() -> dict[str, object]:
     return {
         "hypothesis_id": "hypothesis_1",
@@ -363,6 +382,28 @@ def test_role_schema_author_output_has_independent_diff_and_metadata_caps() -> N
             max_diff_bytes=8 * 1024,
             max_total_bytes=16 * 1024,
         )
+
+
+def test_author_parser_uses_controller_scope_instead_of_model_echo() -> None:
+    """Break caught: redundant model scope metadata could block diff validation."""
+    payload = {
+        **_author_payload(),
+        "changed_paths": ["entry.py"],
+        "changed_symbols": ["evaluate_entry"],
+    }
+
+    artifact = contract.AuthorArtifact.from_json(
+        _canonical_text(payload),
+        max_diff_bytes=8 * 1024,
+        max_total_bytes=16 * 1024,
+        controller_paths=("core/strategy_policy/entry.py",),
+        controller_symbols=("core.strategy_policy.entry.evaluate_entry",),
+    )
+
+    assert artifact.changed_paths == ("core/strategy_policy/entry.py",)
+    assert artifact.changed_symbols == (
+        "core.strategy_policy.entry.evaluate_entry",
+    )
 
 
 def _critic_payload() -> dict[str, object]:

@@ -148,6 +148,26 @@ _POLICY_DECLARED_SYMBOLS = MappingProxyType(
         ),
     }
 )
+_FAMILY_POLICY_PATHS = MappingProxyType(
+    {
+        "entry": ("core/strategy_policy/entry.py",),
+        "exit": ("core/strategy_policy/exit.py",),
+        "risk_sizing": ("core/strategy_policy/risk.py",),
+    }
+)
+
+
+def _controller_scope_for_family(family: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Bind advisory role metadata to the controller-owned policy interface."""
+
+    try:
+        paths = _FAMILY_POLICY_PATHS[family]
+    except KeyError as exc:
+        raise ValueError("investigator family is invalid") from exc
+    symbols = tuple(
+        symbol for path in paths for symbol in _POLICY_DECLARED_SYMBOLS[path]
+    )
+    return paths, symbols
 
 PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
     {
@@ -156,15 +176,12 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "rules, aggregate discovery evidence, incumbent summary, and prior summaries. "
             "Return exactly one JSON object and nothing else: no markdown, chain-of-thought, "
             "schema_version, or extra keys. It must contain exactly these keys: hypothesis_id, "
-            "family, evidence_ids, causal_rationale, target_paths, target_symbols, "
+            "family, evidence_ids, causal_rationale, "
             "expected_diagnostic_changes, known_risks, author_instructions. hypothesis_id, family, and "
             "causal_rationale are strings; every other field is a JSON array of strings. family must be "
             "one of entry, exit, risk_sizing. Use [] only for known_risks when there are none. The local "
-            "response schema is authoritative: use at most "
-            "four items per list, copy evidence IDs and editable paths/symbols verbatim from the "
-            "supplied input, and include a target symbol only when it is declared by one of the "
-            "selected target paths. A symbol may be a declared function or a bare UPPER_CASE "
-            "source constant from a selected path; do not invent symbols. Keep "
+            "response schema is authoritative: use at most four items per list. The controller "
+            "derives policy paths and symbols from family; do not emit path or symbol metadata. Keep "
             "causal_rationale to 256 characters, and keep each diagnostic, "
             "risk, and author-instruction item to 96 characters. Make the object compact enough "
             "for the 8 KiB envelope. Never request hidden data, credentials, local paths, raw "
@@ -174,15 +191,13 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "You are the PIT optimizer author. Implement only the supplied investigator "
             "hypothesis within the immutable constraints and patch bounds. Return exactly one JSON "
             "object and nothing else: no markdown, chain-of-thought, schema_version, or extra keys. "
-            "It must contain exactly these keys: hypothesis_id, behavioral_summary, changed_paths, "
-            "changed_symbols, unified_diff, assumptions, validation_suggestions. hypothesis_id, "
+            "It must contain exactly these keys: hypothesis_id, behavioral_summary, unified_diff, "
+            "assumptions, validation_suggestions. hypothesis_id, "
             "behavioral_summary, and unified_diff are strings; every other field is a JSON array of "
             "strings. Copy hypothesis_id verbatim from the investigator. unified_diff must be a "
-            "nonempty standard unified diff. changed_paths and changed_symbols must be nonempty and "
-            "list only supplied paths and symbols actually changed by unified_diff. A changed "
-            "symbol may be a declared function or a bare UPPER_CASE source constant from a changed "
-            "path; use canonical path order and do not list the whole editable "
-            "scope. assumptions and validation_suggestions may be []. Use at most four assumption "
+            "nonempty standard unified diff. The controller derives changed-path and changed-symbol "
+            "metadata and independently validates the diff, so do not emit that metadata. "
+            "assumptions and validation_suggestions may be []. Use at most four assumption "
             "or validation-suggestion items, keep every such item to 96 characters and "
             "behavioral_summary to 256 characters, and keep unified_diff within the supplied "
             "candidate diff bound. Treat source_bundle.files as the only base revision: copy every "
@@ -306,6 +321,7 @@ def _parse_v2_closed_object(
     keys: frozenset[str],
     *,
     max_total_bytes: int,
+    optional_keys: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     if type(max_total_bytes) is not int or max_total_bytes <= 0:
         raise ValueError("provider payload byte cap is invalid")
@@ -315,7 +331,12 @@ def _parse_v2_closed_object(
         value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise ValueError("provider payload is malformed JSON") from exc
-    if not isinstance(value, dict) or set(value) != keys:
+    actual_keys = set(value) if isinstance(value, dict) else set()
+    if (
+        not isinstance(value, dict)
+        or not keys.issubset(actual_keys)
+        or not actual_keys.issubset(keys | optional_keys)
+    ):
         raise ValueError("provider payload has invalid keys")
     return value
 
@@ -2589,18 +2610,18 @@ class InvestigatorArtifact(_V2Canonical):
                     "family",
                     "evidence_ids",
                     "causal_rationale",
-                    "target_paths",
-                    "target_symbols",
                     "expected_diagnostic_changes",
                     "known_risks",
                     "author_instructions",
                 }
             ),
             max_total_bytes=max_total_bytes,
+            optional_keys=frozenset({"target_paths", "target_symbols"}),
         )
         family = _v2_text(value["family"], "investigator family")
         if family not in _INVESTIGATOR_FAMILIES:
             raise ValueError("investigator family is invalid")
+        target_paths, target_symbols = _controller_scope_for_family(family)
         return cls(
             hypothesis_id=_v2_identifier(
                 value["hypothesis_id"], "investigator hypothesis ID"
@@ -2612,12 +2633,8 @@ class InvestigatorArtifact(_V2Canonical):
             causal_rationale=_v2_text(
                 value["causal_rationale"], "investigator causal rationale"
             ),
-            target_paths=_v2_string_list(
-                value["target_paths"], "investigator target paths"
-            ),
-            target_symbols=_v2_string_list(
-                value["target_symbols"], "investigator target symbols"
-            ),
+            target_paths=target_paths,
+            target_symbols=target_symbols,
             expected_diagnostic_changes=_v2_string_list(
                 value["expected_diagnostic_changes"],
                 "investigator expected diagnostic changes",
@@ -2670,6 +2687,8 @@ class AuthorArtifact(_V2Canonical):
         *,
         max_diff_bytes: int,
         max_total_bytes: int,
+        controller_paths: tuple[str, ...] | None = None,
+        controller_symbols: tuple[str, ...] | None = None,
     ) -> "AuthorArtifact":
         if (
             type(max_diff_bytes) is not int
@@ -2683,39 +2702,67 @@ class AuthorArtifact(_V2Canonical):
                 {
                     "hypothesis_id",
                     "behavioral_summary",
-                    "changed_paths",
-                    "changed_symbols",
                     "unified_diff",
                     "assumptions",
                     "validation_suggestions",
                 }
             ),
             max_total_bytes=max_total_bytes,
+            optional_keys=frozenset({"changed_paths", "changed_symbols"}),
         )
         unified_diff = _v2_blob(
             value["unified_diff"], "author diff", max_bytes=max_diff_bytes
         )
-        non_diff = {**value, "unified_diff": ""}
+        if (controller_paths is None) != (controller_symbols is None):
+            raise ValueError("author controller scope is incomplete")
+        if controller_paths is None:
+            try:
+                changed_paths = _v2_string_list(
+                    value["changed_paths"], "author changed paths"
+                )
+                changed_symbols = _v2_string_list(
+                    value["changed_symbols"], "author changed symbols"
+                )
+            except KeyError as exc:
+                raise ValueError("author controller scope is required") from exc
+        else:
+            changed_paths = _v2_string_tuple(
+                controller_paths, "author controller paths"
+            )
+            changed_symbols = _v2_string_tuple(
+                controller_symbols, "author controller symbols"
+            )
+        hypothesis_id = _v2_identifier(value["hypothesis_id"], "author hypothesis ID")
+        behavioral_summary = _v2_text(
+            value["behavioral_summary"], "author behavioral summary"
+        )
+        assumptions = _v2_string_list(
+            value["assumptions"], "author assumptions", allow_empty=True
+        )
+        validation_suggestions = _v2_string_list(
+            value["validation_suggestions"],
+            "author validation suggestions",
+            allow_empty=True,
+        )
+        non_diff = {
+            "hypothesis_id": hypothesis_id,
+            "behavioral_summary": behavioral_summary,
+            "changed_paths": list(changed_paths),
+            "changed_symbols": list(changed_symbols),
+            "unified_diff": "",
+            "assumptions": list(assumptions),
+            "validation_suggestions": list(validation_suggestions),
+        }
         if len(_v2_canonical_bytes(non_diff)) > MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES:
             raise ValueError("author non-diff artifact exceeds its byte cap")
         return cls(
-            hypothesis_id=_v2_identifier(value["hypothesis_id"], "author hypothesis ID"),
-            behavioral_summary=_v2_text(
-                value["behavioral_summary"], "author behavioral summary"
-            ),
-            changed_paths=_v2_string_list(value["changed_paths"], "author changed paths"),
-            changed_symbols=_v2_string_list(
-                value["changed_symbols"], "author changed symbols"
-            ),
+            hypothesis_id=hypothesis_id,
+            behavioral_summary=behavioral_summary,
+            changed_paths=changed_paths,
+            changed_symbols=changed_symbols,
             unified_diff=unified_diff,
-            assumptions=_v2_string_list(
-                value["assumptions"], "author assumptions", allow_empty=True
-            ),
-            validation_suggestions=_v2_string_list(
-                value["validation_suggestions"],
-                "author validation suggestions",
-                allow_empty=True,
-            ),
+            assumptions=assumptions,
+            validation_suggestions=validation_suggestions,
         )
 
 
@@ -3710,8 +3757,6 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                 "family",
                 "evidence_ids",
                 "causal_rationale",
-                "target_paths",
-                "target_symbols",
                 "expected_diagnostic_changes",
                 "known_risks",
                 "author_instructions",
@@ -3738,22 +3783,6 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                     min_length=1,
                     description="A concise causal explanation grounded in the supplied aggregates.",
                 ),
-                "target_paths": _v2_scoped_name_list_schema(
-                    _POLICY_EDITABLE_PATHS,
-                    "Editable policy paths selected from the supplied source scope.",
-                ),
-                "target_symbols": _v2_scoped_name_list_schema(
-                    tuple(
-                        sorted(
-                            {
-                                symbol
-                                for symbols in _POLICY_DECLARED_SYMBOLS.values()
-                                for symbol in symbols
-                            }
-                        )
-                    ),
-                    "Declared policy symbols selected from the supplied source scope.",
-                ),
                 "expected_diagnostic_changes": _v2_compact_text_list_schema(
                     "Concrete aggregate diagnostics expected to change if the hypothesis is right."
                 ),
@@ -3772,8 +3801,6 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
             "required": [
                 "hypothesis_id",
                 "behavioral_summary",
-                "changed_paths",
-                "changed_symbols",
                 "unified_diff",
                 "assumptions",
                 "validation_suggestions",
@@ -3786,23 +3813,6 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                     max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
                     min_length=1,
                     description="A concise summary of the resulting policy behavior.",
-                ),
-                "changed_paths": _v2_scoped_name_list_schema(
-                    _POLICY_EDITABLE_PATHS,
-                    "Editable paths changed by unified_diff.",
-                    max_items=3,
-                ),
-                "changed_symbols": _v2_scoped_name_list_schema(
-                    tuple(
-                        sorted(
-                            {
-                                symbol
-                                for symbols in _POLICY_DECLARED_SYMBOLS.values()
-                                for symbol in symbols
-                            }
-                        )
-                    ),
-                    "Declared symbols changed by unified_diff.",
                 ),
                 "unified_diff": {
                     "type": "string",
