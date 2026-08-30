@@ -3256,20 +3256,44 @@ def _pit_optimizer_request_failure_provenance(
     return "unknown", None
 
 
-def _pit_optimizer_unexpected_accounting_code(error: BaseException) -> str:
-    """Return a closed, provider-content-free code for an unclassified receipt failure."""
+def _pit_optimizer_unexpected_accounting_code(
+    error: BaseException,
+    *,
+    stage: str,
+) -> str:
+    """Return a closed, provider-content-free code for an unclassified receipt failure.
 
+    A paid response can traverse several local-only closure steps after its bytes
+    arrive.  Preserving that fixed stage name makes a fail-closed rejection
+    actionable without retaining a provider exception or any response content.
+    """
+
+    allowed_stages = {
+        "response_metadata",
+        "inline_usage",
+        "receipt_recovery",
+        "accounting_bounds",
+        "response_validation",
+        "artifact_binding",
+        "provider_facts",
+        "payload_digest",
+        "publication",
+    }
+    if stage not in allowed_stages:
+        stage = "response_metadata"
     if isinstance(error, AssertionError):
-        return "accounting_unexpected_assertion"
-    if isinstance(error, KeyError):
-        return "accounting_unexpected_key"
-    if isinstance(error, TypeError):
-        return "accounting_unexpected_type"
-    if isinstance(error, ValueError):
-        return "accounting_unexpected_value"
-    if isinstance(error, GatewayError):
-        return "accounting_unexpected_gateway"
-    return "accounting_unexpected_internal"
+        kind = "assertion"
+    elif isinstance(error, KeyError):
+        kind = "key"
+    elif isinstance(error, TypeError):
+        kind = "type"
+    elif isinstance(error, ValueError):
+        kind = "value"
+    elif isinstance(error, GatewayError):
+        kind = "gateway"
+    else:
+        kind = "internal"
+    return f"accounting_{stage}_{kind}"
 
 
 def _is_retryable(error: BaseException) -> bool:
@@ -4655,6 +4679,7 @@ class OpenRouterGateway:
         ).hexdigest()
         possibly_sent = False
         response_received = False
+        accounting_stage = "response_metadata"
         returned_model: str | None = None
         finish_reason: str | None = None
         request_failure_class: str | None = None
@@ -4894,6 +4919,7 @@ class OpenRouterGateway:
                 else "unknown"
             )
             recovered_semantics_valid = True
+            accounting_stage = "inline_usage"
             try:
                 usage = _usage_from_response(
                     response,
@@ -4910,6 +4936,7 @@ class OpenRouterGateway:
                 # value-shape failures must take the same single bounded
                 # generation-receipt recovery path; otherwise an inline
                 # parsing exception skips the only authoritative recovery.
+                accounting_stage = "receipt_recovery"
                 try:
                     usage, recovered_semantics_valid = (
                         self._recover_pit_optimizer_generation_usage_once(
@@ -4953,6 +4980,7 @@ class OpenRouterGateway:
                         generation_attempts=recovery_attempts,
                         recovery_usage_diagnostic=recovery_diagnostic,
                     ) from recovery_exc
+            accounting_stage = "accounting_bounds"
             assert usage.prompt_tokens is not None
             assert usage.completion_tokens is not None
             assert usage.total_tokens is not None
@@ -4982,6 +5010,7 @@ class OpenRouterGateway:
                 )
                 finalize(facts, usage, terminal_code="budget_exhausted")
                 raise BudgetExceededError("optimizer per-call provider cap exceeded")
+            accounting_stage = "response_validation"
             content = (
                 _read_field(choices[0], "message", "content")
                 if isinstance(choices, (list, tuple)) and len(choices) == 1
@@ -5042,6 +5071,7 @@ class OpenRouterGateway:
                 raise ResponseValidationError(
                     "optimizer response schema is invalid"
                 ) from exc
+            accounting_stage = "artifact_binding"
             expected_payload_type = {
                 "investigator": InvestigatorArtifact,
                 "author": AuthorArtifact,
@@ -5085,6 +5115,7 @@ class OpenRouterGateway:
                 raise ResponseValidationError(
                     "optimizer artifact differs from its input"
                 ) from exc
+            accounting_stage = "provider_facts"
             facts = provider_facts(
                 outcome="accepted",
                 request_started=True,
@@ -5095,9 +5126,11 @@ class OpenRouterGateway:
                 usage=usage,
                 accounting_source=usage.accounting_source,
             )
+            accounting_stage = "payload_digest"
             payload_digest = hashlib.sha256(
                 completion.payload.canonical_json_bytes()
             ).hexdigest()
+            accounting_stage = "publication"
             finalize(facts, usage, payload_sha256=payload_digest)
             return PitOptimizerRoleCall(plan_snapshot, completion.payload, facts)
         except BaseException as original:
@@ -5183,7 +5216,10 @@ class OpenRouterGateway:
                                 request_failure_status_code if possibly_sent else None
                             ),
                             accounting_failure_code=(
-                                _pit_optimizer_unexpected_accounting_code(original)
+                                _pit_optimizer_unexpected_accounting_code(
+                                    original,
+                                    stage=accounting_stage,
+                                )
                                 if possibly_sent and response_received
                                 else None
                             ),
