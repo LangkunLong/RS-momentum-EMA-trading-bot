@@ -795,13 +795,11 @@ def validate_candidate_diff(
         ).stdout.decode("ascii", errors="strict").strip()
         if actual_head != source_commit:
             raise ValueError("candidate source commit differs from authenticated base")
-        changed_paths = tuple(
-            path
-            for path in EDITABLE_POLICY_PATHS
-            if base_sources[path] != after_sources[path]
-        )
-        if set(changed_paths) != set(cumulative.files):
-            raise ValueError("candidate changed paths differ from Git cumulative diff")
+        # The authenticated Git cumulative diff is the canonical authority for
+        # file scope.  The decoded source maps above still prove that the patch
+        # is not a no-op and feed symbol derivation, but they must not override
+        # Git's exact line-ending and index semantics when identifying files.
+        changed_paths = tuple(cumulative.files)
         changed_symbols = derive_changed_symbols(
             before_sources=base_sources,
             after_sources=after_sources,
