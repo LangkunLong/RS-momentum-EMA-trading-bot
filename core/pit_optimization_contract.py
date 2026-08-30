@@ -58,6 +58,10 @@ PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES = frozenset(
         "payload_json_invalid",
         "payload_keys_invalid",
         "payload_field_invalid",
+        "payload_scope_invalid",
+        "payload_size_invalid",
+        "payload_enum_invalid",
+        "payload_binding_invalid",
         "model_mismatch",
         "validator_boundary_invalid",
     }
