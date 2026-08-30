@@ -1185,29 +1185,39 @@ def _require_subset_canary_call_plan(
         "author": (12_000, 48_500, 72_000, 8_000, 16 * 1024),
         "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
+    author_reasoning_profile = {
+        "investigator": (8_000, 78_000, 86_000, 8_000, 8 * 1024),
+        # Reallocate unused author input headroom to completion headroom.  Deep
+        # reasoning models may account for hidden reasoning in completion
+        # tokens even when the visible JSON artifact remains byte-bounded.
+        "author": (12_000, 48_500, 64_000, 16_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
+    }
     extended_profile = {
         "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
         "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
         "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
     if (max_iterations, len(call_budgets)) == (1, 3):
-        expected_profile = fast_e2e_profile
+        expected_profiles = (fast_e2e_profile, author_reasoning_profile)
     elif (max_iterations, len(call_budgets)) == (2, 6):
-        expected_profile = extended_profile
+        expected_profiles = (extended_profile,)
     else:
         raise ValueError("subset canary iteration profile is unsupported")
-    for budget in call_budgets:
-        actual = (
+    actual_profile = {
+        budget.role: (
             budget.max_static_input_bytes,
             budget.max_dynamic_input_bytes,
             budget.max_input_tokens,
             budget.max_output_tokens,
             budget.max_response_bytes,
         )
-        if budget.model != PIT_OPTIMIZER_R1_MODEL or actual != expected_profile.get(
-            budget.role
-        ):
-            raise ValueError("subset canary call caps are invalid")
+        for budget in call_budgets
+    }
+    if any(budget.model != PIT_OPTIMIZER_R1_MODEL for budget in call_budgets) or (
+        actual_profile not in expected_profiles
+    ):
+        raise ValueError("subset canary call caps are invalid")
 
 
 def build_subset_manifest(
