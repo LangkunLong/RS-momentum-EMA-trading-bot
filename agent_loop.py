@@ -3040,11 +3040,11 @@ def _usage_from_response(
         ) from exc
 
 
-def _complete_pit_optimizer_inline_usage_with_frozen_pricing(
+def _complete_pit_optimizer_usage_with_frozen_pricing(
     usage: Usage,
     pricing: "OptimizerPricingSnapshot",
 ) -> Usage:
-    """Attach immutable local cost when inline tokens are complete but cost is absent."""
+    """Attach immutable local cost when complete PIT token accounting lacks cost."""
 
     from core.pit_optimizer_authorization import OptimizerPricingSnapshot
 
@@ -3156,6 +3156,7 @@ def _usage_from_generation_record(
     payload: object,
     *,
     generation_id: str,
+    allow_missing_cost: bool = False,
 ) -> Usage:
     """Validate one complete authoritative record from OpenRouter's generation endpoint."""
     if not isinstance(payload, Mapping):
@@ -3189,17 +3190,21 @@ def _usage_from_generation_record(
             recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_INVALID,
         ) from exc
     if total_cost is None or usage_cost is None:
-        raise AccountingValidationError(
-            "generation cost accounting is incomplete",
-            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-            recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_MISSING,
-        )
-    if total_cost != usage_cost:
+        if not allow_missing_cost:
+            raise AccountingValidationError(
+                "generation cost accounting is incomplete",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_MISSING,
+            )
+        recovered_cost = None
+    elif total_cost != usage_cost:
         raise AccountingValidationError(
             "generation cost accounting is conflicting",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
             recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_CONFLICT,
         )
+    else:
+        recovered_cost = total_cost
     prompt_tokens, completion_tokens, token_basis = _generation_token_pair(data)
     try:
         cached_tokens = _usage_int(data, "native_tokens_cached")
@@ -3237,7 +3242,7 @@ def _usage_from_generation_record(
         total_tokens=prompt_tokens + completion_tokens,
         cached_tokens=cached_tokens,
         reasoning_tokens=reasoning_tokens,
-        cost_usd=total_cost,
+        cost_usd=recovered_cost,
         accounting_source="generation_endpoint",
     )
 
@@ -4947,7 +4952,7 @@ class OpenRouterGateway:
                     require_complete=True,
                     allow_missing_cost=True,
                 )
-                usage = _complete_pit_optimizer_inline_usage_with_frozen_pricing(
+                usage = _complete_pit_optimizer_usage_with_frozen_pricing(
                     usage,
                     pricing_snapshot,
                 )
@@ -4964,6 +4969,7 @@ class OpenRouterGateway:
                             response,
                             REASONER_MODEL,
                             generation_id_from_header=generation_id_from_header,
+                            pricing_snapshot=pricing_snapshot,
                             wall_deadline=float(wall_deadline),
                             monotonic=monotonic,
                         )
@@ -5518,6 +5524,7 @@ class OpenRouterGateway:
         expected_model: str,
         *,
         generation_id_from_header: str | None = None,
+        pricing_snapshot: "OptimizerPricingSnapshot",
         wall_deadline: float,
         monotonic: Callable[[], float],
     ) -> tuple[Usage, bool]:
@@ -5603,6 +5610,11 @@ class OpenRouterGateway:
             usage = _usage_from_generation_record(
                 payload,
                 generation_id=generation_id,
+                allow_missing_cost=True,
+            )
+            usage = _complete_pit_optimizer_usage_with_frozen_pricing(
+                usage,
+                pricing_snapshot,
             )
         except AccountingValidationError as exc:
             raise AccountingValidationError(
