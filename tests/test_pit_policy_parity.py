@@ -369,6 +369,50 @@ def test_fixed_fold_manifest_uses_only_the_supplied_benchmark_calendar() -> None
     assert all(len(fold.sessions) == 60 for fold in (*manifest.discovery_folds, manifest.hidden_fold))
 
 
+def test_fixed_fold_manifest_can_seal_a_later_independent_subset() -> None:
+    """Break caught: every later canary was forced to reuse the first consumed hidden window."""
+    sessions = tuple(
+        value.date().isoformat()
+        for value in pd.bdate_range("2021-06-25", periods=360)
+    )
+    first_discovery_session = sessions[120]
+    readiness = {
+        "evaluation_contract": {
+            "verification_only": True,
+            "scope": {
+                "benchmark": "SPY",
+                "discovery_start": "2021-06-25",
+                "discovery_end": "2021-09-20",
+                "holdout_start": "2021-09-21",
+                "holdout_end": "2021-12-14",
+                "warmup_start": "2021-01-01",
+                "session_count": 60,
+                "symbol_count": 2,
+                "symbols": ["AAA", "BBB"],
+            },
+        }
+    }
+
+    manifest, _ = build_fixed_fold_manifest(
+        readiness=readiness,
+        benchmark_sessions=sessions,
+        data_identity_sha256="a" * 64,
+        first_discovery_session=first_discovery_session,
+    )
+
+    folds = (*manifest.discovery_folds, manifest.hidden_fold)
+    assert [fold.sessions[0] for fold in folds] == [
+        sessions[120],
+        sessions[180],
+        sessions[240],
+    ]
+    assert [fold.sessions[-1] for fold in folds] == [
+        sessions[179],
+        sessions[239],
+        sessions[299],
+    ]
+
+
 def test_fold_evidence_embeds_exact_result_rows_and_hand_checked_aggregates() -> None:
     """Break caught: capture emitted only hashes or computed aggregates from a different result."""
     fold = _fold("discovery_1", "discovery", "2021-01-04")
@@ -482,6 +526,86 @@ def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Pa
     assert evaluated == ["discovery_1", "discovery_2"]
     assert reference.fold_manifest.hidden_fold.fold_id == "hidden_1"
     assert len(reference.discovery_evidence) == 2
+
+
+def test_capture_carries_a_later_subset_selection_into_the_reference(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a manifest could claim a fresh window while parity still sealed the original one."""
+    sessions = tuple(
+        value.date().isoformat()
+        for value in pd.bdate_range("2021-06-25", periods=360)
+    )
+    readiness = {
+        "evaluation_contract": {
+            "verification_only": True,
+            "scope": {
+                "benchmark": "SPY",
+                "discovery_start": "2021-06-25",
+                "discovery_end": "2021-09-20",
+                "holdout_start": "2021-09-21",
+                "holdout_end": "2021-12-14",
+                "warmup_start": "2021-01-01",
+                "session_count": 60,
+                "symbol_count": 2,
+                "symbols": ["AAA", "BBB"],
+            },
+        },
+        "identities": {
+            "pit_bundle_sha256": "4" * 64,
+            "baseline_manifest_sha256": "5" * 64,
+            "effective_policy_sha256": "d" * 64,
+        },
+    }
+    evaluated: list[tuple[str, str]] = []
+
+    def evaluate(
+        fold: FoldSpec,
+        _universe: tuple[str, ...],
+        _warmup: str,
+    ) -> ParityFoldEvidence:
+        evaluated.append((fold.fold_id, fold.start_date))
+        return _evidence(fold)
+
+    reference = capture_from_authenticated_inputs(
+        readiness=readiness,
+        readiness_sha256="3" * 64,
+        pit_bundle_sha256="4" * 64,
+        reference_source_head="1" * 40,
+        reference_source_fingerprint_sha256="2" * 64,
+        benchmark_sessions=sessions,
+        first_discovery_session=sessions[120],
+        output=tmp_path / "later-reference.json",
+        evaluate_discovery_fold=evaluate,
+        pre_persist_check=lambda: None,
+    )
+
+    assert evaluated == [
+        ("discovery_1", sessions[120]),
+        ("discovery_2", sessions[180]),
+    ]
+    assert reference.fold_manifest.hidden_fold.sessions == sessions[240:300]
+
+
+def test_parity_capture_cli_accepts_a_later_subset_start() -> None:
+    """Break caught: the selectable fresh subset was available only to in-process callers."""
+    parser = parity._parser()
+
+    args = parser.parse_args(
+        [
+            "capture",
+            "--readiness",
+            "C:/artifacts/readiness.json",
+            "--pit-bundle",
+            "C:/artifacts/pit.sqlite3",
+            "--output",
+            "C:/artifacts/reference.json",
+            "--first-discovery-session",
+            "2022-03-14",
+        ]
+    )
+
+    assert args.first_discovery_session == "2022-03-14"
 
 
 def test_capture_simulator_binds_authenticated_signal_cadence() -> None:

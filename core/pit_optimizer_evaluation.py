@@ -1243,6 +1243,7 @@ def _manifest_cli_parser() -> argparse.ArgumentParser:
         "output",
     ):
         build.add_argument(f"--{flag}", type=Path, required=True)
+    build.add_argument("--parity-reference", type=Path)
     build.add_argument("--sandbox-image", required=True)
     build.add_argument("--iterations", type=int, required=True)
     for role in ("investigator", "author", "critic"):
@@ -1317,11 +1318,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_optimizer_manifest,
     )
     from core.pit_optimizer_controller import _load_parity
+    from core.pit_policy_parity import load_parity_reference
 
     readiness_path = _absolute_cli_path(namespace.readiness, "readiness artifact")
     parity_path = _absolute_cli_path(
         namespace.verified_parity,
         "verified parity artifact",
+    )
+    parity_reference = (
+        None
+        if namespace.parity_reference is None
+        else load_parity_reference(
+            _absolute_cli_path(
+                namespace.parity_reference,
+                "parity reference artifact",
+            )
+        )
     )
     readiness = _read_canonical_mapping(readiness_path, "readiness artifact")
     parity = _load_parity(parity_path)
@@ -1351,6 +1363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             namespace.max_diff_bytes,
         ),
         max_iterations=namespace.iterations,
+        parity_reference=parity_reference,
     )
     output = _absolute_cli_path(namespace.output, "optimizer manifest output")
     written, digest = write_optimizer_manifest(manifest, output)

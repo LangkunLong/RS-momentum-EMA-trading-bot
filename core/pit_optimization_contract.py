@@ -1235,6 +1235,38 @@ def _require_subset_canary_call_plan(
         raise ValueError("subset canary call caps are invalid")
 
 
+def _attested_parity_reference_folds(
+    *,
+    parity_attestation: object,
+    parity_reference: object,
+) -> tuple[FoldManifest, tuple[str, ...]]:
+    """Return only the fold plan and universe sealed by a matching parity reference."""
+
+    from core.pit_policy_parity import ParityAttestation, ParityReference
+
+    if not isinstance(parity_attestation, ParityAttestation) or not isinstance(
+        parity_reference, ParityReference
+    ):
+        raise ValueError("attested parity reference is invalid")
+    if (
+        parity_reference.artifact_sha256
+        != parity_attestation.reference_artifact_sha256
+        or parity_reference.reference_source_head
+        != parity_attestation.reference_source_head
+        or parity_reference.pit_bundle_sha256 != parity_attestation.pit_bundle_sha256
+        or parity_reference.baseline_manifest_sha256
+        != parity_attestation.baseline_manifest_sha256
+        or parity_reference.effective_policy_sha256
+        != parity_attestation.effective_policy_sha256
+        or parity_reference.fold_manifest.sha256
+        != parity_attestation.discovery_fold_manifest_sha256
+        or parity_reference.discovery_output_sha256s
+        != parity_attestation.reference_output_sha256s
+    ):
+        raise ValueError("attested parity reference fold manifest differs")
+    return parity_reference.fold_manifest, parity_reference.universe
+
+
 def build_subset_manifest(
     *,
     legacy_readiness: Mapping[str, object],
@@ -1251,6 +1283,7 @@ def build_subset_manifest(
     call_budgets: tuple[PitOptimizerCallBudget, ...],
     candidate_bounds: PatchBounds,
     max_iterations: int,
+    parity_reference: object | None = None,
 ) -> PitOptimizerRunManifest:
     """Authenticate inert inputs and seal one provider-free subset manifest."""
 
@@ -1335,21 +1368,36 @@ def build_subset_manifest(
     if identities.get("effective_policy_sha256") != effective_policy_sha256:
         raise ValueError("legacy readiness effective policy identity differs")
 
-    from core.pit_data import PITDataBundle
-    from core.pit_policy_parity import build_fixed_fold_manifest
+    if parity_reference is None:
+        from core.pit_data import PITDataBundle
+        from core.pit_policy_parity import build_fixed_fold_manifest
 
-    with PITDataBundle(bundle_path, expected_sha256=bundle_sha256) as bundle:
-        rows = bundle._connection.execute(
-            "SELECT trade_date FROM price WHERE ticker='SPY' "
-            "AND trade_date>='2021-06-25' AND trade_date<='2022-03-11' "
-            "ORDER BY trade_date"
-        ).fetchall()
-        benchmark_sessions = tuple(str(row[0]) for row in rows)
-    fold_manifest, _universe = build_fixed_fold_manifest(
-        readiness=legacy_readiness,
-        benchmark_sessions=benchmark_sessions,
-        data_identity_sha256=bundle_sha256,
-    )
+        with PITDataBundle(bundle_path, expected_sha256=bundle_sha256) as bundle:
+            rows = bundle._connection.execute(
+                "SELECT trade_date FROM price WHERE ticker='SPY' "
+                "AND trade_date>='2021-06-25' AND trade_date<='2022-03-11' "
+                "ORDER BY trade_date"
+            ).fetchall()
+            benchmark_sessions = tuple(str(row[0]) for row in rows)
+        fold_manifest, selected_universe = build_fixed_fold_manifest(
+            readiness=legacy_readiness,
+            benchmark_sessions=benchmark_sessions,
+            data_identity_sha256=bundle_sha256,
+        )
+    else:
+        fold_manifest, selected_universe = _attested_parity_reference_folds(
+            parity_attestation=parity_attestation,
+            parity_reference=parity_reference,
+        )
+        scope = evaluation.get("scope") if isinstance(evaluation, Mapping) else None
+        raw_universe = scope.get("symbols") if isinstance(scope, Mapping) else None
+        if (
+            fold_manifest.data_identity_sha256 != bundle_sha256
+            or fold_manifest.benchmark != "SPY"
+            or not isinstance(raw_universe, list)
+            or tuple(raw_universe) != selected_universe
+        ):
+            raise ValueError("attested parity reference differs from legacy readiness")
 
     if (
         parity.pit_bundle_sha256 != bundle_sha256
