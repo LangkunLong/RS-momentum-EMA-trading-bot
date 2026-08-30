@@ -786,19 +786,18 @@ class AuthenticatedRoleInputSnapshot:
             raise ValueError("optimizer response has an invalid type")
         if self.role == "author":
             assert isinstance(artifact, AuthorArtifact)
-            if artifact.hypothesis_id != self.expected_hypothesis_id:
-                raise ValueError("author hypothesis differs from investigator")
             assert self.source_bundle is not None
             assert self.candidate_bounds is not None
-            _resulting_texts, stats = _contract._apply_unified_diff(
+            # The author is allowed to describe its proposal, but the model's
+            # echoed hypothesis/scope metadata is not an authority boundary.
+            # Validate the concrete diff against the sealed source here; the
+            # controller later derives the candidate identity, paths, and
+            # symbols from the authenticated Git result.
+            _contract._apply_unified_diff(
                 {record.path: record.text for record in self.source_bundle.files},
                 artifact.unified_diff,
                 bounds=self.candidate_bounds,
             )
-            if stats.paths != artifact.changed_paths:
-                raise ValueError(
-                    "author changed paths differ from candidate unified diff"
-                )
         elif self.role == "critic":
             assert isinstance(artifact, CriticArtifact)
             if artifact.hypothesis_id != self.expected_hypothesis_id:

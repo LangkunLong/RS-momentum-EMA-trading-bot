@@ -45,7 +45,6 @@ from core.pit_optimizer_candidate import (
     CandidateIdentity,
     build_policy_source_bundle,
     require_source_context_fit,
-    validate_author_manifest,
     validate_candidate_identity,
 )
 from core.pit_optimizer_evaluation import (
@@ -1451,10 +1450,9 @@ def _validate_iteration_candidate(
         if outcome.failure_code is not None or outcome.identity is None:
             raise SandboxIntegrityFailure("valid candidate outcome is inconsistent")
         _require_identity_graph(readiness, outcome)
-        try:
-            validate_author_manifest(author.payload, outcome.identity)  # type: ignore[arg-type]
-        except ValueError as exc:
-            raise IdentityDrift("author manifest differs from candidate identity") from exc
+        # Candidate identity is derived from the authenticated Git state, not
+        # from advisory fields echoed by the author response.  Once that
+        # identity graph is valid, the controller-owned manifest is exact.
         author_manifest_matches = True
         try:
             prospective_bundle = build_policy_source_bundle(
@@ -1718,6 +1716,19 @@ def _run_critic(
         AuthorArtifact,
     ):
         raise ProviderProtocolFailure("critic predecessors are invalid")
+    # Use controller-derived candidate scope after validation.  The author's
+    # summary remains useful feedback, while source scope and symbols stay
+    # tied to the authenticated diff rather than model-declared metadata.
+    changed_paths = (
+        validation.changed_paths
+        if validation.valid
+        else author.payload.changed_paths
+    )
+    changed_symbols = (
+        validation.changed_symbols
+        if validation.valid
+        else author.payload.changed_symbols
+    )
     role_input = CriticInput(
         schema_version=2,
         iteration=state.next_iteration,
@@ -1726,10 +1737,10 @@ def _run_critic(
         hypothesis_id=investigator.payload.hypothesis_id,
         investigator_summary=investigator.payload,
         author_manifest=AuthorManifestSummary(
-            hypothesis_id=author.payload.hypothesis_id,
+            hypothesis_id=investigator.payload.hypothesis_id,
             behavioral_summary=author.payload.behavioral_summary,
-            changed_paths=author.payload.changed_paths,
-            changed_symbols=author.payload.changed_symbols,
+            changed_paths=changed_paths,
+            changed_symbols=changed_symbols,
         ),
         validation=_validation_summary(validation, state.evaluation_failure_code),
         candidate_vs_baseline=(
