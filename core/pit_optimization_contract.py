@@ -185,8 +185,12 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "scope. assumptions and validation_suggestions may be []. Use at most four assumption "
             "or validation-suggestion items, keep every such item to 96 characters and "
             "behavioral_summary to 256 characters, and keep unified_diff within the supplied "
-            "candidate diff bound. Do not execute code or access hidden data, credentials, local "
-            "paths, or unrelated source."
+            "candidate diff bound. Treat source_bundle.files as the only base revision: copy every "
+            "old-side and context line in unified_diff byte-for-byte from the selected supplied file, "
+            "and make every hunk count match its emitted body. Prefer one literal, localized "
+            "replacement over reconstructed or remembered context. Do not invent an old line or "
+            "quote a prior version of the source. Do not execute code or access hidden data, "
+            "credentials, local paths, or unrelated source."
         ),
         "critic": (
             "You are the PIT optimizer critic. Analyze only the supplied sanitized validation "
