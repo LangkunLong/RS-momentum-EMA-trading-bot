@@ -159,7 +159,8 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "response schema is authoritative: use at most "
             "four items per list, copy evidence IDs and editable paths/symbols verbatim from the "
             "supplied input, and include a target symbol only when it is declared by one of the "
-            "selected target paths. Do not use bare source constants or invented symbols. Keep "
+            "selected target paths. A symbol may be a declared function or a bare UPPER_CASE "
+            "source constant from a selected path; do not invent symbols. Keep "
             "causal_rationale to 256 characters, and keep each diagnostic, "
             "risk, and author-instruction item to 96 characters. Make the object compact enough "
             "for the 8 KiB envelope. Never request hidden data, credentials, local paths, raw "
@@ -174,8 +175,9 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "behavioral_summary, and unified_diff are strings; every other field is a JSON array of "
             "strings. Copy hypothesis_id verbatim from the investigator. unified_diff must be a "
             "nonempty standard unified diff. changed_paths and changed_symbols must be nonempty and "
-            "list only supplied paths and declared symbols actually changed by unified_diff, using "
-            "their exact supplied values and canonical path order; do not list the whole editable "
+            "list only supplied paths and symbols actually changed by unified_diff. A changed "
+            "symbol may be a declared function or a bare UPPER_CASE source constant from a changed "
+            "path; use canonical path order and do not list the whole editable "
             "scope. assumptions and validation_suggestions may be []. Use at most four assumption "
             "or validation-suggestion items, keep every such item to 96 characters and "
             "behavioral_summary to 256 characters, and keep unified_diff within the supplied "
@@ -497,6 +499,9 @@ def _validate_scoped_paths_symbols(
     )
     if any(
         symbol not in allowed_symbols
+        # Symbol metadata never grants edit authority: candidate diffs remain
+        # constrained to authenticated paths and bounded by the patch verifier.
+        and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol) is None
         and not any(
             symbol.startswith(prefix)
             and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix))

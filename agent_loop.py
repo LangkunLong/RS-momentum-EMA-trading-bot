@@ -328,6 +328,7 @@ class ProtocolFailureCode(str, Enum):
     PAYLOAD_SCOPE_INVALID = "payload_scope_invalid"
     PAYLOAD_SIZE_INVALID = "payload_size_invalid"
     PAYLOAD_ENUM_INVALID = "payload_enum_invalid"
+    PAYLOAD_BINDING_INVALID = "payload_binding_invalid"
     MODEL_MISMATCH = "model_mismatch"
     VALIDATOR_BOUNDARY_INVALID = "validator_boundary_invalid"
 
@@ -4937,7 +4938,7 @@ class OpenRouterGateway:
                     response_schema_valid=False,
                     usage=usage,
                     response_validation_code=(
-                        ProtocolFailureCode.PAYLOAD_FIELD_INVALID.value
+                        ProtocolFailureCode.PAYLOAD_BINDING_INVALID.value
                     ),
                     accounting_source=usage.accounting_source,
                 )
