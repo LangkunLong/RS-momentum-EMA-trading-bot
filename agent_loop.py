@@ -3061,9 +3061,9 @@ def _complete_pit_optimizer_inline_usage_with_frozen_pricing(
     )
 
 
-def _safe_generation_id(response: object) -> str:
-    """Return one locally hardened OpenRouter generation identifier."""
-    value = _read_field(response, "id")
+def _safe_generation_id_value(value: object) -> str:
+    """Validate one locally hardened OpenRouter generation identifier."""
+
     if value is None:
         raise AccountingValidationError(
             "response is missing a generation accounting identifier",
@@ -3075,6 +3075,12 @@ def _safe_generation_id(response: object) -> str:
             code=AccountingFailureCode.RECOVERY_ID_UNSAFE,
         )
     return value
+
+
+def _safe_generation_id(response: object) -> str:
+    """Return one locally hardened OpenRouter generation identifier."""
+
+    return _safe_generation_id_value(_read_field(response, "id"))
 
 
 class _GenerationTokenBasis(str, Enum):
@@ -4797,23 +4803,41 @@ class OpenRouterGateway:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
             audit_sha256 = self._ensure_pit_optimizer_started_event(lifecycle)
             possibly_sent = True
+            generation_id_from_header: str | None = None
+            request_kwargs: dict[str, object] = {
+                "model": REASONER_MODEL,
+                "messages": messages,
+                "response_format": response_format,
+                "stream": False,
+                "max_tokens": plan_snapshot.max_output_tokens,
+                "timeout": min(self.timeout_seconds, remaining),
+                "extra_headers": {"X-Session-Id": f"{self.run_id}:{role}"},
+                "extra_body": {
+                    "provider": {"require_parameters": True},
+                    # DeepSeek R1 keeps its reasoning budget, but returns the
+                    # reasoning trace separately so ``message.content`` can
+                    # remain the strict JSON role payload we validate.
+                    "reasoning": {"exclude": True},
+                },
+            }
             try:
-                response = client.chat.completions.create(
-                    model=REASONER_MODEL,
-                    messages=messages,
-                    response_format=response_format,
-                    stream=False,
-                    max_tokens=plan_snapshot.max_output_tokens,
-                    timeout=min(self.timeout_seconds, remaining),
-                    extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
-                    extra_body={
-                        "provider": {"require_parameters": True},
-                        # DeepSeek R1 keeps its reasoning budget, but returns the
-                        # reasoning trace separately so ``message.content`` can
-                        # remain the strict JSON role payload we validate.
-                        "reasoning": {"exclude": True},
-                    },
-                )
+                completions = client.chat.completions
+                raw_completions = getattr(completions, "with_raw_response", None)
+                raw_create = getattr(raw_completions, "create", None)
+                if not callable(raw_create):
+                    response = completions.create(**request_kwargs)
+                else:
+                    raw_response = raw_create(**request_kwargs)
+                    parse = getattr(raw_response, "parse", None)
+                    headers = getattr(raw_response, "headers", None)
+                    header_get = getattr(headers, "get", None)
+                    if callable(header_get):
+                        header_value = header_get("x-generation-id")
+                        if header_value is not None:
+                            generation_id_from_header = header_value
+                    if not callable(parse):
+                        raise GatewayError("OpenRouter raw response is invalid")
+                    response = parse()
             except Exception as exc:
                 lifecycle.response_processed = True
                 (
@@ -4863,6 +4887,7 @@ class OpenRouterGateway:
                         self._recover_pit_optimizer_generation_usage_once(
                             response,
                             REASONER_MODEL,
+                            generation_id_from_header=generation_id_from_header,
                             wall_deadline=float(wall_deadline),
                             monotonic=monotonic,
                         )
@@ -5404,6 +5429,7 @@ class OpenRouterGateway:
         response: object,
         expected_model: str,
         *,
+        generation_id_from_header: str | None = None,
         wall_deadline: float,
         monotonic: Callable[[], float],
     ) -> tuple[Usage, bool]:
@@ -5415,7 +5441,11 @@ class OpenRouterGateway:
         the response already received, and never retries either request type.
         """
 
-        generation_id = _safe_generation_id(response)
+        generation_id = (
+            _safe_generation_id(response)
+            if generation_id_from_header is None
+            else _safe_generation_id_value(generation_id_from_header)
+        )
         if self._generation_loader is None and not self._generation_loader_is_builtin:
             raise AccountingValidationError(
                 "generation accounting recovery is unavailable",
