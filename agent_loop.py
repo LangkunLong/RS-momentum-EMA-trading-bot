@@ -84,9 +84,9 @@ REASONER_MODEL = "deepseek/deepseek-r1"
 CODER_MODEL = "qwen/qwen3-coder-next"
 
 # Controller-owned conservative reservation rates for the three-call PIT gate.
-# Provider-returned inline cost remains the authoritative charge; these sealed
-# per-million ceilings prevent a pre-call /models lookup from becoming a fourth
-# provider request.
+# Provider-returned inline cost is preferred; when an otherwise complete
+# response omits only cost, the same sealed rates provide a labeled local
+# reconciliation without a second provider completion or receipt lookup.
 _PIT_OPTIMIZATION_OFFLINE_PRICING = MappingProxyType(
     {
         ORCHESTRATOR_MODEL: MappingProxyType({"prompt": 5.0, "completion": 5.0}),
@@ -1099,7 +1099,11 @@ class Usage:
             raise ProtocolValidationError("reasoning_tokens cannot exceed completion_tokens")
         if self.cost_usd is not None and _non_negative_float(self.cost_usd) is None:
             raise ProtocolValidationError("usage cost must be a finite non-negative number")
-        if self.accounting_source not in {"inline", "generation_endpoint"}:
+        if self.accounting_source not in {
+            "inline",
+            "generation_endpoint",
+            "frozen_pricing",
+        }:
             raise ProtocolValidationError("usage accounting source is invalid")
 
 
@@ -1314,7 +1318,11 @@ class ProviderCallRecord:
             raise ConfigurationError("version 1 provider call has optimizer pricing")
         if self.accounting_complete is not True:
             raise ConfigurationError("provider call must have complete validated accounting")
-        if self.accounting_source not in {"inline", "generation_endpoint"}:
+        if self.accounting_source not in {
+            "inline",
+            "generation_endpoint",
+            "frozen_pricing",
+        }:
             raise ConfigurationError("provider call accounting source is invalid")
         if self.requested_model == "unknown":
             raise ConfigurationError("accounted provider call requires a requested model")
@@ -1427,7 +1435,11 @@ class ProviderCallRecord:
         if self.authoritative_spend_known:
             if self.exposure_basis != "authoritative" or retained_present:
                 raise ConfigurationError("authoritative failed-call exposure is inconsistent")
-            if self.accounting_source not in {"inline", "generation_endpoint"}:
+            if self.accounting_source not in {
+                "inline",
+                "generation_endpoint",
+                "frozen_pricing",
+            }:
                 raise ConfigurationError("authoritative failed-call source is invalid")
             if any(
                 value is None
@@ -1563,7 +1575,8 @@ class ProviderCallRecord:
             elif (
                 self.outcome == "failed_before_send"
                 or not self.locally_accounted
-                or self.accounting_source not in {"inline", "generation_endpoint"}
+                or self.accounting_source
+                not in {"inline", "generation_endpoint", "frozen_pricing"}
             ):
                 raise ConfigurationError("optimizer authoritative accounting is not local")
         else:
@@ -1725,7 +1738,8 @@ class ProviderCallRecord:
             elif (
                 self.outcome == "failed_before_send"
                 or not self.locally_accounted
-                or self.accounting_source not in {"inline", "generation_endpoint"}
+                or self.accounting_source
+                not in {"inline", "generation_endpoint", "frozen_pricing"}
             ):
                 raise ConfigurationError(
                     "optimizer authoritative accounting is not local"
@@ -2912,7 +2926,12 @@ def _usage_cost(value: object, location: str) -> float | None:
     return normalized
 
 
-def _usage_from_response(response: object, *, require_complete: bool = False) -> Usage:
+def _usage_from_response(
+    response: object,
+    *,
+    require_complete: bool = False,
+    allow_missing_cost: bool = False,
+) -> Usage:
     usage = _read_field(response, "usage")
     if usage is None:
         if require_complete:
@@ -2944,7 +2963,7 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
             code=AccountingFailureCode.INLINE_COST_CONFLICT,
         )
     cost = usage_cost if usage_cost is not None else response_cost
-    if require_complete and cost is None:
+    if require_complete and cost is None and not allow_missing_cost:
         raise AccountingValidationError(
             "response is missing authoritative provider cost accounting",
             code=AccountingFailureCode.INLINE_USAGE_MISSING,
@@ -2998,6 +3017,48 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
             "provider accounting is invalid",
             code=AccountingFailureCode.INLINE_USAGE_INVALID,
         ) from exc
+
+
+def _complete_pit_optimizer_inline_usage_with_frozen_pricing(
+    usage: Usage,
+    pricing: "OptimizerPricingSnapshot",
+) -> Usage:
+    """Attach immutable local cost when inline tokens are complete but cost is absent."""
+
+    from core.pit_optimizer_authorization import OptimizerPricingSnapshot
+
+    if not isinstance(usage, Usage) or not isinstance(
+        pricing, OptimizerPricingSnapshot
+    ):
+        raise ConfigurationError("optimizer inline accounting inputs are invalid")
+    if usage.cost_usd is not None:
+        return usage
+    if (
+        pricing.lookup_status != "available"
+        or pricing.prompt_per_million is None
+        or pricing.completion_per_million is None
+        or usage.prompt_tokens is None
+        or usage.completion_tokens is None
+        or usage.total_tokens is None
+        or usage.total_tokens != usage.prompt_tokens + usage.completion_tokens
+    ):
+        raise AccountingValidationError(
+            "optimizer inline accounting cannot be priced locally",
+            code=AccountingFailureCode.INLINE_USAGE_MISSING,
+        )
+    cost = (
+        Decimal(usage.prompt_tokens) * pricing.prompt_per_million
+        + Decimal(usage.completion_tokens) * pricing.completion_per_million
+    ) / Decimal(1_000_000)
+    return Usage(
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        total_tokens=usage.total_tokens,
+        cached_tokens=usage.cached_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        cost_usd=float(cost),
+        accounting_source="frozen_pricing",
+    )
 
 
 def _safe_generation_id(response: object) -> str:
@@ -4787,7 +4848,15 @@ class OpenRouterGateway:
             )
             recovered_semantics_valid = True
             try:
-                usage = _usage_from_response(response, require_complete=True)
+                usage = _usage_from_response(
+                    response,
+                    require_complete=True,
+                    allow_missing_cost=True,
+                )
+                usage = _complete_pit_optimizer_inline_usage_with_frozen_pricing(
+                    usage,
+                    pricing_snapshot,
+                )
             except AccountingValidationError:
                 try:
                     usage, recovered_semantics_valid = (

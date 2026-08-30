@@ -556,7 +556,12 @@ class PitOptimizerProviderFacts:
             raise ValueError("optimizer accounting failure code is invalid")
         if type(self.response_schema_valid) is not bool or type(self.accounting_complete) is not bool:
             raise ValueError("optimizer provider validation/accounting facts are invalid")
-        if self.accounting_source not in {None, "inline", "generation_endpoint"}:
+        if self.accounting_source not in {
+            None,
+            "inline",
+            "generation_endpoint",
+            "frozen_pricing",
+        }:
             raise ValueError("optimizer accounting source is invalid")
         if not self.accounting_complete and self.accounting_source is not None:
             raise ValueError("incomplete optimizer accounting cannot name a source")
