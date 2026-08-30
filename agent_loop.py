@@ -4904,10 +4904,10 @@ class OpenRouterGateway:
                     usage,
                     pricing_snapshot,
                 )
-            except (AccountingValidationError, ResponseValidationError):
+            except (ResponseValidationError, ValueError):
                 # A received response can be billable even when its inline
                 # usage object is absent or malformed.  Both accounting and
-                # usage-shape failures must take the same single bounded
+                # value-shape failures must take the same single bounded
                 # generation-receipt recovery path; otherwise an inline
                 # parsing exception skips the only authoritative recovery.
                 try:
