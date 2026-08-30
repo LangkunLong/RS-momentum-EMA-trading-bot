@@ -9465,12 +9465,15 @@ def _parse_unified_diff(
     raw: str,
     *,
     bounds: object | None = None,
+    allow_plain_unified_diff: bool = False,
 ) -> ParsedPatch:
     from core.pit_optimization_contract import PatchBounds
 
     effective_bounds = bounds or PatchBounds(4, 25, 400, _MAX_DIFF_BYTES)
     if not isinstance(effective_bounds, PatchBounds):
         raise PatchPolicyError("patch bounds are invalid")
+    if type(allow_plain_unified_diff) is not bool:
+        raise PatchPolicyError("plain unified diff policy must be boolean")
     if not isinstance(raw, str) or not raw:
         raise PatchPolicyError("patch is blank")
     if len(raw.encode("utf-8")) > effective_bounds.max_diff_bytes:
@@ -9488,15 +9491,21 @@ def _parse_unified_diff(
     index = 0
     while index < len(lines):
         header = lines[index][:-1]
-        if not header.startswith("diff --git "):
-            raise PatchPolicyError("patch must contain only conventional diff --git sections")
-        fields = header.split(" ")
-        if len(fields) != 4 or not fields[2].startswith("a/") or not fields[3].startswith("b/"):
-            raise PatchPolicyError("malformed or combined diff header")
-        old_path = canonical_patch_path(fields[2][2:])
-        new_path = canonical_patch_path(fields[3][2:])
-        if old_path != new_path:
-            raise PatchPolicyError("renames and copies are forbidden")
+        has_git_header = header.startswith("diff --git ")
+        if has_git_header:
+            fields = header.split(" ")
+            if len(fields) != 4 or not fields[2].startswith("a/") or not fields[3].startswith("b/"):
+                raise PatchPolicyError("malformed or combined diff header")
+            old_path = canonical_patch_path(fields[2][2:])
+            new_path = canonical_patch_path(fields[3][2:])
+            if old_path != new_path:
+                raise PatchPolicyError("renames and copies are forbidden")
+        else:
+            if not allow_plain_unified_diff:
+                raise PatchPolicyError("patch must contain only conventional diff --git sections")
+            if not header.startswith("--- a/"):
+                raise PatchPolicyError("plain unified diff requires an old-file header")
+            old_path = canonical_patch_path(header[len("--- a/") :])
         folded_path = old_path.casefold()
         if folded_path in folded and folded[folded_path] != old_path:
             raise PatchPolicyError("case-colliding patch paths are forbidden")
@@ -9505,19 +9514,26 @@ def _parse_unified_diff(
         folded[folded_path] = old_path
         files.append(old_path)
         index += 1
-        if index >= len(lines):
-            raise PatchPolicyError("incomplete diff section")
-        metadata = lines[index][:-1]
-        if not re.fullmatch(r"index [0-9a-fA-F]+\.\.[0-9a-fA-F]+ 100644", metadata):
-            raise PatchPolicyError("target diff mode must be explicitly 100644")
-        index += 1
-        if index + 1 >= len(lines):
-            raise PatchPolicyError("diff section lacks file headers")
-        if lines[index][:-1] != f"--- a/{old_path}" or lines[index + 1][:-1] != f"+++ b/{old_path}":
-            raise PatchPolicyError("malformed or non-matching file headers")
-        index += 2
+        if has_git_header:
+            if index >= len(lines):
+                raise PatchPolicyError("incomplete diff section")
+            metadata = lines[index][:-1]
+            if not re.fullmatch(r"index [0-9a-fA-F]+\.\.[0-9a-fA-F]+ 100644", metadata):
+                raise PatchPolicyError("target diff mode must be explicitly 100644")
+            index += 1
+            if index + 1 >= len(lines):
+                raise PatchPolicyError("diff section lacks file headers")
+            if lines[index][:-1] != f"--- a/{old_path}" or lines[index + 1][:-1] != f"+++ b/{old_path}":
+                raise PatchPolicyError("malformed or non-matching file headers")
+            index += 2
+        else:
+            if index >= len(lines) or lines[index][:-1] != f"+++ b/{old_path}":
+                raise PatchPolicyError("plain unified diff has malformed file headers")
+            index += 1
         section_hunks = 0
-        while index < len(lines) and not lines[index].startswith("diff --git "):
+        while index < len(lines) and not lines[index].startswith("diff --git ") and not (
+            allow_plain_unified_diff and lines[index].startswith("--- a/")
+        ):
             text = lines[index][:-1]
             if text.startswith(_STRUCTURAL_DIFF_PREFIXES) or text.startswith(("diff --cc ", "diff --combined ", "@@@")):
                 raise PatchPolicyError("structural, binary, or combined diffs are forbidden")
@@ -9573,15 +9589,22 @@ def validate_unified_diff(
     editable_paths: Sequence[str] = (),
     gate: str = "test",
     allow_protected_backtest_paths: bool = False,
+    allow_plain_unified_diff: bool = False,
     bounds: object | None = None,
     git: GitCapability | None = None,
 ) -> ParsedPatch:
     """Apply all path, structure, cap, mode, scope, and live-reference policy before Git."""
     if type(allow_protected_backtest_paths) is not bool:
         raise PatchPolicyError("protected backtest path policy must be boolean")
+    if type(allow_plain_unified_diff) is not bool:
+        raise PatchPolicyError("plain unified diff policy must be boolean")
     if allow_protected_backtest_paths and gate != "backtest":
         raise PatchPolicyError("protected backtest paths require the backtest gate")
-    parsed = _parse_unified_diff(raw, bounds=bounds)
+    parsed = _parse_unified_diff(
+        raw,
+        bounds=bounds,
+        allow_plain_unified_diff=allow_plain_unified_diff,
+    )
     try:
         declared = tuple(canonical_patch_path(path) for path in declared_files)
         extra_editable = {canonical_patch_path(path) for path in editable_paths}

@@ -705,7 +705,15 @@ def validate_candidate_diff(
     }
     applied = False
     try:
-        parsed = _parse_unified_diff(incremental_diff, bounds=bounds)
+        # The author contract permits both conventional Git diffs and standard
+        # ``---``/``+++`` unified diffs.  Preserve that contract only for this
+        # PIT ingestion boundary; all scope, bounds, Git-apply, AST, and
+        # cumulative-diff checks remain mandatory.
+        parsed = _parse_unified_diff(
+            incremental_diff,
+            bounds=bounds,
+            allow_plain_unified_diff=True,
+        )
         validate_unified_diff(
             candidate_root,
             incremental_diff,
@@ -714,6 +722,7 @@ def validate_candidate_diff(
             gate="test",
             bounds=bounds,
             git=git,
+            allow_plain_unified_diff=True,
         )
         encoded = incremental_diff.encode("utf-8")
         try:
