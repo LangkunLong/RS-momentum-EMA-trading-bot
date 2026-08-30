@@ -4920,7 +4920,22 @@ class OpenRouterGateway:
                             monotonic=monotonic,
                         )
                     )
-                except AccountingValidationError as recovery_exc:
+                except (AccountingValidationError, ValueError) as recovery_exc:
+                    recovery_code = (
+                        recovery_exc.code
+                        if isinstance(recovery_exc, AccountingValidationError)
+                        else AccountingFailureCode.RECOVERY_PAYLOAD_INVALID
+                    )
+                    recovery_attempts = (
+                        recovery_exc.generation_attempts
+                        if isinstance(recovery_exc, AccountingValidationError)
+                        else 1
+                    )
+                    recovery_diagnostic = (
+                        recovery_exc.recovery_usage_diagnostic
+                        if isinstance(recovery_exc, AccountingValidationError)
+                        else None
+                    )
                     facts = provider_facts(
                         outcome="uncertain_accounting",
                         request_started=True,
@@ -4929,16 +4944,14 @@ class OpenRouterGateway:
                         finish_reason=finish_reason,
                         response_schema_valid=False,
                         usage=None,
-                        accounting_failure_code=recovery_exc.code.value,
+                        accounting_failure_code=recovery_code.value,
                     )
                     finalize(facts, Usage())
                     raise AccountingValidationError(
                         "optimizer response accounting is uncertain",
-                        code=recovery_exc.code,
-                        generation_attempts=recovery_exc.generation_attempts,
-                        recovery_usage_diagnostic=(
-                            recovery_exc.recovery_usage_diagnostic
-                        ),
+                        code=recovery_code,
+                        generation_attempts=recovery_attempts,
+                        recovery_usage_diagnostic=recovery_diagnostic,
                     ) from recovery_exc
             assert usage.prompt_tokens is not None
             assert usage.completion_tokens is not None
