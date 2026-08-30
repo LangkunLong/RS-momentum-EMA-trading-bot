@@ -703,6 +703,16 @@ def validate_candidate_diff(
     before_bytes = {
         path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
     }
+    candidate_diff = incremental_diff
+    if (
+        isinstance(candidate_diff, str)
+        and candidate_diff
+        and not candidate_diff.endswith("\n")
+    ):
+        # JSON transport can omit only the terminal textual delimiter of an
+        # otherwise valid unified diff.  Normalize that delimiter locally;
+        # Git still authenticates the exact applied candidate state below.
+        candidate_diff += "\n"
     applied = False
     try:
         # The author contract permits both conventional Git diffs and standard
@@ -710,13 +720,13 @@ def validate_candidate_diff(
         # PIT ingestion boundary; all scope, bounds, Git-apply, AST, and
         # cumulative-diff checks remain mandatory.
         parsed = _parse_unified_diff(
-            incremental_diff,
+            candidate_diff,
             bounds=bounds,
             allow_plain_unified_diff=True,
         )
         validate_unified_diff(
             candidate_root,
-            incremental_diff,
+            candidate_diff,
             parsed.files,
             editable_paths=EDITABLE_POLICY_PATHS,
             gate="test",
@@ -724,7 +734,7 @@ def validate_candidate_diff(
             git=git,
             allow_plain_unified_diff=True,
         )
-        encoded = incremental_diff.encode("utf-8")
+        encoded = candidate_diff.encode("utf-8")
         try:
             _git(
                 candidate_root,
@@ -749,12 +759,12 @@ def validate_candidate_diff(
         except PreflightError as exc:
             removed_lines = tuple(
                 line[1:]
-                for line in incremental_diff.splitlines(keepends=True)
+                for line in candidate_diff.splitlines(keepends=True)
                 if line.startswith("-") and not line.startswith("--- ")
             )
             added_lines = tuple(
                 line[1:]
-                for line in incremental_diff.splitlines(keepends=True)
+                for line in candidate_diff.splitlines(keepends=True)
                 if line.startswith("+") and not line.startswith("+++ ")
             )
             if removed_lines == added_lines:
