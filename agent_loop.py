@@ -76,6 +76,7 @@ if TYPE_CHECKING:
         PitOptimizerResult,
         PitOptimizerServices,
     )
+    from core.pit_optimizer_evaluation import DiscoveryScore
 
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -105,6 +106,23 @@ MAX_BATCH_CALLS = 150
 MAX_BATCH_TOKENS = 2_000_000
 GENERATION_ACCOUNTING_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0)
 GENERATION_ACCOUNTING_ATTEMPTS = len(GENERATION_ACCOUNTING_DELAYS_SECONDS) + 1
+
+
+def _unrankable_discovery_score() -> "DiscoveryScore":
+    """Return the typed placeholder required for a no-trade candidate.
+
+    The caller must retain ``rankable=False`` and ``strictly_improves=False``;
+    this value is deliberately not a discovery objective.
+    """
+    from core.pit_optimizer_evaluation import DiscoveryScore
+
+    return DiscoveryScore(
+        median_excess_return_pp=Decimal("0.00"),
+        worst_excess_return_pp=Decimal("0.00"),
+        max_drawdown_magnitude_pp=Decimal("0.00"),
+    )
+
+
 # PIT canaries permit one generation-receipt lookup only.  Give OpenRouter's
 # asynchronously published receipt a bounded chance to appear before that
 # lookup; this is a pre-lookup settle period, not a provider retry.
@@ -19893,13 +19911,14 @@ def _build_pit_optimizer_v3_live_run(
                 )
                 improves = strictly_improves_discovery(fixed_score, current_score)
             else:
-                fixed_score = discovery_score_from_folds(
-                    baseline,
-                    baseline,
-                    original_baseline_sha256=baseline_sha256,
-                    expected_original_baseline_sha256=baseline_sha256,
-                )
-                incumbent_score = fixed_score
+                # An unrankable candidate must not enter the discovery objective.
+                # In particular, the sealed baseline can itself contain a
+                # zero-trade fold, which makes a baseline-vs-baseline score
+                # invalid.  DiscoveryEvaluation still carries typed scores,
+                # so use a neutral placeholder that cannot be selected.
+                unrankable_score = _unrankable_discovery_score()
+                fixed_score = unrankable_score
+                incumbent_score = unrankable_score
                 improves = False
             if improves:
                 incumbent_folds[:] = aggregates

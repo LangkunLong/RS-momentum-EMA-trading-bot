@@ -153,6 +153,19 @@ def test_import_is_lazy_and_never_reads_key_or_execution_modules(tmp_path: Path)
     assert not marker.exists()
 
 
+def test_unrankable_discovery_score_is_typed_neutral() -> None:
+    """Break caught: zero-trade candidates could score a zero-trade baseline."""
+    from decimal import Decimal
+
+    from agent_loop import _unrankable_discovery_score
+
+    score = _unrankable_discovery_score()
+
+    assert score.median_excess_return_pp == Decimal("0.00")
+    assert score.worst_excess_return_pp == Decimal("0.00")
+    assert score.max_drawdown_magnitude_pp == Decimal("0.00")
+
+
 def test_task3_state_and_terminal_status_values_are_closed() -> None:
     """Break caught: controller states or exits could drift into ambiguous free-form strings."""
     from agent_loop import LoopState, TerminalStatus
