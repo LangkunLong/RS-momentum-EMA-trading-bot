@@ -325,6 +325,9 @@ class ProtocolFailureCode(str, Enum):
     PAYLOAD_JSON_INVALID = "payload_json_invalid"
     PAYLOAD_KEYS_INVALID = "payload_keys_invalid"
     PAYLOAD_FIELD_INVALID = "payload_field_invalid"
+    PAYLOAD_SCOPE_INVALID = "payload_scope_invalid"
+    PAYLOAD_SIZE_INVALID = "payload_size_invalid"
+    PAYLOAD_ENUM_INVALID = "payload_enum_invalid"
     MODEL_MISMATCH = "model_mismatch"
     VALIDATOR_BOUNDARY_INVALID = "validator_boundary_invalid"
 
@@ -337,6 +340,30 @@ class ClosedResponseValidationError(ResponseValidationError):
             raise ConfigurationError("protocol failure code is invalid")
         super().__init__(message)
         self.code = code
+
+
+def _closed_payload_error_code(error: ValueError | TypeError) -> ProtocolFailureCode:
+    """Classify a local parser failure without retaining model-provided text."""
+
+    message = str(error)
+    if message == "provider payload is malformed JSON":
+        return ProtocolFailureCode.PAYLOAD_JSON_INVALID
+    if message in {
+        "provider payload has invalid keys",
+        "provider JSON contains a duplicate key",
+    }:
+        return ProtocolFailureCode.PAYLOAD_KEYS_INVALID
+    if "outside the editable scope" in message or "canonical policy order" in message:
+        return ProtocolFailureCode.PAYLOAD_SCOPE_INVALID
+    if (
+        "not bounded JSON text" in message
+        or "too large" in message
+        or "exceeds its byte cap" in message
+    ):
+        return ProtocolFailureCode.PAYLOAD_SIZE_INVALID
+    if message.endswith("family is invalid") or message.endswith("disposition is invalid"):
+        return ProtocolFailureCode.PAYLOAD_ENUM_INVALID
+    return ProtocolFailureCode.PAYLOAD_FIELD_INVALID
 
 
 class AccountingFailureCode(str, Enum):
@@ -5718,7 +5745,7 @@ class OpenRouterGateway:
         except (ValueError, TypeError) as exc:
             raise ClosedResponseValidationError(
                 "response payload validation failed",
-                ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
+                _closed_payload_error_code(exc),
             ) from exc
         normalized_usage = usage or _usage_from_response(
             response, require_complete=require_complete_accounting
