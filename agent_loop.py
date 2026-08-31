@@ -7818,6 +7818,7 @@ class PolicyWorkerSession:
         output_limit_bytes: int | None = None,
         wall_deadline: float | None = None,
         monotonic: Callable[[], float] | None = None,
+        startup_timeout_seconds: float = 30.0,
     ) -> None:
         from core.strategy_policy.worker import (
             DecisionDeterminismGuard,
@@ -7832,6 +7833,12 @@ class PolicyWorkerSession:
             or (monotonic is not None and not callable(monotonic))
         ):
             raise SandboxError("policy worker session timeout is invalid")
+        if (
+            not math.isfinite(startup_timeout_seconds)
+            or startup_timeout_seconds <= 0
+            or startup_timeout_seconds > 30.0
+        ):
+            raise SandboxError("policy worker startup timeout is invalid")
         if output_limit_bytes is not None and (
             type(output_limit_bytes) is not int
             or not 1 <= output_limit_bytes <= 4 * 1024 * 1024
@@ -7847,6 +7854,7 @@ class PolicyWorkerSession:
         self._daemon = daemon
         self._bootstrap = bootstrap
         self._method_timeout_seconds = method_timeout_seconds
+        self._startup_timeout_seconds = float(startup_timeout_seconds)
         self._fold_timeout_seconds = float(fold_timeout_seconds)
         self._output_limit_bytes = output_limit_bytes
         self._wall_deadline = (
@@ -7857,6 +7865,7 @@ class PolicyWorkerSession:
         self._sequence = 1
         self._previous_hmac = initial_chain_sha256(bootstrap)
         self._guard = DecisionDeterminismGuard()
+        self._ready = False
         self._closed = False
         self._lock = threading.Lock()
         self._stdout_values: queue.Queue[bytes | BaseException | None] = queue.Queue()
@@ -7877,6 +7886,57 @@ class PolicyWorkerSession:
         )
         self._stdout_thread.start()
         self._stderr_thread.start()
+
+    def await_ready(self) -> None:
+        from core.strategy_policy.worker import decode_worker_ready
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("policy worker session is closed")
+            if self._ready:
+                raise RuntimeError("policy worker session is already ready")
+            if self._output_limit_exceeded.is_set():
+                output_error = SandboxError("policy worker output limit exceeded")
+                self.close(primary_error=output_error)
+                raise output_error
+            observed_at = float(self._monotonic())
+            remaining_fold = self._fold_timeout_seconds - (
+                observed_at - self._started_at
+            )
+            remaining_wall = (
+                remaining_fold
+                if self._wall_deadline is None
+                else self._wall_deadline - observed_at
+            )
+            remaining = min(remaining_fold, remaining_wall)
+            if remaining <= 0:
+                timeout_error = TimeoutError("policy worker startup deadline")
+                self.close(primary_error=timeout_error)
+                raise timeout_error
+            try:
+                try:
+                    result = self._stdout_values.get(
+                        timeout=min(self._startup_timeout_seconds, remaining)
+                    )
+                except queue.Empty as exc:
+                    raise TimeoutError("policy worker startup timeout") from exc
+                if self._output_limit_exceeded.is_set():
+                    raise SandboxError("policy worker output limit exceeded")
+                if result is None:
+                    raise RuntimeError("policy worker closed before readiness")
+                if isinstance(result, BaseException):
+                    raise RuntimeError("policy worker output failed") from result
+                if len(result) > 16 * 1024 + 1:
+                    raise ValueError("policy worker readiness line limit exceeded")
+                try:
+                    ready_line = result.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise ValueError("policy worker readiness is not UTF-8") from exc
+                decode_worker_ready(ready_line, bootstrap=self._bootstrap)
+                self._ready = True
+            except BaseException as exc:
+                self.close(primary_error=exc)
+                raise
 
     @property
     def stderr_bytes(self) -> bytes:
@@ -7939,6 +7999,8 @@ class PolicyWorkerSession:
         with self._lock:
             if self._closed:
                 raise RuntimeError("policy worker session is closed")
+            if not self._ready:
+                raise RuntimeError("policy worker session is not ready")
             if self._output_limit_exceeded.is_set():
                 output_error = SandboxError("policy worker output limit exceeded")
                 self.close(primary_error=output_error)
@@ -8097,6 +8159,7 @@ class PolicyWorkerRunner:
         output_limit_bytes: int | None = None,
         wall_deadline: float | None = None,
         monotonic: Callable[[], float] | None = None,
+        startup_timeout_seconds: float = 30.0,
     ) -> None:
         if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image or "") is None:
             raise SandboxError("policy worker image must be digest pinned")
@@ -8124,6 +8187,12 @@ class PolicyWorkerRunner:
             raise SandboxError("policy worker wall deadline is invalid")
         if monotonic is not None and not callable(monotonic):
             raise SandboxError("policy worker monotonic clock is invalid")
+        if (
+            not math.isfinite(startup_timeout_seconds)
+            or startup_timeout_seconds <= 0
+            or startup_timeout_seconds > 30.0
+        ):
+            raise SandboxError("policy worker startup timeout is invalid")
         self.image = image
         self._process_factory = process_factory
         self._control_runner = control_runner
@@ -8153,6 +8222,7 @@ class PolicyWorkerRunner:
             raise SandboxError("policy worker temporary parent is invalid")
         self.temp_parent = parent.resolve()
         self.method_timeout_seconds = float(method_timeout_seconds)
+        self.startup_timeout_seconds = float(startup_timeout_seconds)
         self.fold_timeout_seconds = float(fold_timeout_seconds)
         self.output_limit_bytes = (
             64 * 1024 if output_limit_bytes is None else output_limit_bytes
@@ -8554,10 +8624,12 @@ class PolicyWorkerRunner:
                 output_limit_bytes=self._session_output_limit_bytes,
                 wall_deadline=self.wall_deadline,
                 monotonic=self._monotonic,
+                startup_timeout_seconds=self.startup_timeout_seconds,
             )
             try:
                 process.stdin.write(bootstrap.to_json().encode("utf-8") + b"\n")
                 process.stdin.flush()
+                session.await_ready()
             except BaseException as exc:
                 session.close(primary_error=exc)
                 raise
