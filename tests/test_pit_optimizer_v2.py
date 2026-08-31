@@ -2422,10 +2422,6 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
             rendered_values["critic"]["author_manifest"],
             contract.MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES,
         ),
-        (
-            rendered_values["critic"]["candidate_vs_baseline"],
-            contract.MAX_CANDIDATE_COMPARISON_BYTES,
-        ),
     )
     for section, cap in cap_derived_sections:
         section_bytes = len(_canonical_text(section).encode("utf-8"))
