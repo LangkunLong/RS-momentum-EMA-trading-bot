@@ -1833,19 +1833,11 @@ def _run_critic(
         AuthorArtifact,
     ):
         raise ProviderProtocolFailure("critic predecessors are invalid")
-    # Use controller-derived candidate scope after validation.  The author's
-    # summary remains useful feedback, while source scope and symbols stay
-    # tied to the authenticated diff rather than model-declared metadata.
-    changed_paths = (
-        validation.changed_paths
-        if validation.valid
-        else author.payload.changed_paths
-    )
-    changed_symbols = (
-        validation.changed_symbols
-        if validation.valid
-        else author.payload.changed_symbols
-    )
+    # Critic provenance binds to this iteration's incremental author action.
+    # The cumulative candidate identity is authenticated separately by the
+    # validation outcome and may include files changed by earlier incumbents.
+    changed_paths = author.payload.changed_paths
+    changed_symbols = author.payload.changed_symbols
     role_input = CriticInput(
         schema_version=2,
         iteration=state.next_iteration,
