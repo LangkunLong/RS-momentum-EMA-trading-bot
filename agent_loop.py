@@ -20146,7 +20146,7 @@ def _build_pit_optimizer_v3_live_run(
             baseline_sha256 = _folds_digest(baseline)
             incumbent = tuple(incumbent_folds)
             incumbent_sha256 = _folds_digest(incumbent)
-            rankable = all(item.closed_trades >= 1 for item in aggregates)
+            rankable = sum(item.closed_trades for item in aggregates) >= 1
             if rankable:
                 fixed_score = discovery_score_from_folds(
                     aggregates,
@@ -20162,7 +20162,7 @@ def _build_pit_optimizer_v3_live_run(
                 )
                 current_score = (
                     _unrankable_discovery_score()
-                    if any(item.closed_trades < 1 for item in incumbent)
+                    if sum(item.closed_trades for item in incumbent) < 1
                     else discovery_score_from_folds(
                         incumbent,
                         baseline,

@@ -267,8 +267,14 @@ def discovery_score_from_folds(
         or actual_baseline_sha256 != original_baseline_sha256
     ):
         raise ValueError("discovery fixed baseline identity differs")
-    if any(item.closed_trades < 1 for item in candidate_folds):
-        raise ValueError("each fold requires at least one closed discovery trade")
+    # Sparse subset folds are deliberately short and the sealed baseline can
+    # legitimately have no trades in one fold.  Require evidence of trading
+    # somewhere in the fixed discovery window instead of forcing every small
+    # fold to contain a close.  The objective still scores both fold returns
+    # and the worst drawdown, so an inactive fold remains visible and cannot
+    # manufacture an improvement by itself.
+    if sum(item.closed_trades for item in candidate_folds) < 1:
+        raise ValueError("discovery window requires at least one closed trade")
     excess = tuple(
         _objective_decimal(
             Decimal(str(candidate.total_return_pct))
