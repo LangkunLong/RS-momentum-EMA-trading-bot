@@ -1308,6 +1308,11 @@ def _require_subset_canary_call_plan(
         "author": (12_000, 48_500, 64_000, 16_000, 16 * 1024),
         "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
+    legacy_extended_profile = {
+        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
+        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
+    }
     extended_profile = {
         "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
         "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
@@ -1319,7 +1324,7 @@ def _require_subset_canary_call_plan(
     if (max_iterations, len(call_budgets)) == (1, 3):
         expected_profiles = (fast_e2e_profile, author_reasoning_profile)
     elif 2 <= max_iterations <= 8 and len(call_budgets) == 3 * max_iterations:
-        expected_profiles = (extended_profile,)
+        expected_profiles = (legacy_extended_profile, extended_profile)
     else:
         raise ValueError("subset canary iteration profile is unsupported")
     actual_profile = {
