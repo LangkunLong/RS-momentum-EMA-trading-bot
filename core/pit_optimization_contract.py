@@ -218,7 +218,8 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "these keys: hypothesis_id, prediction_vs_observation, causal_explanation, evidence_ids, "
             "disposition, next_direction. All fields except evidence_ids are strings; evidence_ids is "
             "a JSON array of supplied evidence IDs. Copy hypothesis_id and at most four evidence IDs "
-            "verbatim from the supplied aggregates. disposition must be exactly refine, abandon, or "
+            "verbatim from the supplied aggregates. When candidate comparisons are null because local "
+            "validation failed, use [] for evidence_ids. disposition must be exactly refine, abandon, or "
             "change_family. Keep every free-text field to 256 characters. You cannot accept a "
             "candidate and must not request hidden results, credentials, local paths, raw trades, "
             "holdings, or provider audit material."
@@ -2832,7 +2833,9 @@ class CriticArtifact(_V2Canonical):
             "critic prediction versus observation",
         )
         _v2_text(self.causal_explanation, "critic causal explanation")
-        _v2_string_tuple(self.evidence_ids, "critic evidence IDs")
+        _v2_string_tuple(
+            self.evidence_ids, "critic evidence IDs", allow_empty=True
+        )
         if self.disposition not in _CRITIC_DISPOSITIONS:
             raise ValueError("critic disposition is invalid")
         _v2_text(self.next_direction, "critic next direction")
@@ -2875,7 +2878,7 @@ class CriticArtifact(_V2Canonical):
                 value["causal_explanation"], "critic causal explanation"
             ),
             evidence_ids=_v2_response_string_list(
-                value["evidence_ids"], "critic evidence IDs"
+                value["evidence_ids"], "critic evidence IDs", allow_empty=True
             ),
             disposition=disposition,
             next_direction=_v2_response_text(
@@ -3915,11 +3918,14 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                 ),
                 "evidence_ids": _v2_list_schema(
                     max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
-                    min_items=1,
+                    min_items=0,
                     items=_v2_identifier_schema(
                         "An evidence ID copied verbatim from the supplied aggregate evidence."
                     ),
-                    description="Unique aggregate-evidence IDs supporting the critique.",
+                    description=(
+                        "Unique aggregate-evidence IDs supporting the critique; use [] "
+                        "when local validation supplies no candidate comparison."
+                    ),
                 ),
                 "disposition": {
                     "type": "string",
