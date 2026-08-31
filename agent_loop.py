@@ -20001,10 +20001,24 @@ def _build_pit_optimizer_v3_live_run(
                     ),
                     discovery_manifest_sha256=manifest.fold_manifest.sha256,
                 )
-            except ValueError:
+            except ValueError as exc:
+                message = str(exc)
+                failure_code = (
+                    "author_diff_noop"
+                    if "no-op" in message
+                    else (
+                        "author_diff_not_applicable"
+                        if "does not apply" in message
+                        else (
+                            "author_diff_oversize"
+                            if "exceeds max_diff_bytes" in message
+                            else "author_diff_invalid"
+                        )
+                    )
+                )
                 return CandidateValidationOutcome(
                     valid=False,
-                    failure_code="author_diff_invalid",
+                    failure_code=failure_code,
                     incremental_diff=author.unified_diff,
                     cumulative_diff=cumulative_diff or "",
                     identity=None,

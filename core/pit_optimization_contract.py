@@ -178,6 +178,9 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "as failed exploration: do not repeat a one-line threshold adjustment in that family; "
             "choose a materially different causal mechanism, preferably another family, unless "
             "the supplied aggregates directly show an entry-gate bottleneck. "
+            "Treat prior candidate folds identical to baseline as behaviorally inert even when source "
+            "text changed; do not repeat that mechanism. Treat author_diff_not_applicable as a patch "
+            "coordinate/context failure and instruct the author to use the exact current source. "
             "Return exactly one JSON object and nothing else: no markdown, chain-of-thought, "
             "schema_version, or extra keys. It must contain exactly these keys: hypothesis_id, "
             "family, evidence_ids, causal_rationale, "
@@ -208,6 +211,7 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "old-side and context line in unified_diff byte-for-byte from the selected supplied file, "
             "and make every hunk count match its emitted body. Prefer one literal, localized "
             "replacement over reconstructed or remembered context. Do not invent an old line or "
+            "estimate hunk coordinates: derive them from the supplied file and keep context minimal. "
             "quote a prior version of the source. Do not execute code or access hidden data, "
             "credentials, local paths, or unrelated source."
         ),
@@ -3281,6 +3285,7 @@ class IterationFeedbackSummary(_V2Canonical):
     family: str
     author_summary: str
     validation_code: str
+    candidate_folds: tuple[FoldAggregateSummary, ...]
     discovery_score: DiscoveryScore | None
     critic_disposition: str
     critic_next_direction: str
@@ -3293,6 +3298,19 @@ class IterationFeedbackSummary(_V2Canonical):
             raise ValueError("feedback family is invalid")
         _v2_text(self.author_summary, "feedback author summary")
         _v2_identifier(self.validation_code, "feedback validation code")
+        if (
+            type(self.candidate_folds) is not tuple
+            or len(self.candidate_folds) not in {0, 2}
+            or any(
+                not isinstance(item, FoldAggregateSummary)
+                for item in self.candidate_folds
+            )
+        ):
+            raise ValueError("feedback candidate folds are invalid")
+        if self.candidate_folds and tuple(
+            item.fold_id for item in self.candidate_folds
+        ) != ("discovery_1", "discovery_2"):
+            raise ValueError("feedback candidate fold identities are invalid")
         if self.discovery_score is not None and not isinstance(
             self.discovery_score, DiscoveryScore
         ):
@@ -3602,6 +3620,7 @@ def render_worst_iteration_two_role_inputs(
             family="entry",
             author_summary="a" + maximized(count),
             validation_code="valid",
+            candidate_folds=folds,
             discovery_score=None,
             critic_disposition="refine",
             critic_next_direction="next",

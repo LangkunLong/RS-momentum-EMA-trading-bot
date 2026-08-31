@@ -1983,6 +1983,11 @@ def _persist_iteration_decision(
                 else validation.failure_code or "unrankable"
             )
         ),
+        candidate_folds=(
+            ()
+            if discovery is None
+            else tuple(item.aggregate_metrics for item in discovery.folds)
+        ),
         discovery_score=score if rankable else None,
         critic_disposition=critic_payload.disposition,
         critic_next_direction=critic_payload.next_direction,

@@ -741,6 +741,65 @@ def _normalize_author_diff_transport(raw: str) -> str:
     return "".join(normalized)
 
 
+def _reanchor_unique_author_hunks(
+    raw: str,
+    source_texts: Mapping[str, str],
+) -> str:
+    """Correct hunk coordinates only when the exact old body has one source match."""
+
+    lines = raw.splitlines(keepends=True)
+    current_path: str | None = None
+    line_delta = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("--- a/"):
+            current_path = line[len("--- a/") :].removesuffix("\n")
+            line_delta = 0
+            index += 1
+            continue
+        header = _AUTHOR_HUNK_HEADER_RE.fullmatch(line)
+        if header is None or current_path not in source_texts:
+            index += 1
+            continue
+        body_index = index + 1
+        old_body: list[str] = []
+        old_count = 0
+        new_count = 0
+        while body_index < len(lines):
+            body = lines[body_index]
+            if body.startswith(("@@ ", "diff --git ", "--- a/")):
+                break
+            if body.startswith(" "):
+                old_body.append(body[1:])
+                old_count += 1
+                new_count += 1
+            elif body.startswith("-") and not body.startswith("--- "):
+                old_body.append(body[1:])
+                old_count += 1
+            elif body.startswith("+") and not body.startswith("+++ "):
+                new_count += 1
+            elif body != "\\ No newline at end of file\n":
+                return raw
+            body_index += 1
+        source_lines = source_texts[current_path].splitlines(keepends=True)
+        matches = [
+            offset
+            for offset in range(len(source_lines) - len(old_body) + 1)
+            if source_lines[offset : offset + len(old_body)] == old_body
+        ]
+        if old_body and len(matches) == 1:
+            old_start = matches[0] + 1
+            new_start = old_start + line_delta
+            lines[index] = (
+                f"@@ -{old_start},{old_count} +{new_start},{new_count} "
+                f"@@{header.group(5)}\n"
+            )
+        line_delta += new_count - old_count
+        index = body_index
+    return "".join(lines)
+
+
 def validate_candidate_diff(
     *,
     authenticated_base_root: Path,
@@ -780,7 +839,10 @@ def validate_candidate_diff(
     before_bytes = {
         path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
     }
-    candidate_diff = _normalize_author_diff_transport(incremental_diff)
+    candidate_diff = _reanchor_unique_author_hunks(
+        _normalize_author_diff_transport(incremental_diff),
+        before_sources,
+    )
     applied = False
     try:
         # The author contract permits both conventional Git diffs and standard
