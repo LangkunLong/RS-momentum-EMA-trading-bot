@@ -451,10 +451,11 @@ def _symbol_nodes(path: str, source: str) -> dict[str, str]:
     nodes: dict[str, str] = {}
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in _ALLOWED_PUBLIC[path]:
-                nodes[node.name] = ast.dump(node, include_attributes=False)
-            elif not node.name.startswith("_"):
-                nodes[node.name] = ast.dump(node, include_attributes=False)
+            # Private top-level helpers are part of the authenticated policy
+            # implementation even though they are not part of its public API.
+            # Track them so a model can safely refine helper-based strategy
+            # logic without producing an empty candidate identity.
+            nodes[node.name] = ast.dump(node, include_attributes=False)
         elif (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
@@ -646,8 +647,16 @@ def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
         symbol not in allowed
         and not any(
             symbol.startswith(prefix)
-            and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix))
-            is not None
+            and (
+                re.fullmatch(
+                    r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+                or re.fullmatch(
+                    r"_[A-Za-z][A-Za-z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+            )
             for prefix in constant_prefixes
         )
         for symbol in candidate.changed_symbols

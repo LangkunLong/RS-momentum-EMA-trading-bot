@@ -86,11 +86,18 @@ def _require_critic_predecessor_lineage(
         symbol not in author_payload.changed_symbols
         and not any(
             symbol.startswith(prefix)
-            and re.fullmatch(
-                r"[A-Z][A-Z0-9_]*",
-                symbol.removeprefix(prefix),
+            and (
+                re.fullmatch(
+                    r"[A-Z][A-Z0-9_]*",
+                    symbol.removeprefix(prefix),
+                )
+                is not None
+                or re.fullmatch(
+                    r"_[A-Za-z][A-Za-z0-9_]*",
+                    symbol.removeprefix(prefix),
+                )
+                is not None
             )
-            is not None
             for prefix in constant_prefixes
         )
         for symbol in authenticated_author_manifest.changed_symbols

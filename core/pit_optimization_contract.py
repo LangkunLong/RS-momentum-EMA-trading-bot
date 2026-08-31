@@ -586,8 +586,16 @@ def _validate_scoped_paths_symbols(
         and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol) is None
         and not any(
             symbol.startswith(prefix)
-            and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix))
-            is not None
+            and (
+                re.fullmatch(
+                    r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+                or re.fullmatch(
+                    r"_[A-Za-z][A-Za-z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+            )
             for prefix in allowed_constant_prefixes
         )
         for symbol in symbols
