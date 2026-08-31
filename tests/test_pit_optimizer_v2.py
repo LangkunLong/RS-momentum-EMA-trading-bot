@@ -1174,6 +1174,7 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
         family="risk_sizing",
         author_summary="Reduced concentration.",
         validation_code="valid",
+        candidate_folds=(),
         discovery_score=None,
         critic_disposition="refine",
         critic_next_direction="Use a smaller adjustment.",
@@ -1370,9 +1371,9 @@ def _fold_manifest() -> FoldManifest:
 
 def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
     role_caps = {
-        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
-        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
-        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
+        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
+        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
     return tuple(
         contract.PitOptimizerCallBudget(
@@ -1385,7 +1386,6 @@ def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
             max_input_tokens=role_caps[role][2],
             max_output_tokens=role_caps[role][3],
             max_response_bytes=role_caps[role][4],
-            max_usd=role_caps[role][5],
         )
         for iteration in (1, 2)
         for ordinal, role in enumerate(contract.OPTIMIZER_V2_ROLES, start=1)
@@ -1429,13 +1429,12 @@ def _v2_manifest() -> contract.PitOptimizerRunManifest:
         window_id="window_1",
         max_calls=6,
         max_tokens=448_000,
-        max_usd=0.40,
         policy_source_scope_sha256=scope.sha256,
         provider_retries=0,
         apply=False,
     )
     return contract.PitOptimizerRunManifest(
-        schema_version=2,
+        schema_version=3,
         run_id="run_1",
         run_kind="subset_canary",
         model="deepseek/deepseek-r1",
@@ -1498,14 +1497,13 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
         (5, 2, "author"),
         (6, 2, "critic"),
     ]
-    assert sum(item.max_input_tokens for item in manifest.call_budgets) == 416_000
-    assert sum(item.max_output_tokens for item in manifest.call_budgets) == 32_000
+    assert sum(item.max_input_tokens for item in manifest.call_budgets) == 380_000
+    assert sum(item.max_output_tokens for item in manifest.call_budgets) == 68_000
     assert sum(
         item.max_input_tokens + item.max_output_tokens
         for item in manifest.call_budgets
     ) == 448_000
     assert manifest.authorization_requirement.max_tokens == 448_000
-    assert sum(item.max_usd for item in manifest.call_budgets) == pytest.approx(0.40)
     assert manifest.authorization_requirement.apply is False
     assert manifest.authorization_requirement.provider_retries == 0
 
@@ -1552,7 +1550,7 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
                 max_tokens=448_001,
             ),
         )
-    with pytest.raises(ValueError, match="exactly 448000"):
+    with pytest.raises(ValueError, match="exactly 448000|call caps"):
         replace(
             manifest,
             call_budgets=(inflated_output, *manifest.call_budgets[1:]),
@@ -1567,7 +1565,6 @@ _FIRST_CANARY_MUTATIONS = (
     "global_max_iterations",
     "global_max_calls",
     "global_max_tokens",
-    "global_max_usd",
     "call_order",
     *(
         f"{role}_{field}"
@@ -1578,7 +1575,6 @@ _FIRST_CANARY_MUTATIONS = (
             "max_input_tokens",
             "max_output_tokens",
             "max_response_bytes",
-            "max_usd",
         )
     ),
 )
@@ -1602,8 +1598,6 @@ def _mutate_first_canary_primitive(
         authorization["max_calls"] = 7
     elif mutation == "global_max_tokens":
         authorization["max_tokens"] = 448_001
-    elif mutation == "global_max_usd":
-        authorization["max_usd"] = 0.41
     elif mutation == "call_order":
         budgets[0], budgets[1] = budgets[1], budgets[0]
     else:
@@ -1614,7 +1608,6 @@ def _mutate_first_canary_primitive(
             "max_input_tokens",
             "max_output_tokens",
             "max_response_bytes",
-            "max_usd",
         ):
             suffix = f"_{known_field}"
             if mutation.endswith(suffix):
@@ -1625,12 +1618,10 @@ def _mutate_first_canary_primitive(
             index for index, budget in enumerate(budgets) if budget["role"] == role
         ]
         assert len(role_indexes) == 2
-        target = budgets[role_indexes[0]]
+        target = budgets[role_indexes[-1]]
         if field in {"max_input_tokens", "max_output_tokens"}:
             target[field] += 1
-            budgets[role_indexes[1]][field] -= 1
-        elif field == "max_usd":
-            target[field] -= 0.001
+            budgets[role_indexes[0]][field] -= 1
         else:
             target[field] -= 1
     return primitive
@@ -1674,7 +1665,6 @@ def test_direct_canary_rejects_every_first_canary_plan_mutation(
         authorization_requirement_sha256=hashlib.sha256(
             _canonical_file_bytes(authorization)
         ).hexdigest(),
-        max_usd=float(authorization["max_usd"]),
         max_api_calls=int(authorization["max_calls"]),
         max_tokens=int(authorization["max_tokens"]),
         max_iterations=int(primitive["max_iterations"]),
@@ -1832,6 +1822,46 @@ def _builder_fixture(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+    readiness_source_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source_root,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    (source_root / "optimizer-revision.txt").write_bytes(b"later authenticated source\n")
+    for arguments in (
+        ("add", "optimizer-revision.txt"),
+        ("commit", "-m", "later authenticated source"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=source_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    reference_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source_root,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    (source_root / "optimizer-final.txt").write_bytes(b"final authenticated source\n")
+    for arguments in (
+        ("add", "optimizer-final.txt"),
+        ("commit", "-m", "final authenticated source"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=source_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
     source_head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=source_root,
@@ -1895,7 +1925,7 @@ def _builder_fixture(
         "gate": "pit_optimization",
         "phase": "ready",
         "identities": {
-            "source_head": source_head,
+            "source_head": readiness_source_head,
             "source_fingerprint_sha256": source_fingerprint,
             "pit_bundle_sha256": pit_sha256,
             "baseline_manifest_sha256": baseline_sha256,
@@ -1930,7 +1960,7 @@ def _builder_fixture(
     provisional = ParityAttestation(
         schema_version=1,
         reference_artifact_sha256="4" * 64,
-        reference_source_head="1" * 40,
+        reference_source_head=reference_head,
         final_source_head=source_head,
         final_source_fingerprint_sha256=source_fingerprint,
         pit_bundle_sha256=pit_sha256,
@@ -2004,7 +2034,32 @@ def _patch_authenticated_readiness(
         assert isinstance(readiness, dict)
         return readiness, readiness_sha256
 
+    def authenticate_ancestry(
+        *,
+        source_root: Path,
+        reference_head: str,
+        final_head: str,
+    ) -> None:
+        assert Path(source_root).resolve() == Path(inputs["source_root"]).resolve()
+        parity_attestation = inputs["parity_attestation"]
+        assert isinstance(parity_attestation, ParityAttestation)
+        assert (reference_head, final_head) in {
+            (
+                readiness["identities"]["source_head"],
+                parity_attestation.reference_source_head,
+            ),
+            (
+                parity_attestation.reference_source_head,
+                parity_attestation.final_source_head,
+            ),
+        }
+
     monkeypatch.setattr(parity, "_authenticated_readiness", authenticate)
+    monkeypatch.setattr(
+        parity,
+        "_require_later_descendant_source",
+        authenticate_ancestry,
+    )
 
 
 @pytest.fixture
@@ -2022,7 +2077,7 @@ def v2_gate(
         f"{manifest.run_id}.readiness.json"
     )
     readiness = {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest": asdict(manifest),
         "manifest_sha256": manifest.sha256,
         "parity": {},
@@ -2051,7 +2106,6 @@ def v2_gate(
         authorization_window_id=manifest.authorization_requirement.window_id,
         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
         source_transmission_authorized=True,
-        max_usd=0.40,
         max_api_calls=6,
         max_tokens=448_000,
         max_iterations=2,
@@ -2096,7 +2150,6 @@ def _v2_gate_namespace(
         "git_executable": gate.git_executable,
         "docker_executable": gate.docker_executable,
         "sandbox_image": gate.sandbox_image,
-        "max_usd": gate.max_usd,
         "max_api_calls": gate.max_api_calls,
         "max_tokens": gate.max_tokens,
         "max_iterations": gate.max_iterations,
@@ -2132,7 +2185,7 @@ def test_v2_config_rejects_caller_supplied_file_link_before_resolution(
     )
 
     with pytest.raises(agent_loop.ConfigurationError, match="link or reparse point"):
-        agent_loop._build_pit_optimizer_v2_config(
+        agent_loop._build_pit_optimizer_v3_config(
             _v2_gate_namespace(v2_gate, optimizer_manifest=link)
         )
 
@@ -2152,7 +2205,7 @@ def test_v2_config_rejects_linked_directory_ancestor_before_resolution(
     linked_manifest = linked_parent / v2_gate.optimizer_manifest.name
 
     with pytest.raises(agent_loop.ConfigurationError, match="link or reparse point"):
-        agent_loop._build_pit_optimizer_v2_config(
+        agent_loop._build_pit_optimizer_v3_config(
             _v2_gate_namespace(v2_gate, optimizer_manifest=linked_manifest)
         )
 
@@ -2170,7 +2223,7 @@ def test_v2_config_rejects_hard_link_alias_of_authenticated_target(
         pytest.skip(f"hard links are unavailable on this platform: {exc}")
 
     with pytest.raises(agent_loop.ConfigurationError, match="paths overlap"):
-        agent_loop._build_pit_optimizer_v2_config(
+        agent_loop._build_pit_optimizer_v3_config(
             _v2_gate_namespace(
                 v2_gate,
                 verified_parity=alias,
@@ -2208,7 +2261,6 @@ def test_pit_optimizer_v2_config_canary_requires_exact_sealed_authority(
         ({"max_iterations": 1}, "iterations|ceilings"),
         ({"max_api_calls": 7}, "ceilings"),
         ({"max_tokens": 448_001}, "ceilings"),
-        ({"max_usd": 0.41}, "ceilings"),
         ({"apply": True}, "apply"),
     ):
         with pytest.raises(ValueError, match=message):
@@ -2243,13 +2295,12 @@ def test_pit_optimizer_v2_config_builder_derives_prepare_and_requires_canary_ide
         "git_executable": v2_gate.git_executable,
         "docker_executable": v2_gate.docker_executable,
         "sandbox_image": v2_gate.sandbox_image,
-        "max_usd": 0.40,
         "max_api_calls": 6,
         "max_tokens": 448_000,
         "max_iterations": 2,
         "apply": False,
     }
-    prepare = agent_loop._build_pit_optimizer_v2_config(
+    prepare = agent_loop._build_pit_optimizer_v3_config(
         SimpleNamespace(**common)
     )
     assert prepare == replace(
@@ -2261,7 +2312,7 @@ def test_pit_optimizer_v2_config_builder_derives_prepare_and_requires_canary_ide
         source_transmission_authorized=False,
     )
 
-    canary = agent_loop._build_pit_optimizer_v2_config(
+    canary = agent_loop._build_pit_optimizer_v3_config(
         SimpleNamespace(
             **{
                 **common,
@@ -2300,7 +2351,6 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
     )
     assert manifest.authorization_requirement.max_calls == 6
     assert manifest.authorization_requirement.max_tokens == 448_000
-    assert manifest.authorization_requirement.max_usd == pytest.approx(0.40)
     assert manifest.authorization_requirement.apply is False
     assert manifest.authorization_requirement.provider_retries == 0
 
@@ -2583,27 +2633,23 @@ def test_build_subset_manifest_cli_is_exact_and_provider_free(
             "--investigator-static-bytes",
             "8000",
             "--investigator-dynamic-bytes",
-            "80000",
+            "78000",
             "--investigator-input-tokens",
-            "88000",
+            "86000",
             "--investigator-output-tokens",
-            "4000",
+            "16000",
             "--investigator-response-bytes",
             "8192",
-            "--investigator-max-usd",
-            "0.05",
             "--author-static-bytes",
             "12000",
             "--author-dynamic-bytes",
-            "76000",
+            "48500",
             "--author-input-tokens",
-            "88000",
+            "72000",
             "--author-output-tokens",
-            "8000",
+            "14000",
             "--author-response-bytes",
             "16384",
-            "--author-max-usd",
-            "0.10",
             "--critic-static-bytes",
             "8000",
             "--critic-dynamic-bytes",
@@ -2614,8 +2660,6 @@ def test_build_subset_manifest_cli_is_exact_and_provider_free(
             "4000",
             "--critic-response-bytes",
             "8192",
-            "--critic-max-usd",
-            "0.05",
             "--max-files",
             "3",
             "--max-hunks",
@@ -2647,9 +2691,6 @@ def test_build_subset_manifest_cli_is_exact_and_provider_free(
         item["max_input_tokens"] + item["max_output_tokens"]
         for item in manifest_value["call_budgets"]
     ) == 448_000
-    assert sum(item["max_usd"] for item in manifest_value["call_budgets"]) == pytest.approx(
-        0.40
-    )
     assert manifest_value["policy_source_scope"]["editable_paths"] == list(
         contract.PolicySourceScope(
             **{
@@ -2682,7 +2723,6 @@ def test_build_subset_manifest_cli_is_exact_and_provider_free(
     assert emitted["authorization"] == {
         "max_calls": 6,
         "max_tokens": 448_000,
-        "max_usd": 0.40,
     }
 
 
@@ -2745,7 +2785,6 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
         authorization_window_id=None,
         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
         source_transmission_authorized=False,
-        max_usd=0.40,
         max_api_calls=6,
         max_tokens=448_000,
         max_iterations=2,
@@ -2774,7 +2813,7 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
     readiness_path.write_bytes(
         _canonical_file_bytes(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "manifest": asdict(manifest),
                 "manifest_sha256": manifest.sha256,
                 "parity": {},
@@ -4181,7 +4220,6 @@ def test_pit_optimizer_v2_call_preflight_uses_lease_bound_frozen_pricing() -> No
         max_input_tokens=1_000,
         max_output_tokens=1_000,
         max_response_bytes=8_192,
-        max_usd=0.009999,
     )
 
     with pytest.raises(BudgetExceededError, match="per-call USD"):
@@ -4220,7 +4258,6 @@ def test_pit_optimizer_v2_call_preflight_rejects_sections_and_pricing_drift() ->
         max_input_tokens=10,
         max_output_tokens=2,
         max_response_bytes=32,
-        max_usd=0.01,
     )
     lease = AuthorizationRunLease(
         lease_id="lease-v2",
@@ -9912,6 +9949,7 @@ def _task5_feedback(iteration: int) -> contract.IterationFeedbackSummary:
         family="entry",
         author_summary="bounded author summary",
         validation_code="valid",
+        candidate_folds=(),
         discovery_score=None,
         critic_disposition="refine",
         critic_next_direction="bounded next direction",
@@ -10017,7 +10055,6 @@ def test_source_context_fit_measures_complete_canonical_unicode_role_input() -> 
         max_input_tokens=static_bytes + len(rendered),
         max_output_tokens=1,
         max_response_bytes=1,
-        max_usd=0.01,
     )
     assert require_source_context_fit(role_input=role_input, role_budget=exact) == rendered
     too_small = replace(
@@ -10137,7 +10174,6 @@ def test_source_context_fit_preserves_all_feedback_and_enforces_precall_budget(
         max_input_tokens=2,
         max_output_tokens=1,
         max_response_bytes=1,
-        max_usd=0.01,
     )
     with pytest.raises(ValueError, match="context_budget_exhausted"):
         require_source_context_fit(

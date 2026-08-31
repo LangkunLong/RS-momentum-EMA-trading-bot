@@ -1327,18 +1327,19 @@ def _require_subset_canary_call_plan(
         expected_profiles = (legacy_extended_profile, extended_profile)
     else:
         raise ValueError("subset canary iteration profile is unsupported")
-    actual_profile = {
-        budget.role: (
-            budget.max_static_input_bytes,
-            budget.max_dynamic_input_bytes,
-            budget.max_input_tokens,
-            budget.max_output_tokens,
-            budget.max_response_bytes,
+    if any(budget.model != PIT_OPTIMIZER_R1_MODEL for budget in call_budgets) or not any(
+        all(
+            (
+                budget.max_static_input_bytes,
+                budget.max_dynamic_input_bytes,
+                budget.max_input_tokens,
+                budget.max_output_tokens,
+                budget.max_response_bytes,
+            )
+            == profile[budget.role]
+            for budget in call_budgets
         )
-        for budget in call_budgets
-    }
-    if any(budget.model != PIT_OPTIMIZER_R1_MODEL for budget in call_budgets) or (
-        actual_profile not in expected_profiles
+        for profile in expected_profiles
     ):
         raise ValueError("subset canary call caps are invalid")
 
