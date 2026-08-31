@@ -81,8 +81,11 @@ class FoldSpec:
             raise ValueError("fold_id is invalid")
         if self.purpose not in {"discovery", "hidden"}:
             raise ValueError("fold purpose is invalid")
-        if type(self.sessions) is not tuple or len(self.sessions) != 60:
-            raise ValueError("fold must contain exactly 60 sessions")
+        if (
+            type(self.sessions) is not tuple
+            or not 20 <= len(self.sessions) <= 252
+        ):
+            raise ValueError("fold must contain 20 through 252 sessions")
         parsed = tuple(_date(value, "fold session") for value in self.sessions)
         if len(set(parsed)) != len(parsed) or any(left >= right for left, right in pairwise(parsed)):
             raise ValueError("fold sessions must be unique and chronological")
@@ -117,6 +120,8 @@ class FoldManifest:
         folds = (*self.discovery_folds, self.hidden_fold)
         if len({fold.fold_id for fold in folds}) != len(folds):
             raise ValueError("fold IDs must be unique")
+        if len({len(fold.sessions) for fold in folds}) != 1:
+            raise ValueError("folds must contain the same number of sessions")
         seen: set[str] = set()
         for fold in folds:
             overlap = seen.intersection(fold.sessions)

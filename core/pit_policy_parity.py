@@ -512,8 +512,9 @@ def build_fixed_fold_manifest(
     benchmark_sessions: Iterable[str],
     data_identity_sha256: str,
     first_discovery_session: str | None = None,
+    fold_sessions: int = 60,
 ) -> tuple[FoldManifest, tuple[str, ...]]:
-    """Seal three contiguous 60-session folds from the supplied calendar only."""
+    """Seal three equal contiguous folds from the supplied calendar only."""
 
     _require_digest(data_identity_sha256, "fold data identity")
     evaluation = readiness.get("evaluation_contract")
@@ -543,6 +544,8 @@ def build_fixed_fold_manifest(
     calendar = tuple(str(item) for item in benchmark_sessions)
     if len(calendar) != len(set(calendar)) or tuple(sorted(calendar)) != calendar:
         raise ValueError("benchmark sessions are not unique and chronological")
+    if type(fold_sessions) is not int or not 20 <= fold_sessions <= 252:
+        raise ValueError("fold sessions must be an integer from 20 through 252")
 
     selected_start = (
         _DISCOVERY_WINDOWS[0][1]
@@ -556,19 +559,19 @@ def build_fixed_fold_manifest(
     ):
         raise ValueError("first discovery session is not a benchmark session")
     start_index = calendar.index(selected_start)
-    selected_sessions = calendar[start_index : start_index + 180]
-    if len(selected_sessions) != 180:
+    selected_sessions = calendar[start_index : start_index + (3 * fold_sessions)]
+    if len(selected_sessions) != 3 * fold_sessions:
         raise ValueError("benchmark calendar cannot supply three complete folds")
 
     def fold(fold_id: str, purpose: str, offset: int) -> FoldSpec:
-        sessions = selected_sessions[offset : offset + 60]
+        sessions = selected_sessions[offset : offset + fold_sessions]
         return FoldSpec(fold_id, purpose, sessions[0], sessions[-1], sessions)
 
     discoveries = (
         fold("discovery_1", "discovery", 0),
-        fold("discovery_2", "discovery", 60),
+        fold("discovery_2", "discovery", fold_sessions),
     )
-    hidden = fold("hidden_1", "hidden", 120)
+    hidden = fold("hidden_1", "hidden", 2 * fold_sessions)
     universe_sha256 = _digest(list(universe))
     return (
         FoldManifest(
@@ -710,6 +713,7 @@ def capture_from_authenticated_inputs(
     reference_source_fingerprint_sha256: str,
     benchmark_sessions: Iterable[str],
     first_discovery_session: str | None = None,
+    fold_sessions: int = 60,
     output: Path,
     evaluate_discovery_fold: Callable[[FoldSpec, tuple[str, ...], str], ParityFoldEvidence],
     pre_persist_check: Callable[[], None],
@@ -733,6 +737,7 @@ def capture_from_authenticated_inputs(
         benchmark_sessions=benchmark_sessions,
         data_identity_sha256=pit_bundle_sha256,
         first_discovery_session=first_discovery_session,
+        fold_sessions=fold_sessions,
     )
     evidence = tuple(
         evaluate_discovery_fold(fold, universe, manifest.warmup_start_date) for fold in manifest.discovery_folds
@@ -1075,6 +1080,7 @@ def capture_parity_reference(
     output: Path,
     source_root: Path | None = None,
     first_discovery_session: str | None = None,
+    fold_sessions: int = 60,
 ) -> ParityReference:
     """Authenticate local inputs and capture the inline-policy discovery reference."""
 
@@ -1129,6 +1135,7 @@ def capture_parity_reference(
             reference_source_fingerprint_sha256=source_fingerprint,
             benchmark_sessions=calendar,
             first_discovery_session=first_discovery_session,
+            fold_sessions=fold_sessions,
             output=Path(output),
             evaluate_discovery_fold=evaluate,
             pre_persist_check=lambda: _require_unchanged_source(
@@ -1208,6 +1215,7 @@ def _parser() -> argparse.ArgumentParser:
     capture.add_argument("--pit-bundle", required=True, type=Path)
     capture.add_argument("--output", required=True, type=Path)
     capture.add_argument("--first-discovery-session")
+    capture.add_argument("--fold-sessions", type=int, default=60)
     verify = commands.add_parser("verify")
     verify.add_argument("--reference", required=True, type=Path)
     verify.add_argument("--pit-bundle", required=True, type=Path)
@@ -1223,6 +1231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pit_bundle_path=args.pit_bundle,
             output=args.output,
             first_discovery_session=args.first_discovery_session,
+            fold_sessions=args.fold_sessions,
         )
         folds = ",".join(
             f"{fold.fold_id}:{fold.start_date}..{fold.end_date}" for fold in reference.fold_manifest.discovery_folds
