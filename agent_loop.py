@@ -20090,7 +20090,11 @@ def _build_pit_optimizer_v3_live_run(
                     )
                     for fold in manifest.fold_manifest.discovery_folds
                 )
-            except PolicyWorkerOperationalFailure as exc:
+            except (PolicyWorkerOperationalFailure, ValueError) as exc:
+                # A model-authored policy may satisfy static source checks but
+                # return an invalid runtime decision (for example, a negative or
+                # oversized stop distance).  That is candidate feedback, not a
+                # controller/sandbox failure, so keep the optimizer loop alive.
                 raise CandidateEvaluationFailure("worker_failed") from exc
             for item in evidence:
                 evidence_sha256s[(candidate_identity_sha256, item.fold_id)] = (
@@ -20115,11 +20119,15 @@ def _build_pit_optimizer_v3_live_run(
                     original_baseline_sha256=incumbent_sha256,
                     expected_original_baseline_sha256=incumbent_sha256,
                 )
-                current_score = discovery_score_from_folds(
-                    incumbent,
-                    baseline,
-                    original_baseline_sha256=baseline_sha256,
-                    expected_original_baseline_sha256=baseline_sha256,
+                current_score = (
+                    _unrankable_discovery_score()
+                    if any(item.closed_trades < 1 for item in incumbent)
+                    else discovery_score_from_folds(
+                        incumbent,
+                        baseline,
+                        original_baseline_sha256=baseline_sha256,
+                        expected_original_baseline_sha256=baseline_sha256,
+                    )
                 )
                 improves = strictly_improves_discovery(fixed_score, current_score)
             else:

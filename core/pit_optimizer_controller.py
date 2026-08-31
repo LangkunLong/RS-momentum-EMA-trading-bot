@@ -51,6 +51,7 @@ from core.pit_optimizer_evaluation import (
     AggregateMetric,
     DeterminismAttestation,
     DiscoveryEvaluation,
+    DiscoveryScore,
     FoldAggregateSummary,
     HiddenEvaluation,
     HiddenEvaluationAttestation,
@@ -1558,6 +1559,16 @@ def _score_primitive(score: object) -> dict[str, object]:
     }
 
 
+def _unrankable_incumbent_score() -> DiscoveryScore:
+    """Return the neutral starting objective for a zero-trade baseline."""
+
+    return DiscoveryScore(
+        median_excess_return_pp=Decimal("0.00"),
+        worst_excess_return_pp=Decimal("0.00"),
+        max_drawdown_magnitude_pp=Decimal("0.00"),
+    )
+
+
 def _evaluate_iteration_candidate(
     readiness: PitOptimizerReadiness,
     state: _RunState,
@@ -1657,11 +1668,15 @@ def _evaluate_iteration_candidate(
         )
         incumbent_score = state.incumbent_discovery.score
         if incumbent_score is None:
-            incumbent_score = discovery_score_from_folds(
-                baseline_folds,
-                baseline_folds,
-                original_baseline_sha256=baseline_sha256,
-                expected_original_baseline_sha256=baseline_sha256,
+            incumbent_score = (
+                _unrankable_incumbent_score()
+                if any(item.closed_trades < 1 for item in incumbent_folds)
+                else discovery_score_from_folds(
+                    baseline_folds,
+                    baseline_folds,
+                    original_baseline_sha256=baseline_sha256,
+                    expected_original_baseline_sha256=baseline_sha256,
+                )
             )
     except ValueError as exc:
         raise EvidenceTampering("discovery fixed-baseline objective is invalid") from exc

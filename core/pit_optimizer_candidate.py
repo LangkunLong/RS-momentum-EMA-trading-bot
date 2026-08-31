@@ -682,6 +682,25 @@ def _normalize_author_diff_transport(raw: str) -> str:
     if "\r" in candidate or "\x00" in candidate:
         return candidate
     lines = candidate.splitlines(keepends=True)
+    # Some model responses use the standard repo-relative ``--- path`` / ``+++ path``
+    # form instead of Git's ``a/`` / ``b/`` prefixes.  Canonicalize only an exact,
+    # matched pair for one of the sealed editable files.  The strict parser, Git,
+    # AST, scope, and bounds checks below remain authoritative.
+    for header_index in range(len(lines) - 1):
+        old_header = lines[header_index]
+        new_header = lines[header_index + 1]
+        if not old_header.startswith("--- ") or not new_header.startswith("+++ "):
+            continue
+        old_path = old_header[4:].removesuffix("\n")
+        new_path = new_header[4:].removesuffix("\n")
+        if (
+            old_path == new_path
+            and old_path in EDITABLE_POLICY_PATHS
+            and not old_path.startswith("a/")
+            and not new_path.startswith("b/")
+        ):
+            lines[header_index] = f"--- a/{old_path}\n"
+            lines[header_index + 1] = f"+++ b/{new_path}\n"
     normalized: list[str] = []
     index = 0
     while index < len(lines):
