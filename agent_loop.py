@@ -20003,6 +20003,16 @@ def _build_pit_optimizer_v3_live_run(
                 )
             except ValueError as exc:
                 message = str(exc)
+                purity_failure = message.startswith("policy ") and any(
+                    marker in message
+                    for marker in (
+                        "forbidden",
+                        "outside the allowlist",
+                        "must be constants",
+                        "must be immutable",
+                        "public symbols differ",
+                    )
+                )
                 failure_code = (
                     "author_diff_noop"
                     if "no-op" in message
@@ -20010,9 +20020,26 @@ def _build_pit_optimizer_v3_live_run(
                         "author_diff_not_applicable"
                         if "does not apply" in message
                         else (
-                            "author_diff_oversize"
-                            if "exceeds max_diff_bytes" in message
-                            else "author_diff_invalid"
+                            "syntax_failed"
+                            if message
+                            in {
+                                "policy AST syntax is invalid",
+                                "policy source syntax is invalid",
+                            }
+                            else (
+                                "imports_failed"
+                                if "policy import is outside" in message
+                                or "policy contract import is outside" in message
+                                else (
+                                    "purity_failed"
+                                    if purity_failure
+                                    else (
+                                        "author_diff_oversize"
+                                        if "exceeds max_diff_bytes" in message
+                                        else "author_diff_invalid"
+                                    )
+                                )
+                            )
                         )
                     )
                 )
