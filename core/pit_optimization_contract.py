@@ -87,7 +87,6 @@ MAX_ITERATION_HISTORY_BYTES = 32 * 1024
 MAX_INVESTIGATOR_DYNAMIC_BYTES = 80_000
 MAX_AUTHOR_DYNAMIC_BYTES = 76_000
 MAX_CRITIC_DYNAMIC_BYTES = 24_000
-MAX_CANDIDATE_COMPARISON_BYTES = 3 * 1024
 
 _DISALLOWED_TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
@@ -3237,8 +3236,6 @@ class CandidateComparisonSummary(_V2Canonical):
         ids = tuple(item.metric_id for item in self.diagnostics)
         if len(ids) != len(set(ids)):
             raise ValueError("candidate comparison diagnostic IDs must be unique")
-        if len(self.canonical_json_bytes()) > MAX_CANDIDATE_COMPARISON_BYTES:
-            raise ValueError("candidate comparison exceeds its byte cap")
 
 
 def candidate_comparison_from_fixed_baseline(
@@ -3694,7 +3691,7 @@ def render_worst_iteration_two_role_inputs(
             diagnostics=(AggregateMetric("d" + maximized(count), 1),),
             _controller_seal=_CANDIDATE_COMPARISON_SEAL,
         ),
-        MAX_CANDIDATE_COMPARISON_BYTES,
+        MAX_DISCOVERY_EVIDENCE_BYTES,
     )
     validation = _successful_candidate_validation()
     dynamic_values = {
