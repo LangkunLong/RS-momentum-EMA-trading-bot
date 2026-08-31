@@ -1,12 +1,12 @@
 # Adaptive O'Neil Optimizer Core-Strategy Design
 
 **Date:** 2026-08-31
-**Status:** Architecture approved in chat; written specification ready for user review
+**Status:** Approved for implementation
 
 ## Objective
 
 Build a durable model-driven feedback loop that improves one adaptive O'Neil/CAN SLIM trading
-strategy. The first readiness milestone is an absolute **10% annualized portfolio return** on an
+strategy. The first readiness milestone is an absolute **10% annualized portfolio return** on a
 disjoint retrospective constituent panel. The same architecture must support later search
 campaigns aimed at 20% and 50% annualized return without another redesign.
 
