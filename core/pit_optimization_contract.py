@@ -1311,7 +1311,10 @@ def _require_subset_canary_call_plan(
     extended_profile = {
         "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
         "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
-        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
+        # Reserve the same reasoning headroom for the critic. OpenRouter's
+        # completion usage includes DeepSeek R1's hidden reasoning tokens even
+        # when the visible, schema-bound critic artifact remains small.
+        "critic": (8_000, 24_000, 32_000, 16_000, 8 * 1024),
     }
     if (max_iterations, len(call_budgets)) == (1, 3):
         expected_profiles = (fast_e2e_profile, author_reasoning_profile)
