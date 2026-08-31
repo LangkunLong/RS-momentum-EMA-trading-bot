@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -19,6 +20,8 @@ from core.pit_optimizer_holdout import HoldoutProgressJournal, load_discovery_wi
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES = 32 * 1024 * 1024
+_POLICY_WORKER_BASE_FOLD_SESSIONS = 60
 
 
 class HoldoutPreflightError(RuntimeError):
@@ -248,12 +251,21 @@ def _build_hidden_evaluator(
         controller_root=controller_root,
         permanent_runtime_root=permanent_runtime_root,
     )
+    hidden_fold_sessions = len(manifest.fold_manifest.hidden_fold.sessions)
+    fold_scale = max(
+        1,
+        math.ceil(hidden_fold_sessions / _POLICY_WORKER_BASE_FOLD_SESSIONS),
+    )
+    session_output_limit_bytes = min(
+        _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES,
+        output_limit_bytes * fold_scale,
+    )
     runner = PolicyWorkerRunner(
         image=manifest.sandbox_image,
         engine=docker,
         temp_parent=controller_root,
         fold_timeout_seconds=child_timeout_seconds,
-        output_limit_bytes=output_limit_bytes,
+        output_limit_bytes=session_output_limit_bytes,
         wall_deadline=wall_deadline,
     )
     worker_sequence = 0
