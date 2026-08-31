@@ -3684,14 +3684,11 @@ def render_worst_iteration_two_role_inputs(
         original_baseline_sha256=synthetic_baseline_sha256,
         expected_original_baseline_sha256=synthetic_baseline_sha256,
     )
-    comparison = maximize_contract(
-        lambda count: CandidateComparisonSummary(
-            folds=folds,
-            score=comparison_score,
-            diagnostics=(AggregateMetric("d" + maximized(count), 1),),
-            _controller_seal=_CANDIDATE_COMPARISON_SEAL,
-        ),
-        MAX_DISCOVERY_EVIDENCE_BYTES,
+    comparison = CandidateComparisonSummary(
+        folds=folds,
+        score=comparison_score,
+        diagnostics=(),
+        _controller_seal=_CANDIDATE_COMPARISON_SEAL,
     )
     validation = _successful_candidate_validation()
     dynamic_values = {
