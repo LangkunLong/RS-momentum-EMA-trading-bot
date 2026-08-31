@@ -322,7 +322,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                 and len(descendant.targets) == 1
                 and isinstance(descendant.targets[0], ast.Name)
                 and (
-                    isinstance(descendant.value, ast.List)
+                    isinstance(descendant.value, (ast.List, ast.ListComp))
                     or (
                         isinstance(descendant.value, ast.Call)
                         and isinstance(descendant.value.func, ast.Name)
@@ -336,7 +336,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                 isinstance(descendant, ast.AnnAssign)
                 and isinstance(descendant.target, ast.Name)
                 and (
-                    isinstance(descendant.value, ast.List)
+                    isinstance(descendant.value, (ast.List, ast.ListComp))
                     or (
                         isinstance(descendant.value, ast.Call)
                         and isinstance(descendant.value.func, ast.Name)
