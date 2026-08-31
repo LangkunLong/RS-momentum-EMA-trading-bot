@@ -1285,7 +1285,7 @@ def _require_subset_canary_call_plan(
     }
     if (max_iterations, len(call_budgets)) == (1, 3):
         expected_profiles = (fast_e2e_profile, author_reasoning_profile)
-    elif (max_iterations, len(call_budgets)) == (2, 6):
+    elif 2 <= max_iterations <= 8 and len(call_budgets) == 3 * max_iterations:
         expected_profiles = (extended_profile,)
     else:
         raise ValueError("subset canary iteration profile is unsupported")
