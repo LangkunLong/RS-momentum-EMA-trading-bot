@@ -19556,6 +19556,7 @@ def _build_pit_optimizer_v3_live_run(
         CandidateEvaluationFailure,
         CandidateValidationOutcome,
         PitOptimizerServices,
+        ProviderCallNotStarted,
         _CandidateCapabilityRegistry,
         _folds_digest,
         _window_identity,
@@ -20331,11 +20332,16 @@ def _build_pit_optimizer_v3_live_run(
                 predecessors = tuple(completed_role_calls[-1:])
             else:
                 predecessors = tuple(completed_role_calls[-2:])
-            authorization.bind_controller_role_input(
-                role_input,
-                plan,
-                predecessor_calls=predecessors,
-            )
+            try:
+                authorization.bind_controller_role_input(
+                    role_input,
+                    plan,
+                    predecessor_calls=predecessors,
+                )
+            except Exception as exc:
+                raise ProviderCallNotStarted(
+                    "provider role input was rejected before reservation"
+                ) from exc
             call = gateway.request_pit_optimizer_once(
                 plan.role,
                 role_input,

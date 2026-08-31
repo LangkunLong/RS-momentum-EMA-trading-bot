@@ -401,6 +401,10 @@ class ProviderProtocolFailure(RuntimeError):
     pass
 
 
+class ProviderCallNotStarted(RuntimeError):
+    """A locally rejected role input that never reached provider reservation."""
+
+
 class ProviderAccountingFailure(RuntimeError):
     pass
 
@@ -1206,6 +1210,10 @@ def _call_role(
             state.authorization_lease,
             state.pricing_snapshot,
         )
+    except ProviderCallNotStarted as exc:
+        raise ProviderProtocolFailure(
+            "provider role input failed local provenance validation"
+        ) from exc
     except BaseException:
         facts = services.recover_role_attempt(plan, state.authorization_lease)
         _record_provider_attempt(

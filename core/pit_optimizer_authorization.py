@@ -24,6 +24,7 @@ from core.pit_optimization_contract import (
     AuthorizationRequirement,
     AuthorArtifact,
     AuthorInput,
+    AuthorManifestSummary,
     CriticArtifact,
     CriticInput,
     InvestigatorArtifact,
@@ -54,6 +55,62 @@ _GATEWAY_TERMINAL_RECOVERY_SEAL = object()
 
 class AuthorizationError(RuntimeError):
     """Raised when explicit optimizer authority is absent or inconsistent."""
+
+
+def _require_critic_predecessor_lineage(
+    primitive: Mapping[str, object],
+    investigator_payload: InvestigatorArtifact,
+    author_payload: AuthorArtifact,
+) -> None:
+    """Bind critic provenance while permitting authenticated scope refinement."""
+
+    supplied_author_manifest = primitive.get("author_manifest")
+    try:
+        if not isinstance(supplied_author_manifest, dict):
+            raise TypeError("author manifest is not a mapping")
+        authenticated_author_manifest = AuthorManifestSummary(
+            hypothesis_id=supplied_author_manifest["hypothesis_id"],
+            behavioral_summary=supplied_author_manifest["behavioral_summary"],
+            changed_paths=tuple(supplied_author_manifest["changed_paths"]),
+            changed_symbols=tuple(supplied_author_manifest["changed_symbols"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuthorizationError(
+            "optimizer critic author manifest is invalid"
+        ) from exc
+    constant_prefixes = tuple(
+        f"{path.removesuffix('.py').replace('/', '.')}."
+        for path in authenticated_author_manifest.changed_paths
+    )
+    symbol_outside_author_scope = any(
+        symbol not in author_payload.changed_symbols
+        and not any(
+            symbol.startswith(prefix)
+            and re.fullmatch(
+                r"[A-Z][A-Z0-9_]*",
+                symbol.removeprefix(prefix),
+            )
+            is not None
+            for prefix in constant_prefixes
+        )
+        for symbol in authenticated_author_manifest.changed_symbols
+    )
+    if (
+        primitive.get("investigator_summary")
+        != investigator_payload.to_primitive()
+        or authenticated_author_manifest.hypothesis_id
+        != author_payload.hypothesis_id
+        or authenticated_author_manifest.behavioral_summary
+        != author_payload.behavioral_summary
+        or any(
+            path not in author_payload.changed_paths
+            for path in authenticated_author_manifest.changed_paths
+        )
+        or symbol_outside_author_scope
+    ):
+        raise AuthorizationError(
+            "optimizer role input predecessor artifact differs"
+        )
 
 
 def _require_id(value: object, label: str) -> str:
@@ -1395,20 +1452,11 @@ class AuthorizationLedger:
             investigator_call, author_call = predecessor_calls
             author_payload = author_call.payload
             assert isinstance(author_payload, AuthorArtifact)
-            expected_author_manifest = {
-                "hypothesis_id": author_payload.hypothesis_id,
-                "behavioral_summary": author_payload.behavioral_summary,
-                "changed_paths": list(author_payload.changed_paths),
-                "changed_symbols": list(author_payload.changed_symbols),
-            }
-            if (
-                primitive.get("investigator_summary")
-                != investigator_call.payload.to_primitive()
-                or primitive.get("author_manifest") != expected_author_manifest
-            ):
-                raise AuthorizationError(
-                    "optimizer role input predecessor artifact differs"
-                )
+            _require_critic_predecessor_lineage(
+                primitive,
+                investigator_call.payload,
+                author_payload,
+            )
         with self._role_input_lock:
             if canonical_plan.call_index in self._consumed_role_input_plans:
                 raise AuthorizationError("optimizer role input plan was already consumed")
