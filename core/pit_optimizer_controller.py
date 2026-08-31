@@ -1614,7 +1614,7 @@ def _evaluate_iteration_candidate(
     ):
         raise IdentityDrift("discovery evaluation identity differs")
     candidate_folds = tuple(item.aggregate_metrics for item in supplied.folds)
-    if any(item.closed_trades < 1 for item in candidate_folds):
+    if sum(item.closed_trades for item in candidate_folds) < 1:
         if (
             supplied.comparison.rankable
             or supplied.comparison.strictly_improves_incumbent
@@ -1670,7 +1670,7 @@ def _evaluate_iteration_candidate(
         if incumbent_score is None:
             incumbent_score = (
                 _unrankable_incumbent_score()
-                if any(item.closed_trades < 1 for item in incumbent_folds)
+                if sum(item.closed_trades for item in incumbent_folds) < 1
                 else discovery_score_from_folds(
                     baseline_folds,
                     baseline_folds,
