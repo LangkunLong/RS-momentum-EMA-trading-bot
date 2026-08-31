@@ -57,7 +57,7 @@ def load_discovery_winner_evidence(
     expected_summary_sha256: str,
     expected_role_calls: int,
 ) -> DiscoveryWinnerEvidence:
-    """Load only a completed, local discovery winner and its authenticated inert diff."""
+    """Load a closed or safely recoverable local discovery winner."""
 
     artifact_root = Path(root)
     if (
@@ -80,12 +80,34 @@ def load_discovery_winner_evidence(
     cleanup = summary.get("cleanup")
     incumbent = summary.get("incumbent")
     discovery = summary.get("discovery_outcome")
+    iterations = summary.get("iterations")
+    closed_canary = (
+        summary.get("status") == "loop_verified_no_long_replay_candidate"
+        and terminal == {"code": "iteration_limit", "detail": None, "exit_code": 0}
+        and isinstance(accounting, dict)
+        and accounting.get("api_calls") == expected_role_calls
+    )
+    recoverable_winner = (
+        summary.get("status") == "aborted"
+        and terminal
+        == {"code": "provider_protocol_failure", "detail": None, "exit_code": 1}
+        and isinstance(accounting, dict)
+        and type(accounting.get("api_calls")) is int
+        and 3 <= accounting["api_calls"] <= expected_role_calls
+        and isinstance(iterations, dict)
+        and type(iterations.get("started")) is int
+        and type(iterations.get("completed")) is int
+        and type(iterations.get("valid_evaluations")) is int
+        and type(iterations.get("incumbent_updates")) is int
+        and iterations["started"] > iterations["completed"] >= 1
+        and iterations["valid_evaluations"] >= 1
+        and iterations["incumbent_updates"] >= 1
+    )
     if (
         summary.get("schema_version") != 3
         or summary.get("phase") != "run"
-        or summary.get("status") != "loop_verified_no_long_replay_candidate"
         or not isinstance(terminal, dict)
-        or terminal != {"code": "iteration_limit", "detail": None, "exit_code": 0}
+        or not (closed_canary or recoverable_winner)
         or not isinstance(hidden, dict)
         or hidden != {
             "opened": False,
@@ -93,7 +115,6 @@ def load_discovery_winner_evidence(
             "long_replay_eligible": None,
         }
         or not isinstance(accounting, dict)
-        or accounting.get("api_calls") != expected_role_calls
         or accounting.get("retained_reservation_tokens") != 0
         or accounting.get("incomplete_accounting_calls") != 0
         or accounting.get("accounting_complete") is not True
