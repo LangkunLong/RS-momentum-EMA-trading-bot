@@ -2952,6 +2952,7 @@ def _usage_from_response(
     *,
     require_complete: bool = False,
     allow_missing_cost: bool = False,
+    tolerate_optional_token_details: bool = False,
 ) -> Usage:
     usage = _read_field(response, "usage")
     if usage is None:
@@ -2966,16 +2967,22 @@ def _usage_from_response(
     total_tokens = _usage_int(usage, "total_tokens")
     prompt_details = _present_field(usage, "prompt_tokens_details")
     completion_details = _present_field(usage, "completion_tokens_details")
-    cached_tokens = (
-        None
-        if prompt_details is _MISSING_FIELD or prompt_details is None
-        else _usage_int(prompt_details, "cached_tokens")
-    )
-    reasoning_tokens = (
-        None
-        if completion_details is _MISSING_FIELD or completion_details is None
-        else _usage_int(completion_details, "reasoning_tokens")
-    )
+    try:
+        cached_tokens = (
+            None
+            if prompt_details is _MISSING_FIELD or prompt_details is None
+            else _usage_int(prompt_details, "cached_tokens")
+        )
+        reasoning_tokens = (
+            None
+            if completion_details is _MISSING_FIELD or completion_details is None
+            else _usage_int(completion_details, "reasoning_tokens")
+        )
+    except AccountingValidationError:
+        if not tolerate_optional_token_details:
+            raise
+        cached_tokens = None
+        reasoning_tokens = None
     usage_cost = _usage_cost(_present_field(usage, "cost"), "usage")
     response_cost = _usage_cost(_present_field(response, "cost"), "response")
     if usage_cost is not None and response_cost is not None and usage_cost != response_cost:
@@ -3011,19 +3018,25 @@ def _usage_from_response(
         and prompt_tokens is not None
         and cached_tokens > prompt_tokens
     ):
-        raise AccountingValidationError(
-            "cached_tokens cannot exceed prompt_tokens",
-            code=AccountingFailureCode.INLINE_CACHED_EXCEEDS_PROMPT,
-        )
+        if tolerate_optional_token_details:
+            cached_tokens = None
+        else:
+            raise AccountingValidationError(
+                "cached_tokens cannot exceed prompt_tokens",
+                code=AccountingFailureCode.INLINE_CACHED_EXCEEDS_PROMPT,
+            )
     if (
         reasoning_tokens is not None
         and completion_tokens is not None
         and reasoning_tokens > completion_tokens
     ):
-        raise AccountingValidationError(
-            "reasoning_tokens cannot exceed completion_tokens",
-            code=AccountingFailureCode.INLINE_REASONING_EXCEEDS_COMPLETION,
-        )
+        if tolerate_optional_token_details:
+            reasoning_tokens = None
+        else:
+            raise AccountingValidationError(
+                "reasoning_tokens cannot exceed completion_tokens",
+                code=AccountingFailureCode.INLINE_REASONING_EXCEEDS_COMPLETION,
+            )
     try:
         return Usage(
             prompt_tokens=prompt_tokens,
@@ -3157,6 +3170,7 @@ def _usage_from_generation_record(
     *,
     generation_id: str,
     allow_missing_cost: bool = False,
+    tolerate_optional_token_details: bool = False,
 ) -> Usage:
     """Validate one complete authoritative record from OpenRouter's generation endpoint."""
     if not isinstance(payload, Mapping):
@@ -3210,32 +3224,46 @@ def _usage_from_generation_record(
         cached_tokens = _usage_int(data, "native_tokens_cached")
         reasoning_tokens = _usage_int(data, "native_tokens_reasoning")
     except AccountingValidationError as exc:
-        raise AccountingValidationError(
-            "generation optional token accounting is invalid",
-            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-            recovery_usage_diagnostic=(
-                RecoveryUsageDiagnosticCode.OPTIONAL_TOKEN_INVALID
-            ),
-        ) from exc
+        if tolerate_optional_token_details:
+            cached_tokens = None
+            reasoning_tokens = None
+        else:
+            raise AccountingValidationError(
+                "generation optional token accounting is invalid",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=(
+                    RecoveryUsageDiagnosticCode.OPTIONAL_TOKEN_INVALID
+                ),
+            ) from exc
     if token_basis is _GenerationTokenBasis.NORMALIZED:
         cached_tokens = None
         reasoning_tokens = None
     elif cached_tokens is not None and cached_tokens > prompt_tokens:
-        raise AccountingValidationError(
-            "generation cached token accounting is inconsistent",
-            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-            recovery_usage_diagnostic=(
-                RecoveryUsageDiagnosticCode.CACHED_EXCEEDS_PROMPT
-            ),
-        )
-    elif reasoning_tokens is not None and reasoning_tokens > completion_tokens:
-        raise AccountingValidationError(
-            "generation reasoning token accounting is inconsistent",
-            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-            recovery_usage_diagnostic=(
-                RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
-            ),
-        )
+        if tolerate_optional_token_details:
+            cached_tokens = None
+        else:
+            raise AccountingValidationError(
+                "generation cached token accounting is inconsistent",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=(
+                    RecoveryUsageDiagnosticCode.CACHED_EXCEEDS_PROMPT
+                ),
+            )
+    if (
+        token_basis is _GenerationTokenBasis.NATIVE
+        and reasoning_tokens is not None
+        and reasoning_tokens > completion_tokens
+    ):
+        if tolerate_optional_token_details:
+            reasoning_tokens = None
+        else:
+            raise AccountingValidationError(
+                "generation reasoning token accounting is inconsistent",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=(
+                    RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
+                ),
+            )
     return Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -4951,6 +4979,7 @@ class OpenRouterGateway:
                     response,
                     require_complete=True,
                     allow_missing_cost=True,
+                    tolerate_optional_token_details=True,
                 )
                 usage = _complete_pit_optimizer_usage_with_frozen_pricing(
                     usage,
@@ -5611,6 +5640,7 @@ class OpenRouterGateway:
                 payload,
                 generation_id=generation_id,
                 allow_missing_cost=True,
+                tolerate_optional_token_details=True,
             )
             usage = _complete_pit_optimizer_usage_with_frozen_pricing(
                 usage,
