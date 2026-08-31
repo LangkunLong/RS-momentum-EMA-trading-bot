@@ -398,6 +398,8 @@ def _write_summary(
     candidate_removed: bool,
     source_modified: bool,
     controller_resources_removed: bool,
+    failure_stage: str | None,
+    failure_kind: str | None,
 ) -> None:
     store.write_json_artifact(
         "summary.json",
@@ -419,8 +421,40 @@ def _write_summary(
                 "source_modified": source_modified,
                 "controller_resources_removed": controller_resources_removed,
             },
+            "failure": (
+                None
+                if status != "aborted"
+                else {"stage": failure_stage, "kind": failure_kind}
+            ),
         },
     )
+
+
+def _holdout_failure_kind(error: BaseException) -> str:
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, HoldoutPreflightError):
+        return "preflight"
+    names = {
+        "AuditFailure": "audit",
+        "EvidenceTampering": "integrity",
+        "IdentityDrift": "identity",
+        "SandboxError": "sandbox",
+        "SandboxIntegrityFailure": "sandbox",
+    }
+    return names.get(type(error).__name__, "runtime")
+
+
+def _holdout_failure_stage(journal: HoldoutProgressJournal | None) -> str:
+    if journal is None:
+        return "preflight"
+    try:
+        state = journal.read().get("state")
+    except BaseException:
+        return "preflight"
+    if state in {"preflight", "baseline_replay", "candidate_replay", "finalizing"}:
+        return str(state)
+    return "preflight"
 
 
 def _validate_limits(namespace: argparse.Namespace) -> None:
@@ -478,6 +512,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     status = "aborted"
     terminal = "preflight_failed"
+    failure_stage: str | None = None
+    failure_kind: str | None = None
     failure = False
     try:
         _validate_limits(namespace)
@@ -628,9 +664,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             status = "holdout_completed"
             terminal = "holdout_completed"
-    except BaseException:
+    except BaseException as exc:
         failure = True
         status = "aborted"
+        failure_stage = _holdout_failure_stage(journal)
+        failure_kind = _holdout_failure_kind(exc)
         if _hidden_validation_was_opened(state):
             hidden["opened"] = True
         terminal = "hidden_validation_failed" if hidden["opened"] else "preflight_failed"
@@ -662,6 +700,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             status = "aborted"
             terminal = "cleanup_failed"
+            failure_stage = "finalizing"
+            failure_kind = "cleanup"
             failure = True
         if store is not None:
             try:
@@ -674,6 +714,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     candidate_removed=candidate_removed,
                     source_modified=source_modified,
                     controller_resources_removed=controller_resources_removed,
+                    failure_stage=failure_stage,
+                    failure_kind=failure_kind,
                 )
             except BaseException:
                 status = "aborted"
