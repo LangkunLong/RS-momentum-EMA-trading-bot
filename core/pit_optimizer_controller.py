@@ -727,6 +727,18 @@ def _provider_seed_from_baseline(
                 "Attested discovery entry metrics: " + ", ".join(entry_ids) + ".",
             ),
             RuleSummaryRecord(
+                "attested.entry_blockers",
+                "technical_block_* counts are precomputed technical gates; entry_block_* counts are final policy blockers.",
+            ),
+            RuleSummaryRecord(
+                "attested.entry_intersection",
+                "A buy requires every retained blocker to clear; relax blockers selectively from raw EntrySnapshot facts.",
+            ),
+            RuleSummaryRecord(
+                "attested.market_gate",
+                "When market_pass equals evaluated_rows, market permission is not the entry bottleneck.",
+            ),
+            RuleSummaryRecord(
                 "attested.exit_attribution",
                 "Attested discovery exit metrics: " + ", ".join(exit_ids) + ".",
             ),
