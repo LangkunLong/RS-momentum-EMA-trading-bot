@@ -1759,8 +1759,47 @@ def _validation_summary(
     return CandidateValidationSummary(code, *_VALIDATION_FAILURE_FLAGS[code])
 
 
+_FEEDBACK_FUNNEL_IDS = frozenset(
+    {
+        "evaluated_rows",
+        "buy_signal_count",
+        "market_pass",
+        "breakout_pass",
+        "volume_surge_pass",
+        "buy_zone_pass",
+        "technical_score_pass",
+    }
+)
+
+
+def _bounded_feedback_folds(
+    candidate_folds: tuple[FoldAggregateSummary, ...],
+    comparison_folds: tuple[FoldAggregateSummary, ...],
+) -> tuple[FoldAggregateSummary, ...]:
+    """Keep core funnel stages plus every metric changed by the candidate."""
+
+    bounded: list[FoldAggregateSummary] = []
+    for candidate, comparison in zip(
+        candidate_folds,
+        comparison_folds,
+        strict=True,
+    ):
+        comparison_metrics = {
+            metric.metric_id: metric.value for metric in comparison.entry_funnel
+        }
+        selected = tuple(
+            metric
+            for metric in candidate.entry_funnel
+            if metric.metric_id in _FEEDBACK_FUNNEL_IDS
+            or comparison_metrics.get(metric.metric_id) != metric.value
+        )
+        bounded.append(replace(candidate, entry_funnel=selected))
+    return tuple(bounded)
+
+
 def _critic_comparison(
     discovery: DiscoveryEvaluation,
+    comparison_folds: tuple[FoldAggregateSummary, ...],
     *,
     fixed: bool,
 ) -> CandidateComparisonSummary:
@@ -1770,7 +1809,10 @@ def _critic_comparison(
         else discovery.comparison.candidate_vs_incumbent_diagnostics
     )
     return CandidateComparisonSummary(
-        folds=tuple(item.aggregate_metrics for item in discovery.folds),
+        folds=_bounded_feedback_folds(
+            tuple(item.aggregate_metrics for item in discovery.folds),
+            comparison_folds,
+        ),
         score=score,
         diagnostics=(),
         _controller_seal=_CANDIDATE_COMPARISON_SEAL,
@@ -1819,10 +1861,22 @@ def _run_critic(
         ),
         validation=_validation_summary(validation, state.evaluation_failure_code),
         candidate_vs_baseline=(
-            None if discovery is None else _critic_comparison(discovery, fixed=True)
+            None
+            if discovery is None
+            else _critic_comparison(
+                discovery,
+                readiness.baseline_discovery.folds,
+                fixed=True,
+            )
         ),
         candidate_vs_incumbent=(
-            None if discovery is None else _critic_comparison(discovery, fixed=False)
+            None
+            if discovery is None
+            else _critic_comparison(
+                discovery,
+                state.incumbent_discovery.folds,
+                fixed=False,
+            )
         ),
     )
     plan = _plan_for(readiness, state, "critic")
@@ -1998,7 +2052,10 @@ def _persist_iteration_decision(
         candidate_folds=(
             ()
             if discovery is None
-            else tuple(item.aggregate_metrics for item in discovery.folds)
+            else _bounded_feedback_folds(
+                tuple(item.aggregate_metrics for item in discovery.folds),
+                readiness.baseline_discovery.folds,
+            )
         ),
         discovery_score=score if rankable else None,
         critic_disposition=critic_payload.disposition,
