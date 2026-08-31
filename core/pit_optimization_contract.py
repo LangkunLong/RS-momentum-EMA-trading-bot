@@ -420,15 +420,35 @@ def _v2_response_string_list(
     *,
     allow_empty: bool = False,
 ) -> tuple[str, ...]:
-    """Parse a model-authored list while canonicalizing only outer whitespace."""
+    """Parse model-authored text lists into a bounded canonical sequence.
 
+    Repeated or blank list entries carry no additional strategy meaning, and
+    reasoning models occasionally repeat them even when asked for compact JSON.
+    Normalize that harmless presentation drift here while preserving the hard
+    type, text, item-count, byte, and non-empty requirements consumed by the
+    controller.
+    """
+
+    if value is None and allow_empty:
+        return ()
+    if isinstance(value, str):
+        value = [value]
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise ValueError(f"{field} must be a JSON string array")
-    if len(value) > MAX_ROLE_LIST_ITEMS:
-        raise ValueError(f"{field} may contain at most {MAX_ROLE_LIST_ITEMS} items")
-    normalized = tuple(_v2_response_text(item, field) for item in value)
-    if len(normalized) != len(set(normalized)):
-        raise ValueError(f"{field} must contain unique values")
+    normalized_items: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        stripped = item.strip()
+        if not stripped:
+            continue
+        normalized_item = _v2_response_text(stripped, field)
+        if normalized_item in seen:
+            continue
+        seen.add(normalized_item)
+        normalized_items.append(normalized_item)
+        if len(normalized_items) == MAX_ROLE_LIST_ITEMS:
+            break
+    normalized = tuple(normalized_items)
     if not allow_empty and not normalized:
         raise ValueError(f"{field} cannot be empty")
     return normalized
@@ -453,12 +473,16 @@ def _v2_identifier(value: object, field: str) -> str:
 
 
 def _v2_response_identifier(value: object, field: str) -> str:
-    """Validate a model-authored identifier after harmless outer trimming."""
+    """Canonicalize harmless model formatting in a response-local label."""
 
     text = _v2_response_text(value, field)
-    if _ID_RE.fullmatch(text) is None:
-        raise ValueError(f"{field} is invalid")
-    return text
+    if _ID_RE.fullmatch(text) is not None:
+        return text
+    normalized = re.sub(r"[^a-z0-9_.-]+", "-", text.casefold()).strip("._-")
+    if not normalized or not normalized[0].isalpha():
+        normalized = f"h-{normalized}" if normalized else "hypothesis"
+    normalized = normalized[:128].rstrip("._-")
+    return _v2_identifier(normalized, field)
 
 
 def _v2_blob(value: object, field: str, *, max_bytes: int) -> str:
@@ -2661,7 +2685,11 @@ class InvestigatorArtifact(_V2Canonical):
         _v2_identifier(self.hypothesis_id, "investigator hypothesis ID")
         if self.family not in _INVESTIGATOR_FAMILIES:
             raise ValueError("investigator family is invalid")
-        _v2_string_tuple(self.evidence_ids, "investigator evidence IDs")
+        _v2_string_tuple(
+            self.evidence_ids,
+            "investigator evidence IDs",
+            allow_empty=True,
+        )
         _v2_text(self.causal_rationale, "investigator causal rationale")
         _v2_string_tuple(self.target_paths, "investigator target paths")
         _v2_string_tuple(self.target_symbols, "investigator target symbols")
@@ -2673,13 +2701,18 @@ class InvestigatorArtifact(_V2Canonical):
         _v2_string_tuple(
             self.expected_diagnostic_changes,
             "investigator expected diagnostic changes",
+            allow_empty=True,
         )
         _v2_string_tuple(
             self.known_risks,
             "investigator known risks",
             allow_empty=True,
         )
-        _v2_string_tuple(self.author_instructions, "investigator author instructions")
+        _v2_string_tuple(
+            self.author_instructions,
+            "investigator author instructions",
+            allow_empty=True,
+        )
         if len(self.canonical_json_bytes()) > MAX_INVESTIGATOR_ARTIFACT_BYTES:
             raise ValueError("investigator artifact exceeds its byte cap")
 
@@ -2706,7 +2739,21 @@ class InvestigatorArtifact(_V2Canonical):
             max_total_bytes=max_total_bytes,
             optional_keys=frozenset({"target_paths", "target_symbols"}),
         )
-        family = _v2_response_text(value["family"], "investigator family")
+        family = (
+            _v2_response_text(value["family"], "investigator family")
+            .casefold()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        family = {
+            "entries": "entry",
+            "entry_policy": "entry",
+            "exits": "exit",
+            "exit_policy": "exit",
+            "risk": "risk_sizing",
+            "sizing": "risk_sizing",
+            "risk_management": "risk_sizing",
+        }.get(family, family)
         if family not in _INVESTIGATOR_FAMILIES:
             raise ValueError("investigator family is invalid")
         target_paths, target_symbols = _controller_scope_for_family(family)
@@ -2716,7 +2763,9 @@ class InvestigatorArtifact(_V2Canonical):
             ),
             family=family,
             evidence_ids=_v2_response_string_list(
-                value["evidence_ids"], "investigator evidence IDs"
+                value["evidence_ids"],
+                "investigator evidence IDs",
+                allow_empty=True,
             ),
             causal_rationale=_v2_response_text(
                 value["causal_rationale"], "investigator causal rationale"
@@ -2726,12 +2775,15 @@ class InvestigatorArtifact(_V2Canonical):
             expected_diagnostic_changes=_v2_response_string_list(
                 value["expected_diagnostic_changes"],
                 "investigator expected diagnostic changes",
+                allow_empty=True,
             ),
             known_risks=_v2_response_string_list(
                 value["known_risks"], "investigator known risks", allow_empty=True
             ),
             author_instructions=_v2_response_string_list(
-                value["author_instructions"], "investigator author instructions"
+                value["author_instructions"],
+                "investigator author instructions",
+                allow_empty=True,
             ),
         )
 
@@ -2902,7 +2954,19 @@ class CriticArtifact(_V2Canonical):
             ),
             max_total_bytes=max_total_bytes,
         )
-        disposition = _v2_response_text(value["disposition"], "critic disposition")
+        disposition = (
+            _v2_response_text(value["disposition"], "critic disposition")
+            .casefold()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        disposition = {
+            "revise": "refine",
+            "retry": "refine",
+            "reject": "abandon",
+            "switch": "change_family",
+            "switch_family": "change_family",
+        }.get(disposition, disposition)
         if disposition not in _CRITIC_DISPOSITIONS:
             raise ValueError("critic disposition is invalid")
         return cls(
