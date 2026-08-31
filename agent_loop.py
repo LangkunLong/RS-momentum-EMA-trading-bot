@@ -136,6 +136,8 @@ _MAX_DATA_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
 _CONTAINER_SHM_SIZE_BYTES = 64 * 1024 * 1024
 _MAX_GENERATION_ACCOUNTING_BYTES = 64 * 1024
 _MAX_PROVIDER_EVIDENCE_BYTES = 8 * 1024
+_MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES = 32 * 1024 * 1024
+_POLICY_WORKER_BASE_FOLD_SESSIONS = 60
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529})
 _GENERATION_ACCOUNTING_RETRYABLE_STATUS_CODES = frozenset(
     {404, 408, 429, 500, 502, 503, 504, 524, 529}
@@ -7859,7 +7861,9 @@ class PolicyWorkerSession:
             raise SandboxError("policy worker startup timeout is invalid")
         if output_limit_bytes is not None and (
             type(output_limit_bytes) is not int
-            or not 1 <= output_limit_bytes <= 4 * 1024 * 1024
+            or not 1
+            <= output_limit_bytes
+            <= _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES
         ):
             raise SandboxError("policy worker session output limit is invalid")
         if wall_deadline is not None and (
@@ -7932,7 +7936,9 @@ class PolicyWorkerSession:
             if self._ready:
                 raise RuntimeError("policy worker session is already ready")
             if self._output_limit_exceeded.is_set():
-                output_error = SandboxError("policy worker output limit exceeded")
+                output_error = PolicyWorkerOperationalFailure(
+                    "policy worker output limit exceeded"
+                )
                 self.close(primary_error=output_error)
                 raise output_error
             observed_at = float(self._monotonic())
@@ -7959,7 +7965,9 @@ class PolicyWorkerSession:
                 except queue.Empty as exc:
                     raise TimeoutError("policy worker startup timeout") from exc
                 if self._output_limit_exceeded.is_set():
-                    raise SandboxError("policy worker output limit exceeded")
+                    raise PolicyWorkerOperationalFailure(
+                        "policy worker output limit exceeded"
+                    )
                 if result is None:
                     raise RuntimeError("policy worker closed before readiness")
                 if isinstance(result, BaseException):
@@ -8001,7 +8009,9 @@ class PolicyWorkerSession:
                 ):
                     self._output_limit_exceeded.set()
                     self._stdout_values.put(
-                        SandboxError("policy worker stdout output limit exceeded")
+                        PolicyWorkerOperationalFailure(
+                            "policy worker stdout output limit exceeded"
+                        )
                     )
                     return
                 self._stdout_values.put(raw)
@@ -8022,7 +8032,9 @@ class PolicyWorkerSession:
                 ):
                     self._output_limit_exceeded.set()
                     self._stdout_values.put(
-                        SandboxError("policy worker stderr output limit exceeded")
+                        PolicyWorkerOperationalFailure(
+                            "policy worker stderr output limit exceeded"
+                        )
                     )
                     return
                 capture_limit = min(
@@ -8047,7 +8059,9 @@ class PolicyWorkerSession:
             if not self._ready:
                 raise RuntimeError("policy worker session is not ready")
             if self._output_limit_exceeded.is_set():
-                output_error = SandboxError("policy worker output limit exceeded")
+                output_error = PolicyWorkerOperationalFailure(
+                    "policy worker output limit exceeded"
+                )
                 self.close(primary_error=output_error)
                 raise output_error
             observed_at = float(self._monotonic())
@@ -8083,7 +8097,9 @@ class PolicyWorkerSession:
                 except queue.Empty as exc:
                     raise TimeoutError("policy worker method timeout") from exc
                 if self._output_limit_exceeded.is_set():
-                    raise SandboxError("policy worker output limit exceeded")
+                    raise PolicyWorkerOperationalFailure(
+                        "policy worker output limit exceeded"
+                    )
                 if result is None:
                     raise RuntimeError("policy worker closed before a response")
                 if isinstance(result, BaseException):
@@ -8241,7 +8257,9 @@ class PolicyWorkerRunner:
             raise SandboxError("policy worker fold timeout is invalid")
         if output_limit_bytes is not None and (
             type(output_limit_bytes) is not int
-            or not 1 <= output_limit_bytes <= 4 * 1024 * 1024
+            or not 1
+            <= output_limit_bytes
+            <= _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES
         ):
             raise SandboxError("policy worker output limit is invalid")
         if wall_deadline is not None and (
@@ -19641,12 +19659,29 @@ def _build_pit_optimizer_v3_live_run(
             controller_root=controller_temp_parent,
             permanent_runtime_root=permanent_runtime_root,
         )
+        longest_fold_sessions = max(
+            len(fold.sessions)
+            for fold in (
+                *manifest.fold_manifest.discovery_folds,
+                manifest.fold_manifest.hidden_fold,
+            )
+        )
+        fold_scale = max(
+            1,
+            math.ceil(
+                longest_fold_sessions / _POLICY_WORKER_BASE_FOLD_SESSIONS
+            ),
+        )
+        session_output_limit_bytes = min(
+            _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES,
+            output_limit_bytes * fold_scale,
+        )
         return PolicyWorkerRunner(
             image=image,
             engine=docker,
             temp_parent=controller_temp_parent,
             fold_timeout_seconds=child_timeout_seconds,
-            output_limit_bytes=output_limit_bytes,
+            output_limit_bytes=session_output_limit_bytes,
             wall_deadline=wall_deadline,
         )
 
