@@ -608,6 +608,10 @@ class SandboxError(RuntimeError):
     """A sandbox engine or created worker failed attestation."""
 
 
+class PolicyWorkerOperationalFailure(RuntimeError):
+    """A contained policy worker failed after its cleanup was verified."""
+
+
 class GateConfigurationError(ValueError):
     """A deterministic gate input is not in the fixed operator-controlled scope."""
 
@@ -7803,6 +7807,20 @@ def _record_policy_secondary_errors(
         return
 
 
+def _has_policy_secondary_failure(exc: BaseException) -> bool:
+    """Return whether a worker failure carries cleanup/ownership uncertainty."""
+
+    try:
+        notes = getattr(exc, "__notes__", ())
+        return any(
+            isinstance(note, str)
+            and note.startswith("policy_worker_secondary_failure ")
+            for note in notes
+        )
+    except BaseException:
+        return True
+
+
 class PolicyWorkerSession:
     """One bounded authenticated JSON-lines session owned by a single fold."""
 
@@ -7867,6 +7885,7 @@ class PolicyWorkerSession:
         self._guard = DecisionDeterminismGuard()
         self._ready = False
         self._closed = False
+        self._cleanup_errors: tuple[_PolicySecondaryFailure, ...] | None = None
         self._lock = threading.Lock()
         self._stdout_values: queue.Queue[bytes | BaseException | None] = queue.Queue()
         self._stderr = bytearray()
@@ -7886,6 +7905,23 @@ class PolicyWorkerSession:
         )
         self._stdout_thread.start()
         self._stderr_thread.start()
+
+    def _raise_contained_failure(
+        self,
+        exc: BaseException,
+        *,
+        operation: str,
+    ) -> None:
+        cleanup_errors = self.close(primary_error=exc)
+        if cleanup_errors or _has_policy_secondary_failure(exc):
+            raise SandboxError(
+                "policy worker cleanup could not be fully verified"
+            ) from exc
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, SandboxError)):
+            raise exc
+        if isinstance(exc, PolicyWorkerOperationalFailure):
+            raise exc
+        raise PolicyWorkerOperationalFailure(operation) from exc
 
     def await_ready(self) -> None:
         from core.strategy_policy.worker import decode_worker_ready
@@ -7911,8 +7947,10 @@ class PolicyWorkerSession:
             remaining = min(remaining_fold, remaining_wall)
             if remaining <= 0:
                 timeout_error = TimeoutError("policy worker startup deadline")
-                self.close(primary_error=timeout_error)
-                raise timeout_error
+                self._raise_contained_failure(
+                    timeout_error,
+                    operation="policy worker startup failed",
+                )
             try:
                 try:
                     result = self._stdout_values.get(
@@ -7927,16 +7965,23 @@ class PolicyWorkerSession:
                 if isinstance(result, BaseException):
                     raise RuntimeError("policy worker output failed") from result
                 if len(result) > 16 * 1024 + 1:
-                    raise ValueError("policy worker readiness line limit exceeded")
+                    raise SandboxError("policy worker readiness line limit exceeded")
                 try:
                     ready_line = result.decode("utf-8", errors="strict")
                 except UnicodeDecodeError as exc:
-                    raise ValueError("policy worker readiness is not UTF-8") from exc
-                decode_worker_ready(ready_line, bootstrap=self._bootstrap)
+                    raise SandboxError("policy worker readiness is not UTF-8") from exc
+                try:
+                    decode_worker_ready(ready_line, bootstrap=self._bootstrap)
+                except (TypeError, ValueError) as exc:
+                    raise SandboxError(
+                        "policy worker readiness authentication failed"
+                    ) from exc
                 self._ready = True
             except BaseException as exc:
-                self.close(primary_error=exc)
-                raise
+                self._raise_contained_failure(
+                    exc,
+                    operation="policy worker startup failed",
+                )
 
     @property
     def stderr_bytes(self) -> bytes:
@@ -8017,8 +8062,10 @@ class PolicyWorkerSession:
             remaining = min(remaining_fold, remaining_wall)
             if remaining <= 0:
                 timeout_error = TimeoutError("policy worker execution deadline")
-                self.close(primary_error=timeout_error)
-                raise timeout_error
+                self._raise_contained_failure(
+                    timeout_error,
+                    operation="policy worker execution failed",
+                )
             request_line, request = encode_policy_request(
                 bootstrap=self._bootstrap,
                 sequence=self._sequence,
@@ -8042,25 +8089,32 @@ class PolicyWorkerSession:
                 if isinstance(result, BaseException):
                     raise RuntimeError("policy worker output failed") from result
                 if len(result) > 16 * 1024 + 1:
-                    raise ValueError("policy worker response line limit exceeded")
+                    raise SandboxError("policy worker response line limit exceeded")
                 try:
                     response_line = result.decode("utf-8", errors="strict")
                 except UnicodeDecodeError as exc:
-                    raise ValueError("policy worker response is not UTF-8") from exc
-                _response, decision = decode_policy_response(
-                    response_line,
-                    bootstrap=self._bootstrap,
-                    expected_sequence=self._sequence,
-                    expected_request_hmac_sha256=request.hmac_sha256,
-                    expected_method=method,
-                )
+                    raise SandboxError("policy worker response is not UTF-8") from exc
+                try:
+                    _response, decision = decode_policy_response(
+                        response_line,
+                        bootstrap=self._bootstrap,
+                        expected_sequence=self._sequence,
+                        expected_request_hmac_sha256=request.hmac_sha256,
+                        expected_method=method,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise SandboxError(
+                        "policy worker response authentication failed"
+                    ) from exc
                 self._guard.observe(method, snapshot, decision)
                 self._previous_hmac = request.hmac_sha256
                 self._sequence += 1
                 return decision
             except BaseException as exc:
-                self.close(primary_error=exc)
-                raise
+                self._raise_contained_failure(
+                    exc,
+                    operation="policy worker execution failed",
+                )
 
     def validate_determinism(self, probes: tuple[object, ...]) -> None:
         from core.strategy_policy.worker import validate_policy_determinism_probes
@@ -8072,12 +8126,20 @@ class PolicyWorkerSession:
                 self.call(probe.method, probe.unrelated_snapshot)
                 self.call(probe.method, probe.repeated_snapshot)
         except BaseException as exc:
-            self.close(primary_error=exc)
+            cleanup_errors = self.close(primary_error=exc)
+            if cleanup_errors or _has_policy_secondary_failure(exc):
+                raise SandboxError(
+                    "policy worker cleanup could not be fully verified"
+                ) from exc
             raise
 
-    def close(self, *, primary_error: BaseException | None = None) -> None:
+    def close(
+        self,
+        *,
+        primary_error: BaseException | None = None,
+    ) -> tuple[_PolicySecondaryFailure, ...]:
         if self._closed:
-            return
+            return self._cleanup_errors or ()
         self._closed = True
         errors = _cleanup_unowned_policy_process(self._process)
         for thread, action in (
@@ -8133,6 +8195,7 @@ class PolicyWorkerSession:
                     _PolicySecondaryReason.EXCEPTION,
                 )
             )
+        self._cleanup_errors = tuple(errors)
         if errors:
             if primary_error is not None:
                 _record_policy_secondary_errors(primary_error, errors)
@@ -8140,6 +8203,7 @@ class PolicyWorkerSession:
                 raise SandboxError(
                     "policy worker cleanup could not be fully verified"
                 ) from None
+        return self._cleanup_errors
 
 
 class PolicyWorkerRunner:
@@ -8562,14 +8626,22 @@ class PolicyWorkerRunner:
                     output_limit=min(64 * 1024, self.output_limit_bytes),
                 )
             except BaseException as exc:
-                create_error = exc
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    create_error = exc
+                else:
+                    create_error = PolicyWorkerOperationalFailure(
+                        "policy daemon creation failed"
+                    )
+                    create_error.__cause__ = exc
                 created = None
             if create_error is None and (
                 not isinstance(created, ProcessResult)
                 or created.timed_out
                 or created.returncode != 0
             ):
-                create_error = SandboxError("policy daemon creation failed")
+                create_error = PolicyWorkerOperationalFailure(
+                    "policy daemon creation failed"
+                )
             if create_error is not None:
                 daemon = recover_failed_create(create_error)
                 raise create_error
@@ -8603,16 +8675,23 @@ class PolicyWorkerRunner:
                 "--interactive",
                 container_id,
             ]
-            process = self._process_factory(
-                argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                close_fds=True,
-                bufsize=0,
-                env=environment,
-            )
+            try:
+                process = self._process_factory(
+                    argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
+                    close_fds=True,
+                    bufsize=0,
+                    env=environment,
+                )
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise PolicyWorkerOperationalFailure(
+                    "policy daemon attach failed"
+                ) from exc
             bootstrap = WorkerBootstrap.create(interface_version=interface_version)
             session = PolicyWorkerSession(
                 process=process,
@@ -8631,8 +8710,10 @@ class PolicyWorkerRunner:
                 process.stdin.flush()
                 session.await_ready()
             except BaseException as exc:
-                session.close(primary_error=exc)
-                raise
+                session._raise_contained_failure(
+                    exc,
+                    operation="policy worker bootstrap failed",
+                )
             return session
         except BaseException as primary_error:
             cleanup_errors: list[_PolicySecondaryFailure] = []
@@ -8655,6 +8736,10 @@ class PolicyWorkerRunner:
                 primary_error,
                 cleanup_errors,
             )
+            if cleanup_errors or _has_policy_secondary_failure(primary_error):
+                raise SandboxError(
+                    "policy worker cleanup could not be fully verified"
+                ) from primary_error
             raise
 
     def client_factory(
@@ -8692,7 +8777,11 @@ class PolicyWorkerRunner:
                     interface_version=interface_version,
                 )
             except BaseException as exc:
-                session.close(primary_error=exc)
+                cleanup_errors = session.close(primary_error=exc)
+                if cleanup_errors or _has_policy_secondary_failure(exc):
+                    raise SandboxError(
+                        "policy worker cleanup could not be fully verified"
+                    ) from exc
                 raise
 
         return create_client
@@ -19464,6 +19553,7 @@ def _build_pit_optimizer_v3_live_run(
     )
     from core.pit_optimizer_candidate import validate_candidate_diff
     from core.pit_optimizer_controller import (
+        CandidateEvaluationFailure,
         CandidateValidationOutcome,
         PitOptimizerServices,
         _CandidateCapabilityRegistry,
@@ -19963,7 +20053,6 @@ def _build_pit_optimizer_v3_live_run(
         def evaluate_fold(
             candidate_root: Path,
             fold: object,
-            identity_sha256: str,
         ) -> object:
             nonlocal worker_sequence
             require_evaluator_wall_time()
@@ -19985,21 +20074,27 @@ def _build_pit_optimizer_v3_live_run(
                 raise CandidateMutationError(
                     "candidate evaluator evidence identity differs"
                 )
-            evidence_sha256s[(identity_sha256, fold_id)] = evidence.evidence_sha256
             return evidence
 
         def evaluate_discovery(
             workspace: object,
             identity: object,
         ) -> DiscoveryEvaluation:
-            evidence = tuple(
-                evaluate_fold(
-                    workspace.root,
-                    fold,
-                    identity.identity_sha256,
+            candidate_identity_sha256 = identity.identity_sha256
+            try:
+                evidence = tuple(
+                    evaluate_fold(
+                        workspace.root,
+                        fold,
+                    )
+                    for fold in manifest.fold_manifest.discovery_folds
                 )
-                for fold in manifest.fold_manifest.discovery_folds
-            )
+            except PolicyWorkerOperationalFailure as exc:
+                raise CandidateEvaluationFailure("worker_failed") from exc
+            for item in evidence:
+                evidence_sha256s[(candidate_identity_sha256, item.fold_id)] = (
+                    item.evidence_sha256
+                )
             aggregates = tuple(item.aggregate for item in evidence)
             baseline = readiness.baseline_discovery.folds
             baseline_sha256 = _folds_digest(baseline)
@@ -20072,7 +20167,6 @@ def _build_pit_optimizer_v3_live_run(
             repeated = evaluate_fold(
                 workspace.root,
                 fold,
-                identity.identity_sha256,
             ).evidence_sha256
             return DeterminismAttestation(
                 fold_id=fold_id,
@@ -20118,7 +20212,6 @@ def _build_pit_optimizer_v3_live_run(
             candidate = evaluate_fold(
                 workspace.root,
                 fold,
-                identity.identity_sha256,
             )
             hidden_excess = (
                 candidate.aggregate.total_return_pct

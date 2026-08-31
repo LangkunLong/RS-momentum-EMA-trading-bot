@@ -421,6 +421,16 @@ class SandboxIntegrityFailure(RuntimeError):
     pass
 
 
+class CandidateEvaluationFailure(RuntimeError):
+    """A candidate-scoped discovery failure that remains safe for critic feedback."""
+
+    def __init__(self, failure_code: str) -> None:
+        if failure_code not in {"worker_failed", "replay_failed"}:
+            raise ValueError("candidate evaluation failure code is invalid")
+        super().__init__(failure_code)
+        self.failure_code = failure_code
+
+
 class EvidenceTampering(RuntimeError):
     pass
 
@@ -1550,7 +1560,31 @@ def _evaluate_iteration_candidate(
         return None
     if state.iteration_workspace is None or validation.identity is None:
         raise SandboxIntegrityFailure("valid candidate evaluation workspace is absent")
-    supplied = services.evaluate_discovery(state.iteration_workspace, validation.identity)
+    try:
+        supplied = services.evaluate_discovery(
+            state.iteration_workspace,
+            validation.identity,
+        )
+    except CandidateEvaluationFailure as exc:
+        state.evaluation_failure_code = exc.failure_code
+        _record_artifact(
+            state,
+            services.write_json_artifact(
+                _iteration_name(state, "discovery.json"),
+                {
+                    "schema_version": 3,
+                    "failure_code": exc.failure_code,
+                    "fixed_baseline_comparison": None,
+                    "incumbent_diagnostics": None,
+                    "rankable": False,
+                    "strictly_improves_incumbent": False,
+                    "folds": [],
+                    "engine_policy_sha256": readiness.manifest.effective_policy_sha256,
+                    "candidate_identity_sha256": validation.identity.identity_sha256,
+                },
+            ),
+        )
+        return None
     if not isinstance(supplied, DiscoveryEvaluation):
         raise EvidenceTampering("discovery evaluation is not closed")
     manifest = readiness.manifest
