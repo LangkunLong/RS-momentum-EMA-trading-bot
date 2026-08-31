@@ -19551,7 +19551,10 @@ def _build_pit_optimizer_v3_live_run(
     from core.pit_optimizer_authorization import (
         AuthorizationLedger,
     )
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_candidate import (
+        materialize_author_candidate_diff,
+        validate_candidate_diff,
+    )
     from core.pit_optimizer_controller import (
         CandidateEvaluationFailure,
         CandidateValidationOutcome,
@@ -19987,11 +19990,17 @@ def _build_pit_optimizer_v3_live_run(
             author: AuthorArtifact,
             cumulative_diff: str | None,
         ) -> CandidateValidationOutcome:
+            incremental_diff = author.unified_diff
             try:
+                incremental_diff = materialize_author_candidate_diff(
+                    candidate_root=candidate.root,
+                    author=author,
+                    bounds=manifest.candidate_bounds,
+                )
                 identity, authenticated_cumulative = validate_candidate_diff(
                     authenticated_base_root=config.source_root,
                     candidate_root=candidate.root,
-                    incremental_diff=author.unified_diff,
+                    incremental_diff=incremental_diff,
                     git=git_capability,
                     bounds=manifest.candidate_bounds,
                     source_commit=manifest.source_head,
@@ -20046,7 +20055,7 @@ def _build_pit_optimizer_v3_live_run(
                 return CandidateValidationOutcome(
                     valid=False,
                     failure_code=failure_code,
-                    incremental_diff=author.unified_diff,
+                    incremental_diff=incremental_diff,
                     cumulative_diff=cumulative_diff or "",
                     identity=None,
                     changed_paths=author.changed_paths,
@@ -20055,7 +20064,7 @@ def _build_pit_optimizer_v3_live_run(
             return CandidateValidationOutcome(
                 valid=True,
                 failure_code=None,
-                incremental_diff=author.unified_diff,
+                incremental_diff=incremental_diff,
                 cumulative_diff=authenticated_cumulative,
                 identity=identity,
                 changed_paths=identity.changed_paths,

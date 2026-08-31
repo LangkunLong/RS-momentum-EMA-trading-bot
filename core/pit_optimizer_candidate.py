@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import InitVar, dataclass
+import difflib
 import hashlib
 import json
 import os
@@ -59,6 +60,7 @@ _AUTHOR_HUNK_HEADER_RE = re.compile(
     r"^@@ -(0|[1-9][0-9]*)(?:,([0-9]+))? "
     r"\+(0|[1-9][0-9]*)(?:,([0-9]+))? @@((?: .*)?)\n$"
 )
+_FULL_SOURCE_TRANSPORT_PREFIX = "PIT_FULL_SOURCE_V1\n"
 _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL = object()
 _CONTRACT_IMPORTS = frozenset(
     {
@@ -675,6 +677,57 @@ def validate_candidate_identity(candidate: CandidateIdentity) -> None:
     _validate_candidate_identity_fields(candidate)
     if _AUTHENTICATED_CANDIDATE_IDENTITIES.get(id(candidate)) is not candidate:
         raise ValueError("candidate identity is not authenticated")
+
+
+def materialize_author_candidate_diff(
+    *,
+    candidate_root: Path,
+    author: AuthorArtifact,
+    bounds: PatchBounds,
+) -> str:
+    """Convert the author transport into a controller-generated unified diff.
+
+    A full-source envelope avoids asking a reasoning model to reproduce hunk
+    coordinates and duplicate context exactly.  It still targets one
+    controller-authenticated policy path, and the resulting diff passes through
+    the same bounds, Git, AST, purity, determinism, and sandbox validation.
+    Conventional unified diffs remain accepted for historical artifacts.
+    """
+
+    if not isinstance(author, AuthorArtifact) or not isinstance(bounds, PatchBounds):
+        raise ValueError("author candidate transport is invalid")
+    transport = author.unified_diff
+    if not transport.startswith(_FULL_SOURCE_TRANSPORT_PREFIX):
+        return transport
+    if len(author.changed_paths) != 1:
+        raise ValueError("full-source author transport requires one policy path")
+    path = author.changed_paths[0]
+    if path not in EDITABLE_POLICY_PATHS:
+        raise ValueError("full-source author transport path is outside scope")
+    replacement = transport.removeprefix(_FULL_SOURCE_TRANSPORT_PREFIX)
+    if (
+        not replacement
+        or "\r" in replacement
+        or "\x00" in replacement
+        or not replacement.endswith("\n")
+    ):
+        raise ValueError("full-source author transport is invalid")
+    before = _read_policy_sources(candidate_root)[path]
+    if replacement == before:
+        raise ValueError("candidate patch is a no-op")
+    rendered = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            replacement.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            n=3,
+            lineterm="\n",
+        )
+    )
+    if not rendered or len(rendered.encode("utf-8")) > bounds.max_diff_bytes:
+        raise ValueError("candidate patch exceeds max_diff_bytes")
+    return rendered
 
 
 def _normalize_author_diff_transport(raw: str) -> str:
