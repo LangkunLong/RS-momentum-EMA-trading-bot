@@ -187,6 +187,10 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "churn when the supplied aggregates support that causal experiment. When buy signals "
             "trail otherwise-passing entry-funnel stages, investigate selective handling of supplied "
             "technical_blocking_reasons rather than repeatedly changing inactive fundamentals. "
+            "In technical_only mode, current/annual growth, RS, and composite gates inside the "
+            "not-technical-only branch are inactive. When market_pass equals evaluated_rows, changing "
+            "market_permitted is inert. technical_block_* and entry_block_* counts identify the active "
+            "entry bottlenecks; use the raw EntrySnapshot facts to selectively reinterpret those blockers. "
             "Return exactly one JSON object and nothing else: no markdown, chain-of-thought, "
             "schema_version, or extra keys. It must contain exactly these keys: hypothesis_id, "
             "family, evidence_ids, causal_rationale, "
@@ -221,7 +225,10 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "Preserve its imports, module structure, public functions, helpers, and final newline. "
             "For a risk-reduction hypothesis, change risk_fraction directly and leave stop distance "
             "unchanged unless the hypothesis explicitly requires both. Do not quote a prior version "
-            "of the source. Do not execute code or access hidden data, "
+            "of the source. In technical_only mode, do not edit inactive fundamental thresholds. For an "
+            "entry-bottleneck hypothesis, implement selective technical_blocking_reasons handling from "
+            "the supplied raw snapshot facts; do not merely force market permission when market_pass "
+            "already equals evaluated_rows. Do not execute code or access hidden data, "
             "credentials, local paths, or unrelated source."
         ),
         "critic": (

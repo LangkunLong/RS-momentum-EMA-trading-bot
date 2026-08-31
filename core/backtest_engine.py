@@ -421,7 +421,17 @@ class SimulationResult:
             values = pd.to_numeric(self.signal_log[name], errors="coerce")
             return int((values >= threshold).fillna(False).sum())
 
-        return {
+        def count_blocking_reason(name: str, reason: str) -> int:
+            if name not in columns:
+                return 0
+            values = self.signal_log[name].fillna("").astype(str)
+            return int(
+                values.str.split(",").map(
+                    lambda reasons: reason in reasons
+                ).sum()
+            )
+
+        funnel = {
             "evaluated_rows": int(len(self.signal_log)),
             "signal_days": int(
                 self.signal_log["signal_date"].nunique()
@@ -448,6 +458,35 @@ class SimulationResult:
             ),
             "rs_universe_count": int(self.config.get("rs_universe_count", 0)),
         }
+        blocking_reasons = (
+            "close_not_above_prior_close",
+            "volume_ratio_below_threshold",
+            "close_below_pivot",
+            "close_above_buy_zone",
+            "proper_base_unavailable",
+            "insufficient_close_history",
+            "insufficient_prior_volume_history",
+            "non_finite_close_input",
+            "non_finite_volume_input",
+            "non_positive_pivot",
+            "non_positive_prior_average_volume",
+            "current_growth_unavailable",
+            "current_growth_below_threshold",
+            "annual_growth_unavailable",
+            "annual_growth_below_threshold",
+            "rs_score_unavailable",
+            "rs_score_below_threshold",
+            "composite_score_unavailable",
+            "composite_score_below_threshold",
+        )
+        for reason in blocking_reasons:
+            funnel[f"technical_block_{reason}"] = count_blocking_reason(
+                "technical_blocking_reasons", reason
+            )
+            funnel[f"entry_block_{reason}"] = count_blocking_reason(
+                "entry_blocking_reasons", reason
+            )
+        return funnel
 
     @property
     def closed_trades(self) -> List[Trade]:
