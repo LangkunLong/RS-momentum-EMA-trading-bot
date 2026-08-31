@@ -826,7 +826,10 @@ class PitOptimizerRunManifest(_V2Canonical):
             raise ValueError("optimizer iteration limit differs from source scope")
         if type(self.max_iterations) is not int or not 1 <= self.max_iterations <= 8:
             raise ValueError("optimizer iteration limit is invalid")
-        if self.non_improving_limit != 3:
+        if (
+            type(self.non_improving_limit) is not int
+            or not 1 <= self.non_improving_limit <= 8
+        ):
             raise ValueError("optimizer non-improving limit is invalid")
         if (
             type(self.call_budgets) is not tuple
@@ -1608,7 +1611,7 @@ def build_subset_manifest(
         candidate_bounds=candidate_bounds,
         call_budgets=call_budgets,
         max_iterations=max_iterations,
-        non_improving_limit=3,
+        non_improving_limit=max_iterations,
         authorization_requirement=authorization,
     )
 
