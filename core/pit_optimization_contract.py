@@ -181,6 +181,12 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "Treat prior candidate folds identical to baseline as behaviorally inert even when source "
             "text changed; do not repeat that mechanism. Treat author_diff_not_applicable as a patch "
             "coordinate/context failure and instruct the author to use the exact current source. "
+            "On a sparse baseline with negative return from very few trades, distinguish direct "
+            "risk_fraction reduction from a tighter stop distance: tightening the stop can increase "
+            "position size under fixed risk. Prefer the direct risk control over unrelated threshold "
+            "churn when the supplied aggregates support that causal experiment. When buy signals "
+            "trail otherwise-passing entry-funnel stages, investigate selective handling of supplied "
+            "technical_blocking_reasons rather than repeatedly changing inactive fundamentals. "
             "Return exactly one JSON object and nothing else: no markdown, chain-of-thought, "
             "schema_version, or extra keys. It must contain exactly these keys: hypothesis_id, "
             "family, evidence_ids, causal_rationale, "
@@ -212,7 +218,9 @@ PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
             "and make every hunk count match its emitted body. Prefer one literal, localized "
             "replacement over reconstructed or remembered context. Do not invent an old line or "
             "estimate hunk coordinates: derive them from the supplied file and keep context minimal. "
-            "quote a prior version of the source. Do not execute code or access hidden data, "
+            "For a risk-reduction hypothesis, change risk_fraction directly and leave stop distance "
+            "unchanged unless the hypothesis explicitly requires both. Do not quote a prior version "
+            "of the source. Do not execute code or access hidden data, "
             "credentials, local paths, or unrelated source."
         ),
         "critic": (
