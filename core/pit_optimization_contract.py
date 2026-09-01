@@ -4118,6 +4118,13 @@ def _v4_text(value: object, field: str, *, allow_empty: bool = False) -> str:
     return _v2_text(value, field, allow_empty=allow_empty)
 
 
+def _v4_bounded_text(value: object, field: str, *, max_chars: int) -> str:
+    text = _v4_text(value, field)
+    if len(text) > max_chars:
+        raise ValueError(f"{field} exceeds {max_chars} characters")
+    return text
+
+
 def _v4_source_text(value: object, field: str) -> str:
     encoded = _v4_utf8_bytes(value, field)
     assert isinstance(value, str)
@@ -4157,12 +4164,15 @@ def _v4_response_list(
     *,
     allow_empty: bool,
     max_items: int = MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
+    max_item_chars: int = MAX_INVESTIGATOR_LIST_ITEM_CHARS,
 ) -> tuple[str, ...]:
     if type(value) is not list or any(not isinstance(item, str) for item in value):
         raise ValueError(f"{field} must be a JSON string array")
     if len(value) > max_items:
         raise ValueError(f"{field} may contain at most {max_items} items")
-    normalized = tuple(_v4_text(item, field) for item in value)
+    normalized = tuple(
+        _v4_bounded_text(item, field, max_chars=max_item_chars) for item in value
+    )
     if len(set(normalized)) != len(normalized):
         raise ValueError(f"{field} must contain unique values")
     if not allow_empty and not normalized:
@@ -4173,7 +4183,12 @@ def _v4_response_list(
 def _v4_response_ids(value: object, field: str) -> tuple[str, ...]:
     return tuple(
         _v2_identifier(item, field)
-        for item in _v4_response_list(value, field, allow_empty=True)
+        for item in _v4_response_list(
+            value,
+            field,
+            allow_empty=True,
+            max_item_chars=128,
+        )
     )
 
 
@@ -4397,10 +4412,15 @@ class PolicyAuthoringScopeV4(_V2Canonical):
         max_iterations = max(item.iteration for item in self.call_budgets)
         _validate_v4_call_plan(self.call_budgets, max_iterations=max_iterations)
         for budget in self.call_budgets:
-            if budget.role in {"investigator", "author"} and (
-                self.canonical_source_bundle_bytes > budget.max_dynamic_input_bytes
-            ):
-                raise ValueError("policy source context exceeds a role input cap")
+            declared_components = self.max_iteration_feedback_bytes
+            if budget.role in {"investigator", "author"}:
+                declared_components += self.canonical_source_bundle_bytes
+            if budget.role == "investigator":
+                declared_components += self.max_iteration_history_bytes
+            if declared_components > budget.max_dynamic_input_bytes:
+                raise ValueError(
+                    f"{budget.role} declared component envelopes exceed its dynamic cap"
+                )
             if budget.role == "author" and budget.max_response_bytes < (
                 self.canonical_source_bundle_bytes
                 + self.author_response_headroom_bytes
@@ -4451,6 +4471,8 @@ class PitOptimizerRunManifestV4(_V2Canonical):
     policy_interface_version: int
     pit_bundle_sha256: str
     discovery_panel_plan_sha256: str
+    quick_panel_sha256: str
+    discovery_panel_sha256: str
     qualification_plan_sha256: str
     annualized_return_target: AnnualizedReturnTarget
     seed_checkpoint_sha256: str | None
@@ -4486,6 +4508,11 @@ class PitOptimizerRunManifestV4(_V2Canonical):
             (
                 self.discovery_panel_plan_sha256,
                 "optimizer v4 discovery plan SHA-256",
+            ),
+            (self.quick_panel_sha256, "optimizer v4 quick panel SHA-256"),
+            (
+                self.discovery_panel_sha256,
+                "optimizer v4 discovery panel SHA-256",
             ),
             (
                 self.qualification_plan_sha256,
@@ -4572,6 +4599,8 @@ class PitOptimizerRunManifestV4(_V2Canonical):
             policy_interface_version=2,
             pit_bundle_sha256=discovery_panel_plan.pit_bundle_sha256,
             discovery_panel_plan_sha256=discovery_panel_plan.sha256,
+            quick_panel_sha256=discovery_panel_plan.quick_panel.sha256,
+            discovery_panel_sha256=discovery_panel_plan.discovery_panel.sha256,
             qualification_plan_sha256=discovery_panel_plan.qualification_plan_sha256,
             annualized_return_target=discovery_panel_plan.target,
             seed_checkpoint_sha256=seed_checkpoint_sha256,
@@ -4594,6 +4623,8 @@ class PitOptimizerRunManifestV4(_V2Canonical):
             or plan.schema_version != 4
             or plan.sha256 != self.discovery_panel_plan_sha256
             or plan.pit_bundle_sha256 != self.pit_bundle_sha256
+            or plan.quick_panel.sha256 != self.quick_panel_sha256
+            or plan.discovery_panel.sha256 != self.discovery_panel_sha256
             or plan.qualification_plan_sha256 != self.qualification_plan_sha256
             or plan.target != self.annualized_return_target
         ):
@@ -4877,21 +4908,24 @@ _V4_RESPONSE_SCHEMAS = MappingProxyType(
 )
 
 
-def pit_optimizer_v4_response_format(role: str) -> dict[str, object]:
+def pit_optimizer_v4_response_schema(role: str) -> dict[str, object]:
+    """Return a defensive copy of the authoritative local v4 role schema."""
+
     try:
         schema = _V4_RESPONSE_SCHEMAS[role]
     except KeyError as exc:
         raise ValueError("unknown PIT optimizer v4 role") from exc
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": f"pit_optimizer_{role}_v4",
-            "strict": True,
-            "schema": json.loads(
-                json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
-            ),
-        },
-    }
+    copied = json.loads(json.dumps(schema, separators=(",", ":"), ensure_ascii=False))
+    if not isinstance(copied, dict):
+        raise AssertionError("optimizer v4 local response schema is not an object")
+    return copied
+
+
+def pit_optimizer_v4_response_format(role: str) -> dict[str, object]:
+    # DeepSeek through OpenRouter accepts generic JSON-object mode.  The local
+    # closed parsers and ``pit_optimizer_v4_response_schema`` remain authoritative.
+    pit_optimizer_v4_response_schema(role)
+    return {"type": "json_object"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -4923,7 +4957,11 @@ class InvestigatorArtifactV4(_V2Canonical):
         if type(self.evidence_ids) is not tuple or not self.evidence_ids:
             raise ValueError("investigator v4 evidence IDs must be a non-empty tuple")
         _v4_response_ids(list(self.evidence_ids), "investigator v4 evidence IDs")
-        _v4_text(self.causal_rationale, "investigator v4 causal rationale")
+        _v4_bounded_text(
+            self.causal_rationale,
+            "investigator v4 causal rationale",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
         if len(self.canonical_json_bytes()) > MAX_INVESTIGATOR_ARTIFACT_BYTES:
             raise ValueError("investigator v4 artifact exceeds its byte cap")
 
@@ -4956,8 +4994,10 @@ class InvestigatorArtifactV4(_V2Canonical):
                 value["evidence_ids"],
                 "investigator v4 evidence IDs",
             ),
-            causal_rationale=_v4_text(
-                value["causal_rationale"], "investigator v4 causal rationale"
+            causal_rationale=_v4_bounded_text(
+                value["causal_rationale"],
+                "investigator v4 causal rationale",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
             ),
             expected_diagnostic_changes=_v4_response_list(
                 value["expected_diagnostic_changes"],
@@ -4989,7 +5029,11 @@ class AuthorArtifactV4(_V2Canonical):
     def __post_init__(self) -> None:
         _v2_identifier(self.hypothesis_id, "author v4 hypothesis ID")
         _require_digest(self.parent_identity_sha256, "author v4 parent identity SHA-256")
-        _v4_text(self.behavioral_summary, "author v4 behavioral summary")
+        _v4_bounded_text(
+            self.behavioral_summary,
+            "author v4 behavioral summary",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
         _validate_v4_source_files(self.policy_sources, "author v4 policy sources")
         for value, field in (
             (self.assumptions, "author v4 assumptions"),
@@ -5070,8 +5114,10 @@ class AuthorArtifactV4(_V2Canonical):
                 "author v4 hypothesis ID",
             ),
             parent_identity_sha256=parent_identity_sha256,
-            behavioral_summary=_v4_text(
-                value["behavioral_summary"], "author v4 behavioral summary"
+            behavioral_summary=_v4_bounded_text(
+                value["behavioral_summary"],
+                "author v4 behavioral summary",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
             ),
             policy_sources=sources,
             assumptions=_v4_response_list(
@@ -5117,7 +5163,11 @@ class AuthorManifestSummaryV4(_V2Canonical):
             self.parent_identity_sha256,
             "author manifest v4 parent identity SHA-256",
         )
-        _v4_text(self.behavioral_summary, "author manifest v4 behavioral summary")
+        _v4_bounded_text(
+            self.behavioral_summary,
+            "author manifest v4 behavioral summary",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
         if (
             type(self.policy_source_sha256s) is not tuple
             or tuple(path for path, _digest in self.policy_source_sha256s)
@@ -5171,17 +5221,26 @@ class CriticArtifactV4(_V2Canonical):
 
     def __post_init__(self) -> None:
         _v2_identifier(self.hypothesis_id, "critic v4 hypothesis ID")
-        _v4_text(
+        _v4_bounded_text(
             self.prediction_vs_observation,
             "critic v4 prediction versus observation",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
         )
-        _v4_text(self.causal_explanation, "critic v4 causal explanation")
+        _v4_bounded_text(
+            self.causal_explanation,
+            "critic v4 causal explanation",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
         if type(self.evidence_ids) is not tuple:
             raise ValueError("critic v4 evidence IDs must be a tuple")
         _v4_response_ids(list(self.evidence_ids), "critic v4 evidence IDs")
         if self.disposition not in _V4_CRITIC_DISPOSITIONS:
             raise ValueError("critic v4 disposition is invalid")
-        _v4_text(self.next_direction, "critic v4 next direction")
+        _v4_bounded_text(
+            self.next_direction,
+            "critic v4 next direction",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
         if len(self.canonical_json_bytes()) > MAX_CRITIC_ARTIFACT_BYTES:
             raise ValueError("critic v4 artifact exceeds its byte cap")
 
@@ -5209,32 +5268,43 @@ class CriticArtifactV4(_V2Canonical):
                 _v4_text(value["hypothesis_id"], "critic v4 hypothesis ID"),
                 "critic v4 hypothesis ID",
             ),
-            prediction_vs_observation=_v4_text(
+            prediction_vs_observation=_v4_bounded_text(
                 value["prediction_vs_observation"],
                 "critic v4 prediction versus observation",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
             ),
-            causal_explanation=_v4_text(
-                value["causal_explanation"], "critic v4 causal explanation"
+            causal_explanation=_v4_bounded_text(
+                value["causal_explanation"],
+                "critic v4 causal explanation",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
             ),
             evidence_ids=_v4_response_ids(
                 value["evidence_ids"],
                 "critic v4 evidence IDs",
             ),
             disposition=disposition,
-            next_direction=_v4_text(
-                value["next_direction"], "critic v4 next direction"
+            next_direction=_v4_bounded_text(
+                value["next_direction"],
+                "critic v4 next direction",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
             ),
         )
 
 
 @dataclass(frozen=True, slots=True)
 class RoleOutputInvalidSummary(_V2Canonical):
+    iteration: int
+    call_index: int
     role: str
     validation_code: str
 
     def __post_init__(self) -> None:
+        _require_positive_int(self.iteration, "role output invalid summary iteration")
         if self.role != "author":
             raise ValueError("role output invalid summary must describe the author")
+        expected_call_index = (self.iteration - 1) * len(OPTIMIZER_V4_ROLES) + 2
+        if self.call_index != expected_call_index:
+            raise ValueError("role output invalid summary author slot is invalid")
         if self.validation_code not in PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES:
             raise ValueError("role output invalid summary validation code is invalid")
 
@@ -5251,9 +5321,15 @@ def _require_v4_panel_summary(
     value: object,
     purpose: str,
     field: str,
+    *,
+    expected_sha256: str | None = None,
 ) -> PanelAggregateSummary:
     if not isinstance(value, PanelAggregateSummary) or value.panel_id != purpose:
         raise ValueError(f"{field} must be {purpose} panel evidence")
+    if expected_sha256 is not None:
+        _require_digest(expected_sha256, f"{field} expected panel SHA-256")
+        if value.panel_sha256 != expected_sha256:
+            raise ValueError(f"{field} differs from the authenticated panel")
     _v4_cagr(value.portfolio_annualized_return_pct, f"{field} CAGR")
     return value
 
@@ -5323,6 +5399,35 @@ class TargetProgressV4(_V2Canonical):
             target_gap_pp=(target.target_pct - selected).quantize(Decimal("0.01")),
         )
 
+    def validate_summaries(
+        self,
+        *,
+        target: AnnualizedReturnTarget,
+        baseline: PanelAggregateSummary,
+        selected_parent: PanelAggregateSummary,
+        champion: PanelAggregateSummary,
+        discovery_panel_sha256: str,
+    ) -> None:
+        for value, field in (
+            (baseline, "target progress baseline"),
+            (selected_parent, "target progress selected parent"),
+            (champion, "target progress champion"),
+        ):
+            _require_v4_panel_summary(
+                value,
+                "discovery",
+                field,
+                expected_sha256=discovery_panel_sha256,
+            )
+        expected = TargetProgressV4.from_summaries(
+            target=target,
+            baseline=baseline,
+            selected_parent=selected_parent,
+            champion=champion,
+        )
+        if self != expected:
+            raise ValueError("target progress differs from authenticated summaries")
+
 
 @dataclass(frozen=True, slots=True)
 class SelectedParentSummary(_V2Canonical):
@@ -5336,7 +5441,11 @@ class SelectedParentSummary(_V2Canonical):
         if not isinstance(self.identity, SelectedParentIdentity):
             raise ValueError("selected parent summary identity is invalid")
         _v2_identifier(self.hypothesis_id, "selected parent summary hypothesis ID")
-        _v4_text(self.behavioral_summary, "selected parent behavioral summary")
+        _v4_bounded_text(
+            self.behavioral_summary,
+            "selected parent behavioral summary",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
         _require_v4_panel_summary(
             self.quick_panel,
             "quick",
@@ -5346,6 +5455,25 @@ class SelectedParentSummary(_V2Canonical):
             self.discovery_panel,
             "discovery",
             "selected parent discovery panel",
+        )
+
+    def validate_panel_identities(
+        self,
+        *,
+        quick_panel_sha256: str,
+        discovery_panel_sha256: str,
+    ) -> None:
+        _require_v4_panel_summary(
+            self.quick_panel,
+            "quick",
+            "selected parent quick panel",
+            expected_sha256=quick_panel_sha256,
+        )
+        _require_v4_panel_summary(
+            self.discovery_panel,
+            "discovery",
+            "selected parent discovery panel",
+            expected_sha256=discovery_panel_sha256,
         )
 
 
@@ -5363,7 +5491,11 @@ class PriorHypothesisSummaryV4(_V2Canonical):
         _require_positive_int(self.iteration, "prior hypothesis v4 iteration")
         _v2_identifier(self.hypothesis_id, "prior hypothesis v4 ID")
         _v4_focus_areas(list(self.focus_areas), "prior hypothesis v4 focus areas")
-        _v4_text(self.behavioral_summary, "prior hypothesis v4 behavioral summary")
+        _v4_bounded_text(
+            self.behavioral_summary,
+            "prior hypothesis v4 behavioral summary",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
         if not isinstance(self.validation, CandidateValidationStatusV4):
             raise ValueError("prior hypothesis v4 validation is invalid")
         if self.discovery_cagr_pct is not None:
@@ -5381,16 +5513,23 @@ def _validate_role_common_v4(
     schema_version: int,
     iteration: int,
     run_manifest_sha256: str,
+    policy_authoring_scope_sha256: str,
     policy_interface_version: int,
     immutable_constraint_ids: tuple[str, ...],
     annualized_return_target: AnnualizedReturnTarget,
     discovery_panel_plan_sha256: str,
+    quick_panel_sha256: str,
+    discovery_panel_sha256: str,
     selected_parent_identity: SelectedParentIdentity,
 ) -> None:
     if schema_version != 4:
         raise ValueError("optimizer v4 role input schema is unsupported")
     _require_positive_int(iteration, "optimizer v4 role iteration")
     _require_digest(run_manifest_sha256, "optimizer v4 role manifest SHA-256")
+    _require_digest(
+        policy_authoring_scope_sha256,
+        "optimizer v4 role authoring scope SHA-256",
+    )
     if policy_interface_version != 2:
         raise ValueError("optimizer v4 role policy interface must be 2")
     _v2_string_tuple(immutable_constraint_ids, "optimizer v4 immutable constraints")
@@ -5400,23 +5539,74 @@ def _validate_role_common_v4(
         discovery_panel_plan_sha256,
         "optimizer v4 role discovery plan SHA-256",
     )
+    _require_digest(quick_panel_sha256, "optimizer v4 role quick panel SHA-256")
+    _require_digest(
+        discovery_panel_sha256,
+        "optimizer v4 role discovery panel SHA-256",
+    )
     if not isinstance(selected_parent_identity, SelectedParentIdentity):
         raise ValueError("optimizer v4 role selected parent identity is invalid")
 
 
 def _validate_role_v4_budget(
     *,
+    role_context: object,
     role: str,
     iteration: int,
     payload: bytes,
     budget: PitOptimizerCallBudget,
+    scope: PolicyAuthoringScopeV4,
+    manifest: PitOptimizerRunManifestV4,
+    expected_scope_sha256: str,
+    source_component_bytes: int,
+    feedback_component: bytes,
+    history_component: bytes | None = None,
 ) -> None:
+    if not isinstance(manifest, PitOptimizerRunManifestV4):
+        raise ValueError("optimizer v4 role manifest is invalid")
+    if not isinstance(scope, PolicyAuthoringScopeV4):
+        raise ValueError("optimizer v4 role authoring scope is invalid")
+    if (
+        manifest.sha256 != getattr(role_context, "run_manifest_sha256", None)
+        or manifest.policy_authoring_scope != scope
+        or manifest.policy_interface_version
+        != getattr(role_context, "policy_interface_version", None)
+        or manifest.immutable_constraint_ids
+        != getattr(role_context, "immutable_constraint_ids", None)
+        or manifest.annualized_return_target
+        != getattr(role_context, "annualized_return_target", None)
+        or manifest.discovery_panel_plan_sha256
+        != getattr(role_context, "discovery_panel_plan_sha256", None)
+        or manifest.quick_panel_sha256
+        != getattr(role_context, "quick_panel_sha256", None)
+        or manifest.discovery_panel_sha256
+        != getattr(role_context, "discovery_panel_sha256", None)
+    ):
+        raise ValueError("optimizer v4 role manifest binding differs")
+    if scope.sha256 != expected_scope_sha256:
+        raise ValueError("optimizer v4 role authoring scope binding differs")
+    role_ordinal = OPTIMIZER_V4_ROLES.index(role) + 1
+    expected_call_index = (iteration - 1) * len(OPTIMIZER_V4_ROLES) + role_ordinal
     if (
         not isinstance(budget, PitOptimizerCallBudget)
         or budget.role != role
         or budget.iteration != iteration
+        or budget.call_index != expected_call_index
+        or expected_call_index > len(scope.call_budgets)
+        or scope.call_budgets[expected_call_index - 1] != budget
     ):
         raise ValueError("optimizer v4 role budget binding differs")
+    if len(feedback_component) > scope.max_iteration_feedback_bytes:
+        raise ValueError("optimizer v4 role feedback component exceeds scope")
+    if history_component is not None and (
+        len(history_component) > scope.max_iteration_history_bytes
+    ):
+        raise ValueError("optimizer v4 role history component exceeds scope")
+    component_bytes = source_component_bytes + len(feedback_component)
+    if history_component is not None:
+        component_bytes += len(history_component)
+    if component_bytes > budget.max_dynamic_input_bytes:
+        raise ValueError("optimizer v4 role components exceed dynamic call cap")
     static_bytes = len(PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[role].encode("utf-8"))
     static_bytes += len(_v2_canonical_bytes(pit_optimizer_v4_response_format(role)))
     if static_bytes > budget.max_static_input_bytes:
@@ -5430,10 +5620,13 @@ class InvestigatorInputV4(_V2Canonical):
     schema_version: int
     iteration: int
     run_manifest_sha256: str
+    policy_authoring_scope_sha256: str
     policy_interface_version: int
     immutable_constraint_ids: tuple[str, ...]
     annualized_return_target: AnnualizedReturnTarget
     discovery_panel_plan_sha256: str
+    quick_panel_sha256: str
+    discovery_panel_sha256: str
     selected_parent_identity: SelectedParentIdentity
     selected_parent_source_bundle_sha256: str
     selected_parent_sources: tuple[AuthorSourceFile, ...]
@@ -5450,10 +5643,13 @@ class InvestigatorInputV4(_V2Canonical):
             schema_version=self.schema_version,
             iteration=self.iteration,
             run_manifest_sha256=self.run_manifest_sha256,
+            policy_authoring_scope_sha256=self.policy_authoring_scope_sha256,
             policy_interface_version=self.policy_interface_version,
             immutable_constraint_ids=self.immutable_constraint_ids,
             annualized_return_target=self.annualized_return_target,
             discovery_panel_plan_sha256=self.discovery_panel_plan_sha256,
+            quick_panel_sha256=self.quick_panel_sha256,
+            discovery_panel_sha256=self.discovery_panel_sha256,
             selected_parent_identity=self.selected_parent_identity,
         )
         _require_digest(
@@ -5483,8 +5679,45 @@ class InvestigatorInputV4(_V2Canonical):
             or self.branch_summary.identity.parent_kind != "branch"
         ):
             raise ValueError("investigator v4 branch summary is invalid")
+        summaries = tuple(
+            summary
+            for summary in (
+                self.selected_parent_summary,
+                self.baseline_summary,
+                self.champion_summary,
+                self.branch_summary,
+            )
+            if summary is not None
+        )
+        for summary in summaries:
+            summary.validate_panel_identities(
+                quick_panel_sha256=self.quick_panel_sha256,
+                discovery_panel_sha256=self.discovery_panel_sha256,
+            )
+        if self.branch_summary is not None:
+            expected_parent = self.branch_summary
+        elif self.champion_summary is not None:
+            expected_parent = self.champion_summary
+        else:
+            expected_parent = self.baseline_summary
+        if self.selected_parent_summary != expected_parent:
+            raise ValueError(
+                "investigator v4 selected parent differs from deterministic parent state"
+            )
         if not isinstance(self.target_progress, TargetProgressV4):
             raise ValueError("investigator v4 target progress is invalid")
+        champion_panel = (
+            self.champion_summary.discovery_panel
+            if self.champion_summary is not None
+            else self.baseline_summary.discovery_panel
+        )
+        self.target_progress.validate_summaries(
+            target=self.annualized_return_target,
+            baseline=self.baseline_summary.discovery_panel,
+            selected_parent=self.selected_parent_summary.discovery_panel,
+            champion=champion_panel,
+            discovery_panel_sha256=self.discovery_panel_sha256,
+        )
         if (
             type(self.prior_hypotheses) is not tuple
             or any(
@@ -5498,12 +5731,40 @@ class InvestigatorInputV4(_V2Canonical):
         if not isinstance(self.validation_status, CandidateValidationStatusV4):
             raise ValueError("investigator v4 validation status is invalid")
 
-    def validate_budget(self, budget: PitOptimizerCallBudget) -> None:
+    def validate_budget(
+        self,
+        budget: PitOptimizerCallBudget,
+        *,
+        scope: PolicyAuthoringScopeV4,
+        manifest: PitOptimizerRunManifestV4,
+    ) -> None:
+        feedback_component = _v2_canonical_bytes(
+            {
+                "selected_parent_summary": self.selected_parent_summary,
+                "baseline_summary": self.baseline_summary,
+                "champion_summary": self.champion_summary,
+                "branch_summary": self.branch_summary,
+                "target_progress": self.target_progress,
+                "validation_status": self.validation_status,
+            }
+        )
+        history_component = _v2_canonical_bytes(
+            {"prior_hypotheses": self.prior_hypotheses}
+        )
         _validate_role_v4_budget(
+            role_context=self,
             role="investigator",
             iteration=self.iteration,
             payload=self.canonical_json_bytes(),
             budget=budget,
+            scope=scope,
+            manifest=manifest,
+            expected_scope_sha256=self.policy_authoring_scope_sha256,
+            source_component_bytes=len(
+                policy_source_bundle_v4_bytes(self.selected_parent_sources)
+            ),
+            feedback_component=feedback_component,
+            history_component=history_component,
         )
 
 
@@ -5512,10 +5773,13 @@ class AuthorInputV4(_V2Canonical):
     schema_version: int
     iteration: int
     run_manifest_sha256: str
+    policy_authoring_scope_sha256: str
     policy_interface_version: int
     immutable_constraint_ids: tuple[str, ...]
     annualized_return_target: AnnualizedReturnTarget
     discovery_panel_plan_sha256: str
+    quick_panel_sha256: str
+    discovery_panel_sha256: str
     selected_parent_identity: SelectedParentIdentity
     selected_parent_source_bundle_sha256: str
     selected_parent_sources: tuple[AuthorSourceFile, ...]
@@ -5526,10 +5790,13 @@ class AuthorInputV4(_V2Canonical):
             schema_version=self.schema_version,
             iteration=self.iteration,
             run_manifest_sha256=self.run_manifest_sha256,
+            policy_authoring_scope_sha256=self.policy_authoring_scope_sha256,
             policy_interface_version=self.policy_interface_version,
             immutable_constraint_ids=self.immutable_constraint_ids,
             annualized_return_target=self.annualized_return_target,
             discovery_panel_plan_sha256=self.discovery_panel_plan_sha256,
+            quick_panel_sha256=self.quick_panel_sha256,
+            discovery_panel_sha256=self.discovery_panel_sha256,
             selected_parent_identity=self.selected_parent_identity,
         )
         _require_digest(
@@ -5555,12 +5822,28 @@ class AuthorInputV4(_V2Canonical):
         ):
             raise ValueError("author v4 response binding differs from its input")
 
-    def validate_budget(self, budget: PitOptimizerCallBudget) -> None:
+    def validate_budget(
+        self,
+        budget: PitOptimizerCallBudget,
+        *,
+        scope: PolicyAuthoringScopeV4,
+        manifest: PitOptimizerRunManifestV4,
+    ) -> None:
         _validate_role_v4_budget(
+            role_context=self,
             role="author",
             iteration=self.iteration,
             payload=self.canonical_json_bytes(),
             budget=budget,
+            scope=scope,
+            manifest=manifest,
+            expected_scope_sha256=self.policy_authoring_scope_sha256,
+            source_component_bytes=len(
+                policy_source_bundle_v4_bytes(self.selected_parent_sources)
+            ),
+            feedback_component=_v2_canonical_bytes(
+                {"investigator": self.investigator}
+            ),
         )
 
 
@@ -5569,11 +5852,15 @@ class CriticInputV4(_V2Canonical):
     schema_version: int
     iteration: int
     run_manifest_sha256: str
+    policy_authoring_scope_sha256: str
     policy_interface_version: int
     immutable_constraint_ids: tuple[str, ...]
     annualized_return_target: AnnualizedReturnTarget
     discovery_panel_plan_sha256: str
+    quick_panel_sha256: str
+    discovery_panel_sha256: str
     selected_parent_identity: SelectedParentIdentity
+    selected_parent_summary: SelectedParentSummary
     hypothesis_id: str
     investigator_summary: InvestigatorArtifactV4
     author_manifest: AuthorManifestSummaryV4 | None
@@ -5591,11 +5878,23 @@ class CriticInputV4(_V2Canonical):
             schema_version=self.schema_version,
             iteration=self.iteration,
             run_manifest_sha256=self.run_manifest_sha256,
+            policy_authoring_scope_sha256=self.policy_authoring_scope_sha256,
             policy_interface_version=self.policy_interface_version,
             immutable_constraint_ids=self.immutable_constraint_ids,
             annualized_return_target=self.annualized_return_target,
             discovery_panel_plan_sha256=self.discovery_panel_plan_sha256,
+            quick_panel_sha256=self.quick_panel_sha256,
+            discovery_panel_sha256=self.discovery_panel_sha256,
             selected_parent_identity=self.selected_parent_identity,
+        )
+        if (
+            not isinstance(self.selected_parent_summary, SelectedParentSummary)
+            or self.selected_parent_summary.identity != self.selected_parent_identity
+        ):
+            raise ValueError("critic v4 selected parent summary binding differs")
+        self.selected_parent_summary.validate_panel_identities(
+            quick_panel_sha256=self.quick_panel_sha256,
+            discovery_panel_sha256=self.discovery_panel_sha256,
         )
         _v2_identifier(self.hypothesis_id, "critic v4 hypothesis ID")
         if (
@@ -5619,8 +5918,11 @@ class CriticInputV4(_V2Canonical):
             if (
                 not isinstance(self.author_output_invalid, RoleOutputInvalidSummary)
                 or self.author_output_invalid.role != "author"
+                or self.author_output_invalid.iteration != self.iteration
+                or self.author_output_invalid.call_index
+                != (self.iteration - 1) * len(OPTIMIZER_V4_ROLES) + 2
             ):
-                raise ValueError("critic v4 invalid summary must describe the author")
+                raise ValueError("critic v4 invalid summary differs from its author slot")
         if not isinstance(self.validation_status, CandidateValidationStatusV4):
             raise ValueError("critic v4 validation status is invalid")
         if self.author_output_invalid is not None and (
@@ -5628,37 +5930,61 @@ class CriticInputV4(_V2Canonical):
             or self.validation_status.failure_code != "author_output_invalid"
         ):
             raise ValueError("critic v4 invalid author status differs")
+        if self.author_manifest is not None and (
+            self.validation_status.failure_code == "author_output_invalid"
+        ):
+            raise ValueError("critic v4 valid author cannot use invalid-output status")
         if self.candidate_quick is not None:
             _require_v4_panel_summary(
                 self.candidate_quick,
                 "quick",
                 "critic v4 candidate quick",
+                expected_sha256=self.quick_panel_sha256,
             )
         if self.candidate_discovery is not None:
             _require_v4_panel_summary(
                 self.candidate_discovery,
                 "discovery",
                 "critic v4 candidate discovery",
+                expected_sha256=self.discovery_panel_sha256,
             )
             if self.candidate_quick is None:
                 raise ValueError("critic v4 discovery evidence requires quick evidence")
+        has_complete_candidate_evidence = (
+            self.candidate_quick is not None and self.candidate_discovery is not None
+        )
+        if self.validation_status.status == "valid":
+            if not has_complete_candidate_evidence:
+                raise ValueError("critic v4 valid status requires both candidate panels")
+        elif self.candidate_quick is not None or self.candidate_discovery is not None:
+            raise ValueError("critic v4 nonvalid status cannot carry candidate panels")
         _require_v4_panel_summary(
             self.baseline_quick,
             "quick",
             "critic v4 baseline quick",
+            expected_sha256=self.quick_panel_sha256,
         )
         _require_v4_panel_summary(
             self.baseline_discovery,
             "discovery",
             "critic v4 baseline discovery",
+            expected_sha256=self.discovery_panel_sha256,
         )
         _require_v4_panel_summary(
             self.champion_discovery,
             "discovery",
             "critic v4 champion discovery",
+            expected_sha256=self.discovery_panel_sha256,
         )
         if not isinstance(self.target_progress, TargetProgressV4):
             raise ValueError("critic v4 target progress is invalid")
+        self.target_progress.validate_summaries(
+            target=self.annualized_return_target,
+            baseline=self.baseline_discovery,
+            selected_parent=self.selected_parent_summary.discovery_panel,
+            champion=self.champion_discovery,
+            discovery_panel_sha256=self.discovery_panel_sha256,
+        )
         if any(
             key in self.to_primitive()
             for key in ("selected_parent_sources", "policy_sources", "source")
@@ -5671,10 +5997,38 @@ class CriticInputV4(_V2Canonical):
         if artifact.hypothesis_id != self.hypothesis_id:
             raise ValueError("critic v4 hypothesis differs from its input")
 
-    def validate_budget(self, budget: PitOptimizerCallBudget) -> None:
+    def validate_budget(
+        self,
+        budget: PitOptimizerCallBudget,
+        *,
+        scope: PolicyAuthoringScopeV4,
+        manifest: PitOptimizerRunManifestV4,
+    ) -> None:
+        feedback_component = _v2_canonical_bytes(
+            {
+                "selected_parent_summary": self.selected_parent_summary,
+                "hypothesis_id": self.hypothesis_id,
+                "investigator_summary": self.investigator_summary,
+                "author_manifest": self.author_manifest,
+                "author_output_invalid": self.author_output_invalid,
+                "validation_status": self.validation_status,
+                "candidate_quick": self.candidate_quick,
+                "candidate_discovery": self.candidate_discovery,
+                "baseline_quick": self.baseline_quick,
+                "baseline_discovery": self.baseline_discovery,
+                "champion_discovery": self.champion_discovery,
+                "target_progress": self.target_progress,
+            }
+        )
         _validate_role_v4_budget(
+            role_context=self,
             role="critic",
             iteration=self.iteration,
             payload=self.canonical_json_bytes(),
             budget=budget,
+            scope=scope,
+            manifest=manifest,
+            expected_scope_sha256=self.policy_authoring_scope_sha256,
+            source_component_bytes=0,
+            feedback_component=feedback_component,
         )

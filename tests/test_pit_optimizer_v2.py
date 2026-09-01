@@ -315,13 +315,26 @@ def test_role_schema_investigator_output_is_closed_and_bounded() -> None:
         max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
     )
     assert v4_artifact.focus_areas == ("entry", "risk_sizing")
-    v4_schema = contract.pit_optimizer_v4_response_format("investigator")
-    assert v4_schema["json_schema"]["schema"]["properties"]["focus_areas"][
-        "maxItems"
-    ] == 3
+    assert contract.pit_optimizer_v4_response_format("investigator") == {
+        "type": "json_object"
+    }
+    v4_schema = contract.pit_optimizer_v4_response_schema("investigator")
+    assert v4_schema["properties"]["focus_areas"]["maxItems"] == 3
     with pytest.raises(ValueError, match="focus areas"):
         contract.InvestigatorArtifactV4.from_json(
             _canonical_text({**v4_payload, "focus_areas": ["entries"]}),
+            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+        )
+    with pytest.raises(ValueError, match="256 characters"):
+        contract.InvestigatorArtifactV4.from_json(
+            _canonical_text({**v4_payload, "causal_rationale": "x" * 257}),
+            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+        )
+    with pytest.raises(ValueError, match="96 characters"):
+        contract.InvestigatorArtifactV4.from_json(
+            _canonical_text(
+                {**v4_payload, "expected_diagnostic_changes": ["x" * 97]}
+            ),
             max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
         )
 
@@ -446,9 +459,10 @@ def test_role_schema_author_output_has_independent_diff_and_metadata_caps() -> N
     assert tuple(item.path for item in v4_artifact.policy_sources) == _POLICY_PATHS
     assert set(v4_artifact.to_primitive()["policy_sources"]) == set(_POLICY_PATHS)
     assert "unified_diff" not in v4_artifact.to_primitive()
-    author_schema = contract.pit_optimizer_v4_response_format("author")["json_schema"][
-        "schema"
-    ]
+    assert contract.pit_optimizer_v4_response_format("author") == {
+        "type": "json_object"
+    }
+    author_schema = contract.pit_optimizer_v4_response_schema("author")
     assert set(author_schema["properties"]["policy_sources"]["properties"]) == set(
         _POLICY_PATHS
     )
@@ -466,6 +480,12 @@ def test_role_schema_author_output_has_independent_diff_and_metadata_caps() -> N
             ),
             selected_parent=parent,
             max_total_bytes=response_bytes,
+        )
+    with pytest.raises(ValueError, match="256 characters"):
+        contract.AuthorArtifactV4.from_json(
+            _canonical_text({**v4_payload, "behavioral_summary": "x" * 257}),
+            selected_parent=parent,
+            max_total_bytes=response_bytes + 512,
         )
     with pytest.raises(ValueError, match="at least one changed"):
         contract.AuthorArtifactV4.from_json(
@@ -547,9 +567,12 @@ def test_role_schema_critic_output_is_advisory_closed_and_bounded() -> None:
             max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
         )
         assert v4_artifact.disposition == disposition
-    assert contract.pit_optimizer_v4_response_format("critic")["json_schema"][
-        "schema"
-    ]["properties"]["disposition"]["enum"] == ["promote", "refine", "abandon"]
+    assert contract.pit_optimizer_v4_response_format("critic") == {
+        "type": "json_object"
+    }
+    assert contract.pit_optimizer_v4_response_schema("critic")["properties"][
+        "disposition"
+    ]["enum"] == ["promote", "refine", "abandon"]
     for forbidden_alias in ("accept", "change_family", "revise", "reject"):
         with pytest.raises(ValueError, match="disposition"):
             contract.CriticArtifactV4.from_json(
@@ -1438,6 +1461,8 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
         )
 
     v4_sources = _v4_policy_sources()
+    v4_manifest, v4_plan = _v4_manifest()
+    v4_scope = v4_manifest.policy_authoring_scope
     v4_parent = contract.SelectedParentIdentity.issue(
         parent_kind="baseline",
         parent_id="baseline",
@@ -1446,12 +1471,12 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
     )
     quick = _v4_panel_summary(
         "quick",
-        panel_sha256="1" * 64,
+        panel_sha256=v4_plan.quick_panel.sha256,
         cagr_pct=Decimal("4.00"),
     )
     discovery_panel = _v4_panel_summary(
         "discovery",
-        panel_sha256="2" * 64,
+        panel_sha256=v4_plan.discovery_panel.sha256,
         cagr_pct=Decimal("5.00"),
     )
     quick_primitive = asdict(quick)
@@ -1488,11 +1513,14 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
     common_v4 = {
         "schema_version": 4,
         "iteration": 1,
-        "run_manifest_sha256": "0" * 64,
+        "run_manifest_sha256": v4_manifest.sha256,
+        "policy_authoring_scope_sha256": v4_scope.sha256,
         "policy_interface_version": 2,
         "immutable_constraint_ids": ("causal_only", "no_external_io"),
         "annualized_return_target": target,
-        "discovery_panel_plan_sha256": "3" * 64,
+        "discovery_panel_plan_sha256": v4_manifest.discovery_panel_plan_sha256,
+        "quick_panel_sha256": v4_manifest.quick_panel_sha256,
+        "discovery_panel_sha256": v4_manifest.discovery_panel_sha256,
         "selected_parent_identity": v4_parent,
     }
     investigator_input_v4 = contract.InvestigatorInputV4(
@@ -1544,6 +1572,7 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
     )
     critic_input_v4 = contract.CriticInputV4(
         **common_v4,
+        selected_parent_summary=parent_summary,
         hypothesis_id=investigator_v4.hypothesis_id,
         investigator_summary=investigator_v4,
         author_manifest=author_manifest_v4,
@@ -1563,6 +1592,15 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
         value.selected_parent_identity.parent_identity_sha256
         for value in (investigator_input_v4, author_input_v4, critic_input_v4)
     } == {v4_parent.parent_identity_sha256}
+    investigator_input_v4.validate_budget(
+        v4_scope.call_budgets[0], scope=v4_scope, manifest=v4_manifest
+    )
+    author_input_v4.validate_budget(
+        v4_scope.call_budgets[1], scope=v4_scope, manifest=v4_manifest
+    )
+    critic_input_v4.validate_budget(
+        v4_scope.call_budgets[2], scope=v4_scope, manifest=v4_manifest
+    )
     for role_input_v4 in (
         investigator_input_v4,
         author_input_v4,
@@ -1581,6 +1619,8 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
     assert "policy_sources" not in critic_text
     assert "def evaluate_entry" not in critic_text
     invalid_author = contract.RoleOutputInvalidSummary(
+        iteration=1,
+        call_index=2,
         role="author",
         validation_code="payload_schema_invalid",
     )
@@ -1604,6 +1644,54 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
         replace(
             author_input_v4,
             selected_parent_source_bundle_sha256="4" * 64,
+        )
+    with pytest.raises(ValueError, match="authenticated panel"):
+        replace(
+            investigator_input_v4,
+            baseline_summary=replace(
+                parent_summary,
+                quick_panel=replace(quick, panel_sha256="4" * 64),
+            ),
+        )
+    inconsistent_progress = replace(
+        progress,
+        selected_parent_cagr_pct=Decimal("6.00"),
+        target_gap_pp=Decimal("4.00"),
+    )
+    with pytest.raises(ValueError, match="authenticated summaries"):
+        replace(investigator_input_v4, target_progress=inconsistent_progress)
+    branch_parent = contract.SelectedParentIdentity.issue(
+        parent_kind="branch",
+        parent_id="branch_1",
+        source_head="a" * 40,
+        policy_sources=v4_sources,
+    )
+    branch_summary = replace(parent_summary, identity=branch_parent)
+    with pytest.raises(ValueError, match="deterministic parent"):
+        replace(investigator_input_v4, branch_summary=branch_summary)
+    wrong_author_slot = contract.RoleOutputInvalidSummary(
+        iteration=2,
+        call_index=5,
+        role="author",
+        validation_code="payload_schema_invalid",
+    )
+    with pytest.raises(ValueError, match="author slot"):
+        replace(invalid_critic_input, author_output_invalid=wrong_author_slot)
+    with pytest.raises(ValueError, match="nonvalid status"):
+        replace(invalid_critic_input, candidate_quick=quick)
+    with pytest.raises(ValueError, match="both candidate panels"):
+        replace(critic_input_v4, candidate_discovery=None)
+    smaller_scope = replace(v4_scope, max_iteration_feedback_bytes=1)
+    smaller_manifest = replace(v4_manifest, policy_authoring_scope=smaller_scope)
+    with pytest.raises(ValueError, match="feedback component"):
+        replace(
+            critic_input_v4,
+            run_manifest_sha256=smaller_manifest.sha256,
+            policy_authoring_scope_sha256=smaller_scope.sha256,
+        ).validate_budget(
+            smaller_scope.call_budgets[2],
+            scope=smaller_scope,
+            manifest=smaller_manifest,
         )
 
 
@@ -1958,6 +2046,8 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
     assert v4.max_iterations == 3
     assert len(v4.call_budgets) == 9
     assert v4.discovery_panel_plan_sha256 == discovery_plan.sha256
+    assert v4.quick_panel_sha256 == discovery_plan.quick_panel.sha256
+    assert v4.discovery_panel_sha256 == discovery_plan.discovery_panel.sha256
     assert v4.qualification_plan_sha256 == discovery_plan.qualification_plan_sha256
     assert v4.annualized_return_target == discovery_plan.target
     assert v4.apply is False and v4.provider_retries == 0
@@ -2007,6 +2097,11 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
     stale_plan_binding = replace(v4, discovery_panel_plan_sha256="3" * 64)
     with pytest.raises(ValueError, match="discovery plan binding"):
         stale_plan_binding.validate_discovery_plan(discovery_plan)
+    with pytest.raises(ValueError, match="declared component envelopes"):
+        replace(
+            v4.policy_authoring_scope,
+            max_iteration_history_bytes=200_000,
+        )
 
 
 _FIRST_CANARY_MUTATIONS = (
