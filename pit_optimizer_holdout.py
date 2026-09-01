@@ -248,6 +248,11 @@ def _build_hidden_evaluator(
         != set(tradable_tickers).union(market_reference_tickers)
     ):
         raise HoldoutPreflightError("holdout panel escapes the tradable universe")
+    universe_sha256 = hashlib.sha256(
+        _canonical_json_bytes(list(universe)) + b"\n"
+    ).hexdigest()
+    if universe_sha256 != manifest.fold_manifest.universe_sha256:
+        raise HoldoutPreflightError("holdout_universe_identity_invalid")
     probes = (
         PolicyDeterminismProbe(
             "recommend_capacity",
