@@ -151,6 +151,7 @@ def test_manifest_uses_only_the_fold_manifest_bound_by_the_parity_reference(
 
     assert folds == reference.fold_manifest
     assert universe == reference.universe
+    assert set(universe).isdisjoint({"IWM", "QQQ", "SPY"})
     with pytest.raises(ValueError, match="fold manifest"):
         _attested_parity_reference_folds(
             parity_attestation=replace(

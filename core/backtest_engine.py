@@ -1406,6 +1406,9 @@ def _portfolio_checkpoint_fingerprint(
     benchmark: str,
     universe: Iterable[str],
     simulator: "PortfolioSimulator",
+    tradable_tickers: Iterable[str] | None = None,
+    market_reference_tickers: Iterable[str] | None = None,
+    market_context_universe: Iterable[str] | None = None,
     strategy_identity: Optional[dict[str, Any]] = None,
     history_start_date: Optional[pd.Timestamp] = None,
 ) -> str:
@@ -1437,6 +1440,26 @@ def _portfolio_checkpoint_fingerprint(
         "end_date": str(end_date.date()),
         "benchmark": benchmark,
         "universe": sorted(str(item).upper() for item in universe),
+        "tradable_tickers": sorted(
+            str(item).upper()
+            for item in (tradable_tickers if tradable_tickers is not None else universe)
+        ),
+        "market_reference_tickers": sorted(
+            str(item).upper()
+            for item in (
+                market_reference_tickers
+                if market_reference_tickers is not None
+                else (benchmark,)
+            )
+        ),
+        "market_context_universe": sorted(
+            str(item).upper()
+            for item in (
+                market_context_universe
+                if market_context_universe is not None
+                else universe
+            )
+        ),
         "initial_capital": simulator.initial_capital,
         "max_positions": simulator.max_positions,
         "position_size_pct": simulator.position_size_pct,
@@ -1829,19 +1852,39 @@ class PortfolioSimulator:
             raise ValueError("history_start_date must not follow start_date")
 
         if self.pit_bundle is not None:
-            bundle_symbols = set(self.pit_bundle.symbols())
-            requested = [str(ticker).upper() for ticker in tickers] or list(self.pit_bundle.symbols())
+            tradable_tickers = tuple(self.pit_bundle.tradable_symbols())
+            market_reference_tickers = tuple(self.pit_bundle.reference_symbols())
+            tradable_set = set(tradable_tickers)
+            reference_set = set(market_reference_tickers)
+            requested = [str(ticker).upper() for ticker in tickers]
+            if reference_set.intersection(requested):
+                raise ValueError(
+                    "point-in-time reference symbols are observation-only and cannot be traded"
+                )
             tickers = list(
                 dict.fromkeys(
-                    ticker for ticker in requested if ticker in bundle_symbols and ticker != benchmark
+                    ticker for ticker in (requested or list(tradable_tickers))
+                    if ticker in tradable_set
                 )
             )
             if not tickers:
                 raise ValueError("point-in-time bundle has no requested candidate symbols")
-            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
+            all_tickers = list(
+                dict.fromkeys([*tickers, *market_reference_tickers, benchmark])
+            )
+            market_context_universe = tuple(self.pit_bundle.price_symbols())
+            if set(market_context_universe) != tradable_set.union(reference_set):
+                raise ValueError(
+                    "point-in-time market context must exactly cover tradables and references"
+                )
         else:
+            tradable_tickers = tuple(dict.fromkeys(str(ticker).upper() for ticker in tickers))
+            market_reference_tickers = (benchmark,)
             all_tickers = list(dict.fromkeys([*tickers, benchmark]))
-        universe = list(self.pit_bundle.symbols()) if self.pit_bundle is not None else list(dict.fromkeys([*tickers, *get_sp500_tickers()]))
+            market_context_universe = tuple(
+                dict.fromkeys([*tickers, *get_sp500_tickers(), benchmark])
+            )
+        universe = list(market_context_universe)
         checkpoint = Path(checkpoint_path).resolve() if checkpoint_path is not None else None
         progress = Path(progress_log_path).resolve() if progress_log_path is not None else None
         state_log = checkpoint.with_name("portfolio_state.jsonl") if checkpoint is not None else None
@@ -1857,6 +1900,9 @@ class PortfolioSimulator:
             end_date=end_ts,
             benchmark=benchmark,
             universe=all_tickers,
+            tradable_tickers=tradable_tickers,
+            market_reference_tickers=market_reference_tickers,
+            market_context_universe=market_context_universe,
             simulator=self,
             strategy_identity=strategy_identity,
         )
@@ -1923,6 +1969,9 @@ class PortfolioSimulator:
                 "history_start_date": str(history_start.date()),
                 "end_date": str(end_ts.date()),
                 "universe_count": len(universe),
+                "tradable_ticker_count": len(tradable_tickers),
+                "market_reference_ticker_count": len(market_reference_tickers),
+                "market_context_universe_count": len(market_context_universe),
             }, sync=True)
 
         if self.pit_bundle is not None:
@@ -2155,6 +2204,9 @@ class PortfolioSimulator:
             tickers=tickers,
             benchmark=benchmark,
             all_closes=all_closes,
+            tradable_tickers=tradable_tickers,
+            market_reference_tickers=market_reference_tickers,
+            market_context_universe=market_context_universe,
             start_ts=trade_start,
             history_start_ts=history_start,
             end_ts=end_ts,
@@ -2369,6 +2421,9 @@ class PortfolioSimulator:
         tickers: list[str],
         benchmark: str,
         all_closes: pd.DataFrame,
+        tradable_tickers: Iterable[str] | None = None,
+        market_reference_tickers: Iterable[str] | None = None,
+        market_context_universe: Iterable[str] | None = None,
         start_ts: pd.Timestamp,
         end_ts: pd.Timestamp,
         requested_entry_floors: tuple[float | None, float | None] | None = None,
@@ -2384,10 +2439,36 @@ class PortfolioSimulator:
                 self.requested_min_canslim_score,
             )
         )
+        effective_tradable_tickers = tuple(
+            str(ticker).upper()
+            for ticker in (tradable_tickers if tradable_tickers is not None else tickers)
+        )
+        effective_market_reference_tickers = tuple(
+            str(ticker).upper()
+            for ticker in (
+                market_reference_tickers
+                if market_reference_tickers is not None
+                else (benchmark,)
+            )
+        )
+        effective_market_context_universe = tuple(
+            str(ticker).upper()
+            for ticker in (
+                market_context_universe
+                if market_context_universe is not None
+                else all_closes.columns
+            )
+        )
         return {
             "tickers": tickers,
             "candidate_universe_count": len(tickers),
             "rs_universe_count": len(all_closes.columns),
+            "tradable_tickers": list(effective_tradable_tickers),
+            "tradable_ticker_count": len(effective_tradable_tickers),
+            "market_reference_tickers": list(effective_market_reference_tickers),
+            "market_reference_ticker_count": len(effective_market_reference_tickers),
+            "market_context_universe": list(effective_market_context_universe),
+            "market_context_universe_count": len(effective_market_context_universe),
             "benchmark_symbol": benchmark,
             "max_positions": self.max_positions,
             "require_bullish_market": self.require_bullish_market,
@@ -2790,7 +2871,9 @@ class PortfolioSimulator:
         signals: List[dict] = []
         rs_eligible = None
         if self.pit_bundle is not None:
-            rs_eligible = self.pit_bundle.members_at(eval_date) - {self.benchmark_symbol.upper()}
+            rs_eligible = self.pit_bundle.members_at(eval_date).intersection(
+                self.pit_bundle.tradable_symbols()
+            )
         rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date, eligible_tickers=rs_eligible)
         top_groups = get_top_groups(
             rs_snapshot,
@@ -4279,7 +4362,7 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
             pit_bundle = PITDataBundle(
                 args.pit_bundle, expected_sha256=args.pit_bundle_sha256
             )
-            tickers = list(args.tickers or pit_bundle.symbols())
+            tickers = list(args.tickers or pit_bundle.tradable_symbols())
         else:
             tickers = _resolve_universe(args.universe, args.tickers)
             extra = [s for s in settings.EXTRA_SYMBOLS if s not in tickers]

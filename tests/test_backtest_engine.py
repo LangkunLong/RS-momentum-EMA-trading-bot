@@ -82,6 +82,63 @@ def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
     assert closed == [1, 1]
     assert simulator._policy_client is None
 
+    reference_bundle = SimpleNamespace(
+        tradable_symbols=lambda: ("AAA",),
+        reference_symbols=lambda: ("IWM", "QQQ", "SPY"),
+        price_symbols=lambda: ("AAA", "IWM", "QQQ", "SPY"),
+        fundamentals_provider=None,
+    )
+    for reference in ("IWM", "QQQ", "SPY"):
+        with pytest.raises(ValueError, match="observation-only"):
+            PortfolioSimulator(
+                pit_bundle=reference_bundle,
+                technical_only=True,
+            ).run(
+                ["AAA", reference],
+                start_date="2021-06-25",
+                end_date="2021-09-20",
+            )
+
+    prices = {
+        symbol: _make_ohlcv(n=80, close_value=100.0)
+        for symbol in ("AAA", "IWM", "QQQ", "SPY")
+    }
+
+    def fetch_price_data(symbols, _start, _end):
+        return {symbol: prices[symbol] for symbol in symbols}
+
+    def fetch_closes(symbols, _start, _end):
+        return pd.DataFrame(
+            {symbol: prices[symbol]["Close"] for symbol in symbols}
+        )
+
+    reference_bundle.fetch_price_data = fetch_price_data
+    reference_bundle.fetch_closes = fetch_closes
+    reference_bundle.members_at = lambda _session: frozenset({"AAA"})
+    reference_bundle.sha256 = "a" * 64
+    reference_bundle.data_cutoff = prices["SPY"].index[-1]
+    reference_bundle.manifest = lambda: {}
+    result = PortfolioSimulator(
+        pit_bundle=reference_bundle,
+        technical_only=True,
+        signal_every_n_days=1,
+    ).run(
+        ["AAA"],
+        start_date=str(prices["AAA"].index[0].date()),
+        end_date=str(prices["AAA"].index[-1].date()),
+    )
+
+    assert result.config["tickers"] == ["AAA"]
+    assert result.config["market_reference_tickers"] == ["IWM", "QQQ", "SPY"]
+    assert result.config["market_context_universe_count"] == 4
+    assert set(result.signal_log.get("symbol", pd.Series(dtype=str))) <= {"AAA"}
+    assert {trade.symbol for trade in result.trades} <= {"AAA"}
+    assert all(
+        not set(str(row["Holdings"]).split(",")).intersection({"IWM", "QQQ", "SPY"})
+        for _, row in result.weekly_holdings.iterrows()
+    )
+    assert set(result.transaction_log.get("Ticker", pd.Series(dtype=str))) <= {"AAA"}
+
 
 @pytest.mark.parametrize(
     ("client_type", "error_type", "message"),

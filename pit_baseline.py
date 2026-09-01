@@ -1315,9 +1315,15 @@ def run_baseline(
                 master_path=paths["security_master"],
                 exclusions_path=paths["security_master_exclusions"],
             )
-            symbols = bundle.symbols()
-            tickers = [ticker for ticker in symbols if ticker != _BENCHMARK]
-            closes = bundle.fetch_closes(symbols, pd.Timestamp(_START), pd.Timestamp(_END))
+            tradable_tickers = bundle.tradable_symbols()
+            market_reference_tickers = bundle.reference_symbols()
+            market_context_universe = bundle.price_symbols()
+            if _BENCHMARK not in market_reference_tickers:
+                raise ValueError("PIT baseline benchmark is not a sealed market reference")
+            tickers = list(tradable_tickers)
+            closes = bundle.fetch_closes(
+                market_context_universe, pd.Timestamp(_START), pd.Timestamp(_END)
+            )
             if _BENCHMARK not in closes or closes[_BENCHMARK].isna().any():
                 raise ValueError("SPY close calendar is incomplete in the evaluation window")
             sessions = pd.DatetimeIndex(closes[_BENCHMARK].dropna().index).normalize()

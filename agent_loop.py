@@ -19696,7 +19696,17 @@ def _build_pit_optimizer_v3_live_run(
             expected_sha256=pit_bundle_sha256,
         ) as bundle:
             scope = _build_verification_scope(bundle, baseline_run)
-        universe = tuple(scope["symbols"])
+            tradable_tickers = tuple(scope["symbols"])
+            market_reference_tickers = tuple(bundle.reference_symbols())
+            market_context_universe = tuple(bundle.tradable_symbols())
+        if (
+            set(tradable_tickers).intersection(market_reference_tickers)
+            or not set(tradable_tickers).issubset(market_context_universe)
+        ):
+            raise ConfigurationError("PIT evaluator panel escapes the tradable universe")
+        # The simulator derives context closes from this full authenticated
+        # membership set, while evaluator folds trade only the smaller panel.
+        universe = tradable_tickers
         probes = (
             PolicyDeterminismProbe(
                 "recommend_capacity",

@@ -1026,7 +1026,7 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
         or any(
             not isinstance(symbol, str)
             or re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol) is None
-            or symbol == "SPY"
+            or symbol in {"IWM", "QQQ", "SPY"}
             for symbol in symbols
         )
     ):
@@ -1101,9 +1101,15 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
     first_activity = attempts["signal_date"].min()
     fetch_closes = getattr(bundle, "fetch_closes", None)
     members_at = getattr(bundle, "members_at", None)
-    symbols_method = getattr(bundle, "symbols", None)
-    if not all(callable(value) for value in (fetch_closes, members_at, symbols_method)):
+    tradable_symbols = getattr(bundle, "tradable_symbols", None)
+    reference_symbols = getattr(bundle, "reference_symbols", None)
+    if not all(callable(value) for value in (fetch_closes, members_at, tradable_symbols, reference_symbols)):
         raise ValueError("PIT bundle cannot derive a verification scope")
+    market_reference_tickers = tuple(reference_symbols())
+    if "SPY" not in market_reference_tickers:
+        raise ValueError("PIT bundle lacks SPY as a sealed market reference")
+    if set(attempts["symbol"]).intersection(market_reference_tickers):
+        raise ValueError("baseline entry attempts contain non-tradable market references")
     benchmark = fetch_closes(
         ["SPY"], pd.Timestamp(FULL_START_DATE), pd.Timestamp(FULL_END_DATE)
     )
@@ -1129,16 +1135,8 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
         (str(symbol) for symbol in attempt_counts.index),
         key=lambda symbol: (-int(attempt_counts[symbol]), symbol),
     )
-    active_members = {
-        str(symbol)
-        for symbol in members_at(discovery_start)
-        if str(symbol) != "SPY"
-    }
-    available = {
-        str(symbol)
-        for symbol in symbols_method()
-        if str(symbol) != "SPY"
-    }
+    active_members = {str(symbol) for symbol in members_at(discovery_start)}
+    available = {str(symbol) for symbol in tradable_symbols()}
     candidate_pool = sorted(active_members & available)
     closes = fetch_closes(
         candidate_pool, pd.Timestamp(FULL_START_DATE), holdout_end
@@ -2986,7 +2984,7 @@ def evaluate_full_pit_candidate(
     from core.pit_data import PITDataBundle
 
     with PITDataBundle(bundle_path, expected_sha256=pit_bundle_sha256) as bundle:
-        symbols = [symbol for symbol in bundle.symbols() if symbol != "SPY"]
+        symbols = list(bundle.tradable_symbols())
         simulator = PortfolioSimulator(pit_bundle=bundle, signal_every_n_days=1)
         result = simulator.run(
             symbols,
@@ -3078,7 +3076,7 @@ def evaluate_verification_pit_candidate(
 
     with PITDataBundle(bundle_path, expected_sha256=pit_bundle_sha256) as bundle:
         symbols = list(scope["symbols"])
-        if not set(symbols).issubset(set(bundle.symbols()) - {"SPY"}):
+        if not set(symbols).issubset(set(bundle.tradable_symbols())):
             raise ValueError("verification symbols differ from the sealed PIT bundle")
         simulator = PortfolioSimulator(pit_bundle=bundle, signal_every_n_days=1)
         result = simulator.run(

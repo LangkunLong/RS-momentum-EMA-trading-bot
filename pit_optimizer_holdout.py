@@ -237,7 +237,17 @@ def _build_hidden_evaluator(
         raise HoldoutPreflightError("optimizer_readiness_invalid")
     with PITDataBundle(pit_bundle, expected_sha256=manifest.pit_bundle_sha256) as bundle:
         scope = _build_verification_scope(bundle, baseline_run)
-    universe = tuple(scope["symbols"])
+        tradable_tickers = tuple(scope["symbols"])
+        market_reference_tickers = tuple(bundle.reference_symbols())
+        market_context_universe = tuple(bundle.tradable_symbols())
+    if (
+        set(tradable_tickers).intersection(market_reference_tickers)
+        or not set(tradable_tickers).issubset(market_context_universe)
+    ):
+        raise HoldoutPreflightError("holdout panel escapes the tradable universe")
+    # The full membership universe remains available to the simulator for
+    # market context; only this deterministic panel can generate trades.
+    universe = tradable_tickers
     probes = (
         PolicyDeterminismProbe(
             "recommend_capacity",
