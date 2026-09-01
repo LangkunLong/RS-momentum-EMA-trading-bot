@@ -1637,6 +1637,63 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
         candidate_discovery=None,
     )
     assert invalid_critic_input.author_output_invalid == invalid_author
+    from core import pit_optimizer_authorization as authorization
+
+    investigator_facts = authorization.PitOptimizerProviderFacts(
+        call_index=1,
+        iteration=1,
+        role="investigator",
+        requested_model=contract.PIT_OPTIMIZER_R1_MODEL,
+        returned_model=contract.PIT_OPTIMIZER_R1_MODEL,
+        pricing_snapshot_sha256="7" * 64,
+        outcome="accepted",
+        request_started=True,
+        response_received=True,
+        finish_reason="stop",
+        response_schema_valid=True,
+        accounting_complete=True,
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        cost_usd=0.0,
+        retained_reservation_tokens=0,
+        audit_sha256="8" * 64,
+        accounting_source="inline",
+    )
+    investigator_attempt = authorization.PitOptimizerRoleAttempt(
+        plan=v4_scope.call_budgets[0],
+        facts=investigator_facts,
+        payload=investigator_v4,
+    )
+    author_attempt = authorization.PitOptimizerRoleAttempt(
+        plan=v4_scope.call_budgets[1],
+        facts=replace(
+            investigator_facts,
+            call_index=2,
+            role="author",
+            outcome="schema_invalid",
+            response_schema_valid=False,
+            response_validation_code="payload_schema_invalid",
+        ),
+        payload=None,
+    )
+    invalid_critic_primitive = json.loads(
+        invalid_critic_input.canonical_json_bytes()
+    )
+    authorization._require_critic_predecessor_attempt_lineage(
+        invalid_critic_primitive,
+        investigator_attempt,
+        author_attempt,
+    )
+    invalid_critic_primitive["author_output_invalid"][
+        "validation_code"
+    ] = "payload_binding_invalid"
+    with pytest.raises(authorization.AuthorizationError, match="summary differs"):
+        authorization._require_critic_predecessor_attempt_lineage(
+            invalid_critic_primitive,
+            investigator_attempt,
+            author_attempt,
+        )
     with pytest.raises(ValueError, match="exactly one"):
         replace(invalid_critic_input, author_manifest=author_manifest_v4)
     with pytest.raises(ValueError, match="exactly one"):

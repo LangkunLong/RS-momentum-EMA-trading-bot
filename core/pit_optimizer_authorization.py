@@ -26,6 +26,7 @@ from core.pit_optimization_contract import (
     AuthorArtifactV4,
     AuthorInput,
     AuthorManifestSummary,
+    AuthorManifestSummaryV4,
     CriticArtifact,
     CriticArtifactV4,
     CriticInput,
@@ -38,6 +39,7 @@ from core.pit_optimization_contract import (
     PitOptimizerRunManifest,
     PolicySourceBundle,
     PolicySourceRecord,
+    RoleOutputInvalidSummary,
     authenticate_policy_source_bundle,
 )
 import core.pit_optimization_contract as _contract
@@ -816,6 +818,112 @@ class PitOptimizerRoleAttempt:
     @property
     def recoverable_schema_invalid(self) -> bool:
         return self.payload is None
+
+
+def _require_critic_predecessor_attempt_lineage(
+    primitive: Mapping[str, object],
+    investigator_attempt: PitOptimizerRoleCall | PitOptimizerRoleAttempt,
+    author_attempt: PitOptimizerRoleCall | PitOptimizerRoleAttempt,
+) -> None:
+    """Authenticate the critic's accepted-investigator/author-outcome XOR."""
+
+    investigator_payload = investigator_attempt.payload
+    author_payload = author_attempt.payload
+    if (
+        investigator_attempt.facts.outcome != "accepted"
+        or not isinstance(
+            investigator_payload,
+            (InvestigatorArtifact, InvestigatorArtifactV4),
+        )
+    ):
+        raise AuthorizationError(
+            "optimizer critic requires an accepted investigator artifact"
+        )
+    accepted_author = (
+        author_attempt.facts.outcome == "accepted"
+        and isinstance(author_payload, (AuthorArtifact, AuthorArtifactV4))
+    )
+    invalid_author = (
+        isinstance(author_attempt, PitOptimizerRoleAttempt)
+        and author_attempt.recoverable_schema_invalid
+        and author_attempt.plan.role == "author"
+    )
+    if accepted_author == invalid_author:
+        raise AuthorizationError(
+            "optimizer critic author predecessor outcome is ambiguous"
+        )
+    if isinstance(investigator_payload, InvestigatorArtifact):
+        if not accepted_author or not isinstance(author_payload, AuthorArtifact):
+            raise AuthorizationError(
+                "legacy optimizer critic requires an accepted author artifact"
+            )
+        _require_critic_predecessor_lineage(
+            primitive,
+            investigator_payload,
+            author_payload,
+        )
+        return
+    if primitive.get("investigator_summary") != investigator_payload.to_primitive():
+        raise AuthorizationError("optimizer critic investigator artifact differs")
+    if invalid_author:
+        validation_code = author_attempt.facts.response_validation_code
+        assert validation_code is not None
+        expected_invalid = RoleOutputInvalidSummary(
+            iteration=author_attempt.plan.iteration,
+            call_index=author_attempt.plan.call_index,
+            role="author",
+            validation_code=validation_code,
+        )
+        if (
+            primitive.get("author_manifest") is not None
+            or primitive.get("author_output_invalid")
+            != expected_invalid.to_primitive()
+            or any(
+                primitive.get(name) is not None
+                for name in ("author", "author_payload")
+            )
+        ):
+            raise AuthorizationError(
+                "optimizer critic invalid-author summary differs"
+            )
+        return
+    if not isinstance(author_payload, AuthorArtifactV4):
+        raise AuthorizationError(
+            "optimizer critic accepted-author schema differs"
+        )
+    selected_parent = primitive.get("selected_parent_identity")
+    if not isinstance(selected_parent, dict):
+        raise AuthorizationError(
+            "optimizer critic selected parent identity is invalid"
+        )
+    try:
+        parent_identity = _contract.SelectedParentIdentity(
+            schema_version=selected_parent["schema_version"],
+            parent_kind=selected_parent["parent_kind"],
+            parent_id=selected_parent["parent_id"],
+            source_head=selected_parent["source_head"],
+            policy_interface_version=selected_parent["policy_interface_version"],
+            policy_source_sha256s=tuple(
+                tuple(item) for item in selected_parent["policy_source_sha256s"]
+            ),
+            source_bundle_sha256=selected_parent["source_bundle_sha256"],
+            parent_identity_sha256=selected_parent["parent_identity_sha256"],
+        )
+        expected_manifest = AuthorManifestSummaryV4.from_artifact(
+            author_payload,
+            selected_parent=parent_identity,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuthorizationError(
+            "optimizer critic accepted-author manifest is invalid"
+        ) from exc
+    if (
+        primitive.get("author_manifest") != expected_manifest.to_primitive()
+        or primitive.get("author_output_invalid") is not None
+    ):
+        raise AuthorizationError(
+            "optimizer critic accepted-author manifest differs"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1695,17 +1803,19 @@ class AuthorizationLedger:
                     "optimizer role input predecessor artifact differs"
                 )
         elif canonical_plan.role == "critic":
-            if len(legacy_calls) != 2:
+            if len(predecessors) != 2 or any(
+                isinstance(item, AuthorizationPlanSkip) for item in predecessors
+            ):
                 raise AuthorizationError(
-                    "optimizer critic requires accepted predecessor artifacts"
+                    "optimizer critic predecessor lineage is invalid"
                 )
-            investigator_call, author_call = legacy_calls
-            author_payload = author_call.payload
-            assert isinstance(author_payload, AuthorArtifact)
-            _require_critic_predecessor_lineage(
+            investigator_attempt, author_attempt = predecessors
+            assert not isinstance(investigator_attempt, AuthorizationPlanSkip)
+            assert not isinstance(author_attempt, AuthorizationPlanSkip)
+            _require_critic_predecessor_attempt_lineage(
                 primitive,
-                investigator_call.payload,
-                author_payload,
+                investigator_attempt,
+                author_attempt,
             )
         with self._role_input_lock:
             if canonical_plan.call_index in self._consumed_role_input_plans:
