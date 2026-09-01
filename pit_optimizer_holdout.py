@@ -237,17 +237,17 @@ def _build_hidden_evaluator(
         raise HoldoutPreflightError("optimizer_readiness_invalid")
     with PITDataBundle(pit_bundle, expected_sha256=manifest.pit_bundle_sha256) as bundle:
         scope = _build_verification_scope(bundle, baseline_run)
-        tradable_tickers = tuple(scope["symbols"])
+        universe = tuple(scope["symbols"])
+        tradable_tickers = tuple(bundle.tradable_symbols())
         market_reference_tickers = tuple(bundle.reference_symbols())
-        market_context_universe = tuple(bundle.tradable_symbols())
+        market_context_universe = tuple(bundle.price_symbols())
     if (
-        set(tradable_tickers).intersection(market_reference_tickers)
-        or not set(tradable_tickers).issubset(market_context_universe)
+        set(universe).intersection(market_reference_tickers)
+        or not set(universe).issubset(tradable_tickers)
+        or set(market_context_universe)
+        != set(tradable_tickers).union(market_reference_tickers)
     ):
         raise HoldoutPreflightError("holdout panel escapes the tradable universe")
-    # The full membership universe remains available to the simulator for
-    # market context; only this deterministic panel can generate trades.
-    universe = tradable_tickers
     probes = (
         PolicyDeterminismProbe(
             "recommend_capacity",
@@ -293,6 +293,19 @@ def _build_hidden_evaluator(
             raise HoldoutPreflightError("holdout_evidence_identity_invalid")
         return evidence
 
+    def validate_result_universes(result: object) -> object:
+        config = getattr(result, "config", None)
+        expected = {
+            "tradable_tickers": list(tradable_tickers),
+            "market_reference_tickers": list(market_reference_tickers),
+            "market_context_universe": list(market_context_universe),
+        }
+        if not isinstance(config, Mapping) or any(
+            config.get(name) != value for name, value in expected.items()
+        ):
+            raise HoldoutPreflightError("holdout_universe_identity_invalid")
+        return result
+
     def evaluate_baseline(fold: object) -> object:
         progress.publish("baseline_replay")
         require_wall_time()
@@ -310,7 +323,10 @@ def _build_hidden_evaluator(
                 benchmark_symbol=manifest.fold_manifest.benchmark,
             )
         require_wall_time()
-        return validate_evidence(build_fold_evidence(fold=fold, result=result), fold)
+        return validate_evidence(
+            build_fold_evidence(fold=fold, result=validate_result_universes(result)),
+            fold,
+        )
 
     def evaluate_candidate(candidate_root: Path, fold: object, identity_sha256: str) -> object:
         nonlocal worker_sequence
@@ -338,7 +354,10 @@ def _build_hidden_evaluator(
                 benchmark_symbol=manifest.fold_manifest.benchmark,
             )
         require_wall_time()
-        return validate_evidence(build_fold_evidence(fold=fold, result=result), fold)
+        return validate_evidence(
+            build_fold_evidence(fold=fold, result=validate_result_universes(result)),
+            fold,
+        )
 
     def reset_receipt(subject: str, identity_sha256: str) -> object:
         fold = manifest.fold_manifest.hidden_fold

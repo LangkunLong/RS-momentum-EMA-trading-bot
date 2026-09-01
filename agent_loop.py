@@ -19458,20 +19458,36 @@ class _PitOptimizerEvaluatorData:
     """Authenticated universe plus the two local evaluator capabilities."""
 
     universe: tuple[str, ...]
+    tradable_tickers: tuple[str, ...]
+    market_reference_tickers: tuple[str, ...]
+    market_context_universe: tuple[str, ...]
     evaluate_candidate: Callable[[Path, object, object, str], object]
     evaluate_baseline: Callable[[object], object]
 
     def __post_init__(self) -> None:
-        if (
-            type(self.universe) is not tuple
-            or not self.universe
-            or len(set(self.universe)) != len(self.universe)
-            or any(
-                not isinstance(symbol, str)
-                or not symbol
-                or symbol != symbol.strip()
-                for symbol in self.universe
+        def valid_tickers(values: object) -> bool:
+            return (
+                type(values) is tuple
+                and bool(values)
+                and len(set(values)) == len(values)
+                and all(
+                    isinstance(symbol, str)
+                    and bool(symbol)
+                    and symbol == symbol.strip()
+                    and symbol == symbol.upper()
+                    for symbol in values
+                )
             )
+
+        if (
+            not valid_tickers(self.universe)
+            or not valid_tickers(self.tradable_tickers)
+            or not valid_tickers(self.market_reference_tickers)
+            or not valid_tickers(self.market_context_universe)
+            or not set(self.universe).issubset(self.tradable_tickers)
+            or set(self.tradable_tickers).intersection(self.market_reference_tickers)
+            or set(self.market_context_universe)
+            != set(self.tradable_tickers).union(self.market_reference_tickers)
             or not callable(self.evaluate_candidate)
             or not callable(self.evaluate_baseline)
         ):
@@ -19696,17 +19712,17 @@ def _build_pit_optimizer_v3_live_run(
             expected_sha256=pit_bundle_sha256,
         ) as bundle:
             scope = _build_verification_scope(bundle, baseline_run)
-            tradable_tickers = tuple(scope["symbols"])
+            universe = tuple(scope["symbols"])
+            tradable_tickers = tuple(bundle.tradable_symbols())
             market_reference_tickers = tuple(bundle.reference_symbols())
-            market_context_universe = tuple(bundle.tradable_symbols())
+            market_context_universe = tuple(bundle.price_symbols())
         if (
-            set(tradable_tickers).intersection(market_reference_tickers)
-            or not set(tradable_tickers).issubset(market_context_universe)
+            set(universe).intersection(market_reference_tickers)
+            or not set(universe).issubset(tradable_tickers)
+            or set(market_context_universe)
+            != set(tradable_tickers).union(market_reference_tickers)
         ):
             raise ConfigurationError("PIT evaluator panel escapes the tradable universe")
-        # The simulator derives context closes from this full authenticated
-        # membership set, while evaluator folds trade only the smaller panel.
-        universe = tradable_tickers
         probes = (
             PolicyDeterminismProbe(
                 "recommend_capacity",
@@ -19751,7 +19767,9 @@ def _build_pit_optimizer_v3_live_run(
                     ),
                     benchmark_symbol=manifest.fold_manifest.benchmark,
                 )
-            return build_fold_evidence(fold=fold, result=result)
+            return build_fold_evidence(
+                fold=fold, result=validate_result_universes(result)
+            )
 
         def evaluate_baseline(fold: object) -> object:
             with PITDataBundle(
@@ -19772,10 +19790,28 @@ def _build_pit_optimizer_v3_live_run(
                     ),
                     benchmark_symbol=manifest.fold_manifest.benchmark,
                 )
-            return build_fold_evidence(fold=fold, result=result)
+            return build_fold_evidence(
+                fold=fold, result=validate_result_universes(result)
+            )
+
+        def validate_result_universes(result: object) -> object:
+            config = getattr(result, "config", None)
+            expected = {
+                "tradable_tickers": list(tradable_tickers),
+                "market_reference_tickers": list(market_reference_tickers),
+                "market_context_universe": list(market_context_universe),
+            }
+            if not isinstance(config, Mapping) or any(
+                config.get(name) != value for name, value in expected.items()
+            ):
+                raise ConfigurationError("PIT evaluator universe identities differ")
+            return result
 
         return _PitOptimizerEvaluatorData(
             universe=universe,
+            tradable_tickers=tradable_tickers,
+            market_reference_tickers=market_reference_tickers,
+            market_context_universe=market_context_universe,
             evaluate_candidate=evaluate_candidate,
             evaluate_baseline=evaluate_baseline,
         )

@@ -2532,6 +2532,9 @@ def test_dispatch_with_production_composition_completes_mocked_two_iteration_can
         evaluator_factory_calls.append(kwargs)
         return agent_loop._PitOptimizerEvaluatorData(
             universe=universe,
+            tradable_tickers=universe,
+            market_reference_tickers=("IWM", "QQQ", "SPY"),
+            market_context_universe=(*universe, "IWM", "QQQ", "SPY"),
             evaluate_candidate=evaluate_candidate,
             evaluate_baseline=evaluate_baseline,
         )

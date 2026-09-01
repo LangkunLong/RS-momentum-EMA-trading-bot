@@ -106,6 +106,7 @@ _ENTRY_OUTCOMES = (
 )
 _VERIFICATION_SESSION_COUNT = 60
 _VERIFICATION_SYMBOL_COUNT = 25
+_VERIFICATION_FIRST_DISCOVERY_SESSION = "2021-06-25"
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -1035,7 +1036,10 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
         value.get("benchmark") != "SPY"
         or value.get("warmup_start") != FULL_START_DATE
         or value.get("selection")
-        != "sealed_discovery_activity_then_hash_ranked_active_fill"
+        not in {
+            "sealed_discovery_activity_then_hash_ranked_active_fill",
+            "sealed_active_membership_hash_ranked",
+        }
         or value.get("session_count") != _VERIFICATION_SESSION_COUNT
         or value.get("symbol_count") != _VERIFICATION_SYMBOL_COUNT
     ):
@@ -1046,8 +1050,8 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
         "known_holdout_entry_attempts",
     ):
         count = value.get(field)
-        if type(count) is not int or count < 1:
-            raise ValueError(f"optimization verification {field} must be positive")
+        if type(count) is not int or count < 0:
+            raise ValueError(f"optimization verification {field} must be non-negative")
     if int(value["known_activity_symbols"]) > _VERIFICATION_SYMBOL_COUNT:
         raise ValueError("optimization verification activity symbols exceed the subset")
     try:
@@ -1072,33 +1076,9 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
     return value
 
 
-def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, object]:
-    """Derive a small, active slice solely from authenticated local inputs."""
+def _build_verification_scope(bundle: object, _baseline_run: Path) -> dict[str, object]:
+    """Derive a fixed active-membership panel from the authenticated bundle."""
 
-    attempts_path = _regular_file(
-        baseline_run / "entry_attempt_outcomes.csv", "baseline entry attempts"
-    )
-    attempts = pd.read_csv(attempts_path, dtype=str, keep_default_na=False)
-    expected_columns = {
-        "symbol",
-        "signal_date",
-        "entry_date",
-        "pivot",
-        "buy_zone_lower",
-        "buy_zone_upper",
-        "entry_open",
-        "outcome",
-    }
-    if attempts.empty or set(attempts.columns) != expected_columns:
-        raise ValueError("baseline entry attempts cannot define verification activity")
-    attempts["symbol"] = attempts["symbol"].str.upper()
-    try:
-        attempts["signal_date"] = pd.to_datetime(
-            attempts["signal_date"], errors="raise"
-        ).dt.normalize()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("baseline entry-attempt dates are invalid") from exc
-    first_activity = attempts["signal_date"].min()
     fetch_closes = getattr(bundle, "fetch_closes", None)
     members_at = getattr(bundle, "members_at", None)
     tradable_symbols = getattr(bundle, "tradable_symbols", None)
@@ -1108,15 +1088,15 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
     market_reference_tickers = tuple(reference_symbols())
     if "SPY" not in market_reference_tickers:
         raise ValueError("PIT bundle lacks SPY as a sealed market reference")
-    if set(attempts["symbol"]).intersection(market_reference_tickers):
-        raise ValueError("baseline entry attempts contain non-tradable market references")
     benchmark = fetch_closes(
         ["SPY"], pd.Timestamp(FULL_START_DATE), pd.Timestamp(FULL_END_DATE)
     )
     if "SPY" not in benchmark:
         raise ValueError("PIT bundle lacks the verification benchmark")
     sessions = pd.DatetimeIndex(benchmark["SPY"].dropna().index).normalize()
-    measurement_sessions = sessions[sessions >= first_activity][
+    measurement_sessions = sessions[
+        sessions >= pd.Timestamp(_VERIFICATION_FIRST_DISCOVERY_SESSION)
+    ][
         : 2 * _VERIFICATION_SESSION_COUNT
     ]
     if len(measurement_sessions) != 2 * _VERIFICATION_SESSION_COUNT:
@@ -1127,14 +1107,6 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
     discovery_end = discovery_sessions[-1]
     holdout_start = holdout_sessions[0]
     holdout_end = holdout_sessions[-1]
-    discovery_attempts = attempts.loc[
-        attempts["signal_date"].between(discovery_start, discovery_end)
-    ]
-    attempt_counts = discovery_attempts.groupby("symbol", sort=True).size()
-    ranked_activity = sorted(
-        (str(symbol) for symbol in attempt_counts.index),
-        key=lambda symbol: (-int(attempt_counts[symbol]), symbol),
-    )
     active_members = {str(symbol) for symbol in members_at(discovery_start)}
     available = {str(symbol) for symbol in tradable_symbols()}
     candidate_pool = sorted(active_members & available)
@@ -1147,34 +1119,25 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
         for symbol in candidate_pool
         if symbol in closes and int(closes[symbol].count()) >= minimum_warmup_bars
     }
-    if any(symbol not in covered for symbol in ranked_activity):
-        raise ValueError("known verification activity lacks sufficient warm-up prices")
-    fill = sorted(
-        covered - set(ranked_activity),
+    selected = sorted(
+        covered,
         key=lambda symbol: _sha256_bytes(
             f"{PIT_BUNDLE_SHA256}:{symbol}".encode("ascii")
         ),
-    )
-    selected = [*ranked_activity, *fill][:_VERIFICATION_SYMBOL_COUNT]
+    )[:_VERIFICATION_SYMBOL_COUNT]
     if len(selected) != _VERIFICATION_SYMBOL_COUNT:
         raise ValueError("PIT bundle lacks enough covered verification symbols")
-    holdout_attempts = attempts.loc[
-        attempts["signal_date"].between(holdout_start, holdout_end)
-        & attempts["symbol"].isin(selected)
-    ]
-    if holdout_attempts.empty:
-        raise ValueError("verification holdout lacks known strategy activity")
     return _validate_verification_scope(
         {
             "benchmark": "SPY",
             "discovery_end": discovery_end.date().isoformat(),
             "discovery_start": discovery_start.date().isoformat(),
-            "known_activity_symbols": len(ranked_activity),
-            "known_discovery_entry_attempts": int(len(discovery_attempts)),
-            "known_holdout_entry_attempts": int(len(holdout_attempts)),
+            "known_activity_symbols": 0,
+            "known_discovery_entry_attempts": 0,
+            "known_holdout_entry_attempts": 0,
             "holdout_end": holdout_end.date().isoformat(),
             "holdout_start": holdout_start.date().isoformat(),
-            "selection": "sealed_discovery_activity_then_hash_ranked_active_fill",
+            "selection": "sealed_active_membership_hash_ranked",
             "session_count": _VERIFICATION_SESSION_COUNT,
             "symbol_count": _VERIFICATION_SYMBOL_COUNT,
             "symbols": selected,

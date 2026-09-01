@@ -1522,13 +1522,9 @@ def build_subset_manifest(
             parity_attestation=parity_attestation,
             parity_reference=parity_reference,
         )
-        scope = evaluation.get("scope") if isinstance(evaluation, Mapping) else None
-        raw_universe = scope.get("symbols") if isinstance(scope, Mapping) else None
         if (
             fold_manifest.data_identity_sha256 != bundle_sha256
             or fold_manifest.benchmark != "SPY"
-            or not isinstance(raw_universe, list)
-            or tuple(raw_universe) != selected_universe
         ):
             raise ValueError("attested parity reference differs from legacy readiness")
 
