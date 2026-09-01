@@ -1996,6 +1996,7 @@ def _v4_manifest() -> tuple[
         policy_authoring_scope=scope,
         immutable_constraint_ids=("causal_only", "no_external_io"),
         sandbox_image="example.invalid/pit-optimizer@sha256:" + "2" * 64,
+        authorization_window_id="window_v4_manifest_test",
     )
     return manifest, plan
 

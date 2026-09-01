@@ -295,6 +295,8 @@ class PitOptimizerGateConfigV4:
     readiness_sha256: str | None
     campaign_checkpoint: Path | None
     campaign_checkpoint_sha256: str | None
+    authorization_window_id: str | None
+    authorization_requirement_sha256: str
     source_transmission_authorized: bool
     max_api_calls: int
     max_tokens: int
@@ -330,6 +332,7 @@ class PitOptimizerGateConfigV4:
             "pit_bundle_sha256",
             "optimizer_manifest_sha256",
             "discovery_panel_plan_sha256",
+            "authorization_requirement_sha256",
         ):
             if _SHA256_RE.fullmatch(getattr(self, name) or "") is None:
                 raise ValueError(f"optimizer v4 {name} is invalid")
@@ -351,10 +354,16 @@ class PitOptimizerGateConfigV4:
             if _SHA256_RE.fullmatch(self.campaign_checkpoint_sha256 or "") is None:
                 raise ValueError("optimizer v4 campaign checkpoint digest is invalid")
         if self.phase == "prepare":
-            if self.readiness_sha256 is not None or self.source_transmission_authorized:
+            if (
+                self.readiness_sha256 is not None
+                or self.source_transmission_authorized
+                or self.authorization_window_id is not None
+            ):
                 raise ValueError("optimizer v4 prepare cannot carry live authority")
         elif (
             _SHA256_RE.fullmatch(self.readiness_sha256 or "") is None
+            or not isinstance(self.authorization_window_id, str)
+            or not self.authorization_window_id
             or self.source_transmission_authorized is not True
         ):
             raise ValueError("optimizer v4 canary requires readiness and source authority")

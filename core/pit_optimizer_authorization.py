@@ -25,18 +25,22 @@ from core.pit_optimization_contract import (
     AuthorArtifact,
     AuthorArtifactV4,
     AuthorInput,
+    AuthorInputV4,
     AuthorManifestSummary,
     AuthorManifestSummaryV4,
     CriticArtifact,
     CriticArtifactV4,
     CriticInput,
+    CriticInputV4,
     InvestigatorArtifact,
     InvestigatorArtifactV4,
     InvestigatorInput,
+    InvestigatorInputV4,
     OPTIMIZER_V2_ROLES,
     PatchBounds,
     PitOptimizerCallBudget,
     PitOptimizerRunManifest,
+    PitOptimizerRunManifestV4,
     PolicySourceBundle,
     PolicySourceRecord,
     RoleOutputInvalidSummary,
@@ -1111,21 +1115,43 @@ class AuthenticatedRoleInputSnapshot:
     expected_hypothesis_id: str | None = None
     source_bundle: PolicySourceBundle | None = None
     candidate_bounds: PatchBounds | None = None
+    schema_version: int = 3
 
     def validate_artifact(
         self,
-        artifact: InvestigatorArtifact | AuthorArtifact | CriticArtifact,
+        artifact: (
+            InvestigatorArtifact
+            | AuthorArtifact
+            | CriticArtifact
+            | InvestigatorArtifactV4
+            | AuthorArtifactV4
+            | CriticArtifactV4
+        ),
     ) -> None:
         """Validate response relationships only against the authenticated snapshot."""
 
-        expected_type = {
-            "investigator": InvestigatorArtifact,
-            "author": AuthorArtifact,
-            "critic": CriticArtifact,
-        }[self.role]
+        expected_type = (
+            {
+                "investigator": InvestigatorArtifactV4,
+                "author": AuthorArtifactV4,
+                "critic": CriticArtifactV4,
+            }[self.role]
+            if self.schema_version == 4
+            else {
+                "investigator": InvestigatorArtifact,
+                "author": AuthorArtifact,
+                "critic": CriticArtifact,
+            }[self.role]
+        )
         if not isinstance(artifact, expected_type):
             raise ValueError("optimizer response has an invalid type")
-        if self.role == "author":
+        if self.schema_version == 4:
+            if self.role == "critic" and (
+                not isinstance(artifact, CriticArtifactV4)
+                or artifact.hypothesis_id != self.expected_hypothesis_id
+            ):
+                raise ValueError("critic hypothesis differs from its input")
+        elif self.role == "author":
             assert isinstance(artifact, AuthorArtifact)
             # The author proposal is structurally parsed before this point.
             # Its one authoritative applicability check runs later against the
@@ -1139,20 +1165,40 @@ class AuthenticatedRoleInputSnapshot:
                 raise ValueError("critic hypothesis differs from its input")
 
 
+def _authorization_scope_sha256(
+    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
+) -> str:
+    if isinstance(manifest, PitOptimizerRunManifest):
+        return manifest.policy_source_scope.sha256
+    if isinstance(manifest, PitOptimizerRunManifestV4):
+        return manifest.policy_authoring_scope.sha256
+    raise AuthorizationError("authorization manifest is invalid")
+
+
+def _authorization_run_id(
+    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
+) -> str:
+    if isinstance(manifest, PitOptimizerRunManifest):
+        return manifest.run_id
+    if isinstance(manifest, PitOptimizerRunManifestV4):
+        return manifest.campaign_id
+    raise AuthorizationError("authorization manifest is invalid")
+
+
 def require_authorized_policy_source_scope(
-    manifest: PitOptimizerRunManifest,
+    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
     requirement: AuthorizationRequirement,
     window: OperatorAuthorizationWindow,
 ) -> str:
     """Authenticate one window against the exact manifest policy-source scope."""
 
-    if not isinstance(manifest, PitOptimizerRunManifest):
+    if not isinstance(manifest, (PitOptimizerRunManifest, PitOptimizerRunManifestV4)):
         raise AuthorizationError("authorization manifest is invalid")
     if not isinstance(requirement, AuthorizationRequirement):
         raise AuthorizationError("authorization requirement is invalid")
     if not isinstance(window, OperatorAuthorizationWindow):
         raise AuthorizationError("authorization window is invalid")
-    expected = manifest.policy_source_scope.sha256
+    expected = _authorization_scope_sha256(manifest)
     if requirement.sha256 != manifest.authorization_requirement.sha256:
         raise AuthorizationError("authorization requirement mismatch")
     if window.authorization_requirement_sha256 != requirement.sha256:
@@ -1196,7 +1242,11 @@ def _authorization_file_lock(path: Path) -> Iterator[None]:
 class AuthorizationLedger:
     """Permanent hash-chained grant/window ledger for one authenticated manifest."""
 
-    def __init__(self, path: Path, manifest: PitOptimizerRunManifest) -> None:
+    def __init__(
+        self,
+        path: Path,
+        manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
+    ) -> None:
         candidate = Path(path)
         if (
             not candidate.is_absolute()
@@ -1206,7 +1256,10 @@ class AuthorizationLedger:
             or candidate.is_symlink()
         ):
             raise AuthorizationError("authorization ledger path is invalid")
-        if not isinstance(manifest, PitOptimizerRunManifest):
+        if not isinstance(
+            manifest,
+            (PitOptimizerRunManifest, PitOptimizerRunManifestV4),
+        ):
             raise AuthorizationError("authorization ledger manifest is invalid")
         try:
             manifest_primitive = json.loads(
@@ -1215,8 +1268,14 @@ class AuthorizationLedger:
             )
             if not isinstance(manifest_primitive, dict):
                 raise ValueError("optimizer manifest snapshot is invalid")
-            manifest_snapshot = _contract._pit_optimizer_manifest_from_primitive(
-                manifest_primitive
+            manifest_snapshot = (
+                _contract._pit_optimizer_manifest_v4_from_primitive(
+                    manifest_primitive
+                )
+                if manifest.schema_version == 4
+                else _contract._pit_optimizer_manifest_from_primitive(
+                    manifest_primitive
+                )
             )
         except (AuthorizationError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AuthorizationError(
@@ -1243,7 +1302,7 @@ class AuthorizationLedger:
             self._read_records()
 
     @property
-    def manifest(self) -> PitOptimizerRunManifest:
+    def manifest(self) -> PitOptimizerRunManifest | PitOptimizerRunManifestV4:
         """Return the immutable manifest authenticated by this ledger instance."""
 
         return self._manifest
@@ -1257,7 +1316,7 @@ class AuthorizationLedger:
 
         if not isinstance(audit_trail, AuditTrail):
             raise AuthorizationError("authorization audit trail is invalid")
-        if audit_trail.run_id != self._manifest.run_id:
+        if audit_trail.run_id != _authorization_run_id(self._manifest):
             raise AuthorizationError(
                 "authorization audit run differs from manifest"
             )
@@ -1442,9 +1501,9 @@ class AuthorizationLedger:
         """Capture first, then authenticate provenance from those exact bytes."""
 
         expected_types = {
-            "investigator": InvestigatorInput,
-            "author": AuthorInput,
-            "critic": CriticInput,
+            "investigator": (InvestigatorInput, InvestigatorInputV4),
+            "author": (AuthorInput, AuthorInputV4),
+            "critic": (CriticInput, CriticInputV4),
         }
         if (
             not isinstance(plan, PitOptimizerCallBudget)
@@ -1471,8 +1530,12 @@ class AuthorizationLedger:
             ).encode("utf-8")
         ):
             raise AuthorizationError("optimizer role input snapshot is not canonical")
+        schema_version = primitive.get("schema_version")
+        expected_schema_version = 4 if isinstance(
+            self._manifest, PitOptimizerRunManifestV4
+        ) else 2
         if (
-            primitive.get("schema_version") != 2
+            schema_version != expected_schema_version
             or primitive.get("iteration") != plan.iteration
             or primitive.get("run_manifest_sha256") != self._manifest.sha256
             or primitive.get("immutable_constraint_ids")
@@ -1483,7 +1546,27 @@ class AuthorizationLedger:
         source_bundle: PolicySourceBundle | None = None
         candidate_bounds: PatchBounds | None = None
         expected_hypothesis_id: str | None = None
-        if plan.role in {"investigator", "author"}:
+        if isinstance(self._manifest, PitOptimizerRunManifestV4):
+            try:
+                dynamic_input.validate_budget(
+                    plan,
+                    scope=self._manifest.policy_authoring_scope,
+                    manifest=self._manifest,
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise AuthorizationError(
+                    "optimizer v4 role input differs from run manifest"
+                ) from exc
+            if plan.role == "author":
+                investigator = primitive.get("investigator")
+                if not isinstance(investigator, dict):
+                    raise AuthorizationError(
+                        "optimizer v4 author input provenance is invalid"
+                    )
+                expected_hypothesis_id = investigator.get("hypothesis_id")
+            elif plan.role == "critic":
+                expected_hypothesis_id = primitive.get("hypothesis_id")
+        elif plan.role in {"investigator", "author"}:
             if (
                 primitive.get("policy_interface_version")
                 != self._manifest.policy_interface_version
@@ -1571,6 +1654,7 @@ class AuthorizationLedger:
             expected_hypothesis_id=expected_hypothesis_id,
             source_bundle=source_bundle,
             candidate_bounds=candidate_bounds,
+            schema_version=expected_schema_version,
         )
 
     def bind_controller_role_input(
@@ -1732,7 +1816,28 @@ class AuthorizationLedger:
                 (InvestigatorArtifact, AuthorArtifact, CriticArtifact),
             )
         )
-        if canonical_plan.role == "investigator" and canonical_plan.iteration > 1:
+        is_v4 = snapshot.schema_version == 4
+        if (
+            is_v4
+            and canonical_plan.role == "investigator"
+            and canonical_plan.iteration > 1
+        ):
+            prior_hypotheses = primitive.get("prior_hypotheses")
+            valid_history = isinstance(prior_hypotheses, list) and all(
+                isinstance(item, dict) for item in prior_hypotheses
+            )
+            if valid_history:
+                assert isinstance(prior_hypotheses, list)
+                valid_history = (
+                    len(prior_hypotheses) == canonical_plan.iteration - 1
+                    and tuple(item.get("iteration") for item in prior_hypotheses)
+                    == tuple(range(1, canonical_plan.iteration))
+                )
+            if not valid_history:
+                raise AuthorizationError(
+                    "optimizer v4 role input predecessor artifact differs"
+                )
+        elif canonical_plan.role == "investigator" and canonical_plan.iteration > 1:
             feedbacks = primitive.get("prior_iterations")
             if not isinstance(feedbacks, list):
                 raise AuthorizationError(
@@ -1794,11 +1899,25 @@ class AuthorizationLedger:
                         "optimizer role input predecessor artifact differs"
                     )
         elif canonical_plan.role == "author":
-            if (
-                len(legacy_calls) != 1
-                or primitive.get("investigator")
-                != legacy_calls[0].payload.to_primitive()
-            ):
+            predecessor_payloads = tuple(
+                item.payload
+                for item in predecessors
+                if not isinstance(item, AuthorizationPlanSkip)
+            )
+            if is_v4:
+                valid_author_lineage = (
+                    len(predecessor_payloads) == 1
+                    and isinstance(predecessor_payloads[0], InvestigatorArtifactV4)
+                    and primitive.get("investigator")
+                    == predecessor_payloads[0].to_primitive()
+                )
+            else:
+                valid_author_lineage = (
+                    len(legacy_calls) == 1
+                    and primitive.get("investigator")
+                    == legacy_calls[0].payload.to_primitive()
+                )
+            if not valid_author_lineage:
                 raise AuthorizationError(
                     "optimizer role input predecessor artifact differs"
                 )
@@ -1981,7 +2100,7 @@ class AuthorizationLedger:
             or not isinstance(audit_run_id, str)
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", audit_run_id)
             is None
-            or audit_run_id != self._manifest.run_id
+            or audit_run_id != _authorization_run_id(self._manifest)
             or not isinstance(budget_reservation_id, str)
             or re.fullmatch(
                 r"optimizer_budget_[0-9a-f]{32}",
@@ -2507,7 +2626,7 @@ class AuthorizationLedger:
                 requirement = self._manifest.authorization_requirement
                 if (
                     grant.policy_source_scope_sha256
-                    != self._manifest.policy_source_scope.sha256
+                    != _authorization_scope_sha256(self._manifest)
                     or grant.additional_calls > requirement.max_calls
                     or grant.additional_tokens > requirement.max_tokens
                 ):
@@ -3252,7 +3371,9 @@ class AuthorizationLedger:
         if not isinstance(grant, OperatorAuthorizationGrant):
             raise AuthorizationError("authorization grant is invalid")
         requirement = self._manifest.authorization_requirement
-        if grant.policy_source_scope_sha256 != self._manifest.policy_source_scope.sha256:
+        if grant.policy_source_scope_sha256 != _authorization_scope_sha256(
+            self._manifest
+        ):
             raise AuthorizationError("policy source scope mismatch")
         if (
             grant.additional_calls > requirement.max_calls
@@ -4834,7 +4955,7 @@ class AuthorizationLedger:
 def _load_authenticated_manifest(
     manifest_path: Path,
     manifest_sha256: str,
-) -> PitOptimizerRunManifest:
+) -> PitOptimizerRunManifest | PitOptimizerRunManifestV4:
     path = Path(manifest_path)
     if (
         not path.is_absolute()
@@ -4853,7 +4974,11 @@ def _load_authenticated_manifest(
     if not isinstance(primitive, dict) or raw != _canonical_json_bytes(primitive):
         raise AuthorizationError("authorization manifest is not canonical JSON")
     try:
-        manifest = _contract._pit_optimizer_manifest_from_primitive(primitive)
+        manifest = (
+            _contract._pit_optimizer_manifest_v4_from_primitive(primitive)
+            if primitive.get("schema_version") == 4
+            else _contract._pit_optimizer_manifest_from_primitive(primitive)
+        )
     except ValueError as exc:
         raise AuthorizationError("authorization manifest contract is invalid") from exc
     if manifest.sha256 != manifest_sha256:
@@ -4874,7 +4999,8 @@ def record_authorized_grant(
     manifest = _load_authenticated_manifest(manifest_path, manifest_sha256)
     if not isinstance(grant, OperatorAuthorizationGrant):
         raise AuthorizationError("authorization grant is invalid")
-    if grant.policy_source_scope_sha256 != manifest.policy_source_scope.sha256:
+    scope_sha256 = _authorization_scope_sha256(manifest)
+    if grant.policy_source_scope_sha256 != scope_sha256:
         raise AuthorizationError("policy source scope mismatch")
     requirement = manifest.authorization_requirement
     if (
@@ -4888,7 +5014,7 @@ def record_authorized_grant(
         authorization_requirement_sha256=requirement.sha256,
         max_calls=min(requirement.max_calls, grant.additional_calls),
         max_tokens=min(requirement.max_tokens, grant.additional_tokens),
-        policy_source_scope_sha256=manifest.policy_source_scope.sha256,
+        policy_source_scope_sha256=scope_sha256,
     )
     ledger = AuthorizationLedger(Path(ledger_path), manifest)
     ledger.record_grant_and_window(

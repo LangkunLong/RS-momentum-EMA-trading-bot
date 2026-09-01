@@ -1652,10 +1652,10 @@ def build_subset_manifest(
 
 
 def write_optimizer_manifest(
-    manifest: PitOptimizerRunManifest,
+    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
     output: Path,
 ) -> tuple[Path, str]:
-    if not isinstance(manifest, PitOptimizerRunManifest):
+    if not isinstance(manifest, (PitOptimizerRunManifest, PitOptimizerRunManifestV4)):
         raise ValueError("optimizer manifest writer requires a closed manifest")
     path = Path(output)
     if not path.is_absolute():
@@ -4485,6 +4485,7 @@ class PitOptimizerRunManifestV4(_V2Canonical):
     max_iterations: int
     apply: bool
     provider_retries: int
+    authorization_requirement: AuthorizationRequirement
 
     def __post_init__(self) -> None:
         if self.schema_version != 4:
@@ -4542,6 +4543,26 @@ class PitOptimizerRunManifestV4(_V2Canonical):
             or self.policy_authoring_scope.call_budgets != self.call_budgets
         ):
             raise ValueError("optimizer v4 authoring scope differs from manifest")
+        if self.apply is not False:
+            raise ValueError("optimizer v4 apply must be false")
+        if self.provider_retries != 0:
+            raise ValueError("optimizer v4 provider retries must be zero")
+        if not isinstance(self.authorization_requirement, AuthorizationRequirement):
+            raise ValueError("optimizer v4 authorization requirement is invalid")
+        total_tokens = sum(
+            item.max_input_tokens + item.max_output_tokens
+            for item in self.call_budgets
+        )
+        if (
+            self.authorization_requirement.policy_source_scope_sha256
+            != self.policy_authoring_scope.sha256
+            or self.authorization_requirement.max_calls != len(self.call_budgets)
+            or self.authorization_requirement.max_tokens != total_tokens
+            or self.authorization_requirement.provider_retries
+            != self.provider_retries
+            or self.authorization_requirement.apply != self.apply
+        ):
+            raise ValueError("optimizer v4 authorization requirement differs")
         _v2_string_tuple(self.immutable_constraint_ids, "optimizer v4 constraint IDs")
         expected_constraints = hashlib.sha256(
             _v2_canonical_bytes(self.immutable_constraint_ids) + b"\n"
@@ -4553,10 +4574,6 @@ class PitOptimizerRunManifestV4(_V2Canonical):
         _validate_v4_call_plan(self.call_budgets, max_iterations=self.max_iterations)
         if any(item.model != self.model for item in self.call_budgets):
             raise ValueError("optimizer v4 call model differs from manifest")
-        if self.apply is not False:
-            raise ValueError("optimizer v4 apply must be false")
-        if self.provider_retries != 0:
-            raise ValueError("optimizer v4 provider retries must be zero")
         for budget in self.call_budgets:
             static_bytes = len(PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[budget.role].encode("utf-8"))
             static_bytes += len(
@@ -4581,6 +4598,7 @@ class PitOptimizerRunManifestV4(_V2Canonical):
         model: str = PIT_OPTIMIZER_R1_MODEL,
         apply: bool = False,
         provider_retries: int = 0,
+        authorization_window_id: str,
     ) -> "PitOptimizerRunManifestV4":
         if not isinstance(discovery_panel_plan, DiscoveryPanelPlan):
             raise ValueError("optimizer v4 discovery plan is invalid")
@@ -4588,6 +4606,17 @@ class PitOptimizerRunManifestV4(_V2Canonical):
             _v2_canonical_bytes(immutable_constraint_ids) + b"\n"
         ).hexdigest()
         max_iterations = max(item.iteration for item in policy_authoring_scope.call_budgets)
+        authorization = AuthorizationRequirement(
+            window_id=authorization_window_id,
+            max_calls=len(policy_authoring_scope.call_budgets),
+            max_tokens=sum(
+                item.max_input_tokens + item.max_output_tokens
+                for item in policy_authoring_scope.call_budgets
+            ),
+            policy_source_scope_sha256=policy_authoring_scope.sha256,
+            provider_retries=provider_retries,
+            apply=apply,
+        )
         result = cls(
             schema_version=4,
             campaign_id=campaign_id,
@@ -4613,6 +4642,7 @@ class PitOptimizerRunManifestV4(_V2Canonical):
             max_iterations=max_iterations,
             apply=apply,
             provider_retries=provider_retries,
+            authorization_requirement=authorization,
         )
         result.validate_discovery_plan(discovery_panel_plan)
         return result
@@ -4666,6 +4696,12 @@ def _pit_optimizer_manifest_v4_from_primitive(
         values["annualized_return_target"] = AnnualizedReturnTarget.production()
         values["editable_paths"] = tuple(values["editable_paths"])
         values["policy_authoring_scope"] = PolicyAuthoringScopeV4(**scope)
+        authorization_value = values["authorization_requirement"]
+        if not isinstance(authorization_value, dict):
+            raise ValueError("optimizer v4 authorization requirement is invalid")
+        values["authorization_requirement"] = AuthorizationRequirement(
+            **authorization_value
+        )
         values["immutable_constraint_ids"] = tuple(
             values["immutable_constraint_ids"]
         )

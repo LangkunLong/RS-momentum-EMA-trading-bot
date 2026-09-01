@@ -2908,6 +2908,10 @@ class PitOptimizerServicesV4:
     prepare_iteration_artifacts: Callable[[int], Path]
     write_json_artifact: Callable[[str, Mapping[str, object]], tuple[Path, str]]
     write_diff_artifact: Callable[[str, str], tuple[Path, str]]
+    finalize_run: Callable[
+        [tuple[PitOptimizerRoleAttempt, ...], tuple[AuthorizationPlanSkip, ...], str],
+        None,
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2929,7 +2933,7 @@ class PitOptimizerResultV4:
     apply: bool
     cleanup_complete: bool
     source_modified: bool
-    checkpoint: CampaignCheckpoint
+    checkpoint: CampaignCheckpoint | None
     artifact_paths: tuple[tuple[Path, str], ...]
 
     def to_public_artifact(self) -> Mapping[str, object]:
@@ -3099,7 +3103,14 @@ def prepare_pit_optimizer_v4(
             None if branch is None else branch.candidate_identity.identity_sha256
         ),
     }
-    output, digest = write_create_only_json(Path(artifact_path), primitive)
+    try:
+        output, digest = write_create_only_json(Path(artifact_path), primitive)
+    except FileExistsError:
+        output = Path(artifact_path)
+        raw = output.read_bytes()
+        if raw != canonical_json_bytes(primitive):
+            raise ValueError("optimizer v4 readiness artifact differs") from None
+        digest = hashlib.sha256(raw).hexdigest()
     return PitOptimizerReadinessV4(
         schema_version=4,
         manifest=manifest,
@@ -3291,12 +3302,23 @@ def _candidate_parent_summary(
 ) -> SelectedParentSummary:
     if candidate.quick_evidence is None:
         raise IdentityDrift("retained candidate lacks exact quick evidence")
+    candidate_identity = candidate.candidate_identity
+    try:
+        validate_candidate_identity(candidate_identity)
+    except ValueError as exc:
+        raise IdentityDrift("retained candidate identity is unauthenticated") from exc
+    actual_source_sha256s = tuple(
+        (item.path, item.source_sha256) for item in sources
+    )
+    if actual_source_sha256s != candidate_identity.editable_file_sha256s:
+        raise IdentityDrift("retained candidate sources differ from identity")
     identity = SelectedParentIdentity.issue(
         parent_kind=kind,
         parent_id=candidate.candidate_identity.identity_sha256,
         source_head=readiness.manifest.source_head,
         policy_sources=sources,
     )
+    identity.validate_sources(sources)
     return SelectedParentSummary(
         identity=identity,
         hypothesis_id=candidate.hypothesis,
@@ -3347,48 +3369,72 @@ def _materialize_v4_context(
         if kind == "branch"
         else state.champion if kind == "champion" else None
     )
-    selected = services.materialize_parent(kind, selected_candidate)
-    if not isinstance(selected, CandidateParentV4):
-        raise SandboxIntegrityFailure("optimizer v4 parent materialization is invalid")
-    baseline = _baseline_parent_summary(readiness)
-    if kind == "baseline":
-        if selected.policy_sources != readiness.baseline_sources:
-            raise IdentityDrift("optimizer v4 baseline sources differ")
-        selected_summary = baseline
-    else:
-        assert selected_candidate is not None
-        selected_summary = _candidate_parent_summary(
-            readiness=readiness,
-            kind=kind,
-            candidate=selected_candidate,
-            sources=selected.policy_sources,
-        )
-    champion_summary: SelectedParentSummary | None = None
-    if state.champion is not None:
-        if kind == "champion":
-            champion_summary = selected_summary
+    selected_workspace: CandidateWorkspace | None = None
+    try:
+        selected = services.materialize_parent(kind, selected_candidate)
+        if not isinstance(selected, CandidateParentV4):
+            raise SandboxIntegrityFailure("optimizer v4 parent materialization is invalid")
+        selected_workspace = selected.workspace
+        baseline = _baseline_parent_summary(readiness)
+        if kind == "baseline":
+            if selected.policy_sources != readiness.baseline_sources:
+                raise IdentityDrift("optimizer v4 baseline sources differ")
+            selected_summary = baseline
         else:
-            champion_parent = services.materialize_parent("champion", state.champion)
-            try:
-                champion_summary = _candidate_parent_summary(
-                    readiness=readiness,
-                    kind="champion",
-                    candidate=state.champion,
-                    sources=champion_parent.policy_sources,
-                )
-            finally:
-                _dispose_v4(services, state, champion_parent.workspace)
-    branch_summary = selected_summary if kind == "branch" else None
-    state.selected_parent = selected_summary.identity
-    return (
-        kind,
-        selected_candidate,
-        selected,
-        selected_summary,
-        baseline,
-        champion_summary,
-        branch_summary,
-    )
+            assert selected_candidate is not None
+            if (
+                hashlib.sha256(selected.cumulative_diff.encode("utf-8")).hexdigest()
+                != selected_candidate.candidate_identity.cumulative_diff_sha256
+            ):
+                raise IdentityDrift("retained candidate diff differs from identity")
+            selected_summary = _candidate_parent_summary(
+                readiness=readiness,
+                kind=kind,
+                candidate=selected_candidate,
+                sources=selected.policy_sources,
+            )
+        champion_summary: SelectedParentSummary | None = None
+        if state.champion is not None:
+            if kind == "champion":
+                champion_summary = selected_summary
+            else:
+                champion_parent = services.materialize_parent("champion", state.champion)
+                if not isinstance(champion_parent, CandidateParentV4):
+                    raise SandboxIntegrityFailure(
+                        "optimizer v4 champion materialization is invalid"
+                    )
+                try:
+                    if (
+                        hashlib.sha256(
+                            champion_parent.cumulative_diff.encode("utf-8")
+                        ).hexdigest()
+                        != state.champion.candidate_identity.cumulative_diff_sha256
+                    ):
+                        raise IdentityDrift(
+                            "retained champion diff differs from identity"
+                        )
+                    champion_summary = _candidate_parent_summary(
+                        readiness=readiness,
+                        kind="champion",
+                        candidate=state.champion,
+                        sources=champion_parent.policy_sources,
+                    )
+                finally:
+                    _dispose_v4(services, state, champion_parent.workspace)
+        branch_summary = selected_summary if kind == "branch" else None
+        state.selected_parent = selected_summary.identity
+        return (
+            kind,
+            selected_candidate,
+            selected,
+            selected_summary,
+            baseline,
+            champion_summary,
+            branch_summary,
+        )
+    except BaseException:
+        _dispose_v4(services, state, selected_workspace)
+        raise
 
 
 def _checkpoint_v4(
@@ -4073,7 +4119,6 @@ def run_pit_optimizer_v4(
         PitOptimizerServicesV4,
     ):
         raise ValueError("optimizer v4 run composition is invalid")
-    services.verify_inputs(readiness)
     state = _V4RunState(
         champion=None,
         active_branch=None,
@@ -4081,17 +4126,20 @@ def run_pit_optimizer_v4(
     )
     terminal_code = "iteration_limit"
     checkpoint: CampaignCheckpoint | None = None
-    active_workspace: CandidateWorkspace | None = None
+    durable_checkpoint_written = False
     try:
+        services.verify_inputs(readiness)
+        seed_champion: SearchCandidateState | None = None
+        seed_active_branch: SearchCandidateState | None = None
         if readiness.seed_champion is not None:
-            state.champion = _copy_seed_v4(
+            seed_champion = _copy_seed_v4(
                 kind="champion",
                 candidate=readiness.seed_champion,
                 state=state,
                 services=services,
             )
         if readiness.seed_active_branch is not None:
-            state.active_branch = _copy_seed_v4(
+            seed_active_branch = _copy_seed_v4(
                 kind="branch",
                 candidate=readiness.seed_active_branch,
                 state=state,
@@ -4132,17 +4180,25 @@ def run_pit_optimizer_v4(
                 state,
                 services.write_json_artifact(name, primitive),
             )
-        checkpoint = _checkpoint_v4(
+        initial_checkpoint = _checkpoint_v4(
             readiness=readiness,
             completed_iterations=0,
-            champion=state.champion,
-            active_branch=state.active_branch,
+            champion=seed_champion,
+            active_branch=seed_active_branch,
             feedback_tail=state.feedback_tail,
         )
         _record_v4_artifact(
             state,
-            services.write_json_artifact("checkpoint.json", checkpoint.to_primitive()),
+            services.write_json_artifact(
+                "checkpoint.json", initial_checkpoint.to_primitive()
+            ),
         )
+        checkpoint = initial_checkpoint
+        durable_checkpoint_written = True
+        # The imported seed becomes live only after all create-only copies and the
+        # initial atomic checkpoint are durable.
+        state.champion = seed_champion
+        state.active_branch = seed_active_branch
         for iteration in range(1, readiness.manifest.max_iterations + 1):
             if services.cancellation_requested():
                 terminal_code = "cancelled"
@@ -4161,6 +4217,7 @@ def run_pit_optimizer_v4(
                 services=services,
                 iteration=iteration,
             )
+            durable_checkpoint_written = True
     except BaseException as exc:
         terminal_code, _detail = _terminal_from_exception(exc)
         if terminal_code in {
@@ -4170,17 +4227,6 @@ def run_pit_optimizer_v4(
             "cancelled",
         }:
             terminal_code = "audit_failure"
-    finally:
-        _dispose_v4(services, state, active_workspace)
-
-    if checkpoint is None:
-        checkpoint = _checkpoint_v4(
-            readiness=readiness,
-            completed_iterations=state.iterations_completed,
-            champion=state.champion,
-            active_branch=state.active_branch,
-            feedback_tail=state.feedback_tail,
-        )
     try:
         services.verify_inputs(readiness)
     except BaseException:
@@ -4238,7 +4284,7 @@ def run_pit_optimizer_v4(
             ),
             "f",
         ),
-        checkpoint_present=True,
+        checkpoint_present=durable_checkpoint_written,
         apply=False,
         cleanup_complete=cleanup_complete,
         source_modified=source_modified,
@@ -4251,7 +4297,20 @@ def run_pit_optimizer_v4(
             services.write_json_artifact("summary.json", result.to_public_artifact()),
         )
     except BaseException:
-        return replace(
+        result = replace(
+            result,
+            status="aborted",
+            terminal_code="audit_failure",
+            cleanup_complete=False,
+        )
+    try:
+        services.finalize_run(
+            tuple(state.call_attempts),
+            tuple(state.skips),
+            result.terminal_code,
+        )
+    except BaseException:
+        result = replace(
             result,
             status="aborted",
             terminal_code="audit_failure",
