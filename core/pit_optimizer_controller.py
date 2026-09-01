@@ -91,6 +91,7 @@ from core.pit_optimization_contract import (
     InvestigatorInputV4,
     PitOptimizerRunManifestV4,
     PriorHypothesisSummaryV4,
+    RoleContextBudgetExceeded,
     RoleOutputInvalidSummary,
     SelectedParentIdentity,
     SelectedParentSummary,
@@ -2274,7 +2275,7 @@ def _terminal_from_exception(exc: BaseException) -> tuple[str, str | None]:
         (SandboxIntegrityFailure, "sandbox_integrity_failure"),
         (EvidenceTampering, "evidence_tampering"),
     )
-    if isinstance(exc, ContextBudgetExhausted):
+    if isinstance(exc, (ContextBudgetExhausted, RoleContextBudgetExceeded)):
         return "budget_exhausted", "context_budget_exhausted"
     if isinstance(exc, KeyboardInterrupt):
         return "cancelled", None
@@ -4282,7 +4283,6 @@ def run_pit_optimizer_v4(
         terminal_code, _detail = _terminal_from_exception(exc)
         if terminal_code in {
             "iteration_limit",
-            "budget_exhausted",
             "stagnation_limit",
             "cancelled",
         }:

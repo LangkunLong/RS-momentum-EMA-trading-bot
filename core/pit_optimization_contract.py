@@ -675,6 +675,10 @@ class PitOptimizerCallBudget(_V2Canonical):
             raise ValueError("optimizer call input sections exceed the input token cap")
 
 
+class RoleContextBudgetExceeded(ValueError):
+    """The exact transmitted role context exceeds its authenticated byte cap."""
+
+
 @dataclass(frozen=True, slots=True)
 class PolicySourceScope(_V2Canonical):
     schema_version: int
@@ -4367,6 +4371,13 @@ def _validate_v4_call_plan(
 
 @dataclass(frozen=True, slots=True)
 class PolicyAuthoringScopeV4(_V2Canonical):
+    """Authenticated schema-v4 authoring scope.
+
+    The feedback/history fields are legacy advisory allocations retained for
+    schema-v4 compatibility.  The exact canonical per-call dynamic payload cap
+    in ``call_budgets`` is the authoritative transmitted-context limit.
+    """
+
     schema_version: int
     policy_interface_version: int
     initial_policy_source_sha256s: tuple[tuple[str, str], ...]
@@ -4412,15 +4423,6 @@ class PolicyAuthoringScopeV4(_V2Canonical):
         max_iterations = max(item.iteration for item in self.call_budgets)
         _validate_v4_call_plan(self.call_budgets, max_iterations=max_iterations)
         for budget in self.call_budgets:
-            declared_components = self.max_iteration_feedback_bytes
-            if budget.role in {"investigator", "author"}:
-                declared_components += self.canonical_source_bundle_bytes
-            if budget.role == "investigator":
-                declared_components += self.max_iteration_history_bytes
-            if declared_components > budget.max_dynamic_input_bytes:
-                raise ValueError(
-                    f"{budget.role} declared component envelopes exceed its dynamic cap"
-                )
             if budget.role == "author" and budget.max_response_bytes < (
                 self.canonical_source_bundle_bytes
                 + self.author_response_headroom_bytes
@@ -5606,9 +5608,6 @@ def _validate_role_v4_budget(
     scope: PolicyAuthoringScopeV4,
     manifest: PitOptimizerRunManifestV4,
     expected_scope_sha256: str,
-    source_component_bytes: int,
-    feedback_component: bytes,
-    history_component: bytes | None = None,
 ) -> None:
     if not isinstance(manifest, PitOptimizerRunManifestV4):
         raise ValueError("optimizer v4 role manifest is invalid")
@@ -5644,23 +5643,16 @@ def _validate_role_v4_budget(
         or scope.call_budgets[expected_call_index - 1] != budget
     ):
         raise ValueError("optimizer v4 role budget binding differs")
-    if len(feedback_component) > scope.max_iteration_feedback_bytes:
-        raise ValueError("optimizer v4 role feedback component exceeds scope")
-    if history_component is not None and (
-        len(history_component) > scope.max_iteration_history_bytes
-    ):
-        raise ValueError("optimizer v4 role history component exceeds scope")
-    component_bytes = source_component_bytes + len(feedback_component)
-    if history_component is not None:
-        component_bytes += len(history_component)
-    if component_bytes > budget.max_dynamic_input_bytes:
-        raise ValueError("optimizer v4 role components exceed dynamic call cap")
     static_bytes = len(PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[role].encode("utf-8"))
     static_bytes += len(_v2_canonical_bytes(pit_optimizer_v4_response_format(role)))
     if static_bytes > budget.max_static_input_bytes:
-        raise ValueError("optimizer v4 static role context exceeds call cap")
+        raise RoleContextBudgetExceeded(
+            "optimizer v4 static role context exceeds call cap"
+        )
     if len(payload) > budget.max_dynamic_input_bytes:
-        raise ValueError("optimizer v4 dynamic role context exceeds call cap")
+        raise RoleContextBudgetExceeded(
+            "optimizer v4 dynamic role context exceeds call cap"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -5786,19 +5778,6 @@ class InvestigatorInputV4(_V2Canonical):
         scope: PolicyAuthoringScopeV4,
         manifest: PitOptimizerRunManifestV4,
     ) -> None:
-        feedback_component = _v2_canonical_bytes(
-            {
-                "selected_parent_summary": self.selected_parent_summary,
-                "baseline_summary": self.baseline_summary,
-                "champion_summary": self.champion_summary,
-                "branch_summary": self.branch_summary,
-                "target_progress": self.target_progress,
-                "validation_status": self.validation_status,
-            }
-        )
-        history_component = _v2_canonical_bytes(
-            {"prior_hypotheses": self.prior_hypotheses}
-        )
         _validate_role_v4_budget(
             role_context=self,
             role="investigator",
@@ -5808,11 +5787,6 @@ class InvestigatorInputV4(_V2Canonical):
             scope=scope,
             manifest=manifest,
             expected_scope_sha256=self.policy_authoring_scope_sha256,
-            source_component_bytes=len(
-                policy_source_bundle_v4_bytes(self.selected_parent_sources)
-            ),
-            feedback_component=feedback_component,
-            history_component=history_component,
         )
 
 
@@ -5886,12 +5860,6 @@ class AuthorInputV4(_V2Canonical):
             scope=scope,
             manifest=manifest,
             expected_scope_sha256=self.policy_authoring_scope_sha256,
-            source_component_bytes=len(
-                policy_source_bundle_v4_bytes(self.selected_parent_sources)
-            ),
-            feedback_component=_v2_canonical_bytes(
-                {"investigator": self.investigator}
-            ),
         )
 
 
@@ -6052,22 +6020,6 @@ class CriticInputV4(_V2Canonical):
         scope: PolicyAuthoringScopeV4,
         manifest: PitOptimizerRunManifestV4,
     ) -> None:
-        feedback_component = _v2_canonical_bytes(
-            {
-                "selected_parent_summary": self.selected_parent_summary,
-                "hypothesis_id": self.hypothesis_id,
-                "investigator_summary": self.investigator_summary,
-                "author_manifest": self.author_manifest,
-                "author_output_invalid": self.author_output_invalid,
-                "validation_status": self.validation_status,
-                "candidate_quick": self.candidate_quick,
-                "candidate_discovery": self.candidate_discovery,
-                "baseline_quick": self.baseline_quick,
-                "baseline_discovery": self.baseline_discovery,
-                "champion_discovery": self.champion_discovery,
-                "target_progress": self.target_progress,
-            }
-        )
         _validate_role_v4_budget(
             role_context=self,
             role="critic",
@@ -6077,6 +6029,4 @@ class CriticInputV4(_V2Canonical):
             scope=scope,
             manifest=manifest,
             expected_scope_sha256=self.policy_authoring_scope_sha256,
-            source_component_bytes=0,
-            feedback_component=feedback_component,
         )

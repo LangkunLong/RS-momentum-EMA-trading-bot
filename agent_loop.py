@@ -23938,11 +23938,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_nan=False,
         )
     )
-    return (
-        0
-        if isinstance(result, (PitOptimizerReadiness, PitOptimizerReadinessV4))
-        else result.exit_code
-    )
+    if isinstance(result, (PitOptimizerReadiness, PitOptimizerReadinessV4)):
+        return 0
+    if isinstance(result, PitOptimizerResultV4):
+        return 0 if result.status == "completed" else 1
+    return result.exit_code
 
 
 if __name__ == "__main__":
