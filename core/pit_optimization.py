@@ -300,6 +300,39 @@ def _window_frame(
     return result
 
 
+def production_equity_cagr_pct(
+    starting_equity: float | int,
+    ending_equity: float | int,
+    elapsed_calendar_days: int,
+) -> float:
+    """Return the production portfolio CAGR over exact elapsed calendar days."""
+
+    if (
+        isinstance(starting_equity, bool)
+        or type(starting_equity) not in {int, float}
+        or not math.isfinite(float(starting_equity))
+        or float(starting_equity) <= 0.0
+    ):
+        raise ValueError("starting equity must be finite and positive")
+    if (
+        isinstance(ending_equity, bool)
+        or type(ending_equity) not in {int, float}
+        or not math.isfinite(float(ending_equity))
+        or float(ending_equity) <= 0.0
+    ):
+        raise ValueError("ending equity must be finite and positive")
+    if type(elapsed_calendar_days) is not int or elapsed_calendar_days <= 0:
+        raise ValueError("elapsed calendar days must be a positive integer")
+    result = (
+        (float(ending_equity) / float(starting_equity))
+        ** (365.0 / elapsed_calendar_days)
+        - 1.0
+    ) * 100.0
+    if not math.isfinite(result):
+        raise ValueError("production annualized return is non-finite")
+    return result
+
+
 def aggregate_equity_window(
     frame: pd.DataFrame,
     *,

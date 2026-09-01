@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict, fields, replace
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_HALF_EVEN
+from decimal import Decimal
 import difflib
 from itertools import product
 import os
@@ -8738,159 +8738,260 @@ def test_pit_optimizer_v2_gateway_commits_authoritative_per_call_overage(
     assert records[-1]["record_type"] == "lease_close"
 
 
-def test_objective_is_quantized_lexicographic_strict_and_trade_eligible() -> None:
-    """Break caught: floating or non-strict ranking could promote an ineligible candidate."""
-    folds = (
-        replace(
-            _fold_summary("discovery_1", 1.235),
-            max_drawdown_pct=-4.005,
-            closed_trades=1,
-        ),
-        replace(
-            _fold_summary("discovery_2", 0.505),
-            max_drawdown_pct=-2.0,
-            closed_trades=3,
-        ),
+def test_objective_is_absolute_panel_cagr_quantized_and_strict_on_ties() -> None:
+    """Break caught: a diagnostic, trade gate, or CAGR tie could change panel ranking."""
+    target = evaluation.AnnualizedReturnTarget.production()
+    assert target == evaluation.AnnualizedReturnTarget(
+        metric_id="portfolio_annualized_return_pct",
+        formula_id="production_equity_cagr_365_calendar_days_v1",
+        basis="absolute",
+        target_pct=Decimal("10.00"),
+        milestones_pct=(Decimal("10.00"), Decimal("20.00"), Decimal("50.00")),
+        precision_pct=Decimal("0.01"),
+    )
+    candidate = evaluation.PanelAggregateSummary(
+        panel_id="discovery",
+        starting_equity=100.0,
+        ending_equity=121.0,
+        elapsed_calendar_days=730,
+        portfolio_annualized_return_pct=Decimal("10.00"),
+        total_return_pct=21.0,
+        benchmark_return_pct=40.0,
+        max_drawdown_pct=-99.0,
+        sharpe_ratio=-5.0,
+        closed_trades=0,
+        turnover_pct=0.0,
+        average_exposure_pct=0.0,
+        entry_funnel=(),
+        exit_attribution=(),
+    )
+    comparison = evaluation.DiscoveryPanelComparison.from_result(
+        candidate_cagr_pct=candidate.portfolio_annualized_return_pct,
+        fixed_baseline_cagr_pct=Decimal("9.00"),
+        current_champion_cagr_pct=Decimal("10.00"),
+        target=target,
     )
 
-    original_baseline = (
-        _fold_summary("discovery_1", 0.0),
-        _fold_summary("discovery_2", 0.0),
-    )
-    baseline_sha256 = _aggregate_sha256(original_baseline)
-    score = evaluation.discovery_score_from_folds(
-        folds,
-        original_baseline,
-        original_baseline_sha256=baseline_sha256,
-        expected_original_baseline_sha256=baseline_sha256,
-    )
-
-    expected_first = Decimal(str(1.235)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_EVEN
-    )
-    expected_second = Decimal(str(0.505)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_EVEN
-    )
-    assert score == evaluation.DiscoveryScore(
-        median_excess_return_pp=((expected_first + expected_second) / 2).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_EVEN
-        ),
-        worst_excess_return_pp=expected_second,
-        max_drawdown_magnitude_pp=Decimal(str(4.005)).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_EVEN
-        ),
-    )
-    assert score.ordering_key == (
-        Decimal("0.87"),
-        Decimal("0.50"),
-        Decimal("-4.00"),
-    )
-    assert evaluation.strictly_improves_discovery(score, score) is False
-    assert evaluation.strictly_improves_discovery(
-        replace(score, worst_excess_return_pp=Decimal("0.51")),
-        score,
-    ) is True
-    with pytest.raises(ValueError, match="closed discovery trade"):
-        evaluation.discovery_score_from_folds(
-            (replace(folds[0], closed_trades=0), folds[1]),
-            original_baseline,
-            original_baseline_sha256=baseline_sha256,
-            expected_original_baseline_sha256=baseline_sha256,
-        )
+    assert comparison.candidate_vs_fixed_baseline_delta_pp == Decimal("1.00")
+    assert comparison.target_gap_pp == Decimal("0.00")
+    assert comparison.strictly_improves_champion is False
+    assert evaluation.DiscoveryPanelComparison.from_result(
+        candidate_cagr_pct=Decimal("10.006"),
+        fixed_baseline_cagr_pct=Decimal("50.00"),
+        current_champion_cagr_pct=Decimal("10.00"),
+        target=target,
+    ).strictly_improves_champion is True
+    assert evaluation.DiscoveryPanelComparison.from_result(
+        candidate_cagr_pct=Decimal("8.00"),
+        fixed_baseline_cagr_pct=Decimal("7.00"),
+        current_champion_cagr_pct=Decimal("9.00"),
+        target=target,
+    ).target_gap_pp == Decimal("2.00")
+    with pytest.raises(ValueError, match="annualized return"):
+        replace(candidate, portfolio_annualized_return_pct=Decimal("10.01"))
 
 
-def test_discovery_objective_derives_excess_from_authenticated_fixed_baseline(
+def test_panel_allocator_is_lineage_stratified_disjoint_and_capacity_closed(
     tmp_path: Path,
 ) -> None:
-    """Break caught: fabricated excess or a substituted incumbent could drive ranking."""
-    candidate = (
-        replace(
-            _fold_summary("discovery_1", 0.0),
-            total_return_pct=2.235,
-            excess_total_return_pp=99.0,
-        ),
-        replace(
-            _fold_summary("discovery_2", 0.0),
-            total_return_pct=1.505,
-            excess_total_return_pp=-99.0,
-        ),
-    )
-    original_baseline = (
-        replace(_fold_summary("discovery_1", 0.0), total_return_pct=1.0),
-        replace(_fold_summary("discovery_2", 0.0), total_return_pct=1.0),
-    )
-    baseline_sha256 = _aggregate_sha256(original_baseline)
-
-    score = evaluation.discovery_score_from_folds(
-        candidate,
-        original_baseline,
-        original_baseline_sha256=baseline_sha256,
-        expected_original_baseline_sha256=baseline_sha256,
-    )
-
-    assert score.median_excess_return_pp == Decimal("0.87")
-    assert score.worst_excess_return_pp == Decimal("0.50")
-    with pytest.raises(ValueError, match="fixed baseline identity"):
-        evaluation.discovery_score_from_folds(
-            candidate,
-            original_baseline,
-            original_baseline_sha256=baseline_sha256,
-            expected_original_baseline_sha256="f" * 64,
+    """Break caught: allocation could depend on ticker aliases or overrun a stratum."""
+    lineages = tuple(
+        evaluation.PanelSecurityLineage(
+            security_lineage_id=f"chain-{index:02d}",
+            executable_tickers=(f"T{index:02d}",),
+            source_affiliations=(("sp500",) if index < 5 else ("nasdaq100",)),
         )
-    with pytest.raises(ValueError, match="supplied score differs"):
-        proof = _discovery_exposure_proof(tmp_path)
-        contract.candidate_comparison_from_fixed_baseline(
-            candidate_folds=candidate,
-            original_baseline_folds=original_baseline,
-            original_baseline_sha256=baseline_sha256,
-            expected_original_baseline_sha256=baseline_sha256,
-            discovery_exposure=proof,
-            expected_window_identities=proof.window_identities,
-            expected_metadata=proof.metadata,
-            diagnostics=(),
-            supplied_score=replace(
-                score,
-                worst_excess_return_pp=score.worst_excess_return_pp
-                + Decimal("0.01"),
-            ),
+        for index in range(8)
+    )
+    rule = evaluation.PanelAllocationRuleV1(
+        quick_count=1,
+        discovery_count=3,
+        qualification_count=2,
+    )
+    first = evaluation.sha256_lineage_stratified_v1(
+        lineages=lineages,
+        partition_seed_sha256="a" * 64,
+        rule=rule,
+    )
+    second = evaluation.sha256_lineage_stratified_v1(
+        lineages=tuple(reversed(lineages)),
+        partition_seed_sha256="a" * 64,
+        rule=rule,
+    )
+
+    assert first == second
+    quick, discovery, qualification, allocations = first
+    assert (len(quick), len(discovery), len(qualification)) == (1, 3, 2)
+    assert len({item.security_lineage_id for item in (*quick, *discovery, *qualification)}) == 6
+    assert all(
+        item.quick_count
+        + item.discovery_count
+        + item.qualification_count
+        + item.unallocated_count
+        == item.eligible_count
+        for item in allocations
+    )
+    with pytest.raises(ValueError, match="eligible capacity"):
+        evaluation.sha256_lineage_stratified_v1(
+            lineages=lineages,
+            partition_seed_sha256="a" * 64,
+            rule=evaluation.PanelAllocationRuleV1(3, 3, 3),
+        )
+    with pytest.raises(ValueError, match="ticker alias"):
+        evaluation.sha256_lineage_stratified_v1(
+            lineages=(lineages[0], replace(lineages[1], executable_tickers=("T00",))),
+            partition_seed_sha256="a" * 64,
+            rule=evaluation.PanelAllocationRuleV1(0, 1, 1),
         )
 
+    ledger = evaluation.QualificationRetirementLedger(
+        tmp_path / "qualification-ledger.json",
+        qualification_retirement_domain_id="b" * 64,
+    )
+    snapshot = ledger.snapshot()
+    assert snapshot.retired_security_lineage_ids == ()
+    reservation = {
+        "schema_version": 4,
+        "ledger_kind": "qualification_retirement",
+        "qualification_retirement_domain_id": "b" * 64,
+        "record_type": "reservation",
+        "sequence": 1,
+        "previous_record_sha256": snapshot.ledger_head_sha256,
+        "security_lineage_ids": ["chain-00"],
+    }
+    reservation["record_sha256"] = evaluation.QualificationRetirementLedger._record_digest(
+        reservation
+    )
+    with (tmp_path / "qualification-ledger.json").open("ab") as handle:
+        handle.write(_canonical_file_bytes(reservation))
+    retired_snapshot = evaluation.QualificationRetirementLedger(
+        tmp_path / "qualification-ledger.json",
+        qualification_retirement_domain_id="b" * 64,
+    ).snapshot()
+    assert retired_snapshot.retired_security_lineage_ids == ("chain-00",)
+    qualification_plan, discovery_plan = evaluation.compose_panel_plans(
+        lineages=lineages,
+        sessions=("2021-01-04", "2021-01-05", "2021-01-06"),
+        pit_bundle_sha256="c" * 64,
+        prices_provenance_sha256="d" * 64,
+        partition_seed_sha256="a" * 64,
+        target=evaluation.AnnualizedReturnTarget.production(),
+        rule=rule,
+        ledger_snapshot=retired_snapshot,
+    )
+    assert sum(item.eligible_count for item in discovery_plan.stratum_allocations) == 7
+    hidden_ids = {
+        item.security_lineage_id for item in qualification_plan.qualification_panel.lineages
+    }
+    discovery_text = json.dumps(discovery_plan.to_primitive(), sort_keys=True)
+    assert hidden_ids
+    assert all(lineage_id not in discovery_text for lineage_id in hidden_ids)
+    assert discovery_plan.qualification_plan_sha256 == qualification_plan.sha256
 
-def test_holdout_gate_uses_return_trades_and_completeness_without_sharpe() -> None:
-    """Break caught: a Sharpe gate or permissive equality boundary could alter eligibility."""
-    decision = evaluation.HoldoutDecision.from_result(
-        excess_total_return_pp=0.105,
-        closed_trades=3,
-        safety_complete=True,
+    published = evaluation.publish_panel_plans(
+        output_root=tmp_path / "panels",
+        qualification_plan=qualification_plan,
+        discovery_plan=discovery_plan,
+    )
+    assert published["qualification_plan_sha256"] == qualification_plan.sha256
+    assert (tmp_path / "panels" / "publication.json").is_file()
+    with pytest.raises(FileExistsError, match="immutable"):
+        evaluation.publish_panel_plans(
+            output_root=tmp_path / "panels",
+            qualification_plan=qualification_plan,
+            discovery_plan=discovery_plan,
+        )
+
+    partial = tmp_path / "partial-panels"
+    partial.mkdir()
+    (partial / "qualification-plan.json").write_bytes(
+        evaluation.panel_plan_bytes(qualification_plan)
+    )
+    evaluation.publish_panel_plans(
+        output_root=partial,
+        qualification_plan=qualification_plan,
+        discovery_plan=discovery_plan,
+    )
+    assert evaluation.load_discovery_panel_plan(
+        partial / "discovery-plan.json"
+    ) == discovery_plan
+    assert evaluation.load_qualification_panel_plan(
+        partial / "qualification-plan.json"
+    ) == qualification_plan
+    parsed = evaluation._manifest_cli_parser().parse_args(
+        [
+            "build-panel-plans",
+            "--pit-bundle",
+            str(tmp_path / "pit.sqlite3"),
+            "--pit-bundle-sha256",
+            "c" * 64,
+            "--prices-provenance",
+            str(tmp_path / "prices.json"),
+            "--start-date",
+            "2021-01-04",
+            "--end-date",
+            "2025-12-31",
+            "--partition-seed",
+            "sealed-seed",
+            "--quick-count",
+            "12",
+            "--discovery-count",
+            "48",
+            "--qualification-count",
+            "24",
+            "--target-pct",
+            "10.00",
+            "--qualification-ledger",
+            str(tmp_path / "permanent-ledger.json"),
+            "--output-root",
+            str(tmp_path / "published-panels"),
+        ]
+    )
+    assert parsed.command == "build-panel-plans"
+    assert parsed.partition_seed == "sealed-seed"
+
+
+def test_qualification_gate_uses_only_target_integrity_and_same_panel_baseline() -> None:
+    """Break caught: a diagnostic gate or baseline equality could alter qualification."""
+    decision = evaluation.QualificationDecision.from_result(
+        candidate_cagr_pct=Decimal("10.005"),
+        baseline_cagr_pct=Decimal("9.99"),
+        target=evaluation.AnnualizedReturnTarget.production(),
+        evaluation_complete=True,
         integrity_complete=True,
-        accounting_complete=True,
     )
 
-    assert decision.excess_total_return_pp == Decimal("0.10")
-    assert decision.long_replay_eligible is True
-    assert "sharpe" not in {field.name for field in fields(evaluation.HoldoutDecision)}
-    assert evaluation.HoldoutDecision.from_result(
-        excess_total_return_pp=0.094,
-        closed_trades=3,
-        safety_complete=True,
+    assert decision.candidate_cagr_pct == Decimal("10.00")
+    assert decision.qualified is True
+    assert {
+        "closed_trades",
+        "drawdown",
+        "sharpe",
+        "turnover",
+        "transaction_costs",
+    }.isdisjoint({field.name for field in fields(evaluation.QualificationDecision)})
+    assert evaluation.QualificationDecision.from_result(
+        candidate_cagr_pct=Decimal("9.99"),
+        baseline_cagr_pct=Decimal("1.00"),
+        target=evaluation.AnnualizedReturnTarget.production(),
+        evaluation_complete=True,
         integrity_complete=True,
-        accounting_complete=True,
-    ).long_replay_eligible is False
-    assert evaluation.HoldoutDecision.from_result(
-        excess_total_return_pp=0.10,
-        closed_trades=2,
-        safety_complete=True,
+    ).qualified is False
+    assert evaluation.QualificationDecision.from_result(
+        candidate_cagr_pct=Decimal("10.00"),
+        baseline_cagr_pct=Decimal("10.00"),
+        target=evaluation.AnnualizedReturnTarget.production(),
+        evaluation_complete=True,
         integrity_complete=True,
-        accounting_complete=True,
-    ).long_replay_eligible is False
-    with pytest.raises(ValueError, match="eligibility"):
-        evaluation.HoldoutDecision(
-            excess_total_return_pp=Decimal("0.10"),
-            closed_trades=3,
-            safety_complete=True,
+    ).qualified is False
+    with pytest.raises(ValueError, match="qualification decision"):
+        evaluation.QualificationDecision(
+            candidate_cagr_pct=Decimal("10.00"),
+            baseline_cagr_pct=Decimal("9.00"),
+            target_pct=Decimal("10.00"),
+            evaluation_complete=True,
             integrity_complete=True,
-            accounting_complete=True,
-            long_replay_eligible=False,
+            qualified=False,
         )
 
 
