@@ -1,8 +1,9 @@
-"""Crash-safe, incremental local artifacts for the schema-v3 PIT optimizer."""
+"""Crash-safe, incremental local artifacts for the PIT optimizer."""
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from decimal import Decimal
 import hashlib
 import json
 import os
@@ -11,6 +12,216 @@ import secrets
 import stat
 import tempfile
 from typing import Mapping
+
+from core.pit_optimizer_candidate import CandidateIdentityV4
+from core.pit_optimizer_evaluation import PanelAggregateSummary
+
+
+def _closed_sha256(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def _closed_relative_artifact(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or Path(value).is_absolute()
+        or ".." in Path(value).parts
+    ):
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def _artifact_primitive(value: object) -> object:
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, Mapping):
+        return {str(key): _artifact_primitive(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_artifact_primitive(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class SearchCandidateState:
+    """Digest-bound durable state for one champion or exploratory branch."""
+
+    candidate_identity: CandidateIdentityV4
+    cumulative_diff_artifact: str
+    cumulative_diff_sha256: str
+    source_bundle_artifact: str
+    source_bundle_sha256: str
+    discovery_evidence_artifact: str
+    discovery_evidence_sha256: str
+    discovery_evidence: PanelAggregateSummary
+    hypothesis: str
+    behavioral_summary: str
+    originating_run_id: str
+    originating_iteration: int
+    quick_evidence_artifact: str | None = None
+    quick_evidence_sha256: str | None = None
+    quick_evidence: PanelAggregateSummary | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_identity, CandidateIdentityV4):
+            raise ValueError("search candidate identity is invalid")
+        for name in (
+            "cumulative_diff_artifact",
+            "source_bundle_artifact",
+            "discovery_evidence_artifact",
+        ):
+            _closed_relative_artifact(getattr(self, name), f"search candidate {name}")
+        for name in (
+            "cumulative_diff_sha256",
+            "source_bundle_sha256",
+            "discovery_evidence_sha256",
+        ):
+            _closed_sha256(getattr(self, name), f"search candidate {name}")
+        if (
+            self.cumulative_diff_sha256
+            != self.candidate_identity.cumulative_diff_sha256
+        ):
+            raise ValueError("search candidate diff identity differs")
+        if (
+            not isinstance(self.discovery_evidence, PanelAggregateSummary)
+            or self.discovery_evidence.panel_id != "discovery"
+        ):
+            raise ValueError("search candidate discovery evidence is invalid")
+        if (self.quick_evidence is None) != (self.quick_evidence_artifact is None) or (
+            self.quick_evidence is None
+        ) != (self.quick_evidence_sha256 is None):
+            raise ValueError("search candidate quick evidence is incomplete")
+        if self.quick_evidence is not None:
+            if self.quick_evidence.panel_id != "quick":
+                raise ValueError("search candidate quick evidence is invalid")
+            _closed_relative_artifact(
+                self.quick_evidence_artifact,
+                "search candidate quick evidence artifact",
+            )
+            _closed_sha256(
+                self.quick_evidence_sha256,
+                "search candidate quick evidence SHA-256",
+            )
+        if (
+            not isinstance(self.hypothesis, str)
+            or not self.hypothesis.strip()
+            or not isinstance(self.behavioral_summary, str)
+            or not self.behavioral_summary.strip()
+            or not isinstance(self.originating_run_id, str)
+            or not self.originating_run_id.strip()
+            or type(self.originating_iteration) is not int
+            or self.originating_iteration <= 0
+        ):
+            raise ValueError("search candidate provenance is invalid")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "candidate_identity": self.candidate_identity.to_primitive(),
+            "cumulative_diff_artifact": self.cumulative_diff_artifact,
+            "cumulative_diff_sha256": self.cumulative_diff_sha256,
+            "source_bundle_artifact": self.source_bundle_artifact,
+            "source_bundle_sha256": self.source_bundle_sha256,
+            "discovery_evidence_artifact": self.discovery_evidence_artifact,
+            "discovery_evidence_sha256": self.discovery_evidence_sha256,
+            "discovery_evidence": _artifact_primitive(asdict(self.discovery_evidence)),
+            "hypothesis": self.hypothesis,
+            "behavioral_summary": self.behavioral_summary,
+            "originating_run_id": self.originating_run_id,
+            "originating_iteration": self.originating_iteration,
+            "quick_evidence_artifact": self.quick_evidence_artifact,
+            "quick_evidence_sha256": self.quick_evidence_sha256,
+            "quick_evidence": (
+                None
+                if self.quick_evidence is None
+                else _artifact_primitive(asdict(self.quick_evidence))
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignCheckpoint:
+    """Authenticated, atomically replaced state carried between bounded runs."""
+
+    schema_version: int
+    artifact_type: str
+    campaign_id: str
+    campaign_sequence: int
+    source_head: str
+    source_fingerprint_sha256: str
+    discovery_panel_plan_sha256: str
+    completed_iterations: int
+    champion: SearchCandidateState | None
+    active_branch: SearchCandidateState | None
+    feedback_tail: tuple[Mapping[str, object], ...]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 4 or self.artifact_type != "campaign_checkpoint":
+            raise ValueError("campaign checkpoint schema is invalid")
+        if (
+            not isinstance(self.campaign_id, str)
+            or not self.campaign_id.strip()
+            or type(self.campaign_sequence) is not int
+            or self.campaign_sequence <= 0
+            or not isinstance(self.source_head, str)
+            or len(self.source_head) != 40
+            or any(character not in "0123456789abcdef" for character in self.source_head)
+            or type(self.completed_iterations) is not int
+            or self.completed_iterations < 0
+        ):
+            raise ValueError("campaign checkpoint provenance is invalid")
+        _closed_sha256(
+            self.source_fingerprint_sha256,
+            "campaign checkpoint source fingerprint",
+        )
+        _closed_sha256(
+            self.discovery_panel_plan_sha256,
+            "campaign checkpoint discovery plan",
+        )
+        if self.champion is not None and not isinstance(
+            self.champion, SearchCandidateState
+        ):
+            raise ValueError("campaign checkpoint champion is invalid")
+        if self.active_branch is not None and not isinstance(
+            self.active_branch, SearchCandidateState
+        ):
+            raise ValueError("campaign checkpoint active branch is invalid")
+        if self.active_branch is not None and self.champion is not None and (
+            self.active_branch.candidate_identity.identity_sha256
+            == self.champion.candidate_identity.identity_sha256
+        ):
+            raise ValueError("campaign checkpoint branch duplicates champion")
+        if type(self.feedback_tail) is not tuple or any(
+            not isinstance(item, Mapping) for item in self.feedback_tail
+        ):
+            raise ValueError("campaign checkpoint feedback tail is invalid")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "artifact_type": self.artifact_type,
+            "campaign_id": self.campaign_id,
+            "campaign_sequence": self.campaign_sequence,
+            "source_head": self.source_head,
+            "source_fingerprint_sha256": self.source_fingerprint_sha256,
+            "discovery_panel_plan_sha256": self.discovery_panel_plan_sha256,
+            "completed_iterations": self.completed_iterations,
+            "champion": None if self.champion is None else self.champion.to_primitive(),
+            "active_branch": (
+                None if self.active_branch is None else self.active_branch.to_primitive()
+            ),
+            "feedback_tail": [dict(item) for item in self.feedback_tail],
+        }
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self.to_primitive())).hexdigest()
 
 
 def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
@@ -492,15 +703,38 @@ def atomic_replace_json(
 
 
 class IncrementalArtifactStore:
-    """Bounded create-only evidence with two explicit replaceable snapshots."""
+    """Bounded create-only evidence with explicit replaceable snapshots."""
 
-    _REPLACEABLE_JSON = frozenset({"accounting.json"})
-    _REPLACEABLE_DIFF = frozenset({"incumbent.diff"})
+    _REPLACEABLE_JSON = frozenset({"accounting.json", "checkpoint.json"})
+    _REPLACEABLE_DIFF = frozenset({"incumbent.diff", "champion.diff", "branch.diff"})
+    _SEED_DIFF = frozenset({"seed-champion.diff", "seed-branch.diff"})
     _ROOT_JSON = frozenset(
-        {"run.json", "baseline.json", "accounting.json", "holdout.json", "summary.json"}
+        {
+            "run.json",
+            "baseline.json",
+            "accounting.json",
+            "checkpoint.json",
+            "seed-champion-source.json",
+            "seed-champion-quick.json",
+            "seed-champion-discovery.json",
+            "seed-branch-source.json",
+            "seed-branch-quick.json",
+            "seed-branch-discovery.json",
+            "holdout.json",
+            "summary.json",
+        }
     )
     _ITERATION_JSON = frozenset(
-        {"investigator.json", "author.json", "validation.json", "discovery.json", "critic.json", "decision.json"}
+        {
+            "investigator.json",
+            "author.json",
+            "candidate-source.json",
+            "validation.json",
+            "quick.json",
+            "discovery.json",
+            "critic.json",
+            "decision.json",
+        }
     )
     _ROLE_OUTPUT_INVALID_JSON = frozenset(
         {
@@ -579,7 +813,7 @@ class IncrementalArtifactStore:
         ):
             valid = True
         elif not json_artifact and (
-            name in self._REPLACEABLE_DIFF
+            name in self._REPLACEABLE_DIFF | self._SEED_DIFF
             or (
                 len(parts) == 3
                 and parts[0] == "iterations"
@@ -604,7 +838,8 @@ class IncrementalArtifactStore:
         is_recovery_artifact = target_name in (
             self._ROLE_OUTPUT_INVALID_JSON | {self._PLAN_SKIP_JSON}
         )
-        if value.get("schema_version") != (4 if is_recovery_artifact else 3):
+        expected_versions = {4} if is_recovery_artifact else {3, 4}
+        if value.get("schema_version") not in expected_versions:
             raise ValueError("optimizer JSON artifact schema is invalid")
         payload = canonical_json_bytes(value)
         with self._secure_directory(parent_parts, create=False) as directory:

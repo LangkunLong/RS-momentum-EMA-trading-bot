@@ -23,8 +23,18 @@ import pandas as pd
 if TYPE_CHECKING:
     from core.pit_optimizer_controller import (
         PitOptimizerReadiness,
+        PitOptimizerReadinessV4,
         PitOptimizerResult,
+        PitOptimizerResultV4,
         PitOptimizerServices,
+        PitOptimizerServicesV4,
+    )
+    from core.pit_optimization_contract import AuthorSourceFile, PitOptimizerRunManifestV4
+    from core.pit_optimizer_artifacts import SearchCandidateState
+    from core.pit_optimizer_evaluation import (
+        DiscoveryPanelPlan,
+        EvaluationPanelSpec,
+        PanelAggregateSummary,
     )
 
 from core.pit_optimization_contract import (
@@ -267,6 +277,98 @@ class PitOptimizationGateConfig:
             or _SHA256_RE.fullmatch(self.readiness_sha256) is None
         ):
             raise ValueError("canary requires the exact readiness SHA-256")
+
+
+@dataclass(frozen=True, slots=True)
+class PitOptimizerGateConfigV4:
+    """Closed CLI configuration for schema-v4 prepare or bounded search."""
+
+    phase: str
+    baseline_run: Path
+    pit_bundle: Path
+    pit_bundle_sha256: str
+    optimizer_manifest: Path
+    optimizer_manifest_sha256: str
+    discovery_panel_plan: Path
+    discovery_panel_plan_sha256: str
+    readiness_artifact: Path
+    readiness_sha256: str | None
+    campaign_checkpoint: Path | None
+    campaign_checkpoint_sha256: str | None
+    source_transmission_authorized: bool
+    max_api_calls: int
+    max_tokens: int
+    max_iterations: int
+    apply: bool
+    source_root: Path
+    permanent_runtime_root: Path
+    controller_temp_parent: Path
+    artifact_root: Path
+    git_executable: Path
+    docker_executable: Path
+    sandbox_image: str
+
+    def __post_init__(self) -> None:
+        if self.phase not in {"prepare", "canary"}:
+            raise ValueError("optimizer v4 phase must be prepare or canary")
+        for name in (
+            "baseline_run",
+            "pit_bundle",
+            "optimizer_manifest",
+            "discovery_panel_plan",
+            "readiness_artifact",
+            "source_root",
+            "permanent_runtime_root",
+            "controller_temp_parent",
+            "artifact_root",
+            "git_executable",
+            "docker_executable",
+        ):
+            path = _absolute_path(getattr(self, name), f"optimizer v4 {name}")
+            object.__setattr__(self, name, path)
+        for name in (
+            "pit_bundle_sha256",
+            "optimizer_manifest_sha256",
+            "discovery_panel_plan_sha256",
+        ):
+            if _SHA256_RE.fullmatch(getattr(self, name) or "") is None:
+                raise ValueError(f"optimizer v4 {name} is invalid")
+        checkpoint_pair = (
+            self.campaign_checkpoint is not None,
+            self.campaign_checkpoint_sha256 is not None,
+        )
+        if checkpoint_pair[0] != checkpoint_pair[1]:
+            raise ValueError("optimizer v4 checkpoint path and digest must be paired")
+        if self.campaign_checkpoint is not None:
+            object.__setattr__(
+                self,
+                "campaign_checkpoint",
+                _absolute_path(
+                    self.campaign_checkpoint,
+                    "optimizer v4 campaign checkpoint",
+                ),
+            )
+            if _SHA256_RE.fullmatch(self.campaign_checkpoint_sha256 or "") is None:
+                raise ValueError("optimizer v4 campaign checkpoint digest is invalid")
+        if self.phase == "prepare":
+            if self.readiness_sha256 is not None or self.source_transmission_authorized:
+                raise ValueError("optimizer v4 prepare cannot carry live authority")
+        elif (
+            _SHA256_RE.fullmatch(self.readiness_sha256 or "") is None
+            or self.source_transmission_authorized is not True
+        ):
+            raise ValueError("optimizer v4 canary requires readiness and source authority")
+        if (
+            type(self.max_iterations) is not int
+            or self.max_iterations <= 0
+            or self.max_api_calls != 3 * self.max_iterations
+            or type(self.max_tokens) is not int
+            or self.max_tokens <= 0
+            or self.apply is not False
+        ):
+            raise ValueError("optimizer v4 execution bounds are invalid")
+        if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", self.sandbox_image or "") is None:
+            raise ValueError("optimizer v4 sandbox image is not digest pinned")
 
 
 def _numeric_series(frame: pd.DataFrame, field: str, *, positive: bool = False) -> pd.Series:
@@ -3334,6 +3436,50 @@ def run_pit_optimizer_v3(
     """Public adapter for the injected schema-v3 incumbent loop."""
 
     from core.pit_optimizer_controller import run_pit_optimizer_v3 as run
+
+    return run(readiness=readiness, services=services)
+
+
+def prepare_pit_optimizer_v4(
+    *,
+    manifest: PitOptimizerRunManifestV4,
+    discovery_panel_plan: DiscoveryPanelPlan,
+    baseline_sources: tuple[AuthorSourceFile, ...],
+    artifact_path: Path,
+    evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
+    verify_inputs: Callable[[PitOptimizerRunManifestV4, DiscoveryPanelPlan], None],
+    campaign_checkpoint_path: Path | None = None,
+    campaign_checkpoint_sha256: str | None = None,
+    restore_seed: Callable[
+        [str, Mapping[str, object], Path, DiscoveryPanelPlan], SearchCandidateState
+    ]
+    | None = None,
+) -> PitOptimizerReadinessV4:
+    """Public schema-v4 preparation adapter; it has no provider capability."""
+
+    from core.pit_optimizer_controller import prepare_pit_optimizer_v4 as prepare
+
+    return prepare(
+        manifest=manifest,
+        discovery_panel_plan=discovery_panel_plan,
+        baseline_sources=baseline_sources,
+        artifact_path=artifact_path,
+        evaluate_baseline=evaluate_baseline,
+        verify_inputs=verify_inputs,
+        campaign_checkpoint_path=campaign_checkpoint_path,
+        campaign_checkpoint_sha256=campaign_checkpoint_sha256,
+        restore_seed=restore_seed,
+    )
+
+
+def run_pit_optimizer_v4(
+    *,
+    readiness: PitOptimizerReadinessV4,
+    services: PitOptimizerServicesV4,
+) -> PitOptimizerResultV4:
+    """Public adapter for the bounded schema-v4 champion/branch loop."""
+
+    from core.pit_optimizer_controller import run_pit_optimizer_v4 as run
 
     return run(readiness=readiness, services=services)
 

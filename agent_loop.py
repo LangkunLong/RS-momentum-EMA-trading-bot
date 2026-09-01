@@ -12528,11 +12528,15 @@ class LoopConfig:
         except ImportError:
             pit_gate_type = ()
         try:
-            from core.pit_optimization import PitOptimizationGateConfig
+            from core.pit_optimization import (
+                PitOptimizationGateConfig,
+                PitOptimizerGateConfigV4,
+            )
             from core.pit_optimization_contract import PitOptimizerGateConfig
             optimization_gate_type: tuple[type[object], ...] = (
                 PitOptimizationGateConfig,
                 PitOptimizerGateConfig,
+                PitOptimizerGateConfigV4,
             )
         except ImportError:
             optimization_gate_type = ()
@@ -12577,7 +12581,10 @@ class LoopConfig:
                     raise ConfigurationError(
                         "PIT optimization input must not overlap the permanent runtime"
                     )
-            if isinstance(self.gate, PitOptimizerGateConfig):
+            if isinstance(
+                self.gate,
+                (PitOptimizerGateConfig, PitOptimizerGateConfigV4),
+            ):
                 expected_context = (
                     source,
                     runtime,
@@ -12600,7 +12607,7 @@ class LoopConfig:
             raise ConfigurationError("models must be a validated config")
         if optimization_gate_type and isinstance(
             self.gate,
-            PitOptimizerGateConfig,
+            (PitOptimizerGateConfig, PitOptimizerGateConfigV4),
         ):
             if not isinstance(self.limits, PitOptimizerLoopLimits):
                 raise ConfigurationError(
@@ -19213,6 +19220,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--readiness-sha256")
     parser.add_argument("--optimizer-manifest", type=Path)
     parser.add_argument("--optimizer-manifest-sha256")
+    parser.add_argument("--discovery-panel-plan", type=Path)
+    parser.add_argument("--discovery-panel-plan-sha256")
+    parser.add_argument("--campaign-checkpoint", type=Path)
+    parser.add_argument("--campaign-checkpoint-sha256")
     parser.add_argument("--verified-parity", type=Path)
     parser.add_argument("--verified-parity-sha256")
     parser.add_argument("--optimizer-authorization-window-id")
@@ -19473,12 +19484,127 @@ def _build_pit_optimizer_v3_config(
     return config
 
 
+def _build_pit_optimizer_v4_config(namespace: argparse.Namespace) -> object:
+    """Build a closed schema-v4 gate from authenticated manifest/panel inputs."""
+
+    from core.pit_optimization import PitOptimizerGateConfigV4
+    from core.pit_optimization_contract import load_pit_optimizer_manifest_v4
+    from core.pit_optimizer_evaluation import load_discovery_panel_plan
+
+    phase = getattr(namespace, "optimization_phase", None)
+    manifest_path = _absolute_cli_path(
+        getattr(namespace, "optimizer_manifest", None),
+        "optimizer manifest",
+    )
+    manifest_sha256 = getattr(namespace, "optimizer_manifest_sha256", None)
+    panel_path = _absolute_cli_path(
+        getattr(namespace, "discovery_panel_plan", None),
+        "discovery panel plan",
+    )
+    panel_sha256 = getattr(namespace, "discovery_panel_plan_sha256", None)
+    if (
+        _SHA256_RE.fullmatch(manifest_sha256 or "") is None
+        or _SHA256_RE.fullmatch(panel_sha256 or "") is None
+    ):
+        raise ConfigurationError("optimizer v4 manifest/panel digest is invalid")
+    try:
+        panel = load_discovery_panel_plan(panel_path)
+        if hashlib.sha256(panel_path.read_bytes()).hexdigest() != panel_sha256:
+            raise ValueError("optimizer v4 discovery panel digest differs")
+        manifest = load_pit_optimizer_manifest_v4(
+            manifest_path,
+            expected_sha256=manifest_sha256,
+            discovery_panel_plan=panel,
+        )
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    checkpoint = getattr(namespace, "campaign_checkpoint", None)
+    checkpoint_sha256 = getattr(namespace, "campaign_checkpoint_sha256", None)
+    if (checkpoint is None) != (checkpoint_sha256 is None):
+        raise ConfigurationError(
+            "campaign checkpoint path and SHA-256 must be supplied together"
+        )
+    if manifest.seed_checkpoint_sha256 != checkpoint_sha256:
+        raise ConfigurationError("optimizer v4 manifest checkpoint differs")
+    artifact_root = _absolute_cli_path(
+        getattr(namespace, "artifact_root", None),
+        "artifact root",
+    )
+    readiness_artifact = artifact_root / f"{manifest.campaign_id}.readiness.json"
+    try:
+        return PitOptimizerGateConfigV4(
+            phase=phase,
+            baseline_run=_absolute_cli_path(
+                getattr(namespace, "baseline_run", None),
+                "baseline run",
+            ),
+            pit_bundle=_absolute_cli_path(
+                getattr(namespace, "pit_bundle", None),
+                "PIT bundle",
+            ),
+            pit_bundle_sha256=getattr(namespace, "pit_bundle_sha256", None),
+            optimizer_manifest=manifest_path,
+            optimizer_manifest_sha256=manifest_sha256,
+            discovery_panel_plan=panel_path,
+            discovery_panel_plan_sha256=panel_sha256,
+            readiness_artifact=readiness_artifact,
+            readiness_sha256=getattr(namespace, "readiness_sha256", None),
+            campaign_checkpoint=(
+                None
+                if checkpoint is None
+                else _absolute_cli_path(checkpoint, "campaign checkpoint")
+            ),
+            campaign_checkpoint_sha256=checkpoint_sha256,
+            source_transmission_authorized=getattr(
+                namespace,
+                "authorize_policy_source_transmission",
+                False,
+            ),
+            max_api_calls=getattr(namespace, "max_api_calls", None),
+            max_tokens=getattr(namespace, "max_tokens", None),
+            max_iterations=getattr(namespace, "max_iterations", None),
+            apply=getattr(namespace, "apply", None),
+            source_root=_absolute_cli_path(
+                getattr(namespace, "repo_root", None),
+                "repository root",
+            ),
+            permanent_runtime_root=_absolute_cli_path(
+                getattr(namespace, "permanent_runtime_root", None),
+                "permanent runtime root",
+            ),
+            controller_temp_parent=_absolute_cli_path(
+                getattr(namespace, "controller_temp_parent", None),
+                "controller temporary parent",
+            ),
+            artifact_root=artifact_root,
+            git_executable=_absolute_cli_path(
+                getattr(namespace, "git_executable", None),
+                "Git executable",
+            ),
+            docker_executable=_absolute_cli_path(
+                getattr(namespace, "docker_executable", None),
+                "Docker executable",
+            ),
+            sandbox_image=getattr(namespace, "sandbox_image", None),
+        )
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class PitOptimizerLiveRun:
     """Authenticated schema-v3 readiness paired with injected live capabilities."""
 
     readiness: PitOptimizerReadiness
     optimizer_services: PitOptimizerServices
+
+
+@dataclass(frozen=True, slots=True)
+class PitOptimizerLiveRunV4:
+    """Authenticated schema-v4 readiness paired with live capabilities."""
+
+    readiness: object
+    optimizer_services: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -20640,6 +20766,56 @@ def _dispatch_pit_optimizer_v3(
     )
 
 
+def _dispatch_pit_optimizer_v4(
+    config: object,
+    limits: PitOptimizerLoopLimits,
+    *,
+    prepare: Callable[[object], object],
+    build_live_services: Callable[
+        [object, PitOptimizerLoopLimits], PitOptimizerLiveRunV4
+    ],
+) -> object:
+    """Keep provider construction strictly behind authenticated v4 readiness."""
+
+    from core.pit_optimization import (
+        PitOptimizerGateConfigV4,
+        run_pit_optimizer_v4,
+    )
+    from core.pit_optimizer_controller import (
+        PitOptimizerReadinessV4,
+        PitOptimizerServicesV4,
+    )
+
+    if not isinstance(config, PitOptimizerGateConfigV4):
+        raise ConfigurationError("PIT optimizer v4 gate is invalid")
+    if (
+        not isinstance(limits, PitOptimizerLoopLimits)
+        or (
+            limits.max_api_calls,
+            limits.max_tokens,
+            limits.max_iterations,
+        )
+        != (config.max_api_calls, config.max_tokens, config.max_iterations)
+    ):
+        raise ConfigurationError("PIT optimizer v4 execution limits differ")
+    if config.phase == "prepare":
+        readiness = prepare(config)
+        if not isinstance(readiness, PitOptimizerReadinessV4):
+            raise ConfigurationError("PIT optimizer v4 readiness is invalid")
+        return readiness
+    live = build_live_services(config, limits)
+    if (
+        not isinstance(live, PitOptimizerLiveRunV4)
+        or not isinstance(live.readiness, PitOptimizerReadinessV4)
+        or not isinstance(live.optimizer_services, PitOptimizerServicesV4)
+    ):
+        raise ConfigurationError("PIT optimizer v4 live services are invalid")
+    return run_pit_optimizer_v4(
+        readiness=live.readiness,
+        services=live.optimizer_services,
+    )
+
+
 def _build_cli_config(
     namespace: argparse.Namespace,
 ) -> tuple[LoopConfig, Path, str]:
@@ -20712,9 +20888,13 @@ def _build_cli_config(
         namespace.optimization_prior_discovery_feedback,
         namespace.optimization_prior_discovery_feedback_sha256,
     )
-    optimizer_v3_fields = (
+    optimizer_fields = (
         namespace.optimizer_manifest,
         namespace.optimizer_manifest_sha256,
+        namespace.discovery_panel_plan,
+        namespace.discovery_panel_plan_sha256,
+        namespace.campaign_checkpoint,
+        namespace.campaign_checkpoint_sha256,
         namespace.verified_parity,
         namespace.verified_parity_sha256,
         namespace.optimizer_authorization_window_id,
@@ -20723,7 +20903,7 @@ def _build_cli_config(
     if (
         namespace.gate != "pit_optimizer"
         and (
-            any(value is not None for value in optimizer_v3_fields)
+            any(value is not None for value in optimizer_fields)
             or namespace.authorize_policy_source_transmission
         )
     ) or (
@@ -20732,13 +20912,13 @@ def _build_cli_config(
         and namespace.authorize_policy_source_transmission
     ):
         raise ConfigurationError(
-            "schema-v3 optimizer options are accepted only by optimizer canary"
+            "schema-v2 optimizer options are accepted only by optimizer canary"
         )
     all_pit_fields = (
         *pit_shared_fields,
         *diagnosis_fields,
         *optimization_fields,
-        *optimizer_v3_fields,
+        *optimizer_fields,
     )
     if namespace.gate == "test":
         if any(value is not None for value in backtest_fields):
@@ -20909,7 +21089,40 @@ def _build_cli_config(
                 "proposal samples are not supported by the PIT optimizer gate"
             )
         namespace.max_api_calls = max_api_calls
-        gate = _build_pit_optimizer_v3_config(namespace)
+        manifest_path = _absolute_cli_path(
+            namespace.optimizer_manifest,
+            "optimizer manifest",
+        )
+        try:
+            manifest_schema = json.loads(manifest_path.read_bytes()).get(
+                "schema_version"
+            )
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConfigurationError("optimizer manifest is invalid JSON") from exc
+        if manifest_schema == 4:
+            if namespace.verified_parity is not None or (
+                namespace.verified_parity_sha256 is not None
+            ) or namespace.optimizer_authorization_window_id is not None or (
+                namespace.optimizer_authorization_requirement_sha256 is not None
+            ):
+                raise ConfigurationError(
+                    "legacy optimizer authority cannot be supplied to schema v4"
+                )
+            gate = _build_pit_optimizer_v4_config(namespace)
+        else:
+            if any(
+                value is not None
+                for value in (
+                    namespace.discovery_panel_plan,
+                    namespace.discovery_panel_plan_sha256,
+                    namespace.campaign_checkpoint,
+                    namespace.campaign_checkpoint_sha256,
+                )
+            ):
+                raise ConfigurationError(
+                    "schema-v4 checkpoint/panel options require a v4 manifest"
+                )
+            gate = _build_pit_optimizer_v3_config(namespace)
     limits: LoopLimits | PitOptimizerLoopLimits
     if namespace.gate == "pit_optimizer":
         # DeepSeek R1 is a mandatory-reasoning model.  A short generic HTTP
@@ -22007,6 +22220,23 @@ def _pit_optimizer_v3_summary(
     }
 
 
+def _pit_optimizer_v4_summary(result: object) -> dict[str, object]:
+    """Project schema-v4 search status without hashes, source, or credentials."""
+
+    from core.pit_optimizer_controller import PitOptimizerResultV4
+
+    if not isinstance(result, PitOptimizerResultV4):
+        raise ConfigurationError(
+            "CLI execution did not return a PitOptimizerResultV4"
+        )
+    summary = dict(result.to_public_artifact())
+    if any("sha256" in key.lower() for key in summary):
+        raise ConfigurationError("optimizer v4 public summary exposed an opaque digest")
+    if summary.get("apply") is not False:
+        raise ConfigurationError("optimizer v4 public summary is not apply=false")
+    return summary
+
+
 def _pit_optimizer_v3_execution_limit_args(
     limits: PitOptimizerLoopLimits,
 ) -> tuple[str, ...]:
@@ -22298,6 +22528,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from core.pit_optimizer_controller import (
             PitOptimizerReadiness,
             PitOptimizerResult,
+            PitOptimizerResultV4,
         )
         from pit_diagnosis_agent import PitDiagnosisLoopResult
 
@@ -22310,6 +22541,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(result, PitOptimizationLoopResult)
             else _pit_optimizer_v3_summary(result)
             if isinstance(result, PitOptimizerResult)
+            else _pit_optimizer_v4_summary(result)
+            if isinstance(result, PitOptimizerResultV4)
             else {
                 "schema_version": 3,
                 "phase": "prepare",
