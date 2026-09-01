@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import hashlib
 import json
 import os
@@ -501,6 +502,14 @@ class IncrementalArtifactStore:
     _ITERATION_JSON = frozenset(
         {"investigator.json", "author.json", "validation.json", "discovery.json", "critic.json", "decision.json"}
     )
+    _ROLE_OUTPUT_INVALID_JSON = frozenset(
+        {
+            "investigator_output_invalid.json",
+            "author_output_invalid.json",
+            "critic_output_invalid.json",
+        }
+    )
+    _PLAN_SKIP_JSON = "authorization_skips.json"
 
     def __init__(self, root: Path) -> None:
         candidate = Path(root)
@@ -563,7 +572,10 @@ class IncrementalArtifactStore:
             and parts[0] == "iterations"
             and len(parts[1]) == 3
             and parts[1].isdigit()
-            and parts[2] in self._ITERATION_JSON
+            and parts[2]
+            in self._ITERATION_JSON
+            | self._ROLE_OUTPUT_INVALID_JSON
+            | {self._PLAN_SKIP_JSON}
         ):
             valid = True
         elif not json_artifact and (
@@ -586,14 +598,75 @@ class IncrementalArtifactStore:
         name: str,
         value: Mapping[str, object],
     ) -> tuple[Path, str]:
-        if not isinstance(value, Mapping) or value.get("schema_version") != 3:
+        if not isinstance(value, Mapping):
             raise ValueError("optimizer JSON artifact schema is invalid")
         parent_parts, target_name = self._target(name, json_artifact=True)
+        is_recovery_artifact = target_name in (
+            self._ROLE_OUTPUT_INVALID_JSON | {self._PLAN_SKIP_JSON}
+        )
+        if value.get("schema_version") != (4 if is_recovery_artifact else 3):
+            raise ValueError("optimizer JSON artifact schema is invalid")
         payload = canonical_json_bytes(value)
         with self._secure_directory(parent_parts, create=False) as directory:
             if name in self._REPLACEABLE_JSON and directory.entry_exists(target_name):
                 return _atomic_replace_in_directory(directory, target_name, payload)
             return _write_create_only_in_directory(directory, target_name, payload)
+
+    def write_role_output_invalid(self, attempt: object) -> tuple[Path, str]:
+        """Persist closed plan/provider facts, never rejected provider content."""
+
+        from core.pit_optimizer_authorization import PitOptimizerRoleAttempt
+
+        if (
+            not isinstance(attempt, PitOptimizerRoleAttempt)
+            or not attempt.recoverable_schema_invalid
+        ):
+            raise ValueError("optimizer role-output-invalid artifact is invalid")
+        self.prepare_iteration(attempt.plan.iteration)
+        return self.write_json_artifact(
+            (
+                f"iterations/{attempt.plan.iteration:03d}/"
+                f"{attempt.plan.role}_output_invalid.json"
+            ),
+            {
+                "schema_version": 4,
+                "artifact_type": "role_output_invalid",
+                "plan": attempt.plan.to_primitive(),
+                "provider_facts": asdict(attempt.facts),
+                "payload": None,
+            },
+        )
+
+    def write_authorization_plan_skips(
+        self,
+        skips: tuple[object, ...],
+    ) -> tuple[Path, str]:
+        """Persist hash-chained zero-charge settlements without provider content."""
+
+        from core.pit_optimizer_authorization import AuthorizationPlanSkip
+
+        if (
+            type(skips) is not tuple
+            or not skips
+            or any(not isinstance(skip, AuthorizationPlanSkip) for skip in skips)
+        ):
+            raise ValueError("optimizer authorization skip artifact is invalid")
+        typed_skips = tuple(
+            skip for skip in skips if isinstance(skip, AuthorizationPlanSkip)
+        )
+        iteration = typed_skips[0].iteration
+        if any(skip.iteration != iteration for skip in typed_skips):
+            raise ValueError("optimizer authorization skips span iterations")
+        self.prepare_iteration(iteration)
+        return self.write_json_artifact(
+            f"iterations/{iteration:03d}/{self._PLAN_SKIP_JSON}",
+            {
+                "schema_version": 4,
+                "artifact_type": "authorization_plan_skips",
+                "iteration": iteration,
+                "skips": [skip.to_record() for skip in typed_skips],
+            },
+        )
 
     def write_diff_artifact(self, name: str, value: str) -> tuple[Path, str]:
         if not isinstance(value, str) or "\x00" in value:

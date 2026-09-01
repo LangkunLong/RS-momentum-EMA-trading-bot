@@ -69,6 +69,7 @@ if TYPE_CHECKING:
         OptimizerPricingSnapshot,
         PitOptimizerProviderFacts,
         PitOptimizerRoleCall,
+        PitOptimizerRoleAttempt,
         TerminalAuditReceipt,
     )
     from core.pit_optimizer_controller import (
@@ -4153,6 +4154,12 @@ class OpenRouterGateway:
             return requested
         if facts.outcome == "accepted":
             return None
+        if facts.outcome == "schema_invalid" and (
+            facts.response_validation_code is not None
+            and facts.accounting_complete
+            and facts.accounting_source is not None
+        ):
+            return None
         if facts.outcome == "budget_exceeded":
             return "budget_exhausted"
         return "failed"
@@ -4316,8 +4323,8 @@ class OpenRouterGateway:
             raise AuditError("optimizer started lifecycle event is absent")
         if not facts.request_started and lifecycle.started_event_sha256 is not None:
             raise AuditError("optimizer before-send lifecycle has a start event")
-        if facts.outcome == "accepted" and not response_processed:
-            raise AuditError("optimizer accepted response was not processed by gateway")
+        if facts.outcome in {"accepted", "schema_invalid"} and not response_processed:
+            raise AuditError("optimizer response was not processed by gateway")
         if facts.outcome == "accepted":
             if payload_sha256 is None or _SHA256_RE.fullmatch(payload_sha256) is None:
                 raise AuditError("optimizer accepted artifact digest is invalid")
@@ -4554,7 +4561,7 @@ class OpenRouterGateway:
         *,
         authorization_lease: "AuthorizationRunLease",
         call_budget: "PitOptimizerCallBudget",
-    ) -> "PitOptimizerProviderFacts":
+    ) -> "PitOptimizerProviderFacts | PitOptimizerRoleAttempt":
         """Idempotently complete authorization and return verified terminal facts."""
 
         from core.pit_optimizer_authorization import (
@@ -4562,6 +4569,7 @@ class OpenRouterGateway:
             AuthorizationLedger,
             AuthorizationRunLease,
             PitOptimizerProviderFacts,
+            PitOptimizerRoleAttempt,
         )
 
         if not isinstance(self.authorization_ledger, AuthorizationLedger):
@@ -4618,6 +4626,12 @@ class OpenRouterGateway:
             )
         if not isinstance(facts, PitOptimizerProviderFacts):
             raise AuthorizationError("recovered optimizer facts are invalid")
+        if facts.outcome == "schema_invalid":
+            return PitOptimizerRoleAttempt(
+                plan=plan_snapshot,
+                facts=facts,
+                payload=None,
+            )
         return facts
 
     def request_pit_optimizer_once(
@@ -4631,7 +4645,7 @@ class OpenRouterGateway:
         frozen_pricing: "OptimizerPricingSnapshot",
         wall_deadline: float,
         monotonic: Callable[[], float],
-    ) -> "PitOptimizerRoleCall":
+    ) -> "PitOptimizerRoleAttempt":
         """Perform exactly one all-R1 schema-v3 call with durable accounting."""
 
         from core.pit_optimization_contract import (
@@ -4652,7 +4666,7 @@ class OpenRouterGateway:
             AuthorizationRunLease,
             OptimizerPricingSnapshot,
             PitOptimizerProviderFacts,
-            PitOptimizerRoleCall,
+            PitOptimizerRoleAttempt,
         )
 
         role_inputs = {
@@ -5130,9 +5144,11 @@ class OpenRouterGateway:
                     accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
-                raise ResponseValidationError(
-                    "optimizer response schema is invalid"
-                ) from exc
+                return PitOptimizerRoleAttempt(
+                    plan=plan_snapshot,
+                    facts=facts,
+                    payload=None,
+                )
             accounting_stage = "artifact_binding"
             expected_payload_type = {
                 "investigator": InvestigatorArtifact,
@@ -5154,12 +5170,14 @@ class OpenRouterGateway:
                     accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
-                raise ResponseValidationError(
-                    "optimizer parser returned the wrong artifact type"
+                return PitOptimizerRoleAttempt(
+                    plan=plan_snapshot,
+                    facts=facts,
+                    payload=None,
                 )
             try:
                 role_snapshot.validate_artifact(completion.payload)
-            except ValueError as exc:
+            except ValueError:
                 facts = provider_facts(
                     outcome="schema_invalid",
                     request_started=True,
@@ -5174,9 +5192,11 @@ class OpenRouterGateway:
                     accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
-                raise ResponseValidationError(
-                    "optimizer artifact differs from its input"
-                ) from exc
+                return PitOptimizerRoleAttempt(
+                    plan=plan_snapshot,
+                    facts=facts,
+                    payload=None,
+                )
             accounting_stage = "provider_facts"
             facts = provider_facts(
                 outcome="accepted",
@@ -5194,7 +5214,11 @@ class OpenRouterGateway:
             ).hexdigest()
             accounting_stage = "publication"
             finalize(facts, usage, payload_sha256=payload_digest)
-            return PitOptimizerRoleCall(plan_snapshot, completion.payload, facts)
+            return PitOptimizerRoleAttempt(
+                plan=plan_snapshot,
+                facts=facts,
+                payload=completion.payload,
+            )
         except BaseException as original:
             outer_terminal_code = (
                 "cancelled"
@@ -14345,7 +14369,7 @@ class AuditTrail:
             lifecycle_digest,
         )
         terminal_code = terminal_details.get("terminal_code")
-        if record.outcome == "accepted":
+        if record.outcome in {"accepted", "schema_invalid"}:
             if terminal_code not in {
                 None,
                 "failed",
@@ -14353,6 +14377,10 @@ class AuditTrail:
                 "budget_exhausted",
             }:
                 raise AuditError("optimizer audit terminal code is invalid")
+            if record.outcome == "schema_invalid" and terminal_code is not None:
+                raise AuditError(
+                    "accounted invalid optimizer audit cannot close the lease"
+                )
         elif terminal_code not in {
             "failed",
             "cancelled",
@@ -14419,10 +14447,10 @@ class AuditTrail:
             raise AuditError("optimizer terminal audit evidence differs")
         if type(terminal_details.get("response_processed")) is not bool:
             raise AuditError("optimizer response processing evidence is invalid")
-        if record.outcome == "accepted" and not terminal_details[
+        if record.outcome in {"accepted", "schema_invalid"} and not terminal_details[
             "response_processed"
         ]:
-            raise AuditError("optimizer accepted response was not processed")
+            raise AuditError("optimizer response was not processed")
         return terminal, facts, budget_state
 
     def verify_terminal_audit_receipt(

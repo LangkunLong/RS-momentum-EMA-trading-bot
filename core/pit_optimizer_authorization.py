@@ -23,11 +23,14 @@ from typing import Iterator, Mapping, Sequence
 from core.pit_optimization_contract import (
     AuthorizationRequirement,
     AuthorArtifact,
+    AuthorArtifactV4,
     AuthorInput,
     AuthorManifestSummary,
     CriticArtifact,
+    CriticArtifactV4,
     CriticInput,
     InvestigatorArtifact,
+    InvestigatorArtifactV4,
     InvestigatorInput,
     OPTIMIZER_V2_ROLES,
     PatchBounds,
@@ -746,6 +749,76 @@ class PitOptimizerRoleCall:
 
 
 @dataclass(frozen=True, slots=True)
+class PitOptimizerRoleAttempt:
+    """One settled provider attempt without reclassifying invalid output as accepted."""
+
+    plan: PitOptimizerCallBudget
+    facts: PitOptimizerProviderFacts
+    payload: (
+        InvestigatorArtifact
+        | AuthorArtifact
+        | CriticArtifact
+        | InvestigatorArtifactV4
+        | AuthorArtifactV4
+        | CriticArtifactV4
+        | None
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.plan, PitOptimizerCallBudget):
+            raise ValueError("optimizer role attempt plan is invalid")
+        if not isinstance(self.facts, PitOptimizerProviderFacts):
+            raise ValueError("optimizer role attempt facts are invalid")
+        if (
+            self.facts.call_index,
+            self.facts.iteration,
+            self.facts.role,
+            self.facts.requested_model,
+        ) != (
+            self.plan.call_index,
+            self.plan.iteration,
+            self.plan.role,
+            self.plan.model,
+        ):
+            raise ValueError("optimizer role attempt facts differ from plan")
+        expected_payloads = {
+            "investigator": (InvestigatorArtifact, InvestigatorArtifactV4),
+            "author": (AuthorArtifact, AuthorArtifactV4),
+            "critic": (CriticArtifact, CriticArtifactV4),
+        }[self.plan.role]
+        if self.payload is not None:
+            if not isinstance(self.payload, expected_payloads):
+                raise ValueError("optimizer role attempt payload differs from plan role")
+            if (
+                self.facts.outcome != "accepted"
+                or not self.facts.request_started
+                or not self.facts.response_received
+                or not self.facts.response_schema_valid
+                or not self.facts.accounting_complete
+            ):
+                raise ValueError("optimizer role attempt payload is not accepted")
+            return
+        if not (
+            self.facts.outcome == "schema_invalid"
+            and self.facts.request_started
+            and self.facts.response_received
+            and not self.facts.response_schema_valid
+            and self.facts.accounting_complete
+            and self.facts.response_validation_code
+            in _contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES
+            and self.facts.accounting_source is not None
+            and self.facts.retained_reservation_tokens == 0
+        ):
+            raise ValueError(
+                "optimizer role attempt without payload is not an accounted invalid response"
+            )
+
+    @property
+    def recoverable_schema_invalid(self) -> bool:
+        return self.payload is None
+
+
+@dataclass(frozen=True, slots=True)
 class TerminalAuditReceipt:
     """Durable identity cross-verified against one immutable AuditTrail event."""
 
@@ -802,6 +875,11 @@ class TerminalAuditReceipt:
                 raise ValueError("terminal audit receipt code is invalid")
         elif self.payload_sha256 is not None:
             raise ValueError("rejected terminal audit receipt cannot bind a payload")
+        elif self.outcome == "schema_invalid":
+            if self.terminal_code is not None:
+                raise ValueError(
+                    "accounted invalid terminal audit receipt cannot close the lease"
+                )
         elif self.terminal_code not in {
             "failed",
             "cancelled",
@@ -822,6 +900,97 @@ class TerminalAuditReceipt:
             "payload_sha256": self.payload_sha256,
             "terminal_code": self.terminal_code,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationPlanSkip:
+    """One zero-charge plan settlement authenticated by the ledger hash chain."""
+
+    schema_version: int
+    record_index: int
+    lease_id: str
+    call_index: int
+    iteration: int
+    role: str
+    triggering_call_index: int
+    reason: str
+    previous_record_sha256: str
+    record_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 3:
+            raise ValueError("authorization plan skip schema is invalid")
+        _positive_int(self.record_index, "authorization plan skip record index")
+        _require_id(self.lease_id, "authorization plan skip lease ID")
+        _positive_int(self.call_index, "authorization plan skip call index")
+        _positive_int(self.iteration, "authorization plan skip iteration")
+        if self.role not in OPTIMIZER_V2_ROLES:
+            raise ValueError("authorization plan skip role is invalid")
+        _positive_int(
+            self.triggering_call_index,
+            "authorization plan skip triggering call index",
+        )
+        if (
+            self.triggering_call_index >= self.call_index
+            or self.reason != "predecessor_role_output_invalid"
+        ):
+            raise ValueError("authorization plan skip trigger is invalid")
+        _require_digest(
+            self.previous_record_sha256,
+            "authorization plan skip prior ledger SHA-256",
+        )
+        _require_digest(self.record_sha256, "authorization plan skip SHA-256")
+        if self.record_sha256 != _authorization_record_digest(self.to_record()):
+            raise ValueError("authorization plan skip digest differs")
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "record_type": "plan_skip",
+            "record_index": self.record_index,
+            "previous_record_sha256": self.previous_record_sha256,
+            "lease_id": self.lease_id,
+            "call_index": self.call_index,
+            "iteration": self.iteration,
+            "role": self.role,
+            "triggering_call_index": self.triggering_call_index,
+            "reason": self.reason,
+            "record_sha256": self.record_sha256,
+        }
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, object]) -> "AuthorizationPlanSkip":
+        expected_keys = {
+            "schema_version",
+            "record_type",
+            "record_index",
+            "previous_record_sha256",
+            "lease_id",
+            "call_index",
+            "iteration",
+            "role",
+            "triggering_call_index",
+            "reason",
+            "record_sha256",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != expected_keys
+            or value.get("record_type") != "plan_skip"
+        ):
+            raise ValueError("authorization plan skip record is invalid")
+        return cls(
+            schema_version=value.get("schema_version"),  # type: ignore[arg-type]
+            record_index=value.get("record_index"),  # type: ignore[arg-type]
+            lease_id=value.get("lease_id"),  # type: ignore[arg-type]
+            call_index=value.get("call_index"),  # type: ignore[arg-type]
+            iteration=value.get("iteration"),  # type: ignore[arg-type]
+            role=value.get("role"),  # type: ignore[arg-type]
+            triggering_call_index=value.get("triggering_call_index"),  # type: ignore[arg-type]
+            reason=value.get("reason"),  # type: ignore[arg-type]
+            previous_record_sha256=value.get("previous_record_sha256"),  # type: ignore[arg-type]
+            record_sha256=value.get("record_sha256"),  # type: ignore[arg-type]
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1301,14 +1470,31 @@ class AuthorizationLedger:
         dynamic_input: object,
         plan: PitOptimizerCallBudget,
         *,
-        predecessor_calls: Sequence[PitOptimizerRoleCall] = (),
+        predecessor_calls: Sequence[
+            PitOptimizerRoleCall | PitOptimizerRoleAttempt | AuthorizationPlanSkip
+        ] = (),
+        predecessor_attempts: Sequence[
+            PitOptimizerRoleAttempt | AuthorizationPlanSkip
+        ]
+        | None = None,
     ) -> AuthenticatedRoleInputSnapshot:
         """Issue one plan-exclusive snapshot from durable predecessor receipts."""
 
         snapshot = self._snapshot_role_input(dynamic_input, plan)
         canonical_plan = self.snapshot_call_plan(plan)
-        if type(predecessor_calls) is not tuple or any(
-            not isinstance(item, PitOptimizerRoleCall) for item in predecessor_calls
+        if predecessor_attempts is not None and predecessor_calls:
+            raise AuthorizationError("optimizer predecessor lineage is ambiguous")
+        predecessors = (
+            predecessor_attempts
+            if predecessor_attempts is not None
+            else predecessor_calls
+        )
+        if type(predecessors) is not tuple or any(
+            not isinstance(
+                item,
+                (PitOptimizerRoleCall, PitOptimizerRoleAttempt, AuthorizationPlanSkip),
+            )
+            for item in predecessors
         ):
             raise AuthorizationError("optimizer predecessor calls are invalid")
         expected_predecessors: tuple[PitOptimizerCallBudget, ...]
@@ -1325,24 +1511,39 @@ class AuthorizationLedger:
                 self._call_plan_snapshots[canonical_plan.call_index - 3],
                 self._call_plan_snapshots[canonical_plan.call_index - 2],
             )
-        if len(predecessor_calls) != len(expected_predecessors):
+        if len(predecessors) != len(expected_predecessors):
             raise AuthorizationError(
                 "optimizer role input predecessor lineage is incomplete"
             )
         with _authorization_file_lock(self._lock_path):
             records = self._read_records()
             for predecessor, expected_plan in zip(
-                predecessor_calls,
+                predecessors,
                 expected_predecessors,
                 strict=True,
             ):
-                if predecessor.plan != expected_plan:
+                predecessor_plan = (
+                    self._call_plan_snapshots[predecessor.call_index - 1]
+                    if isinstance(predecessor, AuthorizationPlanSkip)
+                    else predecessor.plan
+                )
+                if predecessor_plan != expected_plan:
                     raise AuthorizationError(
                         "optimizer role input predecessor plan differs"
                     )
-                payload_sha256 = hashlib.sha256(
-                    predecessor.payload.canonical_json_bytes()
-                ).hexdigest()
+                if isinstance(predecessor, AuthorizationPlanSkip):
+                    if predecessor.to_record() not in records:
+                        raise AuthorizationError(
+                            "optimizer role input predecessor skip is absent"
+                        )
+                    continue
+                payload_sha256 = (
+                    None
+                    if predecessor.payload is None
+                    else hashlib.sha256(
+                        predecessor.payload.canonical_json_bytes()
+                    ).hexdigest()
+                )
                 matches = [
                     item
                     for item in records
@@ -1364,7 +1565,7 @@ class AuthorizationLedger:
                         expected_plan.call_index,
                         expected_plan.iteration,
                         expected_plan.role,
-                        "accepted",
+                        predecessor.facts.outcome,
                         payload_sha256,
                     )
                 ]
@@ -1411,21 +1612,55 @@ class AuthorizationLedger:
             snapshot.canonical_bytes,
             object_pairs_hook=_reject_duplicate_keys,
         )
+        legacy_calls: tuple[PitOptimizerRoleCall, ...] = tuple(
+            item
+            if isinstance(item, PitOptimizerRoleCall)
+            else PitOptimizerRoleCall(item.plan, item.payload, item.facts)
+            for item in predecessors
+            if not isinstance(item, AuthorizationPlanSkip)
+            and item.payload is not None
+            and isinstance(
+                item.payload,
+                (InvestigatorArtifact, AuthorArtifact, CriticArtifact),
+            )
+        )
         if canonical_plan.role == "investigator" and canonical_plan.iteration > 1:
             feedbacks = primitive.get("prior_iterations")
-            if (
-                not isinstance(feedbacks, list)
-                or len(feedbacks) * len(OPTIMIZER_V2_ROLES)
-                != len(predecessor_calls)
-            ):
+            if not isinstance(feedbacks, list):
                 raise AuthorizationError(
                     "optimizer role input predecessor artifact differs"
                 )
-            for offset, feedback in enumerate(feedbacks):
-                investigator_call, author_call, critic_call = predecessor_calls[
+            complete_groups: list[tuple[PitOptimizerRoleCall, ...]] = []
+            for offset in range(canonical_plan.iteration - 1):
+                group = predecessors[
                     offset * len(OPTIMIZER_V2_ROLES) :
                     (offset + 1) * len(OPTIMIZER_V2_ROLES)
                 ]
+                if all(
+                    not isinstance(item, AuthorizationPlanSkip)
+                    and item.payload is not None
+                    and item.facts.outcome == "accepted"
+                    for item in group
+                ):
+                    complete_groups.append(
+                        tuple(
+                            item
+                            if isinstance(item, PitOptimizerRoleCall)
+                            else PitOptimizerRoleCall(
+                                item.plan,
+                                item.payload,
+                                item.facts,
+                            )
+                            for item in group
+                            if not isinstance(item, AuthorizationPlanSkip)
+                        )
+                    )
+            if len(feedbacks) != len(complete_groups):
+                raise AuthorizationError(
+                    "optimizer role input predecessor artifact differs"
+                )
+            for feedback, group in zip(feedbacks, complete_groups, strict=True):
+                investigator_call, author_call, critic_call = group
                 investigator_payload = investigator_call.payload
                 author_payload = author_call.payload
                 critic_payload = critic_call.payload
@@ -1440,7 +1675,7 @@ class AuthorizationLedger:
                     feedback.get("critic_disposition"),
                     feedback.get("critic_next_direction"),
                 ) != (
-                    offset + 1,
+                    investigator_call.plan.iteration,
                     investigator_payload.hypothesis_id,
                     investigator_payload.family,
                     author_payload.behavioral_summary,
@@ -1451,12 +1686,20 @@ class AuthorizationLedger:
                         "optimizer role input predecessor artifact differs"
                     )
         elif canonical_plan.role == "author":
-            if primitive.get("investigator") != predecessor_calls[0].payload.to_primitive():
+            if (
+                len(legacy_calls) != 1
+                or primitive.get("investigator")
+                != legacy_calls[0].payload.to_primitive()
+            ):
                 raise AuthorizationError(
                     "optimizer role input predecessor artifact differs"
                 )
         elif canonical_plan.role == "critic":
-            investigator_call, author_call = predecessor_calls
+            if len(legacy_calls) != 2:
+                raise AuthorizationError(
+                    "optimizer critic requires accepted predecessor artifacts"
+                )
+            investigator_call, author_call = legacy_calls
             author_payload = author_call.payload
             assert isinstance(author_payload, AuthorArtifact)
             _require_critic_predecessor_lineage(
@@ -2090,6 +2333,8 @@ class AuthorizationLedger:
             str,
             list[tuple[AuthorizationCallReservation, PitOptimizerProviderFacts]],
         ] = {}
+        plan_skips_by_lease: dict[str, list[AuthorizationPlanSkip]] = {}
+        settled_call_indices_by_lease: dict[str, set[int]] = {}
         pending_terminal_closes: dict[str, frozenset[str]] = {}
         gateway_lifecycles: dict[str, list[dict[str, object]]] = {}
         for index, line in enumerate(raw.splitlines(keepends=True), start=1):
@@ -2292,22 +2537,29 @@ class AuthorizationLedger:
                 if reservation.lease_id not in leases:
                     raise AuthorizationError("authorization reservation lease is absent")
                 lease = leases[reservation.lease_id]
-                prior_reservations = [
-                    record
-                    for record in records
-                    if record.get("record_type") == "reservation"
-                    and isinstance(record.get("reservation"), dict)
-                    and record["reservation"].get("lease_id")
-                    == reservation.lease_id
-                ]
                 if (
                     (reservation.projected_call_usd is not None)
                     != (lease.pricing_status == "available")
                     or reservation.call_index > len(self._call_plan_snapshots)
-                    or reservation.call_index != len(prior_reservations) + 1
                 ):
                     raise AuthorizationError(
                         "authorization reservation pricing or plan is invalid"
+                    )
+                settled_indices = settled_call_indices_by_lease.setdefault(
+                    reservation.lease_id,
+                    set(),
+                )
+                next_unsettled = next(
+                    (
+                        call_index
+                        for call_index in range(1, len(self._call_plan_snapshots) + 1)
+                        if call_index not in settled_indices
+                    ),
+                    None,
+                )
+                if reservation.call_index != next_unsettled:
+                    raise AuthorizationError(
+                        "authorization reservation is not the next unsettled plan"
                     )
                 plan = self._call_plan_snapshots[reservation.call_index - 1]
                 if (
@@ -2605,6 +2857,15 @@ class AuthorizationLedger:
                 reconciliations_by_lease.setdefault(lease_id, []).append(
                     (reservation, facts)
                 )
+                settled_indices = settled_call_indices_by_lease.setdefault(
+                    lease_id,
+                    set(),
+                )
+                if reservation.call_index in settled_indices:
+                    raise AuthorizationError(
+                        "authorization plan slot is settled more than once"
+                    )
+                settled_indices.add(reservation.call_index)
                 receipt_terminal_code = (
                     replayed_receipt.terminal_code
                     if terminal_audit_receipt is not None
@@ -2622,7 +2883,10 @@ class AuthorizationLedger:
                     pending_terminal_closes[lease_id] = frozenset(
                         {receipt_terminal_code}
                     )
-                elif facts.outcome != "accepted":
+                elif not self._provider_facts_settle_plan(
+                    facts,
+                    self._call_plan_snapshots[reservation.call_index - 1],
+                ):
                     # Without a terminal receipt, an explicit caller-supplied
                     # failed/cancelled/budget code is not otherwise persisted.
                     pending_terminal_closes[lease_id] = frozenset(
@@ -2630,6 +2894,85 @@ class AuthorizationLedger:
                     )
                 del active_reservations[lease_id]
                 reconciled_reservations.add(reservation.reservation_id)
+            elif record_type == "plan_skip":
+                if set(value) != expected_common | {
+                    "lease_id",
+                    "call_index",
+                    "iteration",
+                    "role",
+                    "triggering_call_index",
+                    "reason",
+                }:
+                    raise AuthorizationError("authorization plan skip keys are invalid")
+                try:
+                    skip = AuthorizationPlanSkip.from_record(value)
+                except (TypeError, ValueError) as exc:
+                    raise AuthorizationError(
+                        "authorization plan skip record is invalid"
+                    ) from exc
+                if skip.lease_id not in leases or skip.lease_id in closed_leases:
+                    raise AuthorizationError("authorization plan skip lease is invalid")
+                if skip.lease_id in active_reservations:
+                    raise AuthorizationError(
+                        "authorization plan skip cannot bypass an active reservation"
+                    )
+                if skip.call_index > len(self._call_plan_snapshots):
+                    raise AuthorizationError("authorization plan skip index is invalid")
+                plan = self._call_plan_snapshots[skip.call_index - 1]
+                if (skip.call_index, skip.iteration, skip.role) != (
+                    plan.call_index,
+                    plan.iteration,
+                    plan.role,
+                ):
+                    raise AuthorizationError(
+                        "authorization plan skip differs from sealed plan"
+                    )
+                settled_indices = settled_call_indices_by_lease.setdefault(
+                    skip.lease_id,
+                    set(),
+                )
+                next_unsettled = next(
+                    (
+                        call_index
+                        for call_index in range(1, len(self._call_plan_snapshots) + 1)
+                        if call_index not in settled_indices
+                    ),
+                    None,
+                )
+                if skip.call_index != next_unsettled:
+                    raise AuthorizationError(
+                        "authorization plan skips must settle a contiguous plan prefix"
+                    )
+                trigger = next(
+                    (
+                        (reservation, facts)
+                        for reservation, facts in reconciliations_by_lease.get(
+                            skip.lease_id,
+                            [],
+                        )
+                        if reservation.call_index == skip.triggering_call_index
+                    ),
+                    None,
+                )
+                if trigger is None:
+                    raise AuthorizationError(
+                        "authorization plan skip trigger is absent"
+                    )
+                trigger_reservation, trigger_facts = trigger
+                if not (
+                    trigger_reservation.iteration == skip.iteration
+                    and trigger_reservation.role == "investigator"
+                    and trigger_facts.outcome == "schema_invalid"
+                    and trigger_facts.accounting_complete
+                    and trigger_facts.response_validation_code
+                    in _contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES
+                    and trigger_facts.accounting_source is not None
+                ):
+                    raise AuthorizationError(
+                        "authorization plan skip trigger is not an accounted invalid investigator"
+                    )
+                settled_indices.add(skip.call_index)
+                plan_skips_by_lease.setdefault(skip.lease_id, []).append(skip)
             elif record_type == "lease_close":
                 if set(value) != expected_common | {"lease_id", "terminal_code"}:
                     raise AuthorizationError("authorization lease close keys are invalid")
@@ -2661,33 +3004,32 @@ class AuthorizationLedger:
                     )
                 if terminal_code in {"completed", "early_stop"}:
                     reconciliations = reconciliations_by_lease.get(str(lease_id), [])
-                    for offset, (reservation, facts) in enumerate(reconciliations):
-                        if offset >= len(self._call_plan_snapshots):
+                    skips = plan_skips_by_lease.get(str(lease_id), [])
+                    covered = {
+                        reservation.call_index for reservation, _facts in reconciliations
+                    } | {skip.call_index for skip in skips}
+                    for reservation, facts in reconciliations:
+                        plan = self._call_plan_snapshots[reservation.call_index - 1]
+                        if not self._provider_facts_settle_plan(facts, plan):
                             raise AuthorizationError(
-                                "authorization completed plan has excess calls"
+                                "authorization completed plan has an unsettled call"
                             )
-                        plan = self._call_plan_snapshots[offset]
-                        if (
-                            reservation.call_index,
-                            reservation.iteration,
-                            reservation.role,
-                        ) != (plan.call_index, plan.iteration, plan.role) or not (
-                            self._provider_facts_accept_plan(facts, plan)
-                        ):
-                            raise AuthorizationError(
-                                "authorization completed plan has a non-accepted call"
-                            )
-                    if terminal_code == "completed" and len(reconciliations) != len(
+                    expected_prefix = set(range(1, len(covered) + 1))
+                    if covered != expected_prefix:
+                        raise AuthorizationError(
+                            "authorization completed plan coverage is not contiguous"
+                        )
+                    if terminal_code == "completed" and len(covered) != len(
                         self._call_plan_snapshots
                     ):
                         raise AuthorizationError(
                             "authorization completed lease requires the exact call plan"
                         )
                     if terminal_code == "early_stop" and not (
-                        0 < len(reconciliations) < len(self._call_plan_snapshots)
+                        0 < len(covered) < len(self._call_plan_snapshots)
                     ):
                         raise AuthorizationError(
-                            "authorization early stop requires an accepted partial plan"
+                            "authorization early stop requires a settled partial plan"
                         )
                 pending_terminal_closes.pop(str(lease_id), None)
                 closed_leases.add(str(lease_id))
@@ -3314,6 +3656,12 @@ class AuthorizationLedger:
             return requested_terminal_code
         if provider_facts.outcome == "accepted":
             return None
+        if provider_facts.outcome == "schema_invalid" and (
+            provider_facts.response_validation_code
+            in _contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES
+            and provider_facts.accounting_source is not None
+        ):
+            return None
         if provider_facts.outcome == "budget_exceeded":
             return "budget_exhausted"
         return "failed"
@@ -3332,6 +3680,27 @@ class AuthorizationLedger:
             and facts.requested_model == plan.model
             and facts.response_schema_valid
             and facts.accounting_complete
+        )
+
+    @classmethod
+    def _provider_facts_settle_plan(
+        cls,
+        facts: PitOptimizerProviderFacts,
+        plan: PitOptimizerCallBudget,
+    ) -> bool:
+        if cls._provider_facts_accept_plan(facts, plan):
+            return True
+        return (
+            facts.outcome == "schema_invalid"
+            and facts.request_started
+            and facts.response_received
+            and facts.requested_model == plan.model
+            and not facts.response_schema_valid
+            and facts.accounting_complete
+            and facts.response_validation_code
+            in _contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES
+            and facts.accounting_source is not None
+            and facts.retained_reservation_tokens == 0
         )
 
     def _verify_reconciliation_records(
@@ -3459,30 +3828,45 @@ class AuthorizationLedger:
                         ) from exc
                     lease_reconciliations.append((lease_reservation, lease_facts))
                 expected_plans = self._call_plan_snapshots
+                lease_skips = [
+                    AuthorizationPlanSkip.from_record(item)
+                    for item in records
+                    if item.get("record_type") == "plan_skip"
+                    and item.get("lease_id") == reservation.lease_id
+                ]
                 if not lease_reconciliations or any(
-                    facts.outcome != "accepted"
-                    for _lease_reservation, facts in lease_reconciliations
+                    not self._provider_facts_settle_plan(
+                        facts,
+                        expected_plans[lease_reservation.call_index - 1],
+                    )
+                    for lease_reservation, facts in lease_reconciliations
                 ):
                     raise AuthorizationError(
-                        "authorization accepted reconciliation close has a non-accepted prefix"
+                        "authorization reconciliation close has an unsettled call"
+                    )
+                covered = {
+                    lease_reservation.call_index
+                    for lease_reservation, _facts in lease_reconciliations
+                } | {skip.call_index for skip in lease_skips}
+                if covered != set(range(1, len(covered) + 1)):
+                    raise AuthorizationError(
+                        "authorization lease settlement is not contiguous"
                     )
                 if close_code == "completed":
-                    if len(lease_reconciliations) != len(expected_plans):
+                    if len(covered) != len(expected_plans):
                         raise AuthorizationError(
                             "authorization completed lease has an incomplete call plan"
                         )
-                elif not 0 < len(lease_reconciliations) < len(expected_plans):
+                elif not 0 < len(covered) < len(expected_plans):
                     raise AuthorizationError(
                         "authorization early-stop lease has an invalid call prefix"
                     )
-                for offset, (lease_reservation, lease_facts) in enumerate(
-                    lease_reconciliations
-                ):
-                    if offset >= len(expected_plans):
+                for lease_reservation, lease_facts in lease_reconciliations:
+                    if lease_reservation.call_index > len(expected_plans):
                         raise AuthorizationError(
                             "authorization lease call plan has excess calls"
                         )
-                    expected_plan = expected_plans[offset]
+                    expected_plan = expected_plans[lease_reservation.call_index - 1]
                     if (
                         lease_reservation.call_index,
                         lease_reservation.iteration,
@@ -3573,7 +3957,8 @@ class AuthorizationLedger:
                 item.get("record_type") == "reconciliation"
                 and item.get("reservation_id") in reservation_ids
                 and isinstance(item.get("provider_facts"), dict)
-                and item["provider_facts"].get("outcome") != "accepted"
+                and item["provider_facts"].get("outcome")
+                not in {"accepted", "schema_invalid"}
                 for item in records
             ):
                 raise AuthorizationError(
@@ -3584,10 +3969,31 @@ class AuthorizationLedger:
                 for item in reservations
             ):
                 raise AuthorizationError("authorization lease has an active call reservation")
-            next_offset = len(reservations)
-            if next_offset >= len(self._manifest.call_budgets):
+            settled_indices = {
+                int(item["provider_facts"]["call_index"])
+                for item in records
+                if item.get("record_type") == "reconciliation"
+                and item.get("reservation_id") in reservation_ids
+                and isinstance(item.get("provider_facts"), dict)
+                and type(item["provider_facts"].get("call_index")) is int
+            } | {
+                int(item["call_index"])
+                for item in records
+                if item.get("record_type") == "plan_skip"
+                and item.get("lease_id") == lease.lease_id
+                and type(item.get("call_index")) is int
+            }
+            next_call_index = next(
+                (
+                    call_index
+                    for call_index in range(1, len(self._call_plan_snapshots) + 1)
+                    if call_index not in settled_indices
+                ),
+                None,
+            )
+            if next_call_index is None:
                 raise AuthorizationError("authorization planned calls are exhausted")
-            expected = self._call_plan_snapshots[next_offset]
+            expected = self._call_plan_snapshots[next_call_index - 1]
             if canonical_plan != expected:
                 raise AuthorizationError("authorization call is not the next sealed plan")
             if stored_lease.run_manifest_sha256 != self._manifest.sha256:
@@ -3619,6 +4025,120 @@ class AuthorizationLedger:
                 [{"record_type": "reservation", "reservation": asdict(reservation)}],
             )
             return reservation
+
+    def skip_unstarted_plans(
+        self,
+        lease: AuthorizationRunLease,
+        plans: tuple[PitOptimizerCallBudget, ...],
+        *,
+        triggering_attempt: PitOptimizerRoleAttempt,
+        reason: str = "predecessor_role_output_invalid",
+    ) -> tuple[AuthorizationPlanSkip, ...]:
+        """Settle the unstarted remainder of an invalid investigator iteration."""
+
+        if type(plans) is not tuple or any(
+            not isinstance(plan, PitOptimizerCallBudget) for plan in plans
+        ):
+            raise AuthorizationError("authorization plan skips are invalid")
+        if (
+            not isinstance(triggering_attempt, PitOptimizerRoleAttempt)
+            or not triggering_attempt.recoverable_schema_invalid
+            or triggering_attempt.plan.role != "investigator"
+            or reason != "predecessor_role_output_invalid"
+        ):
+            raise AuthorizationError("authorization plan skip trigger is invalid")
+        trigger_plan = self.snapshot_call_plan(triggering_attempt.plan)
+        canonical_plans = tuple(self.snapshot_call_plan(plan) for plan in plans)
+        expected_plans = tuple(
+            plan
+            for plan in self._call_plan_snapshots
+            if plan.iteration == trigger_plan.iteration
+            and plan.call_index > trigger_plan.call_index
+        )
+        if canonical_plans != expected_plans or not canonical_plans:
+            raise AuthorizationError(
+                "authorization skips must cover the remaining invalid iteration"
+            )
+        with _authorization_file_lock(self._lock_path):
+            records = self._read_records()
+            self._lease_from_records(records, lease)
+            if any(
+                item.get("record_type") == "lease_close"
+                and item.get("lease_id") == lease.lease_id
+                for item in records
+            ):
+                raise AuthorizationError("authorization lease is closed")
+            reservations = self._reservation_records(records, lease.lease_id)
+            reservation_ids = {
+                str(item["reservation"].get("reservation_id"))
+                for item in reservations
+            }
+            if any(
+                item["reservation"].get("reservation_id")
+                not in self._reconciled_ids(records)
+                for item in reservations
+            ):
+                raise AuthorizationError(
+                    "authorization lease has an active call reservation"
+                )
+            trigger_matches = [
+                item
+                for item in records
+                if item.get("record_type") == "reconciliation"
+                and item.get("reservation_id") in reservation_ids
+                and item.get("provider_facts") == asdict(triggering_attempt.facts)
+            ]
+            if len(trigger_matches) != 1:
+                raise AuthorizationError(
+                    "authorization plan skip trigger reconciliation is absent"
+                )
+            settled_indices = {
+                int(item["provider_facts"]["call_index"])
+                for item in records
+                if item.get("record_type") == "reconciliation"
+                and item.get("reservation_id") in reservation_ids
+                and isinstance(item.get("provider_facts"), dict)
+                and type(item["provider_facts"].get("call_index")) is int
+            } | {
+                int(item["call_index"])
+                for item in records
+                if item.get("record_type") == "plan_skip"
+                and item.get("lease_id") == lease.lease_id
+                and type(item.get("call_index")) is int
+            }
+            expected_next = next(
+                (
+                    call_index
+                    for call_index in range(1, len(self._call_plan_snapshots) + 1)
+                    if call_index not in settled_indices
+                ),
+                None,
+            )
+            if expected_next != canonical_plans[0].call_index:
+                raise AuthorizationError(
+                    "authorization plan skips are not the next unsettled plans"
+                )
+            appended = self._append_records(
+                records,
+                [
+                    {
+                        "record_type": "plan_skip",
+                        "lease_id": lease.lease_id,
+                        "call_index": plan.call_index,
+                        "iteration": plan.iteration,
+                        "role": plan.role,
+                        "triggering_call_index": trigger_plan.call_index,
+                        "reason": reason,
+                    }
+                    for plan in canonical_plans
+                ],
+            )
+        try:
+            return tuple(AuthorizationPlanSkip.from_record(item) for item in appended)
+        except (TypeError, ValueError) as exc:
+            raise AuthorizationError(
+                "authorization plan skip publication is invalid"
+            ) from exc
 
     def reconcile_call(
         self,
@@ -4127,19 +4647,19 @@ class AuthorizationLedger:
             ):
                 raise AuthorizationError("authorization lease has an active call reservation")
             if terminal_code in {"completed", "early_stop"}:
-                accepted_plans: list[PitOptimizerCallBudget] = []
-                for offset, item in enumerate(reservations):
+                reconciled_plans: set[int] = set()
+                for item in reservations:
                     primitive = item.get("reservation")
                     if not isinstance(primitive, dict):
                         raise AuthorizationError(
                             "authorization reservation record is invalid"
                         )
                     reservation = AuthorizationCallReservation(**primitive)
-                    if offset >= len(self._manifest.call_budgets):
+                    if reservation.call_index > len(self._manifest.call_budgets):
                         raise AuthorizationError(
                             "authorization completed plan has excess calls"
                         )
-                    plan = self._manifest.call_budgets[offset]
+                    plan = self._manifest.call_budgets[reservation.call_index - 1]
                     if (
                         reservation.call_index,
                         reservation.iteration,
@@ -4161,22 +4681,33 @@ class AuthorizationLedger:
                             "authorization provider facts are invalid"
                         )
                     facts = PitOptimizerProviderFacts(**facts_primitive)
-                    if not self._provider_facts_accept_plan(facts, plan):
+                    if not self._provider_facts_settle_plan(facts, plan):
                         raise AuthorizationError(
-                            "authorization completed plan has a non-accepted call"
+                            "authorization completed plan has an unsettled call"
                         )
-                    accepted_plans.append(plan)
-                if terminal_code == "completed" and len(accepted_plans) != len(
+                    reconciled_plans.add(plan.call_index)
+                skipped_plans = {
+                    AuthorizationPlanSkip.from_record(record).call_index
+                    for record in records
+                    if record.get("record_type") == "plan_skip"
+                    and record.get("lease_id") == lease.lease_id
+                }
+                covered_plans = reconciled_plans | skipped_plans
+                if covered_plans != set(range(1, len(covered_plans) + 1)):
+                    raise AuthorizationError(
+                        "authorization completed plan coverage is not contiguous"
+                    )
+                if terminal_code == "completed" and len(covered_plans) != len(
                     self._manifest.call_budgets
                 ):
                     raise AuthorizationError(
                         "authorization completed lease requires the exact call plan"
                     )
                 if terminal_code == "early_stop" and not (
-                    0 < len(accepted_plans) < len(self._manifest.call_budgets)
+                    0 < len(covered_plans) < len(self._manifest.call_budgets)
                 ):
                     raise AuthorizationError(
-                        "authorization early stop requires an accepted partial plan"
+                        "authorization early stop requires a settled partial plan"
                     )
             self._append_records(
                 records,

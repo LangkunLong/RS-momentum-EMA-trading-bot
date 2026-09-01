@@ -5308,11 +5308,15 @@ class RoleOutputInvalidSummary(_V2Canonical):
 
     def __post_init__(self) -> None:
         _require_positive_int(self.iteration, "role output invalid summary iteration")
-        if self.role != "author":
-            raise ValueError("role output invalid summary must describe the author")
-        expected_call_index = (self.iteration - 1) * len(OPTIMIZER_V4_ROLES) + 2
+        if self.role not in OPTIMIZER_V4_ROLES:
+            raise ValueError("role output invalid summary role is invalid")
+        expected_call_index = (
+            (self.iteration - 1) * len(OPTIMIZER_V4_ROLES)
+            + OPTIMIZER_V4_ROLES.index(self.role)
+            + 1
+        )
         if self.call_index != expected_call_index:
-            raise ValueError("role output invalid summary author slot is invalid")
+            raise ValueError("role output invalid summary plan slot is invalid")
         if self.validation_code not in PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES:
             raise ValueError("role output invalid summary validation code is invalid")
 

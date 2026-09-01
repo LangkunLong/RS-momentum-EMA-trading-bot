@@ -3781,7 +3781,6 @@ def _task6_authorized_ledger(
     grant_id: str = "grant-v2",
     calls: int = 6,
     tokens: int = 448_000,
-    usd: float = 0.40,
 ):
     from core.pit_optimizer_authorization import (
         AuthorizationLedger,
@@ -3802,7 +3801,6 @@ def _task6_authorized_ledger(
             grant_id=grant_id,
             additional_calls=calls,
             additional_tokens=tokens,
-            additional_usd=usd,
             policy_source_scope_sha256=manifest.policy_source_scope.sha256,
         ),
         operator_approval_reference=f"approval-{grant_id}",
@@ -4258,7 +4256,8 @@ def _task6_open_lease(tmp_path: Path, manifest: contract.PitOptimizerRunManifest
         window_id=window.window_id,
         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
         run_manifest_sha256=manifest.sha256,
-        frozen_pricing_sha256=pricing.pricing_sha256,
+        pricing_snapshot=pricing,
+        projected_plan_usd=Decimal("0"),
     )
     return ledger, ledger_path, lease, pricing
 
@@ -4277,7 +4276,6 @@ def _task6_provider_facts(
     total_tokens: int | None = 150,
     cost_usd: float | None = 0.01,
     retained_tokens: int = 0,
-    retained_usd: float = 0.0,
 ):
     from core.pit_optimizer_authorization import PitOptimizerProviderFacts
 
@@ -4287,7 +4285,7 @@ def _task6_provider_facts(
         role=reservation.role,
         requested_model="deepseek/deepseek-r1",
         returned_model=("deepseek/deepseek-r1" if response_received else None),
-        frozen_pricing_sha256=pricing.pricing_sha256,
+        pricing_snapshot_sha256=pricing.pricing_payload_sha256,
         outcome=outcome,
         request_started=request_started,
         response_received=response_received,
@@ -4299,8 +4297,11 @@ def _task6_provider_facts(
         total_tokens=total_tokens,
         cost_usd=cost_usd,
         retained_reservation_tokens=retained_tokens,
-        retained_reservation_usd=retained_usd,
         audit_sha256="a" * 64,
+        response_validation_code=(
+            "payload_schema_invalid" if outcome == "schema_invalid" else None
+        ),
+        accounting_source=("inline" if accounting_complete else None),
     )
 
 
@@ -4308,14 +4309,21 @@ def test_pit_optimizer_v2_terminal_reconciliation_fences_reopened_lease(
     tmp_path: Path,
     v2_manifest: contract.PitOptimizerRunManifest,
 ) -> None:
-    """Break caught: a crash after terminal reconcile could unlock plan two."""
-    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+    """A reopened lease advances only after authenticated zero-charge skips."""
+    from core.pit_optimizer_authorization import (
+        AuthorizationLedger,
+        PitOptimizerRoleAttempt,
+    )
 
     authorization, ledger_path, lease, pricing = _task6_open_lease(
         tmp_path,
         v2_manifest,
     )
-    reservation = authorization.reserve_call(lease, v2_manifest.call_budgets[0])
+    reservation = authorization.reserve_call(
+        lease,
+        v2_manifest.call_budgets[0],
+        projected_call_usd=Decimal("0"),
+    )
     facts = _task6_provider_facts(
         reservation,
         pricing,
@@ -4328,17 +4336,36 @@ def test_pit_optimizer_v2_terminal_reconciliation_fences_reopened_lease(
         facts,
         terminal_audit_sha256="b" * 64,
     )
+    attempt = PitOptimizerRoleAttempt(
+        plan=v2_manifest.call_budgets[0],
+        facts=facts,
+        payload=None,
+    )
+    skips = authorization.skip_unstarted_plans(
+        lease,
+        tuple(v2_manifest.call_budgets[1:3]),
+        triggering_attempt=attempt,
+    )
     reopened = AuthorizationLedger(ledger_path, v2_manifest)
-
-    with pytest.raises(AuthorizationError, match="(?:terminal|closed)"):
-        reopened.reserve_call(lease, v2_manifest.call_budgets[1])
+    next_reservation = reopened.reserve_call(
+        lease,
+        v2_manifest.call_budgets[3],
+        projected_call_usd=Decimal("0"),
+    )
 
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
-    assert [record["record_type"] for record in records[-2:]] == [
+    assert [skip.call_index for skip in skips] == [2, 3]
+    assert [record["record_type"] for record in records[-4:]] == [
         "reconciliation",
-        "lease_close",
+        "plan_skip",
+        "plan_skip",
+        "reservation",
     ]
-    assert records[-1]["terminal_code"] == "failed"
+    assert all(
+        "charged_calls" not in record and "charged_tokens" not in record
+        for record in records[-3:-1]
+    )
+    assert next_reservation.call_index == 4
 
 
 @pytest.mark.parametrize(
@@ -4489,12 +4516,16 @@ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
     v2_manifest: contract.PitOptimizerRunManifest,
     nonaccepted_outcome: str,
 ) -> None:
-    """Break caught: call count alone could conceal a rejected or uncertain role."""
+    """Accounted invalid output settles; uncertain accounting remains terminal."""
     from core.pit_optimizer_authorization import AuthorizationError
 
     ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
     for index, plan in enumerate(v2_manifest.call_budgets[:3]):
-        reservation = ledger.reserve_call(lease, plan)
+        reservation = ledger.reserve_call(
+            lease,
+            plan,
+            projected_call_usd=Decimal("0"),
+        )
         if index == 2 and nonaccepted_outcome == "uncertain_accounting":
             facts = _task6_provider_facts(
                 reservation,
@@ -4508,7 +4539,6 @@ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
                 total_tokens=None,
                 cost_usd=None,
                 retained_tokens=reservation.reserved_tokens,
-                retained_usd=reservation.reserved_usd,
             )
         else:
             facts = _task6_provider_facts(
@@ -4533,13 +4563,40 @@ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
             terminal_audit_sha256="b" * 64,
         )
 
-    with pytest.raises(AuthorizationError, match="closed"):
-        ledger.reserve_call(lease, v2_manifest.call_budgets[3])
-    with pytest.raises(AuthorizationError, match="already closed"):
+    if nonaccepted_outcome == "schema_invalid":
+        for plan in v2_manifest.call_budgets[3:]:
+            reservation = ledger.reserve_call(
+                lease,
+                plan,
+                projected_call_usd=Decimal("0"),
+            )
+            ledger.reconcile_call(
+                reservation,
+                _task6_provider_facts(
+                    reservation,
+                    pricing,
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                    total_tokens=15,
+                    cost_usd=0.001,
+                ),
+                terminal_audit_sha256="b" * 64,
+            )
         ledger.close_run_lease(lease, terminal_code="completed")
+    else:
+        with pytest.raises(AuthorizationError, match="closed"):
+            ledger.reserve_call(
+                lease,
+                v2_manifest.call_budgets[3],
+                projected_call_usd=Decimal("0"),
+            )
+        with pytest.raises(AuthorizationError, match="already closed"):
+            ledger.close_run_lease(lease, terminal_code="completed")
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
     assert records[-1]["record_type"] == "lease_close"
-    assert records[-1]["terminal_code"] == "failed"
+    assert records[-1]["terminal_code"] == (
+        "completed" if nonaccepted_outcome == "schema_invalid" else "failed"
+    )
 
 
 def test_pit_optimizer_v2_budget_reservation_is_exact_sequential_and_released(
@@ -4646,7 +4703,6 @@ def test_pit_optimizer_v2_provider_call_uncertain_retains_one_full_reservation(
         total_tokens=None,
         cost_usd=None,
         retained_tokens=reservation.reserved_tokens,
-        retained_usd=reservation.reserved_usd,
     )
 
     ledger.reconcile_call(
@@ -5106,7 +5162,8 @@ def _task6_gateway_context(
         window_id=window.window_id,
         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
         run_manifest_sha256=manifest.sha256,
-        frozen_pricing_sha256=pricing.pricing_sha256,
+        pricing_snapshot=pricing,
+        projected_plan_usd=Decimal("0"),
     )
     return (
         authorization,
@@ -9064,6 +9121,7 @@ def test_pit_optimizer_v2_next_investigator_requires_prior_iteration_receipts(
         family=investigator_artifact.family,
         author_summary=author_artifact.behavioral_summary,
         validation_code="valid",
+        candidate_folds=(),
         discovery_score=None,
         critic_disposition=critic_artifact.disposition,
         critic_next_direction=critic_artifact.next_direction,
@@ -9108,9 +9166,9 @@ def test_pit_optimizer_v2_next_investigator_requires_prior_iteration_receipts(
         (
             _task6_fake_response("{}"),
             "schema_invalid",
-            "ResponseValidationError",
+            None,
             "authoritative",
-            "payload_schema_invalid",
+            "payload_keys_invalid",
         ),
         (
             RuntimeError("synthetic post-send transport failure"),
@@ -9126,7 +9184,7 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
     v2_manifest: contract.PitOptimizerRunManifest,
     outcome: object,
     provider_outcome: str,
-    error_type: str,
+    error_type: str | None,
     charge_basis: str,
     response_validation_code: str | None,
 ) -> None:
@@ -9149,9 +9207,8 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
         outcomes=[outcome],
     )
 
-    expected_error = getattr(agent_loop, error_type)
-    with pytest.raises(expected_error):
-        gateway.request_pit_optimizer_once(
+    def request_once():
+        return gateway.request_pit_optimizer_once(
             "investigator",
             _task6_bind_role_input(
                 authorization,
@@ -9165,16 +9222,46 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
             wall_deadline=10.0,
             monotonic=lambda: 1.0,
         )
+
+    if error_type is None:
+        attempt = request_once()
+        assert attempt.payload is None
+        assert attempt.recoverable_schema_invalid
+    else:
+        expected_error = getattr(agent_loop, error_type)
+        with pytest.raises(expected_error):
+            request_once()
     assert len(client.completions.calls) == 1
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
-    assert records[-2]["record_type"] == "reconciliation"
-    assert records[-2]["provider_facts"]["outcome"] == provider_outcome
-    assert records[-2]["charge_basis"] == charge_basis
+    reconciliation = next(
+        item for item in reversed(records) if item["record_type"] == "reconciliation"
+    )
+    assert reconciliation["provider_facts"]["outcome"] == provider_outcome
+    assert reconciliation["cost_accounting_status"] == (
+        "authoritative" if charge_basis == "authoritative" else "unavailable"
+    )
     assert (
-        records[-2]["provider_facts"]["response_validation_code"]
+        reconciliation["provider_facts"]["response_validation_code"]
         == response_validation_code
     )
-    assert records[-1]["record_type"] == "lease_close"
+    closes = [item for item in records if item["record_type"] == "lease_close"]
+    if provider_outcome == "schema_invalid":
+        assert closes == []
+        skips = authorization.skip_unstarted_plans(
+            lease,
+            tuple(v2_manifest.call_budgets[1:3]),
+            triggering_attempt=attempt,
+        )
+        assert [skip.role for skip in skips] == ["author", "critic"]
+        assert [skip.call_index for skip in skips] == [2, 3]
+        next_reservation = authorization.reserve_call(
+            lease,
+            v2_manifest.call_budgets[3],
+            projected_call_usd=Decimal("0"),
+        )
+        assert next_reservation.call_index == 4
+    else:
+        assert closes[-1]["terminal_code"] == "failed"
     assert audit._events[-1]["event"] == "provider_call_rejected"
 
 

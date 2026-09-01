@@ -110,9 +110,9 @@ def _evidence(
 
 def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
     caps = {
-        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
-        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
-        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
+        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
+        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
     return tuple(
         contract.PitOptimizerCallBudget(
@@ -125,7 +125,6 @@ def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
             max_input_tokens=caps[role][2],
             max_output_tokens=caps[role][3],
             max_response_bytes=caps[role][4],
-            max_usd=caps[role][5],
         )
         for iteration in (1, 2)
         for ordinal, role in enumerate(contract.OPTIMIZER_V2_ROLES, start=1)
@@ -275,7 +274,6 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
         window_id="window_task7",
         max_calls=6,
         max_tokens=448_000,
-        max_usd=0.40,
         policy_source_scope_sha256=scope.sha256,
         provider_retries=0,
         apply=False,
@@ -283,7 +281,7 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
     constraints = ("causal_only", "no_external_io")
     constraints_sha256 = hashlib.sha256(_canonical_bytes(constraints)).hexdigest()
     manifest = contract.PitOptimizerRunManifest(
-        schema_version=2,
+        schema_version=3,
         run_id="run_task7",
         run_kind="subset_canary",
         model=contract.PIT_OPTIMIZER_R1_MODEL,
@@ -331,7 +329,6 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
         authorization_window_id=None,
         authorization_requirement_sha256=authorization.sha256,
         source_transmission_authorized=False,
-        max_usd=0.40,
         max_api_calls=6,
         max_tokens=448_000,
         max_iterations=2,
@@ -834,22 +831,22 @@ def test_artifact_initialization_store_is_create_only_and_accounting_replaceable
     store = IncrementalArtifactStore(root)
     first_path, first_digest = store.write_json_artifact(
         "run.json",
-        {"schema_version": 2, "run_id": "run_task7"},
+        {"schema_version": 3, "run_id": "run_task7"},
     )
     assert first_path == root / "run.json"
     assert first_digest == hashlib.sha256(first_path.read_bytes()).hexdigest()
     with pytest.raises(FileExistsError):
         store.write_json_artifact(
             "run.json",
-            {"schema_version": 2, "run_id": "run_other"},
+            {"schema_version": 3, "run_id": "run_other"},
         )
     store.write_json_artifact(
         "accounting.json",
-        {"schema_version": 2, "api_calls": 0},
+        {"schema_version": 3, "api_calls": 0},
     )
     replaced_path, replaced_digest = store.write_json_artifact(
         "accounting.json",
-        {"schema_version": 2, "api_calls": 1},
+        {"schema_version": 3, "api_calls": 1},
     )
     assert json.loads(replaced_path.read_bytes())["api_calls"] == 1
     assert replaced_digest == hashlib.sha256(replaced_path.read_bytes()).hexdigest()
