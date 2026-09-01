@@ -21011,10 +21011,7 @@ def _v4_worker_runner(
         engine=docker,
         temp_parent=config.controller_temp_parent,
         fold_timeout_seconds=limits.child_timeout_seconds,
-        output_limit_bytes=min(
-            _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES,
-            limits.output_limit_bytes,
-        ),
+        output_limit_bytes=_MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES,
         wall_deadline=deadline,
     )
 
