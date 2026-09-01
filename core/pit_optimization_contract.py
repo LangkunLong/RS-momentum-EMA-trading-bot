@@ -4129,6 +4129,11 @@ def _v4_bounded_text(value: object, field: str, *, max_chars: int) -> str:
     return text
 
 
+def _v4_response_identifier(value: object, field: str) -> str:
+    _v4_utf8_bytes(value, field)
+    return _v2_response_identifier(value, field)
+
+
 def _v4_source_text(value: object, field: str) -> str:
     encoded = _v4_utf8_bytes(value, field)
     assert isinstance(value, str)
@@ -4140,6 +4145,15 @@ def _v4_source_text(value: object, field: str) -> str:
     if encoded.decode("utf-8", errors="strict") != value:
         raise ValueError(f"{field} must be valid UTF-8 text")
     return value
+
+
+def _v4_normalize_source_text(value: object, field: str) -> str:
+    """Canonicalize harmless model-authored policy-source line endings."""
+
+    _v4_utf8_bytes(value, field)
+    assert isinstance(value, str)
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+    return _v4_source_text(normalized, field)
 
 
 def _parse_v4_closed_object(
@@ -4175,10 +4189,10 @@ def _v4_response_list(
     if len(value) > max_items:
         raise ValueError(f"{field} may contain at most {max_items} items")
     normalized = tuple(
-        _v4_bounded_text(item, field, max_chars=max_item_chars) for item in value
+        dict.fromkeys(
+            _v4_bounded_text(item, field, max_chars=max_item_chars) for item in value
+        )
     )
-    if len(set(normalized)) != len(normalized):
-        raise ValueError(f"{field} must contain unique values")
     if not allow_empty and not normalized:
         raise ValueError(f"{field} cannot be empty")
     return normalized
@@ -4201,9 +4215,7 @@ def _v4_focus_areas(value: object, field: str) -> tuple[str, ...]:
     if any(item not in _V4_FOCUS_AREAS for item in parsed):
         raise ValueError(f"{field} are invalid")
     canonical = tuple(item for item in _V4_FOCUS_AREAS if item in parsed)
-    if parsed != canonical:
-        raise ValueError(f"{field} must be in canonical order")
-    return parsed
+    return canonical
 
 
 @dataclass(frozen=True, slots=True)
@@ -4224,7 +4236,7 @@ class AuthorSourceFile(_V2Canonical):
 
     @classmethod
     def from_source(cls, *, path: str, source: str) -> "AuthorSourceFile":
-        _v4_source_text(source, f"author source {path}")
+        source = _v4_normalize_source_text(source, f"author source {path}")
         return cls(
             path=path,
             source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
@@ -4783,30 +4795,51 @@ PIT_OPTIMIZER_V4_SYSTEM_PROMPTS = MappingProxyType(
             "selected-parent policy sources and aggregate quick/discovery portfolio evidence. "
             "Propose one focused causal mechanism grounded in O'Neil entry quality, leadership, "
             "risk sizing, exposure, winner retention, or exit behavior. Return exactly one JSON "
-            "object matching the supplied schema. Select one to three focus_areas from entry, "
-            "risk_sizing, and exit in that canonical order. Do not select files, emit patches, "
-            "request qualification data, or include chain-of-thought, credentials, paths outside "
-            "the supplied repository-relative policy scope, raw rows, trades, holdings, or "
-            "provider accounting. The local closed parser is authoritative."
+            "object with exactly these keys and types: hypothesis_id:string; "
+            "focus_areas:array[string] with one to three values chosen from entry, risk_sizing, "
+            "and exit; evidence_ids:array[string] with one to four values; "
+            "causal_rationale:string; expected_diagnostic_changes:array[string] with one to four "
+            "values; known_risks:array[string] with zero to four values; and "
+            "author_instructions:array[string] with one to four values. No other keys are allowed. "
+            "Use a stable hypothesis_id; it becomes the author and critic binding. Every "
+            "evidence_ids value must be copied exactly from the supplied quick/discovery aggregate "
+            "evidence. The controller canonicalizes focus_areas to entry, risk_sizing, exit order. "
+            "Do not select files, emit patches, request qualification data, or include "
+            "chain-of-thought, credentials, paths outside the supplied repository-relative policy "
+            "scope, raw rows, trades, holdings, or provider accounting. The local closed parser is "
+            "authoritative."
         ),
         "author": (
             "You are the adaptive O'Neil strategy author. Implement the investigator's focused "
             "mechanism against the authenticated selected parent. Return exactly one JSON object "
-            "matching the supplied schema, bound to parent_identity_sha256. policy_sources must "
-            "contain exactly the three repository-relative policy keys and the complete UTF-8, "
-            "LF-only, final-newline source for every file, including unchanged files. You may "
-            "change any or all three sources coherently. Do not emit a patch, diff metadata, "
-            "file-selection metadata, markdown, chain-of-thought, I/O, reflection, credentials, "
-            "local paths, or hidden/qualification data. The local closed parser is authoritative."
+            "with exactly these keys and types: hypothesis_id:string; "
+            "parent_identity_sha256:string; behavioral_summary:string; policy_sources:object; "
+            "assumptions:array[string] with zero to four values; and "
+            "validation_suggestions:array[string] with zero to four values. No other top-level "
+            "keys are allowed. hypothesis_id must equal the supplied investigator hypothesis_id, "
+            "and parent_identity_sha256 must equal the supplied selected-parent identity exactly. "
+            "policy_sources must contain exactly these three keys, each mapped to a complete UTF-8 "
+            "source string: core/strategy_policy/entry.py, core/strategy_policy/risk.py, and "
+            "core/strategy_policy/exit.py. Include every file, including unchanged files, and "
+            "change at least one file. Line endings and the final newline are normalized locally. "
+            "The authored policy must remain deterministic and causal and must not perform I/O or "
+            "reflection. Do not emit a patch, diff metadata, file-selection metadata, markdown, "
+            "chain-of-thought, credentials, local paths, or hidden/qualification data. The local "
+            "closed parser is authoritative."
         ),
         "critic": (
             "You are the adaptive O'Neil strategy critic. Explain the supplied validation result "
             "and measured quick/discovery portfolio CAGR behavior relative to the fixed baseline, "
-            "current champion, and target. Return exactly one JSON object matching the supplied "
-            "schema. disposition must be exactly promote, refine, or abandon; it is advisory and "
-            "cannot override metric-owned champion selection. Do not request or reproduce policy "
-            "source, raw trades, holdings, qualification data, local paths, credentials, provider "
-            "accounting, or chain-of-thought. The local closed parser is authoritative."
+            "current champion, and target. Return exactly one JSON object with exactly these keys "
+            "and types: hypothesis_id:string; prediction_vs_observation:string; "
+            "causal_explanation:string; evidence_ids:array[string] with zero to four values; "
+            "disposition:string; and next_direction:string. No other keys are allowed. "
+            "hypothesis_id must equal the supplied hypothesis_id exactly. Every evidence_ids value "
+            "must be copied exactly from the supplied validation or panel evidence. disposition "
+            "must be exactly promote, refine, or abandon; it is advisory and cannot override "
+            "metric-owned champion selection. Do not request or reproduce policy source, raw "
+            "trades, holdings, qualification data, local paths, credentials, provider accounting, "
+            "or chain-of-thought. The local closed parser is authoritative."
         ),
     }
 )
@@ -4978,7 +5011,10 @@ class InvestigatorArtifactV4(_V2Canonical):
 
     def __post_init__(self) -> None:
         _v2_identifier(self.hypothesis_id, "investigator v4 hypothesis ID")
-        _v4_focus_areas(list(self.focus_areas), "investigator v4 focus areas")
+        if self.focus_areas != _v4_focus_areas(
+            list(self.focus_areas), "investigator v4 focus areas"
+        ):
+            raise ValueError("investigator v4 focus areas must be canonical")
         for name, allow_empty in (
             ("expected_diagnostic_changes", False),
             ("known_risks", True),
@@ -4987,14 +5023,18 @@ class InvestigatorArtifactV4(_V2Canonical):
             value = getattr(self, name)
             if type(value) is not tuple:
                 raise ValueError(f"investigator v4 {name} must be a tuple")
-            _v4_response_list(
+            if value != _v4_response_list(
                 list(value),
                 f"investigator v4 {name}",
                 allow_empty=allow_empty,
-            )
+            ):
+                raise ValueError(f"investigator v4 {name} must be canonical")
         if type(self.evidence_ids) is not tuple or not self.evidence_ids:
             raise ValueError("investigator v4 evidence IDs must be a non-empty tuple")
-        _v4_response_ids(list(self.evidence_ids), "investigator v4 evidence IDs")
+        if self.evidence_ids != _v4_response_ids(
+            list(self.evidence_ids), "investigator v4 evidence IDs"
+        ):
+            raise ValueError("investigator v4 evidence IDs must be canonical")
         _v4_bounded_text(
             self.causal_rationale,
             "investigator v4 causal rationale",
@@ -5021,8 +5061,8 @@ class InvestigatorArtifactV4(_V2Canonical):
             max_total_bytes=max_total_bytes,
         )
         return cls(
-            hypothesis_id=_v2_identifier(
-                _v4_text(value["hypothesis_id"], "investigator v4 hypothesis ID"),
+            hypothesis_id=_v4_response_identifier(
+                value["hypothesis_id"],
                 "investigator v4 hypothesis ID",
             ),
             focus_areas=_v4_focus_areas(
@@ -5079,7 +5119,8 @@ class AuthorArtifactV4(_V2Canonical):
         ):
             if type(value) is not tuple:
                 raise ValueError(f"{field} must be a tuple")
-            _v4_response_list(list(value), field, allow_empty=True)
+            if value != _v4_response_list(list(value), field, allow_empty=True):
+                raise ValueError(f"{field} must be canonical")
 
     def to_primitive(self) -> dict[str, object]:
         return {
@@ -5147,8 +5188,8 @@ class AuthorArtifactV4(_V2Canonical):
         if not changed:
             raise ValueError("author v4 response must contain at least one changed file")
         return cls(
-            hypothesis_id=_v2_identifier(
-                _v4_text(value["hypothesis_id"], "author v4 hypothesis ID"),
+            hypothesis_id=_v4_response_identifier(
+                value["hypothesis_id"],
                 "author v4 hypothesis ID",
             ),
             parent_identity_sha256=parent_identity_sha256,
@@ -5279,7 +5320,10 @@ class CriticArtifactV4(_V2Canonical):
         )
         if type(self.evidence_ids) is not tuple:
             raise ValueError("critic v4 evidence IDs must be a tuple")
-        _v4_response_ids(list(self.evidence_ids), "critic v4 evidence IDs")
+        if self.evidence_ids != _v4_response_ids(
+            list(self.evidence_ids), "critic v4 evidence IDs"
+        ):
+            raise ValueError("critic v4 evidence IDs must be canonical")
         if self.disposition not in _V4_CRITIC_DISPOSITIONS:
             raise ValueError("critic v4 disposition is invalid")
         _v4_bounded_text(
@@ -5310,8 +5354,8 @@ class CriticArtifactV4(_V2Canonical):
         if disposition not in _V4_CRITIC_DISPOSITIONS:
             raise ValueError("critic v4 disposition is invalid")
         return cls(
-            hypothesis_id=_v2_identifier(
-                _v4_text(value["hypothesis_id"], "critic v4 hypothesis ID"),
+            hypothesis_id=_v4_response_identifier(
+                value["hypothesis_id"],
                 "critic v4 hypothesis ID",
             ),
             prediction_vs_observation=_v4_bounded_text(

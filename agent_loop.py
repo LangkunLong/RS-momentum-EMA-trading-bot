@@ -21042,15 +21042,29 @@ def _prepare_pit_optimizer_v4_production(
     from core.pit_optimizer_artifacts import canonical_json_bytes
     from core.pit_optimization_contract import load_pit_optimizer_manifest_v4
     from core.pit_optimizer_evaluation import (
+        EvaluationPanelSpec,
+        PanelAggregateSummary,
         QualificationRetirementLedger,
         QualificationRetirementSnapshot,
         _panel_plan_pair_is_consistent,
         load_discovery_panel_plan,
         load_qualification_panel_plan,
+        panel_aggregate_summary_from_primitive,
     )
 
     if not isinstance(config, PitOptimizerGateConfigV4):
         raise ConfigurationError("optimizer v4 production gate is invalid")
+    if config.phase == "canary":
+        try:
+            bundle_identity_valid = (
+                config.pit_bundle.is_file()
+                and not config.pit_bundle.is_symlink()
+                and _file_sha256(config.pit_bundle) == config.pit_bundle_sha256
+            )
+        except (OSError, ValueError) as exc:
+            raise ConfigurationError("optimizer v4 PIT bundle identity differs") from exc
+        if not bundle_identity_valid:
+            raise ConfigurationError("optimizer v4 PIT bundle identity differs")
     plan = load_discovery_panel_plan(config.discovery_panel_plan)
     qualification_plan = load_qualification_panel_plan(
         config.qualification_panel_plan
@@ -21098,6 +21112,9 @@ def _prepare_pit_optimizer_v4_production(
 
     qualification_snapshot = authenticate_current_qualification_ledger()
     readiness_ledger_head = qualification_snapshot.ledger_head_sha256
+    authenticated_baseline: (
+        tuple[PanelAggregateSummary, PanelAggregateSummary] | None
+    ) = None
     if config.phase == "canary":
         if (
             config.readiness_artifact.is_symlink()
@@ -21123,6 +21140,19 @@ def _prepare_pit_optimizer_v4_production(
             or _SHA256_RE.fullmatch(readiness_ledger_head or "") is None
         ):
             raise ConfigurationError("optimizer v4 readiness is not canonical")
+        try:
+            authenticated_baseline = (
+                panel_aggregate_summary_from_primitive(
+                    readiness_primitive.get("baseline_quick")
+                ),
+                panel_aggregate_summary_from_primitive(
+                    readiness_primitive.get("baseline_discovery")
+                ),
+            )
+        except ValueError as exc:
+            raise ConfigurationError(
+                "optimizer v4 readiness baseline is invalid"
+            ) from exc
         qualification_ledger.authenticate_ancestor(readiness_ledger_head)
     manifest = load_pit_optimizer_manifest_v4(
         config.optimizer_manifest,
@@ -21134,7 +21164,8 @@ def _prepare_pit_optimizer_v4_production(
         git_capability,
     )
     if (
-        (source_head, source_fingerprint)
+        config.pit_bundle_sha256 != manifest.pit_bundle_sha256
+        or (source_head, source_fingerprint)
         != (manifest.source_head, manifest.source_fingerprint_sha256)
         or source_state.head != source_head
         or recheck_source_unchanged(source_state).source_modified
@@ -21345,6 +21376,21 @@ def _prepare_pit_optimizer_v4_production(
             quick_evidence=quick,
         )
 
+    def evaluate_baseline(panel: EvaluationPanelSpec) -> PanelAggregateSummary:
+        if authenticated_baseline is None:
+            return _evaluate_v4_panel(
+                config,
+                manifest=manifest,
+                panel=panel,
+                run_label=f"baseline-{panel.purpose}",
+            )
+        quick, discovery = authenticated_baseline
+        if panel == plan.quick_panel:
+            return quick
+        if panel == plan.discovery_panel:
+            return discovery
+        raise ConfigurationError("optimizer v4 baseline panel is not authenticated")
+
     readiness = prepare_pit_optimizer_v4(
         manifest=manifest,
         discovery_panel_plan=plan,
@@ -21353,12 +21399,7 @@ def _prepare_pit_optimizer_v4_production(
         qualification_readiness_head_sha256=readiness_ledger_head,
         baseline_sources=baseline_sources,
         artifact_path=config.readiness_artifact,
-        evaluate_baseline=lambda panel: _evaluate_v4_panel(
-            config,
-            manifest=manifest,
-            panel=panel,
-            run_label=f"baseline-{panel.purpose}",
-        ),
+        evaluate_baseline=evaluate_baseline,
         verify_inputs=verify_inputs,
         campaign_checkpoint_path=config.campaign_checkpoint,
         campaign_checkpoint_sha256=config.campaign_checkpoint_sha256,
