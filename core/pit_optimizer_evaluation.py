@@ -235,12 +235,31 @@ class AnnualizedReturnTarget:
             raise ValueError("annualized return target formula is invalid")
         if self.basis != "absolute":
             raise ValueError("annualized return target basis is invalid")
-        if self.target_pct != Decimal("10.00"):
+        if (
+            not isinstance(self.target_pct, Decimal)
+            or not self.target_pct.is_finite()
+            or self.target_pct <= 0
+            or self.target_pct
+            != self.target_pct.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
+        ):
             raise ValueError("annualized return target is invalid")
-        if self.milestones_pct != (
-            Decimal("10.00"),
-            Decimal("20.00"),
-            Decimal("50.00"),
+        if (
+            type(self.milestones_pct) is not tuple
+            or self.milestones_pct != tuple(sorted(set(self.milestones_pct)))
+            or not {
+                Decimal("10.00"),
+                Decimal("20.00"),
+                Decimal("50.00"),
+            }.issubset(self.milestones_pct)
+            or self.target_pct not in self.milestones_pct
+            or any(
+                not isinstance(item, Decimal)
+                or not item.is_finite()
+                or item <= 0
+                or item
+                != item.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
+                for item in self.milestones_pct
+            )
         ):
             raise ValueError("annualized return milestones are invalid")
         if self.precision_pct != _OBJECTIVE_QUANTUM:
@@ -1390,8 +1409,8 @@ class QualificationDecision:
                 or value != value.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
             ):
                 raise ValueError(f"qualification {name} is invalid")
-        if self.target_pct != AnnualizedReturnTarget.production().target_pct:
-            raise ValueError("qualification target differs from the active target")
+        if self.target_pct <= 0:
+            raise ValueError("qualification target must be positive")
         if type(self.evaluation_complete) is not bool or type(self.integrity_complete) is not bool:
             raise ValueError("qualification completion flags are invalid")
         expected = (
@@ -2095,6 +2114,173 @@ def _validation_file_lock(path: Path) -> Iterator[None]:
 
 
 @dataclass(frozen=True, slots=True)
+class QualificationPanelIdentity:
+    """One exact retrospective panel exposure retired before evaluation."""
+
+    schema_version: int
+    qualification_retirement_domain_id: str
+    pit_bundle_sha256: str
+    qualification_plan_sha256: str
+    qualification_panel_sha256: str
+    security_lineage_ids: tuple[str, ...]
+    sessions_sha256: str
+    session_count: int
+    first_session: str
+    last_session: str
+    warmup_contract_sha256: str
+    engine_policy_sha256: str
+    target_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 4:
+            raise ValueError("qualification panel identity schema is invalid")
+        for name in (
+            "qualification_retirement_domain_id",
+            "pit_bundle_sha256",
+            "qualification_plan_sha256",
+            "qualification_panel_sha256",
+            "sessions_sha256",
+            "warmup_contract_sha256",
+            "engine_policy_sha256",
+            "target_sha256",
+        ):
+            _require_digest(getattr(self, name), f"qualification identity {name}")
+        if (
+            type(self.security_lineage_ids) is not tuple
+            or not self.security_lineage_ids
+            or self.security_lineage_ids
+            != tuple(sorted(set(self.security_lineage_ids)))
+            or any(
+                re.fullmatch(r"[a-z][a-z0-9_-]{0,127}", item) is None
+                for item in self.security_lineage_ids
+            )
+        ):
+            raise ValueError("qualification identity lineage set is invalid")
+        if type(self.session_count) is not int or self.session_count <= 1:
+            raise ValueError("qualification identity session count is invalid")
+        first = _date(self.first_session, "qualification first session")
+        last = _date(self.last_session, "qualification last session")
+        if first >= last:
+            raise ValueError("qualification identity session bounds are invalid")
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: QualificationPanelPlan,
+        *,
+        warmup_contract_sha256: str,
+        engine_policy_sha256: str,
+    ) -> "QualificationPanelIdentity":
+        if not isinstance(plan, QualificationPanelPlan):
+            raise ValueError("qualification identity requires a closed plan")
+        panel = plan.qualification_panel
+        target_sha256 = hashlib.sha256(
+            _canonical_json_bytes(_panel_json_value(plan.target))
+        ).hexdigest()
+        return cls(
+            schema_version=4,
+            qualification_retirement_domain_id=(
+                plan.qualification_retirement_domain_id
+            ),
+            pit_bundle_sha256=plan.pit_bundle_sha256,
+            qualification_plan_sha256=plan.sha256,
+            qualification_panel_sha256=panel.sha256,
+            security_lineage_ids=tuple(
+                sorted(item.security_lineage_id for item in panel.lineages)
+            ),
+            sessions_sha256=panel.sessions_sha256,
+            session_count=len(panel.sessions),
+            first_session=panel.start_date,
+            last_session=panel.end_date,
+            warmup_contract_sha256=warmup_contract_sha256,
+            engine_policy_sha256=engine_policy_sha256,
+            target_sha256=target_sha256,
+        )
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "qualification_retirement_domain_id": (
+                self.qualification_retirement_domain_id
+            ),
+            "pit_bundle_sha256": self.pit_bundle_sha256,
+            "qualification_plan_sha256": self.qualification_plan_sha256,
+            "qualification_panel_sha256": self.qualification_panel_sha256,
+            "security_lineage_ids": list(self.security_lineage_ids),
+            "sessions_sha256": self.sessions_sha256,
+            "session_count": self.session_count,
+            "first_session": self.first_session,
+            "last_session": self.last_session,
+            "warmup_contract_sha256": self.warmup_contract_sha256,
+            "engine_policy_sha256": self.engine_policy_sha256,
+            "target_sha256": self.target_sha256,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(_canonical_json_bytes(self.to_primitive())).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationReservation:
+    qualification_identity_sha256: str
+    reservation_record_sha256: str
+    retired_security_lineage_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_digest(
+            self.qualification_identity_sha256,
+            "qualification reservation identity SHA-256",
+        )
+        _require_digest(
+            self.reservation_record_sha256,
+            "qualification reservation record SHA-256",
+        )
+        if (
+            not self.retired_security_lineage_ids
+            or self.retired_security_lineage_ids
+            != tuple(sorted(set(self.retired_security_lineage_ids)))
+        ):
+            raise ValueError("qualification reservation lineages are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationOutcomeProof:
+    reservation_record_sha256: str
+    attempted: bool
+    completed: bool
+    terminal_code: str
+    qualified: bool | None
+    decision_sha256: str | None
+    outcome_record_sha256: str
+    ledger_head_sha256: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.reservation_record_sha256, "reservation"),
+            (self.outcome_record_sha256, "outcome"),
+            (self.ledger_head_sha256, "ledger head"),
+        ):
+            _require_digest(value, f"qualification outcome {label} SHA-256")
+        if (
+            type(self.attempted) is not bool
+            or type(self.completed) is not bool
+            or self.completed and not self.attempted
+            or _CLOSED_ID_RE.fullmatch(self.terminal_code or "") is None
+        ):
+            raise ValueError("qualification outcome terminal facts are invalid")
+        if self.completed:
+            if type(self.qualified) is not bool or self.decision_sha256 is None:
+                raise ValueError("completed qualification outcome is incomplete")
+            _require_digest(
+                self.decision_sha256,
+                "qualification outcome decision SHA-256",
+            )
+        elif self.qualified is not None or self.decision_sha256 is not None:
+            raise ValueError("failed qualification outcome claims a decision")
+
+
+@dataclass(frozen=True, slots=True)
 class QualificationRetirementSnapshot:
     schema_version: int
     qualification_retirement_domain_id: str
@@ -2229,7 +2415,86 @@ class QualificationRetirementLedger:
                     "record_sha256",
                 } or record_type != "genesis":
                     raise ValueError("qualification retirement ledger genesis is invalid")
-            elif record_type not in {"reservation", "outcome", "retirement"}:
+            elif record_type == "reservation":
+                expected_keys = {
+                    "schema_version",
+                    "ledger_kind",
+                    "qualification_retirement_domain_id",
+                    "record_type",
+                    "sequence",
+                    "previous_record_sha256",
+                    "qualification_identity_sha256",
+                    "candidate_identity_sha256",
+                    "identity",
+                    "retired_security_lineage_ids",
+                    "record_sha256",
+                }
+                identity_value = record.get("identity")
+                if not isinstance(identity_value, dict):
+                    raise ValueError("qualification reservation identity is invalid")
+                identity_value = dict(identity_value)
+                lineage_values = identity_value.get("security_lineage_ids")
+                if not isinstance(lineage_values, list):
+                    raise ValueError("qualification reservation lineages are invalid")
+                identity_value["security_lineage_ids"] = tuple(lineage_values)
+                identity = QualificationPanelIdentity(**identity_value)  # type: ignore[arg-type]
+                retired = record.get("retired_security_lineage_ids")
+                if (
+                    set(record) != expected_keys
+                    or record.get("qualification_identity_sha256") != identity.sha256
+                    or record.get("candidate_identity_sha256") is None
+                    or _SHA256_RE.fullmatch(
+                        str(record.get("candidate_identity_sha256"))
+                    )
+                    is None
+                    or retired != list(identity.security_lineage_ids)
+                ):
+                    raise ValueError("qualification reservation record is invalid")
+            elif record_type == "outcome":
+                expected_keys = {
+                    "schema_version",
+                    "ledger_kind",
+                    "qualification_retirement_domain_id",
+                    "record_type",
+                    "sequence",
+                    "previous_record_sha256",
+                    "reservation_record_sha256",
+                    "attempted",
+                    "completed",
+                    "terminal_code",
+                    "qualified",
+                    "decision_sha256",
+                    "record_sha256",
+                }
+                reservation = record.get("reservation_record_sha256")
+                if (
+                    set(record) != expected_keys
+                    or not isinstance(reservation, str)
+                    or not any(
+                        item.get("record_type") == "reservation"
+                        and item.get("record_sha256") == reservation
+                        for item in records
+                    )
+                    or any(
+                        item.get("record_type") == "outcome"
+                        and item.get("reservation_record_sha256") == reservation
+                        for item in records
+                    )
+                ):
+                    raise ValueError("qualification outcome record is invalid")
+                QualificationOutcomeProof(
+                    reservation_record_sha256=reservation,
+                    attempted=record.get("attempted"),  # type: ignore[arg-type]
+                    completed=record.get("completed"),  # type: ignore[arg-type]
+                    terminal_code=record.get("terminal_code"),  # type: ignore[arg-type]
+                    qualified=record.get("qualified"),  # type: ignore[arg-type]
+                    decision_sha256=record.get("decision_sha256"),  # type: ignore[arg-type]
+                    outcome_record_sha256=str(record["record_sha256"]),
+                    ledger_head_sha256=str(record["record_sha256"]),
+                )
+            elif record_type == "retirement":
+                raise ValueError("legacy qualification retirement records are unsupported")
+            else:
                 raise ValueError("qualification retirement ledger record type is invalid")
             records.append(record)
             previous = digest
@@ -2273,6 +2538,165 @@ class QualificationRetirementLedger:
     def snapshot(self) -> QualificationRetirementSnapshot:
         with _validation_file_lock(self._lock_path):
             return self._snapshot_unlocked()
+
+    def authenticate_ancestor(
+        self,
+        ledger_head_sha256: str,
+    ) -> QualificationRetirementSnapshot:
+        """Authenticate a sealed historical head as an ancestor of current state."""
+
+        _require_digest(ledger_head_sha256, "qualification ledger ancestor head")
+        with _validation_file_lock(self._lock_path):
+            records = self._read_records_unlocked()
+            if not any(
+                record.get("record_sha256") == ledger_head_sha256
+                for record in records
+            ):
+                raise ValueError("qualification ledger snapshot is not an ancestor")
+            return self._snapshot_unlocked()
+
+    def _append_record_unlocked(
+        self,
+        records: Sequence[Mapping[str, object]],
+        primitive: Mapping[str, object],
+    ) -> dict[str, object]:
+        record: dict[str, object] = {
+            "schema_version": 4,
+            "ledger_kind": "qualification_retirement",
+            "qualification_retirement_domain_id": self._domain_id,
+            "sequence": len(records),
+            "previous_record_sha256": records[-1]["record_sha256"],
+            **primitive,
+        }
+        record["record_sha256"] = self._record_digest(record)
+        with self._path.open("ab") as handle:
+            handle.write(_canonical_json_bytes(record))
+            handle.flush()
+            os.fsync(handle.fileno())
+        return record
+
+    def reserve_qualification(
+        self,
+        identity: QualificationPanelIdentity,
+        *,
+        candidate_identity_sha256: str,
+    ) -> QualificationReservation:
+        """Permanently retire the exact panel lineages before any evaluation."""
+
+        if (
+            not isinstance(identity, QualificationPanelIdentity)
+            or identity.qualification_retirement_domain_id != self._domain_id
+        ):
+            raise ValueError("qualification reservation identity differs from ledger")
+        _require_digest(
+            candidate_identity_sha256,
+            "qualification reservation candidate identity SHA-256",
+        )
+        with _validation_file_lock(self._lock_path):
+            records = self._read_records_unlocked()
+            retired = set(self._retired_lineages(records))
+            requested = set(identity.security_lineage_ids)
+            if retired.intersection(requested):
+                raise ValueError("qualification panel contains retired lineages")
+            record = self._append_record_unlocked(
+                records,
+                {
+                    "record_type": "reservation",
+                    "qualification_identity_sha256": identity.sha256,
+                    "candidate_identity_sha256": candidate_identity_sha256,
+                    "identity": identity.to_primitive(),
+                    "retired_security_lineage_ids": list(
+                        identity.security_lineage_ids
+                    ),
+                },
+            )
+        return QualificationReservation(
+            qualification_identity_sha256=identity.sha256,
+            reservation_record_sha256=str(record["record_sha256"]),
+            retired_security_lineage_ids=identity.security_lineage_ids,
+        )
+
+    def record_qualification_outcome(
+        self,
+        reservation: QualificationReservation,
+        *,
+        attempted: bool,
+        completed: bool,
+        terminal_code: str,
+        decision: QualificationDecision | None,
+    ) -> QualificationOutcomeProof:
+        """Append one terminal result for a reservation, including failures."""
+
+        if not isinstance(reservation, QualificationReservation):
+            raise ValueError("qualification outcome reservation is invalid")
+        qualified = None if decision is None else decision.qualified
+        decision_sha256 = (
+            None
+            if decision is None
+            else hashlib.sha256(
+                _canonical_json_bytes(_panel_json_value(decision))
+            ).hexdigest()
+        )
+        provisional = QualificationOutcomeProof(
+            reservation_record_sha256=reservation.reservation_record_sha256,
+            attempted=attempted,
+            completed=completed,
+            terminal_code=terminal_code,
+            qualified=qualified,
+            decision_sha256=decision_sha256,
+            outcome_record_sha256="0" * 64,
+            ledger_head_sha256="0" * 64,
+        )
+        with _validation_file_lock(self._lock_path):
+            records = self._read_records_unlocked()
+            matching = next(
+                (
+                    item
+                    for item in records
+                    if item.get("record_type") == "reservation"
+                    and item.get("record_sha256")
+                    == reservation.reservation_record_sha256
+                    and item.get("qualification_identity_sha256")
+                    == reservation.qualification_identity_sha256
+                    and item.get("retired_security_lineage_ids")
+                    == list(reservation.retired_security_lineage_ids)
+                ),
+                None,
+            )
+            if matching is None:
+                raise ValueError("qualification reservation is absent from ledger")
+            if any(
+                item.get("record_type") == "outcome"
+                and item.get("reservation_record_sha256")
+                == reservation.reservation_record_sha256
+                for item in records
+            ):
+                raise ValueError("qualification reservation outcome already exists")
+            record = self._append_record_unlocked(
+                records,
+                {
+                    "record_type": "outcome",
+                    "reservation_record_sha256": (
+                        provisional.reservation_record_sha256
+                    ),
+                    "attempted": provisional.attempted,
+                    "completed": provisional.completed,
+                    "terminal_code": provisional.terminal_code,
+                    "qualified": provisional.qualified,
+                    "decision_sha256": provisional.decision_sha256,
+                },
+            )
+        digest = str(record["record_sha256"])
+        return QualificationOutcomeProof(
+            reservation_record_sha256=reservation.reservation_record_sha256,
+            attempted=attempted,
+            completed=completed,
+            terminal_code=terminal_code,
+            qualified=qualified,
+            decision_sha256=decision_sha256,
+            outcome_record_sha256=digest,
+            ledger_head_sha256=digest,
+        )
 
     @contextmanager
     def locked_snapshot(self) -> Iterator[QualificationRetirementSnapshot]:
