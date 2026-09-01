@@ -387,6 +387,8 @@ def _closed_payload_error_code(error: ValueError | TypeError) -> ProtocolFailure
         "not bounded JSON text" in message
         or "too large" in message
         or "exceeds its byte cap" in message
+        or ("exceeds " in message and " characters" in message)
+        or "may contain at most" in message
     ):
         return ProtocolFailureCode.PAYLOAD_SIZE_INVALID
     if message.endswith("family is invalid") or message.endswith("disposition is invalid"):

@@ -72,19 +72,18 @@ PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES = frozenset(
 PIT_OPTIMIZER_R1_MODEL = "deepseek/deepseek-r1"
 MAX_ROLE_TEXT_BYTES = 4 * 1024
 MAX_ROLE_LIST_ITEMS = 16
-# Provider-facing investigator output is intentionally smaller than the broad
-# controller-context limits above.  Those bounds are sized for authenticated
-# local artifacts; model output must fit the investigator's 8 KiB artifact
-# envelope before it reaches the local parser.
-MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS = 4
-MAX_INVESTIGATOR_RATIONALE_CHARS = 256
-MAX_INVESTIGATOR_LIST_ITEM_CHARS = 96
+# The provider response already has one authenticated 64 KiB envelope.  Keep
+# only generous structural limits inside it; tiny per-field sub-envelopes turn
+# useful reasoning prose into a schema failure without improving isolation.
+MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS = 16
+MAX_INVESTIGATOR_RATIONALE_CHARS = 4 * 1024
+MAX_INVESTIGATOR_LIST_ITEM_CHARS = 2 * 1024
 MAX_AUTHOR_DIFF_BYTES = 64 * 1024
 MAX_POLICY_SOURCE_BUNDLE_BYTES = 64 * 1024
 MAX_DISCOVERY_EVIDENCE_BYTES = 8 * 1024
-MAX_INVESTIGATOR_ARTIFACT_BYTES = 8 * 1024
+MAX_INVESTIGATOR_ARTIFACT_BYTES = 64 * 1024
 MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES = 8 * 1024
-MAX_CRITIC_ARTIFACT_BYTES = 8 * 1024
+MAX_CRITIC_ARTIFACT_BYTES = 64 * 1024
 MAX_ITERATION_FEEDBACK_BYTES = 4 * 1024
 MAX_ITERATION_HISTORY_BYTES = 32 * 1024
 MAX_INVESTIGATOR_DYNAMIC_BYTES = 80_000
@@ -4129,6 +4128,16 @@ def _v4_bounded_text(value: object, field: str, *, max_chars: int) -> str:
     return text
 
 
+def _v4_response_bounded_text(value: object, field: str, *, max_chars: int) -> str:
+    """Canonicalize harmless response whitespace inside the outer byte cap."""
+
+    _v4_utf8_bytes(value, field)
+    text = _v2_response_text(value, field)
+    if len(text) > max_chars:
+        raise ValueError(f"{field} exceeds {max_chars} characters")
+    return text
+
+
 def _v4_response_identifier(value: object, field: str) -> str:
     _v4_utf8_bytes(value, field)
     return _v2_response_identifier(value, field)
@@ -4186,13 +4195,23 @@ def _v4_response_list(
 ) -> tuple[str, ...]:
     if type(value) is not list or any(not isinstance(item, str) for item in value):
         raise ValueError(f"{field} must be a JSON string array")
-    if len(value) > max_items:
-        raise ValueError(f"{field} may contain at most {max_items} items")
-    normalized = tuple(
-        dict.fromkeys(
-            _v4_bounded_text(item, field, max_chars=max_item_chars) for item in value
+    normalized_items: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not item.strip():
+            continue
+        normalized = _v4_response_bounded_text(
+            item,
+            field,
+            max_chars=max_item_chars,
         )
-    )
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_items.append(normalized)
+    normalized = tuple(normalized_items)
+    if len(normalized) > max_items:
+        raise ValueError(f"{field} may contain at most {max_items} items")
     if not allow_empty and not normalized:
         raise ValueError(f"{field} cannot be empty")
     return normalized
@@ -4212,6 +4231,9 @@ def _v4_response_ids(value: object, field: str) -> tuple[str, ...]:
 
 def _v4_focus_areas(value: object, field: str) -> tuple[str, ...]:
     parsed = _v4_response_list(value, field, allow_empty=False, max_items=3)
+    parsed = tuple(
+        item.casefold().replace("-", "_").replace(" ", "_") for item in parsed
+    )
     if any(item not in _V4_FOCUS_AREAS for item in parsed):
         raise ValueError(f"{field} are invalid")
     canonical = tuple(item for item in _V4_FOCUS_AREAS if item in parsed)
@@ -4797,10 +4819,9 @@ PIT_OPTIMIZER_V4_SYSTEM_PROMPTS = MappingProxyType(
             "risk sizing, exposure, winner retention, or exit behavior. Return exactly one JSON "
             "object with exactly these keys and types: hypothesis_id:string; "
             "focus_areas:array[string] with one to three values chosen from entry, risk_sizing, "
-            "and exit; evidence_ids:array[string] with one to four values; "
-            "causal_rationale:string; expected_diagnostic_changes:array[string] with one to four "
-            "values; known_risks:array[string] with zero to four values; and "
-            "author_instructions:array[string] with one to four values. No other keys are allowed. "
+            "and exit; evidence_ids:nonempty array[string]; causal_rationale:string; "
+            "expected_diagnostic_changes:nonempty array[string]; known_risks:array[string]; and "
+            "author_instructions:nonempty array[string]. No other keys are allowed. "
             "Use a stable hypothesis_id; it becomes the author and critic binding. Every "
             "evidence_ids value must be copied exactly from the supplied quick/discovery aggregate "
             "evidence. The controller canonicalizes focus_areas to entry, risk_sizing, exit order. "
@@ -4814,8 +4835,7 @@ PIT_OPTIMIZER_V4_SYSTEM_PROMPTS = MappingProxyType(
             "mechanism against the authenticated selected parent. Return exactly one JSON object "
             "with exactly these keys and types: hypothesis_id:string; "
             "parent_identity_sha256:string; behavioral_summary:string; policy_sources:object; "
-            "assumptions:array[string] with zero to four values; and "
-            "validation_suggestions:array[string] with zero to four values. No other top-level "
+            "assumptions:array[string]; and validation_suggestions:array[string]. No other top-level "
             "keys are allowed. hypothesis_id must equal the supplied investigator hypothesis_id, "
             "and parent_identity_sha256 must equal the supplied selected-parent identity exactly. "
             "policy_sources must contain exactly these three keys, each mapped to a complete UTF-8 "
@@ -4832,7 +4852,7 @@ PIT_OPTIMIZER_V4_SYSTEM_PROMPTS = MappingProxyType(
             "and measured quick/discovery portfolio CAGR behavior relative to the fixed baseline, "
             "current champion, and target. Return exactly one JSON object with exactly these keys "
             "and types: hypothesis_id:string; prediction_vs_observation:string; "
-            "causal_explanation:string; evidence_ids:array[string] with zero to four values; "
+            "causal_explanation:string; evidence_ids:array[string]; "
             "disposition:string; and next_direction:string. No other keys are allowed. "
             "hypothesis_id must equal the supplied hypothesis_id exactly. Every evidence_ids value "
             "must be copied exactly from the supplied validation or panel evidence. disposition "
@@ -5072,7 +5092,7 @@ class InvestigatorArtifactV4(_V2Canonical):
                 value["evidence_ids"],
                 "investigator v4 evidence IDs",
             ),
-            causal_rationale=_v4_bounded_text(
+            causal_rationale=_v4_response_bounded_text(
                 value["causal_rationale"],
                 "investigator v4 causal rationale",
                 max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
@@ -5193,7 +5213,7 @@ class AuthorArtifactV4(_V2Canonical):
                 "author v4 hypothesis ID",
             ),
             parent_identity_sha256=parent_identity_sha256,
-            behavioral_summary=_v4_bounded_text(
+            behavioral_summary=_v4_response_bounded_text(
                 value["behavioral_summary"],
                 "author v4 behavioral summary",
                 max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
@@ -5350,7 +5370,9 @@ class CriticArtifactV4(_V2Canonical):
             ),
             max_total_bytes=max_total_bytes,
         )
-        disposition = _v4_text(value["disposition"], "critic v4 disposition")
+        disposition = _v2_response_text(
+            value["disposition"], "critic v4 disposition"
+        ).casefold()
         if disposition not in _V4_CRITIC_DISPOSITIONS:
             raise ValueError("critic v4 disposition is invalid")
         return cls(
@@ -5358,12 +5380,12 @@ class CriticArtifactV4(_V2Canonical):
                 value["hypothesis_id"],
                 "critic v4 hypothesis ID",
             ),
-            prediction_vs_observation=_v4_bounded_text(
+            prediction_vs_observation=_v4_response_bounded_text(
                 value["prediction_vs_observation"],
                 "critic v4 prediction versus observation",
                 max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
             ),
-            causal_explanation=_v4_bounded_text(
+            causal_explanation=_v4_response_bounded_text(
                 value["causal_explanation"],
                 "critic v4 causal explanation",
                 max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
@@ -5373,7 +5395,7 @@ class CriticArtifactV4(_V2Canonical):
                 "critic v4 evidence IDs",
             ),
             disposition=disposition,
-            next_direction=_v4_bounded_text(
+            next_direction=_v4_response_bounded_text(
                 value["next_direction"],
                 "critic v4 next direction",
                 max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
