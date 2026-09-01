@@ -1739,18 +1739,22 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
         replace(invalid_critic_input, candidate_quick=quick)
     with pytest.raises(ValueError, match="both candidate panels"):
         replace(critic_input_v4, candidate_discovery=None)
-    smaller_scope = replace(v4_scope, max_iteration_feedback_bytes=1)
-    smaller_manifest = replace(v4_manifest, policy_authoring_scope=smaller_scope)
-    with pytest.raises(ValueError, match="feedback component"):
-        replace(
-            critic_input_v4,
-            run_manifest_sha256=smaller_manifest.sha256,
-            policy_authoring_scope_sha256=smaller_scope.sha256,
-        ).validate_budget(
-            smaller_scope.call_budgets[2],
-            scope=smaller_scope,
-            manifest=smaller_manifest,
-        )
+    advisory_scope = replace(v4_scope, max_iteration_feedback_bytes=1)
+    advisory_manifest = replace(v4_manifest, policy_authoring_scope=advisory_scope)
+    advisory_input = replace(
+        critic_input_v4,
+        run_manifest_sha256=advisory_manifest.sha256,
+        policy_authoring_scope_sha256=advisory_scope.sha256,
+    )
+    assert (
+        len(advisory_input.canonical_json_bytes())
+        <= advisory_scope.call_budgets[2].max_dynamic_input_bytes
+    )
+    advisory_input.validate_budget(
+        advisory_scope.call_budgets[2],
+        scope=advisory_scope,
+        manifest=advisory_manifest,
+    )
 
 
 def _sessions(start: str, end: str) -> tuple[str, ...]:
@@ -2156,11 +2160,12 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
     stale_plan_binding = replace(v4, discovery_panel_plan_sha256="3" * 64)
     with pytest.raises(ValueError, match="discovery plan binding"):
         stale_plan_binding.validate_discovery_plan(discovery_plan)
-    with pytest.raises(ValueError, match="declared component envelopes"):
-        replace(
-            v4.policy_authoring_scope,
-            max_iteration_history_bytes=200_000,
-        )
+    advisory_scope = replace(
+        v4.policy_authoring_scope,
+        max_iteration_history_bytes=200_000,
+    )
+    assert advisory_scope.max_iteration_history_bytes == 200_000
+    assert advisory_scope.call_budgets == v4.call_budgets
 
 
 _FIRST_CANARY_MUTATIONS = (
