@@ -539,6 +539,16 @@ def test_closed_deserializer_rejects_unknown_keys_and_transport_types() -> None:
             rs_at_least_80_fraction=0.0,
             median_rs_score=1.0,
         )
+    with pytest.raises(ValueError, match="breadth_50_coverage_fraction"):
+        _market_context(
+            active_constituent_count=1_000_000_000,
+            breadth_50_coverage_fraction=0.9000000004,
+        )
+    with pytest.raises(ValueError, match="breadth_above_50_fraction"):
+        _market_context(
+            active_constituent_count=1_000_000_000,
+            breadth_above_50_fraction=540_000_000.4 / 900_000_000,
+        )
 
 
 def test_contracts_reject_oversized_tuples_and_candidate_fill_prices() -> None:

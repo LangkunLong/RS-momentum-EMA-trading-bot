@@ -206,7 +206,7 @@ class MarketContextV1(_CanonicalContract):
             "rs_coverage_fraction",
         ):
             covered = float(getattr(self, coverage_name)) * self.active_constituent_count
-            if not math.isclose(covered, round(covered), abs_tol=1e-9):
+            if not math.isclose(covered, round(covered), rel_tol=0.0, abs_tol=1e-9):
                 _fail(coverage_name)
             covered_counts[coverage_name] = round(covered)
         for coverage_name, fraction_name in (
@@ -219,7 +219,12 @@ class MarketContextV1(_CanonicalContract):
             numerator = fraction * covered_count
             if (
                 (covered_count == 0 and fraction != 0.0)
-                or not math.isclose(numerator, round(numerator), abs_tol=1e-9)
+                or not math.isclose(
+                    numerator,
+                    round(numerator),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
                 or not 0 <= round(numerator) <= covered_count
             ):
                 _fail(fraction_name)
