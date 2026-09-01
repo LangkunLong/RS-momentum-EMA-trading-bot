@@ -6,7 +6,7 @@ from .contracts import ExitAction, ExitDecision, ExitSnapshot
 
 
 def evaluate_exit(snapshot: ExitSnapshot) -> ExitDecision:
-    """Return the baseline action plan after the engine's hard-stop precheck."""
+    """Return the baseline plan; interface-v2 market context is observational."""
     early_winner_hold = snapshot.early_winner_hold
     scale_out_tier = snapshot.scale_out_tier
     gain_fraction = (snapshot.current_close - snapshot.entry_price) / snapshot.entry_price

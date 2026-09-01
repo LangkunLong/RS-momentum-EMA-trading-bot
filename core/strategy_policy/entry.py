@@ -14,7 +14,7 @@ def _threshold_code(value: float | None, floor: float, unavailable: str, below: 
 
 
 def evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision:
-    """Apply the fixed CANSLIM entry gates to trusted completed-session facts."""
+    """Apply fixed gates; adaptive code may also inspect ``snapshot.market``."""
     blocking_codes = list(snapshot.technical_blocking_reasons)
     if not snapshot.technical_only:
         for code in (

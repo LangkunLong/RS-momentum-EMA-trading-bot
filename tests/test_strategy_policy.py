@@ -18,6 +18,7 @@ from core.strategy_policy import (
     POLICY_INTERFACE_VERSION,
     AllocationDecision,
     AllocationSnapshot,
+    BenchmarkContextV1,
     CapacityDecision,
     CapacitySnapshot,
     EntryDecision,
@@ -28,6 +29,7 @@ from core.strategy_policy import (
     ExitAction,
     ExitDecision,
     ExitSnapshot,
+    MarketContextV1,
     validate_exit_decision,
 )
 from core.strategy_policy.entry import evaluate_entry
@@ -38,6 +40,30 @@ from core.strategy_policy.risk import (
     select_eviction,
 )
 from core.strategy_policy.runtime import InProcessPolicyClient
+
+
+def _market_context(**changes: object) -> MarketContextV1:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "session": "2026-08-27",
+        "oneil_regime": "confirmed_uptrend",
+        "distribution_days": 2,
+        "follow_through": False,
+        "benchmarks": tuple(
+            BenchmarkContextV1(symbol, 0.05, 0.10, 0.20)
+            for symbol in ("SPY", "QQQ", "IWM")
+        ),
+        "active_constituent_count": 100,
+        "breadth_above_50_fraction": 0.60,
+        "breadth_50_coverage_fraction": 0.90,
+        "breadth_above_200_fraction": 0.55,
+        "breadth_200_coverage_fraction": 0.80,
+        "median_rs_score": 72.0,
+        "rs_at_least_80_fraction": 0.40,
+        "rs_coverage_fraction": 0.95,
+    }
+    values.update(changes)
+    return MarketContextV1(**values)  # type: ignore[arg-type]
 
 
 def _entry_snapshot(**changes: object) -> EntrySnapshot:
@@ -76,9 +102,7 @@ def _entry_snapshot(**changes: object) -> EntrySnapshot:
         "cash_deployment_override": False,
         "use_stateful_regime_gate": False,
         "regime_allows_entries": True,
-        "market_regime": "confirmed_uptrend",
-        "distribution_days": 2,
-        "follow_through": False,
+        "market": _market_context(),
     }
     values.update(changes)
     return EntrySnapshot(**values)  # type: ignore[arg-type]
@@ -86,6 +110,7 @@ def _entry_snapshot(**changes: object) -> EntrySnapshot:
 
 def _capacity_snapshot(**changes: object) -> CapacitySnapshot:
     values: dict[str, object] = {
+        "market": _market_context(),
         "configured_max_positions": 4,
         "maximum_policy_positions": 25,
         "open_position_count": 2,
@@ -99,6 +124,7 @@ def _capacity_snapshot(**changes: object) -> CapacitySnapshot:
 
 def _allocation_snapshot(**changes: object) -> AllocationSnapshot:
     values: dict[str, object] = {
+        "market": _market_context(),
         "portfolio_equity_at_entry_open": 10_000.0,
         "cash_before_transition": 5_000.0,
         "projected_cash_after_eviction": 5_000.0,
@@ -120,6 +146,7 @@ def _allocation_snapshot(**changes: object) -> AllocationSnapshot:
 
 def _eviction_snapshot(**changes: object) -> EvictionSnapshot:
     values: dict[str, object] = {
+        "market": _market_context(),
         "capacity_is_finite": True,
         "capacity_is_full": True,
         "eviction_enabled": True,
@@ -135,6 +162,7 @@ def _eviction_snapshot(**changes: object) -> EvictionSnapshot:
 
 def _exit_snapshot(**changes: object) -> ExitSnapshot:
     values: dict[str, object] = {
+        "market": _market_context(),
         "entry_price": 100.0,
         "original_qty": 10.0,
         "remaining_qty": 10.0,
@@ -253,6 +281,7 @@ def test_entry_policy_recanonicalizes_full_and_technical_rows(
         eval_date=history.index[-1],
         market_allowed=True,
         market_state={"market_is_bullish": True},
+        market=_market_context(),
         entry_facts=facts,
     )
 
@@ -302,6 +331,7 @@ def test_entry_policy_rejects_identity_fill_nonfinite_and_unknown_fields(
             eval_date=history.index[-1],
             market_allowed=True,
             market_state={"market_is_bullish": True},
+            market=_market_context(),
             entry_facts=facts,
         )
 
@@ -371,6 +401,7 @@ def test_policy_rank_uses_valid_nullable_decisions_and_stable_order(
         all_closes=pd.DataFrame(index=history.index),
         eval_date=history.index[-1],
         market_state={"market_is_bullish": True},
+        market=_market_context(),
     )
 
     assert tuple(item.signal["symbol"] for item in pending) == expected_order
@@ -398,6 +429,7 @@ def test_entry_decision_is_closed_and_bool_strict() -> None:
 def test_contract_instances_have_no_mutable_instance_dictionary() -> None:
     """Break caught: inherited instance storage could admit hidden policy fields."""
     contracts = (
+        _market_context(),
         _entry_snapshot(),
         EntryDecision(True, True, (80.0, 85.0), ()),
         _capacity_snapshot(),
@@ -417,6 +449,7 @@ def test_contract_instances_have_no_mutable_instance_dictionary() -> None:
 def test_every_contract_round_trips_canonical_json_and_is_frozen() -> None:
     """Break caught: policy transport could change a validated primitive contract."""
     contracts = (
+        _market_context(),
         _entry_snapshot(),
         EntryDecision(True, True, (80.0, 85.0), ()),
         _capacity_snapshot(),
@@ -457,7 +490,8 @@ def test_contract_collections_must_be_tuples(factory, field: str, value: object)
 @pytest.mark.parametrize(
     ("factory", "field", "value"),
     [
-        (_entry_snapshot, "market_regime", "moonshot"),
+        (_market_context, "oneil_regime", "moonshot"),
+        (_market_context, "benchmarks", tuple(reversed(_market_context().benchmarks))),
         (_entry_snapshot, "canslim_score", math.nan),
         (_entry_snapshot, "rs_score", math.inf),
         (_capacity_snapshot, "cash_fraction", True),
@@ -480,6 +514,12 @@ def test_closed_deserializer_rejects_unknown_keys_and_transport_types() -> None:
     for hidden in (date(2026, 8, 27), Path("secret"), lambda: None, {"bad": "mutable"}):
         with pytest.raises(ValueError):
             _entry_snapshot(c_score=hidden)
+    zero = _market_context(
+        breadth_above_50_fraction=0.0,
+        breadth_above_200_fraction=0.0,
+        rs_at_least_80_fraction=0.0,
+    )
+    assert zero.breadth_above_50_fraction == 0.0
 
 
 def test_contracts_reject_oversized_tuples_and_candidate_fill_prices() -> None:
@@ -612,4 +652,4 @@ def test_exit_decision_validates_action_plan_against_trusted_snapshot() -> None:
 
 def test_interface_version_is_stable() -> None:
     """Break caught: incompatible policy clients could be accepted without a version boundary."""
-    assert POLICY_INTERFACE_VERSION == 1
+    assert POLICY_INTERFACE_VERSION == 2

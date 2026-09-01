@@ -255,6 +255,7 @@ def _require_method_pair(method: str, value: object, *, response: bool) -> type[
 
 
 def _contract_from_payload(contract_type: type[object], payload: object) -> object:
+    """Rebuild interface-v2 contracts, including their nested market context."""
     if not isinstance(payload, dict):
         raise ValueError("policy payload is invalid")
     raw = _canonical_bytes(payload).decode("utf-8")
