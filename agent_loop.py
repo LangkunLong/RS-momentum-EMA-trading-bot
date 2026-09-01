@@ -13588,6 +13588,14 @@ class AuditTrail:
                 "discovery_panel_plan_sha256": (
                     config.gate.discovery_panel_plan_sha256
                 ),
+                "qualification_panel_plan": config.gate.qualification_panel_plan,
+                "qualification_panel_plan_sha256": (
+                    config.gate.qualification_panel_plan_sha256
+                ),
+                "qualification_ledger": config.gate.qualification_ledger,
+                "qualification_ledger_snapshot_sha256": (
+                    config.gate.qualification_ledger_snapshot_sha256
+                ),
                 "readiness_artifact": config.gate.readiness_artifact,
                 "readiness_sha256": config.gate.readiness_sha256,
                 "campaign_checkpoint": config.gate.campaign_checkpoint,
@@ -19286,6 +19294,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimizer-manifest-sha256")
     parser.add_argument("--discovery-panel-plan", type=Path)
     parser.add_argument("--discovery-panel-plan-sha256")
+    parser.add_argument("--qualification-panel-plan", type=Path)
+    parser.add_argument("--qualification-panel-plan-sha256")
+    parser.add_argument("--qualification-ledger", type=Path)
+    parser.add_argument("--qualification-ledger-snapshot-sha256")
     parser.add_argument("--campaign-checkpoint", type=Path)
     parser.add_argument("--campaign-checkpoint-sha256")
     parser.add_argument("--verified-parity", type=Path)
@@ -19553,7 +19565,11 @@ def _build_pit_optimizer_v4_config(namespace: argparse.Namespace) -> object:
 
     from core.pit_optimization import PitOptimizerGateConfigV4
     from core.pit_optimization_contract import load_pit_optimizer_manifest_v4
-    from core.pit_optimizer_evaluation import load_discovery_panel_plan
+    from core.pit_optimizer_evaluation import (
+        _panel_plan_pair_is_consistent,
+        load_discovery_panel_plan,
+        load_qualification_panel_plan,
+    )
 
     phase = getattr(namespace, "optimization_phase", None)
     manifest_path = _absolute_cli_path(
@@ -19566,15 +19582,48 @@ def _build_pit_optimizer_v4_config(namespace: argparse.Namespace) -> object:
         "discovery panel plan",
     )
     panel_sha256 = getattr(namespace, "discovery_panel_plan_sha256", None)
+    qualification_path = _absolute_cli_path(
+        getattr(namespace, "qualification_panel_plan", None),
+        "qualification panel plan",
+    )
+    qualification_sha256 = getattr(
+        namespace,
+        "qualification_panel_plan_sha256",
+        None,
+    )
+    qualification_ledger = _absolute_cli_path(
+        getattr(namespace, "qualification_ledger", None),
+        "qualification ledger",
+    )
+    qualification_ledger_snapshot_sha256 = getattr(
+        namespace,
+        "qualification_ledger_snapshot_sha256",
+        None,
+    )
     if (
         _SHA256_RE.fullmatch(manifest_sha256 or "") is None
         or _SHA256_RE.fullmatch(panel_sha256 or "") is None
+        or _SHA256_RE.fullmatch(qualification_sha256 or "") is None
+        or _SHA256_RE.fullmatch(qualification_ledger_snapshot_sha256 or "")
+        is None
     ):
-        raise ConfigurationError("optimizer v4 manifest/panel digest is invalid")
+        raise ConfigurationError("optimizer v4 sealed input digest is invalid")
     try:
         panel = load_discovery_panel_plan(panel_path)
         if hashlib.sha256(panel_path.read_bytes()).hexdigest() != panel_sha256:
             raise ValueError("optimizer v4 discovery panel digest differs")
+        qualification = load_qualification_panel_plan(qualification_path)
+        if (
+            hashlib.sha256(qualification_path.read_bytes()).hexdigest()
+            != qualification_sha256
+        ):
+            raise ValueError("optimizer v4 qualification panel digest differs")
+        _panel_plan_pair_is_consistent(qualification, panel)
+        if (
+            qualification_ledger_snapshot_sha256
+            != panel.qualification_ledger_snapshot_sha256
+        ):
+            raise ValueError("optimizer v4 qualification ledger snapshot differs")
         manifest = load_pit_optimizer_manifest_v4(
             manifest_path,
             expected_sha256=manifest_sha256,
@@ -19640,6 +19689,12 @@ def _build_pit_optimizer_v4_config(namespace: argparse.Namespace) -> object:
             optimizer_manifest_sha256=manifest_sha256,
             discovery_panel_plan=panel_path,
             discovery_panel_plan_sha256=panel_sha256,
+            qualification_panel_plan=qualification_path,
+            qualification_panel_plan_sha256=qualification_sha256,
+            qualification_ledger=qualification_ledger,
+            qualification_ledger_snapshot_sha256=(
+                qualification_ledger_snapshot_sha256
+            ),
             readiness_artifact=readiness_artifact,
             readiness_sha256=getattr(namespace, "readiness_sha256", None),
             campaign_checkpoint=(
@@ -20985,12 +21040,91 @@ def _prepare_pit_optimizer_v4_production(
     restored_diffs: dict[str, str] | None = None,
 ) -> object:
     from core.pit_optimization import PitOptimizerGateConfigV4, prepare_pit_optimizer_v4
+    from core.pit_optimizer_artifacts import canonical_json_bytes
     from core.pit_optimization_contract import load_pit_optimizer_manifest_v4
-    from core.pit_optimizer_evaluation import load_discovery_panel_plan
+    from core.pit_optimizer_evaluation import (
+        QualificationRetirementLedger,
+        QualificationRetirementSnapshot,
+        _panel_plan_pair_is_consistent,
+        load_discovery_panel_plan,
+        load_qualification_panel_plan,
+    )
 
     if not isinstance(config, PitOptimizerGateConfigV4):
         raise ConfigurationError("optimizer v4 production gate is invalid")
     plan = load_discovery_panel_plan(config.discovery_panel_plan)
+    qualification_plan = load_qualification_panel_plan(
+        config.qualification_panel_plan
+    )
+    if (
+        hashlib.sha256(config.discovery_panel_plan.read_bytes()).hexdigest()
+        != config.discovery_panel_plan_sha256
+        or hashlib.sha256(config.qualification_panel_plan.read_bytes()).hexdigest()
+        != config.qualification_panel_plan_sha256
+    ):
+        raise ConfigurationError("optimizer v4 panel plan digest differs")
+    _panel_plan_pair_is_consistent(qualification_plan, plan)
+    if (
+        config.qualification_ledger_snapshot_sha256
+        != plan.qualification_ledger_snapshot_sha256
+        or not config.qualification_ledger.is_file()
+        or config.qualification_ledger.is_symlink()
+    ):
+        raise ConfigurationError("optimizer v4 qualification ledger differs")
+    qualification_ledger = QualificationRetirementLedger(
+        config.qualification_ledger,
+        plan.qualification_retirement_domain_id,
+    )
+    committed_lineages = {
+        item.security_lineage_id
+        for panel in (
+            plan.quick_panel,
+            plan.discovery_panel,
+            qualification_plan.qualification_panel,
+        )
+        for item in panel.lineages
+    }
+
+    def authenticate_current_qualification_ledger() -> QualificationRetirementSnapshot:
+        current = qualification_ledger.authenticate_ancestor(
+            config.qualification_ledger_snapshot_sha256
+        )
+        if set(current.retired_security_lineage_ids).intersection(
+            committed_lineages
+        ):
+            raise ConfigurationError(
+                "optimizer v4 panel contains a retired lineage"
+            )
+        return current
+
+    qualification_snapshot = authenticate_current_qualification_ledger()
+    readiness_ledger_head = qualification_snapshot.ledger_head_sha256
+    if config.phase == "canary":
+        if (
+            config.readiness_artifact.is_symlink()
+            or not config.readiness_artifact.is_file()
+        ):
+            raise ConfigurationError("optimizer v4 readiness artifact is absent")
+        raw_readiness = config.readiness_artifact.read_bytes()
+        if hashlib.sha256(raw_readiness).hexdigest() != config.readiness_sha256:
+            raise ConfigurationError("optimizer v4 readiness identity differs")
+        try:
+            readiness_primitive = json.loads(raw_readiness)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConfigurationError("optimizer v4 readiness is invalid JSON") from exc
+        if not isinstance(readiness_primitive, dict):
+            raise ConfigurationError("optimizer v4 readiness is not canonical")
+        readiness_ledger_head = readiness_primitive.get(
+            "qualification_ledger_head_sha256"
+        )
+        if (
+            raw_readiness != canonical_json_bytes(readiness_primitive)
+            or readiness_primitive.get("schema_version") != 4
+            or readiness_primitive.get("artifact_type") != "optimizer_readiness"
+            or _SHA256_RE.fullmatch(readiness_ledger_head or "") is None
+        ):
+            raise ConfigurationError("optimizer v4 readiness is not canonical")
+        qualification_ledger.authenticate_ancestor(readiness_ledger_head)
     manifest = load_pit_optimizer_manifest_v4(
         config.optimizer_manifest,
         expected_sha256=config.optimizer_manifest_sha256,
@@ -21030,6 +21164,7 @@ def _prepare_pit_optimizer_v4_production(
             or recheck_source_unchanged(source_state).source_modified
         ):
             raise CandidateMutationError("optimizer v4 source changed")
+        authenticate_current_qualification_ledger()
 
     def read_seed_artifact(
         checkpoint_root: Path,
@@ -21063,7 +21198,7 @@ def _prepare_pit_optimizer_v4_production(
         checkpoint_root: Path,
         supplied_plan: object,
     ) -> object:
-        from core.pit_optimizer_artifacts import SearchCandidateState, canonical_json_bytes
+        from core.pit_optimizer_artifacts import SearchCandidateState
         from core.pit_optimizer_candidate import validate_candidate_sources
         from core.pit_optimization_contract import SelectedParentIdentity
         from core.pit_optimizer_controller import (
@@ -21214,6 +21349,9 @@ def _prepare_pit_optimizer_v4_production(
     readiness = prepare_pit_optimizer_v4(
         manifest=manifest,
         discovery_panel_plan=plan,
+        qualification_panel_plan=qualification_plan,
+        qualification_ledger_snapshot=qualification_snapshot,
+        qualification_readiness_head_sha256=readiness_ledger_head,
         baseline_sources=baseline_sources,
         artifact_path=config.readiness_artifact,
         evaluate_baseline=lambda panel: _evaluate_v4_panel(
@@ -21226,6 +21364,10 @@ def _prepare_pit_optimizer_v4_production(
         campaign_checkpoint_path=config.campaign_checkpoint,
         campaign_checkpoint_sha256=config.campaign_checkpoint_sha256,
         restore_seed=restore_seed,
+    )
+    authenticate_current_qualification_ledger()
+    qualification_ledger.authenticate_ancestor(
+        readiness.qualification_ledger_head_sha256
     )
     if config.phase == "canary" and readiness.readiness_sha256 != config.readiness_sha256:
         raise ConfigurationError("optimizer v4 readiness identity differs")
@@ -21796,6 +21938,10 @@ def _build_cli_config(
         namespace.optimizer_manifest_sha256,
         namespace.discovery_panel_plan,
         namespace.discovery_panel_plan_sha256,
+        namespace.qualification_panel_plan,
+        namespace.qualification_panel_plan_sha256,
+        namespace.qualification_ledger,
+        namespace.qualification_ledger_snapshot_sha256,
         namespace.campaign_checkpoint,
         namespace.campaign_checkpoint_sha256,
         namespace.verified_parity,
@@ -22016,12 +22162,16 @@ def _build_cli_config(
                 for value in (
                     namespace.discovery_panel_plan,
                     namespace.discovery_panel_plan_sha256,
+                    namespace.qualification_panel_plan,
+                    namespace.qualification_panel_plan_sha256,
+                    namespace.qualification_ledger,
+                    namespace.qualification_ledger_snapshot_sha256,
                     namespace.campaign_checkpoint,
                     namespace.campaign_checkpoint_sha256,
                 )
             ):
                 raise ConfigurationError(
-                    "schema-v4 checkpoint/panel options require a v4 manifest"
+                    "schema-v4 checkpoint/panel/ledger options require a v4 manifest"
                 )
             gate = _build_pit_optimizer_v3_config(namespace)
     limits: LoopLimits | PitOptimizerLoopLimits

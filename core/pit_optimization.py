@@ -35,6 +35,8 @@ if TYPE_CHECKING:
         DiscoveryPanelPlan,
         EvaluationPanelSpec,
         PanelAggregateSummary,
+        QualificationPanelPlan,
+        QualificationRetirementSnapshot,
     )
 
 from core.pit_optimization_contract import (
@@ -291,6 +293,10 @@ class PitOptimizerGateConfigV4:
     optimizer_manifest_sha256: str
     discovery_panel_plan: Path
     discovery_panel_plan_sha256: str
+    qualification_panel_plan: Path
+    qualification_panel_plan_sha256: str
+    qualification_ledger: Path
+    qualification_ledger_snapshot_sha256: str
     readiness_artifact: Path
     readiness_sha256: str | None
     campaign_checkpoint: Path | None
@@ -318,6 +324,8 @@ class PitOptimizerGateConfigV4:
             "pit_bundle",
             "optimizer_manifest",
             "discovery_panel_plan",
+            "qualification_panel_plan",
+            "qualification_ledger",
             "readiness_artifact",
             "source_root",
             "permanent_runtime_root",
@@ -332,6 +340,8 @@ class PitOptimizerGateConfigV4:
             "pit_bundle_sha256",
             "optimizer_manifest_sha256",
             "discovery_panel_plan_sha256",
+            "qualification_panel_plan_sha256",
+            "qualification_ledger_snapshot_sha256",
             "authorization_requirement_sha256",
         ):
             if _SHA256_RE.fullmatch(getattr(self, name) or "") is None:
@@ -3453,6 +3463,9 @@ def prepare_pit_optimizer_v4(
     *,
     manifest: PitOptimizerRunManifestV4,
     discovery_panel_plan: DiscoveryPanelPlan,
+    qualification_panel_plan: QualificationPanelPlan,
+    qualification_ledger_snapshot: QualificationRetirementSnapshot,
+    qualification_readiness_head_sha256: str | None = None,
     baseline_sources: tuple[AuthorSourceFile, ...],
     artifact_path: Path,
     evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
@@ -3471,6 +3484,9 @@ def prepare_pit_optimizer_v4(
     return prepare(
         manifest=manifest,
         discovery_panel_plan=discovery_panel_plan,
+        qualification_panel_plan=qualification_panel_plan,
+        qualification_ledger_snapshot=qualification_ledger_snapshot,
+        qualification_readiness_head_sha256=qualification_readiness_head_sha256,
         baseline_sources=baseline_sources,
         artifact_path=artifact_path,
         evaluate_baseline=evaluate_baseline,

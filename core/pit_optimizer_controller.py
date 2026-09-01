@@ -105,6 +105,9 @@ from core.pit_optimizer_evaluation import (
     DiscoveryPanelPlan,
     EvaluationPanelSpec,
     PanelAggregateSummary,
+    QualificationPanelPlan,
+    QualificationRetirementSnapshot,
+    _panel_plan_pair_is_consistent,
 )
 
 
@@ -2783,6 +2786,8 @@ class PitOptimizerReadinessV4:
     schema_version: int
     manifest: PitOptimizerRunManifestV4
     discovery_panel_plan: DiscoveryPanelPlan
+    qualification_panel_plan: QualificationPanelPlan
+    qualification_ledger_head_sha256: str
     readiness_sha256: str
     artifact_path: Path
     baseline_sources: tuple[AuthorSourceFile, ...]
@@ -2799,10 +2804,17 @@ class PitOptimizerReadinessV4:
         if not isinstance(self.discovery_panel_plan, DiscoveryPanelPlan):
             raise ValueError("optimizer v4 readiness panel plan is invalid")
         self.manifest.validate_discovery_plan(self.discovery_panel_plan)
+        if not isinstance(self.qualification_panel_plan, QualificationPanelPlan):
+            raise ValueError("optimizer v4 readiness qualification plan is invalid")
+        _panel_plan_pair_is_consistent(
+            self.qualification_panel_plan,
+            self.discovery_panel_plan,
+        )
         if (
             not isinstance(self.artifact_path, Path)
             or not self.artifact_path.is_absolute()
             or len(self.readiness_sha256) != 64
+            or len(self.qualification_ledger_head_sha256) != 64
         ):
             raise ValueError("optimizer v4 readiness artifact is invalid")
         baseline_identity = SelectedParentIdentity.issue(
@@ -3010,6 +3022,9 @@ def prepare_pit_optimizer_v4(
     *,
     manifest: PitOptimizerRunManifestV4,
     discovery_panel_plan: DiscoveryPanelPlan,
+    qualification_panel_plan: QualificationPanelPlan,
+    qualification_ledger_snapshot: QualificationRetirementSnapshot,
+    qualification_readiness_head_sha256: str | None = None,
     baseline_sources: tuple[AuthorSourceFile, ...],
     artifact_path: Path,
     evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
@@ -3026,6 +3041,43 @@ def prepare_pit_optimizer_v4(
     if not isinstance(manifest, PitOptimizerRunManifestV4):
         raise ValueError("optimizer v4 manifest is invalid")
     manifest.validate_discovery_plan(discovery_panel_plan)
+    _panel_plan_pair_is_consistent(
+        qualification_panel_plan,
+        discovery_panel_plan,
+    )
+    if (
+        not isinstance(
+            qualification_ledger_snapshot,
+            QualificationRetirementSnapshot,
+        )
+        or qualification_ledger_snapshot.qualification_retirement_domain_id
+        != discovery_panel_plan.qualification_retirement_domain_id
+    ):
+        raise ValueError("optimizer v4 qualification ledger snapshot differs")
+    retired = frozenset(
+        qualification_ledger_snapshot.retired_security_lineage_ids
+    )
+    committed_lineages = {
+        item.security_lineage_id
+        for panel in (
+            discovery_panel_plan.quick_panel,
+            discovery_panel_plan.discovery_panel,
+            qualification_panel_plan.qualification_panel,
+        )
+        for item in panel.lineages
+    }
+    if retired.intersection(committed_lineages):
+        raise ValueError("optimizer v4 panel contains a retired lineage")
+    readiness_ledger_head = (
+        qualification_ledger_snapshot.ledger_head_sha256
+        if qualification_readiness_head_sha256 is None
+        else qualification_readiness_head_sha256
+    )
+    if (
+        not isinstance(readiness_ledger_head, str)
+        or len(readiness_ledger_head) != 64
+    ):
+        raise ValueError("optimizer v4 readiness ledger head is invalid")
     verify_inputs(manifest, discovery_panel_plan)
     baseline_identity = SelectedParentIdentity.issue(
         parent_kind="baseline",
@@ -3090,6 +3142,10 @@ def prepare_pit_optimizer_v4(
         "artifact_type": "optimizer_readiness",
         "manifest_sha256": manifest.sha256,
         "discovery_panel_plan_sha256": discovery_panel_plan.sha256,
+        "qualification_panel_plan_sha256": qualification_panel_plan.sha256,
+        "qualification_ledger_head_sha256": (
+            readiness_ledger_head
+        ),
         "baseline_source_sha256s": [
             [item.path, item.source_sha256] for item in baseline_sources
         ],
@@ -3115,6 +3171,10 @@ def prepare_pit_optimizer_v4(
         schema_version=4,
         manifest=manifest,
         discovery_panel_plan=discovery_panel_plan,
+        qualification_panel_plan=qualification_panel_plan,
+        qualification_ledger_head_sha256=(
+            readiness_ledger_head
+        ),
         readiness_sha256=digest,
         artifact_path=output,
         baseline_sources=baseline_sources,

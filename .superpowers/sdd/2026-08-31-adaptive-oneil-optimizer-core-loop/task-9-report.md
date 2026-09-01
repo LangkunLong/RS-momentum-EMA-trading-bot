@@ -26,3 +26,17 @@ for disposable reconstruction.
 
 Verification: compileall and Ruff passed for
 `core/pit_optimizer_artifacts.py`. No provider or Docker call was made.
+
+## Readiness qualification closure
+
+Schema-v4 gate configuration now requires the explicit qualification plan and
+its digest plus the append-only qualification ledger and sealed ancestor head.
+Production preparation authenticates the plan pair, proves the sealed plan
+snapshot and the readiness-recorded head are ancestors of the current chain,
+and rejects any current retirement intersecting the committed quick, discovery,
+or qualification panels. Canonical readiness binds both the qualification plan
+and its authenticated ledger head while allowing unrelated later retirements.
+
+Verification: compileall and Ruff passed for `agent_loop.py`,
+`core/pit_optimization.py`, and `core/pit_optimizer_controller.py`. No provider
+or Docker call was made.
