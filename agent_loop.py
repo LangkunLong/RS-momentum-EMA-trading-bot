@@ -21232,6 +21232,51 @@ def _prepare_pit_optimizer_v4_production(
     return readiness
 
 
+def _finalize_pit_optimizer_v4_lease(
+    *,
+    attempts: tuple[object, ...],
+    skips: tuple[object, ...],
+    settled: Mapping[int, object],
+    terminal_code: str,
+    resource_totals: Callable[[], tuple[int, int, int]],
+    close_lease: Callable[[str], None],
+) -> None:
+    """Validate exact controller accounting before closing one v4 lease."""
+
+    close_terminal = "failed"
+    validation_failure: BaseException | None = None
+    try:
+        supplied = {
+            item.plan.call_index: item for item in attempts
+        } | {item.call_index: item for item in skips}
+        if supplied != settled:
+            raise ConfigurationError("optimizer v4 final accounting differs")
+        api_calls, total_tokens, incomplete_calls = resource_totals()
+        facts = tuple(item.facts for item in attempts)
+        if (
+            api_calls != sum(1 for item in facts if item.request_started)
+            or total_tokens != sum(item.total_tokens or 0 for item in facts)
+            or incomplete_calls
+            != sum(1 for item in facts if not item.accounting_complete)
+        ):
+            raise ConfigurationError("optimizer v4 resource accounting differs")
+        close_terminal = {
+            "iteration_limit": "completed",
+            "cancelled": "cancelled",
+            "budget_exhausted": "budget_exhausted",
+            "authorization_exhausted": "budget_exhausted",
+        }.get(terminal_code, "failed")
+    except BaseException as exc:
+        validation_failure = exc
+        raise
+    finally:
+        try:
+            close_lease(close_terminal)
+        except BaseException:
+            if validation_failure is None:
+                raise
+
+
 def _build_pit_optimizer_v4_live_run(
     config: object,
     *,
@@ -21564,27 +21609,25 @@ def _build_pit_optimizer_v4_live_run(
         if finalization_started:
             raise ConfigurationError("optimizer v4 finalizer was reused")
         finalization_started = True
-        supplied = {
-            item.plan.call_index: item for item in attempts
-        } | {item.call_index: item for item in skips}
-        if supplied != settled:
-            raise ConfigurationError("optimizer v4 final accounting differs")
-        mapped = {
-            "iteration_limit": "completed",
-            "cancelled": "cancelled",
-            "budget_exhausted": "budget_exhausted",
-            "authorization_exhausted": "budget_exhausted",
-        }.get(terminal_code, "failed")
-        authorization.close_run_lease(lease, terminal_code=mapped)
-        snapshot = _pit_optimizer_resource_snapshot(budget)
-        facts = tuple(item.facts for item in attempts)
-        if (
-            snapshot.api_calls != sum(1 for item in facts if item.request_started)
-            or snapshot.total_tokens != sum(item.total_tokens or 0 for item in facts)
-            or snapshot.incomplete_accounting_calls
-            != sum(1 for item in facts if not item.accounting_complete)
-        ):
-            raise ConfigurationError("optimizer v4 resource accounting differs")
+        def resource_totals() -> tuple[int, int, int]:
+            snapshot = _pit_optimizer_resource_snapshot(budget)
+            return (
+                snapshot.api_calls,
+                snapshot.total_tokens,
+                snapshot.incomplete_accounting_calls,
+            )
+
+        _finalize_pit_optimizer_v4_lease(
+            attempts=attempts,
+            skips=skips,
+            settled=settled,
+            terminal_code=terminal_code,
+            resource_totals=resource_totals,
+            close_lease=lambda code: authorization.close_run_lease(
+                lease,
+                terminal_code=code,
+            ),
+        )
 
     lease = authorization.open_run_lease(
         window_id=config.authorization_window_id,

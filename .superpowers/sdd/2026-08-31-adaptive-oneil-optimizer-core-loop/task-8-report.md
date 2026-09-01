@@ -29,3 +29,10 @@ Verification:
 
 No provider request, Docker execution, Task 9 qualification/replay, remote operation,
 secret access, source apply, or progress-file edit was performed.
+
+Finalizer follow-up: schema-v4 lease closure now runs exactly once from a guarded
+finalization path. Exact settled/controller accounting and resource snapshot checks
+complete before a success terminal is selected; every validation failure closes with
+`failed` and preserves the original exception even if closure also fails. Compileall
+and Ruff passed, and an injected extra-settlement smoke confirmed one `failed` close
+with the original final-accounting error re-raised.
