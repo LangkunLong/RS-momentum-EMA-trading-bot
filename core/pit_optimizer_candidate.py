@@ -180,8 +180,7 @@ class CandidateIdentity:
     changed_paths: tuple[str, ...]
     changed_symbols: tuple[str, ...]
     immutable_constraints_sha256: str
-    discovery_panel_plan_sha256: str
-    parent_identity_sha256: str
+    discovery_manifest_sha256: str
     identity_sha256: str
     _controller_seal: InitVar[object] = None
 
@@ -204,15 +203,43 @@ class CandidateIdentity:
             allow_nan=False,
         ) + "\n"
 
-    @property
-    def discovery_manifest_sha256(self) -> str:
-        """Compatibility alias for schema-v3 audit consumers."""
 
-        return self.discovery_panel_plan_sha256
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class CandidateIdentityV4:
+    source_commit: str
+    policy_interface_version: int
+    cumulative_diff_sha256: str
+    editable_file_sha256s: tuple[tuple[str, str], ...]
+    changed_paths: tuple[str, ...]
+    changed_symbols: tuple[str, ...]
+    immutable_constraints_sha256: str
+    discovery_panel_plan_sha256: str
+    parent_identity_sha256: str
+    identity_sha256: str
+    _controller_seal: InitVar[object] = None
+
+    def __post_init__(self, _controller_seal: object) -> None:
+        if _controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
+            raise ValueError("candidate identity must be controller derived")
+        _validate_candidate_identity_v4_fields(self)
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            **_candidate_identity_v4_values(self),
+            "identity_sha256": self.identity_sha256,
+        }
+
+    def to_canonical_json(self) -> str:
+        return json.dumps(
+            self.to_primitive(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n"
 
 
 _AUTHENTICATED_CANDIDATE_IDENTITIES: WeakValueDictionary[
-    int, CandidateIdentity
+    int, CandidateIdentity | CandidateIdentityV4
 ] = WeakValueDictionary()
 
 
@@ -604,12 +631,103 @@ def _candidate_identity_values(candidate: CandidateIdentity) -> dict[str, object
         "changed_paths": candidate.changed_paths,
         "changed_symbols": candidate.changed_symbols,
         "immutable_constraints_sha256": candidate.immutable_constraints_sha256,
+        "discovery_manifest_sha256": candidate.discovery_manifest_sha256,
+    }
+
+
+def _candidate_identity_v4_values(
+    candidate: CandidateIdentityV4,
+) -> dict[str, object]:
+    return {
+        "source_commit": candidate.source_commit,
+        "policy_interface_version": candidate.policy_interface_version,
+        "cumulative_diff_sha256": candidate.cumulative_diff_sha256,
+        "editable_file_sha256s": candidate.editable_file_sha256s,
+        "changed_paths": candidate.changed_paths,
+        "changed_symbols": candidate.changed_symbols,
+        "immutable_constraints_sha256": candidate.immutable_constraints_sha256,
         "discovery_panel_plan_sha256": candidate.discovery_panel_plan_sha256,
         "parent_identity_sha256": candidate.parent_identity_sha256,
     }
 
 
 def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}", candidate.source_commit or "") is None:
+        raise ValueError("candidate identity source commit is invalid")
+    if (
+        type(candidate.policy_interface_version) is not int
+        or candidate.policy_interface_version <= 0
+    ):
+        raise ValueError("candidate identity interface version is invalid")
+    for value in (
+        candidate.cumulative_diff_sha256,
+        candidate.immutable_constraints_sha256,
+        candidate.discovery_manifest_sha256,
+        candidate.identity_sha256,
+    ):
+        if _SHA256_RE.fullmatch(value or "") is None:
+            raise ValueError("candidate identity digest is invalid")
+    if (
+        type(candidate.editable_file_sha256s) is not tuple
+        or tuple(path for path, _digest in candidate.editable_file_sha256s)
+        != EDITABLE_POLICY_PATHS
+        or any(
+            _SHA256_RE.fullmatch(digest or "") is None
+            for _path, digest in candidate.editable_file_sha256s
+        )
+    ):
+        raise ValueError("candidate identity editable hashes are invalid")
+    canonical_paths = tuple(
+        path for path in EDITABLE_POLICY_PATHS if path in candidate.changed_paths
+    )
+    if (
+        type(candidate.changed_paths) is not tuple
+        or not candidate.changed_paths
+        or candidate.changed_paths != canonical_paths
+    ):
+        raise ValueError("candidate identity changed paths are invalid")
+    if (
+        type(candidate.changed_symbols) is not tuple
+        or not candidate.changed_symbols
+        or len(candidate.changed_symbols) != len(set(candidate.changed_symbols))
+        or any(not isinstance(symbol, str) for symbol in candidate.changed_symbols)
+    ):
+        raise ValueError("candidate identity changed symbols are invalid")
+    allowed = {
+        symbol
+        for path in candidate.changed_paths
+        for symbol in _DECLARED_SYMBOLS[path]
+    }
+    constant_prefixes = tuple(
+        f"{path.removesuffix('.py').replace('/', '.')}."
+        for path in candidate.changed_paths
+    )
+    if any(
+        symbol not in allowed
+        and not any(
+            symbol.startswith(prefix)
+            and (
+                re.fullmatch(
+                    r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+                or re.fullmatch(
+                    r"_[A-Za-z][A-Za-z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+            )
+            for prefix in constant_prefixes
+        )
+        for symbol in candidate.changed_symbols
+    ):
+        raise ValueError("candidate identity changed symbols are invalid")
+    if candidate.identity_sha256 != _identity_digest(
+        _candidate_identity_values(candidate)
+    ):
+        raise ValueError("candidate identity self-digest is invalid")
+
+
+def _validate_candidate_identity_v4_fields(candidate: CandidateIdentityV4) -> None:
     if re.fullmatch(r"[0-9a-f]{40}", candidate.source_commit or "") is None:
         raise ValueError("candidate identity source commit is invalid")
     if (
@@ -679,16 +797,21 @@ def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
     ):
         raise ValueError("candidate identity changed symbols are invalid")
     if candidate.identity_sha256 != _identity_digest(
-        _candidate_identity_values(candidate)
+        _candidate_identity_v4_values(candidate)
     ):
         raise ValueError("candidate identity self-digest is invalid")
 
 
-def validate_candidate_identity(candidate: CandidateIdentity) -> None:
+def validate_candidate_identity(
+    candidate: CandidateIdentity | CandidateIdentityV4,
+) -> None:
     """Authenticate one exact controller-created identity object at consumption."""
-    if not isinstance(candidate, CandidateIdentity):
+    if isinstance(candidate, CandidateIdentity):
+        _validate_candidate_identity_fields(candidate)
+    elif isinstance(candidate, CandidateIdentityV4):
+        _validate_candidate_identity_v4_fields(candidate)
+    else:
         raise ValueError("candidate identity is invalid")
-    _validate_candidate_identity_fields(candidate)
     if _AUTHENTICATED_CANDIDATE_IDENTITIES.get(id(candidate)) is not candidate:
         raise ValueError("candidate identity is not authenticated")
 
@@ -1034,21 +1157,7 @@ def validate_candidate_diff(
             "changed_paths": changed_paths,
             "changed_symbols": changed_symbols,
             "immutable_constraints_sha256": immutable_constraints_sha256,
-            "discovery_panel_plan_sha256": discovery_manifest_sha256,
-            "parent_identity_sha256": _identity_digest(
-                {
-                    "source_commit": source_commit,
-                    "editable_file_sha256s": tuple(
-                        (
-                            path,
-                            hashlib.sha256(
-                                before_sources[path].encode("utf-8")
-                            ).hexdigest(),
-                        )
-                        for path in EDITABLE_POLICY_PATHS
-                    ),
-                }
-            ),
+            "discovery_manifest_sha256": discovery_manifest_sha256,
         }
         identity = CandidateIdentity(
             **values,
@@ -1077,7 +1186,7 @@ def validate_candidate_sources(
     immutable_constraints_sha256: str,
     discovery_panel_plan_sha256: str,
     parent_identity_sha256: str,
-) -> tuple[CandidateIdentity, str]:
+) -> tuple[CandidateIdentityV4, str]:
     """Atomically validate and publish one complete three-source candidate."""
     from agent_loop import PreflightError, _git, derive_authenticated_cumulative_diff
 
@@ -1265,7 +1374,7 @@ def validate_candidate_sources(
             "discovery_panel_plan_sha256": discovery_panel_plan_sha256,
             "parent_identity_sha256": parent_identity_sha256,
         }
-        identity = CandidateIdentity(
+        identity = CandidateIdentityV4(
             **values,
             identity_sha256=_identity_digest(values),
             _controller_seal=_CANDIDATE_IDENTITY_CONSTRUCTION_SEAL,
@@ -1396,6 +1505,7 @@ def require_source_context_fit(
     return rendered
 __all__ = [
     "CandidateIdentity",
+    "CandidateIdentityV4",
     "EDITABLE_POLICY_PATHS",
     "LEGACY_PATCH_BOUNDS",
     "PIT_OPTIMIZER_PATCH_BOUNDS",

@@ -9886,6 +9886,8 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
 ) -> None:
     """Break caught: a partial author map could replace the atomic controller identity."""
     from core.pit_optimizer_candidate import (
+        CandidateIdentityV4,
+        validate_candidate_identity,
         validate_candidate_sources,
     )
 
@@ -9928,6 +9930,8 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
     assert identity.source_commit == source_commit
     assert identity.parent_identity_sha256 == "c" * 64
     assert identity.discovery_panel_plan_sha256 == "b" * 64
+    assert isinstance(identity, CandidateIdentityV4)
+    validate_candidate_identity(identity)
     assert identity.cumulative_diff_sha256 == hashlib.sha256(
         cumulative_diff.encode("utf-8")
     ).hexdigest()
@@ -9985,29 +9989,38 @@ def _task5_authenticated_identity(
 
 def test_candidate_identity_rejects_direct_unsealed_construction() -> None:
     """Break caught: a caller could construct an identity without Git/source derivation."""
-    from core.pit_optimizer_candidate import CandidateIdentity
+    from core.pit_optimizer_candidate import CandidateIdentity, CandidateIdentityV4
+
+    shared = {
+        "source_commit": "a" * 40,
+        "policy_interface_version": 1,
+        "cumulative_diff_sha256": "b" * 64,
+        "editable_file_sha256s": tuple(
+            (path, "c" * 64) for path in _POLICY_PATHS
+        ),
+        "changed_paths": ("core/strategy_policy/entry.py",),
+        "changed_symbols": ("core.strategy_policy.entry.evaluate_entry",),
+        "immutable_constraints_sha256": "d" * 64,
+        "identity_sha256": "f" * 64,
+    }
 
     with pytest.raises(ValueError, match="controller derived"):
         CandidateIdentity(
-            source_commit="a" * 40,
-            policy_interface_version=1,
-            cumulative_diff_sha256="b" * 64,
-            editable_file_sha256s=tuple(
-                (path, "c" * 64) for path in _POLICY_PATHS
-            ),
-            changed_paths=("core/strategy_policy/entry.py",),
-            changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
-            immutable_constraints_sha256="d" * 64,
+            **shared,
+            discovery_manifest_sha256="e" * 64,
+        )
+    with pytest.raises(ValueError, match="controller derived"):
+        CandidateIdentityV4(
+            **shared,
             discovery_panel_plan_sha256="e" * 64,
             parent_identity_sha256="f" * 64,
-            identity_sha256="f" * 64,
         )
 
 
 def test_candidate_identity_has_exact_public_nine_field_json_shape(
     tmp_path: Path,
 ) -> None:
-    """Break caught: the construction seal leaked into persisted identity data."""
+    """Break caught: v4 identity fields changed archived schema-v3 reconstruction."""
     from core.pit_optimizer_candidate import CandidateIdentity
 
     identity, _author = _task5_authenticated_identity(tmp_path)
@@ -10019,19 +10032,27 @@ def test_candidate_identity_has_exact_public_nine_field_json_shape(
         "changed_paths",
         "changed_symbols",
         "immutable_constraints_sha256",
-        "discovery_panel_plan_sha256",
-        "parent_identity_sha256",
+        "discovery_manifest_sha256",
         "identity_sha256",
     )
     assert tuple(item.name for item in fields(CandidateIdentity)) == expected_fields
-    primitive = identity.to_primitive()
-    assert tuple(primitive) == expected_fields
-    assert primitive == asdict(identity)
-    assert not any(key.startswith("_") for key in primitive)
-    rendered = identity.to_canonical_json()
-    assert rendered.endswith("\n")
-    assert json.loads(rendered) == json.loads(json.dumps(primitive))
-    assert "controller_seal" not in rendered
+    legacy_values = {
+        "source_commit": identity.source_commit,
+        "policy_interface_version": identity.policy_interface_version,
+        "cumulative_diff_sha256": identity.cumulative_diff_sha256,
+        "editable_file_sha256s": identity.editable_file_sha256s,
+        "changed_paths": identity.changed_paths,
+        "changed_symbols": identity.changed_symbols,
+        "immutable_constraints_sha256": identity.immutable_constraints_sha256,
+        "discovery_manifest_sha256": identity.discovery_manifest_sha256,
+    }
+    expected_digest = hashlib.sha256(_canonical_file_bytes(legacy_values)).hexdigest()
+    expected_bytes = _canonical_file_bytes(
+        {**legacy_values, "identity_sha256": expected_digest}
+    )
+    assert identity.identity_sha256 == expected_digest
+    assert identity.to_canonical_json().encode("utf-8") == expected_bytes
+    assert identity.to_primitive() == asdict(identity)
 
 
 @pytest.mark.parametrize(
@@ -10047,8 +10068,7 @@ def test_candidate_identity_has_exact_public_nine_field_json_shape(
         ("changed_paths", ("core/strategy_policy/risk.py",)),
         ("changed_symbols", ("core.strategy_policy.risk.recommend_capacity",)),
         ("immutable_constraints_sha256", "f" * 64),
-        ("discovery_panel_plan_sha256", "f" * 64),
-        ("parent_identity_sha256", "f" * 64),
+        ("discovery_manifest_sha256", "f" * 64),
         ("identity_sha256", "f" * 64),
     ),
 )
@@ -10085,8 +10105,7 @@ def test_candidate_identity_rejects_attacker_recomputed_digest(
         "changed_paths": identity.changed_paths,
         "changed_symbols": identity.changed_symbols,
         "immutable_constraints_sha256": identity.immutable_constraints_sha256,
-        "discovery_panel_plan_sha256": identity.discovery_panel_plan_sha256,
-        "parent_identity_sha256": identity.parent_identity_sha256,
+        "discovery_manifest_sha256": identity.discovery_manifest_sha256,
     }
     recomputed = hashlib.sha256(
         json.dumps(
