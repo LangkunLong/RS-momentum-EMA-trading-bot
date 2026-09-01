@@ -4176,8 +4176,10 @@ class OpenRouterGateway:
     ) -> _PitOptimizerGatewayLifecycle:
         if not isinstance(self.audit_trail, AuditTrail):
             raise AuditError("optimizer audit trail is required")
-        if self.audit_trail.run_id != self.authorization_ledger.manifest.run_id:
-            raise AuditError("optimizer audit run differs from manifest")
+        # AuthorizationLedger.attach_audit_trail() already binds and verifies
+        # the audit identity for both v3 run IDs and v4 campaign IDs.  Repeating
+        # that check here was not only redundant, it also read the v3-only
+        # ``manifest.run_id`` field and aborted every v4 call after reservation.
         key = (authorization_lease.run_manifest_sha256, plan.call_index)
         if key in self._pit_optimizer_lifecycles:
             raise AuditError("optimizer gateway lifecycle is already registered")
@@ -4921,8 +4923,6 @@ class OpenRouterGateway:
                     "OpenRouter SDK construction failed",
                     status_code=_status_code(exc),
                 ) from exc
-            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
-                raise BudgetExceededError("PIT optimizer wall deadline reached")
             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
             if remaining <= 0:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
@@ -4933,9 +4933,6 @@ class OpenRouterGateway:
                 },
                 {"role": "user", "content": dynamic_bytes.decode("utf-8")},
             ]
-            remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
-            if remaining <= 0:
-                raise BudgetExceededError("PIT optimizer wall deadline reached")
             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
             if remaining <= 0:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
