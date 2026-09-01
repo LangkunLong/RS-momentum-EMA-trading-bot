@@ -8751,6 +8751,7 @@ def test_objective_is_absolute_panel_cagr_quantized_and_strict_on_ties() -> None
     )
     candidate = evaluation.PanelAggregateSummary(
         panel_id="discovery",
+        panel_sha256="e" * 64,
         starting_equity=100.0,
         ending_equity=121.0,
         elapsed_calendar_days=730,
@@ -8918,6 +8919,41 @@ def test_panel_allocator_is_lineage_stratified_disjoint_and_capacity_closed(
     assert evaluation.load_qualification_panel_plan(
         partial / "qualification-plan.json"
     ) == qualification_plan
+    incomplete_discovery = discovery_plan.to_primitive()
+    del incomplete_discovery["allocation_rule"]["algorithm_id"]
+    incomplete_discovery_path = tmp_path / "incomplete-discovery-plan.json"
+    incomplete_discovery_path.write_bytes(_canonical_file_bytes(incomplete_discovery))
+    with pytest.raises(ValueError, match="allocation rule artifact keys"):
+        evaluation.load_discovery_panel_plan(
+            incomplete_discovery_path,
+            require_publication=False,
+        )
+    incomplete_qualification = qualification_plan.to_primitive()
+    del incomplete_qualification["stratum_allocations"][0]["unallocated_count"]
+    incomplete_qualification_path = tmp_path / "incomplete-qualification-plan.json"
+    incomplete_qualification_path.write_bytes(
+        _canonical_file_bytes(incomplete_qualification)
+    )
+    with pytest.raises(ValueError, match="stratum allocation artifact keys"):
+        evaluation.load_qualification_panel_plan(
+            incomplete_qualification_path,
+            require_publication=False,
+        )
+    extra_plan_key = discovery_plan.to_primitive()
+    extra_plan_key["qualification_panel"] = {}
+    extra_plan_path = tmp_path / "extra-key-discovery-plan.json"
+    extra_plan_path.write_bytes(_canonical_file_bytes(extra_plan_key))
+    with pytest.raises(ValueError, match="discovery panel plan keys"):
+        evaluation.load_discovery_panel_plan(
+            extra_plan_path,
+            require_publication=False,
+        )
+    publication_path = partial / "publication.json"
+    publication = json.loads(publication_path.read_bytes())
+    publication["unexpected"] = True
+    publication_path.write_bytes(_canonical_file_bytes(publication))
+    with pytest.raises(ValueError, match="publication marker"):
+        evaluation.load_discovery_panel_plan(partial / "discovery-plan.json")
     parsed = evaluation._manifest_cli_parser().parse_args(
         [
             "build-panel-plans",
@@ -8953,15 +8989,50 @@ def test_panel_allocator_is_lineage_stratified_disjoint_and_capacity_closed(
 
 def test_qualification_gate_uses_only_target_integrity_and_same_panel_baseline() -> None:
     """Break caught: a diagnostic gate or baseline equality could alter qualification."""
+    qualification_panel = evaluation.EvaluationPanelSpec.from_lineages(
+        purpose="qualification",
+        sessions=("2021-01-01", "2023-01-01"),
+        lineages=(
+            evaluation.PanelSecurityLineage(
+                "chain-qualification",
+                ("QUAL",),
+                ("sp500",),
+            ),
+        ),
+    )
+    candidate = evaluation.PanelAggregateSummary(
+        panel_id="qualification",
+        panel_sha256=qualification_panel.sha256,
+        starting_equity=100.0,
+        ending_equity=121.0,
+        elapsed_calendar_days=730,
+        portfolio_annualized_return_pct=Decimal("10.00"),
+        total_return_pct=21.0,
+        benchmark_return_pct=40.0,
+        max_drawdown_pct=-99.0,
+        sharpe_ratio=-5.0,
+        closed_trades=0,
+        turnover_pct=0.0,
+        average_exposure_pct=0.0,
+        entry_funnel=(),
+        exit_attribution=(),
+    )
+    baseline = replace(
+        candidate,
+        ending_equity=118.81,
+        portfolio_annualized_return_pct=Decimal("9.00"),
+    )
     decision = evaluation.QualificationDecision.from_result(
-        candidate_cagr_pct=Decimal("10.005"),
-        baseline_cagr_pct=Decimal("9.99"),
+        candidate_evidence=candidate,
+        baseline_evidence=baseline,
+        qualification_panel=qualification_panel,
         target=evaluation.AnnualizedReturnTarget.production(),
         evaluation_complete=True,
         integrity_complete=True,
     )
 
     assert decision.candidate_cagr_pct == Decimal("10.00")
+    assert decision.qualification_panel_sha256 == qualification_panel.sha256
     assert decision.qualified is True
     assert {
         "closed_trades",
@@ -8971,21 +9042,41 @@ def test_qualification_gate_uses_only_target_integrity_and_same_panel_baseline()
         "transaction_costs",
     }.isdisjoint({field.name for field in fields(evaluation.QualificationDecision)})
     assert evaluation.QualificationDecision.from_result(
-        candidate_cagr_pct=Decimal("9.99"),
-        baseline_cagr_pct=Decimal("1.00"),
+        candidate_evidence=replace(
+            candidate,
+            ending_equity=120.978001,
+            portfolio_annualized_return_pct=Decimal("9.99"),
+        ),
+        baseline_evidence=replace(
+            baseline,
+            ending_equity=102.01,
+            portfolio_annualized_return_pct=Decimal("1.00"),
+        ),
+        qualification_panel=qualification_panel,
         target=evaluation.AnnualizedReturnTarget.production(),
         evaluation_complete=True,
         integrity_complete=True,
     ).qualified is False
     assert evaluation.QualificationDecision.from_result(
-        candidate_cagr_pct=Decimal("10.00"),
-        baseline_cagr_pct=Decimal("10.00"),
+        candidate_evidence=candidate,
+        baseline_evidence=candidate,
+        qualification_panel=qualification_panel,
         target=evaluation.AnnualizedReturnTarget.production(),
         evaluation_complete=True,
         integrity_complete=True,
     ).qualified is False
+    with pytest.raises(ValueError, match="same qualification panel"):
+        evaluation.QualificationDecision.from_result(
+            candidate_evidence=candidate,
+            baseline_evidence=replace(baseline, panel_sha256="0" * 64),
+            qualification_panel=qualification_panel,
+            target=evaluation.AnnualizedReturnTarget.production(),
+            evaluation_complete=True,
+            integrity_complete=True,
+        )
     with pytest.raises(ValueError, match="qualification decision"):
         evaluation.QualificationDecision(
+            qualification_panel_sha256=qualification_panel.sha256,
             candidate_cagr_pct=Decimal("10.00"),
             baseline_cagr_pct=Decimal("9.00"),
             target_pct=Decimal("10.00"),

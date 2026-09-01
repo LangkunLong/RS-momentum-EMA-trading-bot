@@ -1350,6 +1350,7 @@ def build_panel_evidence_v4(
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
     aggregate = PanelAggregateSummary(
         panel_id=panel.purpose,
+        panel_sha256=panel.sha256,
         starting_equity=equity[0].equity,
         ending_equity=equity[-1].equity,
         elapsed_calendar_days=elapsed_days,

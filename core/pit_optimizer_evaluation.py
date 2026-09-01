@@ -955,8 +955,18 @@ def _target_from_primitive(value: object) -> AnnualizedReturnTarget:
 
 
 def _allocation_rule_from_primitive(value: object) -> PanelAllocationRuleV1:
-    if not isinstance(value, dict):
-        raise ValueError("panel allocation rule artifact is invalid")
+    expected_keys = {
+        "quick_count",
+        "discovery_count",
+        "qualification_count",
+        "algorithm_id",
+        "remainder",
+        "affiliation_bitset_order",
+        "panel_allocation_order",
+        "apportionment_id",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("panel allocation rule artifact keys are invalid")
     primitive = dict(value)
     primitive["affiliation_bitset_order"] = tuple(
         tuple(item) for item in primitive.get("affiliation_bitset_order", ())
@@ -968,8 +978,16 @@ def _allocation_rule_from_primitive(value: object) -> PanelAllocationRuleV1:
 
 
 def _allocation_from_primitive(value: object) -> PanelStratumAllocation:
-    if not isinstance(value, dict):
-        raise ValueError("panel stratum allocation artifact is invalid")
+    expected_keys = {
+        "source_affiliations",
+        "eligible_count",
+        "quick_count",
+        "discovery_count",
+        "qualification_count",
+        "unallocated_count",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("panel stratum allocation artifact keys are invalid")
     primitive = dict(value)
     primitive["source_affiliations"] = tuple(
         primitive.get("source_affiliations", ())
@@ -978,7 +996,24 @@ def _allocation_from_primitive(value: object) -> PanelStratumAllocation:
 
 
 def _discovery_panel_plan_from_primitive(value: object) -> DiscoveryPanelPlan:
-    if not isinstance(value, dict) or value.get("schema_version") != 4:
+    expected_keys = {
+        "schema_version",
+        "plan_kind",
+        "pit_bundle_sha256",
+        "prices_provenance_sha256",
+        "partition_seed_sha256",
+        "qualification_retirement_domain_id",
+        "qualification_ledger_snapshot_sha256",
+        "target",
+        "allocation_rule",
+        "stratum_allocations",
+        "quick_panel",
+        "discovery_panel",
+        "qualification_plan_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("discovery panel plan keys are invalid")
+    if value.get("schema_version") != 4:
         raise ValueError("discovery panel plan is not schema-v4")
     primitive = dict(value)
     primitive["target"] = _target_from_primitive(primitive.get("target"))
@@ -1001,7 +1036,22 @@ def _discovery_panel_plan_from_primitive(value: object) -> DiscoveryPanelPlan:
 def _qualification_panel_plan_from_primitive(
     value: object,
 ) -> QualificationPanelPlan:
-    if not isinstance(value, dict) or value.get("schema_version") != 4:
+    expected_keys = {
+        "schema_version",
+        "plan_kind",
+        "pit_bundle_sha256",
+        "prices_provenance_sha256",
+        "partition_seed_sha256",
+        "qualification_retirement_domain_id",
+        "qualification_ledger_snapshot_sha256",
+        "target",
+        "allocation_rule",
+        "stratum_allocations",
+        "qualification_panel",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("qualification panel plan keys are invalid")
+    if value.get("schema_version") != 4:
         raise ValueError("qualification panel plan is not schema-v4")
     primitive = dict(value)
     primitive["target"] = _target_from_primitive(primitive.get("target"))
@@ -1016,6 +1066,18 @@ def _qualification_panel_plan_from_primitive(
         primitive.get("qualification_panel")
     )
     return QualificationPanelPlan(**primitive)  # type: ignore[arg-type]
+
+
+_PANEL_PUBLICATION_KEYS = {
+    "schema_version",
+    "publication_kind",
+    "qualification_plan_sha256",
+    "discovery_plan_sha256",
+    "qualification_ledger_snapshot_sha256",
+    "quick_count",
+    "discovery_count",
+    "qualification_count",
+}
 
 
 def load_discovery_panel_plan(
@@ -1049,12 +1111,21 @@ def load_discovery_panel_plan(
         if (
             not isinstance(publication, dict)
             or marker_raw != _canonical_json_bytes(publication)
+            or set(publication) != _PANEL_PUBLICATION_KEYS
             or publication.get("schema_version") != 4
             or publication.get("publication_kind") != "panel_plans"
             or publication.get("discovery_plan_sha256")
             != hashlib.sha256(raw).hexdigest()
             or publication.get("qualification_plan_sha256")
             != plan.qualification_plan_sha256
+            or publication.get("qualification_ledger_snapshot_sha256")
+            != plan.qualification_ledger_snapshot_sha256
+            or publication.get("quick_count")
+            != plan.allocation_rule.quick_count
+            or publication.get("discovery_count")
+            != plan.allocation_rule.discovery_count
+            or publication.get("qualification_count")
+            != plan.allocation_rule.qualification_count
         ):
             raise ValueError("panel publication marker identity differs")
     return plan
@@ -1091,10 +1162,25 @@ def load_qualification_panel_plan(
         if (
             not isinstance(publication, dict)
             or marker_raw != _canonical_json_bytes(publication)
+            or set(publication) != _PANEL_PUBLICATION_KEYS
             or publication.get("schema_version") != 4
             or publication.get("publication_kind") != "panel_plans"
             or publication.get("qualification_plan_sha256")
             != hashlib.sha256(raw).hexdigest()
+            or publication.get("qualification_ledger_snapshot_sha256")
+            != plan.qualification_ledger_snapshot_sha256
+            or publication.get("quick_count")
+            != plan.allocation_rule.quick_count
+            or publication.get("discovery_count")
+            != plan.allocation_rule.discovery_count
+            or publication.get("qualification_count")
+            != plan.allocation_rule.qualification_count
+            or not isinstance(publication.get("discovery_plan_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                publication["discovery_plan_sha256"],
+            )
+            is None
         ):
             raise ValueError("panel publication marker identity differs")
     return plan
@@ -1103,6 +1189,7 @@ def load_qualification_panel_plan(
 @dataclass(frozen=True, slots=True)
 class PanelAggregateSummary:
     panel_id: str
+    panel_sha256: str
     starting_equity: float
     ending_equity: float
     elapsed_calendar_days: int
@@ -1120,6 +1207,7 @@ class PanelAggregateSummary:
     def __post_init__(self) -> None:
         if self.panel_id not in _PANEL_PURPOSES:
             raise ValueError("panel aggregate identity is invalid")
+        _require_digest(self.panel_sha256, "panel aggregate panel SHA-256")
         for name in (
             "starting_equity",
             "ending_equity",
@@ -1228,6 +1316,7 @@ class DiscoveryPanelComparison:
 
 @dataclass(frozen=True, slots=True)
 class QualificationDecision:
+    qualification_panel_sha256: str
     candidate_cagr_pct: Decimal
     baseline_cagr_pct: Decimal
     target_pct: Decimal
@@ -1236,6 +1325,10 @@ class QualificationDecision:
     qualified: bool
 
     def __post_init__(self) -> None:
+        _require_digest(
+            self.qualification_panel_sha256,
+            "qualification panel SHA-256",
+        )
         for name in ("candidate_cagr_pct", "baseline_cagr_pct", "target_pct"):
             value = getattr(self, name)
             if (
@@ -1261,16 +1354,30 @@ class QualificationDecision:
     def from_result(
         cls,
         *,
-        candidate_cagr_pct: object,
-        baseline_cagr_pct: object,
+        candidate_evidence: PanelAggregateSummary,
+        baseline_evidence: PanelAggregateSummary,
+        qualification_panel: EvaluationPanelSpec,
         target: AnnualizedReturnTarget,
         evaluation_complete: bool,
         integrity_complete: bool,
     ) -> "QualificationDecision":
         if not isinstance(target, AnnualizedReturnTarget):
             raise ValueError("qualification target is invalid")
-        candidate = _objective_decimal(candidate_cagr_pct, "qualification candidate CAGR")
-        baseline = _objective_decimal(baseline_cagr_pct, "qualification baseline CAGR")
+        if (
+            not isinstance(candidate_evidence, PanelAggregateSummary)
+            or not isinstance(baseline_evidence, PanelAggregateSummary)
+            or not isinstance(qualification_panel, EvaluationPanelSpec)
+            or qualification_panel.purpose != "qualification"
+            or candidate_evidence.panel_id != "qualification"
+            or baseline_evidence.panel_id != "qualification"
+            or candidate_evidence.panel_sha256 != qualification_panel.sha256
+            or baseline_evidence.panel_sha256 != qualification_panel.sha256
+        ):
+            raise ValueError(
+                "candidate and baseline evidence must bind the same qualification panel"
+            )
+        candidate = candidate_evidence.portfolio_annualized_return_pct
+        baseline = baseline_evidence.portfolio_annualized_return_pct
         qualified = (
             evaluation_complete is True
             and integrity_complete is True
@@ -1278,6 +1385,7 @@ class QualificationDecision:
             and candidate > baseline
         )
         return cls(
+            qualification_panel_sha256=candidate_evidence.panel_sha256,
             candidate_cagr_pct=candidate,
             baseline_cagr_pct=baseline,
             target_pct=target.target_pct,

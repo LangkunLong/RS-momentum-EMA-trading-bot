@@ -485,6 +485,7 @@ def test_legacy_fold_and_panel_evidence_embed_production_aggregates() -> None:
     )
     panel_evidence = parity.build_panel_evidence_v4(panel=panel, result=result)
     assert panel_evidence["policy_interface_version"] == 2
+    assert panel_evidence["aggregate"]["panel_sha256"] == panel.sha256
     assert panel_evidence["aggregate"]["portfolio_annualized_return_pct"] == "0.00"
 
 
