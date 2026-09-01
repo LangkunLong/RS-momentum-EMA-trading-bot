@@ -19921,8 +19921,6 @@ def _build_pit_optimizer_v3_live_run(
         strictly_improves_discovery,
     )
     from core.pit_policy_parity import ParityFoldEvidence, build_fold_evidence
-    from core.strategy_policy.contracts import CapacitySnapshot
-    from core.strategy_policy.worker import PolicyDeterminismProbe
 
     if not isinstance(source_state, SourceState) or source_state.fingerprint is None:
         raise ConfigurationError("PIT optimizer source capability is invalid")
@@ -20030,13 +20028,7 @@ def _build_pit_optimizer_v3_live_run(
             != set(tradable_tickers).union(market_reference_tickers)
         ):
             raise ConfigurationError("PIT evaluator panel escapes the tradable universe")
-        probes = (
-            PolicyDeterminismProbe(
-                "recommend_capacity",
-                CapacitySnapshot(None, 25, 0, 3, 1.0, False),
-                CapacitySnapshot(5, 25, 2, 1, 0.5, True),
-            ),
-        )
+        probes = _optimizer_capacity_determinism_probes()
 
         def evaluate_candidate(
             candidate_root: Path,
@@ -20940,12 +20932,74 @@ def _v4_policy_sources(root: Path) -> tuple[object, ...]:
     return tuple(result)
 
 
+def _optimizer_capacity_determinism_probes() -> tuple[object, ...]:
+    """Build contract-current capacity probes shared by v3 and v4 workers."""
+
+    from core.strategy_policy.contracts import (
+        BenchmarkContextV1,
+        CapacitySnapshot,
+        MarketContextV1,
+    )
+    from core.strategy_policy.worker import PolicyDeterminismProbe
+
+    benchmarks = tuple(
+        BenchmarkContextV1(
+            symbol=symbol,
+            close_to_sma_50_fraction=0.05,
+            close_to_sma_200_fraction=0.10,
+            realized_volatility_20d_fraction=0.20,
+        )
+        for symbol in ("SPY", "QQQ", "IWM")
+    )
+    market = MarketContextV1(
+        schema_version=1,
+        session="2026-01-02",
+        oneil_regime="confirmed_uptrend",
+        distribution_days=2,
+        follow_through=True,
+        benchmarks=benchmarks,
+        active_constituent_count=100,
+        breadth_above_50_fraction=0.60,
+        breadth_50_coverage_fraction=1.0,
+        breadth_above_200_fraction=0.50,
+        breadth_200_coverage_fraction=1.0,
+        median_rs_score=75.0,
+        rs_at_least_80_fraction=0.40,
+        rs_coverage_fraction=1.0,
+    )
+    return (
+        PolicyDeterminismProbe(
+            "recommend_capacity",
+            CapacitySnapshot(
+                market=market,
+                configured_max_positions=None,
+                maximum_policy_positions=25,
+                open_position_count=0,
+                eligible_signal_count=3,
+                cash_fraction=1.0,
+                configured_eviction_enabled=False,
+            ),
+            CapacitySnapshot(
+                market=market,
+                configured_max_positions=5,
+                maximum_policy_positions=25,
+                open_position_count=2,
+                eligible_signal_count=1,
+                cash_fraction=0.5,
+                configured_eviction_enabled=True,
+            ),
+        ),
+    )
+
+
 def _v4_worker_runner(
     config: object,
     *,
     limits: PitOptimizerLoopLimits,
     deadline: float,
 ) -> PolicyWorkerRunner:
+    # Catch policy-contract drift before an authorization lease or provider call.
+    _optimizer_capacity_determinism_probes()
     docker = configure_docker_executable(
         config.docker_executable,
         source_root=config.source_root,
@@ -20978,8 +21032,6 @@ def _evaluate_v4_panel(
     from core.pit_data import PITDataBundle
     from core.pit_optimizer_evaluation import panel_aggregate_summary_from_primitive
     from core.pit_policy_parity import build_panel_evidence_v4
-    from core.strategy_policy.contracts import CapacitySnapshot
-    from core.strategy_policy.worker import PolicyDeterminismProbe
 
     tickers = tuple(
         sorted(
@@ -21001,13 +21053,7 @@ def _evaluate_v4_panel(
             candidate_root=candidate_root,
             interface_version=manifest.policy_interface_version,
             fold_run_id=run_label,
-            determinism_probes=(
-                PolicyDeterminismProbe(
-                    "recommend_capacity",
-                    CapacitySnapshot(None, 25, 0, 3, 1.0, False),
-                    CapacitySnapshot(5, 25, 2, 1, 0.5, True),
-                ),
-            ),
+            determinism_probes=_optimizer_capacity_determinism_probes(),
         )
     with PITDataBundle(
         config.pit_bundle,

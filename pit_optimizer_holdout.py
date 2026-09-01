@@ -221,7 +221,12 @@ def _build_hidden_evaluator(
     wall_deadline: float,
     progress: HoldoutProgressJournal,
 ) -> Callable[[object, object, object], object]:
-    from agent_loop import PolicyWorkerRunner, configure_docker_executable, _canonical_json_bytes
+    from agent_loop import (
+        PolicyWorkerRunner,
+        _canonical_json_bytes,
+        _optimizer_capacity_determinism_probes,
+        configure_docker_executable,
+    )
     from core.backtest_engine import PortfolioSimulator
     from core.pit_data import PITDataBundle
     from core.pit_optimization import _build_verification_scope
@@ -232,8 +237,6 @@ def _build_hidden_evaluator(
         HoldoutDecision,
     )
     from core.pit_policy_parity import ParityFoldEvidence, build_fold_evidence
-    from core.strategy_policy.contracts import CapacitySnapshot
-    from core.strategy_policy.worker import PolicyDeterminismProbe
 
     manifest = getattr(readiness, "manifest", None)
     if manifest is None:
@@ -256,13 +259,7 @@ def _build_hidden_evaluator(
     ).hexdigest()
     if universe_sha256 != manifest.fold_manifest.universe_sha256:
         raise HoldoutPreflightError("holdout_universe_identity_invalid")
-    probes = (
-        PolicyDeterminismProbe(
-            "recommend_capacity",
-            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
-            CapacitySnapshot(5, 25, 2, 1, 0.5, True),
-        ),
-    )
+    probes = _optimizer_capacity_determinism_probes()
     docker = configure_docker_executable(
         docker_executable,
         source_root=repo_root,
