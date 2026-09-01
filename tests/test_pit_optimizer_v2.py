@@ -280,25 +280,49 @@ def test_role_schema_investigator_output_is_closed_and_bounded() -> None:
             _canonical_text({**payload, "family": "hidden_validation"}),
             max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
         )
-    with pytest.raises(ValueError, match="at most 16"):
-        contract.InvestigatorArtifact.from_json(
-            _canonical_text(
-                {
-                    **payload,
-                    "evidence_ids": [f"evidence_{index}" for index in range(17)],
-                }
-            ),
-            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
-        )
-    with pytest.raises(ValueError, match="unique"):
-        contract.InvestigatorArtifact.from_json(
-            _canonical_text({**payload, "known_risks": ["same", "same"]}),
-            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
-        )
+    bounded = contract.InvestigatorArtifact.from_json(
+        _canonical_text(
+            {
+                **payload,
+                "evidence_ids": [f"evidence_{index}" for index in range(17)],
+            }
+        ),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    assert len(bounded.evidence_ids) == contract.MAX_ROLE_LIST_ITEMS
+    deduplicated = contract.InvestigatorArtifact.from_json(
+        _canonical_text({**payload, "known_risks": ["same", "same"]}),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    assert deduplicated.known_risks == ("same",)
     with pytest.raises(ValueError, match="bounded"):
         contract.InvestigatorArtifact.from_json(
             _canonical_text(payload),
             max_total_bytes=32,
+        )
+
+    v4_payload = {
+        "hypothesis_id": "adaptive_leadership_1",
+        "focus_areas": ["entry", "risk_sizing"],
+        "evidence_ids": ["discovery.cagr", "quick.entry_funnel"],
+        "causal_rationale": "Coordinate entry quality with exposure when leadership narrows.",
+        "expected_diagnostic_changes": ["higher discovery CAGR"],
+        "known_risks": ["lower participation"],
+        "author_instructions": ["Return all three complete policy sources."],
+    }
+    v4_artifact = contract.InvestigatorArtifactV4.from_json(
+        _canonical_text(v4_payload),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    assert v4_artifact.focus_areas == ("entry", "risk_sizing")
+    v4_schema = contract.pit_optimizer_v4_response_format("investigator")
+    assert v4_schema["json_schema"]["schema"]["properties"]["focus_areas"][
+        "maxItems"
+    ] == 3
+    with pytest.raises(ValueError, match="focus areas"):
+        contract.InvestigatorArtifactV4.from_json(
+            _canonical_text({**v4_payload, "focus_areas": ["entries"]}),
+            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
         )
 
 
@@ -383,6 +407,78 @@ def test_role_schema_author_output_has_independent_diff_and_metadata_caps() -> N
             max_total_bytes=16 * 1024,
         )
 
+    parent_sources = tuple(
+        contract.AuthorSourceFile.from_source(path=path, source=source)
+        for path, source in {
+            "core/strategy_policy/entry.py": "def evaluate_entry(snapshot):\n    return None\n",
+            "core/strategy_policy/risk.py": "def recommend_capacity(snapshot):\n    return 1\n",
+            "core/strategy_policy/exit.py": "def evaluate_exit(snapshot):\n    return None\n",
+        }.items()
+    )
+    parent = contract.SelectedParentIdentity.issue(
+        parent_kind="baseline",
+        parent_id="baseline",
+        source_head="a" * 40,
+        policy_sources=parent_sources,
+    )
+    replacement_sources = {
+        item.path: (
+            item.source.replace("return None", "return True")
+            if item.path == "core/strategy_policy/entry.py"
+            else item.source
+        )
+        for item in parent_sources
+    }
+    v4_payload = {
+        "hypothesis_id": "adaptive_leadership_1",
+        "parent_identity_sha256": parent.parent_identity_sha256,
+        "behavioral_summary": "Require a stronger entry while preserving risk and exit.",
+        "policy_sources": replacement_sources,
+        "assumptions": [],
+        "validation_suggestions": ["Run syntax and policy-interface checks."],
+    }
+    response_bytes = len(_canonical_text(v4_payload).encode("utf-8"))
+    v4_artifact = contract.AuthorArtifactV4.from_json(
+        _canonical_text(v4_payload),
+        selected_parent=parent,
+        max_total_bytes=response_bytes,
+    )
+    assert tuple(item.path for item in v4_artifact.policy_sources) == _POLICY_PATHS
+    assert set(v4_artifact.to_primitive()["policy_sources"]) == set(_POLICY_PATHS)
+    assert "unified_diff" not in v4_artifact.to_primitive()
+    author_schema = contract.pit_optimizer_v4_response_format("author")["json_schema"][
+        "schema"
+    ]
+    assert set(author_schema["properties"]["policy_sources"]["properties"]) == set(
+        _POLICY_PATHS
+    )
+    with pytest.raises(ValueError, match="exactly the three editable paths"):
+        contract.AuthorArtifactV4.from_json(
+            _canonical_text(
+                {
+                    **v4_payload,
+                    "policy_sources": {
+                        key: value
+                        for key, value in replacement_sources.items()
+                        if key != "core/strategy_policy/exit.py"
+                    },
+                }
+            ),
+            selected_parent=parent,
+            max_total_bytes=response_bytes,
+        )
+    with pytest.raises(ValueError, match="at least one changed"):
+        contract.AuthorArtifactV4.from_json(
+            _canonical_text(
+                {
+                    **v4_payload,
+                    "policy_sources": {item.path: item.source for item in parent_sources},
+                }
+            ),
+            selected_parent=parent,
+            max_total_bytes=response_bytes,
+        )
+
 
 def test_author_parser_uses_controller_scope_instead_of_model_echo() -> None:
     """Break caught: redundant model scope metadata could block diff validation."""
@@ -444,6 +540,22 @@ def test_role_schema_critic_output_is_advisory_closed_and_bounded() -> None:
             _canonical_text(payload),
             max_total_bytes=64,
         )
+
+    for disposition in ("promote", "refine", "abandon"):
+        v4_artifact = contract.CriticArtifactV4.from_json(
+            _canonical_text({**payload, "disposition": disposition}),
+            max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
+        )
+        assert v4_artifact.disposition == disposition
+    assert contract.pit_optimizer_v4_response_format("critic")["json_schema"][
+        "schema"
+    ]["properties"]["disposition"]["enum"] == ["promote", "refine", "abandon"]
+    for forbidden_alias in ("accept", "change_family", "revise", "reject"):
+        with pytest.raises(ValueError, match="disposition"):
+            contract.CriticArtifactV4.from_json(
+                _canonical_text({**payload, "disposition": forbidden_alias}),
+                max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
+            )
 
 
 def _source_bundle() -> contract.PolicySourceBundle:
@@ -1325,6 +1437,175 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
             next_direction="x" * (4 * 1024 + 1),
         )
 
+    v4_sources = _v4_policy_sources()
+    v4_parent = contract.SelectedParentIdentity.issue(
+        parent_kind="baseline",
+        parent_id="baseline",
+        source_head="a" * 40,
+        policy_sources=v4_sources,
+    )
+    quick = _v4_panel_summary(
+        "quick",
+        panel_sha256="1" * 64,
+        cagr_pct=Decimal("4.00"),
+    )
+    discovery_panel = _v4_panel_summary(
+        "discovery",
+        panel_sha256="2" * 64,
+        cagr_pct=Decimal("5.00"),
+    )
+    quick_primitive = asdict(quick)
+    quick_primitive["portfolio_annualized_return_pct"] = "4.00"
+    assert evaluation.panel_aggregate_summary_from_primitive(quick_primitive) == quick
+    parent_summary = contract.SelectedParentSummary(
+        identity=v4_parent,
+        hypothesis_id="baseline",
+        behavioral_summary="Authenticated interface-v2 baseline.",
+        quick_panel=quick,
+        discovery_panel=discovery_panel,
+    )
+    target = evaluation.AnnualizedReturnTarget.production()
+    progress = contract.TargetProgressV4.from_summaries(
+        target=target,
+        baseline=discovery_panel,
+        selected_parent=discovery_panel,
+        champion=discovery_panel,
+    )
+    investigator_v4 = contract.InvestigatorArtifactV4.from_json(
+        _canonical_text(
+            {
+                "hypothesis_id": "adaptive_leadership_1",
+                "focus_areas": ["entry", "risk_sizing"],
+                "evidence_ids": ["discovery.cagr"],
+                "causal_rationale": "Coordinate entry quality and exposure.",
+                "expected_diagnostic_changes": ["higher discovery CAGR"],
+                "known_risks": [],
+                "author_instructions": ["Return all three complete sources."],
+            }
+        ),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    common_v4 = {
+        "schema_version": 4,
+        "iteration": 1,
+        "run_manifest_sha256": "0" * 64,
+        "policy_interface_version": 2,
+        "immutable_constraint_ids": ("causal_only", "no_external_io"),
+        "annualized_return_target": target,
+        "discovery_panel_plan_sha256": "3" * 64,
+        "selected_parent_identity": v4_parent,
+    }
+    investigator_input_v4 = contract.InvestigatorInputV4(
+        **common_v4,
+        selected_parent_source_bundle_sha256=v4_parent.source_bundle_sha256,
+        selected_parent_sources=v4_sources,
+        selected_parent_summary=parent_summary,
+        baseline_summary=parent_summary,
+        champion_summary=None,
+        branch_summary=None,
+        target_progress=progress,
+        prior_hypotheses=(),
+        validation_status=contract.CandidateValidationStatusV4(
+            status="not_evaluated",
+            failure_code=None,
+        ),
+    )
+    author_input_v4 = contract.AuthorInputV4(
+        **common_v4,
+        selected_parent_source_bundle_sha256=v4_parent.source_bundle_sha256,
+        selected_parent_sources=v4_sources,
+        investigator=investigator_v4,
+    )
+    replacement_sources = {
+        item.path: (
+            item.source.replace("return None", "return True")
+            if item.path == "core/strategy_policy/entry.py"
+            else item.source
+        )
+        for item in v4_sources
+    }
+    author_v4_payload = {
+        "hypothesis_id": investigator_v4.hypothesis_id,
+        "parent_identity_sha256": v4_parent.parent_identity_sha256,
+        "behavioral_summary": "Coordinate entry quality while retaining risk and exit.",
+        "policy_sources": replacement_sources,
+        "assumptions": [],
+        "validation_suggestions": [],
+    }
+    author_v4 = contract.AuthorArtifactV4.from_json(
+        _canonical_text(author_v4_payload),
+        selected_parent=v4_parent,
+        max_total_bytes=len(_canonical_text(author_v4_payload).encode("utf-8")),
+    )
+    author_input_v4.validate_artifact(author_v4)
+    author_manifest_v4 = contract.AuthorManifestSummaryV4.from_artifact(
+        author_v4,
+        selected_parent=v4_parent,
+    )
+    critic_input_v4 = contract.CriticInputV4(
+        **common_v4,
+        hypothesis_id=investigator_v4.hypothesis_id,
+        investigator_summary=investigator_v4,
+        author_manifest=author_manifest_v4,
+        author_output_invalid=None,
+        validation_status=contract.CandidateValidationStatusV4(
+            status="valid",
+            failure_code=None,
+        ),
+        candidate_quick=quick,
+        candidate_discovery=discovery_panel,
+        baseline_quick=quick,
+        baseline_discovery=discovery_panel,
+        champion_discovery=discovery_panel,
+        target_progress=progress,
+    )
+    assert {
+        value.selected_parent_identity.parent_identity_sha256
+        for value in (investigator_input_v4, author_input_v4, critic_input_v4)
+    } == {v4_parent.parent_identity_sha256}
+    for role_input_v4 in (
+        investigator_input_v4,
+        author_input_v4,
+        critic_input_v4,
+    ):
+        rendered = role_input_v4.canonical_json_bytes().decode("utf-8")
+        for forbidden in (
+            "fold_manifest",
+            "discovery_score",
+            "unified_diff",
+            "max_usd",
+            "qualification_panel",
+        ):
+            assert forbidden not in rendered
+    critic_text = critic_input_v4.canonical_json_bytes().decode("utf-8")
+    assert "policy_sources" not in critic_text
+    assert "def evaluate_entry" not in critic_text
+    invalid_author = contract.RoleOutputInvalidSummary(
+        role="author",
+        validation_code="payload_schema_invalid",
+    )
+    invalid_critic_input = replace(
+        critic_input_v4,
+        author_manifest=None,
+        author_output_invalid=invalid_author,
+        validation_status=contract.CandidateValidationStatusV4(
+            status="invalid",
+            failure_code="author_output_invalid",
+        ),
+        candidate_quick=None,
+        candidate_discovery=None,
+    )
+    assert invalid_critic_input.author_output_invalid == invalid_author
+    with pytest.raises(ValueError, match="exactly one"):
+        replace(invalid_critic_input, author_manifest=author_manifest_v4)
+    with pytest.raises(ValueError, match="exactly one"):
+        replace(critic_input_v4, author_manifest=None)
+    with pytest.raises(ValueError, match="selected parent source"):
+        replace(
+            author_input_v4,
+            selected_parent_source_bundle_sha256="4" * 64,
+        )
+
 
 def _sessions(start: str, end: str) -> tuple[str, ...]:
     first = date.fromisoformat(start)
@@ -1462,6 +1743,117 @@ def _v2_manifest() -> contract.PitOptimizerRunManifest:
     )
 
 
+def _v4_policy_sources() -> tuple[contract.AuthorSourceFile, ...]:
+    return tuple(
+        contract.AuthorSourceFile.from_source(path=path, source=source)
+        for path, source in {
+            "core/strategy_policy/entry.py": "def evaluate_entry(snapshot):\n    return None\n",
+            "core/strategy_policy/risk.py": "def recommend_capacity(snapshot):\n    return 1\n",
+            "core/strategy_policy/exit.py": "def evaluate_exit(snapshot):\n    return None\n",
+        }.items()
+    )
+
+
+def _v4_panel_summary(
+    panel_id: str,
+    *,
+    panel_sha256: str,
+    cagr_pct: Decimal,
+) -> evaluation.PanelAggregateSummary:
+    starting_equity = 100.0
+    ending_equity = starting_equity * (1.0 + float(cagr_pct) / 100.0)
+    return evaluation.PanelAggregateSummary(
+        panel_id=panel_id,
+        panel_sha256=panel_sha256,
+        starting_equity=starting_equity,
+        ending_equity=ending_equity,
+        elapsed_calendar_days=365,
+        portfolio_annualized_return_pct=cagr_pct,
+        total_return_pct=float(cagr_pct),
+        benchmark_return_pct=4.0,
+        max_drawdown_pct=-3.0,
+        sharpe_ratio=1.0,
+        closed_trades=0,
+        turnover_pct=0.0,
+        average_exposure_pct=0.0,
+        entry_funnel=(AggregateMetric("evaluated", 10),),
+        exit_attribution=(),
+    )
+
+
+def _v4_call_budgets(iterations: int = 3) -> tuple[contract.PitOptimizerCallBudget, ...]:
+    return tuple(
+        contract.PitOptimizerCallBudget(
+            call_index=(iteration - 1) * 3 + ordinal,
+            iteration=iteration,
+            role=role,
+            model=contract.PIT_OPTIMIZER_R1_MODEL,
+            max_static_input_bytes=20_000,
+            max_dynamic_input_bytes=200_000,
+            max_input_tokens=220_000,
+            max_output_tokens=40_000,
+            max_response_bytes=64_000,
+        )
+        for iteration in range(1, iterations + 1)
+        for ordinal, role in enumerate(contract.OPTIMIZER_V4_ROLES, start=1)
+    )
+
+
+def _v4_discovery_plan() -> evaluation.DiscoveryPanelPlan:
+    lineages = tuple(
+        evaluation.PanelSecurityLineage(
+            security_lineage_id=f"chain-{index}",
+            executable_tickers=(f"T{index}",),
+            source_affiliations=("sp500",),
+        )
+        for index in range(3)
+    )
+    snapshot = evaluation.QualificationRetirementSnapshot(
+        schema_version=4,
+        qualification_retirement_domain_id="a" * 64,
+        ledger_head_sha256="b" * 64,
+        record_count=1,
+        retired_security_lineage_ids=(),
+    )
+    _qualification, discovery = evaluation.compose_panel_plans(
+        lineages=lineages,
+        sessions=("2021-01-04", "2021-01-05", "2021-01-06"),
+        pit_bundle_sha256="c" * 64,
+        prices_provenance_sha256="d" * 64,
+        partition_seed_sha256="e" * 64,
+        target=evaluation.AnnualizedReturnTarget.production(),
+        rule=evaluation.PanelAllocationRuleV1(1, 1, 1),
+        ledger_snapshot=snapshot,
+    )
+    return discovery
+
+
+def _v4_manifest() -> tuple[
+    contract.PitOptimizerRunManifestV4,
+    evaluation.DiscoveryPanelPlan,
+]:
+    policy_sources = _v4_policy_sources()
+    scope = contract.PolicyAuthoringScopeV4.from_sources(
+        policy_sources=policy_sources,
+        call_budgets=_v4_call_budgets(),
+        max_iteration_feedback_bytes=8_000,
+        max_iteration_history_bytes=64_000,
+        author_response_headroom_bytes=8_000,
+    )
+    plan = _v4_discovery_plan()
+    manifest = contract.PitOptimizerRunManifestV4.from_discovery_plan(
+        campaign_id="adaptive_oneil_1",
+        campaign_sequence=1,
+        source_head="f" * 40,
+        source_fingerprint_sha256="1" * 64,
+        discovery_panel_plan=plan,
+        policy_authoring_scope=scope,
+        immutable_constraint_ids=("causal_only", "no_external_io"),
+        sandbox_image="example.invalid/pit-optimizer@sha256:" + "2" * 64,
+    )
+    return manifest, plan
+
+
 def _independent_digest(value: object) -> str:
     payload = (
         json.dumps(
@@ -1559,6 +1951,62 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
                 max_tokens=448_001,
             ),
         )
+
+    v4, discovery_plan = _v4_manifest()
+    assert v4.schema_version == 4
+    assert v4.policy_interface_version == 2
+    assert v4.max_iterations == 3
+    assert len(v4.call_budgets) == 9
+    assert v4.discovery_panel_plan_sha256 == discovery_plan.sha256
+    assert v4.qualification_plan_sha256 == discovery_plan.qualification_plan_sha256
+    assert v4.annualized_return_target == discovery_plan.target
+    assert v4.apply is False and v4.provider_retries == 0
+    assert v4.seed_checkpoint_sha256 is None
+    assert v4.policy_authoring_scope.canonical_source_bundle_bytes == len(
+        contract.policy_source_bundle_v4_bytes(_v4_policy_sources())
+    )
+    forbidden_scope_fields = {
+        "max_files",
+        "max_hunks",
+        "max_changed_lines",
+        "max_diff_bytes",
+        "candidate_bounds",
+        "hard_patch_bounds",
+        "max_usd",
+    }
+    assert not forbidden_scope_fields.intersection(
+        field.name for field in fields(contract.PolicyAuthoringScopeV4)
+    )
+    primitive = v4.to_primitive()
+    assert "qualification_panel" not in json.dumps(primitive, sort_keys=True)
+    assert contract._pit_optimizer_manifest_v4_from_primitive(
+        primitive,
+        discovery_panel_plan=discovery_plan,
+    ) == v4
+    assert contract._pit_optimizer_manifest_from_primitive(
+        _v2_manifest().to_primitive()
+    ) == _v2_manifest()
+    with pytest.raises(ValueError, match="v4 manifest keys"):
+        contract._pit_optimizer_manifest_v4_from_primitive(
+            _v2_manifest().to_primitive()
+        )
+    with pytest.raises(ValueError, match="policy interface"):
+        replace(v4, policy_interface_version=1)
+    with pytest.raises(ValueError, match="apply"):
+        replace(v4, apply=True)
+    with pytest.raises(ValueError, match="provider retries"):
+        replace(v4, provider_retries=1)
+    with pytest.raises(ValueError, match="authoring scope differs|call order"):
+        replace(
+            v4,
+            call_budgets=(
+                replace(v4.call_budgets[0], call_index=2),
+                *v4.call_budgets[1:],
+            ),
+        )
+    stale_plan_binding = replace(v4, discovery_panel_plan_sha256="3" * 64)
+    with pytest.raises(ValueError, match="discovery plan binding"):
+        stale_plan_binding.validate_discovery_plan(discovery_plan)
 
 
 _FIRST_CANARY_MUTATIONS = (

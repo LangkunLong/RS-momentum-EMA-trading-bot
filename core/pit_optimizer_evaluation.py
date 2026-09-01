@@ -934,7 +934,11 @@ def _evaluation_panel_from_primitive(value: object) -> EvaluationPanelSpec:
     )
 
 
-def _target_from_primitive(value: object) -> AnnualizedReturnTarget:
+def annualized_return_target_from_primitive(
+    value: object,
+) -> AnnualizedReturnTarget:
+    """Decode the closed, canonical annualized-return target contract."""
+
     if not isinstance(value, dict) or set(value) != {
         "metric_id",
         "formula_id",
@@ -952,6 +956,10 @@ def _target_from_primitive(value: object) -> AnnualizedReturnTarget:
         milestones_pct=tuple(Decimal(item) for item in value["milestones_pct"]),  # type: ignore[union-attr]
         precision_pct=Decimal(value["precision_pct"]),  # type: ignore[arg-type]
     )
+
+
+def _target_from_primitive(value: object) -> AnnualizedReturnTarget:
+    return annualized_return_target_from_primitive(value)
 
 
 def _allocation_rule_from_primitive(value: object) -> PanelAllocationRuleV1:
@@ -1250,6 +1258,51 @@ class PanelAggregateSummary:
         )
         if supplied != self.portfolio_annualized_return_pct or supplied != expected:
             raise ValueError("panel annualized return differs from production CAGR")
+
+
+def _aggregate_metric_from_primitive(value: object) -> AggregateMetric:
+    if not isinstance(value, dict) or set(value) != {"metric_id", "value"}:
+        raise ValueError("panel aggregate metric artifact is invalid")
+    return AggregateMetric(
+        metric_id=value["metric_id"],  # type: ignore[arg-type]
+        value=value["value"],  # type: ignore[arg-type]
+    )
+
+
+def panel_aggregate_summary_from_primitive(value: object) -> PanelAggregateSummary:
+    """Decode closed quick/discovery aggregate evidence for schema-v4 roles."""
+
+    expected_keys = {field.name for field in fields(PanelAggregateSummary)}
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("panel aggregate summary artifact is invalid")
+    try:
+        return PanelAggregateSummary(
+            panel_id=value["panel_id"],  # type: ignore[arg-type]
+            panel_sha256=value["panel_sha256"],  # type: ignore[arg-type]
+            starting_equity=value["starting_equity"],  # type: ignore[arg-type]
+            ending_equity=value["ending_equity"],  # type: ignore[arg-type]
+            elapsed_calendar_days=value["elapsed_calendar_days"],  # type: ignore[arg-type]
+            portfolio_annualized_return_pct=Decimal(
+                value["portfolio_annualized_return_pct"]  # type: ignore[arg-type]
+            ),
+            total_return_pct=value["total_return_pct"],  # type: ignore[arg-type]
+            benchmark_return_pct=value["benchmark_return_pct"],  # type: ignore[arg-type]
+            max_drawdown_pct=value["max_drawdown_pct"],  # type: ignore[arg-type]
+            sharpe_ratio=value["sharpe_ratio"],  # type: ignore[arg-type]
+            closed_trades=value["closed_trades"],  # type: ignore[arg-type]
+            turnover_pct=value["turnover_pct"],  # type: ignore[arg-type]
+            average_exposure_pct=value["average_exposure_pct"],  # type: ignore[arg-type]
+            entry_funnel=tuple(
+                _aggregate_metric_from_primitive(item)
+                for item in value["entry_funnel"]  # type: ignore[union-attr]
+            ),
+            exit_attribution=tuple(
+                _aggregate_metric_from_primitive(item)
+                for item in value["exit_attribution"]  # type: ignore[union-attr]
+            ),
+        )
+    except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("panel aggregate summary closed contract is invalid") from exc
 
 
 @dataclass(frozen=True, slots=True)
