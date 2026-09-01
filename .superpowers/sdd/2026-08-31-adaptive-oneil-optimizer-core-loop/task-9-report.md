@@ -14,3 +14,15 @@ milestones while the manifest continues to bind the active run target.
 
 Verification: compileall and Ruff passed for
 `core/pit_optimizer_evaluation.py`. No provider or Docker call was made.
+
+## Frozen champion artifact slice
+
+Added a strict schema-v4 checkpoint loader that accepts only a branch-free
+frozen champion. It authenticates canonical checkpoint bytes and digest, the
+candidate identity self-digest and source/discovery bindings, the referenced
+cumulative diff, the exact three policy sources and their identity-bound
+digests, and both referenced panel-evidence artifacts before returning inputs
+for disposable reconstruction.
+
+Verification: compileall and Ruff passed for
+`core/pit_optimizer_artifacts.py`. No provider or Docker call was made.

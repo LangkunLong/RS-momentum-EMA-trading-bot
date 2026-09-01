@@ -11,9 +11,10 @@ from pathlib import Path
 import secrets
 import stat
 import tempfile
+from types import MappingProxyType
 from typing import Mapping
 
-from core.pit_optimizer_candidate import CandidateIdentityV4
+from core.pit_optimizer_candidate import CandidateIdentityV4, EDITABLE_POLICY_PATHS
 from core.pit_optimizer_evaluation import PanelAggregateSummary
 
 
@@ -222,6 +223,218 @@ class CampaignCheckpoint:
     @property
     def sha256(self) -> str:
         return hashlib.sha256(canonical_json_bytes(self.to_primitive())).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenChampionArtifact:
+    """Canonical checkpoint inputs authenticated before disposable reconstruction."""
+
+    checkpoint_path: Path
+    checkpoint_sha256: str
+    campaign_id: str
+    source_head: str
+    source_fingerprint_sha256: str
+    discovery_panel_plan_sha256: str
+    candidate_identity: Mapping[str, object]
+    candidate_identity_sha256: str
+    cumulative_diff: str
+    policy_sources: tuple[tuple[str, str], ...]
+    champion: Mapping[str, object]
+
+
+def _read_frozen_artifact(
+    root: Path,
+    relative: object,
+    expected_sha256: object,
+    *,
+    label: str,
+) -> tuple[Path, bytes]:
+    relative_path = Path(relative) if isinstance(relative, str) else Path()
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or relative_path.is_absolute()
+        or ".." in relative_path.parts
+    ):
+        raise ValueError(f"frozen champion {label} path is invalid")
+    digest = _closed_sha256(
+        expected_sha256,
+        f"frozen champion {label} SHA-256",
+    )
+    target = (root / relative_path).resolve(strict=False)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"frozen champion {label} escaped checkpoint root") from exc
+    if target.is_symlink() or not target.is_file():
+        raise ValueError(f"frozen champion {label} is absent")
+    raw = target.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError(f"frozen champion {label} digest differs")
+    return target, raw
+
+
+def _canonical_frozen_json(raw: bytes, *, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"frozen champion {label} JSON is invalid") from exc
+    if not isinstance(value, dict) or raw != canonical_json_bytes(value):
+        raise ValueError(f"frozen champion {label} is not canonical JSON")
+    return value
+
+
+def load_frozen_champion_artifact(
+    checkpoint_path: Path,
+    *,
+    expected_sha256: str,
+) -> FrozenChampionArtifact:
+    """Load one branch-free schema-v4 checkpoint and all champion references."""
+
+    candidate = Path(checkpoint_path)
+    if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_file():
+        raise ValueError("frozen champion checkpoint path is invalid")
+    expected = _closed_sha256(
+        expected_sha256,
+        "frozen champion checkpoint SHA-256",
+    )
+    raw_checkpoint = candidate.read_bytes()
+    if hashlib.sha256(raw_checkpoint).hexdigest() != expected:
+        raise ValueError("frozen champion checkpoint digest differs")
+    checkpoint = _canonical_frozen_json(raw_checkpoint, label="checkpoint")
+    expected_checkpoint_keys = {
+        "schema_version",
+        "artifact_type",
+        "campaign_id",
+        "campaign_sequence",
+        "source_head",
+        "source_fingerprint_sha256",
+        "discovery_panel_plan_sha256",
+        "completed_iterations",
+        "champion",
+        "active_branch",
+        "feedback_tail",
+    }
+    champion = checkpoint.get("champion")
+    if (
+        set(checkpoint) != expected_checkpoint_keys
+        or checkpoint.get("schema_version") != 4
+        or checkpoint.get("artifact_type") != "campaign_checkpoint"
+        or not isinstance(champion, dict)
+        or checkpoint.get("active_branch") is not None
+    ):
+        raise ValueError("qualification requires one frozen branch-free champion")
+    identity = champion.get("candidate_identity")
+    if not isinstance(identity, dict):
+        raise ValueError("frozen champion candidate identity is invalid")
+    identity_keys = {
+        "source_commit",
+        "policy_interface_version",
+        "cumulative_diff_sha256",
+        "editable_file_sha256s",
+        "changed_paths",
+        "changed_symbols",
+        "immutable_constraints_sha256",
+        "discovery_panel_plan_sha256",
+        "parent_identity_sha256",
+        "identity_sha256",
+    }
+    identity_sha256 = _closed_sha256(
+        identity.get("identity_sha256"),
+        "frozen champion candidate identity SHA-256",
+    )
+    identity_preimage = {
+        key: value for key, value in identity.items() if key != "identity_sha256"
+    }
+    if (
+        set(identity) != identity_keys
+        or hashlib.sha256(canonical_json_bytes(identity_preimage)).hexdigest()
+        != identity_sha256
+        or identity.get("source_commit") != checkpoint.get("source_head")
+        or identity.get("discovery_panel_plan_sha256")
+        != checkpoint.get("discovery_panel_plan_sha256")
+    ):
+        raise ValueError("frozen champion candidate identity differs")
+    root = candidate.parent.resolve()
+    _diff_path, raw_diff = _read_frozen_artifact(
+        root,
+        champion.get("cumulative_diff_artifact"),
+        champion.get("cumulative_diff_sha256"),
+        label="cumulative diff",
+    )
+    try:
+        cumulative_diff = raw_diff.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("frozen champion diff is not UTF-8") from exc
+    if (
+        "\x00" in cumulative_diff
+        or hashlib.sha256(cumulative_diff.encode("utf-8")).hexdigest()
+        != identity.get("cumulative_diff_sha256")
+    ):
+        raise ValueError("frozen champion diff identity differs")
+    _source_path, raw_source = _read_frozen_artifact(
+        root,
+        champion.get("source_bundle_artifact"),
+        champion.get("source_bundle_sha256"),
+        label="source bundle",
+    )
+    source_artifact = _canonical_frozen_json(raw_source, label="source bundle")
+    raw_sources = source_artifact.get("policy_sources")
+    if (
+        source_artifact.get("schema_version") != 4
+        or source_artifact.get("candidate_identity_sha256") != identity_sha256
+        or not isinstance(raw_sources, dict)
+        or set(raw_sources) != set(EDITABLE_POLICY_PATHS)
+        or any(not isinstance(value, str) for value in raw_sources.values())
+    ):
+        raise ValueError("frozen champion source bundle is invalid")
+    policy_sources = tuple((path, raw_sources[path]) for path in EDITABLE_POLICY_PATHS)
+    source_sha256s = tuple(
+        (path, hashlib.sha256(source.encode("utf-8")).hexdigest())
+        for path, source in policy_sources
+    )
+    editable_sha256s = identity.get("editable_file_sha256s")
+    if (
+        not isinstance(editable_sha256s, list)
+        or tuple(tuple(item) for item in editable_sha256s) != source_sha256s
+    ):
+        raise ValueError("frozen champion sources differ from candidate identity")
+    for prefix in ("quick", "discovery"):
+        artifact_name = champion.get(f"{prefix}_evidence_artifact")
+        artifact_sha256 = champion.get(f"{prefix}_evidence_sha256")
+        if artifact_name is None or artifact_sha256 is None:
+            raise ValueError("frozen champion panel evidence is incomplete")
+        _evidence_path, evidence_raw = _read_frozen_artifact(
+            root,
+            artifact_name,
+            artifact_sha256,
+            label=f"{prefix} evidence",
+        )
+        evidence_artifact = _canonical_frozen_json(
+            evidence_raw,
+            label=f"{prefix} evidence",
+        )
+        if evidence_artifact.get("evidence") != champion.get(f"{prefix}_evidence"):
+            raise ValueError("frozen champion panel evidence differs")
+    return FrozenChampionArtifact(
+        checkpoint_path=candidate.resolve(),
+        checkpoint_sha256=expected,
+        campaign_id=str(checkpoint.get("campaign_id")),
+        source_head=str(checkpoint.get("source_head")),
+        source_fingerprint_sha256=_closed_sha256(
+            checkpoint.get("source_fingerprint_sha256"),
+            "frozen champion source fingerprint",
+        ),
+        discovery_panel_plan_sha256=_closed_sha256(
+            checkpoint.get("discovery_panel_plan_sha256"),
+            "frozen champion discovery plan",
+        ),
+        candidate_identity=MappingProxyType(dict(identity)),
+        candidate_identity_sha256=identity_sha256,
+        cumulative_diff=cumulative_diff,
+        policy_sources=policy_sources,
+        champion=MappingProxyType(dict(champion)),
+    )
 
 
 def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
