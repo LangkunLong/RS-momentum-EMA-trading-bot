@@ -8,7 +8,7 @@ the stricter bundle used by ``pit-canslim`` and ``leader-basket`` modes.
 The bundle is a SQLite database with four required tables:
 
 ``dataset_metadata(key TEXT PRIMARY KEY, value TEXT)``
-    Must contain ``schema_version=1`` and a non-empty ``data_cutoff``.
+    Current bundles contain ``schema_version=2`` and a non-empty ``data_cutoff``.
 ``membership(effective_date TEXT, ticker TEXT, member INTEGER)``
     Dated index membership transitions.  ``member`` is 0 or 1.
 ``price(trade_date TEXT, ticker TEXT, open REAL, high REAL, low REAL,
@@ -42,9 +42,15 @@ from typing import Any, Iterable, Mapping
 import pandas as pd
 
 from core.leader_evaluation import PointInTimeUniverse
-from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
+from core.pit_provenance import (
+    PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
+    PIT_PUBLIC_DATES_ATTR,
+    pit_canonical_json,
+    pit_canonical_json_sha256,
+)
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_SECURITY_LINEAGE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 _REQUIRED_TABLES = {"dataset_metadata", "membership", "price", "fundamentals"}
 _REQUIRED_PRICE_COLUMNS = {
     "trade_date",
@@ -109,6 +115,11 @@ _REQUIRED_METADATA = {
     "fundamentals_submissions_archive_sha256",
     "fundamentals_companyfacts_archive_sha256",
     "fundamentals_identity_manifest_csv_sha256",
+}
+_REQUIRED_V2_METADATA = {
+    "non_tradable_reference_symbols_json",
+    "non_tradable_reference_symbols_sha256",
+    "source_universe",
 }
 _SAME_ISSUER_CONTINUITIES = {
     "same_issuer_rename",
@@ -250,11 +261,6 @@ def _canonical_ticker(value: object) -> str:
     return ticker
 
 
-def _canonical_json_sha256(value: object) -> str:
-    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
 def _json_file(path: str | Path) -> tuple[Path, Mapping[str, object]]:
     candidate = Path(path)
     if not candidate.is_file() or candidate.is_symlink():
@@ -322,7 +328,21 @@ class PITDataBundle:
             self._validate_schema()
             self.metadata = self._load_metadata()
             self.membership = self._load_membership()
-            self._symbols = self._load_symbols()
+            self._tradable_symbols = frozenset(
+                event.ticker for event in self.membership.events
+            )
+            self._reference_symbols = frozenset(
+                PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+                if self.metadata["schema_version"] == "2"
+                else ("SPY",)
+            )
+            self._price_symbols = self._load_symbols()
+            self._symbols = (
+                self._price_symbols
+                if self.metadata["schema_version"] == "2"
+                else self._price_symbols.union(self._tradable_symbols)
+            )
+            self._security_lineage_ids: Mapping[str, str] | None = None
             self._validate_integrity()
             self._fundamentals_provider_cache: dict[str, _FundamentalsProviderState] = {}
         except Exception:
@@ -373,13 +393,31 @@ class PITDataBundle:
     def _load_metadata(self) -> dict[str, str]:
         rows = self._connection.execute("SELECT key, value FROM dataset_metadata").fetchall()
         metadata = {str(row[0]): str(row[1]) for row in rows}
-        if metadata.get("schema_version") != "1":
-            raise ValueError("point-in-time bundle schema_version must be 1")
-        missing = _REQUIRED_METADATA.difference(metadata)
+        schema_version = metadata.get("schema_version")
+        if schema_version not in {"1", "2"}:
+            raise ValueError("point-in-time bundle schema_version must be 1 or 2")
+        required = _REQUIRED_METADATA.union(
+            _REQUIRED_V2_METADATA if schema_version == "2" else ()
+        )
+        missing = required.difference(metadata)
         if missing:
             raise ValueError(f"point-in-time bundle metadata is incomplete: {sorted(missing)}")
-        if metadata.get("bundle_kind") != "canslim_pit_v1":
+        expected_kind = "canslim_pit_v2" if schema_version == "2" else "canslim_pit_v1"
+        if metadata.get("bundle_kind") != expected_kind:
             raise ValueError("point-in-time bundle kind is invalid")
+        if schema_version == "2":
+            reference_values = list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+            if (
+                metadata["non_tradable_reference_symbols_json"]
+                != pit_canonical_json(reference_values)
+                or metadata["non_tradable_reference_symbols_sha256"]
+                != pit_canonical_json_sha256(reference_values)
+            ):
+                raise ValueError(
+                    "point-in-time bundle reference-symbol metadata is invalid"
+                )
+            if metadata["source_universe"] != "sp500":
+                raise ValueError("point-in-time bundle source universe is invalid")
         cutoff = metadata.get("data_cutoff", "").strip()
         if not cutoff:
             raise ValueError("point-in-time bundle data_cutoff is required")
@@ -420,9 +458,7 @@ class PITDataBundle:
 
     def _load_symbols(self) -> frozenset[str]:
         prices = self._connection.execute("SELECT DISTINCT ticker FROM price").fetchall()
-        symbols = {_canonical_ticker(row[0]) for row in prices}
-        symbols.update(event.ticker for event in self.membership.events)
-        return frozenset(symbols)
+        return frozenset(_canonical_ticker(row[0]) for row in prices)
 
     def _validate_integrity(self) -> None:
         duplicate_membership = self._connection.execute(
@@ -456,14 +492,55 @@ class PITDataBundle:
         ).fetchone()
         if nonmember_fundamental:
             raise ValueError("point-in-time bundle contains fundamentals outside membership")
-        spy_membership = self._connection.execute(
-            "SELECT 1 FROM membership WHERE ticker='SPY' LIMIT 1"
-        ).fetchone()
-        spy_price = self._connection.execute(
-            "SELECT 1 FROM price WHERE ticker='SPY' LIMIT 1"
-        ).fetchone()
-        if spy_membership or not spy_price:
-            raise ValueError("point-in-time bundle SPY membership/price invariant failed")
+        if self.metadata["schema_version"] == "2":
+            fundamental_symbols = {
+                _canonical_ticker(row[0])
+                for row in self._connection.execute(
+                    "SELECT DISTINCT ticker FROM fundamentals"
+                ).fetchall()
+            }
+            if self._reference_symbols.intersection(self._tradable_symbols):
+                raise ValueError(
+                    "point-in-time bundle references must not appear in membership"
+                )
+            if self._reference_symbols.intersection(fundamental_symbols):
+                raise ValueError(
+                    "point-in-time bundle references must not appear in fundamentals"
+                )
+            if not self._reference_symbols.issubset(self._price_symbols):
+                raise ValueError(
+                    "point-in-time bundle prices do not contain every market reference"
+                )
+            outside_prices = self._price_symbols.difference(
+                self._tradable_symbols.union(self._reference_symbols)
+            )
+            if outside_prices:
+                raise ValueError(
+                    "point-in-time bundle prices contain symbols outside tradables and references"
+                )
+            reference_calendars = {
+                reference: tuple(
+                    str(row[0])
+                    for row in self._connection.execute(
+                        "SELECT trade_date FROM price WHERE ticker=? ORDER BY trade_date",
+                        (reference,),
+                    ).fetchall()
+                )
+                for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+            }
+            if len(set(reference_calendars.values())) != 1:
+                raise ValueError(
+                    "point-in-time bundle market-reference calendars are not identical"
+                )
+        else:
+            spy_membership = self._connection.execute(
+                "SELECT 1 FROM membership WHERE ticker='SPY' LIMIT 1"
+            ).fetchone()
+            spy_price = self._connection.execute(
+                "SELECT 1 FROM price WHERE ticker='SPY' LIMIT 1"
+            ).fetchone()
+            if spy_membership or not spy_price:
+                raise ValueError("point-in-time bundle SPY membership/price invariant failed")
         first_price = self._connection.execute("SELECT MIN(trade_date) FROM price").fetchone()[0]
         if first_price is None:
             raise ValueError("point-in-time bundle has no prices")
@@ -490,7 +567,47 @@ class PITDataBundle:
         return pd.Timestamp(self.metadata["data_cutoff"])
 
     def symbols(self) -> tuple[str, ...]:
-        return tuple(sorted(self._symbols))
+        """Compatibility alias for :meth:`price_symbols`."""
+
+        if self.metadata["schema_version"] == "1":
+            return tuple(sorted(self._symbols))
+        return self.price_symbols()
+
+    def tradable_symbols(self) -> tuple[str, ...]:
+        """Return immutable membership identities eligible for trading."""
+
+        return tuple(sorted(self._tradable_symbols))
+
+    def reference_symbols(self) -> tuple[str, ...]:
+        """Return immutable non-tradable market-reference identities."""
+
+        return tuple(
+            reference
+            for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+            if reference in self._reference_symbols
+        )
+
+    def price_symbols(self) -> tuple[str, ...]:
+        """Return identities with at least one price row in the bundle."""
+
+        return tuple(sorted(self._price_symbols))
+
+    def security_lineage_id(self, ticker: str) -> str:
+        """Return a tradable's authenticated price-identity chain identifier."""
+
+        symbol = _canonical_ticker(ticker)
+        if symbol not in self._tradable_symbols:
+            raise ValueError("security lineage is available only for tradable symbols")
+        if self._security_lineage_ids is None:
+            raise ValueError("security lineages require authenticated prices provenance")
+        return self._security_lineage_ids[symbol]
+
+    def security_lineage_ids(self) -> Mapping[str, str]:
+        """Return every authenticated tradable-to-lineage binding immutably."""
+
+        if self._security_lineage_ids is None:
+            raise ValueError("security lineages require authenticated prices provenance")
+        return self._security_lineage_ids
 
     def load_price_identity_transition_contract(
         self,
@@ -504,7 +621,7 @@ class PITDataBundle:
         raw_contracts = provenance.get("price_identity_request_contracts")
         if not isinstance(raw_contracts, dict) or not raw_contracts:
             raise ValueError("prices provenance has no identity request contract")
-        contract_sha = _canonical_json_sha256(raw_contracts)
+        contract_sha = pit_canonical_json_sha256(raw_contracts)
         if contract_sha != self.metadata["price_identity_request_contracts_sha256"]:
             raise ValueError("price identity request contract digest does not match the bundle")
         if provenance.get("price_identity_request_contracts_sha256") != contract_sha:
@@ -529,14 +646,21 @@ class PITDataBundle:
             start = date.fromisoformat(str(raw_identity["admitted_start"]))
             end = date.fromisoformat(str(raw_identity["admitted_end"]))
             date.fromisoformat(str(raw_identity["identity_asof"]))
-            if end < start or not isinstance(raw_identity["chain_id"], str):
+            if (
+                end < start
+                or not isinstance(raw_identity["chain_id"], str)
+                or _SECURITY_LINEAGE_ID_RE.fullmatch(raw_identity["chain_id"])
+                is None
+            ):
                 raise ValueError("prices provenance identity bounds are invalid")
             if not isinstance(raw_identity["continuity_kind"], str):
                 raise ValueError("prices provenance continuity kind is invalid")
             identities[ticker] = MappingProxyType(dict(raw_identity))
-        required_identities = {event.ticker for event in self.membership.events}.union({"SPY"})
+        required_identities = self._tradable_symbols.union(self._reference_symbols)
         if set(identities) != required_identities:
-            raise ValueError("prices provenance identities do not exactly cover membership plus SPY")
+            raise ValueError(
+                "prices provenance identities do not exactly cover tradables plus references"
+            )
 
         events_by_date: dict[date, dict[bool, list[str]]] = {}
         for event in self.membership.events:
@@ -571,12 +695,19 @@ class PITDataBundle:
                             str(identities[successors[0]]["continuity_kind"]),
                         )
                     )
-        return PriceIdentityTransitionContract(
+        contract = PriceIdentityTransitionContract(
             provenance_sha,
             contract_sha,
             identities,
             tuple(transitions),
         )
+        self._security_lineage_ids = MappingProxyType(
+            {
+                ticker: str(contract.identities[ticker]["chain_id"])
+                for ticker in sorted(self._tradable_symbols)
+            }
+        )
+        return contract
 
     def manifest(self) -> dict[str, object]:
         """Return content-free identity and coverage facts for audit logs."""
@@ -598,7 +729,44 @@ class PITDataBundle:
             ).fetchall()
         ]
         membership_counts = [len(self.membership.members_at(day)) for day in spy_days]
-        return {
+        reference_coverage = {
+            reference: {
+                "first_date": coverage[0],
+                "last_date": coverage[1],
+                "session_count": int(coverage[2]),
+            }
+            for reference in self.reference_symbols()
+            for coverage in (
+                self._connection.execute(
+                    "SELECT MIN(trade_date), MAX(trade_date), COUNT(*) "
+                    "FROM price WHERE ticker=?",
+                    (reference,),
+                ).fetchone(),
+            )
+        }
+        coverage_manifest: dict[str, object] = {
+            "price": {
+                "first_date": price_coverage[0],
+                "last_date": price_coverage[1],
+                "rows": int(price_coverage[2]),
+                "symbols": int(price_coverage[3]),
+            },
+            "fundamentals": {
+                "first_public_date": fundamental_coverage[0],
+                "last_public_date": fundamental_coverage[1],
+                "rows": int(fundamental_coverage[2]),
+                "symbols": int(fundamental_coverage[3]),
+            },
+            "membership": {
+                "first_effective_date": membership_coverage[0],
+                "last_effective_date": membership_coverage[1],
+                "events": int(membership_coverage[2]),
+                "symbols": int(membership_coverage[3]),
+                "evaluation_session_min_members": min(membership_counts),
+                "evaluation_session_max_members": max(membership_counts),
+            },
+        }
+        manifest: dict[str, object] = {
             "bundle_sha256": self.sha256,
             "schema_version": self.metadata["schema_version"],
             "data_cutoff": str(self.data_cutoff.date()),
@@ -607,29 +775,14 @@ class PITDataBundle:
             "membership_events": len(self.membership.events),
             "symbol_count": len(self._symbols),
             "metadata": dict(sorted(self.metadata.items())),
-            "coverage": {
-                "price": {
-                    "first_date": price_coverage[0],
-                    "last_date": price_coverage[1],
-                    "rows": int(price_coverage[2]),
-                    "symbols": int(price_coverage[3]),
-                },
-                "fundamentals": {
-                    "first_public_date": fundamental_coverage[0],
-                    "last_public_date": fundamental_coverage[1],
-                    "rows": int(fundamental_coverage[2]),
-                    "symbols": int(fundamental_coverage[3]),
-                },
-                "membership": {
-                    "first_effective_date": membership_coverage[0],
-                    "last_effective_date": membership_coverage[1],
-                    "events": int(membership_coverage[2]),
-                    "symbols": int(membership_coverage[3]),
-                    "evaluation_session_min_members": min(membership_counts),
-                    "evaluation_session_max_members": max(membership_counts),
-                },
-            },
+            "coverage": coverage_manifest,
         }
+        if self.metadata["schema_version"] == "2":
+            manifest["non_tradable_reference_symbols"] = list(
+                self.reference_symbols()
+            )
+            coverage_manifest["references"] = reference_coverage
+        return manifest
 
     def members_at(self, when: str | datetime | pd.Timestamp) -> frozenset[str]:
         if isinstance(when, datetime):

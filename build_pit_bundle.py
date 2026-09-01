@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from core.pit_data import PITDataBundle, sha256_file
+from core.pit_provenance import (
+    PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
+    pit_canonical_json,
+    pit_canonical_json_sha256,
+)
 
 _MEMBERSHIP_COLUMNS = ("effective_date", "ticker", "member")
 _PRICE_COLUMNS = ("trade_date", "ticker", "open", "high", "low", "close", "volume")
@@ -109,11 +114,6 @@ def _json_input(path: str | Path) -> tuple[Path, Mapping[str, object]]:
     if not isinstance(value, dict):
         raise ValueError("provenance JSON must contain an object")
     return resolved, value
-
-
-def _canonical_json_sha256(value: object) -> str:
-    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _load_membership(path: Path, cutoff: str) -> list[tuple[str, str, int]]:
@@ -248,9 +248,17 @@ def _provenance_metadata(
     contracts = prices_provenance.get("price_identity_request_contracts")
     if not isinstance(contracts, dict) or not contracts:
         raise ValueError("prices provenance has no price identity request contracts")
-    contract_sha = _canonical_json_sha256(contracts)
+    contract_sha = pit_canonical_json_sha256(contracts)
     if prices_provenance.get("price_identity_request_contracts_sha256") != contract_sha:
         raise ValueError("prices provenance identity contract digest is invalid")
+    reference_values = list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+    if (
+        prices_provenance.get("non_tradable_reference_symbols_json")
+        != pit_canonical_json(reference_values)
+        or prices_provenance.get("non_tradable_reference_symbols_sha256")
+        != pit_canonical_json_sha256(reference_values)
+    ):
+        raise ValueError("prices provenance reference-symbol contract is invalid")
     raw_exclusions = prices_provenance.get("symbols_with_no_prices")
     if not isinstance(raw_exclusions, list):
         raise ValueError("prices provenance price exclusions must be a list")
@@ -282,8 +290,15 @@ def _provenance_metadata(
         "price_identity_request_contracts_sha256": contract_sha,
         "spy_trading_days_sha256": spy_days_sha,
         "price_exclusion_count": str(len(exclusions)),
-        "price_exclusions_sha256": _canonical_json_sha256(sorted(exclusions)),
+        "price_exclusions_sha256": pit_canonical_json_sha256(sorted(exclusions)),
         "fundamentals_source_kind": required_text(fundamentals_provenance, "source"),
+        "non_tradable_reference_symbols_json": pit_canonical_json(
+            list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+        ),
+        "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(
+            list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+        ),
+        "source_universe": "sp500",
     }
     if metadata["fundamentals_source_kind"] != "SEC EDGAR official bulk archives":
         raise ValueError("fundamentals provenance source is not the approved SEC bulk archive source")
@@ -308,6 +323,7 @@ def _integrity_gate(
     membership_symbols = {row[1] for row in membership}
     price_symbols = {row[1] for row in prices}
     fundamental_symbols = {row[0] for row in fundamentals}
+    reference_symbols = set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
     missing_prices = membership_symbols.difference(price_symbols, price_exclusions)
     if missing_prices:
         raise ValueError(f"membership tickers lack prices or explicit exclusion: {sorted(missing_prices)}")
@@ -316,10 +332,21 @@ def _integrity_gate(
     outside = fundamental_symbols.difference(membership_symbols)
     if outside:
         raise ValueError(f"fundamental tickers are outside membership: {sorted(outside)}")
-    if "SPY" not in price_symbols or "SPY" in membership_symbols:
-        raise ValueError("SPY must exist in prices and not in membership")
-    if not price_symbols.issubset(membership_symbols.union({"SPY"})):
-        raise ValueError("prices contain symbols outside membership plus SPY")
+    if reference_symbols.intersection(membership_symbols):
+        raise ValueError("market references must not exist in membership")
+    if reference_symbols.intersection(fundamental_symbols):
+        raise ValueError("market references must not exist in fundamentals")
+    if not reference_symbols.issubset(price_symbols):
+        raise ValueError("IWM, QQQ, and SPY must all exist in prices")
+    if not price_symbols.issubset(membership_symbols.union(reference_symbols)):
+        raise ValueError("prices contain symbols outside membership plus references")
+    raw_contracts = prices_provenance.get("price_identity_request_contracts")
+    if not isinstance(raw_contracts, dict) or {
+        _ticker(value) for value in raw_contracts
+    } != membership_symbols.union(reference_symbols):
+        raise ValueError(
+            "price identity request contracts do not exactly cover membership plus references"
+        )
     first_price = date.fromisoformat(min(row[0] for row in prices))
     if first_price < warmup_date or first_price > date(2020, 1, 2):
         raise ValueError("earliest price must be within warmup start through 2020-01-02")
@@ -329,17 +356,36 @@ def _integrity_gate(
     events: dict[str, list[tuple[str, int]]] = {}
     for effective, ticker, member in membership:
         events.setdefault(effective, []).append((ticker, member))
-    all_spy_days = sorted({row[0] for row in prices if row[1] == "SPY"})
-    if not all_spy_days:
-        raise ValueError("no evaluation-period SPY sessions")
+    reference_days = {
+        reference: sorted({row[0] for row in prices if row[1] == reference})
+        for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+    }
+    if any(not days for days in reference_days.values()):
+        raise ValueError("market-reference price calendars must be non-empty")
+    if len({tuple(days) for days in reference_days.values()}) != 1:
+        raise ValueError("IWM, QQQ, and SPY trading-session calendars must be identical")
+    all_spy_days = reference_days["SPY"]
     if all_spy_days[0] != "2020-01-02" or all_spy_days[-1] != cutoff:
-        raise ValueError("SPY calendar does not cover the exact five-year baseline")
+        raise ValueError("market-reference calendar does not cover the exact five-year baseline")
     spy_payload = ("trade_date\n" + "\n".join(all_spy_days) + "\n").encode()
     spy_digest = hashlib.sha256(spy_payload).hexdigest()
     if prices_provenance.get("spy_trading_days_sha256") != spy_digest:
         raise ValueError("recomputed SPY calendar digest does not match prices provenance")
     if prices_provenance.get("spy_first_date") != all_spy_days[0] or prices_provenance.get("spy_last_date") != all_spy_days[-1]:
         raise ValueError("prices provenance SPY date range is inconsistent")
+    expected_reference_coverage = {
+        reference: {
+            "first_date": days[0],
+            "last_date": days[-1],
+            "session_count": len(days),
+        }
+        for reference, days in reference_days.items()
+    }
+    if (
+        prices_provenance.get("reference_symbol_coverage")
+        != expected_reference_coverage
+    ):
+        raise ValueError("prices provenance market-reference coverage is inconsistent")
     if _int(prices_provenance.get("price_row_count"), field="price_row_count", allow_blank=False) != len(prices):
         raise ValueError("prices provenance row count is inconsistent")
     if _int(membership_provenance.get("event_count"), field="event_count", allow_blank=False) != len(membership):
@@ -491,7 +537,7 @@ def main() -> int:
         raise ValueError("an input changed while the bundle was being built")
 
     metadata = {
-        "bundle_kind": "canslim_pit_v1", "schema_version": "1", "data_cutoff": cutoff,
+        "bundle_kind": "canslim_pit_v2", "schema_version": "2", "data_cutoff": cutoff,
         "evaluation_start": evaluation_start, "warmup_start": warmup_start,
         **provenance_metadata,
     }

@@ -78,6 +78,25 @@ def test_price_identity_manifest_accepts_only_reviewed_class_share_provider_form
 
     assert manifest.identities["BF-B"].provider_symbol == "BF.B"
     assert manifest.identities["BRK-B"].provider_symbol == "BRK.B"
+    completed = exporter._complete_price_identities(
+        membership, manifest, date(2025, 12, 31)
+    )
+    assert tuple(completed) == ("BF-B", "BRK-B", "IWM", "PSKY", "QQQ", "SPY")
+    assert {
+        reference: completed[reference].chain_id for reference in ("IWM", "QQQ", "SPY")
+    } == {"IWM": "unmapped_iwm", "QQQ": "unmapped_qqq", "SPY": "unmapped_spy"}
+    request = tmp_path / "request.json"
+    exporter._canonical_request(
+        request, membership, date(2020, 1, 1), date(2025, 12, 31)
+    )
+    assert exporter.json.loads(request.read_text(encoding="utf-8"))["tickers"] == [
+        "BF-B",
+        "BRK-B",
+        "IWM",
+        "PSKY",
+        "QQQ",
+        "SPY",
+    ]
 
 
 def test_price_identity_manifest_rejects_unreviewed_provider_symbol_mismatch(
