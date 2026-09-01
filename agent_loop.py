@@ -7948,7 +7948,6 @@ class PolicyWorkerSession:
         self._stdout_values: queue.Queue[bytes | BaseException | None] = queue.Queue()
         self._stderr = bytearray()
         self._stderr_sha256 = hashlib.sha256()
-        self._stdout_bytes = 0
         self._stderr_bytes = 0
         self._output_limit_exceeded = threading.Event()
         self._stdout_thread = threading.Thread(
@@ -8056,18 +8055,12 @@ class PolicyWorkerSession:
                 if not raw:
                     self._stdout_values.put(None)
                     return
-                self._stdout_bytes += len(raw)
-                if (
-                    self._output_limit_bytes is not None
-                    and self._stdout_bytes > self._output_limit_bytes
-                ):
-                    self._output_limit_exceeded.set()
-                    self._stdout_values.put(
-                        PolicyWorkerOperationalFailure(
-                            "policy worker stdout output limit exceeded"
-                        )
-                    )
-                    return
+                # A panel legitimately emits one authenticated response for every
+                # policy decision.  Bounding their cumulative bytes makes the
+                # allowable panel size depend on response verbosity and rejects
+                # ordinary multi-year discovery runs.  Each response remains
+                # independently capped below and is consumed synchronously by
+                # ``call``; stderr retains the cumulative runaway-output limit.
                 self._stdout_values.put(raw)
         except BaseException as exc:
             self._stdout_values.put(exc)
