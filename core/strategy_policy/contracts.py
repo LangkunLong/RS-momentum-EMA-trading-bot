@@ -199,14 +199,32 @@ class MarketContextV1(_CanonicalContract):
         ):
             _unit_fraction(getattr(self, name), name)
         _number(self.median_rs_score, "median_rs_score")
-        for name in (
+        covered_counts: dict[str, int] = {}
+        for coverage_name in (
             "breadth_50_coverage_fraction",
             "breadth_200_coverage_fraction",
             "rs_coverage_fraction",
         ):
-            covered = float(getattr(self, name)) * self.active_constituent_count
+            covered = float(getattr(self, coverage_name)) * self.active_constituent_count
             if not math.isclose(covered, round(covered), abs_tol=1e-9):
-                _fail(name)
+                _fail(coverage_name)
+            covered_counts[coverage_name] = round(covered)
+        for coverage_name, fraction_name in (
+            ("breadth_50_coverage_fraction", "breadth_above_50_fraction"),
+            ("breadth_200_coverage_fraction", "breadth_above_200_fraction"),
+            ("rs_coverage_fraction", "rs_at_least_80_fraction"),
+        ):
+            covered_count = covered_counts[coverage_name]
+            fraction = float(getattr(self, fraction_name))
+            numerator = fraction * covered_count
+            if (
+                (covered_count == 0 and fraction != 0.0)
+                or not math.isclose(numerator, round(numerator), abs_tol=1e-9)
+                or not 0 <= round(numerator) <= covered_count
+            ):
+                _fail(fraction_name)
+        if covered_counts["rs_coverage_fraction"] == 0 and self.median_rs_score != 0.0:
+            _fail("median_rs_score")
 
 
 @dataclass(frozen=True, slots=True)

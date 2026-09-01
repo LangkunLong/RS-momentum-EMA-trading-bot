@@ -492,6 +492,10 @@ def test_contract_collections_must_be_tuples(factory, field: str, value: object)
     [
         (_market_context, "oneil_regime", "moonshot"),
         (_market_context, "benchmarks", tuple(reversed(_market_context().benchmarks))),
+        (_market_context, "breadth_50_coverage_fraction", 0.905),
+        (_market_context, "breadth_above_50_fraction", 0.605),
+        (_market_context, "breadth_above_200_fraction", 0.551),
+        (_market_context, "rs_at_least_80_fraction", 0.405),
         (_entry_snapshot, "canslim_score", math.nan),
         (_entry_snapshot, "rs_score", math.inf),
         (_capacity_snapshot, "cash_fraction", True),
@@ -516,10 +520,25 @@ def test_closed_deserializer_rejects_unknown_keys_and_transport_types() -> None:
             _entry_snapshot(c_score=hidden)
     zero = _market_context(
         breadth_above_50_fraction=0.0,
+        breadth_50_coverage_fraction=0.0,
         breadth_above_200_fraction=0.0,
+        breadth_200_coverage_fraction=0.0,
+        median_rs_score=0.0,
         rs_at_least_80_fraction=0.0,
+        rs_coverage_fraction=0.0,
     )
     assert zero.breadth_above_50_fraction == 0.0
+    with pytest.raises(ValueError):
+        _market_context(
+            breadth_50_coverage_fraction=0.0,
+            breadth_above_50_fraction=0.01,
+        )
+    with pytest.raises(ValueError, match="median_rs_score"):
+        _market_context(
+            rs_coverage_fraction=0.0,
+            rs_at_least_80_fraction=0.0,
+            median_rs_score=1.0,
+        )
 
 
 def test_contracts_reject_oversized_tuples_and_candidate_fill_prices() -> None:
@@ -570,10 +589,30 @@ def test_entry_technical_only_bypasses_fundamentals_and_institutional_unavailabi
 
 
 def test_entry_stateful_regime_gate_blocks_only_when_enabled() -> None:
-    """Break caught: a disabled regime gate could still suppress valid entries."""
-    enabled = evaluate_entry(_entry_snapshot(use_stateful_regime_gate=True, regime_allows_entries=False))
-    disabled = evaluate_entry(_entry_snapshot(use_stateful_regime_gate=False, regime_allows_entries=False))
-    assert enabled.market_permitted is False
+    """Break caught: the gate could ignore nested regime authority or run while disabled."""
+    correction = evaluate_entry(
+        _entry_snapshot(
+            market=_market_context(oneil_regime="correction"),
+            use_stateful_regime_gate=True,
+            regime_allows_entries=True,
+        )
+    )
+    pressure = evaluate_entry(
+        _entry_snapshot(
+            market=_market_context(oneil_regime="under_pressure"),
+            use_stateful_regime_gate=True,
+            regime_allows_entries=False,
+        )
+    )
+    disabled = evaluate_entry(
+        _entry_snapshot(
+            market=_market_context(oneil_regime="correction"),
+            use_stateful_regime_gate=False,
+            regime_allows_entries=False,
+        )
+    )
+    assert correction.market_permitted is False
+    assert pressure.market_permitted is True
     assert disabled.market_permitted is True
 
 

@@ -25,9 +25,10 @@ def evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision:
         ):
             if code is not None:
                 blocking_codes.append(code)
+    regime_allows_entries = snapshot.market.oneil_regime != "correction"
     market_permitted = (
         (not snapshot.require_bullish_market or snapshot.market_is_bullish or snapshot.cash_deployment_override)
-        and (not snapshot.use_stateful_regime_gate or snapshot.regime_allows_entries)
+        and (not snapshot.use_stateful_regime_gate or regime_allows_entries)
     )
     return EntryDecision(
         qualified=not blocking_codes,
