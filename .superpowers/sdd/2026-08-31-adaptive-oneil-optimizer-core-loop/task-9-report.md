@@ -40,3 +40,17 @@ and its authenticated ledger head while allowing unrelated later retirements.
 Verification: compileall and Ruff passed for `agent_loop.py`,
 `core/pit_optimization.py`, and `core/pit_optimizer_controller.py`. No provider
 or Docker call was made.
+
+## Provider-free qualification core
+
+Added the injected one-use qualification runner. It authenticates the identity
+against the exact qualification plan, durably reserves and retires the panel
+before the first evaluator callback, evaluates baseline and candidate on the
+same panel, derives the existing strict annualized-return decision, and records
+either the completed decision or a closed evaluation-failure outcome in a
+`finally` path. Cleanup is also guaranteed. The result reports authenticated
+coverage and can set `full_replay_ready` only for a qualified result over the
+exact approved S&P 500/Nasdaq-100/Russell 2000 union; replay is always unstarted.
+
+Verification: compileall and Ruff passed for
+`core/pit_optimizer_holdout.py`. No provider, replay, or Docker call was made.

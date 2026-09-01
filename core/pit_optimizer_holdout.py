@@ -12,12 +12,160 @@ import stat
 from typing import Callable, Mapping
 
 from core.pit_optimizer_artifacts import atomic_replace_json, canonical_json_bytes
+from core.pit_optimizer_evaluation import (
+    EvaluationPanelSpec,
+    PanelAggregateSummary,
+    QualificationDecision,
+    QualificationOutcomeProof,
+    QualificationPanelIdentity,
+    QualificationPanelPlan,
+    QualificationReservation,
+    QualificationRetirementLedger,
+)
 
 
 _ACTIVE_STATES = frozenset({"preflight", "baseline_replay", "candidate_replay", "finalizing"})
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 _ALL_STATES = _ACTIVE_STATES | _TERMINAL_STATES
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_APPROVED_FULL_REPLAY_COVERAGE = frozenset(
+    {"sp500", "nasdaq100", "russell2000"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationRunResult:
+    """Provider-free terminal facts from one permanently retired panel."""
+
+    decision: QualificationDecision
+    reservation: QualificationReservation
+    outcome: QualificationOutcomeProof
+    coverage_scope: frozenset[str]
+    full_replay_ready: bool
+    full_replay_started: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.decision, QualificationDecision)
+            or not isinstance(self.reservation, QualificationReservation)
+            or not isinstance(self.outcome, QualificationOutcomeProof)
+            or not isinstance(self.coverage_scope, frozenset)
+            or not self.coverage_scope
+            or not self.coverage_scope.issubset(_APPROVED_FULL_REPLAY_COVERAGE)
+            or type(self.full_replay_ready) is not bool
+            or self.full_replay_started is not False
+            or self.outcome.reservation_record_sha256
+            != self.reservation.reservation_record_sha256
+            or self.outcome.completed is not True
+            or self.outcome.decision_sha256 is None
+            or self.outcome.qualified is not self.decision.qualified
+            or self.full_replay_ready
+            is not (
+                self.decision.qualified
+                and self.coverage_scope == _APPROVED_FULL_REPLAY_COVERAGE
+            )
+        ):
+            raise ValueError("qualification run result is invalid")
+
+
+def qualification_coverage_scope(
+    plan: QualificationPanelPlan,
+) -> frozenset[str]:
+    """Return authenticated eligible-universe affiliations bound by the plan."""
+
+    if not isinstance(plan, QualificationPanelPlan):
+        raise ValueError("qualification coverage requires a closed plan")
+    scope = frozenset(
+        affiliation
+        for allocation in plan.stratum_allocations
+        if allocation.eligible_count > 0
+        for affiliation in allocation.source_affiliations
+    )
+    if not scope or not scope.issubset(_APPROVED_FULL_REPLAY_COVERAGE):
+        raise ValueError("qualification coverage scope is invalid")
+    return scope
+
+
+def run_one_use_qualification(
+    *,
+    plan: QualificationPanelPlan,
+    identity: QualificationPanelIdentity,
+    candidate_identity_sha256: str,
+    ledger: QualificationRetirementLedger,
+    evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
+    evaluate_candidate: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
+    cleanup: Callable[[], None],
+) -> QualificationRunResult:
+    """Retire, evaluate, decide, and close one qualification without a provider."""
+
+    if (
+        not isinstance(plan, QualificationPanelPlan)
+        or not isinstance(identity, QualificationPanelIdentity)
+        or not isinstance(ledger, QualificationRetirementLedger)
+        or _SHA256_RE.fullmatch(candidate_identity_sha256 or "") is None
+        or not callable(evaluate_baseline)
+        or not callable(evaluate_candidate)
+        or not callable(cleanup)
+    ):
+        raise ValueError("qualification run inputs are invalid")
+    expected_identity = QualificationPanelIdentity.from_plan(
+        plan,
+        warmup_contract_sha256=identity.warmup_contract_sha256,
+        engine_policy_sha256=identity.engine_policy_sha256,
+    )
+    if expected_identity != identity:
+        raise ValueError("qualification identity differs from the sealed plan")
+
+    reservation: QualificationReservation | None = None
+    attempted = False
+    decision: QualificationDecision | None = None
+    outcome: QualificationOutcomeProof | None = None
+    try:
+        reservation = ledger.reserve_qualification(
+            identity,
+            candidate_identity_sha256=candidate_identity_sha256,
+        )
+        try:
+            attempted = True
+            baseline = evaluate_baseline(plan.qualification_panel)
+            candidate = evaluate_candidate(plan.qualification_panel)
+            decision = QualificationDecision.from_result(
+                candidate_evidence=candidate,
+                baseline_evidence=baseline,
+                qualification_panel=plan.qualification_panel,
+                target=plan.target,
+                evaluation_complete=True,
+                integrity_complete=True,
+            )
+        finally:
+            outcome = ledger.record_qualification_outcome(
+                reservation,
+                attempted=attempted,
+                completed=decision is not None,
+                terminal_code=(
+                    "qualification_completed"
+                    if decision is not None
+                    else "qualification_evaluation_failed"
+                ),
+                decision=decision,
+            )
+    finally:
+        cleanup()
+
+    if reservation is None or decision is None or outcome is None:
+        raise AssertionError("qualification terminal state was not produced")
+    coverage_scope = qualification_coverage_scope(plan)
+    return QualificationRunResult(
+        decision=decision,
+        reservation=reservation,
+        outcome=outcome,
+        coverage_scope=coverage_scope,
+        full_replay_ready=(
+            decision.qualified
+            and coverage_scope == _APPROVED_FULL_REPLAY_COVERAGE
+        ),
+        full_replay_started=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
