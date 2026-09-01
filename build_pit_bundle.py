@@ -324,11 +324,8 @@ def _integrity_gate(
     price_symbols = {row[1] for row in prices}
     fundamental_symbols = {row[0] for row in fundamentals}
     reference_symbols = set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
-    missing_prices = membership_symbols.difference(price_symbols, price_exclusions)
-    if missing_prices:
-        raise ValueError(f"membership tickers lack prices or explicit exclusion: {sorted(missing_prices)}")
-    if not price_exclusions.issubset(membership_symbols) or price_exclusions.intersection(price_symbols):
-        raise ValueError("price exclusions must be membership-only symbols without price rows")
+    if price_exclusions:
+        raise ValueError("price exclusions are not permitted in schema-v2 bundles")
     outside = fundamental_symbols.difference(membership_symbols)
     if outside:
         raise ValueError(f"fundamental tickers are outside membership: {sorted(outside)}")
@@ -336,10 +333,13 @@ def _integrity_gate(
         raise ValueError("market references must not exist in membership")
     if reference_symbols.intersection(fundamental_symbols):
         raise ValueError("market references must not exist in fundamentals")
-    if not reference_symbols.issubset(price_symbols):
-        raise ValueError("IWM, QQQ, and SPY must all exist in prices")
-    if not price_symbols.issubset(membership_symbols.union(reference_symbols)):
-        raise ValueError("prices contain symbols outside membership plus references")
+    required_price_symbols = membership_symbols.union(reference_symbols)
+    if price_symbols != required_price_symbols:
+        raise ValueError(
+            "price symbols must exactly equal membership plus references; "
+            f"missing={sorted(required_price_symbols - price_symbols)}, "
+            f"outside={sorted(price_symbols - required_price_symbols)}"
+        )
     raw_contracts = prices_provenance.get("price_identity_request_contracts")
     if not isinstance(raw_contracts, dict) or {
         _ticker(value) for value in raw_contracts

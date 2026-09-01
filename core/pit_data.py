@@ -507,16 +507,13 @@ class PITDataBundle:
                 raise ValueError(
                     "point-in-time bundle references must not appear in fundamentals"
                 )
-            if not self._reference_symbols.issubset(self._price_symbols):
-                raise ValueError(
-                    "point-in-time bundle prices do not contain every market reference"
-                )
-            outside_prices = self._price_symbols.difference(
-                self._tradable_symbols.union(self._reference_symbols)
+            required_price_symbols = self._tradable_symbols.union(
+                self._reference_symbols
             )
-            if outside_prices:
+            if self._price_symbols != required_price_symbols:
                 raise ValueError(
-                    "point-in-time bundle prices contain symbols outside tradables and references"
+                    "point-in-time bundle price symbols must exactly equal "
+                    "tradables plus references"
                 )
             reference_calendars = {
                 reference: tuple(

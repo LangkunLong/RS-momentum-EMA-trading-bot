@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import build_pit_bundle as bundle_builder
 import export_pit_prices as exporter
 from core.pit_data import PITDataBundle
 from core.pit_provenance import PIT_NON_TRADABLE_REFERENCE_SYMBOLS
@@ -126,8 +127,8 @@ def test_worker_price_export_rejects_duplicate_missing_spy_and_partial_member_co
         exporter._validate_prices(path, _membership(), pd.Timestamp("2024-01-02").date(), pd.Timestamp("2024-01-05").date())
 
 
-def test_pit_price_reader_rejects_invalid_ohlc_rows() -> None:
-    """Break caught: an apparently positive bar let high fall below close."""
+def test_pit_price_reader_rejects_invalid_ohlc_rows_and_schema_v2_exclusions() -> None:
+    """Break caught: invalid bars or excluded v2 tradables weakened the price surface."""
     connection = sqlite3.connect(":memory:")
     try:
         connection.execute("CREATE TABLE price (trade_date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)")
@@ -137,3 +138,18 @@ def test_pit_price_reader_rejects_invalid_ohlc_rows() -> None:
             PITDataBundle._query_prices(bundle, ("AAPL",), pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-02"))
     finally:
         connection.close()
+    with pytest.raises(ValueError, match="price exclusions are not permitted"):
+        bundle_builder._integrity_gate(
+            cutoff="2025-12-31",
+            evaluation_start="2021-01-01",
+            warmup_start="2020-01-01",
+            membership=[("2021-01-01", "AAPL", 1)],
+            prices=[
+                ("2020-01-02", reference)
+                for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+            ],
+            fundamentals=[("AAPL",)],
+            price_exclusions={"AAPL"},
+            membership_provenance={},
+            prices_provenance={},
+        )
