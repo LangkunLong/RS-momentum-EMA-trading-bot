@@ -95,6 +95,15 @@ def run_one_use_qualification(
     evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
     evaluate_candidate: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
     cleanup: Callable[[], None],
+    record_reservation: Callable[
+        [QualificationPanelIdentity, QualificationReservation], None
+    ]
+    | None = None,
+    record_decision: Callable[[QualificationDecision], None] | None = None,
+    record_outcome: Callable[
+        [QualificationReservation, QualificationOutcomeProof], None
+    ]
+    | None = None,
 ) -> QualificationRunResult:
     """Retire, evaluate, decide, and close one qualification without a provider."""
 
@@ -106,6 +115,9 @@ def run_one_use_qualification(
         or not callable(evaluate_baseline)
         or not callable(evaluate_candidate)
         or not callable(cleanup)
+        or record_reservation is not None and not callable(record_reservation)
+        or record_decision is not None and not callable(record_decision)
+        or record_outcome is not None and not callable(record_outcome)
     ):
         raise ValueError("qualification run inputs are invalid")
     expected_identity = QualificationPanelIdentity.from_plan(
@@ -126,10 +138,12 @@ def run_one_use_qualification(
             candidate_identity_sha256=candidate_identity_sha256,
         )
         try:
+            if record_reservation is not None:
+                record_reservation(identity, reservation)
             attempted = True
             baseline = evaluate_baseline(plan.qualification_panel)
             candidate = evaluate_candidate(plan.qualification_panel)
-            decision = QualificationDecision.from_result(
+            candidate_decision = QualificationDecision.from_result(
                 candidate_evidence=candidate,
                 baseline_evidence=baseline,
                 qualification_panel=plan.qualification_panel,
@@ -137,6 +151,9 @@ def run_one_use_qualification(
                 evaluation_complete=True,
                 integrity_complete=True,
             )
+            if record_decision is not None:
+                record_decision(candidate_decision)
+            decision = candidate_decision
         finally:
             outcome = ledger.record_qualification_outcome(
                 reservation,
@@ -149,6 +166,8 @@ def run_one_use_qualification(
                 ),
                 decision=decision,
             )
+            if record_outcome is not None:
+                record_outcome(reservation, outcome)
     finally:
         cleanup()
 

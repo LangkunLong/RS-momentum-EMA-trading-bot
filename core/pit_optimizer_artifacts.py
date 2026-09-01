@@ -934,6 +934,12 @@ class IncrementalArtifactStore:
             "seed-branch-quick.json",
             "seed-branch-discovery.json",
             "holdout.json",
+            "qualification-identity.json",
+            "qualification-baseline.json",
+            "qualification-candidate.json",
+            "qualification-decision.json",
+            "qualification-outcome.json",
+            "cleanup.json",
             "summary.json",
         }
     )

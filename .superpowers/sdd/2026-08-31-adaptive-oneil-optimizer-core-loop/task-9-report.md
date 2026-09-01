@@ -54,3 +54,23 @@ exact approved S&P 500/Nasdaq-100/Russell 2000 union; replay is always unstarted
 
 Verification: compileall and Ruff passed for
 `core/pit_optimizer_holdout.py`. No provider, replay, or Docker call was made.
+
+## Provider-free qualification CLI
+
+Added early `preflight-qualification` and `execute-qualification` actions while
+leaving the legacy v3 parser intact. The v4 path authenticates the manifest,
+both panel plans, ledger ancestry and current retirements, frozen branch-free
+checkpoint champion and referenced artifacts, clean source identity, and a
+disposable reconstruction of the exact retained diff and policy sources.
+Execution evaluates the unchanged baseline and reconstructed candidate
+continuously on the exact qualification panel, persists identity/reservation,
+baseline, candidate, decision, terminal ledger outcome, cleanup, and a
+content-free summary, and never writes a role checkpoint. Summary replay
+readiness is forced false on abort or incomplete cleanup and replay is always
+reported unstarted.
+
+Verification: compileall and Ruff passed across all Task 9 production files.
+A focused injected S&P-only smoke proved reservation precedes evaluation,
+baseline and candidate use the same panel, the strict decision and terminal
+outcome are recorded, cleanup runs, and `full_replay_ready`/`started` remain
+false. No provider, replay, or Docker call was made.
