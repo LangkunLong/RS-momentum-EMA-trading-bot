@@ -1565,6 +1565,7 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
         selected_parent=v4_parent,
         max_total_bytes=len(_canonical_text(author_v4_payload).encode("utf-8")),
     )
+    assert dict(author_v4.replacement_sources) == replacement_sources
     author_input_v4.validate_artifact(author_v4)
     author_manifest_v4 = contract.AuthorManifestSummaryV4.from_artifact(
         author_v4,
@@ -9883,32 +9884,36 @@ def _task5_create_directory_link(target: Path, link: Path) -> None:
 def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
     tmp_path: Path,
 ) -> None:
-    """Break caught: author-declared scope could replace controller-derived identity."""
+    """Break caught: a partial author map could replace the atomic controller identity."""
     from core.pit_optimizer_candidate import (
-        PIT_OPTIMIZER_PATCH_BOUNDS,
-        validate_author_manifest,
-        validate_candidate_diff,
+        validate_candidate_sources,
     )
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
-    incremental = _task5_incremental_diff(
-        candidate_root,
-        "core/strategy_policy/entry.py",
+    replacement_sources = {
+        path: (candidate_root / path).read_text("utf-8") for path in _POLICY_PATHS
+    }
+    replacement_sources["core/strategy_policy/entry.py"] = replacement_sources[
+        "core/strategy_policy/entry.py"
+    ].replace(
         "return EntryDecision(True, True, (None, None), ())",
-        "return EntryDecision(snapshot.market_is_bullish, True, (None, None), ())",
+        "return EntryDecision(snapshot.market.oneil_regime == 'confirmed_uptrend', True, (None, None), ())",
+    ).replace(
+        "from .contracts import EntryDecision, EntrySnapshot",
+        "from .contracts import EntryDecision, EntrySnapshot, MarketContextV1",
     )
     source_commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
 
-    identity, cumulative_diff = validate_candidate_diff(
+    identity, cumulative_diff = validate_candidate_sources(
         authenticated_base_root=authenticated,
         candidate_root=candidate_root,
-        incremental_diff=incremental,
+        replacement_sources=replacement_sources,
         git=git,
-        bounds=PIT_OPTIMIZER_PATCH_BOUNDS,
         source_commit=source_commit,
-        policy_interface_version=1,
+        policy_interface_version=2,
         immutable_constraints_sha256="a" * 64,
-        discovery_manifest_sha256="b" * 64,
+        discovery_panel_plan_sha256="b" * 64,
+        parent_identity_sha256="c" * 64,
     )
 
     assert cumulative_diff == _task5_git(
@@ -9921,6 +9926,8 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
         *_POLICY_PATHS,
     )
     assert identity.source_commit == source_commit
+    assert identity.parent_identity_sha256 == "c" * 64
+    assert identity.discovery_panel_plan_sha256 == "b" * 64
     assert identity.cumulative_diff_sha256 == hashlib.sha256(
         cumulative_diff.encode("utf-8")
     ).hexdigest()
@@ -9932,26 +9939,10 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
         _POLICY_PATHS
     )
 
-    matching = contract.AuthorArtifact.from_json(
-        _canonical_text(
-            {
-                **_author_payload(),
-                "changed_paths": list(identity.changed_paths),
-                "changed_symbols": list(identity.changed_symbols),
-                "unified_diff": incremental,
-            }
-        ),
-        max_diff_bytes=64 * 1024,
-        max_total_bytes=72 * 1024,
-    )
-    validate_author_manifest(matching, identity)
-    mismatch = replace(
-        matching,
-        changed_paths=("core/strategy_policy/risk.py",),
-        changed_symbols=("core.strategy_policy.risk.recommend_capacity",),
-    )
-    with pytest.raises(ValueError, match="author_manifest_mismatch"):
-        validate_author_manifest(mismatch, identity)
+    assert dict(identity.editable_file_sha256s) == {
+        path: hashlib.sha256(source.encode("utf-8")).hexdigest()
+        for path, source in replacement_sources.items()
+    }
 
 
 def _task5_authenticated_identity(
@@ -10007,7 +9998,8 @@ def test_candidate_identity_rejects_direct_unsealed_construction() -> None:
             changed_paths=("core/strategy_policy/entry.py",),
             changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
             immutable_constraints_sha256="d" * 64,
-            discovery_manifest_sha256="e" * 64,
+            discovery_panel_plan_sha256="e" * 64,
+            parent_identity_sha256="f" * 64,
             identity_sha256="f" * 64,
         )
 
@@ -10027,7 +10019,8 @@ def test_candidate_identity_has_exact_public_nine_field_json_shape(
         "changed_paths",
         "changed_symbols",
         "immutable_constraints_sha256",
-        "discovery_manifest_sha256",
+        "discovery_panel_plan_sha256",
+        "parent_identity_sha256",
         "identity_sha256",
     )
     assert tuple(item.name for item in fields(CandidateIdentity)) == expected_fields
@@ -10054,7 +10047,8 @@ def test_candidate_identity_has_exact_public_nine_field_json_shape(
         ("changed_paths", ("core/strategy_policy/risk.py",)),
         ("changed_symbols", ("core.strategy_policy.risk.recommend_capacity",)),
         ("immutable_constraints_sha256", "f" * 64),
-        ("discovery_manifest_sha256", "f" * 64),
+        ("discovery_panel_plan_sha256", "f" * 64),
+        ("parent_identity_sha256", "f" * 64),
         ("identity_sha256", "f" * 64),
     ),
 )
@@ -10091,7 +10085,8 @@ def test_candidate_identity_rejects_attacker_recomputed_digest(
         "changed_paths": identity.changed_paths,
         "changed_symbols": identity.changed_symbols,
         "immutable_constraints_sha256": identity.immutable_constraints_sha256,
-        "discovery_manifest_sha256": identity.discovery_manifest_sha256,
+        "discovery_panel_plan_sha256": identity.discovery_panel_plan_sha256,
+        "parent_identity_sha256": identity.parent_identity_sha256,
     }
     recomputed = hashlib.sha256(
         json.dumps(
@@ -10268,44 +10263,54 @@ def test_candidate_identity_rejects_git_derived_cumulative_scope_growth(
 
 
 @pytest.mark.parametrize(
-    ("old", "new", "message"),
+    ("case", "message"),
     (
-        (
-            "return EntryDecision(True, True, (None, None), ())",
-            "return EntryDecision(True, True, (None, None), ())",
-            "no-op",
-        ),
-        (
-            "return EntryDecision(False, False, (None, None), ())",
-            "return EntryDecision(True, False, (None, None), ())",
-            "apply",
-        ),
+        ("no_op", "no-op"),
+        ("crlf", "LF-only"),
+        ("missing_final_lf", "end with LF"),
     ),
 )
 def test_candidate_identity_rejects_noop_or_non_applicable_incremental_diff(
     tmp_path: Path,
-    old: str,
-    new: str,
+    case: str,
     message: str,
 ) -> None:
-    """Break caught: an unapplied author artifact could receive an executable identity."""
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    """Break caught: a no-op or non-canonical source map received an identity."""
+    from core.pit_optimizer_candidate import validate_candidate_sources
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    before = {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    }
+    replacements = {
+        path: content.decode("utf-8") for path, content in before.items()
+    }
+    if case != "no_op":
+        entry = replacements["core/strategy_policy/entry.py"].replace(
+            "EntryDecision(True", "EntryDecision(False"
+        )
+        replacements["core/strategy_policy/entry.py"] = (
+            entry.replace("\n", "\r\n")
+            if case == "crlf"
+            else entry.removesuffix("\n")
+        )
     with pytest.raises(ValueError, match=message):
-        validate_candidate_diff(
+        validate_candidate_sources(
             authenticated_base_root=authenticated,
             candidate_root=candidate_root,
-            incremental_diff=_task5_raw_author_diff(old, new),
+            replacement_sources=replacements,
             git=git,
-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
             source_commit=_task5_git(
                 authenticated, "rev-parse", "HEAD", text=True
             ).strip(),
-            policy_interface_version=1,
+            policy_interface_version=2,
             immutable_constraints_sha256="a" * 64,
-            discovery_manifest_sha256="b" * 64,
+            discovery_panel_plan_sha256="b" * 64,
+            parent_identity_sha256="c" * 64,
         )
+    assert {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    } == before
 
 
 @pytest.mark.parametrize(
@@ -10321,24 +10326,61 @@ def test_candidate_identity_rejects_protected_or_generated_paths(
     tmp_path: Path,
     path: str,
 ) -> None:
-    """Break caught: a policy diff could target protected infrastructure or generated code."""
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    """Break caught: a complete-source map could include protected or omit required code."""
+    from core.pit_optimizer_candidate import validate_candidate_sources
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
-    with pytest.raises(ValueError, match="editable|permanently denied|outside"):
-        validate_candidate_diff(
-            authenticated_base_root=authenticated,
-            candidate_root=candidate_root,
-            incremental_diff=_task5_raw_author_diff("old", "new", path=path),
-            git=git,
-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
-            source_commit=_task5_git(
-                authenticated, "rev-parse", "HEAD", text=True
-            ).strip(),
-            policy_interface_version=1,
-            immutable_constraints_sha256="a" * 64,
-            discovery_manifest_sha256="b" * 64,
+    before = {
+        relative: (candidate_root / relative).read_bytes()
+        for relative in _POLICY_PATHS
+    }
+    replacements = {
+        relative: content.decode("utf-8") for relative, content in before.items()
+    }
+    replacements["core/strategy_policy/entry.py"] = replacements[
+        "core/strategy_policy/entry.py"
+    ].replace("EntryDecision(True", "EntryDecision(False")
+    replacements[path] = "def protected():\n    return None\n"
+    common = {
+        "authenticated_base_root": authenticated,
+        "candidate_root": candidate_root,
+        "git": git,
+        "source_commit": _task5_git(
+            authenticated, "rev-parse", "HEAD", text=True
+        ).strip(),
+        "policy_interface_version": 2,
+        "immutable_constraints_sha256": "a" * 64,
+        "discovery_panel_plan_sha256": "b" * 64,
+        "parent_identity_sha256": "c" * 64,
+    }
+    with pytest.raises(ValueError, match="exactly the three editable paths"):
+        validate_candidate_sources(
+            **common,
+            replacement_sources=replacements,
         )
+    replacements.pop(path)
+    replacements.pop("core/strategy_policy/exit.py")
+    with pytest.raises(ValueError, match="exactly the three editable paths"):
+        validate_candidate_sources(
+            **common,
+            replacement_sources=replacements,
+        )
+    foreign = candidate_root / path
+    foreign.write_text("def protected():\n    return None\n", encoding="utf-8")
+    replacements[path] = replacements.get(path, "")
+    replacements["core/strategy_policy/exit.py"] = before[
+        "core/strategy_policy/exit.py"
+    ].decode("utf-8")
+    replacements.pop(path)
+    with pytest.raises(ValueError, match="out-of-scope"):
+        validate_candidate_sources(
+            **common,
+            replacement_sources=replacements,
+        )
+    assert {
+        relative: (candidate_root / relative).read_bytes()
+        for relative in _POLICY_PATHS
+    } == before
 
 
 @pytest.mark.parametrize("mode", ("120000", "160000"))
@@ -10347,15 +10389,18 @@ def test_candidate_identity_rejects_non_regular_index_mode(
     mode: str,
 ) -> None:
     """Break caught: a symlink/gitlink could evade regular-source provenance."""
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_candidate import validate_candidate_sources
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
-    incremental = _task5_incremental_diff(
-        candidate_root,
-        "core/strategy_policy/entry.py",
-        "return EntryDecision(True, True, (None, None), ())",
-        "return EntryDecision(False, True, (None, None), ())",
-    )
+    before = {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    }
+    replacements = {
+        path: content.decode("utf-8") for path, content in before.items()
+    }
+    replacements["core/strategy_policy/entry.py"] = replacements[
+        "core/strategy_policy/entry.py"
+    ].replace("EntryDecision(True", "EntryDecision(False")
     commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
     object_id = (
         commit
@@ -10375,18 +10420,21 @@ def test_candidate_identity_rejects_non_regular_index_mode(
         f"{mode},{object_id},core/strategy_policy/entry.py",
     )
 
-    with pytest.raises(ValueError, match="100644|regular"):
-        validate_candidate_diff(
+    with pytest.raises(ValueError, match="100644|mode|out-of-scope"):
+        validate_candidate_sources(
             authenticated_base_root=authenticated,
             candidate_root=candidate_root,
-            incremental_diff=incremental,
+            replacement_sources=replacements,
             git=git,
-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
             source_commit=commit,
-            policy_interface_version=1,
+            policy_interface_version=2,
             immutable_constraints_sha256="a" * 64,
-            discovery_manifest_sha256="b" * 64,
+            discovery_panel_plan_sha256="b" * 64,
+            parent_identity_sha256="c" * 64,
         )
+    assert {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    } == before
 
 
 @pytest.mark.parametrize(
@@ -10492,39 +10540,48 @@ def test_candidate_identity_rolls_back_after_fault_or_cancellation(
     monkeypatch: pytest.MonkeyPatch,
     failure: BaseException,
 ) -> None:
-    """Break caught: post-apply faults or cancellation left candidate policy bytes changed."""
+    """Break caught: post-publish faults left any member of the source bundle changed."""
     import agent_loop
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_candidate import validate_candidate_sources
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
-    entry = candidate_root / "core/strategy_policy/entry.py"
-    before_entry = entry.read_bytes()
-    incremental = _task5_incremental_diff(
-        candidate_root,
-        "core/strategy_policy/entry.py",
-        "return EntryDecision(True, True, (None, None), ())",
-        "return EntryDecision(False, True, (None, None), ())",
-    )
+    before = {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    }
+    replacements = {
+        path: content.decode("utf-8") for path, content in before.items()
+    }
+    replacements["core/strategy_policy/entry.py"] = replacements[
+        "core/strategy_policy/entry.py"
+    ].replace("EntryDecision(True", "EntryDecision(False")
+    replacements["core/strategy_policy/risk.py"] = replacements[
+        "core/strategy_policy/risk.py"
+    ].replace("AllocationDecision(0.01", "AllocationDecision(0.02")
+    replacements["core/strategy_policy/exit.py"] = replacements[
+        "core/strategy_policy/exit.py"
+    ].replace("ExitDecision((), None", "ExitDecision((), 0.03")
 
     def fail_after_apply(**_kwargs: object) -> str:
         raise failure
 
     monkeypatch.setattr(agent_loop, "derive_authenticated_cumulative_diff", fail_after_apply)
     with pytest.raises(type(failure), match="fault" if isinstance(failure, RuntimeError) else None):
-        validate_candidate_diff(
+        validate_candidate_sources(
             authenticated_base_root=authenticated,
             candidate_root=candidate_root,
-            incremental_diff=incremental,
+            replacement_sources=replacements,
             git=git,
-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
             source_commit=_task5_git(
                 authenticated, "rev-parse", "HEAD", text=True
             ).strip(),
-            policy_interface_version=1,
+            policy_interface_version=2,
             immutable_constraints_sha256="a" * 64,
-            discovery_manifest_sha256="b" * 64,
+            discovery_panel_plan_sha256="b" * 64,
+            parent_identity_sha256="c" * 64,
         )
-    assert entry.read_bytes() == before_entry
+    assert {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    } == before
 
 
 @pytest.mark.parametrize(
@@ -10642,6 +10699,13 @@ def _task5_entry_source(body: str, *, prelude: str = "") -> str:
         (_task5_entry_source("handle = open('x')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
         (_task5_entry_source("module = __import__('os')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
         (_task5_entry_source("value = eval('1')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+        (
+            _task5_entry_source(
+                "context = MarketContextV1()\nreturn EntryDecision(bool(context), True, (None, None), ())",
+                prelude="\nfrom .contracts import MarketContextV1\n",
+            ),
+            "call",
+        ),
         ("from .contracts import EntryDecision\n\nasync def evaluate_entry(snapshot):\n    return EntryDecision(True, True, (None, None), ())\n", "async"),
         (_task5_entry_source("yield snapshot\nreturn EntryDecision(True, True, (None, None), ())"), "generator"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\ndef public_helper():\n    return True\n"), "public"),
@@ -10672,6 +10736,10 @@ def test_ast_purity_accepts_current_policy_and_immutable_literal_constants() -> 
             source = source.replace(
                 "from __future__ import annotations\n",
                 "from __future__ import annotations\nFLOORS = (0.25, 70.0, None, 'entry')\n",
+                1,
+            ).replace(
+                "from .contracts import EntryDecision, EntrySnapshot",
+                "from .contracts import BenchmarkContextV1, EntryDecision, EntrySnapshot, MarketContextV1",
                 1,
             )
         validate_policy_ast(path=path, source=source)

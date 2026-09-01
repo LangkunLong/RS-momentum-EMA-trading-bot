@@ -5134,6 +5134,14 @@ class AuthorArtifactV4(_V2Canonical):
     def source_bundle_sha256(self) -> str:
         return policy_source_bundle_v4_sha256(self.policy_sources)
 
+    @property
+    def replacement_sources(self) -> Mapping[str, str]:
+        """Expose the complete canonical source map for atomic materialization."""
+
+        return MappingProxyType(
+            {item.path: item.source for item in self.policy_sources}
+        )
+
     def changed_paths(self, parent: SelectedParentIdentity) -> tuple[str, ...]:
         if self.parent_identity_sha256 != parent.parent_identity_sha256:
             raise ValueError("author v4 artifact parent identity differs")

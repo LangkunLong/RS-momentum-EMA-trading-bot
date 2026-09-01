@@ -1848,7 +1848,7 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
     )
     from core.pit_optimizer_artifacts import IncrementalArtifactStore
     from core.pit_optimizer_authorization import PitOptimizerRoleCall
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_candidate import validate_candidate_sources
     from core.pit_optimizer_controller import (
         CandidateValidationOutcome,
         CandidateWorkspace,
@@ -1996,18 +1996,36 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
         cumulative_diff: str | None,
     ) -> CandidateValidationOutcome:
         assert live[workspace.workspace_id] == workspace.root
-        identity, authenticated_cumulative = validate_candidate_diff(
+        replacement_sources = {
+            path: (workspace.root / path).read_text("utf-8")
+            for path in (
+                "core/strategy_policy/entry.py",
+                "core/strategy_policy/risk.py",
+                "core/strategy_policy/exit.py",
+            )
+        }
+        before_literal, after_literal = (
+            ("None", "True")
+            if author.behavioral_summary.endswith("1")
+            else ("True", "False")
+        )
+        replacement_sources["core/strategy_policy/entry.py"] = replacement_sources[
+            "core/strategy_policy/entry.py"
+        ].replace(f"return {before_literal}", f"return {after_literal}")
+        identity, authenticated_cumulative = validate_candidate_sources(
             authenticated_base_root=Path(inputs["source_root"]).resolve(),
             candidate_root=workspace.root,
-            incremental_diff=author.unified_diff,
+            replacement_sources=replacement_sources,
             git=git_capability,
-            bounds=readiness.manifest.candidate_bounds,
             source_commit=readiness.manifest.source_head,
             policy_interface_version=readiness.manifest.policy_interface_version,
             immutable_constraints_sha256=(
                 readiness.manifest.immutable_constraints_sha256
             ),
-            discovery_manifest_sha256=readiness.manifest.fold_manifest.sha256,
+            discovery_panel_plan_sha256=readiness.manifest.fold_manifest.sha256,
+            parent_identity_sha256=hashlib.sha256(
+                (cumulative_diff or "baseline").encode("utf-8")
+            ).hexdigest(),
         )
         return CandidateValidationOutcome(
             True,
