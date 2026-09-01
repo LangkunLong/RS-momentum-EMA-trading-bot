@@ -23409,12 +23409,15 @@ def _pit_optimizer_v4_prepare_lines(
         != config.discovery_panel_plan_sha256
         or readiness.qualification_panel_plan.sha256
         != config.qualification_panel_plan_sha256
+        or readiness.discovery_panel_plan.qualification_ledger_snapshot_sha256
+        != config.qualification_ledger_snapshot_sha256
+        or readiness.qualification_panel_plan.qualification_ledger_snapshot_sha256
+        != config.qualification_ledger_snapshot_sha256
         or not isinstance(readiness.qualification_ledger_head_sha256, str)
     ):
         raise ConfigurationError(
             "prepare output requires authenticated schema-v4 readiness"
         )
-    config.validate()
     manifest = readiness.manifest
     supplied_readiness = Path(readiness.artifact_path)
     expected_readiness = config.readiness_artifact.resolve(strict=False)
