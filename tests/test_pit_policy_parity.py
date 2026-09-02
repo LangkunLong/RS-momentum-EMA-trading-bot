@@ -21,9 +21,11 @@ from core.backtest_engine import (
 from core.strategy_policy.runtime import InProcessPolicyClient
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
+    EvaluationPanelSpec,
     FoldAggregateSummary,
     FoldManifest,
     FoldSpec,
+    PanelSecurityLineage,
 )
 from core.pit_policy_parity import (
     ParityEntryOutcome,
@@ -198,7 +200,7 @@ def _evidence(
     return ParityFoldEvidence(**fields, evidence_sha256=digest)
 
 
-def test_fold_manifest_rejects_reused_discovery_sessions() -> None:
+def test_legacy_fold_manifest_rejects_reused_discovery_sessions() -> None:
     """Break caught: the same market sessions could influence both discovery folds."""
     first = _fold("discovery_1", "discovery", "2021-01-04")
     second = replace(first, fold_id="discovery_2")
@@ -214,7 +216,7 @@ def test_fold_manifest_rejects_reused_discovery_sessions() -> None:
         )
 
 
-def test_fold_manifest_requires_two_chronological_discovery_folds_before_hidden() -> None:
+def test_legacy_fold_manifest_requires_two_chronological_discovery_folds_before_hidden() -> None:
     """Break caught: a short, reordered, or mislabeled fold could be evaluated."""
     first = _fold("discovery_1", "discovery", "2021-01-04")
     second = _fold("discovery_2", "discovery", "2021-04-01")
@@ -369,7 +371,51 @@ def test_fixed_fold_manifest_uses_only_the_supplied_benchmark_calendar() -> None
     assert all(len(fold.sessions) == 60 for fold in (*manifest.discovery_folds, manifest.hidden_fold))
 
 
-def test_fold_evidence_embeds_exact_result_rows_and_hand_checked_aggregates() -> None:
+def test_fixed_fold_manifest_can_seal_a_later_independent_subset() -> None:
+    """Break caught: every later canary was forced to reuse the first consumed hidden window."""
+    sessions = tuple(
+        value.date().isoformat()
+        for value in pd.bdate_range("2021-06-25", periods=360)
+    )
+    first_discovery_session = sessions[120]
+    readiness = {
+        "evaluation_contract": {
+            "verification_only": True,
+            "scope": {
+                "benchmark": "SPY",
+                "discovery_start": "2021-06-25",
+                "discovery_end": "2021-09-20",
+                "holdout_start": "2021-09-21",
+                "holdout_end": "2021-12-14",
+                "warmup_start": "2021-01-01",
+                "session_count": 60,
+                "symbol_count": 2,
+                "symbols": ["AAA", "BBB"],
+            },
+        }
+    }
+
+    manifest, _ = build_fixed_fold_manifest(
+        readiness=readiness,
+        benchmark_sessions=sessions,
+        data_identity_sha256="a" * 64,
+        first_discovery_session=first_discovery_session,
+    )
+
+    folds = (*manifest.discovery_folds, manifest.hidden_fold)
+    assert [fold.sessions[0] for fold in folds] == [
+        sessions[120],
+        sessions[180],
+        sessions[240],
+    ]
+    assert [fold.sessions[-1] for fold in folds] == [
+        sessions[179],
+        sessions[239],
+        sessions[299],
+    ]
+
+
+def test_legacy_fold_and_panel_evidence_embed_production_aggregates() -> None:
     """Break caught: capture emitted only hashes or computed aggregates from a different result."""
     fold = _fold("discovery_1", "discovery", "2021-01-04")
     equity = pd.Series([1_000.0] * 60, index=fold.sessions)
@@ -430,9 +476,20 @@ def test_fold_evidence_embeds_exact_result_rows_and_hand_checked_aggregates() ->
     assert evidence.aggregate.turnover_pct == 20.0
     assert evidence.aggregate.average_exposure_pct == pytest.approx(59 / 6)
     assert dict((item.metric_id, item.value) for item in evidence.aggregate.exit_attribution) == {"end_of_test": 1}
+    panel = EvaluationPanelSpec.from_lineages(
+        purpose="discovery",
+        sessions=fold.sessions,
+        lineages=(
+            PanelSecurityLineage("chain_aaa", ("AAA",), ("sp500",)),
+        ),
+    )
+    panel_evidence = parity.build_panel_evidence_v4(panel=panel, result=result)
+    assert panel_evidence["policy_interface_version"] == 2
+    assert panel_evidence["aggregate"]["panel_sha256"] == panel.sha256
+    assert panel_evidence["aggregate"]["portfolio_annualized_return_pct"] == "0.00"
 
 
-def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Path) -> None:
+def test_legacy_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Path) -> None:
     """Break caught: reference capture evaluated hidden data or omitted its sealed boundary."""
     closures = {"2021-07-05", "2021-09-06", "2021-11-25", "2021-12-24", "2022-01-17", "2022-02-21"}
     sessions = tuple(
@@ -482,6 +539,111 @@ def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Pa
     assert evaluated == ["discovery_1", "discovery_2"]
     assert reference.fold_manifest.hidden_fold.fold_id == "hidden_1"
     assert len(reference.discovery_evidence) == 2
+
+
+def test_capture_carries_a_later_subset_selection_into_the_reference(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a manifest could claim a fresh window while parity still sealed the original one."""
+    sessions = tuple(
+        value.date().isoformat()
+        for value in pd.bdate_range("2021-06-25", periods=360)
+    )
+    readiness = {
+        "evaluation_contract": {
+            "verification_only": True,
+            "scope": {
+                "benchmark": "SPY",
+                "discovery_start": "2021-06-25",
+                "discovery_end": "2021-09-20",
+                "holdout_start": "2021-09-21",
+                "holdout_end": "2021-12-14",
+                "warmup_start": "2021-01-01",
+                "session_count": 60,
+                "symbol_count": 2,
+                "symbols": ["AAA", "BBB"],
+            },
+        },
+        "identities": {
+            "pit_bundle_sha256": "4" * 64,
+            "baseline_manifest_sha256": "5" * 64,
+            "effective_policy_sha256": "d" * 64,
+        },
+    }
+    evaluated: list[tuple[str, str]] = []
+
+    def evaluate(
+        fold: FoldSpec,
+        _universe: tuple[str, ...],
+        _warmup: str,
+    ) -> ParityFoldEvidence:
+        evaluated.append((fold.fold_id, fold.start_date))
+        return _evidence(fold)
+
+    reference = capture_from_authenticated_inputs(
+        readiness=readiness,
+        readiness_sha256="3" * 64,
+        pit_bundle_sha256="4" * 64,
+        reference_source_head="1" * 40,
+        reference_source_fingerprint_sha256="2" * 64,
+        benchmark_sessions=sessions,
+        first_discovery_session=sessions[120],
+        output=tmp_path / "later-reference.json",
+        evaluate_discovery_fold=evaluate,
+        pre_persist_check=lambda: None,
+    )
+
+    assert evaluated == [
+        ("discovery_1", sessions[120]),
+        ("discovery_2", sessions[180]),
+    ]
+    assert reference.fold_manifest.hidden_fold.sessions == sessions[240:300]
+
+
+def test_panel_parity_cli_requires_provider_free_v4_identity_inputs() -> None:
+    """Break caught: v4 parity could expose qualification or omit a sealed local identity."""
+    parser = parity._parser()
+
+    capture = parser.parse_args(
+        [
+            "capture-v4",
+            "--discovery-panel-plan",
+            "C:/artifacts/panels/discovery-plan.json",
+            "--pit-bundle",
+            "C:/artifacts/pit.sqlite3",
+            "--pit-bundle-sha256",
+            "a" * 64,
+            "--prices-provenance",
+            "C:/artifacts/prices.json",
+            "--sandbox-image",
+            "localhost/pit@sha256:" + "b" * 64,
+            "--output-root",
+            "C:/artifacts/parity/reference",
+        ]
+    )
+    verify = parser.parse_args(
+        [
+            "verify-v4",
+            "--reference",
+            "C:/artifacts/parity/reference/parity-reference.json",
+            "--discovery-panel-plan",
+            "C:/artifacts/panels/discovery-plan.json",
+            "--pit-bundle",
+            "C:/artifacts/pit.sqlite3",
+            "--pit-bundle-sha256",
+            "a" * 64,
+            "--prices-provenance",
+            "C:/artifacts/prices.json",
+            "--sandbox-image",
+            "localhost/pit@sha256:" + "b" * 64,
+            "--output-root",
+            "C:/artifacts/parity/verification",
+        ]
+    )
+
+    assert capture.command == "capture-v4"
+    assert verify.command == "verify-v4"
+    assert not hasattr(capture, "qualification_panel_plan")
 
 
 def test_capture_simulator_binds_authenticated_signal_cadence() -> None:

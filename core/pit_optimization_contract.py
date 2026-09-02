@@ -9,6 +9,7 @@ import math
 import os
 import re
 import stat
+import subprocess
 import uuid
 from dataclasses import InitVar, dataclass, fields, is_dataclass, replace
 from decimal import Decimal
@@ -23,10 +24,13 @@ from core.pit_optimizer_command import (
 )
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
+    AnnualizedReturnTarget,
+    DiscoveryPanelPlan,
     DiscoveryExposureProof,
     DiscoveryScore,
     FoldAggregateSummary,
     FoldManifest,
+    PanelAggregateSummary,
     ValidationExposureMetadata,
     ValidationWindowIdentity,
     discovery_score_from_folds,
@@ -57,6 +61,10 @@ PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES = frozenset(
         "payload_json_invalid",
         "payload_keys_invalid",
         "payload_field_invalid",
+        "payload_scope_invalid",
+        "payload_size_invalid",
+        "payload_enum_invalid",
+        "payload_binding_invalid",
         "model_mismatch",
         "validator_boundary_invalid",
     }
@@ -64,25 +72,23 @@ PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES = frozenset(
 PIT_OPTIMIZER_R1_MODEL = "deepseek/deepseek-r1"
 MAX_ROLE_TEXT_BYTES = 4 * 1024
 MAX_ROLE_LIST_ITEMS = 16
-# Provider-facing investigator output is intentionally smaller than the broad
-# controller-context limits above.  Those bounds are sized for authenticated
-# local artifacts; model output must fit the investigator's 8 KiB artifact
-# envelope before it reaches the local parser.
-MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS = 4
-MAX_INVESTIGATOR_RATIONALE_CHARS = 256
-MAX_INVESTIGATOR_LIST_ITEM_CHARS = 96
+# The provider response already has one authenticated 64 KiB envelope.  Keep
+# only generous structural limits inside it; tiny per-field sub-envelopes turn
+# useful reasoning prose into a schema failure without improving isolation.
+MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS = 16
+MAX_INVESTIGATOR_RATIONALE_CHARS = 4 * 1024
+MAX_INVESTIGATOR_LIST_ITEM_CHARS = 2 * 1024
 MAX_AUTHOR_DIFF_BYTES = 64 * 1024
 MAX_POLICY_SOURCE_BUNDLE_BYTES = 64 * 1024
 MAX_DISCOVERY_EVIDENCE_BYTES = 8 * 1024
-MAX_INVESTIGATOR_ARTIFACT_BYTES = 8 * 1024
+MAX_INVESTIGATOR_ARTIFACT_BYTES = 64 * 1024
 MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES = 8 * 1024
-MAX_CRITIC_ARTIFACT_BYTES = 8 * 1024
+MAX_CRITIC_ARTIFACT_BYTES = 64 * 1024
 MAX_ITERATION_FEEDBACK_BYTES = 4 * 1024
 MAX_ITERATION_HISTORY_BYTES = 32 * 1024
 MAX_INVESTIGATOR_DYNAMIC_BYTES = 80_000
 MAX_AUTHOR_DYNAMIC_BYTES = 76_000
 MAX_CRITIC_DYNAMIC_BYTES = 24_000
-MAX_CANDIDATE_COMPARISON_BYTES = 3 * 1024
 
 _DISALLOWED_TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
@@ -143,42 +149,101 @@ _POLICY_DECLARED_SYMBOLS = MappingProxyType(
         ),
     }
 )
+_FAMILY_POLICY_PATHS = MappingProxyType(
+    {
+        "entry": ("core/strategy_policy/entry.py",),
+        "exit": ("core/strategy_policy/exit.py",),
+        "risk_sizing": ("core/strategy_policy/risk.py",),
+    }
+)
+
+
+def _controller_scope_for_family(family: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Bind advisory role metadata to the controller-owned policy interface."""
+
+    try:
+        paths = _FAMILY_POLICY_PATHS[family]
+    except KeyError as exc:
+        raise ValueError("investigator family is invalid") from exc
+    symbols = tuple(
+        symbol for path in paths for symbol in _POLICY_DECLARED_SYMBOLS[path]
+    )
+    return paths, symbols
 
 PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
     {
         "investigator": (
             "You are the PIT optimizer investigator. Use only the supplied bounded source, "
             "rules, aggregate discovery evidence, incumbent summary, and prior summaries. "
+            "Treat a rankable candidate with no median or worst excess return and worse drawdown "
+            "as failed exploration: do not repeat a one-line threshold adjustment in that family; "
+            "choose a materially different causal mechanism, preferably another family, unless "
+            "the supplied aggregates directly show an entry-gate bottleneck. "
+            "Treat prior candidate folds identical to baseline as behaviorally inert even when source "
+            "text changed; do not repeat that mechanism. Treat author_diff_not_applicable as a patch "
+            "coordinate/context failure and instruct the author to use the exact current source. "
+            "On a sparse baseline with negative return from very few trades, distinguish direct "
+            "risk_fraction reduction from a tighter stop distance: tightening the stop can increase "
+            "position size under fixed risk. Prefer the direct risk control over unrelated threshold "
+            "churn when the supplied aggregates support that causal experiment. When buy signals "
+            "trail otherwise-passing entry-funnel stages, investigate selective handling of supplied "
+            "technical_blocking_reasons rather than repeatedly changing inactive fundamentals. "
+            "In technical_only mode, current/annual growth, RS, and composite gates inside the "
+            "not-technical-only branch are inactive. When market_pass equals evaluated_rows, changing "
+            "market_permitted is inert. technical_block_* and entry_block_* counts identify the active "
+            "entry bottlenecks; use the raw EntrySnapshot facts to selectively reinterpret those blockers. "
             "Return exactly one JSON object and nothing else: no markdown, chain-of-thought, "
             "schema_version, or extra keys. It must contain exactly these keys: hypothesis_id, "
-            "family, evidence_ids, causal_rationale, target_paths, target_symbols, "
-            "expected_diagnostic_changes, known_risks, author_instructions. family must be one of "
-            "entry, exit, risk_sizing. Every listed field must be a JSON array; use [] only for "
-            "known_risks when there are none. The local response schema is authoritative: use at most "
-            "four items per list, copy evidence IDs and editable paths/symbols verbatim from the "
-            "supplied input, keep causal_rationale to 256 characters, and keep each diagnostic, "
+            "family, evidence_ids, causal_rationale, "
+            "expected_diagnostic_changes, known_risks, author_instructions. hypothesis_id, family, and "
+            "causal_rationale are strings; every other field is a JSON array of strings. family must be "
+            "one of entry, exit, risk_sizing. Use [] only for known_risks when there are none. The local "
+            "response schema is authoritative: use at most four items per list. The controller "
+            "derives policy paths and symbols from family; do not emit path or symbol metadata. Keep "
+            "causal_rationale to 256 characters, and keep each diagnostic, "
             "risk, and author-instruction item to 96 characters. Make the object compact enough "
             "for the 8 KiB envelope. Never request hidden data, credentials, local paths, raw "
             "trades, holdings, or provider audit material."
         ),
         "author": (
             "You are the PIT optimizer author. Implement only the supplied investigator "
-            "hypothesis within the immutable constraints and patch bounds. Return one strict "
-            "schema-v2 author object containing a unified diff; the local response schema is "
-            "authoritative. Copy hypothesis_id verbatim from the investigator. List only paths and "
-            "declared symbols actually changed by unified_diff, using their exact supplied values; "
-            "do not list the whole editable scope. Use at most four assumption or validation-suggestion items, keep every such item to 96 "
-            "characters and behavioral_summary to 256 characters, and keep unified_diff within "
-            "the supplied candidate diff bound. Do not execute code or access hidden data, "
+            "hypothesis within the immutable constraints and patch bounds. Return exactly one JSON "
+            "object and nothing else: no markdown, chain-of-thought, schema_version, or extra keys. "
+            "It must contain exactly these keys: hypothesis_id, behavioral_summary, unified_diff, "
+            "assumptions, validation_suggestions. hypothesis_id, "
+            "behavioral_summary, and unified_diff are strings; every other field is a JSON array of "
+            "strings. Copy hypothesis_id verbatim from the investigator. unified_diff must be a "
+            "nonempty full-source envelope: the exact first line PIT_FULL_SOURCE_V1 followed by a "
+            "newline and the complete replacement text of the single controller-targeted file. "
+            "Do not emit diff headers, hunk markers, or markdown fences. The controller derives a "
+            "canonical unified diff plus changed-path and changed-symbol "
+            "metadata and independently validates the diff, so do not emit that metadata. "
+            "assumptions and validation_suggestions may be []. Use at most four assumption "
+            "or validation-suggestion items, keep every such item to 96 characters and "
+            "behavioral_summary to 256 characters, and keep unified_diff within the supplied "
+            "candidate diff bound. Treat source_bundle.files as the only base revision: copy the "
+            "selected supplied file completely, byte-for-byte except for the intended strategy edit. "
+            "Preserve its imports, module structure, public functions, helpers, and final newline. "
+            "For a risk-reduction hypothesis, change risk_fraction directly and leave stop distance "
+            "unchanged unless the hypothesis explicitly requires both. Do not quote a prior version "
+            "of the source. In technical_only mode, do not edit inactive fundamental thresholds. For an "
+            "entry-bottleneck hypothesis, implement selective technical_blocking_reasons handling from "
+            "the supplied raw snapshot facts; do not merely force market permission when market_pass "
+            "already equals evaluated_rows. Do not execute code or access hidden data, "
             "credentials, local paths, or unrelated source."
         ),
         "critic": (
             "You are the PIT optimizer critic. Analyze only the supplied sanitized validation "
-            "and aggregate discovery comparisons. Return one schema-v2 advisory object; "
-            "the local response schema is authoritative. Copy at most four evidence IDs verbatim from "
-            "the supplied aggregates and keep every free-text field to 256 characters. You cannot "
-            "accept a candidate and must not request hidden results, credentials, local paths, "
-            "raw trades, holdings, or provider audit material."
+            "and aggregate discovery comparisons. Return exactly one JSON object and nothing else: "
+            "no markdown, chain-of-thought, schema_version, or extra keys. It must contain exactly "
+            "these keys: hypothesis_id, prediction_vs_observation, causal_explanation, evidence_ids, "
+            "disposition, next_direction. All fields except evidence_ids are strings; evidence_ids is "
+            "a JSON array of supplied evidence IDs. Copy hypothesis_id and at most four evidence IDs "
+            "verbatim from the supplied aggregates. When candidate comparisons are null because local "
+            "validation failed, use [] for evidence_ids. disposition must be exactly refine, abandon, or "
+            "change_family. Keep every free-text field to 256 characters. You cannot accept a "
+            "candidate and must not request hidden results, credentials, local paths, raw trades, "
+            "holdings, or provider audit material."
         ),
     }
 )
@@ -282,6 +347,7 @@ def _parse_v2_closed_object(
     keys: frozenset[str],
     *,
     max_total_bytes: int,
+    optional_keys: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     if type(max_total_bytes) is not int or max_total_bytes <= 0:
         raise ValueError("provider payload byte cap is invalid")
@@ -291,7 +357,12 @@ def _parse_v2_closed_object(
         value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise ValueError("provider payload is malformed JSON") from exc
-    if not isinstance(value, dict) or set(value) != keys:
+    actual_keys = set(value) if isinstance(value, dict) else set()
+    if (
+        not isinstance(value, dict)
+        or not keys.issubset(actual_keys)
+        or not actual_keys.issubset(keys | optional_keys)
+    ):
         raise ValueError("provider payload has invalid keys")
     return value
 
@@ -312,6 +383,21 @@ def _v2_text(value: object, field: str, *, allow_empty: bool = False) -> str:
     return value
 
 
+def _v2_response_text(value: object, field: str, *, allow_empty: bool = False) -> str:
+    """Normalize harmless outer whitespace in model-authored text fields.
+
+    Provider JSON is untrusted, but outer whitespace has no strategy meaning once
+    the response is converted into a canonical local artifact.  Tolerating that
+    one formatting variation avoids discarding an otherwise valid role result;
+    types, control characters, emptiness, byte caps, and all subsequent binding
+    checks remain enforced by ``_v2_text``.
+    """
+
+    if not isinstance(value, str):
+        return _v2_text(value, field, allow_empty=allow_empty)
+    return _v2_text(value.strip(), field, allow_empty=allow_empty)
+
+
 def _v2_string_list(
     value: object,
     field: str,
@@ -325,6 +411,46 @@ def _v2_string_list(
     normalized = tuple(_v2_text(item, field) for item in value)
     if len(normalized) != len(set(normalized)):
         raise ValueError(f"{field} must contain unique values")
+    if not allow_empty and not normalized:
+        raise ValueError(f"{field} cannot be empty")
+    return normalized
+
+
+def _v2_response_string_list(
+    value: object,
+    field: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    """Parse model-authored text lists into a bounded canonical sequence.
+
+    Repeated or blank list entries carry no additional strategy meaning, and
+    reasoning models occasionally repeat them even when asked for compact JSON.
+    Normalize that harmless presentation drift here while preserving the hard
+    type, text, item-count, byte, and non-empty requirements consumed by the
+    controller.
+    """
+
+    if value is None and allow_empty:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{field} must be a JSON string array")
+    normalized_items: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        stripped = item.strip()
+        if not stripped:
+            continue
+        normalized_item = _v2_response_text(stripped, field)
+        if normalized_item in seen:
+            continue
+        seen.add(normalized_item)
+        normalized_items.append(normalized_item)
+        if len(normalized_items) == MAX_ROLE_LIST_ITEMS:
+            break
+    normalized = tuple(normalized_items)
     if not allow_empty and not normalized:
         raise ValueError(f"{field} cannot be empty")
     return normalized
@@ -346,6 +472,19 @@ def _v2_identifier(value: object, field: str) -> str:
     if _ID_RE.fullmatch(text) is None:
         raise ValueError(f"{field} is invalid")
     return text
+
+
+def _v2_response_identifier(value: object, field: str) -> str:
+    """Canonicalize harmless model formatting in a response-local label."""
+
+    text = _v2_response_text(value, field)
+    if _ID_RE.fullmatch(text) is not None:
+        return text
+    normalized = re.sub(r"[^a-z0-9_.-]+", "-", text.casefold()).strip("._-")
+    if not normalized or not normalized[0].isalpha():
+        normalized = f"h-{normalized}" if normalized else "hypothesis"
+    normalized = normalized[:128].rstrip("._-")
+    return _v2_identifier(normalized, field)
 
 
 def _v2_blob(value: object, field: str, *, max_bytes: int) -> str:
@@ -483,10 +622,21 @@ def _validate_scoped_paths_symbols(
     )
     if any(
         symbol not in allowed_symbols
+        # Symbol metadata never grants edit authority: candidate diffs remain
+        # constrained to authenticated paths and bounded by the patch verifier.
+        and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol) is None
         and not any(
             symbol.startswith(prefix)
-            and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix))
-            is not None
+            and (
+                re.fullmatch(
+                    r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+                or re.fullmatch(
+                    r"_[A-Za-z][A-Za-z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+            )
             for prefix in allowed_constant_prefixes
         )
         for symbol in symbols
@@ -522,6 +672,10 @@ class PitOptimizerCallBudget(_V2Canonical):
             _require_positive_int(getattr(self, name), f"optimizer call {name}")
         if self.max_static_input_bytes + self.max_dynamic_input_bytes > self.max_input_tokens:
             raise ValueError("optimizer call input sections exceed the input token cap")
+
+
+class RoleContextBudgetExceeded(ValueError):
+    """The exact transmitted role context exceeds its authenticated byte cap."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -701,7 +855,10 @@ class PitOptimizerRunManifest(_V2Canonical):
             raise ValueError("optimizer iteration limit differs from source scope")
         if type(self.max_iterations) is not int or not 1 <= self.max_iterations <= 8:
             raise ValueError("optimizer iteration limit is invalid")
-        if self.non_improving_limit != 3:
+        if (
+            type(self.non_improving_limit) is not int
+            or not 1 <= self.non_improving_limit <= 8
+        ):
             raise ValueError("optimizer non-improving limit is invalid")
         if (
             type(self.call_budgets) is not tuple
@@ -1012,6 +1169,25 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _committed_policy_source_text(source_root: Path, relative: str) -> str:
+    """Read the exact policy text a candidate export receives from HEAD."""
+
+    _resolved_file(source_root / Path(relative), f"policy source {relative}")
+    try:
+        completed = subprocess.run(
+            ["git", "show", f"HEAD:{relative}"],
+            cwd=source_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return completed.stdout.decode("utf-8")
+    except (OSError, UnicodeDecodeError, subprocess.CalledProcessError) as exc:
+        raise ValueError(
+            "committed policy source must be readable as UTF-8 text"
+        ) from exc
+
+
 def _pit_optimizer_manifest_from_primitive(
     primitive: Mapping[str, object],
 ) -> PitOptimizerRunManifest:
@@ -1154,29 +1330,80 @@ def _require_subset_canary_call_plan(
         "author": (12_000, 48_500, 72_000, 8_000, 16 * 1024),
         "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
-    extended_profile = {
+    author_reasoning_profile = {
+        "investigator": (8_000, 78_000, 86_000, 8_000, 8 * 1024),
+        # Reallocate unused author input headroom to completion headroom.  Deep
+        # reasoning models may account for hidden reasoning in completion
+        # tokens even when the visible JSON artifact remains byte-bounded.
+        "author": (12_000, 48_500, 64_000, 16_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
+    }
+    legacy_extended_profile = {
         "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
         "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
         "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
+    extended_profile = {
+        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
+        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
+        # Reserve the same reasoning headroom for the critic. OpenRouter's
+        # completion usage includes DeepSeek R1's hidden reasoning tokens even
+        # when the visible, schema-bound critic artifact remains small.
+        "critic": (8_000, 24_000, 32_000, 16_000, 8 * 1024),
+    }
     if (max_iterations, len(call_budgets)) == (1, 3):
-        expected_profile = fast_e2e_profile
-    elif (max_iterations, len(call_budgets)) == (2, 6):
-        expected_profile = extended_profile
+        expected_profiles = (fast_e2e_profile, author_reasoning_profile)
+    elif 2 <= max_iterations <= 8 and len(call_budgets) == 3 * max_iterations:
+        expected_profiles = (legacy_extended_profile, extended_profile)
     else:
         raise ValueError("subset canary iteration profile is unsupported")
-    for budget in call_budgets:
-        actual = (
-            budget.max_static_input_bytes,
-            budget.max_dynamic_input_bytes,
-            budget.max_input_tokens,
-            budget.max_output_tokens,
-            budget.max_response_bytes,
+    if any(budget.model != PIT_OPTIMIZER_R1_MODEL for budget in call_budgets) or not any(
+        all(
+            (
+                budget.max_static_input_bytes,
+                budget.max_dynamic_input_bytes,
+                budget.max_input_tokens,
+                budget.max_output_tokens,
+                budget.max_response_bytes,
+            )
+            == profile[budget.role]
+            for budget in call_budgets
         )
-        if budget.model != PIT_OPTIMIZER_R1_MODEL or actual != expected_profile.get(
-            budget.role
-        ):
-            raise ValueError("subset canary call caps are invalid")
+        for profile in expected_profiles
+    ):
+        raise ValueError("subset canary call caps are invalid")
+
+
+def _attested_parity_reference_folds(
+    *,
+    parity_attestation: object,
+    parity_reference: object,
+) -> tuple[FoldManifest, tuple[str, ...]]:
+    """Return only the fold plan and universe sealed by a matching parity reference."""
+
+    from core.pit_policy_parity import ParityAttestation, ParityReference
+
+    if not isinstance(parity_attestation, ParityAttestation) or not isinstance(
+        parity_reference, ParityReference
+    ):
+        raise ValueError("attested parity reference is invalid")
+    if (
+        parity_reference.artifact_sha256
+        != parity_attestation.reference_artifact_sha256
+        or parity_reference.reference_source_head
+        != parity_attestation.reference_source_head
+        or parity_reference.pit_bundle_sha256 != parity_attestation.pit_bundle_sha256
+        or parity_reference.baseline_manifest_sha256
+        != parity_attestation.baseline_manifest_sha256
+        or parity_reference.effective_policy_sha256
+        != parity_attestation.effective_policy_sha256
+        or parity_reference.fold_manifest.sha256
+        != parity_attestation.discovery_fold_manifest_sha256
+        or parity_reference.discovery_output_sha256s
+        != parity_attestation.reference_output_sha256s
+    ):
+        raise ValueError("attested parity reference fold manifest differs")
+    return parity_reference.fold_manifest, parity_reference.universe
 
 
 def build_subset_manifest(
@@ -1195,6 +1422,7 @@ def build_subset_manifest(
     call_budgets: tuple[PitOptimizerCallBudget, ...],
     candidate_bounds: PatchBounds,
     max_iterations: int,
+    parity_reference: object | None = None,
 ) -> PitOptimizerRunManifest:
     """Authenticate inert inputs and seal one provider-free subset manifest."""
 
@@ -1279,21 +1507,36 @@ def build_subset_manifest(
     if identities.get("effective_policy_sha256") != effective_policy_sha256:
         raise ValueError("legacy readiness effective policy identity differs")
 
-    from core.pit_data import PITDataBundle
-    from core.pit_policy_parity import build_fixed_fold_manifest
+    if parity_reference is None:
+        from core.pit_data import PITDataBundle
+        from core.pit_policy_parity import build_fixed_fold_manifest
 
-    with PITDataBundle(bundle_path, expected_sha256=bundle_sha256) as bundle:
-        rows = bundle._connection.execute(
-            "SELECT trade_date FROM price WHERE ticker='SPY' "
-            "AND trade_date>='2021-06-25' AND trade_date<='2022-03-11' "
-            "ORDER BY trade_date"
-        ).fetchall()
-        benchmark_sessions = tuple(str(row[0]) for row in rows)
-    fold_manifest, _universe = build_fixed_fold_manifest(
-        readiness=legacy_readiness,
-        benchmark_sessions=benchmark_sessions,
-        data_identity_sha256=bundle_sha256,
-    )
+        with PITDataBundle(bundle_path, expected_sha256=bundle_sha256) as bundle:
+            rows = bundle._connection.execute(
+                "SELECT trade_date FROM price WHERE ticker='SPY' "
+                "AND trade_date>='2021-06-25' AND trade_date<='2022-03-11' "
+                "ORDER BY trade_date"
+            ).fetchall()
+            benchmark_sessions = tuple(str(row[0]) for row in rows)
+        fold_manifest, selected_universe = build_fixed_fold_manifest(
+            readiness=legacy_readiness,
+            benchmark_sessions=benchmark_sessions,
+            data_identity_sha256=bundle_sha256,
+        )
+    else:
+        fold_manifest, selected_universe = _attested_parity_reference_folds(
+            parity_attestation=parity_attestation,
+            parity_reference=parity_reference,
+        )
+        scope = evaluation.get("scope") if isinstance(evaluation, Mapping) else None
+        raw_universe = scope.get("symbols") if isinstance(scope, Mapping) else None
+        if (
+            fold_manifest.data_identity_sha256 != bundle_sha256
+            or fold_manifest.benchmark != "SPY"
+            or not isinstance(raw_universe, list)
+            or tuple(raw_universe) != selected_universe
+        ):
+            raise ValueError("attested parity reference differs from legacy readiness")
 
     if (
         parity.pit_bundle_sha256 != bundle_sha256
@@ -1306,14 +1549,15 @@ def build_subset_manifest(
     ):
         raise ValueError("verified parity differs from the authenticated identity graph")
 
+    # Candidates are exported from the committed tree, not copied from the
+    # checkout.  Seal those exact Git blob bytes here as well: a Windows
+    # checkout may materialize CRLF while the exported candidate uses the
+    # committed LF blob, and hashing the checkout would make every policy
+    # scope fail before the first authorized role call.
     source_texts: dict[str, str] = {}
     source_sha256s: list[tuple[str, str]] = []
     for relative in _POLICY_EDITABLE_PATHS:
-        source_file = _resolved_file(source / Path(relative), f"policy source {relative}")
-        try:
-            text = source_file.read_bytes().decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("policy source must be UTF-8 text") from exc
+        text = _committed_policy_source_text(source, relative)
         source_texts[relative] = text
         source_sha256s.append((relative, hashlib.sha256(text.encode("utf-8")).hexdigest()))
 
@@ -1405,16 +1649,16 @@ def build_subset_manifest(
         candidate_bounds=candidate_bounds,
         call_budgets=call_budgets,
         max_iterations=max_iterations,
-        non_improving_limit=3,
+        non_improving_limit=max_iterations,
         authorization_requirement=authorization,
     )
 
 
 def write_optimizer_manifest(
-    manifest: PitOptimizerRunManifest,
+    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
     output: Path,
 ) -> tuple[Path, str]:
-    if not isinstance(manifest, PitOptimizerRunManifest):
+    if not isinstance(manifest, (PitOptimizerRunManifest, PitOptimizerRunManifestV4)):
         raise ValueError("optimizer manifest writer requires a closed manifest")
     path = Path(output)
     if not path.is_absolute():
@@ -1476,8 +1720,8 @@ def build_prepare_command(
     if _sha256_file(baseline_manifest) != manifest.baseline_manifest_sha256:
         raise ValueError("baseline run differs from manifest")
     for relative, expected_sha256 in manifest.policy_source_sha256s:
-        path = _resolved_file(repository / relative, f"policy source {relative}")
-        if _sha256_file(path) != expected_sha256:
+        source_text = _committed_policy_source_text(repository, relative)
+        if hashlib.sha256(source_text.encode("utf-8")).hexdigest() != expected_sha256:
             raise ValueError("repository policy source differs from manifest")
     if sandbox_image != manifest.sandbox_image:
         raise ValueError("prepare sandbox image differs from manifest")
@@ -2447,7 +2691,11 @@ class InvestigatorArtifact(_V2Canonical):
         _v2_identifier(self.hypothesis_id, "investigator hypothesis ID")
         if self.family not in _INVESTIGATOR_FAMILIES:
             raise ValueError("investigator family is invalid")
-        _v2_string_tuple(self.evidence_ids, "investigator evidence IDs")
+        _v2_string_tuple(
+            self.evidence_ids,
+            "investigator evidence IDs",
+            allow_empty=True,
+        )
         _v2_text(self.causal_rationale, "investigator causal rationale")
         _v2_string_tuple(self.target_paths, "investigator target paths")
         _v2_string_tuple(self.target_symbols, "investigator target symbols")
@@ -2459,13 +2707,18 @@ class InvestigatorArtifact(_V2Canonical):
         _v2_string_tuple(
             self.expected_diagnostic_changes,
             "investigator expected diagnostic changes",
+            allow_empty=True,
         )
         _v2_string_tuple(
             self.known_risks,
             "investigator known risks",
             allow_empty=True,
         )
-        _v2_string_tuple(self.author_instructions, "investigator author instructions")
+        _v2_string_tuple(
+            self.author_instructions,
+            "investigator author instructions",
+            allow_empty=True,
+        )
         if len(self.canonical_json_bytes()) > MAX_INVESTIGATOR_ARTIFACT_BYTES:
             raise ValueError("investigator artifact exceeds its byte cap")
 
@@ -2484,44 +2737,59 @@ class InvestigatorArtifact(_V2Canonical):
                     "family",
                     "evidence_ids",
                     "causal_rationale",
-                    "target_paths",
-                    "target_symbols",
                     "expected_diagnostic_changes",
                     "known_risks",
                     "author_instructions",
                 }
             ),
             max_total_bytes=max_total_bytes,
+            optional_keys=frozenset({"target_paths", "target_symbols"}),
         )
-        family = _v2_text(value["family"], "investigator family")
+        family = (
+            _v2_response_text(value["family"], "investigator family")
+            .casefold()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        family = {
+            "entries": "entry",
+            "entry_policy": "entry",
+            "exits": "exit",
+            "exit_policy": "exit",
+            "risk": "risk_sizing",
+            "sizing": "risk_sizing",
+            "risk_management": "risk_sizing",
+        }.get(family, family)
         if family not in _INVESTIGATOR_FAMILIES:
             raise ValueError("investigator family is invalid")
+        target_paths, target_symbols = _controller_scope_for_family(family)
         return cls(
-            hypothesis_id=_v2_identifier(
+            hypothesis_id=_v2_response_identifier(
                 value["hypothesis_id"], "investigator hypothesis ID"
             ),
             family=family,
-            evidence_ids=_v2_string_list(
-                value["evidence_ids"], "investigator evidence IDs"
+            evidence_ids=_v2_response_string_list(
+                value["evidence_ids"],
+                "investigator evidence IDs",
+                allow_empty=True,
             ),
-            causal_rationale=_v2_text(
+            causal_rationale=_v2_response_text(
                 value["causal_rationale"], "investigator causal rationale"
             ),
-            target_paths=_v2_string_list(
-                value["target_paths"], "investigator target paths"
-            ),
-            target_symbols=_v2_string_list(
-                value["target_symbols"], "investigator target symbols"
-            ),
-            expected_diagnostic_changes=_v2_string_list(
+            target_paths=target_paths,
+            target_symbols=target_symbols,
+            expected_diagnostic_changes=_v2_response_string_list(
                 value["expected_diagnostic_changes"],
                 "investigator expected diagnostic changes",
+                allow_empty=True,
             ),
-            known_risks=_v2_string_list(
+            known_risks=_v2_response_string_list(
                 value["known_risks"], "investigator known risks", allow_empty=True
             ),
-            author_instructions=_v2_string_list(
-                value["author_instructions"], "investigator author instructions"
+            author_instructions=_v2_response_string_list(
+                value["author_instructions"],
+                "investigator author instructions",
+                allow_empty=True,
             ),
         )
 
@@ -2565,6 +2833,8 @@ class AuthorArtifact(_V2Canonical):
         *,
         max_diff_bytes: int,
         max_total_bytes: int,
+        controller_paths: tuple[str, ...] | None = None,
+        controller_symbols: tuple[str, ...] | None = None,
     ) -> "AuthorArtifact":
         if (
             type(max_diff_bytes) is not int
@@ -2578,39 +2848,69 @@ class AuthorArtifact(_V2Canonical):
                 {
                     "hypothesis_id",
                     "behavioral_summary",
-                    "changed_paths",
-                    "changed_symbols",
                     "unified_diff",
                     "assumptions",
                     "validation_suggestions",
                 }
             ),
             max_total_bytes=max_total_bytes,
+            optional_keys=frozenset({"changed_paths", "changed_symbols"}),
         )
         unified_diff = _v2_blob(
             value["unified_diff"], "author diff", max_bytes=max_diff_bytes
         )
-        non_diff = {**value, "unified_diff": ""}
+        if (controller_paths is None) != (controller_symbols is None):
+            raise ValueError("author controller scope is incomplete")
+        if controller_paths is None:
+            try:
+                changed_paths = _v2_string_list(
+                    value["changed_paths"], "author changed paths"
+                )
+                changed_symbols = _v2_string_list(
+                    value["changed_symbols"], "author changed symbols"
+                )
+            except KeyError as exc:
+                raise ValueError("author controller scope is required") from exc
+        else:
+            changed_paths = _v2_string_tuple(
+                controller_paths, "author controller paths"
+            )
+            changed_symbols = _v2_string_tuple(
+                controller_symbols, "author controller symbols"
+            )
+        hypothesis_id = _v2_response_identifier(
+            value["hypothesis_id"], "author hypothesis ID"
+        )
+        behavioral_summary = _v2_response_text(
+            value["behavioral_summary"], "author behavioral summary"
+        )
+        assumptions = _v2_response_string_list(
+            value["assumptions"], "author assumptions", allow_empty=True
+        )
+        validation_suggestions = _v2_response_string_list(
+            value["validation_suggestions"],
+            "author validation suggestions",
+            allow_empty=True,
+        )
+        non_diff = {
+            "hypothesis_id": hypothesis_id,
+            "behavioral_summary": behavioral_summary,
+            "changed_paths": list(changed_paths),
+            "changed_symbols": list(changed_symbols),
+            "unified_diff": "",
+            "assumptions": list(assumptions),
+            "validation_suggestions": list(validation_suggestions),
+        }
         if len(_v2_canonical_bytes(non_diff)) > MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES:
             raise ValueError("author non-diff artifact exceeds its byte cap")
         return cls(
-            hypothesis_id=_v2_identifier(value["hypothesis_id"], "author hypothesis ID"),
-            behavioral_summary=_v2_text(
-                value["behavioral_summary"], "author behavioral summary"
-            ),
-            changed_paths=_v2_string_list(value["changed_paths"], "author changed paths"),
-            changed_symbols=_v2_string_list(
-                value["changed_symbols"], "author changed symbols"
-            ),
+            hypothesis_id=hypothesis_id,
+            behavioral_summary=behavioral_summary,
+            changed_paths=changed_paths,
+            changed_symbols=changed_symbols,
             unified_diff=unified_diff,
-            assumptions=_v2_string_list(
-                value["assumptions"], "author assumptions", allow_empty=True
-            ),
-            validation_suggestions=_v2_string_list(
-                value["validation_suggestions"],
-                "author validation suggestions",
-                allow_empty=True,
-            ),
+            assumptions=assumptions,
+            validation_suggestions=validation_suggestions,
         )
 
 
@@ -2630,7 +2930,9 @@ class CriticArtifact(_V2Canonical):
             "critic prediction versus observation",
         )
         _v2_text(self.causal_explanation, "critic causal explanation")
-        _v2_string_tuple(self.evidence_ids, "critic evidence IDs")
+        _v2_string_tuple(
+            self.evidence_ids, "critic evidence IDs", allow_empty=True
+        )
         if self.disposition not in _CRITIC_DISPOSITIONS:
             raise ValueError("critic disposition is invalid")
         _v2_text(self.next_direction, "critic next direction")
@@ -2658,21 +2960,39 @@ class CriticArtifact(_V2Canonical):
             ),
             max_total_bytes=max_total_bytes,
         )
-        disposition = _v2_text(value["disposition"], "critic disposition")
+        disposition = (
+            _v2_response_text(value["disposition"], "critic disposition")
+            .casefold()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        disposition = {
+            "revise": "refine",
+            "retry": "refine",
+            "reject": "abandon",
+            "switch": "change_family",
+            "switch_family": "change_family",
+        }.get(disposition, disposition)
         if disposition not in _CRITIC_DISPOSITIONS:
             raise ValueError("critic disposition is invalid")
         return cls(
-            hypothesis_id=_v2_identifier(value["hypothesis_id"], "critic hypothesis ID"),
-            prediction_vs_observation=_v2_text(
+            hypothesis_id=_v2_response_identifier(
+                value["hypothesis_id"], "critic hypothesis ID"
+            ),
+            prediction_vs_observation=_v2_response_text(
                 value["prediction_vs_observation"],
                 "critic prediction versus observation",
             ),
-            causal_explanation=_v2_text(
+            causal_explanation=_v2_response_text(
                 value["causal_explanation"], "critic causal explanation"
             ),
-            evidence_ids=_v2_string_list(value["evidence_ids"], "critic evidence IDs"),
+            evidence_ids=_v2_response_string_list(
+                value["evidence_ids"], "critic evidence IDs", allow_empty=True
+            ),
             disposition=disposition,
-            next_direction=_v2_text(value["next_direction"], "critic next direction"),
+            next_direction=_v2_response_text(
+                value["next_direction"], "critic next direction"
+            ),
         )
 
 
@@ -2995,8 +3315,6 @@ class CandidateComparisonSummary(_V2Canonical):
         ids = tuple(item.metric_id for item in self.diagnostics)
         if len(ids) != len(set(ids)):
             raise ValueError("candidate comparison diagnostic IDs must be unique")
-        if len(self.canonical_json_bytes()) > MAX_CANDIDATE_COMPARISON_BYTES:
-            raise ValueError("candidate comparison exceeds its byte cap")
 
 
 def candidate_comparison_from_fixed_baseline(
@@ -3070,6 +3388,7 @@ class IterationFeedbackSummary(_V2Canonical):
     family: str
     author_summary: str
     validation_code: str
+    candidate_folds: tuple[FoldAggregateSummary, ...]
     discovery_score: DiscoveryScore | None
     critic_disposition: str
     critic_next_direction: str
@@ -3082,6 +3401,19 @@ class IterationFeedbackSummary(_V2Canonical):
             raise ValueError("feedback family is invalid")
         _v2_text(self.author_summary, "feedback author summary")
         _v2_identifier(self.validation_code, "feedback validation code")
+        if (
+            type(self.candidate_folds) is not tuple
+            or len(self.candidate_folds) not in {0, 2}
+            or any(
+                not isinstance(item, FoldAggregateSummary)
+                for item in self.candidate_folds
+            )
+        ):
+            raise ValueError("feedback candidate folds are invalid")
+        if self.candidate_folds and tuple(
+            item.fold_id for item in self.candidate_folds
+        ) != ("discovery_1", "discovery_2"):
+            raise ValueError("feedback candidate fold identities are invalid")
         if self.discovery_score is not None and not isinstance(
             self.discovery_score, DiscoveryScore
         ):
@@ -3193,15 +3525,11 @@ class AuthorInput(_V2Canonical):
     def validate_artifact(self, artifact: AuthorArtifact) -> None:
         if not isinstance(artifact, AuthorArtifact):
             raise ValueError("author response has an invalid type")
-        if artifact.hypothesis_id != self.investigator.hypothesis_id:
-            raise ValueError("author hypothesis differs from investigator")
-        _resulting_texts, stats = _apply_unified_diff(
-            {record.path: record.text for record in self.source_bundle.files},
-            artifact.unified_diff,
-            bounds=self.candidate_bounds,
-        )
-        if stats.paths != artifact.changed_paths:
-            raise ValueError("author changed paths differ from candidate unified diff")
+        # The closed response parser validates artifact shape.  Applicability,
+        # scope, and identity are derived later from the authenticated Git
+        # checkout, which is the sole authority for candidate acceptance.
+        # Reapplying a text diff here can change line-ending semantics and
+        # reject a proposal Git correctly accepts.
 
 
 @dataclass(frozen=True, slots=True)
@@ -3395,6 +3723,7 @@ def render_worst_iteration_two_role_inputs(
             family="entry",
             author_summary="a" + maximized(count),
             validation_code="valid",
+            candidate_folds=folds,
             discovery_score=None,
             critic_disposition="refine",
             critic_next_direction="next",
@@ -3434,14 +3763,11 @@ def render_worst_iteration_two_role_inputs(
         original_baseline_sha256=synthetic_baseline_sha256,
         expected_original_baseline_sha256=synthetic_baseline_sha256,
     )
-    comparison = maximize_contract(
-        lambda count: CandidateComparisonSummary(
-            folds=folds,
-            score=comparison_score,
-            diagnostics=(AggregateMetric("d" + maximized(count), 1),),
-            _controller_seal=_CANDIDATE_COMPARISON_SEAL,
-        ),
-        MAX_CANDIDATE_COMPARISON_BYTES,
+    comparison = CandidateComparisonSummary(
+        folds=folds,
+        score=comparison_score,
+        diagnostics=(),
+        _controller_seal=_CANDIDATE_COMPARISON_SEAL,
     )
     validation = _successful_candidate_validation()
     dynamic_values = {
@@ -3609,8 +3935,6 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                 "family",
                 "evidence_ids",
                 "causal_rationale",
-                "target_paths",
-                "target_symbols",
                 "expected_diagnostic_changes",
                 "known_risks",
                 "author_instructions",
@@ -3637,22 +3961,6 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                     min_length=1,
                     description="A concise causal explanation grounded in the supplied aggregates.",
                 ),
-                "target_paths": _v2_scoped_name_list_schema(
-                    _POLICY_EDITABLE_PATHS,
-                    "Editable policy paths selected from the supplied source scope.",
-                ),
-                "target_symbols": _v2_scoped_name_list_schema(
-                    tuple(
-                        sorted(
-                            {
-                                symbol
-                                for symbols in _POLICY_DECLARED_SYMBOLS.values()
-                                for symbol in symbols
-                            }
-                        )
-                    ),
-                    "Declared policy symbols selected from the supplied source scope.",
-                ),
                 "expected_diagnostic_changes": _v2_compact_text_list_schema(
                     "Concrete aggregate diagnostics expected to change if the hypothesis is right."
                 ),
@@ -3671,8 +3979,6 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
             "required": [
                 "hypothesis_id",
                 "behavioral_summary",
-                "changed_paths",
-                "changed_symbols",
                 "unified_diff",
                 "assumptions",
                 "validation_suggestions",
@@ -3685,23 +3991,6 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                     max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
                     min_length=1,
                     description="A concise summary of the resulting policy behavior.",
-                ),
-                "changed_paths": _v2_scoped_name_list_schema(
-                    _POLICY_EDITABLE_PATHS,
-                    "Editable paths changed by unified_diff.",
-                    max_items=3,
-                ),
-                "changed_symbols": _v2_scoped_name_list_schema(
-                    tuple(
-                        sorted(
-                            {
-                                symbol
-                                for symbols in _POLICY_DECLARED_SYMBOLS.values()
-                                for symbol in symbols
-                            }
-                        )
-                    ),
-                    "Declared symbols changed by unified_diff.",
                 ),
                 "unified_diff": {
                     "type": "string",
@@ -3748,11 +4037,14 @@ _V2_RESPONSE_SCHEMAS = MappingProxyType(
                 ),
                 "evidence_ids": _v2_list_schema(
                     max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
-                    min_items=1,
+                    min_items=0,
                     items=_v2_identifier_schema(
                         "An evidence ID copied verbatim from the supplied aggregate evidence."
                     ),
-                    description="Unique aggregate-evidence IDs supporting the critique.",
+                    description=(
+                        "Unique aggregate-evidence IDs supporting the critique; use [] "
+                        "when local validation supplies no candidate comparison."
+                    ),
                 ),
                 "disposition": {
                     "type": "string",
@@ -3789,3 +4081,2245 @@ def pit_optimizer_response_format(role: str) -> dict[str, object]:
             "schema": json.loads(json.dumps(schema, separators=(",", ":"))),
         },
     }
+
+
+# Schema v4 is deliberately additive.  The schema-v3 contracts, prompts, and
+# loader above authenticate historical audit material byte-for-byte; live v4
+# callers use only the versioned contracts below and cannot reinterpret v3.
+OPTIMIZER_V4_ROLES = OPTIMIZER_V2_ROLES
+_V4_FOCUS_AREAS = ("entry", "risk_sizing", "exit")
+_V4_PARENT_KINDS = ("baseline", "champion", "branch")
+_V4_CRITIC_DISPOSITIONS = ("promote", "refine", "abandon")
+_V4_VALIDATION_STATUSES = ("not_evaluated", "valid", "invalid")
+_V4_VALIDATION_FAILURE_CODES = frozenset(
+    {
+        "author_output_invalid",
+        "source_invalid",
+        "syntax_failed",
+        "imports_failed",
+        "purity_failed",
+        "determinism_failed",
+        "worker_failed",
+        "typed_decision_invalid",
+        "runtime_invalid",
+        "evaluation_failed",
+    }
+)
+
+
+def _v4_utf8_bytes(value: object, field: str) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be UTF-8 text")
+    try:
+        return value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field} must be valid UTF-8 text") from exc
+
+
+def _v4_text(value: object, field: str, *, allow_empty: bool = False) -> str:
+    _v4_utf8_bytes(value, field)
+    return _v2_text(value, field, allow_empty=allow_empty)
+
+
+def _v4_bounded_text(value: object, field: str, *, max_chars: int) -> str:
+    text = _v4_text(value, field)
+    if len(text) > max_chars:
+        raise ValueError(f"{field} exceeds {max_chars} characters")
+    return text
+
+
+def _v4_response_bounded_text(value: object, field: str, *, max_chars: int) -> str:
+    """Canonicalize harmless response whitespace inside the outer byte cap."""
+
+    _v4_utf8_bytes(value, field)
+    text = _v2_response_text(value, field)
+    if len(text) > max_chars:
+        raise ValueError(f"{field} exceeds {max_chars} characters")
+    return text
+
+
+def _v4_response_text_value(
+    value: object,
+    field: str,
+    *,
+    max_chars: int,
+    allow_empty: bool = False,
+) -> str:
+    """Preserve bounded semantic content even when a reasoner structures it."""
+
+    if value is None and allow_empty:
+        return ""
+    if not isinstance(value, str):
+        if isinstance(value, (dict, list)):
+            value = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        else:
+            raise ValueError(f"{field} must be text or structured JSON")
+    if not value.strip() and allow_empty:
+        return ""
+    return _v4_response_bounded_text(value, field, max_chars=max_chars)
+
+
+def _v4_response_identifier(value: object, field: str) -> str:
+    _v4_utf8_bytes(value, field)
+    return _v2_response_identifier(value, field)
+
+
+def _v4_source_text(value: object, field: str) -> str:
+    encoded = _v4_utf8_bytes(value, field)
+    assert isinstance(value, str)
+    if not value or not value.endswith("\n"):
+        raise ValueError(f"{field} must end with LF")
+    if "\r" in value or "\x00" in value:
+        raise ValueError(f"{field} must be LF-only text without NUL")
+    # Round-tripping catches any future encoder-policy drift explicitly.
+    if encoded.decode("utf-8", errors="strict") != value:
+        raise ValueError(f"{field} must be valid UTF-8 text")
+    return value
+
+
+def _v4_normalize_source_text(value: object, field: str) -> str:
+    """Canonicalize harmless model-authored policy-source line endings."""
+
+    _v4_utf8_bytes(value, field)
+    assert isinstance(value, str)
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+    return _v4_source_text(normalized, field)
+
+
+def _parse_v4_closed_object(
+    raw: str,
+    keys: frozenset[str],
+    *,
+    max_total_bytes: int,
+    optional_keys: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    if type(max_total_bytes) is not int or max_total_bytes <= 0:
+        raise ValueError("provider payload byte cap is invalid")
+    encoded = _v4_utf8_bytes(raw, "provider payload")
+    if len(encoded) > max_total_bytes:
+        raise ValueError("provider payload is not bounded JSON text")
+    try:
+        value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("provider payload is malformed JSON") from exc
+    if not optional_keys.issubset(keys):
+        raise ValueError("provider payload optional keys are invalid")
+    if not isinstance(value, dict) or not (keys - optional_keys).issubset(value):
+        raise ValueError("provider payload has invalid keys")
+    # Reasoning models often add an explanatory metadata key even in JSON mode.
+    # The local artifact keeps only the recognized semantic fields, so harmless
+    # extras neither widen authority nor invalidate otherwise usable work.
+    return {key: value[key] for key in keys if key in value}
+
+
+def _v4_response_list(
+    value: object,
+    field: str,
+    *,
+    allow_empty: bool,
+    max_items: int = MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
+    max_item_chars: int = MAX_INVESTIGATOR_LIST_ITEM_CHARS,
+) -> tuple[str, ...]:
+    if value is None and allow_empty:
+        return ()
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if type(value) is not list:
+        raise ValueError(f"{field} must be text or a JSON array")
+    if len(value) > max_items:
+        raise ValueError(f"{field} may contain at most {max_items} items")
+    normalized_items: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        normalized = _v4_response_text_value(
+            item,
+            field,
+            max_chars=max_item_chars,
+            allow_empty=True,
+        )
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_items.append(normalized)
+    normalized = tuple(normalized_items)
+    if not allow_empty and not normalized:
+        raise ValueError(f"{field} cannot be empty")
+    return normalized
+
+
+def _v4_response_ids(value: object, field: str) -> tuple[str, ...]:
+    # Evidence references are advisory citations into supplied aggregate data.
+    # Panel digests may begin with a digit, so identifier grammar is the wrong
+    # constraint; bounded canonical text preserves exact controller-provided refs.
+    return _v4_response_list(
+        value,
+        field,
+        allow_empty=True,
+        max_item_chars=128,
+    )
+
+
+def _v4_focus_areas(value: object, field: str) -> tuple[str, ...]:
+    parsed = _v4_response_list(value, field, allow_empty=True, max_items=16)
+    aliases = {
+        "entry": "entry",
+        "entries": "entry",
+        "entry_quality": "entry",
+        "buy": "entry",
+        "buying": "entry",
+        "breakout": "entry",
+        "leadership": "entry",
+        "risk": "risk_sizing",
+        "risk_management": "risk_sizing",
+        "risk_sizing": "risk_sizing",
+        "sizing": "risk_sizing",
+        "position_sizing": "risk_sizing",
+        "allocation": "risk_sizing",
+        "capacity": "risk_sizing",
+        "exit": "exit",
+        "exits": "exit",
+        "sell": "exit",
+        "selling": "exit",
+        "retention": "exit",
+        "winner_retention": "exit",
+    }
+    normalized: set[str] = set()
+    for item in parsed:
+        key = re.sub(r"[^a-z0-9]+", "_", item.casefold()).strip("_")
+        mapped = aliases.get(key)
+        if mapped is not None:
+            normalized.add(mapped)
+    # Focus labels are advisory routing hints, not permissions.  An unfamiliar
+    # but useful strategy mechanism should broaden review, not discard the plan.
+    if not normalized:
+        return _V4_FOCUS_AREAS
+    return tuple(item for item in _V4_FOCUS_AREAS if item in normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorSourceFile(_V2Canonical):
+    """One complete UTF-8/LF policy source bound to its repository path."""
+
+    path: str
+    source_sha256: str
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.path not in _POLICY_EDITABLE_PATHS:
+            raise ValueError("author source path is outside the editable scope")
+        _v4_source_text(self.source, f"author source {self.path}")
+        _require_digest(self.source_sha256, "author source SHA-256")
+        if hashlib.sha256(self.source.encode("utf-8")).hexdigest() != self.source_sha256:
+            raise ValueError("author source SHA-256 differs from its text")
+
+    @classmethod
+    def from_source(cls, *, path: str, source: str) -> "AuthorSourceFile":
+        source = _v4_normalize_source_text(source, f"author source {path}")
+        return cls(
+            path=path,
+            source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            source=source,
+        )
+
+
+def _validate_v4_source_files(
+    policy_sources: tuple[AuthorSourceFile, ...],
+    field: str,
+) -> None:
+    if (
+        type(policy_sources) is not tuple
+        or len(policy_sources) != len(_POLICY_EDITABLE_PATHS)
+        or any(not isinstance(item, AuthorSourceFile) for item in policy_sources)
+        or tuple(item.path for item in policy_sources) != _POLICY_EDITABLE_PATHS
+    ):
+        raise ValueError(f"{field} must contain exactly the three editable paths")
+
+
+def policy_source_bundle_v4_bytes(
+    policy_sources: tuple[AuthorSourceFile, ...],
+) -> bytes:
+    """Return the exact escaped canonical source-context envelope."""
+
+    _validate_v4_source_files(policy_sources, "policy source bundle")
+    return _v2_canonical_bytes(
+        {
+            "policy_interface_version": 2,
+            "files": policy_sources,
+        }
+    )
+
+
+def policy_source_bundle_v4_sha256(
+    policy_sources: tuple[AuthorSourceFile, ...],
+) -> str:
+    return hashlib.sha256(policy_source_bundle_v4_bytes(policy_sources) + b"\n").hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedParentIdentity(_V2Canonical):
+    schema_version: int
+    parent_kind: str
+    parent_id: str
+    source_head: str
+    policy_interface_version: int
+    policy_source_sha256s: tuple[tuple[str, str], ...]
+    source_bundle_sha256: str
+    parent_identity_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 4:
+            raise ValueError("selected parent schema is unsupported")
+        if self.parent_kind not in _V4_PARENT_KINDS:
+            raise ValueError("selected parent kind is invalid")
+        _v2_identifier(self.parent_id, "selected parent ID")
+        if re.fullmatch(r"[0-9a-f]{40}", self.source_head or "") is None:
+            raise ValueError("selected parent source HEAD is invalid")
+        if self.policy_interface_version != 2:
+            raise ValueError("selected parent policy interface must be 2")
+        if (
+            type(self.policy_source_sha256s) is not tuple
+            or tuple(path for path, _digest in self.policy_source_sha256s)
+            != _POLICY_EDITABLE_PATHS
+        ):
+            raise ValueError("selected parent source identities are invalid")
+        for path, digest in self.policy_source_sha256s:
+            if path not in _POLICY_EDITABLE_PATHS:
+                raise ValueError("selected parent source path is invalid")
+            _require_digest(digest, "selected parent policy source SHA-256")
+        _require_digest(self.source_bundle_sha256, "selected parent source bundle SHA-256")
+        _require_digest(self.parent_identity_sha256, "selected parent identity SHA-256")
+        expected = _v2_digest(
+            {
+                "schema_version": self.schema_version,
+                "parent_kind": self.parent_kind,
+                "parent_id": self.parent_id,
+                "source_head": self.source_head,
+                "policy_interface_version": self.policy_interface_version,
+                "policy_source_sha256s": self.policy_source_sha256s,
+                "source_bundle_sha256": self.source_bundle_sha256,
+            }
+        )
+        if self.parent_identity_sha256 != expected:
+            raise ValueError("selected parent identity is not self-authenticating")
+
+    @classmethod
+    def issue(
+        cls,
+        *,
+        parent_kind: str,
+        parent_id: str,
+        source_head: str,
+        policy_sources: tuple[AuthorSourceFile, ...],
+    ) -> "SelectedParentIdentity":
+        _validate_v4_source_files(policy_sources, "selected parent sources")
+        values = {
+            "schema_version": 4,
+            "parent_kind": parent_kind,
+            "parent_id": parent_id,
+            "source_head": source_head,
+            "policy_interface_version": 2,
+            "policy_source_sha256s": tuple(
+                (item.path, item.source_sha256) for item in policy_sources
+            ),
+            "source_bundle_sha256": policy_source_bundle_v4_sha256(policy_sources),
+        }
+        return cls(**values, parent_identity_sha256=_v2_digest(values))
+
+    def validate_sources(self, policy_sources: tuple[AuthorSourceFile, ...]) -> None:
+        _validate_v4_source_files(policy_sources, "selected parent sources")
+        if tuple(
+            (item.path, item.source_sha256) for item in policy_sources
+        ) != self.policy_source_sha256s or (
+            policy_source_bundle_v4_sha256(policy_sources)
+            != self.source_bundle_sha256
+        ):
+            raise ValueError("selected parent source digest differs from its identity")
+
+
+def _validate_v4_call_plan(
+    call_budgets: tuple[PitOptimizerCallBudget, ...],
+    *,
+    max_iterations: int,
+) -> None:
+    _require_positive_int(max_iterations, "optimizer v4 iteration cap")
+    if (
+        type(call_budgets) is not tuple
+        or len(call_budgets) != 3 * max_iterations
+        or any(not isinstance(item, PitOptimizerCallBudget) for item in call_budgets)
+    ):
+        raise ValueError("optimizer v4 call plan is incomplete")
+    expected = tuple(
+        ((iteration - 1) * 3 + ordinal, iteration, role)
+        for iteration in range(1, max_iterations + 1)
+        for ordinal, role in enumerate(OPTIMIZER_V4_ROLES, start=1)
+    )
+    if tuple(
+        (item.call_index, item.iteration, item.role) for item in call_budgets
+    ) != expected:
+        raise ValueError("optimizer v4 call order is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyAuthoringScopeV4(_V2Canonical):
+    """Authenticated schema-v4 authoring scope.
+
+    The feedback/history fields are legacy advisory allocations retained for
+    schema-v4 compatibility.  The exact canonical per-call dynamic payload cap
+    in ``call_budgets`` is the authoritative transmitted-context limit.
+    """
+
+    schema_version: int
+    policy_interface_version: int
+    initial_policy_source_sha256s: tuple[tuple[str, str], ...]
+    initial_source_bundle_sha256: str
+    canonical_source_bundle_bytes: int
+    editable_paths: tuple[str, ...]
+    max_iteration_feedback_bytes: int
+    max_iteration_history_bytes: int
+    author_response_headroom_bytes: int
+    call_budgets: tuple[PitOptimizerCallBudget, ...]
+    allowed_descendant_rule: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 4:
+            raise ValueError("policy authoring scope schema is unsupported")
+        if self.policy_interface_version != 2:
+            raise ValueError("policy authoring scope interface must be 2")
+        if self.editable_paths != _POLICY_EDITABLE_PATHS:
+            raise ValueError("policy authoring scope editable paths are invalid")
+        if (
+            type(self.initial_policy_source_sha256s) is not tuple
+            or tuple(path for path, _digest in self.initial_policy_source_sha256s)
+            != self.editable_paths
+        ):
+            raise ValueError("policy authoring scope initial identities are invalid")
+        for _path, digest in self.initial_policy_source_sha256s:
+            _require_digest(digest, "policy authoring scope source SHA-256")
+        _require_digest(
+            self.initial_source_bundle_sha256,
+            "policy authoring scope bundle SHA-256",
+        )
+        for name in (
+            "canonical_source_bundle_bytes",
+            "max_iteration_feedback_bytes",
+            "max_iteration_history_bytes",
+            "author_response_headroom_bytes",
+        ):
+            _require_positive_int(getattr(self, name), f"policy authoring scope {name}")
+        if self.allowed_descendant_rule != "authenticated_parent_plus_atomic_full_sources":
+            raise ValueError("policy authoring scope descendant rule is invalid")
+        if not self.call_budgets:
+            raise ValueError("policy authoring scope call plan is absent")
+        max_iterations = max(item.iteration for item in self.call_budgets)
+        _validate_v4_call_plan(self.call_budgets, max_iterations=max_iterations)
+        for budget in self.call_budgets:
+            if budget.role == "author" and budget.max_response_bytes < (
+                self.canonical_source_bundle_bytes
+                + self.author_response_headroom_bytes
+            ):
+                raise ValueError("author response cap lacks declared source headroom")
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        policy_sources: tuple[AuthorSourceFile, ...],
+        call_budgets: tuple[PitOptimizerCallBudget, ...],
+        max_iteration_feedback_bytes: int,
+        max_iteration_history_bytes: int,
+        author_response_headroom_bytes: int,
+    ) -> "PolicyAuthoringScopeV4":
+        envelope = policy_source_bundle_v4_bytes(policy_sources)
+        return cls(
+            schema_version=4,
+            policy_interface_version=2,
+            initial_policy_source_sha256s=tuple(
+                (item.path, item.source_sha256) for item in policy_sources
+            ),
+            initial_source_bundle_sha256=hashlib.sha256(envelope + b"\n").hexdigest(),
+            canonical_source_bundle_bytes=len(envelope),
+            editable_paths=_POLICY_EDITABLE_PATHS,
+            max_iteration_feedback_bytes=max_iteration_feedback_bytes,
+            max_iteration_history_bytes=max_iteration_history_bytes,
+            author_response_headroom_bytes=author_response_headroom_bytes,
+            call_budgets=call_budgets,
+            allowed_descendant_rule="authenticated_parent_plus_atomic_full_sources",
+        )
+
+    @property
+    def sha256(self) -> str:
+        return _v2_digest(self)
+
+
+@dataclass(frozen=True, slots=True)
+class PitOptimizerRunManifestV4(_V2Canonical):
+    schema_version: int
+    campaign_id: str
+    campaign_sequence: int
+    model: str
+    source_head: str
+    source_fingerprint_sha256: str
+    source_clean: bool
+    policy_interface_version: int
+    pit_bundle_sha256: str
+    discovery_panel_plan_sha256: str
+    quick_panel_sha256: str
+    discovery_panel_sha256: str
+    qualification_plan_sha256: str
+    annualized_return_target: AnnualizedReturnTarget
+    seed_checkpoint_sha256: str | None
+    editable_paths: tuple[str, ...]
+    policy_authoring_scope: PolicyAuthoringScopeV4
+    immutable_constraints_sha256: str
+    immutable_constraint_ids: tuple[str, ...]
+    sandbox_image: str
+    call_budgets: tuple[PitOptimizerCallBudget, ...]
+    max_iterations: int
+    apply: bool
+    provider_retries: int
+    authorization_requirement: AuthorizationRequirement
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 4:
+            raise ValueError("optimizer v4 manifest schema is unsupported")
+        _v2_identifier(self.campaign_id, "optimizer v4 campaign ID")
+        _require_positive_int(self.campaign_sequence, "optimizer v4 campaign sequence")
+        if self.model != PIT_OPTIMIZER_R1_MODEL:
+            raise ValueError("optimizer v4 model is invalid")
+        if re.fullmatch(r"[0-9a-f]{40}", self.source_head or "") is None:
+            raise ValueError("optimizer v4 source HEAD is invalid")
+        _require_digest(
+            self.source_fingerprint_sha256,
+            "optimizer v4 source fingerprint SHA-256",
+        )
+        if self.source_clean is not True:
+            raise ValueError("optimizer v4 source must be clean")
+        if self.policy_interface_version != 2:
+            raise ValueError("optimizer v4 policy interface must be 2")
+        for value, label in (
+            (self.pit_bundle_sha256, "optimizer v4 PIT bundle SHA-256"),
+            (
+                self.discovery_panel_plan_sha256,
+                "optimizer v4 discovery plan SHA-256",
+            ),
+            (self.quick_panel_sha256, "optimizer v4 quick panel SHA-256"),
+            (
+                self.discovery_panel_sha256,
+                "optimizer v4 discovery panel SHA-256",
+            ),
+            (
+                self.qualification_plan_sha256,
+                "optimizer v4 qualification commitment",
+            ),
+            (
+                self.immutable_constraints_sha256,
+                "optimizer v4 immutable constraints SHA-256",
+            ),
+        ):
+            _require_digest(value, label)
+        if not isinstance(self.annualized_return_target, AnnualizedReturnTarget):
+            raise ValueError("optimizer v4 annualized return target is invalid")
+        if self.seed_checkpoint_sha256 is not None:
+            _require_digest(
+                self.seed_checkpoint_sha256,
+                "optimizer v4 seed checkpoint SHA-256",
+            )
+        if self.editable_paths != _POLICY_EDITABLE_PATHS:
+            raise ValueError("optimizer v4 editable paths are invalid")
+        if not isinstance(self.policy_authoring_scope, PolicyAuthoringScopeV4):
+            raise ValueError("optimizer v4 policy authoring scope is invalid")
+        if (
+            self.policy_authoring_scope.policy_interface_version
+            != self.policy_interface_version
+            or self.policy_authoring_scope.editable_paths != self.editable_paths
+            or self.policy_authoring_scope.call_budgets != self.call_budgets
+        ):
+            raise ValueError("optimizer v4 authoring scope differs from manifest")
+        if self.apply is not False:
+            raise ValueError("optimizer v4 apply must be false")
+        if self.provider_retries != 0:
+            raise ValueError("optimizer v4 provider retries must be zero")
+        if not isinstance(self.authorization_requirement, AuthorizationRequirement):
+            raise ValueError("optimizer v4 authorization requirement is invalid")
+        total_tokens = sum(
+            item.max_input_tokens + item.max_output_tokens
+            for item in self.call_budgets
+        )
+        if (
+            self.authorization_requirement.policy_source_scope_sha256
+            != self.policy_authoring_scope.sha256
+            or self.authorization_requirement.max_calls != len(self.call_budgets)
+            or self.authorization_requirement.max_tokens != total_tokens
+            or self.authorization_requirement.provider_retries
+            != self.provider_retries
+            or self.authorization_requirement.apply != self.apply
+        ):
+            raise ValueError("optimizer v4 authorization requirement differs")
+        _v2_string_tuple(self.immutable_constraint_ids, "optimizer v4 constraint IDs")
+        expected_constraints = hashlib.sha256(
+            _v2_canonical_bytes(self.immutable_constraint_ids) + b"\n"
+        ).hexdigest()
+        if self.immutable_constraints_sha256 != expected_constraints:
+            raise ValueError("optimizer v4 immutable constraint identity differs")
+        if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", self.sandbox_image or "") is None:
+            raise ValueError("optimizer v4 sandbox image must be digest pinned")
+        _validate_v4_call_plan(self.call_budgets, max_iterations=self.max_iterations)
+        if any(item.model != self.model for item in self.call_budgets):
+            raise ValueError("optimizer v4 call model differs from manifest")
+        for budget in self.call_budgets:
+            static_bytes = len(PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[budget.role].encode("utf-8"))
+            static_bytes += len(
+                _v2_canonical_bytes(pit_optimizer_v4_response_format(budget.role))
+            )
+            if static_bytes > budget.max_static_input_bytes:
+                raise ValueError("optimizer v4 static role context exceeds call cap")
+
+    @classmethod
+    def from_discovery_plan(
+        cls,
+        *,
+        campaign_id: str,
+        campaign_sequence: int,
+        source_head: str,
+        source_fingerprint_sha256: str,
+        discovery_panel_plan: DiscoveryPanelPlan,
+        policy_authoring_scope: PolicyAuthoringScopeV4,
+        immutable_constraint_ids: tuple[str, ...],
+        sandbox_image: str,
+        seed_checkpoint_sha256: str | None = None,
+        model: str = PIT_OPTIMIZER_R1_MODEL,
+        apply: bool = False,
+        provider_retries: int = 0,
+        authorization_window_id: str,
+    ) -> "PitOptimizerRunManifestV4":
+        if not isinstance(discovery_panel_plan, DiscoveryPanelPlan):
+            raise ValueError("optimizer v4 discovery plan is invalid")
+        constraint_sha256 = hashlib.sha256(
+            _v2_canonical_bytes(immutable_constraint_ids) + b"\n"
+        ).hexdigest()
+        max_iterations = max(item.iteration for item in policy_authoring_scope.call_budgets)
+        authorization = AuthorizationRequirement(
+            window_id=authorization_window_id,
+            max_calls=len(policy_authoring_scope.call_budgets),
+            max_tokens=sum(
+                item.max_input_tokens + item.max_output_tokens
+                for item in policy_authoring_scope.call_budgets
+            ),
+            policy_source_scope_sha256=policy_authoring_scope.sha256,
+            provider_retries=provider_retries,
+            apply=apply,
+        )
+        result = cls(
+            schema_version=4,
+            campaign_id=campaign_id,
+            campaign_sequence=campaign_sequence,
+            model=model,
+            source_head=source_head,
+            source_fingerprint_sha256=source_fingerprint_sha256,
+            source_clean=True,
+            policy_interface_version=2,
+            pit_bundle_sha256=discovery_panel_plan.pit_bundle_sha256,
+            discovery_panel_plan_sha256=discovery_panel_plan.sha256,
+            quick_panel_sha256=discovery_panel_plan.quick_panel.sha256,
+            discovery_panel_sha256=discovery_panel_plan.discovery_panel.sha256,
+            qualification_plan_sha256=discovery_panel_plan.qualification_plan_sha256,
+            annualized_return_target=discovery_panel_plan.target,
+            seed_checkpoint_sha256=seed_checkpoint_sha256,
+            editable_paths=_POLICY_EDITABLE_PATHS,
+            policy_authoring_scope=policy_authoring_scope,
+            immutable_constraints_sha256=constraint_sha256,
+            immutable_constraint_ids=immutable_constraint_ids,
+            sandbox_image=sandbox_image,
+            call_budgets=policy_authoring_scope.call_budgets,
+            max_iterations=max_iterations,
+            apply=apply,
+            provider_retries=provider_retries,
+            authorization_requirement=authorization,
+        )
+        result.validate_discovery_plan(discovery_panel_plan)
+        return result
+
+    def validate_discovery_plan(self, plan: DiscoveryPanelPlan) -> None:
+        if (
+            not isinstance(plan, DiscoveryPanelPlan)
+            or plan.schema_version != 4
+            or plan.sha256 != self.discovery_panel_plan_sha256
+            or plan.pit_bundle_sha256 != self.pit_bundle_sha256
+            or plan.quick_panel.sha256 != self.quick_panel_sha256
+            or plan.discovery_panel.sha256 != self.discovery_panel_sha256
+            or plan.qualification_plan_sha256 != self.qualification_plan_sha256
+            or plan.target != self.annualized_return_target
+        ):
+            raise ValueError("optimizer v4 discovery plan binding differs")
+
+    @property
+    def sha256(self) -> str:
+        return _v2_digest(self)
+
+
+def _pit_optimizer_manifest_v4_from_primitive(
+    primitive: Mapping[str, object],
+    *,
+    discovery_panel_plan: DiscoveryPanelPlan | None = None,
+) -> PitOptimizerRunManifestV4:
+    expected_keys = {field.name for field in fields(PitOptimizerRunManifestV4)}
+    if not isinstance(primitive, Mapping) or set(primitive) != expected_keys:
+        raise ValueError("optimizer v4 manifest keys are invalid")
+    try:
+        values = dict(primitive)
+        scope_value = values["policy_authoring_scope"]
+        target_value = values["annualized_return_target"]
+        if not isinstance(scope_value, dict) or not isinstance(target_value, dict):
+            raise ValueError("optimizer v4 nested contracts are invalid")
+        scope_keys = {field.name for field in fields(PolicyAuthoringScopeV4)}
+        if set(scope_value) != scope_keys:
+            raise ValueError("optimizer v4 authoring scope keys are invalid")
+        scope = dict(scope_value)
+        scope["initial_policy_source_sha256s"] = tuple(
+            tuple(item) for item in scope["initial_policy_source_sha256s"]
+        )
+        scope["editable_paths"] = tuple(scope["editable_paths"])
+        scope["call_budgets"] = tuple(
+            PitOptimizerCallBudget(**item) for item in scope["call_budgets"]
+        )
+        expected_target = _v2_primitive(AnnualizedReturnTarget.production())
+        if target_value != expected_target:
+            raise ValueError("optimizer v4 target contract is invalid")
+        values["annualized_return_target"] = AnnualizedReturnTarget.production()
+        values["editable_paths"] = tuple(values["editable_paths"])
+        values["policy_authoring_scope"] = PolicyAuthoringScopeV4(**scope)
+        authorization_value = values["authorization_requirement"]
+        if not isinstance(authorization_value, dict):
+            raise ValueError("optimizer v4 authorization requirement is invalid")
+        values["authorization_requirement"] = AuthorizationRequirement(
+            **authorization_value
+        )
+        values["immutable_constraint_ids"] = tuple(
+            values["immutable_constraint_ids"]
+        )
+        values["call_budgets"] = tuple(
+            PitOptimizerCallBudget(**item) for item in values["call_budgets"]
+        )
+        manifest = PitOptimizerRunManifestV4(**values)
+        if discovery_panel_plan is not None:
+            manifest.validate_discovery_plan(discovery_panel_plan)
+        return manifest
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("optimizer v4 manifest closed contract is invalid") from exc
+
+
+def _load_canonical_optimizer_manifest(
+    path: Path,
+    *,
+    expected_sha256: str | None,
+) -> Mapping[str, object]:
+    resolved = _resolved_file(path, "optimizer manifest artifact")
+    raw = resolved.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected_sha256 is not None:
+        _require_digest(expected_sha256, "optimizer manifest expected SHA-256")
+        if digest != expected_sha256:
+            raise ValueError("optimizer manifest digest differs")
+    try:
+        primitive = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("optimizer manifest is invalid JSON") from exc
+    if (
+        not isinstance(primitive, dict)
+        or raw != _v2_canonical_bytes(primitive) + b"\n"
+    ):
+        raise ValueError("optimizer manifest is not canonical JSON")
+    return primitive
+
+
+def load_pit_optimizer_manifest_v3_audit(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> PitOptimizerRunManifest:
+    """Authenticate legacy schema-v3 history; it is not resumable as v4."""
+
+    primitive = _load_canonical_optimizer_manifest(
+        path,
+        expected_sha256=expected_sha256,
+    )
+    if primitive.get("schema_version") != 3:
+        raise ValueError("legacy optimizer audit manifest must use schema 3")
+    return _pit_optimizer_manifest_from_primitive(primitive)
+
+
+def load_pit_optimizer_manifest_v4(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    discovery_panel_plan: DiscoveryPanelPlan | None = None,
+) -> PitOptimizerRunManifestV4:
+    primitive = _load_canonical_optimizer_manifest(
+        path,
+        expected_sha256=expected_sha256,
+    )
+    if primitive.get("schema_version") != 4:
+        raise ValueError("optimizer v4 manifest must use schema 4")
+    return _pit_optimizer_manifest_v4_from_primitive(
+        primitive,
+        discovery_panel_plan=discovery_panel_plan,
+    )
+
+
+PIT_OPTIMIZER_V4_SYSTEM_PROMPTS = MappingProxyType(
+    {
+        "investigator": (
+            "You are the adaptive O'Neil strategy investigator. Diagnose only the supplied "
+            "selected-parent policy sources and aggregate quick/discovery portfolio evidence. "
+            "Propose one focused causal mechanism grounded in O'Neil entry quality, leadership, "
+            "risk sizing, exposure, winner retention, or exit behavior. Return exactly one JSON "
+            "object with exactly these keys and types: hypothesis_id:string; "
+            "focus_areas:array[string] with one to three values chosen from entry, risk_sizing, "
+            "and exit; evidence_ids:nonempty array[string]; causal_rationale:string; "
+            "expected_diagnostic_changes:nonempty array[string]; known_risks:array[string]; and "
+            "author_instructions:nonempty array[string]. No other keys are allowed. "
+            "Use a stable hypothesis_id; it becomes the author and critic binding. Every "
+            "evidence_ids value must be copied exactly from the supplied quick/discovery aggregate "
+            "evidence. The controller canonicalizes focus_areas to entry, risk_sizing, exit order. "
+            "Do not select files, emit patches, request qualification data, or include "
+            "chain-of-thought, credentials, paths outside the supplied repository-relative policy "
+            "scope, raw rows, trades, holdings, or provider accounting. The local closed parser is "
+            "authoritative."
+        ),
+        "author": (
+            "You are the adaptive O'Neil strategy author. Implement the investigator's focused "
+            "mechanism against the authenticated selected parent. Return exactly one JSON object "
+            "with exactly these keys and types: hypothesis_id:string; "
+            "parent_identity_sha256:string; behavioral_summary:string; policy_sources:object; "
+            "assumptions:array[string]; and validation_suggestions:array[string]. No other top-level "
+            "keys are allowed. hypothesis_id must equal the supplied investigator hypothesis_id, "
+            "and parent_identity_sha256 must equal the supplied selected-parent identity exactly. "
+            "policy_sources must contain exactly these three keys, each mapped to a complete UTF-8 "
+            "source string: core/strategy_policy/entry.py, core/strategy_policy/risk.py, and "
+            "core/strategy_policy/exit.py. Include every file, including unchanged files, and "
+            "change at least one file. Line endings and the final newline are normalized locally. "
+            "The authored policy must remain deterministic and causal and must not perform I/O or "
+            "reflection. Do not emit a patch, diff metadata, file-selection metadata, markdown, "
+            "chain-of-thought, credentials, local paths, or hidden/qualification data. The local "
+            "closed parser is authoritative."
+        ),
+        "critic": (
+            "You are the adaptive O'Neil strategy critic. Explain the supplied validation result "
+            "and measured quick/discovery portfolio CAGR behavior relative to the fixed baseline, "
+            "current champion, and target. Return exactly one JSON object with exactly these keys "
+            "and types: hypothesis_id:string; prediction_vs_observation:string; "
+            "causal_explanation:string; evidence_ids:array[string]; "
+            "disposition:string; and next_direction:string. No other keys are allowed. "
+            "hypothesis_id must equal the supplied hypothesis_id exactly. Every evidence_ids value "
+            "must be copied exactly from the supplied validation or panel evidence. disposition "
+            "must be exactly promote, refine, or abandon; it is advisory and cannot override "
+            "metric-owned champion selection. panel_evidence is a lossless columnar table: each "
+            "bindings value selects a zero-based panel column, every columns array uses that same "
+            "order, and each entry_funnel or exit_attribution values array aligns to those columns; "
+            "a null binding means that candidate evidence is absent. Do not request or reproduce "
+            "policy source, raw "
+            "trades, holdings, qualification data, local paths, credentials, provider accounting, "
+            "or chain-of-thought. The local closed parser is authoritative."
+        ),
+    }
+)
+
+
+_V4_RESPONSE_SCHEMAS = MappingProxyType(
+    {
+        "investigator": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "hypothesis_id",
+                "focus_areas",
+                "evidence_ids",
+                "causal_rationale",
+                "expected_diagnostic_changes",
+                "known_risks",
+                "author_instructions",
+            ],
+            "properties": {
+                "hypothesis_id": _v2_identifier_schema(
+                    "A stable lower-case identifier for the focused mechanism."
+                ),
+                "focus_areas": _v2_list_schema(
+                    max_items=3,
+                    min_items=1,
+                    items={"type": "string", "enum": list(_V4_FOCUS_AREAS)},
+                    description="One to three canonical O'Neil policy focus areas.",
+                ),
+                "evidence_ids": _v2_list_schema(
+                    max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
+                    min_items=1,
+                    items=_v2_string_schema(
+                        max_length=128,
+                        min_length=1,
+                    ),
+                ),
+                "causal_rationale": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                ),
+                "expected_diagnostic_changes": _v2_compact_text_list_schema(
+                    "Expected aggregate diagnostic changes."
+                ),
+                "known_risks": _v2_compact_text_list_schema(
+                    "Known aggregate-only risks.", allow_empty=True
+                ),
+                "author_instructions": _v2_compact_text_list_schema(
+                    "Concrete full-source implementation instructions."
+                ),
+            },
+        },
+        "author": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "hypothesis_id",
+                "parent_identity_sha256",
+                "behavioral_summary",
+                "policy_sources",
+                "assumptions",
+                "validation_suggestions",
+            ],
+            "properties": {
+                "hypothesis_id": _v2_identifier_schema(
+                    "The investigator hypothesis ID copied verbatim."
+                ),
+                "parent_identity_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                },
+                "behavioral_summary": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                ),
+                "policy_sources": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": list(_POLICY_EDITABLE_PATHS),
+                    "properties": {
+                        path: {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Complete UTF-8/LF policy source ending in LF.",
+                        }
+                        for path in _POLICY_EDITABLE_PATHS
+                    },
+                },
+                "assumptions": _v2_compact_text_list_schema(
+                    "Optional bounded assumptions.", allow_empty=True
+                ),
+                "validation_suggestions": _v2_compact_text_list_schema(
+                    "Optional bounded local validation suggestions.", allow_empty=True
+                ),
+            },
+        },
+        "critic": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "hypothesis_id",
+                "prediction_vs_observation",
+                "causal_explanation",
+                "evidence_ids",
+                "disposition",
+                "next_direction",
+            ],
+            "properties": {
+                "hypothesis_id": _v2_identifier_schema(
+                    "The investigator hypothesis ID copied verbatim."
+                ),
+                "prediction_vs_observation": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                ),
+                "causal_explanation": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                ),
+                "evidence_ids": _v2_list_schema(
+                    max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
+                    min_items=0,
+                    items=_v2_string_schema(
+                        max_length=128,
+                        min_length=1,
+                    ),
+                ),
+                "disposition": {
+                    "type": "string",
+                    "enum": list(_V4_CRITIC_DISPOSITIONS),
+                },
+                "next_direction": _v2_string_schema(
+                    max_length=MAX_INVESTIGATOR_RATIONALE_CHARS,
+                    min_length=1,
+                ),
+            },
+        },
+    }
+)
+
+
+def pit_optimizer_v4_response_schema(role: str) -> dict[str, object]:
+    """Return a defensive copy of the authoritative local v4 role schema."""
+
+    try:
+        schema = _V4_RESPONSE_SCHEMAS[role]
+    except KeyError as exc:
+        raise ValueError("unknown PIT optimizer v4 role") from exc
+    copied = json.loads(json.dumps(schema, separators=(",", ":"), ensure_ascii=False))
+    if not isinstance(copied, dict):
+        raise AssertionError("optimizer v4 local response schema is not an object")
+    return copied
+
+
+def pit_optimizer_v4_response_format(role: str) -> dict[str, object]:
+    # DeepSeek through OpenRouter accepts generic JSON-object mode.  The local
+    # closed parsers and ``pit_optimizer_v4_response_schema`` remain authoritative.
+    pit_optimizer_v4_response_schema(role)
+    return {"type": "json_object"}
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigatorArtifactV4(_V2Canonical):
+    hypothesis_id: str
+    focus_areas: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    causal_rationale: str
+    expected_diagnostic_changes: tuple[str, ...]
+    known_risks: tuple[str, ...]
+    author_instructions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _v2_identifier(self.hypothesis_id, "investigator v4 hypothesis ID")
+        if self.focus_areas != _v4_focus_areas(
+            list(self.focus_areas), "investigator v4 focus areas"
+        ):
+            raise ValueError("investigator v4 focus areas must be canonical")
+        for name, allow_empty in (
+            ("expected_diagnostic_changes", False),
+            ("known_risks", True),
+            ("author_instructions", False),
+        ):
+            value = getattr(self, name)
+            if type(value) is not tuple:
+                raise ValueError(f"investigator v4 {name} must be a tuple")
+            if value != _v4_response_list(
+                list(value),
+                f"investigator v4 {name}",
+                allow_empty=allow_empty,
+            ):
+                raise ValueError(f"investigator v4 {name} must be canonical")
+        if type(self.evidence_ids) is not tuple or not self.evidence_ids:
+            raise ValueError("investigator v4 evidence IDs must be a non-empty tuple")
+        if self.evidence_ids != _v4_response_ids(
+            list(self.evidence_ids), "investigator v4 evidence IDs"
+        ):
+            raise ValueError("investigator v4 evidence IDs must be canonical")
+        _v4_bounded_text(
+            self.causal_rationale,
+            "investigator v4 causal rationale",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
+        if len(self.canonical_json_bytes()) > MAX_INVESTIGATOR_ARTIFACT_BYTES:
+            raise ValueError("investigator v4 artifact exceeds its byte cap")
+
+    @classmethod
+    def from_json(cls, raw: str, *, max_total_bytes: int) -> "InvestigatorArtifactV4":
+        value = _parse_v4_closed_object(
+            raw,
+            frozenset(
+                {
+                    "hypothesis_id",
+                    "focus_areas",
+                    "evidence_ids",
+                    "causal_rationale",
+                    "expected_diagnostic_changes",
+                    "known_risks",
+                    "author_instructions",
+                }
+            ),
+            max_total_bytes=max_total_bytes,
+            optional_keys=frozenset(
+                {
+                    "focus_areas",
+                    "evidence_ids",
+                    "causal_rationale",
+                    "expected_diagnostic_changes",
+                    "known_risks",
+                    "author_instructions",
+                }
+            ),
+        )
+        instructions = _v4_response_list(
+            value.get("author_instructions"),
+            "investigator v4 author instructions",
+            allow_empty=True,
+        )
+        rationale = _v4_response_text_value(
+            value.get("causal_rationale"),
+            "investigator v4 causal rationale",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+            allow_empty=True,
+        )
+        if not rationale and not instructions:
+            raise ValueError(
+                "investigator v4 response requires rationale or author instructions"
+            )
+        if not rationale:
+            rationale = instructions[0]
+        if not instructions:
+            instructions = (
+                "Implement the focused strategy change described in causal_rationale.",
+            )
+        expected_changes = _v4_response_list(
+            value.get("expected_diagnostic_changes"),
+            "investigator v4 expected diagnostic changes",
+            allow_empty=True,
+        )
+        if not expected_changes:
+            expected_changes = (
+                "Improve the supplied aggregate portfolio diagnostics.",
+            )
+        evidence_ids = _v4_response_ids(
+            value.get("evidence_ids"),
+            "investigator v4 evidence IDs",
+        )
+        if not evidence_ids:
+            evidence_ids = ("aggregate",)
+        return cls(
+            hypothesis_id=_v4_response_identifier(
+                value["hypothesis_id"],
+                "investigator v4 hypothesis ID",
+            ),
+            focus_areas=_v4_focus_areas(
+                value.get("focus_areas"), "investigator v4 focus areas"
+            ),
+            evidence_ids=evidence_ids,
+            causal_rationale=rationale,
+            expected_diagnostic_changes=expected_changes,
+            known_risks=_v4_response_list(
+                value.get("known_risks"),
+                "investigator v4 known risks",
+                allow_empty=True,
+            ),
+            author_instructions=instructions,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorArtifactV4(_V2Canonical):
+    hypothesis_id: str
+    parent_identity_sha256: str
+    behavioral_summary: str
+    policy_sources: tuple[AuthorSourceFile, ...]
+    assumptions: tuple[str, ...]
+    validation_suggestions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _v2_identifier(self.hypothesis_id, "author v4 hypothesis ID")
+        _require_digest(self.parent_identity_sha256, "author v4 parent identity SHA-256")
+        _v4_bounded_text(
+            self.behavioral_summary,
+            "author v4 behavioral summary",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
+        _validate_v4_source_files(self.policy_sources, "author v4 policy sources")
+        for value, field in (
+            (self.assumptions, "author v4 assumptions"),
+            (self.validation_suggestions, "author v4 validation suggestions"),
+        ):
+            if type(value) is not tuple:
+                raise ValueError(f"{field} must be a tuple")
+            if value != _v4_response_list(list(value), field, allow_empty=True):
+                raise ValueError(f"{field} must be canonical")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "hypothesis_id": self.hypothesis_id,
+            "parent_identity_sha256": self.parent_identity_sha256,
+            "behavioral_summary": self.behavioral_summary,
+            "policy_sources": {
+                item.path: item.source for item in self.policy_sources
+            },
+            "assumptions": list(self.assumptions),
+            "validation_suggestions": list(self.validation_suggestions),
+        }
+
+    def canonical_json_bytes(self) -> bytes:
+        return _v2_canonical_bytes(self.to_primitive())
+
+    @classmethod
+    def from_json(
+        cls,
+        raw: str,
+        *,
+        selected_parent: SelectedParentIdentity,
+        max_total_bytes: int,
+    ) -> "AuthorArtifactV4":
+        if not isinstance(selected_parent, SelectedParentIdentity):
+            raise ValueError("author v4 selected parent is invalid")
+        value = _parse_v4_closed_object(
+            raw,
+            frozenset(
+                {
+                    "hypothesis_id",
+                    "parent_identity_sha256",
+                    "behavioral_summary",
+                    "policy_sources",
+                    "assumptions",
+                    "validation_suggestions",
+                }
+            ),
+            max_total_bytes=max_total_bytes,
+            optional_keys=frozenset({"assumptions", "validation_suggestions"}),
+        )
+        parent_identity_sha256 = value["parent_identity_sha256"]
+        _require_digest(parent_identity_sha256, "author v4 parent identity SHA-256")
+        if parent_identity_sha256 != selected_parent.parent_identity_sha256:
+            raise ValueError("author v4 parent identity differs from selected parent")
+        source_map = value["policy_sources"]
+        if not isinstance(source_map, dict) or set(source_map) != set(
+            _POLICY_EDITABLE_PATHS
+        ):
+            raise ValueError(
+                "author v4 policy sources must contain exactly the three editable paths"
+            )
+        sources = tuple(
+            AuthorSourceFile.from_source(path=path, source=source_map[path])
+            for path in _POLICY_EDITABLE_PATHS
+        )
+        changed = tuple(
+            path
+            for (path, parent_sha256), item in zip(
+                selected_parent.policy_source_sha256s,
+                sources,
+                strict=True,
+            )
+            if item.source_sha256 != parent_sha256
+        )
+        if not changed:
+            raise ValueError("author v4 response must contain at least one changed file")
+        return cls(
+            hypothesis_id=_v4_response_identifier(
+                value["hypothesis_id"],
+                "author v4 hypothesis ID",
+            ),
+            parent_identity_sha256=parent_identity_sha256,
+            behavioral_summary=_v4_response_bounded_text(
+                value["behavioral_summary"],
+                "author v4 behavioral summary",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+            ),
+            policy_sources=sources,
+            assumptions=_v4_response_list(
+                value.get("assumptions"), "author v4 assumptions", allow_empty=True
+            ),
+            validation_suggestions=_v4_response_list(
+                value.get("validation_suggestions"),
+                "author v4 validation suggestions",
+                allow_empty=True,
+            ),
+        )
+
+    @property
+    def source_bundle_sha256(self) -> str:
+        return policy_source_bundle_v4_sha256(self.policy_sources)
+
+    @property
+    def replacement_sources(self) -> Mapping[str, str]:
+        """Expose the complete canonical source map for atomic materialization."""
+
+        return MappingProxyType(
+            {item.path: item.source for item in self.policy_sources}
+        )
+
+    def changed_paths(self, parent: SelectedParentIdentity) -> tuple[str, ...]:
+        if self.parent_identity_sha256 != parent.parent_identity_sha256:
+            raise ValueError("author v4 artifact parent identity differs")
+        return tuple(
+            item.path
+            for item, (_path, parent_sha256) in zip(
+                self.policy_sources,
+                parent.policy_source_sha256s,
+                strict=True,
+            )
+            if item.source_sha256 != parent_sha256
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorManifestSummaryV4(_V2Canonical):
+    hypothesis_id: str
+    parent_identity_sha256: str
+    behavioral_summary: str
+    policy_source_sha256s: tuple[tuple[str, str], ...]
+    source_bundle_sha256: str
+    changed_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _v2_identifier(self.hypothesis_id, "author manifest v4 hypothesis ID")
+        _require_digest(
+            self.parent_identity_sha256,
+            "author manifest v4 parent identity SHA-256",
+        )
+        _v4_bounded_text(
+            self.behavioral_summary,
+            "author manifest v4 behavioral summary",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
+        if (
+            type(self.policy_source_sha256s) is not tuple
+            or tuple(path for path, _digest in self.policy_source_sha256s)
+            != _POLICY_EDITABLE_PATHS
+        ):
+            raise ValueError("author manifest v4 source identities are invalid")
+        for _path, digest in self.policy_source_sha256s:
+            _require_digest(digest, "author manifest v4 source SHA-256")
+        _require_digest(
+            self.source_bundle_sha256,
+            "author manifest v4 source bundle SHA-256",
+        )
+        if (
+            type(self.changed_paths) is not tuple
+            or not self.changed_paths
+            or self.changed_paths
+            != tuple(path for path in _POLICY_EDITABLE_PATHS if path in self.changed_paths)
+        ):
+            raise ValueError("author manifest v4 changed paths are invalid")
+
+    @classmethod
+    def from_artifact(
+        cls,
+        artifact: AuthorArtifactV4,
+        *,
+        selected_parent: SelectedParentIdentity,
+    ) -> "AuthorManifestSummaryV4":
+        if not isinstance(artifact, AuthorArtifactV4):
+            raise ValueError("author manifest v4 artifact is invalid")
+        changed_paths = artifact.changed_paths(selected_parent)
+        return cls(
+            hypothesis_id=artifact.hypothesis_id,
+            parent_identity_sha256=artifact.parent_identity_sha256,
+            behavioral_summary=artifact.behavioral_summary,
+            policy_source_sha256s=tuple(
+                (item.path, item.source_sha256) for item in artifact.policy_sources
+            ),
+            source_bundle_sha256=artifact.source_bundle_sha256,
+            changed_paths=changed_paths,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CriticArtifactV4(_V2Canonical):
+    hypothesis_id: str
+    prediction_vs_observation: str
+    causal_explanation: str
+    evidence_ids: tuple[str, ...]
+    disposition: str
+    next_direction: str
+
+    def __post_init__(self) -> None:
+        _v2_identifier(self.hypothesis_id, "critic v4 hypothesis ID")
+        _v4_bounded_text(
+            self.prediction_vs_observation,
+            "critic v4 prediction versus observation",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
+        _v4_bounded_text(
+            self.causal_explanation,
+            "critic v4 causal explanation",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
+        if type(self.evidence_ids) is not tuple:
+            raise ValueError("critic v4 evidence IDs must be a tuple")
+        if self.evidence_ids != _v4_response_ids(
+            list(self.evidence_ids), "critic v4 evidence IDs"
+        ):
+            raise ValueError("critic v4 evidence IDs must be canonical")
+        if self.disposition not in _V4_CRITIC_DISPOSITIONS:
+            raise ValueError("critic v4 disposition is invalid")
+        _v4_bounded_text(
+            self.next_direction,
+            "critic v4 next direction",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
+        if len(self.canonical_json_bytes()) > MAX_CRITIC_ARTIFACT_BYTES:
+            raise ValueError("critic v4 artifact exceeds its byte cap")
+
+    @classmethod
+    def from_json(cls, raw: str, *, max_total_bytes: int) -> "CriticArtifactV4":
+        value = _parse_v4_closed_object(
+            raw,
+            frozenset(
+                {
+                    "hypothesis_id",
+                    "prediction_vs_observation",
+                    "causal_explanation",
+                    "evidence_ids",
+                    "disposition",
+                    "next_direction",
+                }
+            ),
+            max_total_bytes=max_total_bytes,
+            optional_keys=frozenset({"evidence_ids"}),
+        )
+        disposition = _v2_response_text(
+            value["disposition"], "critic v4 disposition"
+        ).casefold()
+        disposition = {
+            "accept": "promote",
+            "adopt": "promote",
+            "keep": "promote",
+            "continue": "refine",
+            "iterate": "refine",
+            "revise": "refine",
+            "reject": "abandon",
+            "discard": "abandon",
+            "stop": "abandon",
+        }.get(disposition, disposition)
+        if disposition not in _V4_CRITIC_DISPOSITIONS:
+            raise ValueError("critic v4 disposition is invalid")
+        return cls(
+            hypothesis_id=_v4_response_identifier(
+                value["hypothesis_id"],
+                "critic v4 hypothesis ID",
+            ),
+            prediction_vs_observation=_v4_response_text_value(
+                value["prediction_vs_observation"],
+                "critic v4 prediction versus observation",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+            ),
+            causal_explanation=_v4_response_text_value(
+                value["causal_explanation"],
+                "critic v4 causal explanation",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+            ),
+            evidence_ids=_v4_response_ids(
+                value.get("evidence_ids"),
+                "critic v4 evidence IDs",
+            ),
+            disposition=disposition,
+            next_direction=_v4_response_text_value(
+                value["next_direction"],
+                "critic v4 next direction",
+                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RoleOutputInvalidSummary(_V2Canonical):
+    iteration: int
+    call_index: int
+    role: str
+    validation_code: str
+
+    def __post_init__(self) -> None:
+        _require_positive_int(self.iteration, "role output invalid summary iteration")
+        if self.role not in OPTIMIZER_V4_ROLES:
+            raise ValueError("role output invalid summary role is invalid")
+        expected_call_index = (
+            (self.iteration - 1) * len(OPTIMIZER_V4_ROLES)
+            + OPTIMIZER_V4_ROLES.index(self.role)
+            + 1
+        )
+        if self.call_index != expected_call_index:
+            raise ValueError("role output invalid summary plan slot is invalid")
+        if self.validation_code not in PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES:
+            raise ValueError("role output invalid summary validation code is invalid")
+
+
+def _v4_cagr(value: object, field: str) -> Decimal:
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError(f"{field} must be a finite Decimal")
+    if value != value.quantize(Decimal("0.01")):
+        raise ValueError(f"{field} must use 0.01 percentage-point precision")
+    return value
+
+
+def _require_v4_panel_summary(
+    value: object,
+    purpose: str,
+    field: str,
+    *,
+    expected_sha256: str | None = None,
+) -> PanelAggregateSummary:
+    if not isinstance(value, PanelAggregateSummary) or value.panel_id != purpose:
+        raise ValueError(f"{field} must be {purpose} panel evidence")
+    if expected_sha256 is not None:
+        _require_digest(expected_sha256, f"{field} expected panel SHA-256")
+        if value.panel_sha256 != expected_sha256:
+            raise ValueError(f"{field} differs from the authenticated panel")
+    _v4_cagr(value.portfolio_annualized_return_pct, f"{field} CAGR")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateValidationStatusV4(_V2Canonical):
+    status: str
+    failure_code: str | None
+
+    def __post_init__(self) -> None:
+        if self.status not in _V4_VALIDATION_STATUSES:
+            raise ValueError("candidate validation v4 status is invalid")
+        if self.status == "invalid":
+            if self.failure_code not in _V4_VALIDATION_FAILURE_CODES:
+                raise ValueError("candidate validation v4 failure code is invalid")
+        elif self.failure_code is not None:
+            raise ValueError("candidate validation v4 nonfailure cannot carry a code")
+
+
+@dataclass(frozen=True, slots=True)
+class TargetProgressV4(_V2Canonical):
+    target_pct: Decimal
+    baseline_cagr_pct: Decimal
+    selected_parent_cagr_pct: Decimal
+    champion_cagr_pct: Decimal
+    target_gap_pp: Decimal
+
+    def __post_init__(self) -> None:
+        for name in (
+            "target_pct",
+            "baseline_cagr_pct",
+            "selected_parent_cagr_pct",
+            "champion_cagr_pct",
+            "target_gap_pp",
+        ):
+            _v4_cagr(getattr(self, name), f"target progress {name}")
+        if self.target_pct != AnnualizedReturnTarget.production().target_pct:
+            raise ValueError("target progress differs from annualized objective")
+        if self.target_gap_pp != (self.target_pct - self.selected_parent_cagr_pct).quantize(
+            Decimal("0.01")
+        ):
+            raise ValueError("target progress gap differs from selected parent CAGR")
+
+    @classmethod
+    def from_summaries(
+        cls,
+        *,
+        target: AnnualizedReturnTarget,
+        baseline: PanelAggregateSummary,
+        selected_parent: PanelAggregateSummary,
+        champion: PanelAggregateSummary,
+    ) -> "TargetProgressV4":
+        if not isinstance(target, AnnualizedReturnTarget):
+            raise ValueError("target progress objective is invalid")
+        for value, field in (
+            (baseline, "target progress baseline"),
+            (selected_parent, "target progress selected parent"),
+            (champion, "target progress champion"),
+        ):
+            _require_v4_panel_summary(value, "discovery", field)
+        selected = selected_parent.portfolio_annualized_return_pct
+        return cls(
+            target_pct=target.target_pct,
+            baseline_cagr_pct=baseline.portfolio_annualized_return_pct,
+            selected_parent_cagr_pct=selected,
+            champion_cagr_pct=champion.portfolio_annualized_return_pct,
+            target_gap_pp=(target.target_pct - selected).quantize(Decimal("0.01")),
+        )
+
+    def validate_summaries(
+        self,
+        *,
+        target: AnnualizedReturnTarget,
+        baseline: PanelAggregateSummary,
+        selected_parent: PanelAggregateSummary,
+        champion: PanelAggregateSummary,
+        discovery_panel_sha256: str,
+    ) -> None:
+        for value, field in (
+            (baseline, "target progress baseline"),
+            (selected_parent, "target progress selected parent"),
+            (champion, "target progress champion"),
+        ):
+            _require_v4_panel_summary(
+                value,
+                "discovery",
+                field,
+                expected_sha256=discovery_panel_sha256,
+            )
+        expected = TargetProgressV4.from_summaries(
+            target=target,
+            baseline=baseline,
+            selected_parent=selected_parent,
+            champion=champion,
+        )
+        if self != expected:
+            raise ValueError("target progress differs from authenticated summaries")
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedParentSummary(_V2Canonical):
+    identity: SelectedParentIdentity
+    hypothesis_id: str
+    behavioral_summary: str
+    quick_panel: PanelAggregateSummary
+    discovery_panel: PanelAggregateSummary
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, SelectedParentIdentity):
+            raise ValueError("selected parent summary identity is invalid")
+        _v2_identifier(self.hypothesis_id, "selected parent summary hypothesis ID")
+        _v4_bounded_text(
+            self.behavioral_summary,
+            "selected parent behavioral summary",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
+        _require_v4_panel_summary(
+            self.quick_panel,
+            "quick",
+            "selected parent quick panel",
+        )
+        _require_v4_panel_summary(
+            self.discovery_panel,
+            "discovery",
+            "selected parent discovery panel",
+        )
+
+    def validate_panel_identities(
+        self,
+        *,
+        quick_panel_sha256: str,
+        discovery_panel_sha256: str,
+    ) -> None:
+        _require_v4_panel_summary(
+            self.quick_panel,
+            "quick",
+            "selected parent quick panel",
+            expected_sha256=quick_panel_sha256,
+        )
+        _require_v4_panel_summary(
+            self.discovery_panel,
+            "discovery",
+            "selected parent discovery panel",
+            expected_sha256=discovery_panel_sha256,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PriorHypothesisSummaryV4(_V2Canonical):
+    iteration: int
+    hypothesis_id: str
+    focus_areas: tuple[str, ...]
+    behavioral_summary: str
+    validation: CandidateValidationStatusV4
+    discovery_cagr_pct: Decimal | None
+    critic_disposition: str
+
+    def __post_init__(self) -> None:
+        _require_positive_int(self.iteration, "prior hypothesis v4 iteration")
+        _v2_identifier(self.hypothesis_id, "prior hypothesis v4 ID")
+        _v4_focus_areas(list(self.focus_areas), "prior hypothesis v4 focus areas")
+        _v4_bounded_text(
+            self.behavioral_summary,
+            "prior hypothesis v4 behavioral summary",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+        )
+        if not isinstance(self.validation, CandidateValidationStatusV4):
+            raise ValueError("prior hypothesis v4 validation is invalid")
+        if self.discovery_cagr_pct is not None:
+            _v4_cagr(self.discovery_cagr_pct, "prior hypothesis v4 discovery CAGR")
+        if self.validation.status == "valid" and self.discovery_cagr_pct is None:
+            raise ValueError("valid prior hypothesis requires discovery CAGR")
+        if self.validation.status != "valid" and self.discovery_cagr_pct is not None:
+            raise ValueError("invalid prior hypothesis cannot carry discovery CAGR")
+        if self.critic_disposition not in _V4_CRITIC_DISPOSITIONS:
+            raise ValueError("prior hypothesis v4 critic disposition is invalid")
+
+
+def _validate_role_common_v4(
+    *,
+    schema_version: int,
+    iteration: int,
+    run_manifest_sha256: str,
+    policy_authoring_scope_sha256: str,
+    policy_interface_version: int,
+    immutable_constraint_ids: tuple[str, ...],
+    annualized_return_target: AnnualizedReturnTarget,
+    discovery_panel_plan_sha256: str,
+    quick_panel_sha256: str,
+    discovery_panel_sha256: str,
+    selected_parent_identity: SelectedParentIdentity,
+) -> None:
+    if schema_version != 4:
+        raise ValueError("optimizer v4 role input schema is unsupported")
+    _require_positive_int(iteration, "optimizer v4 role iteration")
+    _require_digest(run_manifest_sha256, "optimizer v4 role manifest SHA-256")
+    _require_digest(
+        policy_authoring_scope_sha256,
+        "optimizer v4 role authoring scope SHA-256",
+    )
+    if policy_interface_version != 2:
+        raise ValueError("optimizer v4 role policy interface must be 2")
+    _v2_string_tuple(immutable_constraint_ids, "optimizer v4 immutable constraints")
+    if not isinstance(annualized_return_target, AnnualizedReturnTarget):
+        raise ValueError("optimizer v4 role annualized target is invalid")
+    _require_digest(
+        discovery_panel_plan_sha256,
+        "optimizer v4 role discovery plan SHA-256",
+    )
+    _require_digest(quick_panel_sha256, "optimizer v4 role quick panel SHA-256")
+    _require_digest(
+        discovery_panel_sha256,
+        "optimizer v4 role discovery panel SHA-256",
+    )
+    if not isinstance(selected_parent_identity, SelectedParentIdentity):
+        raise ValueError("optimizer v4 role selected parent identity is invalid")
+
+
+def _validate_role_v4_budget(
+    *,
+    role_context: object,
+    role: str,
+    iteration: int,
+    payload: bytes,
+    budget: PitOptimizerCallBudget,
+    scope: PolicyAuthoringScopeV4,
+    manifest: PitOptimizerRunManifestV4,
+    expected_scope_sha256: str,
+) -> None:
+    if not isinstance(manifest, PitOptimizerRunManifestV4):
+        raise ValueError("optimizer v4 role manifest is invalid")
+    if not isinstance(scope, PolicyAuthoringScopeV4):
+        raise ValueError("optimizer v4 role authoring scope is invalid")
+    if (
+        manifest.sha256 != getattr(role_context, "run_manifest_sha256", None)
+        or manifest.policy_authoring_scope != scope
+        or manifest.policy_interface_version
+        != getattr(role_context, "policy_interface_version", None)
+        or manifest.immutable_constraint_ids
+        != getattr(role_context, "immutable_constraint_ids", None)
+        or manifest.annualized_return_target
+        != getattr(role_context, "annualized_return_target", None)
+        or manifest.discovery_panel_plan_sha256
+        != getattr(role_context, "discovery_panel_plan_sha256", None)
+        or manifest.quick_panel_sha256
+        != getattr(role_context, "quick_panel_sha256", None)
+        or manifest.discovery_panel_sha256
+        != getattr(role_context, "discovery_panel_sha256", None)
+    ):
+        raise ValueError("optimizer v4 role manifest binding differs")
+    if scope.sha256 != expected_scope_sha256:
+        raise ValueError("optimizer v4 role authoring scope binding differs")
+    role_ordinal = OPTIMIZER_V4_ROLES.index(role) + 1
+    expected_call_index = (iteration - 1) * len(OPTIMIZER_V4_ROLES) + role_ordinal
+    if (
+        not isinstance(budget, PitOptimizerCallBudget)
+        or budget.role != role
+        or budget.iteration != iteration
+        or budget.call_index != expected_call_index
+        or expected_call_index > len(scope.call_budgets)
+        or scope.call_budgets[expected_call_index - 1] != budget
+    ):
+        raise ValueError("optimizer v4 role budget binding differs")
+    static_bytes = len(PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[role].encode("utf-8"))
+    static_bytes += len(_v2_canonical_bytes(pit_optimizer_v4_response_format(role)))
+    if static_bytes > budget.max_static_input_bytes:
+        raise RoleContextBudgetExceeded(
+            "optimizer v4 static role context exceeds call cap"
+        )
+    if len(payload) > budget.max_dynamic_input_bytes:
+        raise RoleContextBudgetExceeded(
+            "optimizer v4 dynamic role context exceeds call cap"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigatorInputV4(_V2Canonical):
+    schema_version: int
+    iteration: int
+    run_manifest_sha256: str
+    policy_authoring_scope_sha256: str
+    policy_interface_version: int
+    immutable_constraint_ids: tuple[str, ...]
+    annualized_return_target: AnnualizedReturnTarget
+    discovery_panel_plan_sha256: str
+    quick_panel_sha256: str
+    discovery_panel_sha256: str
+    selected_parent_identity: SelectedParentIdentity
+    selected_parent_source_bundle_sha256: str
+    selected_parent_sources: tuple[AuthorSourceFile, ...]
+    selected_parent_summary: SelectedParentSummary
+    baseline_summary: SelectedParentSummary
+    champion_summary: SelectedParentSummary | None
+    branch_summary: SelectedParentSummary | None
+    target_progress: TargetProgressV4
+    prior_hypotheses: tuple[PriorHypothesisSummaryV4, ...]
+    validation_status: CandidateValidationStatusV4
+
+    def __post_init__(self) -> None:
+        _validate_role_common_v4(
+            schema_version=self.schema_version,
+            iteration=self.iteration,
+            run_manifest_sha256=self.run_manifest_sha256,
+            policy_authoring_scope_sha256=self.policy_authoring_scope_sha256,
+            policy_interface_version=self.policy_interface_version,
+            immutable_constraint_ids=self.immutable_constraint_ids,
+            annualized_return_target=self.annualized_return_target,
+            discovery_panel_plan_sha256=self.discovery_panel_plan_sha256,
+            quick_panel_sha256=self.quick_panel_sha256,
+            discovery_panel_sha256=self.discovery_panel_sha256,
+            selected_parent_identity=self.selected_parent_identity,
+        )
+        _require_digest(
+            self.selected_parent_source_bundle_sha256,
+            "investigator v4 selected parent source bundle SHA-256",
+        )
+        self.selected_parent_identity.validate_sources(self.selected_parent_sources)
+        if (
+            self.selected_parent_source_bundle_sha256
+            != self.selected_parent_identity.source_bundle_sha256
+            or not isinstance(self.selected_parent_summary, SelectedParentSummary)
+            or self.selected_parent_summary.identity != self.selected_parent_identity
+        ):
+            raise ValueError("investigator v4 selected parent binding differs")
+        if (
+            not isinstance(self.baseline_summary, SelectedParentSummary)
+            or self.baseline_summary.identity.parent_kind != "baseline"
+        ):
+            raise ValueError("investigator v4 baseline summary is invalid")
+        if self.champion_summary is not None and (
+            not isinstance(self.champion_summary, SelectedParentSummary)
+            or self.champion_summary.identity.parent_kind != "champion"
+        ):
+            raise ValueError("investigator v4 champion summary is invalid")
+        if self.branch_summary is not None and (
+            not isinstance(self.branch_summary, SelectedParentSummary)
+            or self.branch_summary.identity.parent_kind != "branch"
+        ):
+            raise ValueError("investigator v4 branch summary is invalid")
+        summaries = tuple(
+            summary
+            for summary in (
+                self.selected_parent_summary,
+                self.baseline_summary,
+                self.champion_summary,
+                self.branch_summary,
+            )
+            if summary is not None
+        )
+        for summary in summaries:
+            summary.validate_panel_identities(
+                quick_panel_sha256=self.quick_panel_sha256,
+                discovery_panel_sha256=self.discovery_panel_sha256,
+            )
+        if self.branch_summary is not None:
+            expected_parent = self.branch_summary
+        elif self.champion_summary is not None:
+            expected_parent = self.champion_summary
+        else:
+            expected_parent = self.baseline_summary
+        if self.selected_parent_summary != expected_parent:
+            raise ValueError(
+                "investigator v4 selected parent differs from deterministic parent state"
+            )
+        if not isinstance(self.target_progress, TargetProgressV4):
+            raise ValueError("investigator v4 target progress is invalid")
+        champion_panel = (
+            self.champion_summary.discovery_panel
+            if self.champion_summary is not None
+            else self.baseline_summary.discovery_panel
+        )
+        self.target_progress.validate_summaries(
+            target=self.annualized_return_target,
+            baseline=self.baseline_summary.discovery_panel,
+            selected_parent=self.selected_parent_summary.discovery_panel,
+            champion=champion_panel,
+            discovery_panel_sha256=self.discovery_panel_sha256,
+        )
+        if (
+            type(self.prior_hypotheses) is not tuple
+            or any(
+                not isinstance(item, PriorHypothesisSummaryV4)
+                for item in self.prior_hypotheses
+            )
+            or tuple(item.iteration for item in self.prior_hypotheses)
+            != tuple(range(1, self.iteration))
+        ):
+            raise ValueError("investigator v4 prior hypotheses must be contiguous")
+        if not isinstance(self.validation_status, CandidateValidationStatusV4):
+            raise ValueError("investigator v4 validation status is invalid")
+
+    def validate_budget(
+        self,
+        budget: PitOptimizerCallBudget,
+        *,
+        scope: PolicyAuthoringScopeV4,
+        manifest: PitOptimizerRunManifestV4,
+    ) -> None:
+        _validate_role_v4_budget(
+            role_context=self,
+            role="investigator",
+            iteration=self.iteration,
+            payload=self.canonical_json_bytes(),
+            budget=budget,
+            scope=scope,
+            manifest=manifest,
+            expected_scope_sha256=self.policy_authoring_scope_sha256,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorInputV4(_V2Canonical):
+    schema_version: int
+    iteration: int
+    run_manifest_sha256: str
+    policy_authoring_scope_sha256: str
+    policy_interface_version: int
+    immutable_constraint_ids: tuple[str, ...]
+    annualized_return_target: AnnualizedReturnTarget
+    discovery_panel_plan_sha256: str
+    quick_panel_sha256: str
+    discovery_panel_sha256: str
+    selected_parent_identity: SelectedParentIdentity
+    selected_parent_source_bundle_sha256: str
+    selected_parent_sources: tuple[AuthorSourceFile, ...]
+    investigator: InvestigatorArtifactV4
+
+    def __post_init__(self) -> None:
+        _validate_role_common_v4(
+            schema_version=self.schema_version,
+            iteration=self.iteration,
+            run_manifest_sha256=self.run_manifest_sha256,
+            policy_authoring_scope_sha256=self.policy_authoring_scope_sha256,
+            policy_interface_version=self.policy_interface_version,
+            immutable_constraint_ids=self.immutable_constraint_ids,
+            annualized_return_target=self.annualized_return_target,
+            discovery_panel_plan_sha256=self.discovery_panel_plan_sha256,
+            quick_panel_sha256=self.quick_panel_sha256,
+            discovery_panel_sha256=self.discovery_panel_sha256,
+            selected_parent_identity=self.selected_parent_identity,
+        )
+        _require_digest(
+            self.selected_parent_source_bundle_sha256,
+            "author v4 selected parent source bundle SHA-256",
+        )
+        self.selected_parent_identity.validate_sources(self.selected_parent_sources)
+        if (
+            self.selected_parent_source_bundle_sha256
+            != self.selected_parent_identity.source_bundle_sha256
+        ):
+            raise ValueError("author v4 selected parent source binding differs")
+        if not isinstance(self.investigator, InvestigatorArtifactV4):
+            raise ValueError("author v4 investigator artifact is invalid")
+
+    def validate_artifact(self, artifact: AuthorArtifactV4) -> None:
+        if not isinstance(artifact, AuthorArtifactV4):
+            raise ValueError("author v4 response has an invalid type")
+        if (
+            artifact.hypothesis_id != self.investigator.hypothesis_id
+            or artifact.parent_identity_sha256
+            != self.selected_parent_identity.parent_identity_sha256
+        ):
+            raise ValueError("author v4 response binding differs from its input")
+
+    def validate_budget(
+        self,
+        budget: PitOptimizerCallBudget,
+        *,
+        scope: PolicyAuthoringScopeV4,
+        manifest: PitOptimizerRunManifestV4,
+    ) -> None:
+        _validate_role_v4_budget(
+            role_context=self,
+            role="author",
+            iteration=self.iteration,
+            payload=self.canonical_json_bytes(),
+            budget=budget,
+            scope=scope,
+            manifest=manifest,
+            expected_scope_sha256=self.policy_authoring_scope_sha256,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CriticInputV4(_V2Canonical):
+    schema_version: int
+    iteration: int
+    run_manifest_sha256: str
+    policy_authoring_scope_sha256: str
+    policy_interface_version: int
+    immutable_constraint_ids: tuple[str, ...]
+    annualized_return_target: AnnualizedReturnTarget
+    discovery_panel_plan_sha256: str
+    quick_panel_sha256: str
+    discovery_panel_sha256: str
+    selected_parent_identity: SelectedParentIdentity
+    selected_parent_summary: SelectedParentSummary
+    hypothesis_id: str
+    investigator_summary: InvestigatorArtifactV4
+    author_manifest: AuthorManifestSummaryV4 | None
+    author_output_invalid: RoleOutputInvalidSummary | None
+    validation_status: CandidateValidationStatusV4
+    candidate_quick: PanelAggregateSummary | None
+    candidate_discovery: PanelAggregateSummary | None
+    baseline_quick: PanelAggregateSummary
+    baseline_discovery: PanelAggregateSummary
+    champion_discovery: PanelAggregateSummary
+    target_progress: TargetProgressV4
+
+    _PANEL_BINDINGS = (
+        "baseline_quick",
+        "baseline_discovery",
+        "candidate_quick",
+        "candidate_discovery",
+        "selected_parent_quick",
+        "selected_parent_discovery",
+        "champion_discovery",
+    )
+    _PANEL_SCALARS = (
+        "panel_id",
+        "panel_sha256",
+        "starting_equity",
+        "ending_equity",
+        "elapsed_calendar_days",
+        "portfolio_annualized_return_pct",
+        "total_return_pct",
+        "benchmark_return_pct",
+        "max_drawdown_pct",
+        "sharpe_ratio",
+        "closed_trades",
+        "turnover_pct",
+        "average_exposure_pct",
+    )
+
+    def __post_init__(self) -> None:
+        _validate_role_common_v4(
+            schema_version=self.schema_version,
+            iteration=self.iteration,
+            run_manifest_sha256=self.run_manifest_sha256,
+            policy_authoring_scope_sha256=self.policy_authoring_scope_sha256,
+            policy_interface_version=self.policy_interface_version,
+            immutable_constraint_ids=self.immutable_constraint_ids,
+            annualized_return_target=self.annualized_return_target,
+            discovery_panel_plan_sha256=self.discovery_panel_plan_sha256,
+            quick_panel_sha256=self.quick_panel_sha256,
+            discovery_panel_sha256=self.discovery_panel_sha256,
+            selected_parent_identity=self.selected_parent_identity,
+        )
+        if (
+            not isinstance(self.selected_parent_summary, SelectedParentSummary)
+            or self.selected_parent_summary.identity != self.selected_parent_identity
+        ):
+            raise ValueError("critic v4 selected parent summary binding differs")
+        self.selected_parent_summary.validate_panel_identities(
+            quick_panel_sha256=self.quick_panel_sha256,
+            discovery_panel_sha256=self.discovery_panel_sha256,
+        )
+        _v2_identifier(self.hypothesis_id, "critic v4 hypothesis ID")
+        if (
+            not isinstance(self.investigator_summary, InvestigatorArtifactV4)
+            or self.investigator_summary.hypothesis_id != self.hypothesis_id
+        ):
+            raise ValueError("critic v4 investigator binding differs")
+        if (self.author_manifest is None) == (self.author_output_invalid is None):
+            raise ValueError(
+                "critic v4 requires exactly one author manifest or invalid summary"
+            )
+        if self.author_manifest is not None:
+            if (
+                not isinstance(self.author_manifest, AuthorManifestSummaryV4)
+                or self.author_manifest.hypothesis_id != self.hypothesis_id
+                or self.author_manifest.parent_identity_sha256
+                != self.selected_parent_identity.parent_identity_sha256
+            ):
+                raise ValueError("critic v4 author manifest binding differs")
+        else:
+            if (
+                not isinstance(self.author_output_invalid, RoleOutputInvalidSummary)
+                or self.author_output_invalid.role != "author"
+                or self.author_output_invalid.iteration != self.iteration
+                or self.author_output_invalid.call_index
+                != (self.iteration - 1) * len(OPTIMIZER_V4_ROLES) + 2
+            ):
+                raise ValueError("critic v4 invalid summary differs from its author slot")
+        if not isinstance(self.validation_status, CandidateValidationStatusV4):
+            raise ValueError("critic v4 validation status is invalid")
+        if self.author_output_invalid is not None and (
+            self.validation_status.status != "invalid"
+            or self.validation_status.failure_code != "author_output_invalid"
+        ):
+            raise ValueError("critic v4 invalid author status differs")
+        if self.author_manifest is not None and (
+            self.validation_status.failure_code == "author_output_invalid"
+        ):
+            raise ValueError("critic v4 valid author cannot use invalid-output status")
+        if self.candidate_quick is not None:
+            _require_v4_panel_summary(
+                self.candidate_quick,
+                "quick",
+                "critic v4 candidate quick",
+                expected_sha256=self.quick_panel_sha256,
+            )
+        if self.candidate_discovery is not None:
+            _require_v4_panel_summary(
+                self.candidate_discovery,
+                "discovery",
+                "critic v4 candidate discovery",
+                expected_sha256=self.discovery_panel_sha256,
+            )
+            if self.candidate_quick is None:
+                raise ValueError("critic v4 discovery evidence requires quick evidence")
+        has_complete_candidate_evidence = (
+            self.candidate_quick is not None and self.candidate_discovery is not None
+        )
+        if self.validation_status.status == "valid":
+            if not has_complete_candidate_evidence:
+                raise ValueError("critic v4 valid status requires both candidate panels")
+        elif self.candidate_discovery is not None:
+            raise ValueError("critic v4 nonvalid status cannot carry discovery evidence")
+        elif self.candidate_quick is not None and self.validation_status.failure_code not in {
+            "worker_failed",
+            "evaluation_failed",
+        }:
+            raise ValueError(
+                "critic v4 partial quick evidence requires an evaluation failure"
+            )
+        _require_v4_panel_summary(
+            self.baseline_quick,
+            "quick",
+            "critic v4 baseline quick",
+            expected_sha256=self.quick_panel_sha256,
+        )
+        _require_v4_panel_summary(
+            self.baseline_discovery,
+            "discovery",
+            "critic v4 baseline discovery",
+            expected_sha256=self.discovery_panel_sha256,
+        )
+        _require_v4_panel_summary(
+            self.champion_discovery,
+            "discovery",
+            "critic v4 champion discovery",
+            expected_sha256=self.discovery_panel_sha256,
+        )
+        if not isinstance(self.target_progress, TargetProgressV4):
+            raise ValueError("critic v4 target progress is invalid")
+        self.target_progress.validate_summaries(
+            target=self.annualized_return_target,
+            baseline=self.baseline_discovery,
+            selected_parent=self.selected_parent_summary.discovery_panel,
+            champion=self.champion_discovery,
+            discovery_panel_sha256=self.discovery_panel_sha256,
+        )
+        if any(
+            key in self.to_primitive()
+            for key in ("selected_parent_sources", "policy_sources", "source")
+        ):
+            raise ValueError("critic v4 input cannot expose policy source")
+
+    def _panel_evidence_primitive(self) -> dict[str, object]:
+        semantic_panels = (
+            self.baseline_quick,
+            self.baseline_discovery,
+            self.candidate_quick,
+            self.candidate_discovery,
+            self.selected_parent_summary.quick_panel,
+            self.selected_parent_summary.discovery_panel,
+            self.champion_discovery,
+        )
+        unique_panels: list[PanelAggregateSummary] = []
+        binding_indexes: list[int | None] = []
+        for panel in semantic_panels:
+            if panel is None:
+                binding_indexes.append(None)
+                continue
+            try:
+                index = unique_panels.index(panel)
+            except ValueError:
+                index = len(unique_panels)
+                unique_panels.append(panel)
+            binding_indexes.append(index)
+
+        def metric_series(field: str) -> list[dict[str, object]]:
+            metric_ids = sorted(
+                {
+                    metric.metric_id
+                    for panel in unique_panels
+                    for metric in getattr(panel, field)
+                }
+            )
+            return [
+                {
+                    "metric_id": metric_id,
+                    "values": [
+                        next(
+                            (
+                                metric.value
+                                for metric in getattr(panel, field)
+                                if metric.metric_id == metric_id
+                            ),
+                            None,
+                        )
+                        for panel in unique_panels
+                    ],
+                }
+                for metric_id in metric_ids
+            ]
+
+        return {
+            "bindings": dict(zip(self._PANEL_BINDINGS, binding_indexes, strict=True)),
+            "columns": {
+                field: [_v2_primitive(getattr(panel, field)) for panel in unique_panels]
+                for field in self._PANEL_SCALARS
+            },
+            "entry_funnel": metric_series("entry_funnel"),
+            "exit_attribution": metric_series("exit_attribution"),
+        }
+
+    def to_primitive(self) -> dict[str, object]:
+        primitive = _v2_primitive(self)
+        if not isinstance(primitive, dict):
+            raise ValueError("critic v4 input is not an object")
+        selected_parent = primitive.get("selected_parent_summary")
+        if not isinstance(selected_parent, dict):
+            raise ValueError("critic v4 selected parent primitive is invalid")
+        for field in (
+            "baseline_quick",
+            "baseline_discovery",
+            "candidate_quick",
+            "candidate_discovery",
+            "champion_discovery",
+        ):
+            primitive.pop(field)
+        selected_parent.pop("quick_panel")
+        selected_parent.pop("discovery_panel")
+        primitive["panel_evidence"] = self._panel_evidence_primitive()
+        return primitive
+
+    def canonical_json_bytes(self) -> bytes:
+        return _v2_canonical_bytes(self.to_primitive())
+
+    def validate_artifact(self, artifact: CriticArtifactV4) -> None:
+        if not isinstance(artifact, CriticArtifactV4):
+            raise ValueError("critic v4 response has an invalid type")
+        if artifact.hypothesis_id != self.hypothesis_id:
+            raise ValueError("critic v4 hypothesis differs from its input")
+
+    def validate_budget(
+        self,
+        budget: PitOptimizerCallBudget,
+        *,
+        scope: PolicyAuthoringScopeV4,
+        manifest: PitOptimizerRunManifestV4,
+    ) -> None:
+        _validate_role_v4_budget(
+            role_context=self,
+            role="critic",
+            iteration=self.iteration,
+            payload=self.canonical_json_bytes(),
+            budget=budget,
+            scope=scope,
+            manifest=manifest,
+            expected_scope_sha256=self.policy_authoring_scope_sha256,
+        )

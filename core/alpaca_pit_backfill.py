@@ -29,6 +29,8 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from dotenv import dotenv_values
 
+from core.pit_provenance import PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+
 PRICE_COLUMNS = ("trade_date", "ticker", "open", "high", "low", "close", "volume")
 REQUEST_ALIASES = {"BF.B": "BF-B", "BRK.B": "BRK-B"}
 MAX_SYMBOLS_PER_REQUEST = 100
@@ -424,9 +426,12 @@ def _fetch_alpaca_sip_snapshot(
     if output_path.exists() or output_path.is_symlink():
         raise ValueError("Alpaca snapshot output must not already exist")
     canonical = tuple(sorted(set(canonical_symbols)))
-    if tuple(canonical_symbols) != canonical or "SPY" not in canonical:
-        raise ValueError("provider symbols must be sorted, unique, and include SPY")
-    if membership_symbol_count != len(canonical) - 1:
+    references = set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+    if tuple(canonical_symbols) != canonical or not references.issubset(canonical):
+        raise ValueError(
+            "provider symbols must be sorted, unique, and include IWM, QQQ, and SPY"
+        )
+    if membership_symbol_count != len(set(canonical) - references):
         raise ValueError("membership symbol count does not match the provider request")
     if set(identities) != set(canonical):
         raise ValueError("provider identity contracts differ from requested symbols")
@@ -512,22 +517,29 @@ def _fetch_alpaca_sip_snapshot(
             missing = sorted(set(canonical) - returned)
             raise ValueError(f"Alpaca SIP returned no valid rows for requested symbol {missing[0]}")
         row_count = _merge_chunks(chunk_paths, output_path)
-    spy_dates: list[date] = []
+    reference_dates: dict[str, list[date]] = {
+        reference: [] for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+    }
     with output_path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         for row in reader:
-            if row["ticker"] == "SPY":
-                spy_dates.append(date.fromisoformat(row["trade_date"]))
-    if tuple(spy_dates) != expected_days:
-        output_path.unlink(missing_ok=True)
-        raise ValueError("Alpaca SIP does not provide complete SPY coverage for the required calendar")
+            ticker = row["ticker"]
+            if ticker in reference_dates:
+                reference_dates[ticker].append(date.fromisoformat(row["trade_date"]))
+    for reference, observed_dates in reference_dates.items():
+        if tuple(observed_dates) != expected_days:
+            output_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"Alpaca SIP does not provide complete {reference} coverage "
+                "for the required calendar"
+            )
     return AlpacaSnapshot(
         path=output_path,
         retrieved_at_utc=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         requested_symbol_count=len(canonical),
         requested_membership_symbol_count=membership_symbol_count,
         returned_symbol_count=len(returned),
-        returned_membership_symbol_count=len(returned - {"SPY"}),
+        returned_membership_symbol_count=len(returned - references),
         chunk_count=len(request_groups),
         row_count=row_count,
         adjustment=adjustment.value,

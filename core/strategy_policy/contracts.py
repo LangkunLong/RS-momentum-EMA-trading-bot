@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, fields
+from datetime import date
 from typing import Any, ClassVar
 
 
@@ -39,6 +40,12 @@ def _positive(value: object, name: str, *, nullable: bool = False) -> None:
 def _fraction(value: object, name: str, *, nullable: bool = False) -> None:
     _positive(value, name, nullable=nullable)
     if value is not None and float(value) > 1:
+        _fail(name)
+
+
+def _unit_fraction(value: object, name: str) -> None:
+    _number(value, name)
+    if not 0 <= float(value) <= 1:
         _fail(name)
 
 
@@ -100,7 +107,7 @@ class _CanonicalContract:
         values: dict[str, object] = dict(decoded)
         for name, nested_type in cls._nested_fields.items():
             value = values[name]
-            if name in {"positions", "actions"}:
+            if type(value) is list:
                 if type(value) is not list:
                     _fail(name)
                 values[name] = tuple(
@@ -121,7 +128,113 @@ class _CanonicalContract:
 
 
 @dataclass(frozen=True, slots=True)
+class BenchmarkContextV1(_CanonicalContract):
+    symbol: str
+    close_to_sma_50_fraction: float
+    close_to_sma_200_fraction: float
+    realized_volatility_20d_fraction: float
+
+    def __post_init__(self) -> None:
+        _string(self.symbol, "symbol")
+        for name in (
+            "close_to_sma_50_fraction",
+            "close_to_sma_200_fraction",
+            "realized_volatility_20d_fraction",
+        ):
+            _number(getattr(self, name), name)
+        if self.realized_volatility_20d_fraction < 0:
+            _fail("realized_volatility_20d_fraction")
+
+
+@dataclass(frozen=True, slots=True)
+class MarketContextV1(_CanonicalContract):
+    schema_version: int
+    session: str
+    oneil_regime: str
+    distribution_days: int
+    follow_through: bool
+    benchmarks: tuple[BenchmarkContextV1, ...]
+    active_constituent_count: int
+    breadth_above_50_fraction: float
+    breadth_50_coverage_fraction: float
+    breadth_above_200_fraction: float
+    breadth_200_coverage_fraction: float
+    median_rs_score: float
+    rs_at_least_80_fraction: float
+    rs_coverage_fraction: float
+
+    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {
+        "benchmarks": BenchmarkContextV1,
+    }
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("schema_version")
+        _string(self.session, "session")
+        try:
+            parsed_session = date.fromisoformat(self.session)
+        except ValueError as exc:
+            raise ValueError("session is invalid") from exc
+        if parsed_session.isoformat() != self.session:
+            _fail("session")
+        if self.oneil_regime not in _MARKET_REGIMES:
+            _fail("oneil_regime")
+        _integer(self.distribution_days, "distribution_days")
+        _bool(self.follow_through, "follow_through")
+        benchmarks = _tuple(self.benchmarks, "benchmarks", maximum=3)
+        if (
+            tuple(item.symbol for item in benchmarks if type(item) is BenchmarkContextV1)
+            != ("SPY", "QQQ", "IWM")
+            or any(type(item) is not BenchmarkContextV1 for item in benchmarks)
+        ):
+            _fail("benchmarks")
+        _integer(self.active_constituent_count, "active_constituent_count", minimum=1)
+        for name in (
+            "breadth_above_50_fraction",
+            "breadth_50_coverage_fraction",
+            "breadth_above_200_fraction",
+            "breadth_200_coverage_fraction",
+            "rs_at_least_80_fraction",
+            "rs_coverage_fraction",
+        ):
+            _unit_fraction(getattr(self, name), name)
+        _number(self.median_rs_score, "median_rs_score")
+        covered_counts: dict[str, int] = {}
+        for coverage_name in (
+            "breadth_50_coverage_fraction",
+            "breadth_200_coverage_fraction",
+            "rs_coverage_fraction",
+        ):
+            covered = float(getattr(self, coverage_name)) * self.active_constituent_count
+            if not math.isclose(covered, round(covered), rel_tol=0.0, abs_tol=1e-9):
+                _fail(coverage_name)
+            covered_counts[coverage_name] = round(covered)
+        for coverage_name, fraction_name in (
+            ("breadth_50_coverage_fraction", "breadth_above_50_fraction"),
+            ("breadth_200_coverage_fraction", "breadth_above_200_fraction"),
+            ("rs_coverage_fraction", "rs_at_least_80_fraction"),
+        ):
+            covered_count = covered_counts[coverage_name]
+            fraction = float(getattr(self, fraction_name))
+            numerator = fraction * covered_count
+            if (
+                (covered_count == 0 and fraction != 0.0)
+                or not math.isclose(
+                    numerator,
+                    round(numerator),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                or not 0 <= round(numerator) <= covered_count
+            ):
+                _fail(fraction_name)
+        if covered_counts["rs_coverage_fraction"] == 0 and self.median_rs_score != 0.0:
+            _fail("median_rs_score")
+
+
+@dataclass(frozen=True, slots=True)
 class EntrySnapshot(_CanonicalContract):
+    market: MarketContextV1
     technical_only: bool
     require_proper_base: bool
     c_score: float | None
@@ -156,16 +269,15 @@ class EntrySnapshot(_CanonicalContract):
     cash_deployment_override: bool
     use_stateful_regime_gate: bool
     regime_allows_entries: bool
-    market_regime: str
-    distribution_days: int
-    follow_through: bool
+
+    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"market": MarketContextV1}
 
     def __post_init__(self) -> None:
         for field in (
             "technical_only", "require_proper_base", "institutional_data_available", "price_advanced",
             "has_volume_surge", "in_buy_zone", "technical_eligible", "has_power_gap_today",
             "require_bullish_market", "market_is_bullish", "cash_deployment_override",
-            "use_stateful_regime_gate", "regime_allows_entries", "follow_through",
+            "use_stateful_regime_gate", "regime_allows_entries",
         ):
             _bool(getattr(self, field), field)
         for field in (
@@ -175,9 +287,8 @@ class EntrySnapshot(_CanonicalContract):
             "pivot", "volume_ratio", "extension",
         ):
             _number(getattr(self, field), field, nullable=True)
-        _integer(self.distribution_days, "distribution_days")
-        if self.market_regime not in _MARKET_REGIMES:
-            _fail("market_regime")
+        if type(self.market) is not MarketContextV1:
+            _fail("market")
         for item in _tuple(self.technical_blocking_reasons, "technical_blocking_reasons"):
             _string(item, "technical_blocking_reasons")
 
@@ -203,6 +314,7 @@ class EntryDecision(_CanonicalContract):
 
 @dataclass(frozen=True, slots=True)
 class CapacitySnapshot(_CanonicalContract):
+    market: MarketContextV1
     configured_max_positions: int | None
     maximum_policy_positions: int
     open_position_count: int
@@ -210,7 +322,11 @@ class CapacitySnapshot(_CanonicalContract):
     cash_fraction: float
     configured_eviction_enabled: bool
 
+    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"market": MarketContextV1}
+
     def __post_init__(self) -> None:
+        if type(self.market) is not MarketContextV1:
+            _fail("market")
         _integer(self.maximum_policy_positions, "maximum_policy_positions", minimum=1)
         _integer(self.configured_max_positions, "configured_max_positions", minimum=1, nullable=True)
         if self.configured_max_positions is not None and self.configured_max_positions > self.maximum_policy_positions:
@@ -233,6 +349,7 @@ class CapacityDecision(_CanonicalContract):
 
 @dataclass(frozen=True, slots=True)
 class AllocationSnapshot(_CanonicalContract):
+    market: MarketContextV1
     portfolio_equity_at_entry_open: float
     cash_before_transition: float
     projected_cash_after_eviction: float
@@ -248,7 +365,11 @@ class AllocationSnapshot(_CanonicalContract):
     canslim_score: float | None
     rs_score: float | None
 
+    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"market": MarketContextV1}
+
     def __post_init__(self) -> None:
+        if type(self.market) is not MarketContextV1:
+            _fail("market")
         for field in (
             "portfolio_equity_at_entry_open", "cash_before_transition", "projected_cash_after_eviction",
             "gross_exposure_before", "projected_gross_exposure_after_eviction", "entry_open",
@@ -293,15 +414,21 @@ class EvictionPosition(_CanonicalContract):
 
 @dataclass(frozen=True, slots=True)
 class EvictionSnapshot(_CanonicalContract):
+    market: MarketContextV1
     capacity_is_finite: bool
     capacity_is_full: bool
     eviction_enabled: bool
     candidate_rs_score: float
     positions: tuple[EvictionPosition, ...]
 
-    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"positions": EvictionPosition}
+    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {
+        "market": MarketContextV1,
+        "positions": EvictionPosition,
+    }
 
     def __post_init__(self) -> None:
+        if type(self.market) is not MarketContextV1:
+            _fail("market")
         _bool(self.capacity_is_finite, "capacity_is_finite")
         _bool(self.capacity_is_full, "capacity_is_full")
         _bool(self.eviction_enabled, "eviction_enabled")
@@ -323,6 +450,7 @@ class EvictionDecision(_CanonicalContract):
 
 @dataclass(frozen=True, slots=True)
 class ExitSnapshot(_CanonicalContract):
+    market: MarketContextV1
     entry_price: float
     original_qty: float
     remaining_qty: float
@@ -354,7 +482,11 @@ class ExitSnapshot(_CanonicalContract):
     early_winner_trigger_days: int
     early_winner_release_days: int
 
+    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"market": MarketContextV1}
+
     def __post_init__(self) -> None:
+        if type(self.market) is not MarketContextV1:
+            _fail("market")
         for field in (
             "entry_price", "original_qty", "remaining_qty", "stop_price", "peak_close", "current_high",
             "current_low", "current_close",

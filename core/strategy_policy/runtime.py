@@ -21,19 +21,19 @@ from .contracts import (
 class InProcessPolicyClient:
     interface_version = POLICY_INTERFACE_VERSION
 
-    def evaluate_entry(self, snapshot):
+    def evaluate_entry(self, snapshot: EntrySnapshot) -> EntryDecision:
         return entry.evaluate_entry(snapshot)
 
-    def recommend_capacity(self, snapshot):
+    def recommend_capacity(self, snapshot: CapacitySnapshot) -> CapacityDecision:
         return risk.recommend_capacity(snapshot)
 
-    def recommend_allocation(self, snapshot):
+    def recommend_allocation(self, snapshot: AllocationSnapshot) -> AllocationDecision:
         return risk.recommend_allocation(snapshot)
 
-    def select_eviction(self, snapshot):
+    def select_eviction(self, snapshot: EvictionSnapshot) -> EvictionDecision:
         return risk.select_eviction(snapshot)
 
-    def evaluate_exit(self, snapshot):
+    def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision:
         return exit.evaluate_exit(snapshot)
 
     def close(self) -> None:

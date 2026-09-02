@@ -11,8 +11,10 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import build_pit_bundle as bundle_builder
 import export_pit_prices as exporter
 from core.pit_data import PITDataBundle
+from core.pit_provenance import PIT_NON_TRADABLE_REFERENCE_SYMBOLS
 
 
 def _cache(path: Path, *, extra_table: bool = False) -> str:
@@ -24,7 +26,7 @@ def _cache(path: Path, *, extra_table: bool = False) -> str:
         conn.execute(
             "INSERT INTO dataset_cache VALUES (?, ?, ?, ?)",
             (
-                "price::1d::2024-01-02::2024-01-05::AAPL,SPY",
+                "price::1d::2024-01-02::2024-01-05::AAPL,IWM,QQQ,SPY",
                 "price",
                 "2024-01-06T00:00:00Z",
                 b"worker-controlled-not-a-pickle",
@@ -38,8 +40,9 @@ def _cache(path: Path, *, extra_table: bool = False) -> str:
 def _price_rows(*, missing_spy: bool = False, partial_aapl: bool = False, duplicate: bool = False) -> list[tuple[object, ...]]:
     rows: list[tuple[object, ...]] = []
     for index, day in enumerate(("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05")):
-        if not missing_spy:
-            rows.append((day, "SPY", 100, 101, 99, 100, 1_000))
+        for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS:
+            if not (missing_spy and reference == "SPY"):
+                rows.append((day, reference, 100, 101, 99, 100, 1_000))
         if not (partial_aapl and index == 3):
             rows.append((day, "AAPL", 100, 101, 99, 100, 1_000))
     if duplicate:
@@ -61,7 +64,7 @@ def _membership() -> exporter.Membership:
 def test_worker_cache_and_spy_aapl_export_are_validated_without_payload_deserialization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Break caught: host decoded worker data or rejected a complete SPY/AAPL export."""
+    """Break caught: host decoded worker data or rejected a complete reference/AAPL export."""
     source = tmp_path / "worker.sqlite3"
     digest = _cache(source)
     monkeypatch.setattr(
@@ -81,6 +84,14 @@ def test_worker_cache_and_spy_aapl_export_are_validated_without_payload_deserial
     )
     assert snapshot.key_count == 1
     assert metrics["coverage_pct"] == 100.0
+    assert metrics["reference_symbol_coverage"] == {
+        reference: {
+            "first_date": "2024-01-02",
+            "last_date": "2024-01-05",
+            "session_count": 4,
+        }
+        for reference in ("IWM", "QQQ", "SPY")
+    }
     assert tuple(str(item) for item in spy_days) == ("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05")
 
 
@@ -103,7 +114,7 @@ def test_worker_cache_rejects_bad_hash_and_extra_schema(
     ("rows", "expected"),
     [
         (_price_rows(duplicate=True), "violates the output contract"),
-        (_price_rows(missing_spy=True), "contains no SPY"),
+        (_price_rows(missing_spy=True), "SPY reference coverage is incomplete"),
         (_price_rows(partial_aapl=True), "below 98%"),
     ],
 )
@@ -116,8 +127,8 @@ def test_worker_price_export_rejects_duplicate_missing_spy_and_partial_member_co
         exporter._validate_prices(path, _membership(), pd.Timestamp("2024-01-02").date(), pd.Timestamp("2024-01-05").date())
 
 
-def test_pit_price_reader_rejects_invalid_ohlc_rows() -> None:
-    """Break caught: an apparently positive bar let high fall below close."""
+def test_pit_price_reader_rejects_invalid_ohlc_rows_and_schema_v2_exclusions() -> None:
+    """Break caught: invalid bars or excluded v2 tradables weakened the price surface."""
     connection = sqlite3.connect(":memory:")
     try:
         connection.execute("CREATE TABLE price (trade_date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)")
@@ -127,3 +138,18 @@ def test_pit_price_reader_rejects_invalid_ohlc_rows() -> None:
             PITDataBundle._query_prices(bundle, ("AAPL",), pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-02"))
     finally:
         connection.close()
+    with pytest.raises(ValueError, match="price exclusions are not permitted"):
+        bundle_builder._integrity_gate(
+            cutoff="2025-12-31",
+            evaluation_start="2021-01-01",
+            warmup_start="2020-01-01",
+            membership=[("2021-01-01", "AAPL", 1)],
+            prices=[
+                ("2020-01-02", reference)
+                for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+            ],
+            fundamentals=[("AAPL",)],
+            price_exclusions={"AAPL"},
+            membership_provenance={},
+            prices_provenance={},
+        )

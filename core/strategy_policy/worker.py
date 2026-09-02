@@ -139,6 +139,23 @@ class WorkerBootstrap:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkerReady:
+    schema_version: int
+    interface_version: int
+    status: str
+    hmac_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("worker ready schema is unsupported")
+        if type(self.interface_version) is not int or self.interface_version <= 0:
+            raise ValueError("worker ready interface is invalid")
+        if self.status != "ready":
+            raise ValueError("worker ready status is invalid")
+        _sha256(self.hmac_sha256, "ready HMAC")
+
+
+@dataclass(frozen=True, slots=True)
 class PolicyRequestEnvelope:
     sequence: int
     previous_hmac_sha256: str
@@ -192,6 +209,42 @@ def _envelope_hmac(bootstrap: WorkerBootstrap, primitive: Mapping[str, object]) 
     return hmac.new(key, nonce + b"\n" + _canonical_bytes(primitive), hashlib.sha256).hexdigest()
 
 
+def encode_worker_ready(*, bootstrap: WorkerBootstrap) -> str:
+    if not isinstance(bootstrap, WorkerBootstrap):
+        raise ValueError("worker bootstrap is invalid")
+    unsigned = {
+        "schema_version": 1,
+        "interface_version": bootstrap.interface_version,
+        "status": "ready",
+    }
+    ready = WorkerReady(
+        **unsigned,
+        hmac_sha256=_envelope_hmac(bootstrap, unsigned),
+    )
+    return _canonical_bytes(
+        {field.name: getattr(ready, field.name) for field in fields(ready)}
+    ).decode("utf-8")
+
+
+def decode_worker_ready(raw: str, *, bootstrap: WorkerBootstrap) -> WorkerReady:
+    if not isinstance(bootstrap, WorkerBootstrap):
+        raise ValueError("worker bootstrap is invalid")
+    value = _closed_json(
+        raw,
+        frozenset({"schema_version", "interface_version", "status", "hmac_sha256"}),
+    )
+    ready = WorkerReady(**value)  # type: ignore[arg-type]
+    if ready.interface_version != bootstrap.interface_version:
+        raise ValueError("worker ready interface differs")
+    unsigned = {key: item for key, item in value.items() if key != "hmac_sha256"}
+    if not hmac.compare_digest(
+        ready.hmac_sha256,
+        _envelope_hmac(bootstrap, unsigned),
+    ):
+        raise ValueError("worker ready HMAC is invalid")
+    return ready
+
+
 def _require_method_pair(method: str, value: object, *, response: bool) -> type[object]:
     if method not in _METHOD_TYPES:
         raise ValueError("policy method is invalid")
@@ -202,6 +255,7 @@ def _require_method_pair(method: str, value: object, *, response: bool) -> type[
 
 
 def _contract_from_payload(contract_type: type[object], payload: object) -> object:
+    """Rebuild interface-v2 contracts, including their nested market context."""
     if not isinstance(payload, dict):
         raise ValueError("policy payload is invalid")
     raw = _canonical_bytes(payload).decode("utf-8")
@@ -445,6 +499,12 @@ def worker_main() -> int:
         "select_eviction": risk.select_eviction,
         "evaluate_exit": exit.evaluate_exit,
     }
+    try:
+        ready = encode_worker_ready(bootstrap=bootstrap)
+        sys.stdout.buffer.write(ready.encode("utf-8") + b"\n")
+        sys.stdout.buffer.flush()
+    except (OSError, ValueError):
+        return 2
     sequence = 1
     previous_hmac = initial_chain_sha256(bootstrap)
     while True:
@@ -488,10 +548,13 @@ __all__ = [
     "PolicyRequestEnvelope",
     "PolicyResponseEnvelope",
     "WorkerBootstrap",
+    "WorkerReady",
+    "decode_worker_ready",
     "decode_policy_request",
     "decode_policy_response",
     "encode_policy_request",
     "encode_policy_response",
+    "encode_worker_ready",
     "initial_chain_sha256",
     "validate_policy_determinism_probes",
     "worker_main",

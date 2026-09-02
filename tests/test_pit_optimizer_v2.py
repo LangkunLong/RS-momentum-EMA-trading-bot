@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict, fields, replace
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_HALF_EVEN
+from decimal import Decimal
 import difflib
 from itertools import product
 import os
@@ -280,26 +280,82 @@ def test_role_schema_investigator_output_is_closed_and_bounded() -> None:
             _canonical_text({**payload, "family": "hidden_validation"}),
             max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
         )
-    with pytest.raises(ValueError, match="at most 16"):
-        contract.InvestigatorArtifact.from_json(
-            _canonical_text(
-                {
-                    **payload,
-                    "evidence_ids": [f"evidence_{index}" for index in range(17)],
-                }
-            ),
-            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
-        )
-    with pytest.raises(ValueError, match="unique"):
-        contract.InvestigatorArtifact.from_json(
-            _canonical_text({**payload, "known_risks": ["same", "same"]}),
-            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
-        )
+    bounded = contract.InvestigatorArtifact.from_json(
+        _canonical_text(
+            {
+                **payload,
+                "evidence_ids": [f"evidence_{index}" for index in range(17)],
+            }
+        ),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    assert len(bounded.evidence_ids) == contract.MAX_ROLE_LIST_ITEMS
+    deduplicated = contract.InvestigatorArtifact.from_json(
+        _canonical_text({**payload, "known_risks": ["same", "same"]}),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    assert deduplicated.known_risks == ("same",)
     with pytest.raises(ValueError, match="bounded"):
         contract.InvestigatorArtifact.from_json(
             _canonical_text(payload),
             max_total_bytes=32,
         )
+
+    v4_payload = {
+        "hypothesis_id": "adaptive_leadership_1",
+        "focus_areas": ["entry", "risk_sizing"],
+        "evidence_ids": ["discovery.cagr", "quick.entry_funnel"],
+        "causal_rationale": "Coordinate entry quality with exposure when leadership narrows.",
+        "expected_diagnostic_changes": ["higher discovery CAGR"],
+        "known_risks": ["lower participation"],
+        "author_instructions": ["Return all three complete policy sources."],
+    }
+    v4_artifact = contract.InvestigatorArtifactV4.from_json(
+        _canonical_text(v4_payload),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    assert v4_artifact.focus_areas == ("entry", "risk_sizing")
+    assert contract.pit_optimizer_v4_response_format("investigator") == {
+        "type": "json_object"
+    }
+    v4_schema = contract.pit_optimizer_v4_response_schema("investigator")
+    assert v4_schema["properties"]["focus_areas"]["maxItems"] == 3
+    with pytest.raises(ValueError, match="focus areas"):
+        contract.InvestigatorArtifactV4.from_json(
+            _canonical_text({**v4_payload, "focus_areas": ["entries"]}),
+            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+        )
+    with pytest.raises(ValueError, match="256 characters"):
+        contract.InvestigatorArtifactV4.from_json(
+            _canonical_text({**v4_payload, "causal_rationale": "x" * 257}),
+            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+        )
+    with pytest.raises(ValueError, match="96 characters"):
+        contract.InvestigatorArtifactV4.from_json(
+            _canonical_text(
+                {**v4_payload, "expected_diagnostic_changes": ["x" * 97]}
+            ),
+            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+        )
+
+
+def test_investigator_parser_derives_scope_instead_of_trusting_model_echo() -> None:
+    """Break caught: harmless model path aliases could abort before any candidate exists."""
+    payload = {
+        **_investigator_payload(),
+        "target_paths": ["entry.py"],
+        "target_symbols": ["evaluate_entry"],
+    }
+
+    artifact = contract.InvestigatorArtifact.from_json(
+        _canonical_text(payload),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+
+    assert artifact.target_paths == ("core/strategy_policy/entry.py",)
+    assert artifact.target_symbols == (
+        "core.strategy_policy.entry.evaluate_entry",
+    )
 
 
 def _author_payload() -> dict[str, object]:
@@ -364,6 +420,107 @@ def test_role_schema_author_output_has_independent_diff_and_metadata_caps() -> N
             max_total_bytes=16 * 1024,
         )
 
+    parent_sources = tuple(
+        contract.AuthorSourceFile.from_source(path=path, source=source)
+        for path, source in {
+            "core/strategy_policy/entry.py": "def evaluate_entry(snapshot):\n    return None\n",
+            "core/strategy_policy/risk.py": "def recommend_capacity(snapshot):\n    return 1\n",
+            "core/strategy_policy/exit.py": "def evaluate_exit(snapshot):\n    return None\n",
+        }.items()
+    )
+    parent = contract.SelectedParentIdentity.issue(
+        parent_kind="baseline",
+        parent_id="baseline",
+        source_head="a" * 40,
+        policy_sources=parent_sources,
+    )
+    replacement_sources = {
+        item.path: (
+            item.source.replace("return None", "return True")
+            if item.path == "core/strategy_policy/entry.py"
+            else item.source
+        )
+        for item in parent_sources
+    }
+    v4_payload = {
+        "hypothesis_id": "adaptive_leadership_1",
+        "parent_identity_sha256": parent.parent_identity_sha256,
+        "behavioral_summary": "Require a stronger entry while preserving risk and exit.",
+        "policy_sources": replacement_sources,
+        "assumptions": [],
+        "validation_suggestions": ["Run syntax and policy-interface checks."],
+    }
+    response_bytes = len(_canonical_text(v4_payload).encode("utf-8"))
+    v4_artifact = contract.AuthorArtifactV4.from_json(
+        _canonical_text(v4_payload),
+        selected_parent=parent,
+        max_total_bytes=response_bytes,
+    )
+    assert tuple(item.path for item in v4_artifact.policy_sources) == _POLICY_PATHS
+    assert set(v4_artifact.to_primitive()["policy_sources"]) == set(_POLICY_PATHS)
+    assert "unified_diff" not in v4_artifact.to_primitive()
+    assert contract.pit_optimizer_v4_response_format("author") == {
+        "type": "json_object"
+    }
+    author_schema = contract.pit_optimizer_v4_response_schema("author")
+    assert set(author_schema["properties"]["policy_sources"]["properties"]) == set(
+        _POLICY_PATHS
+    )
+    with pytest.raises(ValueError, match="exactly the three editable paths"):
+        contract.AuthorArtifactV4.from_json(
+            _canonical_text(
+                {
+                    **v4_payload,
+                    "policy_sources": {
+                        key: value
+                        for key, value in replacement_sources.items()
+                        if key != "core/strategy_policy/exit.py"
+                    },
+                }
+            ),
+            selected_parent=parent,
+            max_total_bytes=response_bytes,
+        )
+    with pytest.raises(ValueError, match="256 characters"):
+        contract.AuthorArtifactV4.from_json(
+            _canonical_text({**v4_payload, "behavioral_summary": "x" * 257}),
+            selected_parent=parent,
+            max_total_bytes=response_bytes + 512,
+        )
+    with pytest.raises(ValueError, match="at least one changed"):
+        contract.AuthorArtifactV4.from_json(
+            _canonical_text(
+                {
+                    **v4_payload,
+                    "policy_sources": {item.path: item.source for item in parent_sources},
+                }
+            ),
+            selected_parent=parent,
+            max_total_bytes=response_bytes,
+        )
+
+
+def test_author_parser_uses_controller_scope_instead_of_model_echo() -> None:
+    """Break caught: redundant model scope metadata could block diff validation."""
+    payload = {
+        **_author_payload(),
+        "changed_paths": ["entry.py"],
+        "changed_symbols": ["evaluate_entry"],
+    }
+
+    artifact = contract.AuthorArtifact.from_json(
+        _canonical_text(payload),
+        max_diff_bytes=8 * 1024,
+        max_total_bytes=16 * 1024,
+        controller_paths=("core/strategy_policy/entry.py",),
+        controller_symbols=("core.strategy_policy.entry.evaluate_entry",),
+    )
+
+    assert artifact.changed_paths == ("core/strategy_policy/entry.py",)
+    assert artifact.changed_symbols == (
+        "core.strategy_policy.entry.evaluate_entry",
+    )
+
 
 def _critic_payload() -> dict[str, object]:
     return {
@@ -403,6 +560,25 @@ def test_role_schema_critic_output_is_advisory_closed_and_bounded() -> None:
             _canonical_text(payload),
             max_total_bytes=64,
         )
+
+    for disposition in ("promote", "refine", "abandon"):
+        v4_artifact = contract.CriticArtifactV4.from_json(
+            _canonical_text({**payload, "disposition": disposition}),
+            max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
+        )
+        assert v4_artifact.disposition == disposition
+    assert contract.pit_optimizer_v4_response_format("critic") == {
+        "type": "json_object"
+    }
+    assert contract.pit_optimizer_v4_response_schema("critic")["properties"][
+        "disposition"
+    ]["enum"] == ["promote", "refine", "abandon"]
+    for forbidden_alias in ("accept", "change_family", "revise", "reject"):
+        with pytest.raises(ValueError, match="disposition"):
+            contract.CriticArtifactV4.from_json(
+                _canonical_text({**payload, "disposition": forbidden_alias}),
+                max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
+            )
 
 
 def _source_bundle() -> contract.PolicySourceBundle:
@@ -1133,6 +1309,7 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
         family="risk_sizing",
         author_summary="Reduced concentration.",
         validation_code="valid",
+        candidate_folds=(),
         discovery_score=None,
         critic_disposition="refine",
         critic_next_direction="Use a smaller adjustment.",
@@ -1257,8 +1434,7 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
             assert forbidden not in rendered
 
     author_input.validate_artifact(author_artifact)
-    with pytest.raises(ValueError, match="hypothesis"):
-        author_input.validate_artifact(replace(author_artifact, hypothesis_id="other"))
+    author_input.validate_artifact(replace(author_artifact, hypothesis_id="other"))
     with pytest.raises(ValueError, match="hypothesis"):
         replace(critic_input, hypothesis_id="other")
     with pytest.raises(ValueError, match="source SHA-256"):
@@ -1283,6 +1459,302 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
             ),
             next_direction="x" * (4 * 1024 + 1),
         )
+
+    v4_sources = _v4_policy_sources()
+    v4_manifest, v4_plan = _v4_manifest()
+    v4_scope = v4_manifest.policy_authoring_scope
+    v4_parent = contract.SelectedParentIdentity.issue(
+        parent_kind="baseline",
+        parent_id="baseline",
+        source_head="a" * 40,
+        policy_sources=v4_sources,
+    )
+    quick = _v4_panel_summary(
+        "quick",
+        panel_sha256=v4_plan.quick_panel.sha256,
+        cagr_pct=Decimal("4.00"),
+    )
+    discovery_panel = _v4_panel_summary(
+        "discovery",
+        panel_sha256=v4_plan.discovery_panel.sha256,
+        cagr_pct=Decimal("5.00"),
+    )
+    quick_primitive = asdict(quick)
+    quick_primitive["portfolio_annualized_return_pct"] = "4.00"
+    assert evaluation.panel_aggregate_summary_from_primitive(quick_primitive) == quick
+    parent_summary = contract.SelectedParentSummary(
+        identity=v4_parent,
+        hypothesis_id="baseline",
+        behavioral_summary="Authenticated interface-v2 baseline.",
+        quick_panel=quick,
+        discovery_panel=discovery_panel,
+    )
+    target = evaluation.AnnualizedReturnTarget.production()
+    progress = contract.TargetProgressV4.from_summaries(
+        target=target,
+        baseline=discovery_panel,
+        selected_parent=discovery_panel,
+        champion=discovery_panel,
+    )
+    investigator_v4 = contract.InvestigatorArtifactV4.from_json(
+        _canonical_text(
+            {
+                "hypothesis_id": "adaptive_leadership_1",
+                "focus_areas": ["entry", "risk_sizing"],
+                "evidence_ids": ["discovery.cagr"],
+                "causal_rationale": "Coordinate entry quality and exposure.",
+                "expected_diagnostic_changes": ["higher discovery CAGR"],
+                "known_risks": [],
+                "author_instructions": ["Return all three complete sources."],
+            }
+        ),
+        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+    )
+    common_v4 = {
+        "schema_version": 4,
+        "iteration": 1,
+        "run_manifest_sha256": v4_manifest.sha256,
+        "policy_authoring_scope_sha256": v4_scope.sha256,
+        "policy_interface_version": 2,
+        "immutable_constraint_ids": ("causal_only", "no_external_io"),
+        "annualized_return_target": target,
+        "discovery_panel_plan_sha256": v4_manifest.discovery_panel_plan_sha256,
+        "quick_panel_sha256": v4_manifest.quick_panel_sha256,
+        "discovery_panel_sha256": v4_manifest.discovery_panel_sha256,
+        "selected_parent_identity": v4_parent,
+    }
+    investigator_input_v4 = contract.InvestigatorInputV4(
+        **common_v4,
+        selected_parent_source_bundle_sha256=v4_parent.source_bundle_sha256,
+        selected_parent_sources=v4_sources,
+        selected_parent_summary=parent_summary,
+        baseline_summary=parent_summary,
+        champion_summary=None,
+        branch_summary=None,
+        target_progress=progress,
+        prior_hypotheses=(),
+        validation_status=contract.CandidateValidationStatusV4(
+            status="not_evaluated",
+            failure_code=None,
+        ),
+    )
+    author_input_v4 = contract.AuthorInputV4(
+        **common_v4,
+        selected_parent_source_bundle_sha256=v4_parent.source_bundle_sha256,
+        selected_parent_sources=v4_sources,
+        investigator=investigator_v4,
+    )
+    replacement_sources = {
+        item.path: (
+            item.source.replace("return None", "return True")
+            if item.path == "core/strategy_policy/entry.py"
+            else item.source
+        )
+        for item in v4_sources
+    }
+    author_v4_payload = {
+        "hypothesis_id": investigator_v4.hypothesis_id,
+        "parent_identity_sha256": v4_parent.parent_identity_sha256,
+        "behavioral_summary": "Coordinate entry quality while retaining risk and exit.",
+        "policy_sources": replacement_sources,
+        "assumptions": [],
+        "validation_suggestions": [],
+    }
+    author_v4 = contract.AuthorArtifactV4.from_json(
+        _canonical_text(author_v4_payload),
+        selected_parent=v4_parent,
+        max_total_bytes=len(_canonical_text(author_v4_payload).encode("utf-8")),
+    )
+    assert dict(author_v4.replacement_sources) == replacement_sources
+    author_input_v4.validate_artifact(author_v4)
+    author_manifest_v4 = contract.AuthorManifestSummaryV4.from_artifact(
+        author_v4,
+        selected_parent=v4_parent,
+    )
+    critic_input_v4 = contract.CriticInputV4(
+        **common_v4,
+        selected_parent_summary=parent_summary,
+        hypothesis_id=investigator_v4.hypothesis_id,
+        investigator_summary=investigator_v4,
+        author_manifest=author_manifest_v4,
+        author_output_invalid=None,
+        validation_status=contract.CandidateValidationStatusV4(
+            status="valid",
+            failure_code=None,
+        ),
+        candidate_quick=quick,
+        candidate_discovery=discovery_panel,
+        baseline_quick=quick,
+        baseline_discovery=discovery_panel,
+        champion_discovery=discovery_panel,
+        target_progress=progress,
+    )
+    assert {
+        value.selected_parent_identity.parent_identity_sha256
+        for value in (investigator_input_v4, author_input_v4, critic_input_v4)
+    } == {v4_parent.parent_identity_sha256}
+    investigator_input_v4.validate_budget(
+        v4_scope.call_budgets[0], scope=v4_scope, manifest=v4_manifest
+    )
+    author_input_v4.validate_budget(
+        v4_scope.call_budgets[1], scope=v4_scope, manifest=v4_manifest
+    )
+    critic_input_v4.validate_budget(
+        v4_scope.call_budgets[2], scope=v4_scope, manifest=v4_manifest
+    )
+    for role_input_v4 in (
+        investigator_input_v4,
+        author_input_v4,
+        critic_input_v4,
+    ):
+        rendered = role_input_v4.canonical_json_bytes().decode("utf-8")
+        for forbidden in (
+            "fold_manifest",
+            "discovery_score",
+            "unified_diff",
+            "max_usd",
+            "qualification_panel",
+        ):
+            assert forbidden not in rendered
+    critic_text = critic_input_v4.canonical_json_bytes().decode("utf-8")
+    assert "policy_sources" not in critic_text
+    assert "def evaluate_entry" not in critic_text
+    invalid_author = contract.RoleOutputInvalidSummary(
+        iteration=1,
+        call_index=2,
+        role="author",
+        validation_code="payload_schema_invalid",
+    )
+    invalid_critic_input = replace(
+        critic_input_v4,
+        author_manifest=None,
+        author_output_invalid=invalid_author,
+        validation_status=contract.CandidateValidationStatusV4(
+            status="invalid",
+            failure_code="author_output_invalid",
+        ),
+        candidate_quick=None,
+        candidate_discovery=None,
+    )
+    assert invalid_critic_input.author_output_invalid == invalid_author
+    from core import pit_optimizer_authorization as authorization
+
+    investigator_facts = authorization.PitOptimizerProviderFacts(
+        call_index=1,
+        iteration=1,
+        role="investigator",
+        requested_model=contract.PIT_OPTIMIZER_R1_MODEL,
+        returned_model=contract.PIT_OPTIMIZER_R1_MODEL,
+        pricing_snapshot_sha256="7" * 64,
+        outcome="accepted",
+        request_started=True,
+        response_received=True,
+        finish_reason="stop",
+        response_schema_valid=True,
+        accounting_complete=True,
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        cost_usd=0.0,
+        retained_reservation_tokens=0,
+        audit_sha256="8" * 64,
+        accounting_source="inline",
+    )
+    investigator_attempt = authorization.PitOptimizerRoleAttempt(
+        plan=v4_scope.call_budgets[0],
+        facts=investigator_facts,
+        payload=investigator_v4,
+    )
+    author_attempt = authorization.PitOptimizerRoleAttempt(
+        plan=v4_scope.call_budgets[1],
+        facts=replace(
+            investigator_facts,
+            call_index=2,
+            role="author",
+            outcome="schema_invalid",
+            response_schema_valid=False,
+            response_validation_code="payload_schema_invalid",
+        ),
+        payload=None,
+    )
+    invalid_critic_primitive = json.loads(
+        invalid_critic_input.canonical_json_bytes()
+    )
+    authorization._require_critic_predecessor_attempt_lineage(
+        invalid_critic_primitive,
+        investigator_attempt,
+        author_attempt,
+    )
+    invalid_critic_primitive["author_output_invalid"][
+        "validation_code"
+    ] = "payload_binding_invalid"
+    with pytest.raises(authorization.AuthorizationError, match="summary differs"):
+        authorization._require_critic_predecessor_attempt_lineage(
+            invalid_critic_primitive,
+            investigator_attempt,
+            author_attempt,
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        replace(invalid_critic_input, author_manifest=author_manifest_v4)
+    with pytest.raises(ValueError, match="exactly one"):
+        replace(critic_input_v4, author_manifest=None)
+    with pytest.raises(ValueError, match="selected parent source"):
+        replace(
+            author_input_v4,
+            selected_parent_source_bundle_sha256="4" * 64,
+        )
+    with pytest.raises(ValueError, match="authenticated panel"):
+        replace(
+            investigator_input_v4,
+            baseline_summary=replace(
+                parent_summary,
+                quick_panel=replace(quick, panel_sha256="4" * 64),
+            ),
+        )
+    inconsistent_progress = replace(
+        progress,
+        selected_parent_cagr_pct=Decimal("6.00"),
+        target_gap_pp=Decimal("4.00"),
+    )
+    with pytest.raises(ValueError, match="authenticated summaries"):
+        replace(investigator_input_v4, target_progress=inconsistent_progress)
+    branch_parent = contract.SelectedParentIdentity.issue(
+        parent_kind="branch",
+        parent_id="branch_1",
+        source_head="a" * 40,
+        policy_sources=v4_sources,
+    )
+    branch_summary = replace(parent_summary, identity=branch_parent)
+    with pytest.raises(ValueError, match="deterministic parent"):
+        replace(investigator_input_v4, branch_summary=branch_summary)
+    wrong_author_slot = contract.RoleOutputInvalidSummary(
+        iteration=2,
+        call_index=5,
+        role="author",
+        validation_code="payload_schema_invalid",
+    )
+    with pytest.raises(ValueError, match="author slot"):
+        replace(invalid_critic_input, author_output_invalid=wrong_author_slot)
+    with pytest.raises(ValueError, match="nonvalid status"):
+        replace(invalid_critic_input, candidate_quick=quick)
+    with pytest.raises(ValueError, match="both candidate panels"):
+        replace(critic_input_v4, candidate_discovery=None)
+    advisory_scope = replace(v4_scope, max_iteration_feedback_bytes=1)
+    advisory_manifest = replace(v4_manifest, policy_authoring_scope=advisory_scope)
+    advisory_input = replace(
+        critic_input_v4,
+        run_manifest_sha256=advisory_manifest.sha256,
+        policy_authoring_scope_sha256=advisory_scope.sha256,
+    )
+    assert (
+        len(advisory_input.canonical_json_bytes())
+        <= advisory_scope.call_budgets[2].max_dynamic_input_bytes
+    )
+    advisory_input.validate_budget(
+        advisory_scope.call_budgets[2],
+        scope=advisory_scope,
+        manifest=advisory_manifest,
+    )
 
 
 def _sessions(start: str, end: str) -> tuple[str, ...]:
@@ -1330,9 +1802,9 @@ def _fold_manifest() -> FoldManifest:
 
 def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
     role_caps = {
-        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
-        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
-        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
+        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
+        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
     return tuple(
         contract.PitOptimizerCallBudget(
@@ -1345,7 +1817,6 @@ def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
             max_input_tokens=role_caps[role][2],
             max_output_tokens=role_caps[role][3],
             max_response_bytes=role_caps[role][4],
-            max_usd=role_caps[role][5],
         )
         for iteration in (1, 2)
         for ordinal, role in enumerate(contract.OPTIMIZER_V2_ROLES, start=1)
@@ -1389,13 +1860,12 @@ def _v2_manifest() -> contract.PitOptimizerRunManifest:
         window_id="window_1",
         max_calls=6,
         max_tokens=448_000,
-        max_usd=0.40,
         policy_source_scope_sha256=scope.sha256,
         provider_retries=0,
         apply=False,
     )
     return contract.PitOptimizerRunManifest(
-        schema_version=2,
+        schema_version=3,
         run_id="run_1",
         run_kind="subset_canary",
         model="deepseek/deepseek-r1",
@@ -1421,6 +1891,118 @@ def _v2_manifest() -> contract.PitOptimizerRunManifest:
         non_improving_limit=3,
         authorization_requirement=authorization,
     )
+
+
+def _v4_policy_sources() -> tuple[contract.AuthorSourceFile, ...]:
+    return tuple(
+        contract.AuthorSourceFile.from_source(path=path, source=source)
+        for path, source in {
+            "core/strategy_policy/entry.py": "def evaluate_entry(snapshot):\n    return None\n",
+            "core/strategy_policy/risk.py": "def recommend_capacity(snapshot):\n    return 1\n",
+            "core/strategy_policy/exit.py": "def evaluate_exit(snapshot):\n    return None\n",
+        }.items()
+    )
+
+
+def _v4_panel_summary(
+    panel_id: str,
+    *,
+    panel_sha256: str,
+    cagr_pct: Decimal,
+) -> evaluation.PanelAggregateSummary:
+    starting_equity = 100.0
+    ending_equity = starting_equity * (1.0 + float(cagr_pct) / 100.0)
+    return evaluation.PanelAggregateSummary(
+        panel_id=panel_id,
+        panel_sha256=panel_sha256,
+        starting_equity=starting_equity,
+        ending_equity=ending_equity,
+        elapsed_calendar_days=365,
+        portfolio_annualized_return_pct=cagr_pct,
+        total_return_pct=float(cagr_pct),
+        benchmark_return_pct=4.0,
+        max_drawdown_pct=-3.0,
+        sharpe_ratio=1.0,
+        closed_trades=0,
+        turnover_pct=0.0,
+        average_exposure_pct=0.0,
+        entry_funnel=(AggregateMetric("evaluated", 10),),
+        exit_attribution=(),
+    )
+
+
+def _v4_call_budgets(iterations: int = 3) -> tuple[contract.PitOptimizerCallBudget, ...]:
+    return tuple(
+        contract.PitOptimizerCallBudget(
+            call_index=(iteration - 1) * 3 + ordinal,
+            iteration=iteration,
+            role=role,
+            model=contract.PIT_OPTIMIZER_R1_MODEL,
+            max_static_input_bytes=20_000,
+            max_dynamic_input_bytes=200_000,
+            max_input_tokens=220_000,
+            max_output_tokens=40_000,
+            max_response_bytes=64_000,
+        )
+        for iteration in range(1, iterations + 1)
+        for ordinal, role in enumerate(contract.OPTIMIZER_V4_ROLES, start=1)
+    )
+
+
+def _v4_discovery_plan() -> evaluation.DiscoveryPanelPlan:
+    lineages = tuple(
+        evaluation.PanelSecurityLineage(
+            security_lineage_id=f"chain-{index}",
+            executable_tickers=(f"T{index}",),
+            source_affiliations=("sp500",),
+        )
+        for index in range(3)
+    )
+    snapshot = evaluation.QualificationRetirementSnapshot(
+        schema_version=4,
+        qualification_retirement_domain_id="a" * 64,
+        ledger_head_sha256="b" * 64,
+        record_count=1,
+        retired_security_lineage_ids=(),
+    )
+    _qualification, discovery = evaluation.compose_panel_plans(
+        lineages=lineages,
+        sessions=("2021-01-04", "2021-01-05", "2021-01-06"),
+        pit_bundle_sha256="c" * 64,
+        prices_provenance_sha256="d" * 64,
+        partition_seed_sha256="e" * 64,
+        target=evaluation.AnnualizedReturnTarget.production(),
+        rule=evaluation.PanelAllocationRuleV1(1, 1, 1),
+        ledger_snapshot=snapshot,
+    )
+    return discovery
+
+
+def _v4_manifest() -> tuple[
+    contract.PitOptimizerRunManifestV4,
+    evaluation.DiscoveryPanelPlan,
+]:
+    policy_sources = _v4_policy_sources()
+    scope = contract.PolicyAuthoringScopeV4.from_sources(
+        policy_sources=policy_sources,
+        call_budgets=_v4_call_budgets(),
+        max_iteration_feedback_bytes=8_000,
+        max_iteration_history_bytes=64_000,
+        author_response_headroom_bytes=8_000,
+    )
+    plan = _v4_discovery_plan()
+    manifest = contract.PitOptimizerRunManifestV4.from_discovery_plan(
+        campaign_id="adaptive_oneil_1",
+        campaign_sequence=1,
+        source_head="f" * 40,
+        source_fingerprint_sha256="1" * 64,
+        discovery_panel_plan=plan,
+        policy_authoring_scope=scope,
+        immutable_constraint_ids=("causal_only", "no_external_io"),
+        sandbox_image="example.invalid/pit-optimizer@sha256:" + "2" * 64,
+        authorization_window_id="window_v4_manifest_test",
+    )
+    return manifest, plan
 
 
 def _independent_digest(value: object) -> str:
@@ -1458,14 +2040,13 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
         (5, 2, "author"),
         (6, 2, "critic"),
     ]
-    assert sum(item.max_input_tokens for item in manifest.call_budgets) == 416_000
-    assert sum(item.max_output_tokens for item in manifest.call_budgets) == 32_000
+    assert sum(item.max_input_tokens for item in manifest.call_budgets) == 380_000
+    assert sum(item.max_output_tokens for item in manifest.call_budgets) == 68_000
     assert sum(
         item.max_input_tokens + item.max_output_tokens
         for item in manifest.call_budgets
     ) == 448_000
     assert manifest.authorization_requirement.max_tokens == 448_000
-    assert sum(item.max_usd for item in manifest.call_budgets) == pytest.approx(0.40)
     assert manifest.authorization_requirement.apply is False
     assert manifest.authorization_requirement.provider_retries == 0
 
@@ -1512,7 +2093,7 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
                 max_tokens=448_001,
             ),
         )
-    with pytest.raises(ValueError, match="exactly 448000"):
+    with pytest.raises(ValueError, match="exactly 448000|call caps"):
         replace(
             manifest,
             call_budgets=(inflated_output, *manifest.call_budgets[1:]),
@@ -1522,12 +2103,75 @@ def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
             ),
         )
 
+    v4, discovery_plan = _v4_manifest()
+    assert v4.schema_version == 4
+    assert v4.policy_interface_version == 2
+    assert v4.max_iterations == 3
+    assert len(v4.call_budgets) == 9
+    assert v4.discovery_panel_plan_sha256 == discovery_plan.sha256
+    assert v4.quick_panel_sha256 == discovery_plan.quick_panel.sha256
+    assert v4.discovery_panel_sha256 == discovery_plan.discovery_panel.sha256
+    assert v4.qualification_plan_sha256 == discovery_plan.qualification_plan_sha256
+    assert v4.annualized_return_target == discovery_plan.target
+    assert v4.apply is False and v4.provider_retries == 0
+    assert v4.seed_checkpoint_sha256 is None
+    assert v4.policy_authoring_scope.canonical_source_bundle_bytes == len(
+        contract.policy_source_bundle_v4_bytes(_v4_policy_sources())
+    )
+    forbidden_scope_fields = {
+        "max_files",
+        "max_hunks",
+        "max_changed_lines",
+        "max_diff_bytes",
+        "candidate_bounds",
+        "hard_patch_bounds",
+        "max_usd",
+    }
+    assert not forbidden_scope_fields.intersection(
+        field.name for field in fields(contract.PolicyAuthoringScopeV4)
+    )
+    primitive = v4.to_primitive()
+    assert "qualification_panel" not in json.dumps(primitive, sort_keys=True)
+    assert contract._pit_optimizer_manifest_v4_from_primitive(
+        primitive,
+        discovery_panel_plan=discovery_plan,
+    ) == v4
+    assert contract._pit_optimizer_manifest_from_primitive(
+        _v2_manifest().to_primitive()
+    ) == _v2_manifest()
+    with pytest.raises(ValueError, match="v4 manifest keys"):
+        contract._pit_optimizer_manifest_v4_from_primitive(
+            _v2_manifest().to_primitive()
+        )
+    with pytest.raises(ValueError, match="policy interface"):
+        replace(v4, policy_interface_version=1)
+    with pytest.raises(ValueError, match="apply"):
+        replace(v4, apply=True)
+    with pytest.raises(ValueError, match="provider retries"):
+        replace(v4, provider_retries=1)
+    with pytest.raises(ValueError, match="authoring scope differs|call order"):
+        replace(
+            v4,
+            call_budgets=(
+                replace(v4.call_budgets[0], call_index=2),
+                *v4.call_budgets[1:],
+            ),
+        )
+    stale_plan_binding = replace(v4, discovery_panel_plan_sha256="3" * 64)
+    with pytest.raises(ValueError, match="discovery plan binding"):
+        stale_plan_binding.validate_discovery_plan(discovery_plan)
+    advisory_scope = replace(
+        v4.policy_authoring_scope,
+        max_iteration_history_bytes=200_000,
+    )
+    assert advisory_scope.max_iteration_history_bytes == 200_000
+    assert advisory_scope.call_budgets == v4.call_budgets
+
 
 _FIRST_CANARY_MUTATIONS = (
     "global_max_iterations",
     "global_max_calls",
     "global_max_tokens",
-    "global_max_usd",
     "call_order",
     *(
         f"{role}_{field}"
@@ -1538,7 +2182,6 @@ _FIRST_CANARY_MUTATIONS = (
             "max_input_tokens",
             "max_output_tokens",
             "max_response_bytes",
-            "max_usd",
         )
     ),
 )
@@ -1562,8 +2205,6 @@ def _mutate_first_canary_primitive(
         authorization["max_calls"] = 7
     elif mutation == "global_max_tokens":
         authorization["max_tokens"] = 448_001
-    elif mutation == "global_max_usd":
-        authorization["max_usd"] = 0.41
     elif mutation == "call_order":
         budgets[0], budgets[1] = budgets[1], budgets[0]
     else:
@@ -1574,7 +2215,6 @@ def _mutate_first_canary_primitive(
             "max_input_tokens",
             "max_output_tokens",
             "max_response_bytes",
-            "max_usd",
         ):
             suffix = f"_{known_field}"
             if mutation.endswith(suffix):
@@ -1585,12 +2225,10 @@ def _mutate_first_canary_primitive(
             index for index, budget in enumerate(budgets) if budget["role"] == role
         ]
         assert len(role_indexes) == 2
-        target = budgets[role_indexes[0]]
+        target = budgets[role_indexes[-1]]
         if field in {"max_input_tokens", "max_output_tokens"}:
             target[field] += 1
-            budgets[role_indexes[1]][field] -= 1
-        elif field == "max_usd":
-            target[field] -= 0.001
+            budgets[role_indexes[0]][field] -= 1
         else:
             target[field] -= 1
     return primitive
@@ -1634,7 +2272,6 @@ def test_direct_canary_rejects_every_first_canary_plan_mutation(
         authorization_requirement_sha256=hashlib.sha256(
             _canonical_file_bytes(authorization)
         ).hexdigest(),
-        max_usd=float(authorization["max_usd"]),
         max_api_calls=int(authorization["max_calls"]),
         max_tokens=int(authorization["max_tokens"]),
         max_iterations=int(primitive["max_iterations"]),
@@ -1792,6 +2429,46 @@ def _builder_fixture(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+    readiness_source_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source_root,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    (source_root / "optimizer-revision.txt").write_bytes(b"later authenticated source\n")
+    for arguments in (
+        ("add", "optimizer-revision.txt"),
+        ("commit", "-m", "later authenticated source"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=source_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    reference_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source_root,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    (source_root / "optimizer-final.txt").write_bytes(b"final authenticated source\n")
+    for arguments in (
+        ("add", "optimizer-final.txt"),
+        ("commit", "-m", "final authenticated source"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=source_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
     source_head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=source_root,
@@ -1855,7 +2532,7 @@ def _builder_fixture(
         "gate": "pit_optimization",
         "phase": "ready",
         "identities": {
-            "source_head": source_head,
+            "source_head": readiness_source_head,
             "source_fingerprint_sha256": source_fingerprint,
             "pit_bundle_sha256": pit_sha256,
             "baseline_manifest_sha256": baseline_sha256,
@@ -1890,7 +2567,7 @@ def _builder_fixture(
     provisional = ParityAttestation(
         schema_version=1,
         reference_artifact_sha256="4" * 64,
-        reference_source_head="1" * 40,
+        reference_source_head=reference_head,
         final_source_head=source_head,
         final_source_fingerprint_sha256=source_fingerprint,
         pit_bundle_sha256=pit_sha256,
@@ -1964,7 +2641,32 @@ def _patch_authenticated_readiness(
         assert isinstance(readiness, dict)
         return readiness, readiness_sha256
 
+    def authenticate_ancestry(
+        *,
+        source_root: Path,
+        reference_head: str,
+        final_head: str,
+    ) -> None:
+        assert Path(source_root).resolve() == Path(inputs["source_root"]).resolve()
+        parity_attestation = inputs["parity_attestation"]
+        assert isinstance(parity_attestation, ParityAttestation)
+        assert (reference_head, final_head) in {
+            (
+                readiness["identities"]["source_head"],
+                parity_attestation.reference_source_head,
+            ),
+            (
+                parity_attestation.reference_source_head,
+                parity_attestation.final_source_head,
+            ),
+        }
+
     monkeypatch.setattr(parity, "_authenticated_readiness", authenticate)
+    monkeypatch.setattr(
+        parity,
+        "_require_later_descendant_source",
+        authenticate_ancestry,
+    )
 
 
 @pytest.fixture
@@ -1982,7 +2684,7 @@ def v2_gate(
         f"{manifest.run_id}.readiness.json"
     )
     readiness = {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest": asdict(manifest),
         "manifest_sha256": manifest.sha256,
         "parity": {},
@@ -2011,7 +2713,6 @@ def v2_gate(
         authorization_window_id=manifest.authorization_requirement.window_id,
         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
         source_transmission_authorized=True,
-        max_usd=0.40,
         max_api_calls=6,
         max_tokens=448_000,
         max_iterations=2,
@@ -2056,7 +2757,6 @@ def _v2_gate_namespace(
         "git_executable": gate.git_executable,
         "docker_executable": gate.docker_executable,
         "sandbox_image": gate.sandbox_image,
-        "max_usd": gate.max_usd,
         "max_api_calls": gate.max_api_calls,
         "max_tokens": gate.max_tokens,
         "max_iterations": gate.max_iterations,
@@ -2092,7 +2792,7 @@ def test_v2_config_rejects_caller_supplied_file_link_before_resolution(
     )
 
     with pytest.raises(agent_loop.ConfigurationError, match="link or reparse point"):
-        agent_loop._build_pit_optimizer_v2_config(
+        agent_loop._build_pit_optimizer_v3_config(
             _v2_gate_namespace(v2_gate, optimizer_manifest=link)
         )
 
@@ -2112,7 +2812,7 @@ def test_v2_config_rejects_linked_directory_ancestor_before_resolution(
     linked_manifest = linked_parent / v2_gate.optimizer_manifest.name
 
     with pytest.raises(agent_loop.ConfigurationError, match="link or reparse point"):
-        agent_loop._build_pit_optimizer_v2_config(
+        agent_loop._build_pit_optimizer_v3_config(
             _v2_gate_namespace(v2_gate, optimizer_manifest=linked_manifest)
         )
 
@@ -2130,7 +2830,7 @@ def test_v2_config_rejects_hard_link_alias_of_authenticated_target(
         pytest.skip(f"hard links are unavailable on this platform: {exc}")
 
     with pytest.raises(agent_loop.ConfigurationError, match="paths overlap"):
-        agent_loop._build_pit_optimizer_v2_config(
+        agent_loop._build_pit_optimizer_v3_config(
             _v2_gate_namespace(
                 v2_gate,
                 verified_parity=alias,
@@ -2168,7 +2868,6 @@ def test_pit_optimizer_v2_config_canary_requires_exact_sealed_authority(
         ({"max_iterations": 1}, "iterations|ceilings"),
         ({"max_api_calls": 7}, "ceilings"),
         ({"max_tokens": 448_001}, "ceilings"),
-        ({"max_usd": 0.41}, "ceilings"),
         ({"apply": True}, "apply"),
     ):
         with pytest.raises(ValueError, match=message):
@@ -2203,13 +2902,12 @@ def test_pit_optimizer_v2_config_builder_derives_prepare_and_requires_canary_ide
         "git_executable": v2_gate.git_executable,
         "docker_executable": v2_gate.docker_executable,
         "sandbox_image": v2_gate.sandbox_image,
-        "max_usd": 0.40,
         "max_api_calls": 6,
         "max_tokens": 448_000,
         "max_iterations": 2,
         "apply": False,
     }
-    prepare = agent_loop._build_pit_optimizer_v2_config(
+    prepare = agent_loop._build_pit_optimizer_v3_config(
         SimpleNamespace(**common)
     )
     assert prepare == replace(
@@ -2221,7 +2919,7 @@ def test_pit_optimizer_v2_config_builder_derives_prepare_and_requires_canary_ide
         source_transmission_authorized=False,
     )
 
-    canary = agent_loop._build_pit_optimizer_v2_config(
+    canary = agent_loop._build_pit_optimizer_v3_config(
         SimpleNamespace(
             **{
                 **common,
@@ -2260,7 +2958,6 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
     )
     assert manifest.authorization_requirement.max_calls == 6
     assert manifest.authorization_requirement.max_tokens == 448_000
-    assert manifest.authorization_requirement.max_usd == pytest.approx(0.40)
     assert manifest.authorization_requirement.apply is False
     assert manifest.authorization_requirement.provider_retries == 0
 
@@ -2381,10 +3078,6 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
         (
             rendered_values["critic"]["author_manifest"],
             contract.MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES,
-        ),
-        (
-            rendered_values["critic"]["candidate_vs_baseline"],
-            contract.MAX_CANDIDATE_COMPARISON_BYTES,
         ),
     )
     for section, cap in cap_derived_sections:
@@ -2547,27 +3240,23 @@ def test_build_subset_manifest_cli_is_exact_and_provider_free(
             "--investigator-static-bytes",
             "8000",
             "--investigator-dynamic-bytes",
-            "80000",
+            "78000",
             "--investigator-input-tokens",
-            "88000",
+            "86000",
             "--investigator-output-tokens",
-            "4000",
+            "16000",
             "--investigator-response-bytes",
             "8192",
-            "--investigator-max-usd",
-            "0.05",
             "--author-static-bytes",
             "12000",
             "--author-dynamic-bytes",
-            "76000",
+            "48500",
             "--author-input-tokens",
-            "88000",
+            "72000",
             "--author-output-tokens",
-            "8000",
+            "14000",
             "--author-response-bytes",
             "16384",
-            "--author-max-usd",
-            "0.10",
             "--critic-static-bytes",
             "8000",
             "--critic-dynamic-bytes",
@@ -2578,8 +3267,6 @@ def test_build_subset_manifest_cli_is_exact_and_provider_free(
             "4000",
             "--critic-response-bytes",
             "8192",
-            "--critic-max-usd",
-            "0.05",
             "--max-files",
             "3",
             "--max-hunks",
@@ -2611,9 +3298,6 @@ def test_build_subset_manifest_cli_is_exact_and_provider_free(
         item["max_input_tokens"] + item["max_output_tokens"]
         for item in manifest_value["call_budgets"]
     ) == 448_000
-    assert sum(item["max_usd"] for item in manifest_value["call_budgets"]) == pytest.approx(
-        0.40
-    )
     assert manifest_value["policy_source_scope"]["editable_paths"] == list(
         contract.PolicySourceScope(
             **{
@@ -2646,7 +3330,6 @@ def test_build_subset_manifest_cli_is_exact_and_provider_free(
     assert emitted["authorization"] == {
         "max_calls": 6,
         "max_tokens": 448_000,
-        "max_usd": 0.40,
     }
 
 
@@ -2709,7 +3392,6 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
         authorization_window_id=None,
         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
         source_transmission_authorized=False,
-        max_usd=0.40,
         max_api_calls=6,
         max_tokens=448_000,
         max_iterations=2,
@@ -2738,7 +3420,7 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
     readiness_path.write_bytes(
         _canonical_file_bytes(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "manifest": asdict(manifest),
                 "manifest_sha256": manifest.sha256,
                 "parity": {},
@@ -3162,7 +3844,6 @@ def _task6_authorized_ledger(
     grant_id: str = "grant-v2",
     calls: int = 6,
     tokens: int = 448_000,
-    usd: float = 0.40,
 ):
     from core.pit_optimizer_authorization import (
         AuthorizationLedger,
@@ -3183,7 +3864,6 @@ def _task6_authorized_ledger(
             grant_id=grant_id,
             additional_calls=calls,
             additional_tokens=tokens,
-            additional_usd=usd,
             policy_source_scope_sha256=manifest.policy_source_scope.sha256,
         ),
         operator_approval_reference=f"approval-{grant_id}",
@@ -3639,7 +4319,8 @@ def _task6_open_lease(tmp_path: Path, manifest: contract.PitOptimizerRunManifest
         window_id=window.window_id,
         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
         run_manifest_sha256=manifest.sha256,
-        frozen_pricing_sha256=pricing.pricing_sha256,
+        pricing_snapshot=pricing,
+        projected_plan_usd=Decimal("0"),
     )
     return ledger, ledger_path, lease, pricing
 
@@ -3658,7 +4339,6 @@ def _task6_provider_facts(
     total_tokens: int | None = 150,
     cost_usd: float | None = 0.01,
     retained_tokens: int = 0,
-    retained_usd: float = 0.0,
 ):
     from core.pit_optimizer_authorization import PitOptimizerProviderFacts
 
@@ -3668,7 +4348,7 @@ def _task6_provider_facts(
         role=reservation.role,
         requested_model="deepseek/deepseek-r1",
         returned_model=("deepseek/deepseek-r1" if response_received else None),
-        frozen_pricing_sha256=pricing.pricing_sha256,
+        pricing_snapshot_sha256=pricing.pricing_payload_sha256,
         outcome=outcome,
         request_started=request_started,
         response_received=response_received,
@@ -3680,8 +4360,11 @@ def _task6_provider_facts(
         total_tokens=total_tokens,
         cost_usd=cost_usd,
         retained_reservation_tokens=retained_tokens,
-        retained_reservation_usd=retained_usd,
         audit_sha256="a" * 64,
+        response_validation_code=(
+            "payload_schema_invalid" if outcome == "schema_invalid" else None
+        ),
+        accounting_source=("inline" if accounting_complete else None),
     )
 
 
@@ -3689,14 +4372,21 @@ def test_pit_optimizer_v2_terminal_reconciliation_fences_reopened_lease(
     tmp_path: Path,
     v2_manifest: contract.PitOptimizerRunManifest,
 ) -> None:
-    """Break caught: a crash after terminal reconcile could unlock plan two."""
-    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
+    """A reopened lease advances only after authenticated zero-charge skips."""
+    from core.pit_optimizer_authorization import (
+        AuthorizationLedger,
+        PitOptimizerRoleAttempt,
+    )
 
     authorization, ledger_path, lease, pricing = _task6_open_lease(
         tmp_path,
         v2_manifest,
     )
-    reservation = authorization.reserve_call(lease, v2_manifest.call_budgets[0])
+    reservation = authorization.reserve_call(
+        lease,
+        v2_manifest.call_budgets[0],
+        projected_call_usd=Decimal("0"),
+    )
     facts = _task6_provider_facts(
         reservation,
         pricing,
@@ -3709,17 +4399,36 @@ def test_pit_optimizer_v2_terminal_reconciliation_fences_reopened_lease(
         facts,
         terminal_audit_sha256="b" * 64,
     )
+    attempt = PitOptimizerRoleAttempt(
+        plan=v2_manifest.call_budgets[0],
+        facts=facts,
+        payload=None,
+    )
+    skips = authorization.skip_unstarted_plans(
+        lease,
+        tuple(v2_manifest.call_budgets[1:3]),
+        triggering_attempt=attempt,
+    )
     reopened = AuthorizationLedger(ledger_path, v2_manifest)
-
-    with pytest.raises(AuthorizationError, match="(?:terminal|closed)"):
-        reopened.reserve_call(lease, v2_manifest.call_budgets[1])
+    next_reservation = reopened.reserve_call(
+        lease,
+        v2_manifest.call_budgets[3],
+        projected_call_usd=Decimal("0"),
+    )
 
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
-    assert [record["record_type"] for record in records[-2:]] == [
+    assert [skip.call_index for skip in skips] == [2, 3]
+    assert [record["record_type"] for record in records[-4:]] == [
         "reconciliation",
-        "lease_close",
+        "plan_skip",
+        "plan_skip",
+        "reservation",
     ]
-    assert records[-1]["terminal_code"] == "failed"
+    assert all(
+        "charged_calls" not in record and "charged_tokens" not in record
+        for record in records[-3:-1]
+    )
+    assert next_reservation.call_index == 4
 
 
 @pytest.mark.parametrize(
@@ -3870,12 +4579,16 @@ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
     v2_manifest: contract.PitOptimizerRunManifest,
     nonaccepted_outcome: str,
 ) -> None:
-    """Break caught: call count alone could conceal a rejected or uncertain role."""
+    """Accounted invalid output settles; uncertain accounting remains terminal."""
     from core.pit_optimizer_authorization import AuthorizationError
 
     ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
     for index, plan in enumerate(v2_manifest.call_budgets[:3]):
-        reservation = ledger.reserve_call(lease, plan)
+        reservation = ledger.reserve_call(
+            lease,
+            plan,
+            projected_call_usd=Decimal("0"),
+        )
         if index == 2 and nonaccepted_outcome == "uncertain_accounting":
             facts = _task6_provider_facts(
                 reservation,
@@ -3889,7 +4602,6 @@ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
                 total_tokens=None,
                 cost_usd=None,
                 retained_tokens=reservation.reserved_tokens,
-                retained_usd=reservation.reserved_usd,
             )
         else:
             facts = _task6_provider_facts(
@@ -3914,13 +4626,40 @@ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
             terminal_audit_sha256="b" * 64,
         )
 
-    with pytest.raises(AuthorizationError, match="closed"):
-        ledger.reserve_call(lease, v2_manifest.call_budgets[3])
-    with pytest.raises(AuthorizationError, match="already closed"):
+    if nonaccepted_outcome == "schema_invalid":
+        for plan in v2_manifest.call_budgets[3:]:
+            reservation = ledger.reserve_call(
+                lease,
+                plan,
+                projected_call_usd=Decimal("0"),
+            )
+            ledger.reconcile_call(
+                reservation,
+                _task6_provider_facts(
+                    reservation,
+                    pricing,
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                    total_tokens=15,
+                    cost_usd=0.001,
+                ),
+                terminal_audit_sha256="b" * 64,
+            )
         ledger.close_run_lease(lease, terminal_code="completed")
+    else:
+        with pytest.raises(AuthorizationError, match="closed"):
+            ledger.reserve_call(
+                lease,
+                v2_manifest.call_budgets[3],
+                projected_call_usd=Decimal("0"),
+            )
+        with pytest.raises(AuthorizationError, match="already closed"):
+            ledger.close_run_lease(lease, terminal_code="completed")
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
     assert records[-1]["record_type"] == "lease_close"
-    assert records[-1]["terminal_code"] == "failed"
+    assert records[-1]["terminal_code"] == (
+        "completed" if nonaccepted_outcome == "schema_invalid" else "failed"
+    )
 
 
 def test_pit_optimizer_v2_budget_reservation_is_exact_sequential_and_released(
@@ -4027,7 +4766,6 @@ def test_pit_optimizer_v2_provider_call_uncertain_retains_one_full_reservation(
         total_tokens=None,
         cost_usd=None,
         retained_tokens=reservation.reserved_tokens,
-        retained_usd=reservation.reserved_usd,
     )
 
     ledger.reconcile_call(
@@ -4145,7 +4883,6 @@ def test_pit_optimizer_v2_call_preflight_uses_lease_bound_frozen_pricing() -> No
         max_input_tokens=1_000,
         max_output_tokens=1_000,
         max_response_bytes=8_192,
-        max_usd=0.009999,
     )
 
     with pytest.raises(BudgetExceededError, match="per-call USD"):
@@ -4184,7 +4921,6 @@ def test_pit_optimizer_v2_call_preflight_rejects_sections_and_pricing_drift() ->
         max_input_tokens=10,
         max_output_tokens=2,
         max_response_bytes=32,
-        max_usd=0.01,
     )
     lease = AuthorizationRunLease(
         lease_id="lease-v2",
@@ -4489,7 +5225,8 @@ def _task6_gateway_context(
         window_id=window.window_id,
         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
         run_manifest_sha256=manifest.sha256,
-        frozen_pricing_sha256=pricing.pricing_sha256,
+        pricing_snapshot=pricing,
+        projected_plan_usd=Decimal("0"),
     )
     return (
         authorization,
@@ -8447,6 +9184,7 @@ def test_pit_optimizer_v2_next_investigator_requires_prior_iteration_receipts(
         family=investigator_artifact.family,
         author_summary=author_artifact.behavioral_summary,
         validation_code="valid",
+        candidate_folds=(),
         discovery_score=None,
         critic_disposition=critic_artifact.disposition,
         critic_next_direction=critic_artifact.next_direction,
@@ -8491,9 +9229,9 @@ def test_pit_optimizer_v2_next_investigator_requires_prior_iteration_receipts(
         (
             _task6_fake_response("{}"),
             "schema_invalid",
-            "ResponseValidationError",
+            None,
             "authoritative",
-            "payload_schema_invalid",
+            "payload_keys_invalid",
         ),
         (
             RuntimeError("synthetic post-send transport failure"),
@@ -8509,7 +9247,7 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
     v2_manifest: contract.PitOptimizerRunManifest,
     outcome: object,
     provider_outcome: str,
-    error_type: str,
+    error_type: str | None,
     charge_basis: str,
     response_validation_code: str | None,
 ) -> None:
@@ -8532,9 +9270,8 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
         outcomes=[outcome],
     )
 
-    expected_error = getattr(agent_loop, error_type)
-    with pytest.raises(expected_error):
-        gateway.request_pit_optimizer_once(
+    def request_once():
+        return gateway.request_pit_optimizer_once(
             "investigator",
             _task6_bind_role_input(
                 authorization,
@@ -8548,16 +9285,46 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
             wall_deadline=10.0,
             monotonic=lambda: 1.0,
         )
+
+    if error_type is None:
+        attempt = request_once()
+        assert attempt.payload is None
+        assert attempt.recoverable_schema_invalid
+    else:
+        expected_error = getattr(agent_loop, error_type)
+        with pytest.raises(expected_error):
+            request_once()
     assert len(client.completions.calls) == 1
     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
-    assert records[-2]["record_type"] == "reconciliation"
-    assert records[-2]["provider_facts"]["outcome"] == provider_outcome
-    assert records[-2]["charge_basis"] == charge_basis
+    reconciliation = next(
+        item for item in reversed(records) if item["record_type"] == "reconciliation"
+    )
+    assert reconciliation["provider_facts"]["outcome"] == provider_outcome
+    assert reconciliation["cost_accounting_status"] == (
+        "authoritative" if charge_basis == "authoritative" else "unavailable"
+    )
     assert (
-        records[-2]["provider_facts"]["response_validation_code"]
+        reconciliation["provider_facts"]["response_validation_code"]
         == response_validation_code
     )
-    assert records[-1]["record_type"] == "lease_close"
+    closes = [item for item in records if item["record_type"] == "lease_close"]
+    if provider_outcome == "schema_invalid":
+        assert closes == []
+        skips = authorization.skip_unstarted_plans(
+            lease,
+            tuple(v2_manifest.call_budgets[1:3]),
+            triggering_attempt=attempt,
+        )
+        assert [skip.role for skip in skips] == ["author", "critic"]
+        assert [skip.call_index for skip in skips] == [2, 3]
+        next_reservation = authorization.reserve_call(
+            lease,
+            v2_manifest.call_budgets[3],
+            projected_call_usd=Decimal("0"),
+        )
+        assert next_reservation.call_index == 4
+    else:
+        assert closes[-1]["terminal_code"] == "failed"
     assert audit._events[-1]["event"] == "provider_call_rejected"
 
 
@@ -8665,159 +9432,351 @@ def test_pit_optimizer_v2_gateway_commits_authoritative_per_call_overage(
     assert records[-1]["record_type"] == "lease_close"
 
 
-def test_objective_is_quantized_lexicographic_strict_and_trade_eligible() -> None:
-    """Break caught: floating or non-strict ranking could promote an ineligible candidate."""
-    folds = (
-        replace(
-            _fold_summary("discovery_1", 1.235),
-            max_drawdown_pct=-4.005,
-            closed_trades=1,
-        ),
-        replace(
-            _fold_summary("discovery_2", 0.505),
-            max_drawdown_pct=-2.0,
-            closed_trades=3,
-        ),
+def test_objective_is_absolute_panel_cagr_quantized_and_strict_on_ties() -> None:
+    """Break caught: a diagnostic, trade gate, or CAGR tie could change panel ranking."""
+    target = evaluation.AnnualizedReturnTarget.production()
+    assert target == evaluation.AnnualizedReturnTarget(
+        metric_id="portfolio_annualized_return_pct",
+        formula_id="production_equity_cagr_365_calendar_days_v1",
+        basis="absolute",
+        target_pct=Decimal("10.00"),
+        milestones_pct=(Decimal("10.00"), Decimal("20.00"), Decimal("50.00")),
+        precision_pct=Decimal("0.01"),
+    )
+    candidate = evaluation.PanelAggregateSummary(
+        panel_id="discovery",
+        panel_sha256="e" * 64,
+        starting_equity=100.0,
+        ending_equity=121.0,
+        elapsed_calendar_days=730,
+        portfolio_annualized_return_pct=Decimal("10.00"),
+        total_return_pct=21.0,
+        benchmark_return_pct=40.0,
+        max_drawdown_pct=-99.0,
+        sharpe_ratio=-5.0,
+        closed_trades=0,
+        turnover_pct=0.0,
+        average_exposure_pct=0.0,
+        entry_funnel=(),
+        exit_attribution=(),
+    )
+    comparison = evaluation.DiscoveryPanelComparison.from_result(
+        candidate_cagr_pct=candidate.portfolio_annualized_return_pct,
+        fixed_baseline_cagr_pct=Decimal("9.00"),
+        current_champion_cagr_pct=Decimal("10.00"),
+        target=target,
     )
 
-    original_baseline = (
-        _fold_summary("discovery_1", 0.0),
-        _fold_summary("discovery_2", 0.0),
-    )
-    baseline_sha256 = _aggregate_sha256(original_baseline)
-    score = evaluation.discovery_score_from_folds(
-        folds,
-        original_baseline,
-        original_baseline_sha256=baseline_sha256,
-        expected_original_baseline_sha256=baseline_sha256,
-    )
-
-    expected_first = Decimal(str(1.235)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_EVEN
-    )
-    expected_second = Decimal(str(0.505)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_EVEN
-    )
-    assert score == evaluation.DiscoveryScore(
-        median_excess_return_pp=((expected_first + expected_second) / 2).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_EVEN
-        ),
-        worst_excess_return_pp=expected_second,
-        max_drawdown_magnitude_pp=Decimal(str(4.005)).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_EVEN
-        ),
-    )
-    assert score.ordering_key == (
-        Decimal("0.87"),
-        Decimal("0.50"),
-        Decimal("-4.00"),
-    )
-    assert evaluation.strictly_improves_discovery(score, score) is False
-    assert evaluation.strictly_improves_discovery(
-        replace(score, worst_excess_return_pp=Decimal("0.51")),
-        score,
-    ) is True
-    with pytest.raises(ValueError, match="closed discovery trade"):
-        evaluation.discovery_score_from_folds(
-            (replace(folds[0], closed_trades=0), folds[1]),
-            original_baseline,
-            original_baseline_sha256=baseline_sha256,
-            expected_original_baseline_sha256=baseline_sha256,
-        )
+    assert comparison.candidate_vs_fixed_baseline_delta_pp == Decimal("1.00")
+    assert comparison.target_gap_pp == Decimal("0.00")
+    assert comparison.strictly_improves_champion is False
+    assert evaluation.DiscoveryPanelComparison.from_result(
+        candidate_cagr_pct=Decimal("10.006"),
+        fixed_baseline_cagr_pct=Decimal("50.00"),
+        current_champion_cagr_pct=Decimal("10.00"),
+        target=target,
+    ).strictly_improves_champion is True
+    assert evaluation.DiscoveryPanelComparison.from_result(
+        candidate_cagr_pct=Decimal("8.00"),
+        fixed_baseline_cagr_pct=Decimal("7.00"),
+        current_champion_cagr_pct=Decimal("9.00"),
+        target=target,
+    ).target_gap_pp == Decimal("2.00")
+    with pytest.raises(ValueError, match="annualized return"):
+        replace(candidate, portfolio_annualized_return_pct=Decimal("10.01"))
 
 
-def test_discovery_objective_derives_excess_from_authenticated_fixed_baseline(
+def test_panel_allocator_is_lineage_stratified_disjoint_and_capacity_closed(
     tmp_path: Path,
 ) -> None:
-    """Break caught: fabricated excess or a substituted incumbent could drive ranking."""
-    candidate = (
-        replace(
-            _fold_summary("discovery_1", 0.0),
-            total_return_pct=2.235,
-            excess_total_return_pp=99.0,
-        ),
-        replace(
-            _fold_summary("discovery_2", 0.0),
-            total_return_pct=1.505,
-            excess_total_return_pp=-99.0,
-        ),
-    )
-    original_baseline = (
-        replace(_fold_summary("discovery_1", 0.0), total_return_pct=1.0),
-        replace(_fold_summary("discovery_2", 0.0), total_return_pct=1.0),
-    )
-    baseline_sha256 = _aggregate_sha256(original_baseline)
-
-    score = evaluation.discovery_score_from_folds(
-        candidate,
-        original_baseline,
-        original_baseline_sha256=baseline_sha256,
-        expected_original_baseline_sha256=baseline_sha256,
-    )
-
-    assert score.median_excess_return_pp == Decimal("0.87")
-    assert score.worst_excess_return_pp == Decimal("0.50")
-    with pytest.raises(ValueError, match="fixed baseline identity"):
-        evaluation.discovery_score_from_folds(
-            candidate,
-            original_baseline,
-            original_baseline_sha256=baseline_sha256,
-            expected_original_baseline_sha256="f" * 64,
+    """Break caught: allocation could depend on ticker aliases or overrun a stratum."""
+    lineages = tuple(
+        evaluation.PanelSecurityLineage(
+            security_lineage_id=f"chain-{index:02d}",
+            executable_tickers=(f"T{index:02d}",),
+            source_affiliations=(("sp500",) if index < 5 else ("nasdaq100",)),
         )
-    with pytest.raises(ValueError, match="supplied score differs"):
-        proof = _discovery_exposure_proof(tmp_path)
-        contract.candidate_comparison_from_fixed_baseline(
-            candidate_folds=candidate,
-            original_baseline_folds=original_baseline,
-            original_baseline_sha256=baseline_sha256,
-            expected_original_baseline_sha256=baseline_sha256,
-            discovery_exposure=proof,
-            expected_window_identities=proof.window_identities,
-            expected_metadata=proof.metadata,
-            diagnostics=(),
-            supplied_score=replace(
-                score,
-                worst_excess_return_pp=score.worst_excess_return_pp
-                + Decimal("0.01"),
+        for index in range(8)
+    )
+    rule = evaluation.PanelAllocationRuleV1(
+        quick_count=1,
+        discovery_count=3,
+        qualification_count=2,
+    )
+    first = evaluation.sha256_lineage_stratified_v1(
+        lineages=lineages,
+        partition_seed_sha256="a" * 64,
+        rule=rule,
+    )
+    second = evaluation.sha256_lineage_stratified_v1(
+        lineages=tuple(reversed(lineages)),
+        partition_seed_sha256="a" * 64,
+        rule=rule,
+    )
+
+    assert first == second
+    quick, discovery, qualification, allocations = first
+    assert (len(quick), len(discovery), len(qualification)) == (1, 3, 2)
+    assert len({item.security_lineage_id for item in (*quick, *discovery, *qualification)}) == 6
+    assert all(
+        item.quick_count
+        + item.discovery_count
+        + item.qualification_count
+        + item.unallocated_count
+        == item.eligible_count
+        for item in allocations
+    )
+    with pytest.raises(ValueError, match="eligible capacity"):
+        evaluation.sha256_lineage_stratified_v1(
+            lineages=lineages,
+            partition_seed_sha256="a" * 64,
+            rule=evaluation.PanelAllocationRuleV1(3, 3, 3),
+        )
+    with pytest.raises(ValueError, match="ticker alias"):
+        evaluation.sha256_lineage_stratified_v1(
+            lineages=(lineages[0], replace(lineages[1], executable_tickers=("T00",))),
+            partition_seed_sha256="a" * 64,
+            rule=evaluation.PanelAllocationRuleV1(0, 1, 1),
+        )
+
+    ledger = evaluation.QualificationRetirementLedger(
+        tmp_path / "qualification-ledger.json",
+        qualification_retirement_domain_id="b" * 64,
+    )
+    snapshot = ledger.snapshot()
+    assert snapshot.retired_security_lineage_ids == ()
+    reservation = {
+        "schema_version": 4,
+        "ledger_kind": "qualification_retirement",
+        "qualification_retirement_domain_id": "b" * 64,
+        "record_type": "reservation",
+        "sequence": 1,
+        "previous_record_sha256": snapshot.ledger_head_sha256,
+        "security_lineage_ids": ["chain-00"],
+    }
+    reservation["record_sha256"] = evaluation.QualificationRetirementLedger._record_digest(
+        reservation
+    )
+    with (tmp_path / "qualification-ledger.json").open("ab") as handle:
+        handle.write(_canonical_file_bytes(reservation))
+    retired_snapshot = evaluation.QualificationRetirementLedger(
+        tmp_path / "qualification-ledger.json",
+        qualification_retirement_domain_id="b" * 64,
+    ).snapshot()
+    assert retired_snapshot.retired_security_lineage_ids == ("chain-00",)
+    qualification_plan, discovery_plan = evaluation.compose_panel_plans(
+        lineages=lineages,
+        sessions=("2021-01-04", "2021-01-05", "2021-01-06"),
+        pit_bundle_sha256="c" * 64,
+        prices_provenance_sha256="d" * 64,
+        partition_seed_sha256="a" * 64,
+        target=evaluation.AnnualizedReturnTarget.production(),
+        rule=rule,
+        ledger_snapshot=retired_snapshot,
+    )
+    assert sum(item.eligible_count for item in discovery_plan.stratum_allocations) == 7
+    hidden_ids = {
+        item.security_lineage_id for item in qualification_plan.qualification_panel.lineages
+    }
+    discovery_text = json.dumps(discovery_plan.to_primitive(), sort_keys=True)
+    assert hidden_ids
+    assert all(lineage_id not in discovery_text for lineage_id in hidden_ids)
+    assert discovery_plan.qualification_plan_sha256 == qualification_plan.sha256
+
+    published = evaluation.publish_panel_plans(
+        output_root=tmp_path / "panels",
+        qualification_plan=qualification_plan,
+        discovery_plan=discovery_plan,
+    )
+    assert published["qualification_plan_sha256"] == qualification_plan.sha256
+    assert (tmp_path / "panels" / "publication.json").is_file()
+    with pytest.raises(FileExistsError, match="immutable"):
+        evaluation.publish_panel_plans(
+            output_root=tmp_path / "panels",
+            qualification_plan=qualification_plan,
+            discovery_plan=discovery_plan,
+        )
+
+    partial = tmp_path / "partial-panels"
+    partial.mkdir()
+    (partial / "qualification-plan.json").write_bytes(
+        evaluation.panel_plan_bytes(qualification_plan)
+    )
+    evaluation.publish_panel_plans(
+        output_root=partial,
+        qualification_plan=qualification_plan,
+        discovery_plan=discovery_plan,
+    )
+    assert evaluation.load_discovery_panel_plan(
+        partial / "discovery-plan.json"
+    ) == discovery_plan
+    assert evaluation.load_qualification_panel_plan(
+        partial / "qualification-plan.json"
+    ) == qualification_plan
+    incomplete_discovery = discovery_plan.to_primitive()
+    del incomplete_discovery["allocation_rule"]["algorithm_id"]
+    incomplete_discovery_path = tmp_path / "incomplete-discovery-plan.json"
+    incomplete_discovery_path.write_bytes(_canonical_file_bytes(incomplete_discovery))
+    with pytest.raises(ValueError, match="allocation rule artifact keys"):
+        evaluation.load_discovery_panel_plan(
+            incomplete_discovery_path,
+            require_publication=False,
+        )
+    incomplete_qualification = qualification_plan.to_primitive()
+    del incomplete_qualification["stratum_allocations"][0]["unallocated_count"]
+    incomplete_qualification_path = tmp_path / "incomplete-qualification-plan.json"
+    incomplete_qualification_path.write_bytes(
+        _canonical_file_bytes(incomplete_qualification)
+    )
+    with pytest.raises(ValueError, match="stratum allocation artifact keys"):
+        evaluation.load_qualification_panel_plan(
+            incomplete_qualification_path,
+            require_publication=False,
+        )
+    extra_plan_key = discovery_plan.to_primitive()
+    extra_plan_key["qualification_panel"] = {}
+    extra_plan_path = tmp_path / "extra-key-discovery-plan.json"
+    extra_plan_path.write_bytes(_canonical_file_bytes(extra_plan_key))
+    with pytest.raises(ValueError, match="discovery panel plan keys"):
+        evaluation.load_discovery_panel_plan(
+            extra_plan_path,
+            require_publication=False,
+        )
+    publication_path = partial / "publication.json"
+    publication = json.loads(publication_path.read_bytes())
+    publication["unexpected"] = True
+    publication_path.write_bytes(_canonical_file_bytes(publication))
+    with pytest.raises(ValueError, match="publication marker"):
+        evaluation.load_discovery_panel_plan(partial / "discovery-plan.json")
+    parsed = evaluation._manifest_cli_parser().parse_args(
+        [
+            "build-panel-plans",
+            "--pit-bundle",
+            str(tmp_path / "pit.sqlite3"),
+            "--pit-bundle-sha256",
+            "c" * 64,
+            "--prices-provenance",
+            str(tmp_path / "prices.json"),
+            "--start-date",
+            "2021-01-04",
+            "--end-date",
+            "2025-12-31",
+            "--partition-seed",
+            "sealed-seed",
+            "--quick-count",
+            "12",
+            "--discovery-count",
+            "48",
+            "--qualification-count",
+            "24",
+            "--target-pct",
+            "10.00",
+            "--qualification-ledger",
+            str(tmp_path / "permanent-ledger.json"),
+            "--output-root",
+            str(tmp_path / "published-panels"),
+        ]
+    )
+    assert parsed.command == "build-panel-plans"
+    assert parsed.partition_seed == "sealed-seed"
+
+
+def test_qualification_gate_uses_only_target_integrity_and_same_panel_baseline() -> None:
+    """Break caught: a diagnostic gate or baseline equality could alter qualification."""
+    qualification_panel = evaluation.EvaluationPanelSpec.from_lineages(
+        purpose="qualification",
+        sessions=("2021-01-01", "2023-01-01"),
+        lineages=(
+            evaluation.PanelSecurityLineage(
+                "chain-qualification",
+                ("QUAL",),
+                ("sp500",),
             ),
-        )
-
-
-def test_holdout_gate_uses_return_trades_and_completeness_without_sharpe() -> None:
-    """Break caught: a Sharpe gate or permissive equality boundary could alter eligibility."""
-    decision = evaluation.HoldoutDecision.from_result(
-        excess_total_return_pp=0.105,
-        closed_trades=3,
-        safety_complete=True,
+        ),
+    )
+    candidate = evaluation.PanelAggregateSummary(
+        panel_id="qualification",
+        panel_sha256=qualification_panel.sha256,
+        starting_equity=100.0,
+        ending_equity=121.0,
+        elapsed_calendar_days=730,
+        portfolio_annualized_return_pct=Decimal("10.00"),
+        total_return_pct=21.0,
+        benchmark_return_pct=40.0,
+        max_drawdown_pct=-99.0,
+        sharpe_ratio=-5.0,
+        closed_trades=0,
+        turnover_pct=0.0,
+        average_exposure_pct=0.0,
+        entry_funnel=(),
+        exit_attribution=(),
+    )
+    baseline = replace(
+        candidate,
+        ending_equity=118.81,
+        portfolio_annualized_return_pct=Decimal("9.00"),
+    )
+    decision = evaluation.QualificationDecision.from_result(
+        candidate_evidence=candidate,
+        baseline_evidence=baseline,
+        qualification_panel=qualification_panel,
+        target=evaluation.AnnualizedReturnTarget.production(),
+        evaluation_complete=True,
         integrity_complete=True,
-        accounting_complete=True,
     )
 
-    assert decision.excess_total_return_pp == Decimal("0.10")
-    assert decision.long_replay_eligible is True
-    assert "sharpe" not in {field.name for field in fields(evaluation.HoldoutDecision)}
-    assert evaluation.HoldoutDecision.from_result(
-        excess_total_return_pp=0.094,
-        closed_trades=3,
-        safety_complete=True,
+    assert decision.candidate_cagr_pct == Decimal("10.00")
+    assert decision.qualification_panel_sha256 == qualification_panel.sha256
+    assert decision.qualified is True
+    assert {
+        "closed_trades",
+        "drawdown",
+        "sharpe",
+        "turnover",
+        "transaction_costs",
+    }.isdisjoint({field.name for field in fields(evaluation.QualificationDecision)})
+    assert evaluation.QualificationDecision.from_result(
+        candidate_evidence=replace(
+            candidate,
+            ending_equity=120.978001,
+            portfolio_annualized_return_pct=Decimal("9.99"),
+        ),
+        baseline_evidence=replace(
+            baseline,
+            ending_equity=102.01,
+            portfolio_annualized_return_pct=Decimal("1.00"),
+        ),
+        qualification_panel=qualification_panel,
+        target=evaluation.AnnualizedReturnTarget.production(),
+        evaluation_complete=True,
         integrity_complete=True,
-        accounting_complete=True,
-    ).long_replay_eligible is False
-    assert evaluation.HoldoutDecision.from_result(
-        excess_total_return_pp=0.10,
-        closed_trades=2,
-        safety_complete=True,
+    ).qualified is False
+    assert evaluation.QualificationDecision.from_result(
+        candidate_evidence=candidate,
+        baseline_evidence=candidate,
+        qualification_panel=qualification_panel,
+        target=evaluation.AnnualizedReturnTarget.production(),
+        evaluation_complete=True,
         integrity_complete=True,
-        accounting_complete=True,
-    ).long_replay_eligible is False
-    with pytest.raises(ValueError, match="eligibility"):
-        evaluation.HoldoutDecision(
-            excess_total_return_pp=Decimal("0.10"),
-            closed_trades=3,
-            safety_complete=True,
+    ).qualified is False
+    with pytest.raises(ValueError, match="same qualification panel"):
+        evaluation.QualificationDecision.from_result(
+            candidate_evidence=candidate,
+            baseline_evidence=replace(baseline, panel_sha256="0" * 64),
+            qualification_panel=qualification_panel,
+            target=evaluation.AnnualizedReturnTarget.production(),
+            evaluation_complete=True,
             integrity_complete=True,
-            accounting_complete=True,
-            long_replay_eligible=False,
+        )
+    with pytest.raises(ValueError, match="qualification decision"):
+        evaluation.QualificationDecision(
+            qualification_panel_sha256=qualification_panel.sha256,
+            candidate_cagr_pct=Decimal("10.00"),
+            baseline_cagr_pct=Decimal("9.00"),
+            target_pct=Decimal("10.00"),
+            evaluation_complete=True,
+            integrity_complete=True,
+            qualified=False,
         )
 
 
@@ -9075,32 +10034,38 @@ def _task5_create_directory_link(target: Path, link: Path) -> None:
 def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
     tmp_path: Path,
 ) -> None:
-    """Break caught: author-declared scope could replace controller-derived identity."""
+    """Break caught: a partial author map could replace the atomic controller identity."""
     from core.pit_optimizer_candidate import (
-        PIT_OPTIMIZER_PATCH_BOUNDS,
-        validate_author_manifest,
-        validate_candidate_diff,
+        CandidateIdentityV4,
+        validate_candidate_identity,
+        validate_candidate_sources,
     )
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
-    incremental = _task5_incremental_diff(
-        candidate_root,
-        "core/strategy_policy/entry.py",
+    replacement_sources = {
+        path: (candidate_root / path).read_text("utf-8") for path in _POLICY_PATHS
+    }
+    replacement_sources["core/strategy_policy/entry.py"] = replacement_sources[
+        "core/strategy_policy/entry.py"
+    ].replace(
         "return EntryDecision(True, True, (None, None), ())",
-        "return EntryDecision(snapshot.market_is_bullish, True, (None, None), ())",
+        "return EntryDecision(snapshot.market.oneil_regime == 'confirmed_uptrend', True, (None, None), ())",
+    ).replace(
+        "from .contracts import EntryDecision, EntrySnapshot",
+        "from .contracts import EntryDecision, EntrySnapshot, MarketContextV1",
     )
     source_commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
 
-    identity, cumulative_diff = validate_candidate_diff(
+    identity, cumulative_diff = validate_candidate_sources(
         authenticated_base_root=authenticated,
         candidate_root=candidate_root,
-        incremental_diff=incremental,
+        replacement_sources=replacement_sources,
         git=git,
-        bounds=PIT_OPTIMIZER_PATCH_BOUNDS,
         source_commit=source_commit,
-        policy_interface_version=1,
+        policy_interface_version=2,
         immutable_constraints_sha256="a" * 64,
-        discovery_manifest_sha256="b" * 64,
+        discovery_panel_plan_sha256="b" * 64,
+        parent_identity_sha256="c" * 64,
     )
 
     assert cumulative_diff == _task5_git(
@@ -9113,6 +10078,10 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
         *_POLICY_PATHS,
     )
     assert identity.source_commit == source_commit
+    assert identity.parent_identity_sha256 == "c" * 64
+    assert identity.discovery_panel_plan_sha256 == "b" * 64
+    assert isinstance(identity, CandidateIdentityV4)
+    validate_candidate_identity(identity)
     assert identity.cumulative_diff_sha256 == hashlib.sha256(
         cumulative_diff.encode("utf-8")
     ).hexdigest()
@@ -9124,26 +10093,10 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
         _POLICY_PATHS
     )
 
-    matching = contract.AuthorArtifact.from_json(
-        _canonical_text(
-            {
-                **_author_payload(),
-                "changed_paths": list(identity.changed_paths),
-                "changed_symbols": list(identity.changed_symbols),
-                "unified_diff": incremental,
-            }
-        ),
-        max_diff_bytes=64 * 1024,
-        max_total_bytes=72 * 1024,
-    )
-    validate_author_manifest(matching, identity)
-    mismatch = replace(
-        matching,
-        changed_paths=("core/strategy_policy/risk.py",),
-        changed_symbols=("core.strategy_policy.risk.recommend_capacity",),
-    )
-    with pytest.raises(ValueError, match="author_manifest_mismatch"):
-        validate_author_manifest(mismatch, identity)
+    assert dict(identity.editable_file_sha256s) == {
+        path: hashlib.sha256(source.encode("utf-8")).hexdigest()
+        for path, source in replacement_sources.items()
+    }
 
 
 def _task5_authenticated_identity(
@@ -9186,28 +10139,38 @@ def _task5_authenticated_identity(
 
 def test_candidate_identity_rejects_direct_unsealed_construction() -> None:
     """Break caught: a caller could construct an identity without Git/source derivation."""
-    from core.pit_optimizer_candidate import CandidateIdentity
+    from core.pit_optimizer_candidate import CandidateIdentity, CandidateIdentityV4
+
+    shared = {
+        "source_commit": "a" * 40,
+        "policy_interface_version": 1,
+        "cumulative_diff_sha256": "b" * 64,
+        "editable_file_sha256s": tuple(
+            (path, "c" * 64) for path in _POLICY_PATHS
+        ),
+        "changed_paths": ("core/strategy_policy/entry.py",),
+        "changed_symbols": ("core.strategy_policy.entry.evaluate_entry",),
+        "immutable_constraints_sha256": "d" * 64,
+        "identity_sha256": "f" * 64,
+    }
 
     with pytest.raises(ValueError, match="controller derived"):
         CandidateIdentity(
-            source_commit="a" * 40,
-            policy_interface_version=1,
-            cumulative_diff_sha256="b" * 64,
-            editable_file_sha256s=tuple(
-                (path, "c" * 64) for path in _POLICY_PATHS
-            ),
-            changed_paths=("core/strategy_policy/entry.py",),
-            changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
-            immutable_constraints_sha256="d" * 64,
+            **shared,
             discovery_manifest_sha256="e" * 64,
-            identity_sha256="f" * 64,
+        )
+    with pytest.raises(ValueError, match="controller derived"):
+        CandidateIdentityV4(
+            **shared,
+            discovery_panel_plan_sha256="e" * 64,
+            parent_identity_sha256="f" * 64,
         )
 
 
 def test_candidate_identity_has_exact_public_nine_field_json_shape(
     tmp_path: Path,
 ) -> None:
-    """Break caught: the construction seal leaked into persisted identity data."""
+    """Break caught: v4 identity fields changed archived schema-v3 reconstruction."""
     from core.pit_optimizer_candidate import CandidateIdentity
 
     identity, _author = _task5_authenticated_identity(tmp_path)
@@ -9223,14 +10186,23 @@ def test_candidate_identity_has_exact_public_nine_field_json_shape(
         "identity_sha256",
     )
     assert tuple(item.name for item in fields(CandidateIdentity)) == expected_fields
-    primitive = identity.to_primitive()
-    assert tuple(primitive) == expected_fields
-    assert primitive == asdict(identity)
-    assert not any(key.startswith("_") for key in primitive)
-    rendered = identity.to_canonical_json()
-    assert rendered.endswith("\n")
-    assert json.loads(rendered) == json.loads(json.dumps(primitive))
-    assert "controller_seal" not in rendered
+    legacy_values = {
+        "source_commit": identity.source_commit,
+        "policy_interface_version": identity.policy_interface_version,
+        "cumulative_diff_sha256": identity.cumulative_diff_sha256,
+        "editable_file_sha256s": identity.editable_file_sha256s,
+        "changed_paths": identity.changed_paths,
+        "changed_symbols": identity.changed_symbols,
+        "immutable_constraints_sha256": identity.immutable_constraints_sha256,
+        "discovery_manifest_sha256": identity.discovery_manifest_sha256,
+    }
+    expected_digest = hashlib.sha256(_canonical_file_bytes(legacy_values)).hexdigest()
+    expected_bytes = _canonical_file_bytes(
+        {**legacy_values, "identity_sha256": expected_digest}
+    )
+    assert identity.identity_sha256 == expected_digest
+    assert identity.to_canonical_json().encode("utf-8") == expected_bytes
+    assert identity.to_primitive() == asdict(identity)
 
 
 @pytest.mark.parametrize(
@@ -9460,44 +10432,54 @@ def test_candidate_identity_rejects_git_derived_cumulative_scope_growth(
 
 
 @pytest.mark.parametrize(
-    ("old", "new", "message"),
+    ("case", "message"),
     (
-        (
-            "return EntryDecision(True, True, (None, None), ())",
-            "return EntryDecision(True, True, (None, None), ())",
-            "no-op",
-        ),
-        (
-            "return EntryDecision(False, False, (None, None), ())",
-            "return EntryDecision(True, False, (None, None), ())",
-            "apply",
-        ),
+        ("no_op", "no-op"),
+        ("crlf", "LF-only"),
+        ("missing_final_lf", "end with LF"),
     ),
 )
 def test_candidate_identity_rejects_noop_or_non_applicable_incremental_diff(
     tmp_path: Path,
-    old: str,
-    new: str,
+    case: str,
     message: str,
 ) -> None:
-    """Break caught: an unapplied author artifact could receive an executable identity."""
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    """Break caught: a no-op or non-canonical source map received an identity."""
+    from core.pit_optimizer_candidate import validate_candidate_sources
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+    before = {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    }
+    replacements = {
+        path: content.decode("utf-8") for path, content in before.items()
+    }
+    if case != "no_op":
+        entry = replacements["core/strategy_policy/entry.py"].replace(
+            "EntryDecision(True", "EntryDecision(False"
+        )
+        replacements["core/strategy_policy/entry.py"] = (
+            entry.replace("\n", "\r\n")
+            if case == "crlf"
+            else entry.removesuffix("\n")
+        )
     with pytest.raises(ValueError, match=message):
-        validate_candidate_diff(
+        validate_candidate_sources(
             authenticated_base_root=authenticated,
             candidate_root=candidate_root,
-            incremental_diff=_task5_raw_author_diff(old, new),
+            replacement_sources=replacements,
             git=git,
-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
             source_commit=_task5_git(
                 authenticated, "rev-parse", "HEAD", text=True
             ).strip(),
-            policy_interface_version=1,
+            policy_interface_version=2,
             immutable_constraints_sha256="a" * 64,
-            discovery_manifest_sha256="b" * 64,
+            discovery_panel_plan_sha256="b" * 64,
+            parent_identity_sha256="c" * 64,
         )
+    assert {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    } == before
 
 
 @pytest.mark.parametrize(
@@ -9513,24 +10495,61 @@ def test_candidate_identity_rejects_protected_or_generated_paths(
     tmp_path: Path,
     path: str,
 ) -> None:
-    """Break caught: a policy diff could target protected infrastructure or generated code."""
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    """Break caught: a complete-source map could include protected or omit required code."""
+    from core.pit_optimizer_candidate import validate_candidate_sources
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
-    with pytest.raises(ValueError, match="editable|permanently denied|outside"):
-        validate_candidate_diff(
-            authenticated_base_root=authenticated,
-            candidate_root=candidate_root,
-            incremental_diff=_task5_raw_author_diff("old", "new", path=path),
-            git=git,
-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
-            source_commit=_task5_git(
-                authenticated, "rev-parse", "HEAD", text=True
-            ).strip(),
-            policy_interface_version=1,
-            immutable_constraints_sha256="a" * 64,
-            discovery_manifest_sha256="b" * 64,
+    before = {
+        relative: (candidate_root / relative).read_bytes()
+        for relative in _POLICY_PATHS
+    }
+    replacements = {
+        relative: content.decode("utf-8") for relative, content in before.items()
+    }
+    replacements["core/strategy_policy/entry.py"] = replacements[
+        "core/strategy_policy/entry.py"
+    ].replace("EntryDecision(True", "EntryDecision(False")
+    replacements[path] = "def protected():\n    return None\n"
+    common = {
+        "authenticated_base_root": authenticated,
+        "candidate_root": candidate_root,
+        "git": git,
+        "source_commit": _task5_git(
+            authenticated, "rev-parse", "HEAD", text=True
+        ).strip(),
+        "policy_interface_version": 2,
+        "immutable_constraints_sha256": "a" * 64,
+        "discovery_panel_plan_sha256": "b" * 64,
+        "parent_identity_sha256": "c" * 64,
+    }
+    with pytest.raises(ValueError, match="exactly the three editable paths"):
+        validate_candidate_sources(
+            **common,
+            replacement_sources=replacements,
         )
+    replacements.pop(path)
+    replacements.pop("core/strategy_policy/exit.py")
+    with pytest.raises(ValueError, match="exactly the three editable paths"):
+        validate_candidate_sources(
+            **common,
+            replacement_sources=replacements,
+        )
+    foreign = candidate_root / path
+    foreign.write_text("def protected():\n    return None\n", encoding="utf-8")
+    replacements[path] = replacements.get(path, "")
+    replacements["core/strategy_policy/exit.py"] = before[
+        "core/strategy_policy/exit.py"
+    ].decode("utf-8")
+    replacements.pop(path)
+    with pytest.raises(ValueError, match="out-of-scope"):
+        validate_candidate_sources(
+            **common,
+            replacement_sources=replacements,
+        )
+    assert {
+        relative: (candidate_root / relative).read_bytes()
+        for relative in _POLICY_PATHS
+    } == before
 
 
 @pytest.mark.parametrize("mode", ("120000", "160000"))
@@ -9539,15 +10558,18 @@ def test_candidate_identity_rejects_non_regular_index_mode(
     mode: str,
 ) -> None:
     """Break caught: a symlink/gitlink could evade regular-source provenance."""
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_candidate import validate_candidate_sources
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
-    incremental = _task5_incremental_diff(
-        candidate_root,
-        "core/strategy_policy/entry.py",
-        "return EntryDecision(True, True, (None, None), ())",
-        "return EntryDecision(False, True, (None, None), ())",
-    )
+    before = {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    }
+    replacements = {
+        path: content.decode("utf-8") for path, content in before.items()
+    }
+    replacements["core/strategy_policy/entry.py"] = replacements[
+        "core/strategy_policy/entry.py"
+    ].replace("EntryDecision(True", "EntryDecision(False")
     commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
     object_id = (
         commit
@@ -9567,18 +10589,21 @@ def test_candidate_identity_rejects_non_regular_index_mode(
         f"{mode},{object_id},core/strategy_policy/entry.py",
     )
 
-    with pytest.raises(ValueError, match="100644|regular"):
-        validate_candidate_diff(
+    with pytest.raises(ValueError, match="100644|mode|out-of-scope"):
+        validate_candidate_sources(
             authenticated_base_root=authenticated,
             candidate_root=candidate_root,
-            incremental_diff=incremental,
+            replacement_sources=replacements,
             git=git,
-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
             source_commit=commit,
-            policy_interface_version=1,
+            policy_interface_version=2,
             immutable_constraints_sha256="a" * 64,
-            discovery_manifest_sha256="b" * 64,
+            discovery_panel_plan_sha256="b" * 64,
+            parent_identity_sha256="c" * 64,
         )
+    assert {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    } == before
 
 
 @pytest.mark.parametrize(
@@ -9684,39 +10709,48 @@ def test_candidate_identity_rolls_back_after_fault_or_cancellation(
     monkeypatch: pytest.MonkeyPatch,
     failure: BaseException,
 ) -> None:
-    """Break caught: post-apply faults or cancellation left candidate policy bytes changed."""
+    """Break caught: post-publish faults left any member of the source bundle changed."""
     import agent_loop
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_candidate import validate_candidate_sources
 
     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
-    entry = candidate_root / "core/strategy_policy/entry.py"
-    before_entry = entry.read_bytes()
-    incremental = _task5_incremental_diff(
-        candidate_root,
-        "core/strategy_policy/entry.py",
-        "return EntryDecision(True, True, (None, None), ())",
-        "return EntryDecision(False, True, (None, None), ())",
-    )
+    before = {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    }
+    replacements = {
+        path: content.decode("utf-8") for path, content in before.items()
+    }
+    replacements["core/strategy_policy/entry.py"] = replacements[
+        "core/strategy_policy/entry.py"
+    ].replace("EntryDecision(True", "EntryDecision(False")
+    replacements["core/strategy_policy/risk.py"] = replacements[
+        "core/strategy_policy/risk.py"
+    ].replace("AllocationDecision(0.01", "AllocationDecision(0.02")
+    replacements["core/strategy_policy/exit.py"] = replacements[
+        "core/strategy_policy/exit.py"
+    ].replace("ExitDecision((), None", "ExitDecision((), 0.03")
 
     def fail_after_apply(**_kwargs: object) -> str:
         raise failure
 
     monkeypatch.setattr(agent_loop, "derive_authenticated_cumulative_diff", fail_after_apply)
     with pytest.raises(type(failure), match="fault" if isinstance(failure, RuntimeError) else None):
-        validate_candidate_diff(
+        validate_candidate_sources(
             authenticated_base_root=authenticated,
             candidate_root=candidate_root,
-            incremental_diff=incremental,
+            replacement_sources=replacements,
             git=git,
-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
             source_commit=_task5_git(
                 authenticated, "rev-parse", "HEAD", text=True
             ).strip(),
-            policy_interface_version=1,
+            policy_interface_version=2,
             immutable_constraints_sha256="a" * 64,
-            discovery_manifest_sha256="b" * 64,
+            discovery_panel_plan_sha256="b" * 64,
+            parent_identity_sha256="c" * 64,
         )
-    assert entry.read_bytes() == before_entry
+    assert {
+        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
+    } == before
 
 
 @pytest.mark.parametrize(
@@ -9834,6 +10868,13 @@ def _task5_entry_source(body: str, *, prelude: str = "") -> str:
         (_task5_entry_source("handle = open('x')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
         (_task5_entry_source("module = __import__('os')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
         (_task5_entry_source("value = eval('1')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+        (
+            _task5_entry_source(
+                "context = MarketContextV1()\nreturn EntryDecision(bool(context), True, (None, None), ())",
+                prelude="\nfrom .contracts import MarketContextV1\n",
+            ),
+            "call",
+        ),
         ("from .contracts import EntryDecision\n\nasync def evaluate_entry(snapshot):\n    return EntryDecision(True, True, (None, None), ())\n", "async"),
         (_task5_entry_source("yield snapshot\nreturn EntryDecision(True, True, (None, None), ())"), "generator"),
         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\ndef public_helper():\n    return True\n"), "public"),
@@ -9865,6 +10906,10 @@ def test_ast_purity_accepts_current_policy_and_immutable_literal_constants() -> 
                 "from __future__ import annotations\n",
                 "from __future__ import annotations\nFLOORS = (0.25, 70.0, None, 'entry')\n",
                 1,
+            ).replace(
+                "from .contracts import EntryDecision, EntrySnapshot",
+                "from .contracts import BenchmarkContextV1, EntryDecision, EntrySnapshot, MarketContextV1",
+                1,
             )
         validate_policy_ast(path=path, source=source)
 
@@ -9876,6 +10921,7 @@ def _task5_feedback(iteration: int) -> contract.IterationFeedbackSummary:
         family="entry",
         author_summary="bounded author summary",
         validation_code="valid",
+        candidate_folds=(),
         discovery_score=None,
         critic_disposition="refine",
         critic_next_direction="bounded next direction",
@@ -9981,7 +11027,6 @@ def test_source_context_fit_measures_complete_canonical_unicode_role_input() -> 
         max_input_tokens=static_bytes + len(rendered),
         max_output_tokens=1,
         max_response_bytes=1,
-        max_usd=0.01,
     )
     assert require_source_context_fit(role_input=role_input, role_budget=exact) == rendered
     too_small = replace(
@@ -10101,7 +11146,6 @@ def test_source_context_fit_preserves_all_feedback_and_enforces_precall_budget(
         max_input_tokens=2,
         max_output_tokens=1,
         max_response_bytes=1,
-        max_usd=0.01,
     )
     with pytest.raises(ValueError, match="context_budget_exhausted"):
         require_source_context_fit(

@@ -11,6 +11,7 @@ import pytest
 from core.canslim.entry_contract import CanslimEntryFacts
 from core.strategy_policy import (
     AllocationDecision,
+    BenchmarkContextV1,
     CapacityDecision,
     EntryDecision,
     EntrySnapshot,
@@ -18,6 +19,7 @@ from core.strategy_policy import (
     ExitAction,
     ExitDecision,
     ExitSnapshot,
+    MarketContextV1,
 )
 from core.strategy_policy.runtime import InProcessPolicyClient
 from core.backtest_engine import (
@@ -49,13 +51,42 @@ class _CountingClient(InProcessPolicyClient):
 
 
 class _MismatchedVersionClient(_CountingClient):
-    interface_version = 2
+    interface_version = 1
 
 
 class _RaisingVersionClient(_CountingClient):
     @property
     def interface_version(self) -> int:
         raise RuntimeError("injected interface version failure")
+
+
+def _market_context(session: str = "2026-08-27") -> MarketContextV1:
+    return MarketContextV1(
+        schema_version=1,
+        session=session,
+        oneil_regime="confirmed_uptrend",
+        distribution_days=0,
+        follow_through=False,
+        benchmarks=tuple(
+            BenchmarkContextV1(symbol, 0.05, 0.10, 0.20)
+            for symbol in ("SPY", "QQQ", "IWM")
+        ),
+        active_constituent_count=1,
+        breadth_above_50_fraction=1.0,
+        breadth_50_coverage_fraction=1.0,
+        breadth_above_200_fraction=1.0,
+        breadth_200_coverage_fraction=1.0,
+        median_rs_score=90.0,
+        rs_at_least_80_fraction=1.0,
+        rs_coverage_fraction=1.0,
+    )
+
+
+def _pending_entry(
+    signal: dict[str, object],
+    capacity: CapacityDecision,
+) -> PendingEntry:
+    return PendingEntry(signal=signal, capacity=capacity, market=_market_context())
 
 
 def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
@@ -81,6 +112,68 @@ def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
     assert len({id(client) for client in made}) == 2
     assert closed == [1, 1]
     assert simulator._policy_client is None
+
+    reference_bundle = SimpleNamespace(
+        tradable_symbols=lambda: ("AAA",),
+        reference_symbols=lambda: ("IWM", "QQQ", "SPY"),
+        price_symbols=lambda: ("AAA", "IWM", "QQQ", "SPY"),
+        fundamentals_provider=None,
+    )
+    for reference in ("IWM", "QQQ", "SPY"):
+        with pytest.raises(ValueError, match="observation-only"):
+            PortfolioSimulator(
+                pit_bundle=reference_bundle,
+                technical_only=True,
+            ).run(
+                ["AAA", reference],
+                start_date="2021-06-25",
+                end_date="2021-09-20",
+            )
+
+    constituents = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH", "III", "JJJ")
+    all_symbols = (*constituents, "IWM", "QQQ", "SPY")
+    prices = {
+        symbol: _make_ohlcv(n=260, close_value=100.0)
+        for symbol in all_symbols
+    }
+
+    def fetch_price_data(symbols, _start, _end):
+        return {symbol: prices[symbol] for symbol in symbols}
+
+    def fetch_closes(symbols, _start, _end):
+        return pd.DataFrame(
+            {symbol: prices[symbol]["Close"] for symbol in symbols}
+        )
+
+    reference_bundle.tradable_symbols = lambda: constituents
+    reference_bundle.price_symbols = lambda: all_symbols
+    reference_bundle.fetch_price_data = fetch_price_data
+    reference_bundle.fetch_closes = fetch_closes
+    reference_bundle.members_at = lambda _session: frozenset(constituents)
+    reference_bundle.sha256 = "a" * 64
+    reference_bundle.data_cutoff = prices["SPY"].index[-1]
+    reference_bundle.manifest = lambda: {}
+    result = PortfolioSimulator(
+        pit_bundle=reference_bundle,
+        technical_only=True,
+        signal_every_n_days=1,
+    ).run(
+        ["AAA"],
+        start_date=str(prices["AAA"].index[199].date()),
+        history_start_date=str(prices["AAA"].index[0].date()),
+        end_date=str(prices["AAA"].index[-1].date()),
+    )
+
+    assert result.config["tickers"] == ["AAA"]
+    assert result.config["market_reference_tickers"] == ["IWM", "QQQ", "SPY"]
+    assert result.config["market_context_universe_count"] == len(all_symbols)
+    assert set(result.signal_log.get("symbol", pd.Series(dtype=str))) <= {"AAA"}
+    assert {trade.symbol for trade in result.trades} <= {"AAA"}
+    assert all(
+        not set(str(row["Holdings"]).split(",")).intersection({"IWM", "QQQ", "SPY"})
+        for _, row in result.weekly_holdings.iterrows()
+    )
+    assert set(result.transaction_log.get("Ticker", pd.Series(dtype=str))) <= {"AAA"}
 
 
 @pytest.mark.parametrize(
@@ -194,7 +287,7 @@ def test_take_profit_scale_out_fires_all_three_tiers_on_gap_up() -> None:
 
     # high=121 clears tier1(110), tier2(115), tier3(120)
     ohlcv = _make_ohlcv(n=5, close_value=121.0, high_value=121.0, low_value=109.0)
-    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1])
+    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1], market=_market_context())
 
     assert "NVDA" in sim._open_positions
     result = sim._open_positions["NVDA"]
@@ -214,7 +307,7 @@ def test_scale_out_tier1_only_when_gain_between_10_and_15_pct() -> None:
 
     # high=112 clears tier1(110) but NOT tier2(115)
     ohlcv = _make_ohlcv(n=3, close_value=112.0, high_value=112.0, low_value=109.0)
-    sim._check_exits("AAPL", ohlcv, ohlcv.index[-1])
+    sim._check_exits("AAPL", ohlcv, ohlcv.index[-1], market=_market_context())
 
     assert "AAPL" in sim._open_positions
     result = sim._open_positions["AAPL"]
@@ -234,7 +327,7 @@ def test_scale_out_remaining_qty_is_25_pct_of_original_after_tier3() -> None:
     sim._open_positions["MSFT"] = trade
 
     ohlcv = _make_ohlcv(n=3, close_value=62.0, high_value=62.0, low_value=51.0)
-    sim._check_exits("MSFT", ohlcv, ohlcv.index[-1])
+    sim._check_exits("MSFT", ohlcv, ohlcv.index[-1], market=_market_context())
 
     result = sim._open_positions["MSFT"]
     assert result.scale_out_tier == 3
@@ -253,7 +346,7 @@ def test_time_stop_exits_stagnant_position() -> None:
     sim._open_positions["MSFT"] = trade
 
     ohlcv = _make_ohlcv(n=5, close_value=102.0, high_value=103.0, low_value=101.0)
-    sim._check_exits("MSFT", ohlcv, ohlcv.index[-1])
+    sim._check_exits("MSFT", ohlcv, ohlcv.index[-1], market=_market_context())
 
     assert "MSFT" not in sim._open_positions
     assert sim._trades[-1].exit_reason == "time_stop"
@@ -276,11 +369,11 @@ def test_stop_moves_to_breakeven_after_eight_percent_gain() -> None:
         index=dates,
     )
 
-    sim._check_exits("NVDA", first, dates[0])
+    sim._check_exits("NVDA", first, dates[0], market=_market_context())
     assert sim._open_positions["NVDA"].stop_price == pytest.approx(100.0)
     assert sim._open_positions["NVDA"].breakeven_armed is True
 
-    sim._check_exits("NVDA", first, dates[1])
+    sim._check_exits("NVDA", first, dates[1], market=_market_context())
     assert "NVDA" not in sim._open_positions
     assert sim._trades[-1].exit_reason == "stop_loss"
     assert sim._trades[-1].exit_price == pytest.approx(100.0)
@@ -311,14 +404,14 @@ def test_profitable_trade_trails_stop_with_21_day_ema() -> None:
     )
     sim._open_positions["MSFT"] = trade
 
-    sim._check_exits("MSFT", ohlcv, dates[21])
+    sim._check_exits("MSFT", ohlcv, dates[21], market=_market_context())
     raised_stop = sim._open_positions["MSFT"].stop_price
     assert raised_stop > 100.0
     assert sim._open_positions["MSFT"].ema_trailing_active is True
 
     exit_bar = ohlcv.copy()
     exit_bar.loc[dates[22], "Low"] = raised_stop - 0.5
-    sim._check_exits("MSFT", exit_bar, dates[22])
+    sim._check_exits("MSFT", exit_bar, dates[22], market=_market_context())
 
     assert "MSFT" not in sim._open_positions
     assert sim._trades[-1].exit_reason == "stop_loss"
@@ -420,7 +513,7 @@ def test_technical_only_mode_allows_buy_without_fundamentals() -> None:
             ticker_ohlcv=ticker_ohlcv,
             all_closes=all_closes,
             eval_date=dates[-1],
-            market_state={"m_score": 0.9, "market_is_bullish": True, "distribution_days": 0, "follow_through": True},
+                market_state={"m_score": 0.9, "market_is_bullish": True, "distribution_days": 0, "follow_through": True, "market": _market_context()},
         )
 
     assert row is not None
@@ -458,7 +551,7 @@ def test_technical_only_mode_skips_fundamental_fetch() -> None:
             ticker_ohlcv=ticker_ohlcv,
             all_closes=all_closes,
             eval_date=dates[-1],
-            market_state={"m_score": 0.9, "market_is_bullish": True, "distribution_days": 0, "follow_through": True},
+                market_state={"m_score": 0.9, "market_is_bullish": True, "distribution_days": 0, "follow_through": True, "market": _market_context()},
         )
 
     mocked_fund.assert_not_called()
@@ -516,8 +609,9 @@ def test_entry_policy_canslim_strategy_receives_institutional_reweighted_snapsho
                 "m_score": 0.8,
                 "market_is_bullish": True,
                 "distribution_days": 0,
-                "follow_through": False,
-            },
+                    "follow_through": False,
+                    "market": _market_context(),
+                },
         )
 
     assert len(snapshots) == 1
@@ -601,7 +695,7 @@ def test_eight_week_hold_triggered_by_20pct_gain_in_3_weeks() -> None:
 
     # close=122 → 22% gain, within 15-day window → should trigger hold
     ohlcv = _make_ohlcv(n=20, close_value=122.0, high_value=122.0, low_value=109.0)
-    sim._check_exits("CRWD", ohlcv, ohlcv.index[-1])
+    sim._check_exits("CRWD", ohlcv, ohlcv.index[-1], market=_market_context())
 
     result = sim._open_positions["CRWD"]
     assert result.eight_week_hold is True
@@ -618,7 +712,7 @@ def test_eight_week_hold_not_triggered_after_3_week_window() -> None:
 
     # close=122 → 22% gain, but day 16 is outside the 15-day window
     ohlcv = _make_ohlcv(n=20, close_value=122.0, high_value=122.0, low_value=109.0)
-    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1])
+    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1], market=_market_context())
 
     result = sim._open_positions["NVDA"]
     assert result.eight_week_hold is False
@@ -636,7 +730,7 @@ def test_eight_week_hold_releases_after_40_bars_and_tiers_resume() -> None:
 
     # price at 25% gain — all 3 tiers would fire once hold releases
     ohlcv = _make_ohlcv(n=45, close_value=125.0, high_value=125.0, low_value=109.0)
-    sim._check_exits("MU", ohlcv, ohlcv.index[-1])
+    sim._check_exits("MU", ohlcv, ohlcv.index[-1], market=_market_context())
 
     result = sim._open_positions["MU"]
     assert result.eight_week_hold is False
@@ -654,7 +748,7 @@ def test_stop_loss_fires_during_eight_week_hold() -> None:
 
     # low drops below stop
     ohlcv = _make_ohlcv(n=10, close_value=90.0, high_value=91.0, low_value=89.0)
-    sim._check_exits("VST", ohlcv, ohlcv.index[-1])
+    sim._check_exits("VST", ohlcv, ohlcv.index[-1], market=_market_context())
 
     assert "VST" not in sim._open_positions
     assert sim._trades[-1].exit_reason == "stop_loss"
@@ -706,6 +800,7 @@ def test_full_portfolio_signal_reaches_eviction_and_replaces_lower_rs_position()
         all_closes=pd.DataFrame(index=ohlcv_map["GEV"].index),
         eval_date=entry_date,
         market_state={"market_is_bullish": True},
+        market=_market_context(),
     )
 
     assert [pending.signal["symbol"] for pending in signals] == ["GEV"]
@@ -734,6 +829,7 @@ def test_full_portfolio_without_eviction_returns_no_candidates() -> None:
         all_closes=pd.DataFrame(index=ohlcv_map["GEV"].index),
         eval_date=ohlcv_map["GEV"].index[-1],
         market_state={"market_is_bullish": True},
+        market=_market_context(),
     )
 
     assert signals == []
@@ -761,6 +857,7 @@ def test_open_slot_returns_only_best_ranked_candidate() -> None:
         all_closes=pd.DataFrame(index=ohlcv_map["BEST"].index),
         eval_date=eval_date,
         market_state={"market_is_bullish": True},
+        market=_market_context(),
     )
 
     assert [pending.signal["symbol"] for pending in signals] == ["BEST"]
@@ -780,7 +877,11 @@ def test_eviction_skips_incumbent_with_missing_price_data() -> None:
         "buy_signal": True,
     }
 
-    sim._enter_position(signal, ohlcv_map, ohlcv_map["GEV"].index[-1])
+    sim._enter_position(
+        _pending_entry(signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
+        ohlcv_map,
+        ohlcv_map["GEV"].index[-1],
+    )
 
     assert set(sim._open_positions) == {"MSFT"}
     assert sim._trades == []
@@ -808,7 +909,11 @@ def test_eviction_pass1_evicts_underwater_lower_rs_position() -> None:
     ohlcv_map["GEV"] = _make_ohlcv(n=10, close_value=50.0)
     entry_date = ohlcv_map["GEV"].index[-1]
 
-    sim._enter_position(new_signal, ohlcv_map, entry_date)
+    sim._enter_position(
+        _pending_entry(new_signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
+        ohlcv_map,
+        entry_date,
+    )
 
     assert "MSFT" not in sim._open_positions
     assert "GEV" in sim._open_positions
@@ -837,7 +942,11 @@ def test_eviction_pass2_evicts_lowest_rs_when_no_underwater_positions() -> None:
     ohlcv_map["VRT"] = _make_ohlcv(n=10, close_value=60.0)
     entry_date = ohlcv_map["VRT"].index[-1]
 
-    sim._enter_position(new_signal, ohlcv_map, entry_date)
+    sim._enter_position(
+        _pending_entry(new_signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
+        ohlcv_map,
+        entry_date,
+    )
 
     assert "MSFT" not in sim._open_positions
     assert "VRT" in sim._open_positions
@@ -867,7 +976,11 @@ def test_eviction_skipped_when_new_signal_rs_lower_than_all_positions() -> None:
     ohlcv_map["GEV"] = _make_ohlcv(n=10, close_value=40.0)
     entry_date = ohlcv_map["GEV"].index[-1]
 
-    sim._enter_position(new_signal, ohlcv_map, entry_date)
+    sim._enter_position(
+        _pending_entry(new_signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
+        ohlcv_map,
+        entry_date,
+    )
 
     assert set(sim._open_positions.keys()) == original
     assert "GEV" not in sim._open_positions
@@ -896,7 +1009,11 @@ def test_eviction_disabled_when_flag_is_false() -> None:
     ohlcv_map["VST"] = _make_ohlcv(n=10, close_value=70.0)
     entry_date = ohlcv_map["VST"].index[-1]
 
-    sim._enter_position(new_signal, ohlcv_map, entry_date)
+    sim._enter_position(
+        _pending_entry(new_signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
+        ohlcv_map,
+        entry_date,
+    )
 
     assert set(sim._open_positions.keys()) == original
     assert "VST" not in sim._open_positions
@@ -929,6 +1046,7 @@ def test_policy_capacity_resolves_validated_baseline_decisions(
     assert simulator._resolve_capacity(
         eligible_signal_count=3,
         cash_fraction=0.5,
+        market=_market_context(),
     ) == expected
 
 
@@ -942,7 +1060,11 @@ def test_policy_capacity_rejects_finite_limit_above_engine_ceiling() -> None:
     simulator = PortfolioSimulator()
     simulator._policy_client = Client()
     with pytest.raises(ValueError, match="max_positions"):
-        simulator._resolve_capacity(eligible_signal_count=1, cash_fraction=1.0)
+        simulator._resolve_capacity(
+            eligible_signal_count=1,
+            cash_fraction=1.0,
+            market=_market_context(),
+        )
 
 
 def test_policy_capacity_pending_entry_round_trip_and_carried_capacity() -> None:
@@ -950,6 +1072,7 @@ def test_policy_capacity_pending_entry_round_trip_and_carried_capacity() -> None
     pending = PendingEntry(
         signal={"symbol": "NEW", "rs_score": 90.0},
         capacity=CapacityDecision(max_positions=1, eviction_enabled=False),
+        market=_market_context(),
     )
     assert PendingEntry.from_primitive(pending.to_primitive()) == pending
     simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
@@ -985,11 +1108,13 @@ def test_policy_capacity_lowered_below_holdings_blocks_without_liquidation() -> 
         all_closes=pd.DataFrame(index=frame.index),
         eval_date=frame.index[-1],
         market_state={"market_is_bullish": True},
+        market=_market_context(),
     ) == []
 
     pending = PendingEntry(
         signal={"symbol": "NEW", "rs_score": 99.0, "canslim_score": 90.0},
         capacity=CapacityDecision(1, True),
+        market=_market_context(),
     )
 
     assert simulator._capacity_state(pending) == (True, False)
@@ -1034,6 +1159,7 @@ def test_policy_capacity_evaluate_signals_carries_one_batch_decision() -> None:
         all_closes=pd.DataFrame(index=frame.index),
         eval_date=frame.index[-1],
         market_state={"market_is_bullish": True},
+        market=_market_context(),
     )
 
     assert client.capacity_calls == 1
@@ -1041,6 +1167,7 @@ def test_policy_capacity_evaluate_signals_carries_one_batch_decision() -> None:
         PendingEntry(
             signal=pending[0].signal,
             capacity=CapacityDecision(1, False),
+            market=_market_context(),
         )
     ]
 
@@ -1052,6 +1179,7 @@ def test_policy_capacity_checkpoint_serializes_pending_carrier() -> None:
     pending = PendingEntry(
         signal={"symbol": "NEW", "rs_score": 90.0},
         capacity=CapacityDecision(1, False),
+        market=_market_context(),
     )
     payload = simulator._checkpoint_payload(
         fingerprint="a" * 64,
@@ -1079,6 +1207,7 @@ def test_policy_capacity_next_session_enforces_carried_decision() -> None:
     pending = PendingEntry(
         signal={"symbol": "NEW", "rs_score": 99.0, "canslim_score": 90.0},
         capacity=CapacityDecision(1, False),
+        market=_market_context(),
     )
 
     simulator._enter_position(pending, {"NEW": frame, "OLD": frame}, frame.index[-1])
@@ -1099,6 +1228,7 @@ def test_policy_eviction_snapshot_uses_stable_opaque_slots() -> None:
     pending = PendingEntry(
         signal={"symbol": "NEW", "rs_score": 90.0},
         capacity=CapacityDecision(2, True),
+        market=_market_context(),
     )
 
     snapshot = simulator._build_eviction_snapshot(
@@ -1121,6 +1251,7 @@ def test_policy_eviction_rejects_unknown_slot_without_mutation() -> None:
     pending = PendingEntry(
         signal={"symbol": "NEW", "rs_score": 90.0},
         capacity=CapacityDecision(1, True),
+        market=_market_context(),
     )
     before = (simulator._equity, dict(simulator._open_positions), list(simulator._transactions))
 
@@ -1266,7 +1397,10 @@ def test_policy_allocation_fixed_engine_ceilings_apply_to_direct_entry(
 
     with pytest.raises(ValueError, match=message):
         simulator._enter_position(
-            {"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
+            _pending_entry(
+                {"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
+                CapacityDecision(simulator.max_positions, simulator.enable_eviction),
+            ),
             {"NEW": frame},
             frame.index[-1],
         )
@@ -1288,6 +1422,7 @@ def test_projected_entry_transition_failed_allocation_is_byte_stable() -> None:
     pending = PendingEntry(
         signal={"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
         capacity=CapacityDecision(1, True),
+        market=_market_context(),
     )
     before = (
         simulator._equity,
@@ -1319,6 +1454,7 @@ def test_policy_allocation_uncapped_batch_preserves_cash_for_remaining_entries()
     pending = PendingEntry(
         signal={"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
         capacity=CapacityDecision(None, True),
+        market=_market_context(),
     )
 
     simulator._enter_position(pending, {"NEW": frame}, frame.index[-1])
@@ -1343,7 +1479,7 @@ def test_policy_exit_hard_stop_precedes_any_policy_call() -> None:
     simulator._open_positions = {"AAA": trade}
     frame = _make_ohlcv(n=3, close_value=90.0, high_value=91.0, low_value=89.0)
 
-    simulator._check_exits("AAA", frame, frame.index[-1])
+    simulator._check_exits("AAA", frame, frame.index[-1], market=_market_context())
 
     assert calls == []
     assert simulator._trades[-1].exit_reason == "stop_loss"
@@ -1371,7 +1507,7 @@ def test_policy_exit_close_uses_trusted_current_close() -> None:
     }
     frame = _make_ohlcv(n=3, close_value=103.0, high_value=104.0, low_value=99.0)
 
-    simulator._check_exits("AAA", frame, frame.index[-1])
+    simulator._check_exits("AAA", frame, frame.index[-1], market=_market_context())
 
     assert simulator._trades[-1].exit_reason == "policy_exit"
     assert simulator._trades[-1].exit_price == 103.0
@@ -1406,6 +1542,6 @@ def test_policy_exit_rejects_uncrossed_scale_out_before_mutation() -> None:
     before = (trade.remaining_qty, simulator._equity, list(simulator._transactions))
 
     with pytest.raises(ValueError, match="crossed"):
-        simulator._check_exits("AAA", frame, frame.index[-1])
+        simulator._check_exits("AAA", frame, frame.index[-1], market=_market_context())
 
     assert (trade.remaining_qty, simulator._equity, simulator._transactions) == before

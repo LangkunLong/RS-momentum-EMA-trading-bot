@@ -32,6 +32,11 @@ from core.alpaca_pit_backfill import (
     fetch_alpaca_sip_snapshot,
     load_alpaca_credentials,
 )
+from core.pit_provenance import (
+    PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
+    pit_canonical_json,
+    pit_canonical_json_sha256,
+)
 
 _BASELINE_START = date(2020, 1, 1)
 _BASELINE_END = date(2025, 12, 31)
@@ -228,7 +233,9 @@ def _load_identity_bounds(
     if not mapped:
         raise ValueError("reviewed symbol-history map contains no canonical identities")
     end_dates = {ticker: mapped.get(ticker, cutoff) for ticker in membership.tickers}
-    end_dates["SPY"] = cutoff
+    end_dates.update(
+        {reference: cutoff for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS}
+    )
     return IdentityBounds(
         path,
         expected_sha256,
@@ -351,7 +358,7 @@ def _complete_price_identities(
     cutoff: date,
 ) -> dict[str, PriceIdentity]:
     identities = dict(manifest.identities)
-    for ticker in (*membership.tickers, "SPY"):
+    for ticker in (*membership.tickers, *PIT_NON_TRADABLE_REFERENCE_SYMBOLS):
         if ticker not in identities:
             identities[ticker] = PriceIdentity(
                 ticker,
@@ -496,7 +503,9 @@ def _canonical_request(path: Path, membership: Membership, start: date, end: dat
     value = {
         "end_date": end.isoformat(),
         "start_date": start.isoformat(),
-        "tickers": sorted({*membership.tickers, "SPY"}),
+        "tickers": sorted(
+            {*membership.tickers, *PIT_NON_TRADABLE_REFERENCE_SYMBOLS}
+        ),
         "version": 1,
     }
     path.write_bytes((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode())
@@ -827,9 +836,11 @@ def _validate_prices(
     *,
     enforce_gates: bool = True,
 ) -> tuple[dict[str, object], tuple[date, ...]]:
-    requested = {*membership.tickers, "SPY"}
+    requested = {*membership.tickers, *PIT_NON_TRADABLE_REFERENCE_SYMBOLS}
     closes: dict[date, set[str]] = {}
-    spy_days: list[date] = []
+    reference_days: dict[str, list[date]] = {
+        reference: [] for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+    }
     previous: tuple[date, str] | None = None
     first_price_date: date | None = None
     last_price_date: date | None = None
@@ -860,11 +871,11 @@ def _validate_prices(
             first_price_date = first_price_date or trade_date
             last_price_date = trade_date
             closes.setdefault(trade_date, set()).add(ticker)
-            if ticker == "SPY":
-                spy_days.append(trade_date)
-    expected_spy = _expected_trading_days(start, end)
-    if not spy_days or first_price_date is None or last_price_date is None:
-        raise ValueError("worker prices CSV contains no SPY or price rows")
+            if ticker in reference_days:
+                reference_days[ticker].append(trade_date)
+    expected_days = _expected_trading_days(start, end)
+    if first_price_date is None or last_price_date is None:
+        raise ValueError("worker prices CSV contains no price rows")
     events_by_date: dict[date, list[tuple[str, bool]]] = {}
     for effective, ticker, member in membership.events:
         events_by_date.setdefault(effective, []).append((ticker, member))
@@ -875,7 +886,7 @@ def _validate_prices(
     covered = 0
     event_dates = sorted(events_by_date)
     event_index = 0
-    for trading_day in expected_spy:
+    for trading_day in expected_days:
         while event_index < len(event_dates) and event_dates[event_index] <= trading_day:
             for ticker, member in events_by_date[event_dates[event_index]]:
                 if member:
@@ -905,26 +916,43 @@ def _validate_prices(
         "coverage_pct": round(coverage_ratio * 100, 8),
         "symbols_with_no_prices": no_prices,
         "symbols_with_partial_prices": partial,
-        "spy_first_date": spy_days[0].isoformat(),
-        "spy_last_date": spy_days[-1].isoformat(),
+        "reference_symbol_coverage": {
+            reference: {
+                "first_date": days[0].isoformat() if days else None,
+                "last_date": days[-1].isoformat() if days else None,
+                "session_count": len(days),
+            }
+            for reference, days in reference_days.items()
+        },
+        "spy_first_date": (
+            reference_days["SPY"][0].isoformat() if reference_days["SPY"] else None
+        ),
+        "spy_last_date": (
+            reference_days["SPY"][-1].isoformat() if reference_days["SPY"] else None
+        ),
         "price_row_count": price_row_count,
     }
-    if enforce_gates and tuple(spy_days) != expected_spy:
-        missing = sorted(set(expected_spy) - set(spy_days))
-        unexpected = sorted(set(spy_days) - set(expected_spy))
-        detail = f"; first missing trading day: {missing[0]}" if missing else ""
-        if unexpected:
-            detail += f"; first unexpected day: {unexpected[0]}"
-        raise ValueError(
-            "SPY coverage is incomplete for 2020-01-01 through 2025-12-31"
-            f"; observed SPY: {spy_days[0]} through {spy_days[-1]}"
-            f"; observed prices: {first_price_date} through {last_price_date}"
-            f"; member coverage: {covered}/{pairs} ({coverage_ratio:.8%})"
-            + detail
-        )
+    if enforce_gates:
+        for reference, days in reference_days.items():
+            if tuple(days) == expected_days:
+                continue
+            missing = sorted(set(expected_days) - set(days))
+            unexpected = sorted(set(days) - set(expected_days))
+            detail = f"; first missing trading day: {missing[0]}" if missing else ""
+            if unexpected:
+                detail += f"; first unexpected day: {unexpected[0]}"
+            observed = f"{days[0]} through {days[-1]}" if days else "no sessions"
+            raise ValueError(
+                f"{reference} reference coverage is incomplete for "
+                "2020-01-01 through 2025-12-31"
+                f"; observed {reference}: {observed}"
+                f"; observed prices: {first_price_date} through {last_price_date}"
+                f"; member coverage: {covered}/{pairs} ({coverage_ratio:.8%})"
+                + detail
+            )
     if enforce_gates and coverage_ratio < 0.98:
         raise ValueError(f"member/trading-day close coverage is below 98%: {coverage_ratio:.6%}")
-    return metrics, tuple(spy_days)
+    return metrics, tuple(reference_days["SPY"])
 
 
 def _relative_difference(left: float, right: float) -> float:
@@ -1542,7 +1570,9 @@ def export(args: argparse.Namespace) -> dict[str, object]:
         if alpaca_sip_backfill:
             env_path = Path(alpaca_env_file_value) if alpaca_env_file_value is not None else None
             api_key, secret_key = load_alpaca_credentials(env_path)
-            provider_symbols = tuple(sorted({*membership.tickers, "SPY"}))
+            provider_symbols = tuple(
+                sorted({*membership.tickers, *PIT_NON_TRADABLE_REFERENCE_SYMBOLS})
+            )
             expected_trading_days = _expected_trading_days(args.start_date, args.end_date)
             split_snapshot = fetch_alpaca_sip_snapshot(
                 provider_symbols,
@@ -1564,7 +1594,10 @@ def export(args: argparse.Namespace) -> dict[str, object]:
             )
             raw_snapshot = fetch_alpaca_sip_raw_calibration(
                 factor_anchor_symbols,
-                membership_symbol_count=len(factor_anchor_symbols) - 1,
+                membership_symbol_count=len(
+                    set(factor_anchor_symbols)
+                    - set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+                ),
                 start=args.start_date,
                 end=args.end_date,
                 expected_trading_days=expected_trading_days,
@@ -1733,6 +1766,12 @@ def export(args: argparse.Namespace) -> dict[str, object]:
             "cache_key_count": snapshot.key_count,
             "cache_keys_sha256": snapshot.keys_sha256,
             "membership_sha256": _sha256_file(membership_path),
+            "non_tradable_reference_symbols_json": pit_canonical_json(
+                list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+            ),
+            "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(
+                list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+            ),
             "start_date": args.start_date.isoformat(),
             "end_date": args.end_date.isoformat(),
             "sandbox_image": args.sandbox_image,

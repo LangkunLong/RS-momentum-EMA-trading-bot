@@ -75,12 +75,17 @@ from core.strategy_policy import (
     EvictionSnapshot,
     ExitDecision,
     ExitSnapshot,
+    MarketContextV1,
     StrategyPolicyClient,
     StrategyPolicyClientFactory,
     validate_allocation_decision,
     validate_capacity_decision,
     validate_eviction_decision,
     validate_exit_decision,
+)
+from core.strategy_policy.market_context import (
+    BENCHMARK_CONTEXT_SYMBOLS,
+    build_market_context,
 )
 from core.strategy_policy.runtime import InProcessPolicyClient
 from core.trading_sessions import (
@@ -181,6 +186,7 @@ def _calculate_rs_snapshot(
 class PendingEntry:
     signal: dict[str, object]
     capacity: CapacityDecision
+    market: MarketContextV1
 
     def to_primitive(self) -> dict[str, object]:
         return {
@@ -189,13 +195,20 @@ class PendingEntry:
                 "max_positions": self.capacity.max_positions,
                 "eviction_enabled": self.capacity.eviction_enabled,
             },
+            "market": self.market.to_primitive(),
         }
 
     @classmethod
     def from_primitive(cls, raw: Mapping[str, object]) -> "PendingEntry":
         signal = raw.get("signal")
         capacity = raw.get("capacity")
-        if not isinstance(signal, Mapping) or not isinstance(capacity, Mapping):
+        market = raw.get("market")
+        if (
+            set(raw) != {"signal", "capacity", "market"}
+            or not isinstance(signal, Mapping)
+            or not isinstance(capacity, Mapping)
+            or not isinstance(market, Mapping)
+        ):
             raise ValueError("pending entry checkpoint is invalid")
         max_positions = capacity.get("max_positions")
         eviction_enabled = capacity.get("eviction_enabled")
@@ -212,6 +225,9 @@ class PendingEntry:
             capacity=CapacityDecision(
                 max_positions=max_positions,
                 eviction_enabled=eviction_enabled,
+            ),
+            market=MarketContextV1.from_canonical_json(
+                json.dumps(market, sort_keys=True, separators=(",", ":"))
             ),
         )
 
@@ -421,7 +437,17 @@ class SimulationResult:
             values = pd.to_numeric(self.signal_log[name], errors="coerce")
             return int((values >= threshold).fillna(False).sum())
 
-        return {
+        def count_blocking_reason(name: str, reason: str) -> int:
+            if name not in columns:
+                return 0
+            values = self.signal_log[name].fillna("").astype(str)
+            return int(
+                values.str.split(",").map(
+                    lambda reasons: reason in reasons
+                ).sum()
+            )
+
+        funnel = {
             "evaluated_rows": int(len(self.signal_log)),
             "signal_days": int(
                 self.signal_log["signal_date"].nunique()
@@ -448,6 +474,35 @@ class SimulationResult:
             ),
             "rs_universe_count": int(self.config.get("rs_universe_count", 0)),
         }
+        blocking_reasons = (
+            "close_not_above_prior_close",
+            "volume_ratio_below_threshold",
+            "close_below_pivot",
+            "close_above_buy_zone",
+            "proper_base_unavailable",
+            "insufficient_close_history",
+            "insufficient_prior_volume_history",
+            "non_finite_close_input",
+            "non_finite_volume_input",
+            "non_positive_pivot",
+            "non_positive_prior_average_volume",
+            "current_growth_unavailable",
+            "current_growth_below_threshold",
+            "annual_growth_unavailable",
+            "annual_growth_below_threshold",
+            "rs_score_unavailable",
+            "rs_score_below_threshold",
+            "composite_score_unavailable",
+            "composite_score_below_threshold",
+        )
+        for reason in blocking_reasons:
+            funnel[f"technical_block_{reason}"] = count_blocking_reason(
+                "technical_blocking_reasons", reason
+            )
+            funnel[f"entry_block_{reason}"] = count_blocking_reason(
+                "entry_blocking_reasons", reason
+            )
+        return funnel
 
     @property
     def closed_trades(self) -> List[Trade]:
@@ -701,15 +756,12 @@ def _entry_policy_snapshot(
     use_stateful_regime_gate: bool,
     market_allowed: bool,
     market_state: Mapping[str, object],
-    default_market_regime: str = "confirmed_uptrend",
+    market: MarketContextV1,
 ) -> EntrySnapshot:
     """Copy trusted completed-session facts into the identity-free entry schema."""
 
-    raw_regime = market_state.get("market_regime", default_market_regime)
-    market_regime = (
-        raw_regime.value if isinstance(raw_regime, MarketRegime) else raw_regime
-    )
     return EntrySnapshot(
+        market=market,
         technical_only=technical_only,
         require_proper_base=require_proper_base,
         c_score=_finite_signal_number(row.get("c_score")),
@@ -744,9 +796,6 @@ def _entry_policy_snapshot(
         cash_deployment_override=bool(market_state.get("cash_deployment_override", False)),
         use_stateful_regime_gate=use_stateful_regime_gate,
         regime_allows_entries=bool(market_state.get("regime_allows_entries", True)),
-        market_regime=str(market_regime),
-        distribution_days=int(market_state.get("distribution_days", 0)),
-        follow_through=bool(market_state.get("follow_through", False)),
     )
 
 
@@ -1034,6 +1083,9 @@ class CanslimStrategy:
             or market_state["market_is_bullish"]
             or market_state.get("cash_deployment_override", False)
         )
+        market = market_state.get("market")
+        if type(market) is not MarketContextV1:
+            raise ValueError("entry market context is invalid")
         policy_snapshot = _entry_policy_snapshot(
             row={
                 "c_score": c_score,
@@ -1063,6 +1115,7 @@ class CanslimStrategy:
             ),
             market_allowed=m_pass,
             market_state=market_state,
+            market=market,
         )
         policy_client = self._policy_client_provider()
         decision = _validated_entry_policy_decision(
@@ -1157,7 +1210,7 @@ def _new_execution_diagnostics() -> dict[str, int]:
     }
 
 
-_PORTFOLIO_CHECKPOINT_SCHEMA = 3
+_PORTFOLIO_CHECKPOINT_SCHEMA = 4
 _BUILTIN_CANSLIM_STRATEGY_CHECKPOINT_VERSION = 1
 _MISSING_CHECKPOINT_IDENTITY = object()
 
@@ -1367,6 +1420,9 @@ def _portfolio_checkpoint_fingerprint(
     benchmark: str,
     universe: Iterable[str],
     simulator: "PortfolioSimulator",
+    tradable_tickers: Iterable[str] | None = None,
+    market_reference_tickers: Iterable[str] | None = None,
+    market_context_universe: Iterable[str] | None = None,
     strategy_identity: Optional[dict[str, Any]] = None,
     history_start_date: Optional[pd.Timestamp] = None,
 ) -> str:
@@ -1398,6 +1454,26 @@ def _portfolio_checkpoint_fingerprint(
         "end_date": str(end_date.date()),
         "benchmark": benchmark,
         "universe": sorted(str(item).upper() for item in universe),
+        "tradable_tickers": sorted(
+            str(item).upper()
+            for item in (tradable_tickers if tradable_tickers is not None else universe)
+        ),
+        "market_reference_tickers": sorted(
+            str(item).upper()
+            for item in (
+                market_reference_tickers
+                if market_reference_tickers is not None
+                else (benchmark,)
+            )
+        ),
+        "market_context_universe": sorted(
+            str(item).upper()
+            for item in (
+                market_context_universe
+                if market_context_universe is not None
+                else universe
+            )
+        ),
         "initial_capital": simulator.initial_capital,
         "max_positions": simulator.max_positions,
         "position_size_pct": simulator.position_size_pct,
@@ -1619,6 +1695,7 @@ class PortfolioSimulator:
         self._entry_projection_safety_limits: dict[int, tuple[float, float]] = {}
         self._entry_projection_notional_caps: dict[int, float] = {}
         self._exit_policy_snapshots: dict[int, ExitSnapshot] = {}
+        self._market_context_cache: dict[str, MarketContextV1] = {}
         self._policy_client_factory = (
             policy_client_factory
             if policy_client_factory is not None
@@ -1790,19 +1867,41 @@ class PortfolioSimulator:
             raise ValueError("history_start_date must not follow start_date")
 
         if self.pit_bundle is not None:
-            bundle_symbols = set(self.pit_bundle.symbols())
-            requested = [str(ticker).upper() for ticker in tickers] or list(self.pit_bundle.symbols())
+            tradable_tickers = tuple(self.pit_bundle.tradable_symbols())
+            market_reference_tickers = tuple(self.pit_bundle.reference_symbols())
+            tradable_set = set(tradable_tickers)
+            reference_set = set(market_reference_tickers)
+            requested = [str(ticker).upper() for ticker in tickers]
+            if reference_set.intersection(requested):
+                raise ValueError(
+                    "point-in-time reference symbols are observation-only and cannot be traded"
+                )
             tickers = list(
                 dict.fromkeys(
-                    ticker for ticker in requested if ticker in bundle_symbols and ticker != benchmark
+                    ticker for ticker in (requested or list(tradable_tickers))
+                    if ticker in tradable_set
                 )
             )
             if not tickers:
                 raise ValueError("point-in-time bundle has no requested candidate symbols")
-            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
+            all_tickers = list(
+                dict.fromkeys([*tickers, *market_reference_tickers, benchmark])
+            )
+            market_context_universe = tuple(self.pit_bundle.price_symbols())
+            if set(market_context_universe) != tradable_set.union(reference_set):
+                raise ValueError(
+                    "point-in-time market context must exactly cover tradables and references"
+                )
         else:
-            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
-        universe = list(self.pit_bundle.symbols()) if self.pit_bundle is not None else list(dict.fromkeys([*tickers, *get_sp500_tickers()]))
+            tradable_tickers = tuple(dict.fromkeys(str(ticker).upper() for ticker in tickers))
+            market_reference_tickers = BENCHMARK_CONTEXT_SYMBOLS
+            all_tickers = list(dict.fromkeys([*tickers, *market_reference_tickers, benchmark]))
+            market_context_universe = tuple(
+                dict.fromkeys(
+                    [*tickers, *get_sp500_tickers(), *market_reference_tickers, benchmark]
+                )
+            )
+        universe = list(market_context_universe)
         checkpoint = Path(checkpoint_path).resolve() if checkpoint_path is not None else None
         progress = Path(progress_log_path).resolve() if progress_log_path is not None else None
         state_log = checkpoint.with_name("portfolio_state.jsonl") if checkpoint is not None else None
@@ -1818,6 +1917,9 @@ class PortfolioSimulator:
             end_date=end_ts,
             benchmark=benchmark,
             universe=all_tickers,
+            tradable_tickers=tradable_tickers,
+            market_reference_tickers=market_reference_tickers,
+            market_context_universe=market_context_universe,
             simulator=self,
             strategy_identity=strategy_identity,
         )
@@ -1884,6 +1986,9 @@ class PortfolioSimulator:
                 "history_start_date": str(history_start.date()),
                 "end_date": str(end_ts.date()),
                 "universe_count": len(universe),
+                "tradable_ticker_count": len(tradable_tickers),
+                "market_reference_ticker_count": len(market_reference_tickers),
+                "market_context_universe_count": len(market_context_universe),
             }, sync=True)
 
         if self.pit_bundle is not None:
@@ -2000,6 +2105,22 @@ class PortfolioSimulator:
                         prev_volume=float(prev_bar["Volume"]),
                     )
 
+            market_state = self.strategy.evaluate_market(benchmark_df, eval_date)
+            if self.pit_bundle is not None:
+                context_members = self.pit_bundle.members_at(eval_date).intersection(
+                    self.pit_bundle.tradable_symbols()
+                )
+            else:
+                context_members = set(market_context_universe).difference(
+                    (*market_reference_tickers, benchmark)
+                )
+            market = self._market_context_for_session(
+                eval_date=eval_date,
+                all_closes=all_closes,
+                active_constituents=context_members,
+                market_state=market_state,
+            )
+
             date_str = str(eval_date.date())
 
             self._apply_identity_transitions(ticker_ohlcv, eval_date)
@@ -2013,10 +2134,9 @@ class PortfolioSimulator:
             for symbol in list(self._open_positions.keys()):
                 ohlcv = ticker_ohlcv.get(symbol)
                 if ohlcv is not None:
-                    self._check_exits(symbol, ohlcv, eval_date)
+                    self._check_exits(symbol, ohlcv, eval_date, market=market)
 
             is_signal_day = day_idx % self.signal_every_n_days == 0
-            market_state = self.strategy.evaluate_market(benchmark_df, eval_date)
             if is_signal_day:
                 active_tickers = tickers
                 if self.pit_bundle is not None:
@@ -2028,6 +2148,7 @@ class PortfolioSimulator:
                     all_closes=all_closes,
                     eval_date=eval_date,
                     market_state=market_state,
+                    market=market,
                 )
 
             equity_series[date_str] = self._mark_equity(ticker_ohlcv, eval_date)
@@ -2116,6 +2237,9 @@ class PortfolioSimulator:
             tickers=tickers,
             benchmark=benchmark,
             all_closes=all_closes,
+            tradable_tickers=tradable_tickers,
+            market_reference_tickers=market_reference_tickers,
+            market_context_universe=market_context_universe,
             start_ts=trade_start,
             history_start_ts=history_start,
             end_ts=end_ts,
@@ -2191,7 +2315,40 @@ class PortfolioSimulator:
         self._entry_projection_notional_caps = {}
         self._exit_policy_snapshots = {}
         self._regime_tracker = MarketRegimeTracker()
+        self._market_context_cache: dict[str, MarketContextV1] = {}
         self._reset_strict_pit_pattern_cache()
+
+    def _market_context_for_session(
+        self,
+        *,
+        eval_date: pd.Timestamp,
+        all_closes: pd.DataFrame,
+        active_constituents: Iterable[str],
+        market_state: Mapping[str, object],
+    ) -> MarketContextV1:
+        session = pd.Timestamp(eval_date).normalize()
+        key = session.date().isoformat()
+        cached = self._market_context_cache.get(key)
+        if cached is not None:
+            return cached
+        active = tuple(sorted(str(symbol).upper() for symbol in active_constituents))
+        rs_scores = _calculate_rs_snapshot(
+            all_closes,
+            session,
+            eligible_tickers=active,
+        )
+        regime = getattr(self._regime_tracker.regime, "value", self._regime_tracker.regime)
+        context = build_market_context(
+            session=session,
+            oneil_regime=str(regime),
+            distribution_days=self._regime_tracker.distribution_days,
+            follow_through=bool(market_state.get("follow_through", False)),
+            closes=all_closes,
+            active_constituents=active,
+            rs_scores=rs_scores,
+        )
+        self._market_context_cache[key] = context
+        return context
 
     def _reset_strict_pit_pattern_cache(self) -> None:
         """Clear the built-in strict-PIT acceleration state before each run."""
@@ -2330,6 +2487,9 @@ class PortfolioSimulator:
         tickers: list[str],
         benchmark: str,
         all_closes: pd.DataFrame,
+        tradable_tickers: Iterable[str] | None = None,
+        market_reference_tickers: Iterable[str] | None = None,
+        market_context_universe: Iterable[str] | None = None,
         start_ts: pd.Timestamp,
         end_ts: pd.Timestamp,
         requested_entry_floors: tuple[float | None, float | None] | None = None,
@@ -2345,10 +2505,36 @@ class PortfolioSimulator:
                 self.requested_min_canslim_score,
             )
         )
+        effective_tradable_tickers = tuple(
+            str(ticker).upper()
+            for ticker in (tradable_tickers if tradable_tickers is not None else tickers)
+        )
+        effective_market_reference_tickers = tuple(
+            str(ticker).upper()
+            for ticker in (
+                market_reference_tickers
+                if market_reference_tickers is not None
+                else (benchmark,)
+            )
+        )
+        effective_market_context_universe = tuple(
+            str(ticker).upper()
+            for ticker in (
+                market_context_universe
+                if market_context_universe is not None
+                else all_closes.columns
+            )
+        )
         return {
             "tickers": tickers,
             "candidate_universe_count": len(tickers),
             "rs_universe_count": len(all_closes.columns),
+            "tradable_tickers": list(effective_tradable_tickers),
+            "tradable_ticker_count": len(effective_tradable_tickers),
+            "market_reference_tickers": list(effective_market_reference_tickers),
+            "market_reference_ticker_count": len(effective_market_reference_tickers),
+            "market_context_universe": list(effective_market_context_universe),
+            "market_context_universe_count": len(effective_market_context_universe),
             "benchmark_symbol": benchmark,
             "max_positions": self.max_positions,
             "require_bullish_market": self.require_bullish_market,
@@ -2549,6 +2735,7 @@ class PortfolioSimulator:
         eval_date: pd.Timestamp,
         market_allowed: bool,
         market_state: dict[str, Any],
+        market: MarketContextV1,
         entry_facts: CanslimEntryFacts | None = None,
     ) -> dict[str, Any]:
         """Rebuild the authoritative entry decision at the execution boundary."""
@@ -2584,6 +2771,7 @@ class PortfolioSimulator:
             facts=facts,
             market_allowed=market_allowed,
             market_state=market_state,
+            market=market,
         )
         client = self._policy_client or InProcessPolicyClient()
         decision = self._validate_entry_policy_decision(
@@ -2640,19 +2828,10 @@ class PortfolioSimulator:
         facts: CanslimEntryFacts,
         market_allowed: bool,
         market_state: Mapping[str, object],
+        market: MarketContextV1,
     ) -> EntrySnapshot:
         """Copy trusted completed-session entry facts into the closed policy schema."""
 
-        tracker_regime = getattr(
-            getattr(self, "_regime_tracker", None),
-            "regime",
-            MarketRegime.CONFIRMED_UPTREND,
-        )
-        default_market_regime = (
-            tracker_regime.value
-            if isinstance(tracker_regime, MarketRegime)
-            else "confirmed_uptrend"
-        )
         return _entry_policy_snapshot(
             row=row,
             facts=facts,
@@ -2662,7 +2841,7 @@ class PortfolioSimulator:
             use_stateful_regime_gate=self.use_stateful_regime_gate,
             market_allowed=market_allowed,
             market_state=market_state,
-            default_market_regime=default_market_regime,
+            market=market,
         )
 
     @staticmethod
@@ -2674,8 +2853,10 @@ class PortfolioSimulator:
         *,
         eligible_signal_count: int,
         cash_fraction: float,
+        market: MarketContextV1,
     ) -> CapacityDecision:
         snapshot = CapacitySnapshot(
+            market=market,
             configured_max_positions=self.max_positions,
             maximum_policy_positions=MAXIMUM_POLICY_POSITIONS,
             open_position_count=len(self._open_positions),
@@ -2707,6 +2888,7 @@ class PortfolioSimulator:
         all_closes: pd.DataFrame,
         eval_date: pd.Timestamp,
         market_state: dict,
+        market: MarketContextV1,
     ) -> List[PendingEntry]:
         self._execution_diagnostics["signal_days"] += 1
         regime_allowed = bool(self._regime_tracker.allows_entries)
@@ -2733,6 +2915,7 @@ class PortfolioSimulator:
             "value",
             "confirmed_uptrend",
         )
+        effective_market_state["market"] = market
         market_allowed = bool(
             not self.require_bullish_market
             or market_state["market_is_bullish"]
@@ -2751,7 +2934,9 @@ class PortfolioSimulator:
         signals: List[dict] = []
         rs_eligible = None
         if self.pit_bundle is not None:
-            rs_eligible = self.pit_bundle.members_at(eval_date) - {self.benchmark_symbol.upper()}
+            rs_eligible = self.pit_bundle.members_at(eval_date).intersection(
+                self.pit_bundle.tradable_symbols()
+            )
         rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date, eligible_tickers=rs_eligible)
         top_groups = get_top_groups(
             rs_snapshot,
@@ -2807,6 +2992,7 @@ class PortfolioSimulator:
                 eval_date=eval_date,
                 market_allowed=market_allowed,
                 market_state=effective_market_state,
+                market=market,
                 entry_facts=entry_facts,
             )
             self._signal_rows.append(row)
@@ -2856,6 +3042,7 @@ class PortfolioSimulator:
         capacity = self._resolve_capacity(
             eligible_signal_count=len(signals),
             cash_fraction=min(cash_fraction, 1.0),
+            market=market,
         )
         if capacity.max_positions is None:
             candidate_limit = len(signals)
@@ -2876,7 +3063,7 @@ class PortfolioSimulator:
             0,
         )
         return [
-            PendingEntry(signal=dict(signal), capacity=capacity)
+            PendingEntry(signal=dict(signal), capacity=capacity, market=market)
             for signal in signals[:candidate_limit]
         ]
 
@@ -2906,6 +3093,7 @@ class PortfolioSimulator:
                 )
             )
         return EvictionSnapshot(
+            market=pending.market,
             capacity_is_finite=pending.capacity.max_positions is not None,
             capacity_is_full=full,
             eviction_enabled=eviction_enabled,
@@ -3208,18 +3396,12 @@ class PortfolioSimulator:
 
     def _enter_position(
         self,
-        pending: PendingEntry | dict[str, object],
+        pending: PendingEntry,
         ticker_ohlcv: Dict[str, pd.DataFrame],
         entry_date: pd.Timestamp,
     ) -> None:
-        if not isinstance(pending, PendingEntry):
-            pending = PendingEntry(
-                signal=dict(pending),
-                capacity=CapacityDecision(
-                    self.max_positions,
-                    self.enable_eviction,
-                ),
-            )
+        if type(pending) is not PendingEntry:
+            raise TypeError("entry execution requires an explicit pending entry")
         if (
             pending.capacity.max_positions is not None
             and pending.capacity.max_positions > MAXIMUM_POLICY_POSITIONS
@@ -3327,6 +3509,7 @@ class PortfolioSimulator:
         entry_open = projection.entry_open
 
         allocation_snapshot = AllocationSnapshot(
+            market=pending.market,
             portfolio_equity_at_entry_open=(
                 projection.portfolio_equity_at_entry_open
             ),
@@ -3402,8 +3585,10 @@ class PortfolioSimulator:
         ema_today: float | None,
         consecutive_closes_below_ema: bool,
         protective_stop_candidates: tuple[float, ...],
+        market: MarketContextV1,
     ) -> ExitSnapshot:
         return ExitSnapshot(
+            market=market,
             entry_price=trade.entry_price,
             original_qty=trade.qty,
             remaining_qty=float(trade.remaining_qty or 0.0),
@@ -3489,6 +3674,7 @@ class PortfolioSimulator:
         ohlcv: pd.DataFrame,
         eval_date: pd.Timestamp,
         *_unused_args,
+        market: MarketContextV1,
         **_unused_kwargs,
     ) -> None:
         trade = self._open_positions.get(symbol)
@@ -3550,6 +3736,7 @@ class PortfolioSimulator:
             ema_today=ema_today,
             consecutive_closes_below_ema=consecutive_closes_below_ema,
             protective_stop_candidates=protective_stop_candidates,
+            market=market,
         )
         decision = self._adapter_policy_client().evaluate_exit(snapshot)
         if type(decision) is not ExitDecision:
@@ -4240,7 +4427,7 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
             pit_bundle = PITDataBundle(
                 args.pit_bundle, expected_sha256=args.pit_bundle_sha256
             )
-            tickers = list(args.tickers or pit_bundle.symbols())
+            tickers = list(args.tickers or pit_bundle.tradable_symbols())
         else:
             tickers = _resolve_universe(args.universe, args.tickers)
             extra = [s for s in settings.EXTRA_SYMBOLS if s not in tickers]

@@ -5,8 +5,12 @@ from dataclasses import dataclass
 import pandas as pd
 import pytest
 
-from core.backtest_engine import PortfolioSimulator, Trade, _calculate_rs_snapshot
+from core.backtest_engine import PendingEntry, PortfolioSimulator, Trade, _calculate_rs_snapshot
 from core.momentum_analysis import calculate_rs_snapshot
+from core.strategy_policy import BenchmarkContextV1, CapacityDecision, MarketContextV1
+
+
+_CONTEXT_SYMBOLS = tuple(f"CTX{number:02d}" for number in range(10))
 
 
 def _ohlcv(
@@ -38,7 +42,7 @@ def _with_warmup_and_canonical_entry(
     first_session = pd.Timestamp(history.index[0])
     warmup_dates = pd.bdate_range(
         end=first_session - pd.offsets.BDay(1),
-        periods=51,
+        periods=260,
     )
     base_close = float(history["Close"].iloc[0])
     warmup = _ohlcv(
@@ -66,6 +70,50 @@ def _signal(symbol: str, signal_date: pd.Timestamp, *, rs_score: float = 90.0) -
         "canslim_score": 80.0,
         "signal_reason": "causality regression",
         "buy_signal": True,
+    }
+
+
+def _market_context(session: pd.Timestamp) -> MarketContextV1:
+    return MarketContextV1(
+        schema_version=1,
+        session=session.date().isoformat(),
+        oneil_regime="confirmed_uptrend",
+        distribution_days=0,
+        follow_through=False,
+        benchmarks=tuple(
+            BenchmarkContextV1(symbol, 0.0, 0.0, 0.0)
+            for symbol in ("SPY", "QQQ", "IWM")
+        ),
+        active_constituent_count=10,
+        breadth_above_50_fraction=0.0,
+        breadth_50_coverage_fraction=1.0,
+        breadth_above_200_fraction=0.0,
+        breadth_200_coverage_fraction=1.0,
+        median_rs_score=55.0,
+        rs_at_least_80_fraction=0.0,
+        rs_coverage_fraction=1.0,
+    )
+
+
+def _pending(signal: dict[str, object], capacity: CapacityDecision) -> PendingEntry:
+    signal_session = pd.Timestamp(signal["signal_date"])
+    return PendingEntry(signal, capacity, _market_context(signal_session))
+
+
+def _context_closes(dates: pd.DatetimeIndex) -> dict[str, pd.Series]:
+    return {
+        symbol: pd.Series(
+            [100.0 * (1.0 + (offset + 1) * 0.0001) ** day for day in range(len(dates))],
+            index=dates,
+        )
+        for offset, symbol in enumerate((*_CONTEXT_SYMBOLS, "SPY", "QQQ", "IWM"))
+    }
+
+
+def _reference_prices(dates: pd.DatetimeIndex) -> dict[str, pd.DataFrame]:
+    return {
+        symbol: _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates))
+        for symbol in ("SPY", "QQQ", "IWM")
     }
 
 
@@ -163,7 +211,7 @@ def test_fold_history_is_visible_without_emitting_prefold_state_and_runs_reset(
     evaluation_dates = pd.bdate_range("2026-05-04", periods=30)
     warmup_dates = pd.bdate_range(
         end=evaluation_dates[0] - pd.offsets.BDay(1),
-        periods=60,
+        periods=260,
     )
     all_dates = warmup_dates.append(evaluation_dates)
     lead = _ohlcv(
@@ -177,14 +225,9 @@ def test_fold_history_is_visible_without_emitting_prefold_state_and_runs_reset(
     lead.loc[evaluation_dates[-1], "Close"] = 102.0
     lead.loc[evaluation_dates[-1], "High"] = 102.0
     lead.loc[evaluation_dates[-1], "Volume"] = 1_300_000.0
-    spy = _ohlcv(
-        all_dates,
-        opens=[100.0] * len(all_dates),
-        closes=[100.0] * len(all_dates),
-    )
     fetcher = _RecordingFetcher(
-        prices={"LEAD": lead, "SPY": spy},
-        closes=pd.DataFrame({"LEAD": lead["Close"]}),
+        prices={"LEAD": lead, **_reference_prices(all_dates)},
+        closes=pd.DataFrame({"LEAD": lead["Close"], **_context_closes(all_dates)}),
         price_windows=[],
         close_windows=[],
     )
@@ -205,7 +248,7 @@ def test_fold_history_is_visible_without_emitting_prefold_state_and_runs_reset(
         data_fetcher=fetcher,
         strategy=strategy,
     )
-    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
+    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: list(_CONTEXT_SYMBOLS))
 
     results = [
         simulator.run(
@@ -261,12 +304,11 @@ def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytes
         _ohlcv(dates, opens=[50.0] * len(dates), closes=[50.0] * len(dates)),
         dates[1],
     )
-    spy = _with_warmup_and_canonical_entry(
-        _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates)),
-        None,
+    full_dates = pd.DatetimeIndex(old.index)
+    prices = {"OLD": old, "NEW": new, **_reference_prices(full_dates)}
+    closes = pd.DataFrame(
+        {"OLD": old["Close"], "NEW": new["Close"], **_context_closes(full_dates)}
     )
-    prices = {"OLD": old, "NEW": new, "SPY": spy}
-    closes = pd.DataFrame({"OLD": old["Close"], "NEW": new["Close"]})
     strategy = _DatedSignals(
         {
             ("OLD", dates[0]): _signal("OLD", dates[0]),
@@ -283,7 +325,7 @@ def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytes
         data_fetcher=_StaticFetcher(prices, closes),
         strategy=strategy,
     )
-    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
+    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: list(_CONTEXT_SYMBOLS))
 
     result = simulator.run(
         ["OLD", "NEW"],
@@ -315,11 +357,8 @@ def test_new_open_position_still_observes_same_day_stop(monkeypatch: pytest.Monk
         ),
         dates[0],
     )
-    spy = _with_warmup_and_canonical_entry(
-        _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates)),
-        None,
-    )
-    prices = {"NEW": new, "SPY": spy}
+    full_dates = pd.DatetimeIndex(new.index)
+    prices = {"NEW": new, **_reference_prices(full_dates)}
     strategy = _DatedSignals({("NEW", dates[0]): _signal("NEW", dates[0])})
     simulator = PortfolioSimulator(
         initial_capital=1_000.0,
@@ -328,10 +367,13 @@ def test_new_open_position_still_observes_same_day_stop(monkeypatch: pytest.Monk
         signal_every_n_days=1,
         technical_only=True,
         stagnation_days=999,
-        data_fetcher=_StaticFetcher(prices, pd.DataFrame({"NEW": new["Close"]}, index=dates)),
+        data_fetcher=_StaticFetcher(
+            prices,
+            pd.DataFrame({"NEW": new["Close"], **_context_closes(full_dates)}),
+        ),
         strategy=strategy,
     )
-    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
+    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: list(_CONTEXT_SYMBOLS))
 
     result = simulator.run(
         ["NEW"],
@@ -377,7 +419,14 @@ def test_entry_sizing_marks_holdings_at_open_then_strictly_prior_close() -> None
         "NEW": _ohlcv(dates, opens=[10.0, 10.0, 10.0], closes=[10.0, 10.0, 10.0]),
     }
 
-    simulator._enter_position(_signal("NEW", dates[1]), prices, dates[2])
+    simulator._enter_position(
+        _pending(
+            _signal("NEW", dates[1]),
+            CapacityDecision(simulator.max_positions, simulator.enable_eviction),
+        ),
+        prices,
+        dates[2],
+    )
 
     buy = next(row for row in simulator._transactions if row["Action"] == "BUY")
     assert buy["Ticker"] == "NEW"
@@ -415,7 +464,14 @@ def test_capped_eviction_selects_and_sells_using_causal_open_price() -> None:
         "NEW": _ohlcv(dates, opens=[50.0, 50.0], closes=[50.0, 50.0]),
     }
 
-    simulator._enter_position(_signal("NEW", dates[0], rs_score=80.0), prices, dates[1])
+    simulator._enter_position(
+        _pending(
+            _signal("NEW", dates[0], rs_score=80.0),
+            CapacityDecision(simulator.max_positions, simulator.enable_eviction),
+        ),
+        prices,
+        dates[1],
+    )
 
     evicted = next(trade for trade in simulator._trades if trade.exit_reason == "evicted")
     sell = next(row for row in simulator._transactions if row["Action"] == "SELL")
@@ -439,7 +495,14 @@ def test_pivotless_pending_entry_requires_exact_next_session_open(bar_state: str
         history.loc[dates[1], "Open"] = float("nan")
     simulator = PortfolioSimulator(initial_capital=1_000.0, technical_only=True)
 
-    simulator._enter_position(_signal("LEAD", dates[0]), {"LEAD": history}, dates[1])
+    simulator._enter_position(
+        _pending(
+            _signal("LEAD", dates[0]),
+            CapacityDecision(simulator.max_positions, simulator.enable_eviction),
+        ),
+        {"LEAD": history},
+        dates[1],
+    )
 
     assert simulator._transactions == []
     assert simulator._entry_outcomes[-1].outcome == "entry_rejected_missing_data"

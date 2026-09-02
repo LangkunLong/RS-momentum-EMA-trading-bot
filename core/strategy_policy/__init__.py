@@ -7,6 +7,7 @@ from typing import Callable, Protocol
 from .contracts import (
     AllocationDecision,
     AllocationSnapshot,
+    BenchmarkContextV1,
     CapacityDecision,
     CapacitySnapshot,
     EntryDecision,
@@ -17,13 +18,14 @@ from .contracts import (
     ExitAction,
     ExitDecision,
     ExitSnapshot,
+    MarketContextV1,
     validate_allocation_decision,
     validate_capacity_decision,
     validate_eviction_decision,
     validate_exit_decision,
 )
 
-POLICY_INTERFACE_VERSION = 1
+POLICY_INTERFACE_VERSION = 2
 
 
 class StrategyPolicyClient(Protocol):
@@ -41,6 +43,7 @@ StrategyPolicyClientFactory = Callable[[], StrategyPolicyClient]
 
 __all__ = [
     "POLICY_INTERFACE_VERSION", "StrategyPolicyClient", "StrategyPolicyClientFactory",
+    "BenchmarkContextV1", "MarketContextV1",
     "EntrySnapshot", "EntryDecision", "CapacitySnapshot", "CapacityDecision",
     "AllocationSnapshot", "AllocationDecision", "EvictionPosition", "EvictionSnapshot",
     "EvictionDecision", "ExitSnapshot", "ExitAction", "ExitDecision",

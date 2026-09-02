@@ -375,16 +375,26 @@ class FactCacheBuilder:
 
     def _prefetch_prices(self) -> _PrefetchedPrices:
         warmup = str(getattr(self.bundle, "metadata", {}).get("warmup_start", self.partitions.discovery.start))
-        symbols = tuple(sorted({str(symbol).upper() for symbol in self.bundle.symbols()}.union({"SPY"})))
+        tradable_tickers = tuple(self.bundle.tradable_symbols())
+        market_reference_tickers = tuple(self.bundle.reference_symbols())
+        symbols = tuple(self.bundle.price_symbols())
         prices = self.bundle.fetch_price_data(symbols, pd.Timestamp(warmup), pd.Timestamp(self.partitions.locked_evaluation.end))
         normalized = MappingProxyType({str(symbol).upper(): frame for symbol, frame in prices.items()})
         prepared = {
             symbol: _prepare_pattern_history(frame)
             for symbol, frame in normalized.items()
-            if symbol != "SPY" and not frame.empty
+            if symbol in tradable_tickers and not frame.empty
         }
         self._prepared_pattern_histories = MappingProxyType(prepared)
-        closes = pd.DataFrame({symbol: frame["Close"] for symbol, frame in normalized.items() if symbol != "SPY"})
+        closes = pd.DataFrame(
+            {
+                symbol: frame["Close"]
+                for symbol, frame in normalized.items()
+                if symbol in tradable_tickers
+            }
+        )
+        if "SPY" not in market_reference_tickers:
+            raise ValueError("PIT diagnosis requires SPY as a sealed market reference")
         return _PrefetchedPrices(closes=closes, prices=normalized, spy=normalized.get("SPY"))
 
     def _sessions(self, spy: pd.DataFrame | None) -> list[str]:
@@ -395,7 +405,7 @@ class FactCacheBuilder:
         return [session for session in all_sessions if any(partition.start <= session <= partition.end for partition in ranges)]
 
     def _fundamental_states(self, sessions: list[str]) -> dict[str, list[tuple[str, Mapping[str, Any]]]]:
-        symbols = tuple(symbol for symbol in self.bundle.symbols() if symbol != "SPY")
+        symbols = tuple(self.bundle.tradable_symbols())
         bounds = {symbol: (pd.Timestamp(sessions[0]), pd.Timestamp(sessions[-1])) for symbol in symbols}
         result: dict[str, list[tuple[str, Mapping[str, Any]]]] = {symbol: [] for symbol in symbols}
         for symbol, as_of, snapshot in self.bundle.iter_fundamental_state_boundaries(bounds):

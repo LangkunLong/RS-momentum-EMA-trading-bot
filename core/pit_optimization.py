@@ -23,8 +23,20 @@ import pandas as pd
 if TYPE_CHECKING:
     from core.pit_optimizer_controller import (
         PitOptimizerReadiness,
+        PitOptimizerReadinessV4,
         PitOptimizerResult,
+        PitOptimizerResultV4,
         PitOptimizerServices,
+        PitOptimizerServicesV4,
+    )
+    from core.pit_optimization_contract import AuthorSourceFile, PitOptimizerRunManifestV4
+    from core.pit_optimizer_artifacts import SearchCandidateState
+    from core.pit_optimizer_evaluation import (
+        DiscoveryPanelPlan,
+        EvaluationPanelSpec,
+        PanelAggregateSummary,
+        QualificationPanelPlan,
+        QualificationRetirementSnapshot,
     )
 
 from core.pit_optimization_contract import (
@@ -106,6 +118,7 @@ _ENTRY_OUTCOMES = (
 )
 _VERIFICATION_SESSION_COUNT = 60
 _VERIFICATION_SYMBOL_COUNT = 25
+_VERIFICATION_FIRST_DISCOVERY_SESSION = "2021-06-25"
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -268,6 +281,115 @@ class PitOptimizationGateConfig:
             raise ValueError("canary requires the exact readiness SHA-256")
 
 
+@dataclass(frozen=True, slots=True)
+class PitOptimizerGateConfigV4:
+    """Closed CLI configuration for schema-v4 prepare or bounded search."""
+
+    phase: str
+    baseline_run: Path
+    pit_bundle: Path
+    pit_bundle_sha256: str
+    optimizer_manifest: Path
+    optimizer_manifest_sha256: str
+    discovery_panel_plan: Path
+    discovery_panel_plan_sha256: str
+    qualification_panel_plan: Path
+    qualification_panel_plan_sha256: str
+    qualification_ledger: Path
+    qualification_ledger_snapshot_sha256: str
+    readiness_artifact: Path
+    readiness_sha256: str | None
+    campaign_checkpoint: Path | None
+    campaign_checkpoint_sha256: str | None
+    authorization_window_id: str | None
+    authorization_requirement_sha256: str
+    source_transmission_authorized: bool
+    max_api_calls: int
+    max_tokens: int
+    max_iterations: int
+    apply: bool
+    source_root: Path
+    permanent_runtime_root: Path
+    controller_temp_parent: Path
+    artifact_root: Path
+    git_executable: Path
+    docker_executable: Path
+    sandbox_image: str
+
+    def __post_init__(self) -> None:
+        if self.phase not in {"prepare", "canary"}:
+            raise ValueError("optimizer v4 phase must be prepare or canary")
+        for name in (
+            "baseline_run",
+            "pit_bundle",
+            "optimizer_manifest",
+            "discovery_panel_plan",
+            "qualification_panel_plan",
+            "qualification_ledger",
+            "readiness_artifact",
+            "source_root",
+            "permanent_runtime_root",
+            "controller_temp_parent",
+            "artifact_root",
+            "git_executable",
+            "docker_executable",
+        ):
+            path = _absolute_path(getattr(self, name), f"optimizer v4 {name}")
+            object.__setattr__(self, name, path)
+        for name in (
+            "pit_bundle_sha256",
+            "optimizer_manifest_sha256",
+            "discovery_panel_plan_sha256",
+            "qualification_panel_plan_sha256",
+            "qualification_ledger_snapshot_sha256",
+            "authorization_requirement_sha256",
+        ):
+            if _SHA256_RE.fullmatch(getattr(self, name) or "") is None:
+                raise ValueError(f"optimizer v4 {name} is invalid")
+        checkpoint_pair = (
+            self.campaign_checkpoint is not None,
+            self.campaign_checkpoint_sha256 is not None,
+        )
+        if checkpoint_pair[0] != checkpoint_pair[1]:
+            raise ValueError("optimizer v4 checkpoint path and digest must be paired")
+        if self.campaign_checkpoint is not None:
+            object.__setattr__(
+                self,
+                "campaign_checkpoint",
+                _absolute_path(
+                    self.campaign_checkpoint,
+                    "optimizer v4 campaign checkpoint",
+                ),
+            )
+            if _SHA256_RE.fullmatch(self.campaign_checkpoint_sha256 or "") is None:
+                raise ValueError("optimizer v4 campaign checkpoint digest is invalid")
+        if self.phase == "prepare":
+            if (
+                self.readiness_sha256 is not None
+                or self.source_transmission_authorized
+                or self.authorization_window_id is not None
+            ):
+                raise ValueError("optimizer v4 prepare cannot carry live authority")
+        elif (
+            _SHA256_RE.fullmatch(self.readiness_sha256 or "") is None
+            or not isinstance(self.authorization_window_id, str)
+            or not self.authorization_window_id
+            or self.source_transmission_authorized is not True
+        ):
+            raise ValueError("optimizer v4 canary requires readiness and source authority")
+        if (
+            type(self.max_iterations) is not int
+            or self.max_iterations <= 0
+            or self.max_api_calls != 3 * self.max_iterations
+            or type(self.max_tokens) is not int
+            or self.max_tokens <= 0
+            or self.apply is not False
+        ):
+            raise ValueError("optimizer v4 execution bounds are invalid")
+        if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", self.sandbox_image or "") is None:
+            raise ValueError("optimizer v4 sandbox image is not digest pinned")
+
+
 def _numeric_series(frame: pd.DataFrame, field: str, *, positive: bool = False) -> pd.Series:
     if field not in frame:
         raise ValueError(f"frame lacks {field}")
@@ -296,6 +418,39 @@ def _window_frame(
     result = result.loc[(result[date_field] >= start) & (result[date_field] <= end)].copy()
     if result.empty:
         raise ValueError("window contains no observations")
+    return result
+
+
+def production_equity_cagr_pct(
+    starting_equity: float | int,
+    ending_equity: float | int,
+    elapsed_calendar_days: int,
+) -> float:
+    """Return the production portfolio CAGR over exact elapsed calendar days."""
+
+    if (
+        isinstance(starting_equity, bool)
+        or type(starting_equity) not in {int, float}
+        or not math.isfinite(float(starting_equity))
+        or float(starting_equity) <= 0.0
+    ):
+        raise ValueError("starting equity must be finite and positive")
+    if (
+        isinstance(ending_equity, bool)
+        or type(ending_equity) not in {int, float}
+        or not math.isfinite(float(ending_equity))
+        or float(ending_equity) <= 0.0
+    ):
+        raise ValueError("ending equity must be finite and positive")
+    if type(elapsed_calendar_days) is not int or elapsed_calendar_days <= 0:
+        raise ValueError("elapsed calendar days must be a positive integer")
+    result = (
+        (float(ending_equity) / float(starting_equity))
+        ** (365.0 / elapsed_calendar_days)
+        - 1.0
+    ) * 100.0
+    if not math.isfinite(result):
+        raise ValueError("production annualized return is non-finite")
     return result
 
 
@@ -1026,7 +1181,7 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
         or any(
             not isinstance(symbol, str)
             or re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol) is None
-            or symbol == "SPY"
+            or symbol in {"IWM", "QQQ", "SPY"}
             for symbol in symbols
         )
     ):
@@ -1035,7 +1190,10 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
         value.get("benchmark") != "SPY"
         or value.get("warmup_start") != FULL_START_DATE
         or value.get("selection")
-        != "sealed_discovery_activity_then_hash_ranked_active_fill"
+        not in {
+            "sealed_discovery_activity_then_hash_ranked_active_fill",
+            "sealed_active_membership_hash_ranked",
+        }
         or value.get("session_count") != _VERIFICATION_SESSION_COUNT
         or value.get("symbol_count") != _VERIFICATION_SYMBOL_COUNT
     ):
@@ -1046,8 +1204,8 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
         "known_holdout_entry_attempts",
     ):
         count = value.get(field)
-        if type(count) is not int or count < 1:
-            raise ValueError(f"optimization verification {field} must be positive")
+        if type(count) is not int or count < 0:
+            raise ValueError(f"optimization verification {field} must be non-negative")
     if int(value["known_activity_symbols"]) > _VERIFICATION_SYMBOL_COUNT:
         raise ValueError("optimization verification activity symbols exceed the subset")
     try:
@@ -1072,45 +1230,27 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
     return value
 
 
-def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, object]:
-    """Derive a small, active slice solely from authenticated local inputs."""
+def _build_verification_scope(bundle: object, _baseline_run: Path) -> dict[str, object]:
+    """Derive a fixed active-membership panel from the authenticated bundle."""
 
-    attempts_path = _regular_file(
-        baseline_run / "entry_attempt_outcomes.csv", "baseline entry attempts"
-    )
-    attempts = pd.read_csv(attempts_path, dtype=str, keep_default_na=False)
-    expected_columns = {
-        "symbol",
-        "signal_date",
-        "entry_date",
-        "pivot",
-        "buy_zone_lower",
-        "buy_zone_upper",
-        "entry_open",
-        "outcome",
-    }
-    if attempts.empty or set(attempts.columns) != expected_columns:
-        raise ValueError("baseline entry attempts cannot define verification activity")
-    attempts["symbol"] = attempts["symbol"].str.upper()
-    try:
-        attempts["signal_date"] = pd.to_datetime(
-            attempts["signal_date"], errors="raise"
-        ).dt.normalize()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("baseline entry-attempt dates are invalid") from exc
-    first_activity = attempts["signal_date"].min()
     fetch_closes = getattr(bundle, "fetch_closes", None)
     members_at = getattr(bundle, "members_at", None)
-    symbols_method = getattr(bundle, "symbols", None)
-    if not all(callable(value) for value in (fetch_closes, members_at, symbols_method)):
+    tradable_symbols = getattr(bundle, "tradable_symbols", None)
+    reference_symbols = getattr(bundle, "reference_symbols", None)
+    if not all(callable(value) for value in (fetch_closes, members_at, tradable_symbols, reference_symbols)):
         raise ValueError("PIT bundle cannot derive a verification scope")
+    market_reference_tickers = tuple(reference_symbols())
+    if "SPY" not in market_reference_tickers:
+        raise ValueError("PIT bundle lacks SPY as a sealed market reference")
     benchmark = fetch_closes(
         ["SPY"], pd.Timestamp(FULL_START_DATE), pd.Timestamp(FULL_END_DATE)
     )
     if "SPY" not in benchmark:
         raise ValueError("PIT bundle lacks the verification benchmark")
     sessions = pd.DatetimeIndex(benchmark["SPY"].dropna().index).normalize()
-    measurement_sessions = sessions[sessions >= first_activity][
+    measurement_sessions = sessions[
+        sessions >= pd.Timestamp(_VERIFICATION_FIRST_DISCOVERY_SESSION)
+    ][
         : 2 * _VERIFICATION_SESSION_COUNT
     ]
     if len(measurement_sessions) != 2 * _VERIFICATION_SESSION_COUNT:
@@ -1121,24 +1261,8 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
     discovery_end = discovery_sessions[-1]
     holdout_start = holdout_sessions[0]
     holdout_end = holdout_sessions[-1]
-    discovery_attempts = attempts.loc[
-        attempts["signal_date"].between(discovery_start, discovery_end)
-    ]
-    attempt_counts = discovery_attempts.groupby("symbol", sort=True).size()
-    ranked_activity = sorted(
-        (str(symbol) for symbol in attempt_counts.index),
-        key=lambda symbol: (-int(attempt_counts[symbol]), symbol),
-    )
-    active_members = {
-        str(symbol)
-        for symbol in members_at(discovery_start)
-        if str(symbol) != "SPY"
-    }
-    available = {
-        str(symbol)
-        for symbol in symbols_method()
-        if str(symbol) != "SPY"
-    }
+    active_members = {str(symbol) for symbol in members_at(discovery_start)}
+    available = {str(symbol) for symbol in tradable_symbols()}
     candidate_pool = sorted(active_members & available)
     closes = fetch_closes(
         candidate_pool, pd.Timestamp(FULL_START_DATE), holdout_end
@@ -1149,34 +1273,25 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
         for symbol in candidate_pool
         if symbol in closes and int(closes[symbol].count()) >= minimum_warmup_bars
     }
-    if any(symbol not in covered for symbol in ranked_activity):
-        raise ValueError("known verification activity lacks sufficient warm-up prices")
-    fill = sorted(
-        covered - set(ranked_activity),
+    selected = sorted(
+        covered,
         key=lambda symbol: _sha256_bytes(
             f"{PIT_BUNDLE_SHA256}:{symbol}".encode("ascii")
         ),
-    )
-    selected = [*ranked_activity, *fill][:_VERIFICATION_SYMBOL_COUNT]
+    )[:_VERIFICATION_SYMBOL_COUNT]
     if len(selected) != _VERIFICATION_SYMBOL_COUNT:
         raise ValueError("PIT bundle lacks enough covered verification symbols")
-    holdout_attempts = attempts.loc[
-        attempts["signal_date"].between(holdout_start, holdout_end)
-        & attempts["symbol"].isin(selected)
-    ]
-    if holdout_attempts.empty:
-        raise ValueError("verification holdout lacks known strategy activity")
     return _validate_verification_scope(
         {
             "benchmark": "SPY",
             "discovery_end": discovery_end.date().isoformat(),
             "discovery_start": discovery_start.date().isoformat(),
-            "known_activity_symbols": len(ranked_activity),
-            "known_discovery_entry_attempts": int(len(discovery_attempts)),
-            "known_holdout_entry_attempts": int(len(holdout_attempts)),
+            "known_activity_symbols": 0,
+            "known_discovery_entry_attempts": 0,
+            "known_holdout_entry_attempts": 0,
             "holdout_end": holdout_end.date().isoformat(),
             "holdout_start": holdout_start.date().isoformat(),
-            "selection": "sealed_discovery_activity_then_hash_ranked_active_fill",
+            "selection": "sealed_active_membership_hash_ranked",
             "session_count": _VERIFICATION_SESSION_COUNT,
             "symbol_count": _VERIFICATION_SYMBOL_COUNT,
             "symbols": selected,
@@ -2986,7 +3101,7 @@ def evaluate_full_pit_candidate(
     from core.pit_data import PITDataBundle
 
     with PITDataBundle(bundle_path, expected_sha256=pit_bundle_sha256) as bundle:
-        symbols = [symbol for symbol in bundle.symbols() if symbol != "SPY"]
+        symbols = list(bundle.tradable_symbols())
         simulator = PortfolioSimulator(pit_bundle=bundle, signal_every_n_days=1)
         result = simulator.run(
             symbols,
@@ -3078,7 +3193,7 @@ def evaluate_verification_pit_candidate(
 
     with PITDataBundle(bundle_path, expected_sha256=pit_bundle_sha256) as bundle:
         symbols = list(scope["symbols"])
-        if not set(symbols).issubset(set(bundle.symbols()) - {"SPY"}):
+        if not set(symbols).issubset(set(bundle.tradable_symbols())):
             raise ValueError("verification symbols differ from the sealed PIT bundle")
         simulator = PortfolioSimulator(pit_bundle=bundle, signal_every_n_days=1)
         result = simulator.run(
@@ -3340,6 +3455,56 @@ def run_pit_optimizer_v3(
     """Public adapter for the injected schema-v3 incumbent loop."""
 
     from core.pit_optimizer_controller import run_pit_optimizer_v3 as run
+
+    return run(readiness=readiness, services=services)
+
+
+def prepare_pit_optimizer_v4(
+    *,
+    manifest: PitOptimizerRunManifestV4,
+    discovery_panel_plan: DiscoveryPanelPlan,
+    qualification_panel_plan: QualificationPanelPlan,
+    qualification_ledger_snapshot: QualificationRetirementSnapshot,
+    qualification_readiness_head_sha256: str | None = None,
+    baseline_sources: tuple[AuthorSourceFile, ...],
+    artifact_path: Path,
+    evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
+    verify_inputs: Callable[[PitOptimizerRunManifestV4, DiscoveryPanelPlan], None],
+    campaign_checkpoint_path: Path | None = None,
+    campaign_checkpoint_sha256: str | None = None,
+    restore_seed: Callable[
+        [str, Mapping[str, object], Path, DiscoveryPanelPlan], SearchCandidateState
+    ]
+    | None = None,
+) -> PitOptimizerReadinessV4:
+    """Public schema-v4 preparation adapter; it has no provider capability."""
+
+    from core.pit_optimizer_controller import prepare_pit_optimizer_v4 as prepare
+
+    return prepare(
+        manifest=manifest,
+        discovery_panel_plan=discovery_panel_plan,
+        qualification_panel_plan=qualification_panel_plan,
+        qualification_ledger_snapshot=qualification_ledger_snapshot,
+        qualification_readiness_head_sha256=qualification_readiness_head_sha256,
+        baseline_sources=baseline_sources,
+        artifact_path=artifact_path,
+        evaluate_baseline=evaluate_baseline,
+        verify_inputs=verify_inputs,
+        campaign_checkpoint_path=campaign_checkpoint_path,
+        campaign_checkpoint_sha256=campaign_checkpoint_sha256,
+        restore_seed=restore_seed,
+    )
+
+
+def run_pit_optimizer_v4(
+    *,
+    readiness: PitOptimizerReadinessV4,
+    services: PitOptimizerServicesV4,
+) -> PitOptimizerResultV4:
+    """Public adapter for the bounded schema-v4 champion/branch loop."""
+
+    from core.pit_optimizer_controller import run_pit_optimizer_v4 as run
 
     return run(readiness=readiness, services=services)
 

@@ -1,0 +1,3 @@
+core/strategy_policy/entry.py text eol=lf
+core/strategy_policy/risk.py text eol=lf
+core/strategy_policy/exit.py text eol=lf

@@ -34,7 +34,12 @@ from core.pit_optimization_contract import (
     _pit_optimizer_manifest_from_primitive,
     render_worst_iteration_two_role_inputs,
 )
-from core.pit_optimizer_artifacts import canonical_json_bytes, write_create_only_json
+from core.pit_optimizer_artifacts import (
+    CampaignCheckpoint,
+    SearchCandidateState,
+    canonical_json_bytes,
+    write_create_only_json,
+)
 from core.pit_optimizer_authorization import (
     AuthorizationRunLease,
     OptimizerPricingSnapshot,
@@ -43,15 +48,16 @@ from core.pit_optimizer_authorization import (
 )
 from core.pit_optimizer_candidate import (
     CandidateIdentity,
+    CandidateIdentityV4,
     build_policy_source_bundle,
     require_source_context_fit,
-    validate_author_manifest,
     validate_candidate_identity,
 )
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
     DeterminismAttestation,
     DiscoveryEvaluation,
+    DiscoveryScore,
     FoldAggregateSummary,
     HiddenEvaluation,
     HiddenEvaluationAttestation,
@@ -71,6 +77,38 @@ from core.pit_policy_parity import (
     ParityEquityPoint,
     ParityFoldEvidence,
     ParityTransaction,
+)
+
+from core.pit_optimization_contract import (
+    AuthorArtifactV4,
+    AuthorInputV4,
+    AuthorManifestSummaryV4,
+    AuthorSourceFile,
+    CandidateValidationStatusV4,
+    CriticArtifactV4,
+    CriticInputV4,
+    InvestigatorArtifactV4,
+    InvestigatorInputV4,
+    PitOptimizerRunManifestV4,
+    PriorHypothesisSummaryV4,
+    RoleContextBudgetExceeded,
+    RoleOutputInvalidSummary,
+    SelectedParentIdentity,
+    SelectedParentSummary,
+    TargetProgressV4,
+)
+from core.pit_optimizer_authorization import (
+    AuthorizationPlanSkip,
+    PitOptimizerRoleAttempt,
+)
+from core.pit_optimizer_evaluation import (
+    AnnualizedReturnTarget,
+    DiscoveryPanelPlan,
+    EvaluationPanelSpec,
+    PanelAggregateSummary,
+    QualificationPanelPlan,
+    QualificationRetirementSnapshot,
+    _panel_plan_pair_is_consistent,
 )
 
 
@@ -363,6 +401,14 @@ class _RunState:
     provider_enabled: bool
     pricing_snapshot: OptimizerPricingSnapshot | None
     authorization_lease: AuthorizationRunLease | None
+    baseline_quick: PanelAggregateSummary | None = None
+    baseline_discovery_v4: PanelAggregateSummary | None = None
+    champion: SearchCandidateState | None = None
+    active_branch: SearchCandidateState | None = None
+    selected_parent: SelectedParentIdentity | None = None
+    call_attempts: list[PitOptimizerRoleAttempt] = field(default_factory=list)
+    skips: list[AuthorizationPlanSkip] = field(default_factory=list)
+    feedback_tail: list[PriorHypothesisSummaryV4] = field(default_factory=list)
     artifact_paths: list[tuple[Path, str]] = field(default_factory=list)
     artifact_root: Path | None = None
     call_records: list[PitOptimizerRoleCall] = field(default_factory=list)
@@ -402,6 +448,10 @@ class ProviderProtocolFailure(RuntimeError):
     pass
 
 
+class ProviderCallNotStarted(RuntimeError):
+    """A locally rejected role input that never reached provider reservation."""
+
+
 class ProviderAccountingFailure(RuntimeError):
     pass
 
@@ -420,6 +470,16 @@ class IdentityDrift(RuntimeError):
 
 class SandboxIntegrityFailure(RuntimeError):
     pass
+
+
+class CandidateEvaluationFailure(RuntimeError):
+    """A candidate-scoped discovery failure that remains safe for critic feedback."""
+
+    def __init__(self, failure_code: str) -> None:
+        if failure_code not in {"worker_failed", "replay_failed"}:
+            raise ValueError("candidate evaluation failure code is invalid")
+        super().__init__(failure_code)
+        self.failure_code = failure_code
 
 
 class EvidenceTampering(RuntimeError):
@@ -711,6 +771,18 @@ def _provider_seed_from_baseline(
             RuleSummaryRecord(
                 "attested.entry_funnel",
                 "Attested discovery entry metrics: " + ", ".join(entry_ids) + ".",
+            ),
+            RuleSummaryRecord(
+                "attested.entry_blockers",
+                "technical_block_* counts are precomputed technical gates; entry_block_* counts are final policy blockers.",
+            ),
+            RuleSummaryRecord(
+                "attested.entry_intersection",
+                "A buy requires every retained blocker to clear; relax blockers selectively from raw EntrySnapshot facts.",
+            ),
+            RuleSummaryRecord(
+                "attested.market_gate",
+                "When market_pass equals evaluated_rows, market permission is not the entry bottleneck.",
             ),
             RuleSummaryRecord(
                 "attested.exit_attribution",
@@ -1197,6 +1269,10 @@ def _call_role(
             state.authorization_lease,
             state.pricing_snapshot,
         )
+    except ProviderCallNotStarted as exc:
+        raise ProviderProtocolFailure(
+            "provider role input failed local provenance validation"
+        ) from exc
     except BaseException:
         facts = services.recover_role_attempt(plan, state.authorization_lease)
         _record_provider_attempt(
@@ -1381,6 +1457,8 @@ def _run_author(
             raw,
             max_diff_bytes=readiness.manifest.candidate_bounds.max_diff_bytes,
             max_total_bytes=plan.max_response_bytes,
+            controller_paths=investigator.payload.target_paths,
+            controller_symbols=investigator.payload.target_symbols,
         ),
     )
     _record_artifact(
@@ -1451,10 +1529,9 @@ def _validate_iteration_candidate(
         if outcome.failure_code is not None or outcome.identity is None:
             raise SandboxIntegrityFailure("valid candidate outcome is inconsistent")
         _require_identity_graph(readiness, outcome)
-        try:
-            validate_author_manifest(author.payload, outcome.identity)  # type: ignore[arg-type]
-        except ValueError as exc:
-            raise IdentityDrift("author manifest differs from candidate identity") from exc
+        # Candidate identity is derived from the authenticated Git state, not
+        # from advisory fields echoed by the author response.  Once that
+        # identity graph is valid, the controller-owned manifest is exact.
         author_manifest_matches = True
         try:
             prospective_bundle = build_policy_source_bundle(
@@ -1540,6 +1617,16 @@ def _score_primitive(score: object) -> dict[str, object]:
     }
 
 
+def _unrankable_incumbent_score() -> DiscoveryScore:
+    """Return the neutral starting objective for a zero-trade baseline."""
+
+    return DiscoveryScore(
+        median_excess_return_pp=Decimal("0.00"),
+        worst_excess_return_pp=Decimal("0.00"),
+        max_drawdown_magnitude_pp=Decimal("0.00"),
+    )
+
+
 def _evaluate_iteration_candidate(
     readiness: PitOptimizerReadiness,
     state: _RunState,
@@ -1550,7 +1637,31 @@ def _evaluate_iteration_candidate(
         return None
     if state.iteration_workspace is None or validation.identity is None:
         raise SandboxIntegrityFailure("valid candidate evaluation workspace is absent")
-    supplied = services.evaluate_discovery(state.iteration_workspace, validation.identity)
+    try:
+        supplied = services.evaluate_discovery(
+            state.iteration_workspace,
+            validation.identity,
+        )
+    except CandidateEvaluationFailure as exc:
+        state.evaluation_failure_code = exc.failure_code
+        _record_artifact(
+            state,
+            services.write_json_artifact(
+                _iteration_name(state, "discovery.json"),
+                {
+                    "schema_version": 3,
+                    "failure_code": exc.failure_code,
+                    "fixed_baseline_comparison": None,
+                    "incumbent_diagnostics": None,
+                    "rankable": False,
+                    "strictly_improves_incumbent": False,
+                    "folds": [],
+                    "engine_policy_sha256": readiness.manifest.effective_policy_sha256,
+                    "candidate_identity_sha256": validation.identity.identity_sha256,
+                },
+            ),
+        )
+        return None
     if not isinstance(supplied, DiscoveryEvaluation):
         raise EvidenceTampering("discovery evaluation is not closed")
     manifest = readiness.manifest
@@ -1561,7 +1672,7 @@ def _evaluate_iteration_candidate(
     ):
         raise IdentityDrift("discovery evaluation identity differs")
     candidate_folds = tuple(item.aggregate_metrics for item in supplied.folds)
-    if any(item.closed_trades < 1 for item in candidate_folds):
+    if sum(item.closed_trades for item in candidate_folds) < 1:
         if (
             supplied.comparison.rankable
             or supplied.comparison.strictly_improves_incumbent
@@ -1591,7 +1702,11 @@ def _evaluate_iteration_candidate(
                 },
             ),
         )
-        return None
+        # The candidate is ineligible for selection, but its aggregate folds are
+        # still the critic's only evidence for why tradeability disappeared.
+        # Preserve the unrankable evaluation for feedback while the decision
+        # path continues to require rankable=True before any acceptance.
+        return supplied
     baseline_folds = readiness.baseline_discovery.folds
     baseline_sha256 = _folds_digest(baseline_folds)
     try:
@@ -1611,11 +1726,15 @@ def _evaluate_iteration_candidate(
         )
         incumbent_score = state.incumbent_discovery.score
         if incumbent_score is None:
-            incumbent_score = discovery_score_from_folds(
-                baseline_folds,
-                baseline_folds,
-                original_baseline_sha256=baseline_sha256,
-                expected_original_baseline_sha256=baseline_sha256,
+            incumbent_score = (
+                _unrankable_incumbent_score()
+                if sum(item.closed_trades for item in incumbent_folds) < 1
+                else discovery_score_from_folds(
+                    baseline_folds,
+                    baseline_folds,
+                    original_baseline_sha256=baseline_sha256,
+                    expected_original_baseline_sha256=baseline_sha256,
+                )
             )
     except ValueError as exc:
         raise EvidenceTampering("discovery fixed-baseline objective is invalid") from exc
@@ -1686,8 +1805,47 @@ def _validation_summary(
     return CandidateValidationSummary(code, *_VALIDATION_FAILURE_FLAGS[code])
 
 
+_FEEDBACK_FUNNEL_IDS = frozenset(
+    {
+        "evaluated_rows",
+        "buy_signal_count",
+        "market_pass",
+        "breakout_pass",
+        "volume_surge_pass",
+        "buy_zone_pass",
+        "technical_score_pass",
+    }
+)
+
+
+def _bounded_feedback_folds(
+    candidate_folds: tuple[FoldAggregateSummary, ...],
+    comparison_folds: tuple[FoldAggregateSummary, ...],
+) -> tuple[FoldAggregateSummary, ...]:
+    """Keep core funnel stages plus every metric changed by the candidate."""
+
+    bounded: list[FoldAggregateSummary] = []
+    for candidate, comparison in zip(
+        candidate_folds,
+        comparison_folds,
+        strict=True,
+    ):
+        comparison_metrics = {
+            metric.metric_id: metric.value for metric in comparison.entry_funnel
+        }
+        selected = tuple(
+            metric
+            for metric in candidate.entry_funnel
+            if metric.metric_id in _FEEDBACK_FUNNEL_IDS
+            or comparison_metrics.get(metric.metric_id) != metric.value
+        )
+        bounded.append(replace(candidate, entry_funnel=selected))
+    return tuple(bounded)
+
+
 def _critic_comparison(
     discovery: DiscoveryEvaluation,
+    comparison_folds: tuple[FoldAggregateSummary, ...],
     *,
     fixed: bool,
 ) -> CandidateComparisonSummary:
@@ -1697,7 +1855,10 @@ def _critic_comparison(
         else discovery.comparison.candidate_vs_incumbent_diagnostics
     )
     return CandidateComparisonSummary(
-        folds=tuple(item.aggregate_metrics for item in discovery.folds),
+        folds=_bounded_feedback_folds(
+            tuple(item.aggregate_metrics for item in discovery.folds),
+            comparison_folds,
+        ),
         score=score,
         diagnostics=(),
         _controller_seal=_CANDIDATE_COMPARISON_SEAL,
@@ -1718,6 +1879,11 @@ def _run_critic(
         AuthorArtifact,
     ):
         raise ProviderProtocolFailure("critic predecessors are invalid")
+    # Critic provenance binds to this iteration's incremental author action.
+    # The cumulative candidate identity is authenticated separately by the
+    # validation outcome and may include files changed by earlier incumbents.
+    changed_paths = author.payload.changed_paths
+    changed_symbols = author.payload.changed_symbols
     role_input = CriticInput(
         schema_version=2,
         iteration=state.next_iteration,
@@ -1726,17 +1892,29 @@ def _run_critic(
         hypothesis_id=investigator.payload.hypothesis_id,
         investigator_summary=investigator.payload,
         author_manifest=AuthorManifestSummary(
-            hypothesis_id=author.payload.hypothesis_id,
+            hypothesis_id=investigator.payload.hypothesis_id,
             behavioral_summary=author.payload.behavioral_summary,
-            changed_paths=author.payload.changed_paths,
-            changed_symbols=author.payload.changed_symbols,
+            changed_paths=changed_paths,
+            changed_symbols=changed_symbols,
         ),
         validation=_validation_summary(validation, state.evaluation_failure_code),
         candidate_vs_baseline=(
-            None if discovery is None else _critic_comparison(discovery, fixed=True)
+            None
+            if discovery is None
+            else _critic_comparison(
+                discovery,
+                readiness.baseline_discovery.folds,
+                fixed=True,
+            )
         ),
         candidate_vs_incumbent=(
-            None if discovery is None else _critic_comparison(discovery, fixed=False)
+            None
+            if discovery is None
+            else _critic_comparison(
+                discovery,
+                state.incumbent_discovery.folds,
+                fixed=False,
+            )
         ),
     )
     plan = _plan_for(readiness, state, "critic")
@@ -1907,6 +2085,14 @@ def _persist_iteration_decision(
                 "valid"
                 if validation.valid and rankable
                 else validation.failure_code or "unrankable"
+            )
+        ),
+        candidate_folds=(
+            ()
+            if discovery is None
+            else _bounded_feedback_folds(
+                tuple(item.aggregate_metrics for item in discovery.folds),
+                readiness.baseline_discovery.folds,
             )
         ),
         discovery_score=score if rankable else None,
@@ -2089,7 +2275,7 @@ def _terminal_from_exception(exc: BaseException) -> tuple[str, str | None]:
         (SandboxIntegrityFailure, "sandbox_integrity_failure"),
         (EvidenceTampering, "evidence_tampering"),
     )
-    if isinstance(exc, ContextBudgetExhausted):
+    if isinstance(exc, (ContextBudgetExhausted, RoleContextBudgetExceeded)):
         return "budget_exhausted", "context_budget_exhausted"
     if isinstance(exc, KeyboardInterrupt):
         return "cancelled", None
@@ -2590,3 +2776,1614 @@ def run_pit_optimizer_v3(
         terminal_code, terminal_detail = _terminal_from_exception(exc)
         state.terminal_detail = terminal_detail
     return _finalize_result(readiness, state, services, terminal_code)
+
+
+# Schema v4 deliberately lives beside the read-only v3 audit path.  It does not
+# reuse v3 fold ranking or hidden-validation state.
+
+
+@dataclass(frozen=True, slots=True)
+class PitOptimizerReadinessV4:
+    schema_version: int
+    manifest: PitOptimizerRunManifestV4
+    discovery_panel_plan: DiscoveryPanelPlan
+    qualification_panel_plan: QualificationPanelPlan
+    qualification_ledger_head_sha256: str
+    readiness_sha256: str
+    artifact_path: Path
+    baseline_sources: tuple[AuthorSourceFile, ...]
+    baseline_quick: PanelAggregateSummary
+    baseline_discovery: PanelAggregateSummary
+    seed_champion: SearchCandidateState | None = None
+    seed_active_branch: SearchCandidateState | None = None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 4:
+            raise ValueError("optimizer v4 readiness schema is unsupported")
+        if not isinstance(self.manifest, PitOptimizerRunManifestV4):
+            raise ValueError("optimizer v4 readiness manifest is invalid")
+        if not isinstance(self.discovery_panel_plan, DiscoveryPanelPlan):
+            raise ValueError("optimizer v4 readiness panel plan is invalid")
+        self.manifest.validate_discovery_plan(self.discovery_panel_plan)
+        if not isinstance(self.qualification_panel_plan, QualificationPanelPlan):
+            raise ValueError("optimizer v4 readiness qualification plan is invalid")
+        _panel_plan_pair_is_consistent(
+            self.qualification_panel_plan,
+            self.discovery_panel_plan,
+        )
+        if (
+            not isinstance(self.artifact_path, Path)
+            or not self.artifact_path.is_absolute()
+            or len(self.readiness_sha256) != 64
+            or len(self.qualification_ledger_head_sha256) != 64
+        ):
+            raise ValueError("optimizer v4 readiness artifact is invalid")
+        baseline_identity = SelectedParentIdentity.issue(
+            parent_kind="baseline",
+            parent_id="baseline_policy",
+            source_head=self.manifest.source_head,
+            policy_sources=self.baseline_sources,
+        )
+        baseline_identity.validate_sources(self.baseline_sources)
+        expected_hashes = tuple(
+            (item.path, item.source_sha256) for item in self.baseline_sources
+        )
+        if (
+            expected_hashes
+            != self.manifest.policy_authoring_scope.initial_policy_source_sha256s
+            or self.baseline_quick.panel_id != "quick"
+            or self.baseline_quick.panel_sha256 != self.manifest.quick_panel_sha256
+            or self.baseline_discovery.panel_id != "discovery"
+            or self.baseline_discovery.panel_sha256
+            != self.manifest.discovery_panel_sha256
+        ):
+            raise ValueError("optimizer v4 readiness baseline differs")
+        for candidate in (self.seed_champion, self.seed_active_branch):
+            if candidate is not None and (
+                not isinstance(candidate, SearchCandidateState)
+                or candidate.candidate_identity.source_commit
+                != self.manifest.source_head
+                or candidate.candidate_identity.discovery_panel_plan_sha256
+                != self.manifest.discovery_panel_plan_sha256
+                or candidate.discovery_evidence.panel_sha256
+                != self.manifest.discovery_panel_sha256
+                or candidate.quick_evidence is None
+                or candidate.quick_evidence.panel_sha256
+                != self.manifest.quick_panel_sha256
+            ):
+                raise ValueError("optimizer v4 resumed candidate was not reminted")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateParentV4:
+    workspace: CandidateWorkspace
+    cumulative_diff: str
+    policy_sources: tuple[AuthorSourceFile, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.workspace, CandidateWorkspace):
+            raise ValueError("optimizer v4 parent workspace is invalid")
+        if not isinstance(self.cumulative_diff, str) or "\x00" in self.cumulative_diff:
+            raise ValueError("optimizer v4 parent diff is invalid")
+        if type(self.policy_sources) is not tuple or len(self.policy_sources) != 3:
+            raise ValueError("optimizer v4 parent sources are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateValidationOutcomeV4:
+    valid: bool
+    failure_code: str | None
+    cumulative_diff: str
+    identity: CandidateIdentityV4 | None
+
+    def __post_init__(self) -> None:
+        if type(self.valid) is not bool or not isinstance(self.cumulative_diff, str):
+            raise ValueError("optimizer v4 candidate validation is invalid")
+        if self.valid != (self.identity is not None):
+            raise ValueError("optimizer v4 candidate validation identity differs")
+        if self.valid:
+            if self.failure_code is not None or not isinstance(
+                self.identity, CandidateIdentityV4
+            ):
+                raise ValueError("optimizer v4 valid candidate is inconsistent")
+        elif not isinstance(self.failure_code, str) or not self.failure_code:
+            raise ValueError("optimizer v4 invalid candidate lacks a failure code")
+
+
+@dataclass(frozen=True, slots=True)
+class PitOptimizerServicesV4:
+    call_role: Callable[
+        [
+            PitOptimizerCallBudget,
+            InvestigatorInputV4 | AuthorInputV4 | CriticInputV4,
+            Callable[[str], object],
+        ],
+        PitOptimizerRoleAttempt,
+    ]
+    materialize_parent: Callable[
+        [str, SearchCandidateState | None], CandidateParentV4
+    ]
+    validate_and_apply: Callable[
+        [CandidateWorkspace, AuthorArtifactV4, SelectedParentIdentity],
+        CandidateValidationOutcomeV4,
+    ]
+    evaluate_candidate: Callable[
+        [CandidateWorkspace, CandidateIdentityV4, EvaluationPanelSpec],
+        PanelAggregateSummary,
+    ]
+    dispose_candidate: Callable[[CandidateWorkspace], PitOptimizerCleanup]
+    settle_invalid_investigator: Callable[
+        [PitOptimizerCallBudget, tuple[PitOptimizerCallBudget, ...]],
+        tuple[AuthorizationPlanSkip, ...],
+    ]
+    verify_inputs: Callable[[PitOptimizerReadinessV4], None]
+    cancellation_requested: Callable[[], bool]
+    prepare_iteration_artifacts: Callable[[int], Path]
+    write_json_artifact: Callable[[str, Mapping[str, object]], tuple[Path, str]]
+    write_diff_artifact: Callable[[str, str], tuple[Path, str]]
+    finalize_run: Callable[
+        [tuple[PitOptimizerRoleAttempt, ...], tuple[AuthorizationPlanSkip, ...], str],
+        None,
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class PitOptimizerResultV4:
+    schema_version: int
+    status: str
+    terminal_code: str
+    campaign_id: str
+    target_cagr_pct: str
+    baseline_cagr_pct: str
+    champion_cagr_pct: str
+    branch_cagr_pct: str | None
+    iterations_started: int
+    iterations_completed: int
+    calls: int
+    tokens: int
+    cost_usd: str
+    checkpoint_present: bool
+    apply: bool
+    cleanup_complete: bool
+    source_modified: bool
+    checkpoint: CampaignCheckpoint | None
+    artifact_paths: tuple[tuple[Path, str], ...]
+
+    def to_public_artifact(self) -> Mapping[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "status": self.status,
+            "terminal_reason": self.terminal_code,
+            "campaign_id": self.campaign_id,
+            "target_cagr_pct": self.target_cagr_pct,
+            "baseline_cagr_pct": self.baseline_cagr_pct,
+            "champion_cagr_pct": self.champion_cagr_pct,
+            "branch_cagr_pct": self.branch_cagr_pct,
+            "iterations": {
+                "started": self.iterations_started,
+                "completed": self.iterations_completed,
+            },
+            "accounting": {
+                "calls": self.calls,
+                "tokens": self.tokens,
+                "cost_usd": self.cost_usd,
+            },
+            "checkpoint_present": self.checkpoint_present,
+            "apply": self.apply,
+            "cleanup": {
+                "complete": self.cleanup_complete,
+                "source_modified": self.source_modified,
+            },
+        }
+
+
+def _panel_v4_artifact(value: PanelAggregateSummary) -> dict[str, object]:
+    primitive = asdict(value)
+    primitive["portfolio_annualized_return_pct"] = format(
+        value.portfolio_annualized_return_pct,
+        "f",
+    )
+    return primitive
+
+
+def _target_v4_artifact(value: AnnualizedReturnTarget) -> dict[str, object]:
+    primitive = asdict(value)
+    primitive["target_pct"] = format(primitive["target_pct"], "f")
+    primitive["milestones_pct"] = [
+        format(item, "f") for item in primitive["milestones_pct"]
+    ]
+    primitive["precision_pct"] = format(primitive["precision_pct"], "f")
+    return primitive
+
+
+def _read_checkpoint_primitive(path: Path, expected_sha256: str) -> Mapping[str, object]:
+    candidate = Path(path)
+    if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_file():
+        raise ValueError("campaign checkpoint must be an absolute regular file")
+    if len(expected_sha256) != 64:
+        raise ValueError("campaign checkpoint SHA-256 is invalid")
+    raw = candidate.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("campaign checkpoint digest differs")
+    try:
+        primitive = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("campaign checkpoint is invalid JSON") from exc
+    if (
+        not isinstance(primitive, dict)
+        or raw != canonical_json_bytes(primitive)
+        or primitive.get("schema_version") != 4
+        or primitive.get("artifact_type") != "campaign_checkpoint"
+    ):
+        raise ValueError("campaign checkpoint is not canonical schema v4")
+    return primitive
+
+
+def prepare_pit_optimizer_v4(
+    *,
+    manifest: PitOptimizerRunManifestV4,
+    discovery_panel_plan: DiscoveryPanelPlan,
+    qualification_panel_plan: QualificationPanelPlan,
+    qualification_ledger_snapshot: QualificationRetirementSnapshot,
+    qualification_readiness_head_sha256: str | None = None,
+    baseline_sources: tuple[AuthorSourceFile, ...],
+    artifact_path: Path,
+    evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
+    verify_inputs: Callable[[PitOptimizerRunManifestV4, DiscoveryPanelPlan], None],
+    campaign_checkpoint_path: Path | None = None,
+    campaign_checkpoint_sha256: str | None = None,
+    restore_seed: Callable[
+        [str, Mapping[str, object], Path, DiscoveryPanelPlan], SearchCandidateState
+    ]
+    | None = None,
+) -> PitOptimizerReadinessV4:
+    """Evaluate the unchanged policy on the exact quick/discovery panels."""
+
+    if not isinstance(manifest, PitOptimizerRunManifestV4):
+        raise ValueError("optimizer v4 manifest is invalid")
+    manifest.validate_discovery_plan(discovery_panel_plan)
+    _panel_plan_pair_is_consistent(
+        qualification_panel_plan,
+        discovery_panel_plan,
+    )
+    if (
+        not isinstance(
+            qualification_ledger_snapshot,
+            QualificationRetirementSnapshot,
+        )
+        or qualification_ledger_snapshot.qualification_retirement_domain_id
+        != discovery_panel_plan.qualification_retirement_domain_id
+    ):
+        raise ValueError("optimizer v4 qualification ledger snapshot differs")
+    retired = frozenset(
+        qualification_ledger_snapshot.retired_security_lineage_ids
+    )
+    committed_lineages = {
+        item.security_lineage_id
+        for panel in (
+            discovery_panel_plan.quick_panel,
+            discovery_panel_plan.discovery_panel,
+            qualification_panel_plan.qualification_panel,
+        )
+        for item in panel.lineages
+    }
+    if retired.intersection(committed_lineages):
+        raise ValueError("optimizer v4 panel contains a retired lineage")
+    readiness_ledger_head = (
+        qualification_ledger_snapshot.ledger_head_sha256
+        if qualification_readiness_head_sha256 is None
+        else qualification_readiness_head_sha256
+    )
+    if (
+        not isinstance(readiness_ledger_head, str)
+        or len(readiness_ledger_head) != 64
+    ):
+        raise ValueError("optimizer v4 readiness ledger head is invalid")
+    verify_inputs(manifest, discovery_panel_plan)
+    baseline_identity = SelectedParentIdentity.issue(
+        parent_kind="baseline",
+        parent_id="baseline_policy",
+        source_head=manifest.source_head,
+        policy_sources=baseline_sources,
+    )
+    baseline_identity.validate_sources(baseline_sources)
+    quick = evaluate_baseline(discovery_panel_plan.quick_panel)
+    discovery = evaluate_baseline(discovery_panel_plan.discovery_panel)
+    if (
+        quick.panel_id != "quick"
+        or quick.panel_sha256 != manifest.quick_panel_sha256
+        or discovery.panel_id != "discovery"
+        or discovery.panel_sha256 != manifest.discovery_panel_sha256
+    ):
+        raise ValueError("optimizer v4 baseline evidence differs from exact panels")
+
+    checkpoint_supplied = campaign_checkpoint_path is not None
+    if checkpoint_supplied != (campaign_checkpoint_sha256 is not None):
+        raise ValueError("campaign checkpoint path and digest must be supplied together")
+    if manifest.seed_checkpoint_sha256 != campaign_checkpoint_sha256:
+        raise ValueError("optimizer v4 manifest seed checkpoint differs")
+    champion = None
+    branch = None
+    if campaign_checkpoint_path is not None:
+        primitive = _read_checkpoint_primitive(
+            campaign_checkpoint_path,
+            campaign_checkpoint_sha256 or "",
+        )
+        if restore_seed is None:
+            raise ValueError("campaign checkpoint restore capability is absent")
+        for kind, key in (("champion", "champion"), ("branch", "active_branch")):
+            candidate = primitive.get(key)
+            if candidate is None:
+                continue
+            if not isinstance(candidate, Mapping):
+                raise ValueError("campaign checkpoint candidate state is invalid")
+            restored = restore_seed(
+                kind,
+                candidate,
+                campaign_checkpoint_path.parent,
+                discovery_panel_plan,
+            )
+            if (
+                restored.candidate_identity.source_commit != manifest.source_head
+                or restored.candidate_identity.discovery_panel_plan_sha256
+                != manifest.discovery_panel_plan_sha256
+                or restored.discovery_evidence.panel_sha256
+                != manifest.discovery_panel_sha256
+                or restored.quick_evidence is None
+                or restored.quick_evidence.panel_sha256 != manifest.quick_panel_sha256
+            ):
+                raise ValueError("restored checkpoint candidate was not reminted and reevaluated")
+            if kind == "champion":
+                champion = restored
+            else:
+                branch = restored
+
+    primitive = {
+        "schema_version": 4,
+        "artifact_type": "optimizer_readiness",
+        "manifest_sha256": manifest.sha256,
+        "discovery_panel_plan_sha256": discovery_panel_plan.sha256,
+        "qualification_panel_plan_sha256": qualification_panel_plan.sha256,
+        "qualification_ledger_head_sha256": (
+            readiness_ledger_head
+        ),
+        "baseline_source_sha256s": [
+            [item.path, item.source_sha256] for item in baseline_sources
+        ],
+        "baseline_quick": _panel_v4_artifact(quick),
+        "baseline_discovery": _panel_v4_artifact(discovery),
+        "seed_checkpoint_sha256": campaign_checkpoint_sha256,
+        "seed_champion_identity": (
+            None if champion is None else champion.candidate_identity.identity_sha256
+        ),
+        "seed_branch_identity": (
+            None if branch is None else branch.candidate_identity.identity_sha256
+        ),
+    }
+    try:
+        output, digest = write_create_only_json(Path(artifact_path), primitive)
+    except FileExistsError:
+        output = Path(artifact_path)
+        raw = output.read_bytes()
+        if raw != canonical_json_bytes(primitive):
+            raise ValueError("optimizer v4 readiness artifact differs") from None
+        digest = hashlib.sha256(raw).hexdigest()
+    return PitOptimizerReadinessV4(
+        schema_version=4,
+        manifest=manifest,
+        discovery_panel_plan=discovery_panel_plan,
+        qualification_panel_plan=qualification_panel_plan,
+        qualification_ledger_head_sha256=(
+            readiness_ledger_head
+        ),
+        readiness_sha256=digest,
+        artifact_path=output,
+        baseline_sources=baseline_sources,
+        baseline_quick=quick,
+        baseline_discovery=discovery,
+        seed_champion=champion,
+        seed_active_branch=branch,
+    )
+
+
+@dataclass(slots=True)
+class _V4RunState:
+    champion: SearchCandidateState | None
+    active_branch: SearchCandidateState | None
+    feedback_tail: list[PriorHypothesisSummaryV4]
+    selected_parent: SelectedParentIdentity | None = None
+    call_attempts: list[PitOptimizerRoleAttempt] = field(default_factory=list)
+    skips: list[AuthorizationPlanSkip] = field(default_factory=list)
+    artifact_paths: list[tuple[Path, str]] = field(default_factory=list)
+    iterations_started: int = 0
+    iterations_completed: int = 0
+    cleanup_observations: list[PitOptimizerCleanup] = field(default_factory=list)
+
+
+def _v4_plan(
+    readiness: PitOptimizerReadinessV4,
+    *,
+    iteration: int,
+    role: str,
+) -> PitOptimizerCallBudget:
+    role_offset = {"investigator": 1, "author": 2, "critic": 3}[role]
+    call_index = (iteration - 1) * 3 + role_offset
+    plans = readiness.manifest.call_budgets
+    if call_index > len(plans):
+        raise AuthorizationExhausted("optimizer v4 call plan is exhausted")
+    plan = plans[call_index - 1]
+    if (plan.call_index, plan.iteration, plan.role) != (
+        call_index,
+        iteration,
+        role,
+    ):
+        raise AuthorizationExhausted("optimizer v4 plan slot differs")
+    return plan
+
+
+def _record_v4_artifact(
+    state: _V4RunState,
+    artifact: tuple[Path, str],
+) -> tuple[Path, str]:
+    path, digest = artifact
+    if not isinstance(path, Path) or not path.is_absolute() or len(digest) != 64:
+        raise AuditFailure("optimizer v4 artifact writer returned invalid evidence")
+    state.artifact_paths.append((path, digest))
+    return path, digest
+
+
+def _v4_attempt_artifact(attempt: PitOptimizerRoleAttempt) -> dict[str, object]:
+    payload = attempt.payload
+    return {
+        "schema_version": 4,
+        "artifact_type": (
+            "role_output_invalid" if payload is None else "role_output"
+        ),
+        "plan": attempt.plan.to_primitive(),
+        "provider_facts": asdict(attempt.facts),
+        "payload": None if payload is None else payload.to_primitive(),
+    }
+
+
+def _write_v4_attempt(
+    *,
+    state: _V4RunState,
+    services: PitOptimizerServicesV4,
+    attempt: PitOptimizerRoleAttempt,
+) -> None:
+    state.call_attempts.append(attempt)
+    suffix = (
+        f"{attempt.plan.role}_output_invalid.json"
+        if attempt.payload is None
+        else f"{attempt.plan.role}.json"
+    )
+    _record_v4_artifact(
+        state,
+        services.write_json_artifact(
+            f"iterations/{attempt.plan.iteration:03d}/{suffix}",
+            _v4_attempt_artifact(attempt),
+        ),
+    )
+    _record_v4_artifact(
+        state,
+        services.write_json_artifact(
+            "accounting.json",
+            _v4_accounting_artifact(state),
+        ),
+    )
+
+
+def _v4_accounting_artifact(state: _V4RunState) -> dict[str, object]:
+    facts = tuple(attempt.facts for attempt in state.call_attempts)
+    return {
+        "schema_version": 4,
+        "artifact_type": "optimizer_accounting",
+        "attempts": [
+            {
+                "call_index": attempt.plan.call_index,
+                "iteration": attempt.plan.iteration,
+                "role": attempt.plan.role,
+                "outcome": attempt.facts.outcome,
+                "request_started": attempt.facts.request_started,
+                "accounting_complete": attempt.facts.accounting_complete,
+                "prompt_tokens": attempt.facts.prompt_tokens,
+                "completion_tokens": attempt.facts.completion_tokens,
+                "total_tokens": attempt.facts.total_tokens,
+                "cost_usd": attempt.facts.cost_usd,
+            }
+            for attempt in state.call_attempts
+        ],
+        "skips": [skip.to_record() for skip in state.skips],
+        "totals": {
+            "calls": sum(1 for item in facts if item.request_started),
+            "prompt_tokens": sum(item.prompt_tokens or 0 for item in facts),
+            "completion_tokens": sum(item.completion_tokens or 0 for item in facts),
+            "total_tokens": sum(item.total_tokens or 0 for item in facts),
+            "cost_usd": format(
+                sum(
+                    (
+                        Decimal(str(item.cost_usd or 0))
+                        for item in facts
+                        if item.accounting_complete
+                    ),
+                    Decimal("0"),
+                ),
+                "f",
+            ),
+        },
+        "accounting_complete": all(item.accounting_complete for item in facts),
+    }
+
+
+def _call_v4_role(
+    *,
+    state: _V4RunState,
+    services: PitOptimizerServicesV4,
+    plan: PitOptimizerCallBudget,
+    role_input: InvestigatorInputV4 | AuthorInputV4 | CriticInputV4,
+    parser: Callable[[str], object],
+) -> PitOptimizerRoleAttempt:
+    attempt = services.call_role(plan, role_input, parser)
+    if not isinstance(attempt, PitOptimizerRoleAttempt) or attempt.plan != plan:
+        raise ProviderProtocolFailure("optimizer v4 provider attempt differs from plan")
+    if attempt.payload is not None:
+        validator = getattr(role_input, "validate_artifact", None)
+        if callable(validator):
+            validator(attempt.payload)
+        elif not isinstance(attempt.payload, InvestigatorArtifactV4):
+            raise ProviderProtocolFailure("optimizer v4 investigator payload differs")
+    _write_v4_attempt(state=state, services=services, attempt=attempt)
+    return attempt
+
+
+def _baseline_parent_summary(
+    readiness: PitOptimizerReadinessV4,
+) -> SelectedParentSummary:
+    identity = SelectedParentIdentity.issue(
+        parent_kind="baseline",
+        parent_id="baseline_policy",
+        source_head=readiness.manifest.source_head,
+        policy_sources=readiness.baseline_sources,
+    )
+    return SelectedParentSummary(
+        identity=identity,
+        hypothesis_id="baseline_policy",
+        behavioral_summary="Authenticated unchanged baseline policy.",
+        quick_panel=readiness.baseline_quick,
+        discovery_panel=readiness.baseline_discovery,
+    )
+
+
+def _candidate_parent_summary(
+    *,
+    readiness: PitOptimizerReadinessV4,
+    kind: str,
+    candidate: SearchCandidateState,
+    sources: tuple[AuthorSourceFile, ...],
+) -> SelectedParentSummary:
+    if candidate.quick_evidence is None:
+        raise IdentityDrift("retained candidate lacks exact quick evidence")
+    candidate_identity = candidate.candidate_identity
+    try:
+        validate_candidate_identity(candidate_identity)
+    except ValueError as exc:
+        raise IdentityDrift("retained candidate identity is unauthenticated") from exc
+    actual_source_sha256s = tuple(
+        (item.path, item.source_sha256) for item in sources
+    )
+    if actual_source_sha256s != candidate_identity.editable_file_sha256s:
+        raise IdentityDrift("retained candidate sources differ from identity")
+    identity = SelectedParentIdentity.issue(
+        parent_kind=kind,
+        parent_id=f"candidate_{candidate.candidate_identity.identity_sha256}",
+        source_head=readiness.manifest.source_head,
+        policy_sources=sources,
+    )
+    identity.validate_sources(sources)
+    return SelectedParentSummary(
+        identity=identity,
+        hypothesis_id=candidate.hypothesis,
+        behavioral_summary=candidate.behavioral_summary,
+        quick_panel=candidate.quick_evidence,
+        discovery_panel=candidate.discovery_evidence,
+    )
+
+
+def _selected_parent_kind(state: _V4RunState) -> str:
+    if state.active_branch is not None:
+        return "branch"
+    if state.champion is not None:
+        return "champion"
+    return "baseline"
+
+
+def _dispose_v4(
+    services: PitOptimizerServicesV4,
+    state: _V4RunState,
+    workspace: CandidateWorkspace | None,
+) -> None:
+    if workspace is None:
+        return
+    cleanup = services.dispose_candidate(workspace)
+    if not isinstance(cleanup, PitOptimizerCleanup):
+        raise SandboxIntegrityFailure("optimizer v4 cleanup evidence is invalid")
+    state.cleanup_observations.append(cleanup)
+
+
+def _materialize_v4_context(
+    *,
+    readiness: PitOptimizerReadinessV4,
+    state: _V4RunState,
+    services: PitOptimizerServicesV4,
+) -> tuple[
+    str,
+    SearchCandidateState | None,
+    CandidateParentV4,
+    SelectedParentSummary,
+    SelectedParentSummary,
+    SelectedParentSummary | None,
+    SelectedParentSummary | None,
+]:
+    kind = _selected_parent_kind(state)
+    selected_candidate = (
+        state.active_branch
+        if kind == "branch"
+        else state.champion if kind == "champion" else None
+    )
+    selected_workspace: CandidateWorkspace | None = None
+    try:
+        selected = services.materialize_parent(kind, selected_candidate)
+        if not isinstance(selected, CandidateParentV4):
+            raise SandboxIntegrityFailure("optimizer v4 parent materialization is invalid")
+        selected_workspace = selected.workspace
+        baseline = _baseline_parent_summary(readiness)
+        if kind == "baseline":
+            if selected.policy_sources != readiness.baseline_sources:
+                raise IdentityDrift("optimizer v4 baseline sources differ")
+            selected_summary = baseline
+        else:
+            assert selected_candidate is not None
+            if (
+                hashlib.sha256(selected.cumulative_diff.encode("utf-8")).hexdigest()
+                != selected_candidate.candidate_identity.cumulative_diff_sha256
+            ):
+                raise IdentityDrift("retained candidate diff differs from identity")
+            selected_summary = _candidate_parent_summary(
+                readiness=readiness,
+                kind=kind,
+                candidate=selected_candidate,
+                sources=selected.policy_sources,
+            )
+        champion_summary: SelectedParentSummary | None = None
+        if state.champion is not None:
+            if kind == "champion":
+                champion_summary = selected_summary
+            else:
+                champion_parent = services.materialize_parent("champion", state.champion)
+                if not isinstance(champion_parent, CandidateParentV4):
+                    raise SandboxIntegrityFailure(
+                        "optimizer v4 champion materialization is invalid"
+                    )
+                try:
+                    if (
+                        hashlib.sha256(
+                            champion_parent.cumulative_diff.encode("utf-8")
+                        ).hexdigest()
+                        != state.champion.candidate_identity.cumulative_diff_sha256
+                    ):
+                        raise IdentityDrift(
+                            "retained champion diff differs from identity"
+                        )
+                    champion_summary = _candidate_parent_summary(
+                        readiness=readiness,
+                        kind="champion",
+                        candidate=state.champion,
+                        sources=champion_parent.policy_sources,
+                    )
+                finally:
+                    _dispose_v4(services, state, champion_parent.workspace)
+        branch_summary = selected_summary if kind == "branch" else None
+        state.selected_parent = selected_summary.identity
+        return (
+            kind,
+            selected_candidate,
+            selected,
+            selected_summary,
+            baseline,
+            champion_summary,
+            branch_summary,
+        )
+    except BaseException:
+        _dispose_v4(services, state, selected_workspace)
+        raise
+
+
+def _checkpoint_v4(
+    *,
+    readiness: PitOptimizerReadinessV4,
+    completed_iterations: int,
+    champion: SearchCandidateState | None,
+    active_branch: SearchCandidateState | None,
+    feedback_tail: Sequence[PriorHypothesisSummaryV4],
+) -> CampaignCheckpoint:
+    return CampaignCheckpoint(
+        schema_version=4,
+        artifact_type="campaign_checkpoint",
+        campaign_id=readiness.manifest.campaign_id,
+        campaign_sequence=readiness.manifest.campaign_sequence,
+        source_head=readiness.manifest.source_head,
+        source_fingerprint_sha256=readiness.manifest.source_fingerprint_sha256,
+        discovery_panel_plan_sha256=readiness.manifest.discovery_panel_plan_sha256,
+        completed_iterations=completed_iterations,
+        champion=champion,
+        active_branch=active_branch,
+        feedback_tail=tuple(item.to_primitive() for item in feedback_tail),
+    )
+
+
+def _persist_v4_transition(
+    *,
+    readiness: PitOptimizerReadinessV4,
+    state: _V4RunState,
+    services: PitOptimizerServicesV4,
+    iteration: int,
+    decision: Mapping[str, object],
+    champion: SearchCandidateState | None,
+    active_branch: SearchCandidateState | None,
+    feedback_tail: Sequence[PriorHypothesisSummaryV4],
+) -> CampaignCheckpoint:
+    checkpoint = _checkpoint_v4(
+        readiness=readiness,
+        completed_iterations=iteration,
+        champion=champion,
+        active_branch=active_branch,
+        feedback_tail=feedback_tail,
+    )
+    # This ordering is the crash boundary: the complete prospective decision,
+    # then the atomically replaced checkpoint, and only then live state.
+    _record_v4_artifact(
+        state,
+        services.write_json_artifact(
+            f"iterations/{iteration:03d}/decision.json",
+            {"schema_version": 4, **dict(decision)},
+        ),
+    )
+    _record_v4_artifact(
+        state,
+        services.write_json_artifact("checkpoint.json", checkpoint.to_primitive()),
+    )
+    return checkpoint
+
+
+def _invalid_investigator_feedback(iteration: int) -> PriorHypothesisSummaryV4:
+    return PriorHypothesisSummaryV4(
+        iteration=iteration,
+        hypothesis_id=f"invalid_investigator_{iteration}",
+        focus_areas=("entry",),
+        behavioral_summary="Investigator output was rejected by the closed schema.",
+        validation=CandidateValidationStatusV4(
+            status="not_evaluated",
+            failure_code=None,
+        ),
+        discovery_cagr_pct=None,
+        critic_disposition="abandon",
+    )
+
+
+def _candidate_failure_code(value: str | None) -> str:
+    allowed = {
+        "author_output_invalid",
+        "source_invalid",
+        "syntax_failed",
+        "imports_failed",
+        "purity_failed",
+        "determinism_failed",
+        "worker_failed",
+        "typed_decision_invalid",
+        "runtime_invalid",
+        "evaluation_failed",
+    }
+    return value if value in allowed else "source_invalid"
+
+
+def _v4_role_common(
+    readiness: PitOptimizerReadinessV4,
+    *,
+    iteration: int,
+    parent_identity: SelectedParentIdentity,
+) -> dict[str, object]:
+    manifest = readiness.manifest
+    return {
+        "schema_version": 4,
+        "iteration": iteration,
+        "run_manifest_sha256": manifest.sha256,
+        "policy_authoring_scope_sha256": manifest.policy_authoring_scope.sha256,
+        "policy_interface_version": manifest.policy_interface_version,
+        "immutable_constraint_ids": manifest.immutable_constraint_ids,
+        "annualized_return_target": manifest.annualized_return_target,
+        "discovery_panel_plan_sha256": manifest.discovery_panel_plan_sha256,
+        "quick_panel_sha256": manifest.quick_panel_sha256,
+        "discovery_panel_sha256": manifest.discovery_panel_sha256,
+        "selected_parent_identity": parent_identity,
+    }
+
+
+def _write_validation_v4(
+    *,
+    state: _V4RunState,
+    services: PitOptimizerServicesV4,
+    iteration: int,
+    status: CandidateValidationStatusV4,
+    identity: CandidateIdentityV4 | None,
+) -> None:
+    _record_v4_artifact(
+        state,
+        services.write_json_artifact(
+            f"iterations/{iteration:03d}/validation.json",
+            {
+                "schema_version": 4,
+                "artifact_type": "candidate_validation",
+                "status": status.to_primitive(),
+                "candidate_identity": (
+                    None if identity is None else identity.to_primitive()
+                ),
+            },
+        ),
+    )
+
+
+def _run_v4_iteration(
+    *,
+    readiness: PitOptimizerReadinessV4,
+    state: _V4RunState,
+    services: PitOptimizerServicesV4,
+    iteration: int,
+) -> CampaignCheckpoint:
+    manifest = readiness.manifest
+    selected_workspace: CandidateWorkspace | None = None
+    (
+        selected_kind,
+        selected_candidate,
+        parent,
+        selected_summary,
+        baseline_summary,
+        champion_summary,
+        branch_summary,
+    ) = _materialize_v4_context(
+        readiness=readiness,
+        state=state,
+        services=services,
+    )
+    selected_workspace = parent.workspace
+    try:
+        common = _v4_role_common(
+            readiness,
+            iteration=iteration,
+            parent_identity=selected_summary.identity,
+        )
+        champion_panel = (
+            readiness.baseline_discovery
+            if champion_summary is None
+            else champion_summary.discovery_panel
+        )
+        investigator_input = InvestigatorInputV4(
+            **common,  # type: ignore[arg-type]
+            selected_parent_source_bundle_sha256=(
+                selected_summary.identity.source_bundle_sha256
+            ),
+            selected_parent_sources=parent.policy_sources,
+            selected_parent_summary=selected_summary,
+            baseline_summary=baseline_summary,
+            champion_summary=champion_summary,
+            branch_summary=branch_summary,
+            target_progress=TargetProgressV4.from_summaries(
+                target=manifest.annualized_return_target,
+                baseline=readiness.baseline_discovery,
+                selected_parent=selected_summary.discovery_panel,
+                champion=champion_panel,
+            ),
+            prior_hypotheses=tuple(state.feedback_tail),
+            validation_status=CandidateValidationStatusV4(
+                status="not_evaluated",
+                failure_code=None,
+            ),
+        )
+        investigator_plan = _v4_plan(
+            readiness,
+            iteration=iteration,
+            role="investigator",
+        )
+        investigator_input.validate_budget(
+            investigator_plan,
+            scope=manifest.policy_authoring_scope,
+            manifest=manifest,
+        )
+        investigator_attempt = _call_v4_role(
+            state=state,
+            services=services,
+            plan=investigator_plan,
+            role_input=investigator_input,
+            parser=lambda raw: InvestigatorArtifactV4.from_json(
+                raw,
+                max_total_bytes=investigator_plan.max_response_bytes,
+            ),
+        )
+        if investigator_attempt.payload is None:
+            remaining = (
+                _v4_plan(readiness, iteration=iteration, role="author"),
+                _v4_plan(readiness, iteration=iteration, role="critic"),
+            )
+            skips = services.settle_invalid_investigator(
+                investigator_plan,
+                remaining,
+            )
+            if (
+                type(skips) is not tuple
+                or tuple(skip.call_index for skip in skips)
+                != tuple(plan.call_index for plan in remaining)
+            ):
+                raise AuditFailure("optimizer v4 invalid-investigator skips differ")
+            state.skips.extend(skips)
+            _record_v4_artifact(
+                state,
+                services.write_json_artifact(
+                    "accounting.json",
+                    _v4_accounting_artifact(state),
+                ),
+            )
+            _record_v4_artifact(
+                state,
+                services.write_json_artifact(
+                    f"iterations/{iteration:03d}/authorization_skips.json",
+                    {
+                        "schema_version": 4,
+                        "artifact_type": "authorization_plan_skips",
+                        "iteration": iteration,
+                        "skips": [skip.to_record() for skip in skips],
+                    },
+                ),
+            )
+            feedback = _invalid_investigator_feedback(iteration)
+            prospective_feedback = (*state.feedback_tail, feedback)
+            checkpoint = _persist_v4_transition(
+                readiness=readiness,
+                state=state,
+                services=services,
+                iteration=iteration,
+                decision={
+                    "artifact_type": "search_transition",
+                    "selected_parent_kind": selected_kind,
+                    "candidate_valid": False,
+                    "candidate_promoted": False,
+                    "critic_disposition": "abandon",
+                    "effective_disposition": "unchanged",
+                    "prospective_champion": (
+                        None
+                        if state.champion is None
+                        else state.champion.to_primitive()
+                    ),
+                    "prospective_active_branch": (
+                        None
+                        if state.active_branch is None
+                        else state.active_branch.to_primitive()
+                    ),
+                },
+                champion=state.champion,
+                active_branch=state.active_branch,
+                feedback_tail=prospective_feedback,
+            )
+            state.feedback_tail = list(prospective_feedback)
+            state.iterations_completed = iteration
+            return checkpoint
+
+        investigator = investigator_attempt.payload
+        if not isinstance(investigator, InvestigatorArtifactV4):
+            raise ProviderProtocolFailure("optimizer v4 investigator type differs")
+        author_plan = _v4_plan(readiness, iteration=iteration, role="author")
+        author_input = AuthorInputV4(
+            **common,  # type: ignore[arg-type]
+            selected_parent_source_bundle_sha256=(
+                selected_summary.identity.source_bundle_sha256
+            ),
+            selected_parent_sources=parent.policy_sources,
+            investigator=investigator,
+        )
+        author_input.validate_budget(
+            author_plan,
+            scope=manifest.policy_authoring_scope,
+            manifest=manifest,
+        )
+        author_attempt = _call_v4_role(
+            state=state,
+            services=services,
+            plan=author_plan,
+            role_input=author_input,
+            parser=lambda raw: AuthorArtifactV4.from_json(
+                raw,
+                selected_parent=selected_summary.identity,
+                max_total_bytes=author_plan.max_response_bytes,
+            ),
+        )
+
+        candidate_state: SearchCandidateState | None = None
+        candidate_identity: CandidateIdentityV4 | None = None
+        quick: PanelAggregateSummary | None = None
+        discovery: PanelAggregateSummary | None = None
+        source_artifact: tuple[Path, str] | None = None
+        diff_artifact: tuple[Path, str] | None = None
+        quick_artifact: tuple[Path, str] | None = None
+        discovery_artifact: tuple[Path, str] | None = None
+        if author_attempt.payload is None:
+            validation_status = CandidateValidationStatusV4(
+                status="invalid",
+                failure_code="author_output_invalid",
+            )
+            author_manifest = None
+            validation_code = author_attempt.facts.response_validation_code
+            if validation_code is None:
+                raise AuditFailure("invalid author attempt lacks validation code")
+            author_invalid = RoleOutputInvalidSummary(
+                iteration=iteration,
+                call_index=author_plan.call_index,
+                role="author",
+                validation_code=validation_code,
+            )
+            behavioral_summary = "Author output was rejected by the closed schema."
+        else:
+            author = author_attempt.payload
+            if not isinstance(author, AuthorArtifactV4):
+                raise ProviderProtocolFailure("optimizer v4 author type differs")
+            author_manifest = AuthorManifestSummaryV4.from_artifact(
+                author,
+                selected_parent=selected_summary.identity,
+            )
+            author_invalid = None
+            behavioral_summary = author.behavioral_summary
+            outcome = services.validate_and_apply(
+                parent.workspace,
+                author,
+                selected_summary.identity,
+            )
+            if not isinstance(outcome, CandidateValidationOutcomeV4):
+                raise SandboxIntegrityFailure("optimizer v4 validation evidence is invalid")
+            if not outcome.valid:
+                validation_status = CandidateValidationStatusV4(
+                    status="invalid",
+                    failure_code=_candidate_failure_code(outcome.failure_code),
+                )
+            else:
+                candidate_identity = outcome.identity
+                assert candidate_identity is not None
+                if (
+                    candidate_identity.parent_identity_sha256
+                    != selected_summary.identity.parent_identity_sha256
+                    or candidate_identity.discovery_panel_plan_sha256
+                    != manifest.discovery_panel_plan_sha256
+                ):
+                    raise IdentityDrift("optimizer v4 candidate identity differs")
+                diff_artifact = _record_v4_artifact(
+                    state,
+                    services.write_diff_artifact(
+                        f"iterations/{iteration:03d}/candidate.diff",
+                        outcome.cumulative_diff,
+                    ),
+                )
+                source_artifact = _record_v4_artifact(
+                    state,
+                    services.write_json_artifact(
+                        f"iterations/{iteration:03d}/candidate-source.json",
+                        {
+                            "schema_version": 4,
+                            "artifact_type": "candidate_source_bundle",
+                            "candidate_identity_sha256": candidate_identity.identity_sha256,
+                            "policy_sources": {
+                                item.path: item.source for item in author.policy_sources
+                            },
+                        },
+                    ),
+                )
+                try:
+                    quick = services.evaluate_candidate(
+                        parent.workspace,
+                        candidate_identity,
+                        readiness.discovery_panel_plan.quick_panel,
+                    )
+                    if (
+                        quick.panel_id != "quick"
+                        or quick.panel_sha256 != manifest.quick_panel_sha256
+                    ):
+                        raise CandidateEvaluationFailure("replay_failed")
+                    quick_artifact = _record_v4_artifact(
+                        state,
+                        services.write_json_artifact(
+                            f"iterations/{iteration:03d}/quick.json",
+                            {
+                                "schema_version": 4,
+                                "artifact_type": "candidate_panel_evidence",
+                                "candidate_identity_sha256": candidate_identity.identity_sha256,
+                                "evidence": _panel_v4_artifact(quick),
+                            },
+                        ),
+                    )
+                    # Quick return/trades never gate discovery.
+                    discovery = services.evaluate_candidate(
+                        parent.workspace,
+                        candidate_identity,
+                        readiness.discovery_panel_plan.discovery_panel,
+                    )
+                    if (
+                        discovery.panel_id != "discovery"
+                        or discovery.panel_sha256 != manifest.discovery_panel_sha256
+                    ):
+                        raise CandidateEvaluationFailure("replay_failed")
+                    discovery_artifact = _record_v4_artifact(
+                        state,
+                        services.write_json_artifact(
+                            f"iterations/{iteration:03d}/discovery.json",
+                            {
+                                "schema_version": 4,
+                                "artifact_type": "candidate_panel_evidence",
+                                "candidate_identity_sha256": candidate_identity.identity_sha256,
+                                "evidence": _panel_v4_artifact(discovery),
+                            },
+                        ),
+                    )
+                    validation_status = CandidateValidationStatusV4(
+                        status="valid",
+                        failure_code=None,
+                    )
+                except CandidateEvaluationFailure as exc:
+                    validation_status = CandidateValidationStatusV4(
+                        status="invalid",
+                        failure_code=(
+                            "worker_failed"
+                            if exc.failure_code == "worker_failed"
+                            else "evaluation_failed"
+                        ),
+                    )
+                    # Preserve a completed quick panel for critic feedback when
+                    # only the larger discovery evaluation failed operationally.
+                    if quick_artifact is None:
+                        quick = None
+                    discovery = None
+
+        _write_validation_v4(
+            state=state,
+            services=services,
+            iteration=iteration,
+            status=validation_status,
+            identity=(
+                candidate_identity if validation_status.status == "valid" else None
+            ),
+        )
+        critic_plan = _v4_plan(readiness, iteration=iteration, role="critic")
+        critic_input = CriticInputV4(
+            **common,  # type: ignore[arg-type]
+            selected_parent_summary=selected_summary,
+            hypothesis_id=investigator.hypothesis_id,
+            investigator_summary=investigator,
+            author_manifest=author_manifest,
+            author_output_invalid=author_invalid,
+            validation_status=validation_status,
+            candidate_quick=quick,
+            candidate_discovery=discovery,
+            baseline_quick=readiness.baseline_quick,
+            baseline_discovery=readiness.baseline_discovery,
+            champion_discovery=champion_panel,
+            target_progress=TargetProgressV4.from_summaries(
+                target=manifest.annualized_return_target,
+                baseline=readiness.baseline_discovery,
+                selected_parent=selected_summary.discovery_panel,
+                champion=champion_panel,
+            ),
+        )
+        critic_input.validate_budget(
+            critic_plan,
+            scope=manifest.policy_authoring_scope,
+            manifest=manifest,
+        )
+        critic_attempt = _call_v4_role(
+            state=state,
+            services=services,
+            plan=critic_plan,
+            role_input=critic_input,
+            parser=lambda raw: CriticArtifactV4.from_json(
+                raw,
+                max_total_bytes=critic_plan.max_response_bytes,
+            ),
+        )
+        critic = critic_attempt.payload
+        critic_valid = isinstance(critic, CriticArtifactV4)
+        disposition = critic.disposition if critic_valid else "abandon"
+
+        if validation_status.status == "valid":
+            assert (
+                candidate_identity is not None
+                and quick is not None
+                and discovery is not None
+                and source_artifact is not None
+                and diff_artifact is not None
+                and quick_artifact is not None
+                and discovery_artifact is not None
+            )
+            candidate_state = SearchCandidateState(
+                candidate_identity=candidate_identity,
+                cumulative_diff_artifact=(
+                    f"iterations/{iteration:03d}/candidate.diff"
+                ),
+                cumulative_diff_sha256=diff_artifact[1],
+                source_bundle_artifact=(
+                    f"iterations/{iteration:03d}/candidate-source.json"
+                ),
+                source_bundle_sha256=source_artifact[1],
+                discovery_evidence_artifact=(
+                    f"iterations/{iteration:03d}/discovery.json"
+                ),
+                discovery_evidence_sha256=discovery_artifact[1],
+                discovery_evidence=discovery,
+                hypothesis=investigator.hypothesis_id,
+                behavioral_summary=behavioral_summary,
+                originating_run_id=manifest.campaign_id,
+                originating_iteration=iteration,
+                quick_evidence_artifact=f"iterations/{iteration:03d}/quick.json",
+                quick_evidence_sha256=quick_artifact[1],
+                quick_evidence=quick,
+            )
+
+        current_winner_cagr = (
+            readiness.baseline_discovery.portfolio_annualized_return_pct
+            if state.champion is None
+            else state.champion.discovery_evidence.portfolio_annualized_return_pct
+        )
+        promoted = bool(
+            candidate_state is not None
+            and candidate_state.discovery_evidence.portfolio_annualized_return_pct
+            > current_winner_cagr
+        )
+        if promoted:
+            prospective_champion = candidate_state
+            prospective_branch = None
+            effective_disposition = "promote"
+        elif candidate_state is not None and disposition == "refine":
+            prospective_champion = state.champion
+            prospective_branch = candidate_state
+            effective_disposition = "refine"
+        elif candidate_state is None and disposition == "refine" and selected_kind == "branch":
+            prospective_champion = state.champion
+            prospective_branch = selected_candidate
+            effective_disposition = "refine_existing_branch"
+        else:
+            prospective_champion = state.champion
+            prospective_branch = None
+            effective_disposition = "abandon"
+
+        feedback = PriorHypothesisSummaryV4(
+            iteration=iteration,
+            hypothesis_id=investigator.hypothesis_id,
+            focus_areas=investigator.focus_areas,
+            behavioral_summary=behavioral_summary,
+            validation=validation_status,
+            discovery_cagr_pct=(
+                None
+                if candidate_state is None
+                else candidate_state.discovery_evidence.portfolio_annualized_return_pct
+            ),
+            critic_disposition=disposition,
+        )
+        prospective_feedback = (*state.feedback_tail, feedback)
+        checkpoint = _persist_v4_transition(
+            readiness=readiness,
+            state=state,
+            services=services,
+            iteration=iteration,
+            decision={
+                "artifact_type": "search_transition",
+                "selected_parent_kind": selected_kind,
+                "candidate_valid": candidate_state is not None,
+                "candidate_promoted": promoted,
+                "critic_output_valid": critic_valid,
+                "critic_disposition": disposition,
+                "effective_disposition": effective_disposition,
+                "prospective_champion": (
+                    None
+                    if prospective_champion is None
+                    else prospective_champion.to_primitive()
+                ),
+                "prospective_active_branch": (
+                    None
+                    if prospective_branch is None
+                    else prospective_branch.to_primitive()
+                ),
+            },
+            champion=prospective_champion,
+            active_branch=prospective_branch,
+            feedback_tail=prospective_feedback,
+        )
+        state.champion = prospective_champion
+        state.active_branch = prospective_branch
+        state.feedback_tail = list(prospective_feedback)
+        state.iterations_completed = iteration
+        return checkpoint
+    finally:
+        _dispose_v4(services, state, selected_workspace)
+
+
+def _copy_seed_v4(
+    *,
+    kind: str,
+    candidate: SearchCandidateState,
+    state: _V4RunState,
+    services: PitOptimizerServicesV4,
+) -> SearchCandidateState:
+    parent = services.materialize_parent(kind, candidate)
+    label = "champion" if kind == "champion" else "branch"
+    try:
+        diff = _record_v4_artifact(
+            state,
+            services.write_diff_artifact(
+                f"seed-{label}.diff",
+                parent.cumulative_diff,
+            ),
+        )
+        source = _record_v4_artifact(
+            state,
+            services.write_json_artifact(
+                f"seed-{label}-source.json",
+                {
+                    "schema_version": 4,
+                    "artifact_type": "seed_candidate_source_bundle",
+                    "candidate_identity_sha256": (
+                        candidate.candidate_identity.identity_sha256
+                    ),
+                    "policy_sources": {
+                        item.path: item.source for item in parent.policy_sources
+                    },
+                },
+            ),
+        )
+        quick = _record_v4_artifact(
+            state,
+            services.write_json_artifact(
+                f"seed-{label}-quick.json",
+                {
+                    "schema_version": 4,
+                    "artifact_type": "seed_candidate_panel_evidence",
+                    "evidence": _panel_v4_artifact(candidate.quick_evidence),
+                },
+            ),
+        )
+        discovery = _record_v4_artifact(
+            state,
+            services.write_json_artifact(
+                f"seed-{label}-discovery.json",
+                {
+                    "schema_version": 4,
+                    "artifact_type": "seed_candidate_panel_evidence",
+                    "evidence": _panel_v4_artifact(candidate.discovery_evidence),
+                },
+            ),
+        )
+        return replace(
+            candidate,
+            cumulative_diff_artifact=f"seed-{label}.diff",
+            cumulative_diff_sha256=diff[1],
+            source_bundle_artifact=f"seed-{label}-source.json",
+            source_bundle_sha256=source[1],
+            discovery_evidence_artifact=f"seed-{label}-discovery.json",
+            discovery_evidence_sha256=discovery[1],
+            quick_evidence_artifact=f"seed-{label}-quick.json",
+            quick_evidence_sha256=quick[1],
+        )
+    finally:
+        _dispose_v4(services, state, parent.workspace)
+
+
+def run_pit_optimizer_v4(
+    *,
+    readiness: PitOptimizerReadinessV4,
+    services: PitOptimizerServicesV4,
+) -> PitOptimizerResultV4:
+    """Run the bounded schema-v4 search without qualification or replay."""
+
+    if not isinstance(readiness, PitOptimizerReadinessV4) or not isinstance(
+        services,
+        PitOptimizerServicesV4,
+    ):
+        raise ValueError("optimizer v4 run composition is invalid")
+    state = _V4RunState(
+        champion=None,
+        active_branch=None,
+        feedback_tail=[],
+    )
+    terminal_code = "iteration_limit"
+    checkpoint: CampaignCheckpoint | None = None
+    durable_checkpoint_written = False
+    try:
+        services.verify_inputs(readiness)
+        seed_champion: SearchCandidateState | None = None
+        seed_active_branch: SearchCandidateState | None = None
+        if readiness.seed_champion is not None:
+            seed_champion = _copy_seed_v4(
+                kind="champion",
+                candidate=readiness.seed_champion,
+                state=state,
+                services=services,
+            )
+        if readiness.seed_active_branch is not None:
+            seed_active_branch = _copy_seed_v4(
+                kind="branch",
+                candidate=readiness.seed_active_branch,
+                state=state,
+                services=services,
+            )
+        for name, primitive in (
+            (
+                "run.json",
+                {
+                    "schema_version": 4,
+                    "artifact_type": "optimizer_run",
+                    "campaign_id": readiness.manifest.campaign_id,
+                    "campaign_sequence": readiness.manifest.campaign_sequence,
+                    "manifest_sha256": readiness.manifest.sha256,
+                    "readiness_sha256": readiness.readiness_sha256,
+                    "target": _target_v4_artifact(
+                        readiness.manifest.annualized_return_target
+                    ),
+                    "apply": False,
+                    "provider_retries": 0,
+                    "qualification_started": False,
+                    "full_replay_started": False,
+                },
+            ),
+            (
+                "baseline.json",
+                {
+                    "schema_version": 4,
+                    "artifact_type": "exact_panel_baseline",
+                    "quick": _panel_v4_artifact(readiness.baseline_quick),
+                    "discovery": _panel_v4_artifact(readiness.baseline_discovery),
+                    "parity_use": "engine_equivalence_only",
+                },
+            ),
+            ("accounting.json", _v4_accounting_artifact(state)),
+        ):
+            _record_v4_artifact(
+                state,
+                services.write_json_artifact(name, primitive),
+            )
+        initial_checkpoint = _checkpoint_v4(
+            readiness=readiness,
+            completed_iterations=0,
+            champion=seed_champion,
+            active_branch=seed_active_branch,
+            feedback_tail=state.feedback_tail,
+        )
+        _record_v4_artifact(
+            state,
+            services.write_json_artifact(
+                "checkpoint.json", initial_checkpoint.to_primitive()
+            ),
+        )
+        checkpoint = initial_checkpoint
+        durable_checkpoint_written = True
+        # The imported seed becomes live only after all create-only copies and the
+        # initial atomic checkpoint are durable.
+        state.champion = seed_champion
+        state.active_branch = seed_active_branch
+        for iteration in range(1, readiness.manifest.max_iterations + 1):
+            if services.cancellation_requested():
+                terminal_code = "cancelled"
+                break
+            directory = services.prepare_iteration_artifacts(iteration)
+            if (
+                not isinstance(directory, Path)
+                or not directory.is_absolute()
+                or not directory.is_dir()
+            ):
+                raise AuditFailure("optimizer v4 iteration directory is not durable")
+            state.iterations_started = iteration
+            checkpoint = _run_v4_iteration(
+                readiness=readiness,
+                state=state,
+                services=services,
+                iteration=iteration,
+            )
+            durable_checkpoint_written = True
+    except BaseException as exc:
+        terminal_code, _detail = _terminal_from_exception(exc)
+        if terminal_code in {
+            "iteration_limit",
+            "stagnation_limit",
+            "cancelled",
+        }:
+            terminal_code = "audit_failure"
+    try:
+        services.verify_inputs(readiness)
+    except BaseException:
+        terminal_code = "identity_drift"
+    facts = tuple(attempt.facts for attempt in state.call_attempts)
+    cleanup_complete = all(
+        item.candidate_removed and item.worker_stopped and not item.source_modified
+        for item in state.cleanup_observations
+    )
+    source_modified = any(item.source_modified for item in state.cleanup_observations)
+    accounting_complete = all(item.accounting_complete for item in facts)
+    if not accounting_complete:
+        terminal_code = "provider_accounting_failure"
+    successful_terminal = terminal_code in {"iteration_limit", "cancelled"}
+    if successful_terminal and not cleanup_complete:
+        terminal_code = "sandbox_integrity_failure"
+        successful_terminal = False
+    champion_cagr = (
+        readiness.baseline_discovery.portfolio_annualized_return_pct
+        if state.champion is None
+        else state.champion.discovery_evidence.portfolio_annualized_return_pct
+    )
+    branch_cagr = (
+        None
+        if state.active_branch is None
+        else state.active_branch.discovery_evidence.portfolio_annualized_return_pct
+    )
+    result = PitOptimizerResultV4(
+        schema_version=4,
+        status="completed" if successful_terminal else "aborted",
+        terminal_code=terminal_code,
+        campaign_id=readiness.manifest.campaign_id,
+        target_cagr_pct=format(
+            readiness.manifest.annualized_return_target.target_pct,
+            "f",
+        ),
+        baseline_cagr_pct=format(
+            readiness.baseline_discovery.portfolio_annualized_return_pct,
+            "f",
+        ),
+        champion_cagr_pct=format(champion_cagr, "f"),
+        branch_cagr_pct=None if branch_cagr is None else format(branch_cagr, "f"),
+        iterations_started=state.iterations_started,
+        iterations_completed=state.iterations_completed,
+        calls=sum(1 for item in facts if item.request_started),
+        tokens=sum(item.total_tokens or 0 for item in facts),
+        cost_usd=format(
+            sum(
+                (
+                    Decimal(str(item.cost_usd or 0))
+                    for item in facts
+                    if item.accounting_complete
+                ),
+                Decimal("0"),
+            ),
+            "f",
+        ),
+        checkpoint_present=durable_checkpoint_written,
+        apply=False,
+        cleanup_complete=cleanup_complete,
+        source_modified=source_modified,
+        checkpoint=checkpoint,
+        artifact_paths=tuple(state.artifact_paths),
+    )
+    try:
+        _record_v4_artifact(
+            state,
+            services.write_json_artifact("summary.json", result.to_public_artifact()),
+        )
+    except BaseException:
+        result = replace(
+            result,
+            status="aborted",
+            terminal_code="audit_failure",
+            cleanup_complete=False,
+        )
+    try:
+        services.finalize_run(
+            tuple(state.call_attempts),
+            tuple(state.skips),
+            result.terminal_code,
+        )
+    except BaseException:
+        result = replace(
+            result,
+            status="aborted",
+            terminal_code="audit_failure",
+            cleanup_complete=False,
+        )
+    return replace(result, artifact_paths=tuple(state.artifact_paths))

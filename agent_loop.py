@@ -58,6 +58,7 @@ if __name__ == "__main__":
     sys.modules.setdefault("agent_loop", sys.modules[__name__])
 
 if TYPE_CHECKING:
+    from core.pit_optimization import PitOptimizerGateConfigV4
     from core.pit_optimization_contract import (
         PitOptimizerCallBudget,
         PitOptimizerGateConfig,
@@ -69,13 +70,16 @@ if TYPE_CHECKING:
         OptimizerPricingSnapshot,
         PitOptimizerProviderFacts,
         PitOptimizerRoleCall,
+        PitOptimizerRoleAttempt,
         TerminalAuditReceipt,
     )
     from core.pit_optimizer_controller import (
         PitOptimizerReadiness,
+        PitOptimizerReadinessV4,
         PitOptimizerResult,
         PitOptimizerServices,
     )
+    from core.pit_optimizer_evaluation import DiscoveryScore
 
 MAX_ITERATIONS = 10
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -84,9 +88,9 @@ REASONER_MODEL = "deepseek/deepseek-r1"
 CODER_MODEL = "qwen/qwen3-coder-next"
 
 # Controller-owned conservative reservation rates for the three-call PIT gate.
-# Provider-returned inline cost remains the authoritative charge; these sealed
-# per-million ceilings prevent a pre-call /models lookup from becoming a fourth
-# provider request.
+# Provider-returned inline cost is preferred; when an otherwise complete
+# response omits only cost, the same sealed rates provide a labeled local
+# reconciliation without a second provider completion or receipt lookup.
 _PIT_OPTIMIZATION_OFFLINE_PRICING = MappingProxyType(
     {
         ORCHESTRATOR_MODEL: MappingProxyType({"prompt": 5.0, "completion": 5.0}),
@@ -106,6 +110,27 @@ MAX_BATCH_TOKENS = 2_000_000
 GENERATION_ACCOUNTING_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0)
 GENERATION_ACCOUNTING_ATTEMPTS = len(GENERATION_ACCOUNTING_DELAYS_SECONDS) + 1
 
+
+def _unrankable_discovery_score() -> "DiscoveryScore":
+    """Return the typed placeholder required for a no-trade candidate.
+
+    The caller must retain ``rankable=False`` and ``strictly_improves=False``;
+    this value is deliberately not a discovery objective.
+    """
+    from core.pit_optimizer_evaluation import DiscoveryScore
+
+    return DiscoveryScore(
+        median_excess_return_pp=Decimal("0.00"),
+        worst_excess_return_pp=Decimal("0.00"),
+        max_drawdown_magnitude_pp=Decimal("0.00"),
+    )
+
+
+# PIT canaries permit one generation-receipt lookup only.  Give OpenRouter's
+# asynchronously published receipt a bounded chance to appear before that
+# lookup; this is a pre-lookup settle period, not a provider retry.
+PIT_OPTIMIZER_GENERATION_PUBLICATION_WAIT_SECONDS = 30.0
+
 _MAX_FILES = 8
 _MAX_LIST_ITEMS = 16
 _MAX_TEXT_BYTES = 16 * 1024
@@ -114,6 +139,8 @@ _MAX_DATA_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
 _CONTAINER_SHM_SIZE_BYTES = 64 * 1024 * 1024
 _MAX_GENERATION_ACCOUNTING_BYTES = 64 * 1024
 _MAX_PROVIDER_EVIDENCE_BYTES = 8 * 1024
+_MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES = 32 * 1024 * 1024
+_POLICY_WORKER_BASE_FOLD_SESSIONS = 60
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 524, 529})
 _GENERATION_ACCOUNTING_RETRYABLE_STATUS_CODES = frozenset(
     {404, 408, 429, 500, 502, 503, 504, 524, 529}
@@ -325,6 +352,10 @@ class ProtocolFailureCode(str, Enum):
     PAYLOAD_JSON_INVALID = "payload_json_invalid"
     PAYLOAD_KEYS_INVALID = "payload_keys_invalid"
     PAYLOAD_FIELD_INVALID = "payload_field_invalid"
+    PAYLOAD_SCOPE_INVALID = "payload_scope_invalid"
+    PAYLOAD_SIZE_INVALID = "payload_size_invalid"
+    PAYLOAD_ENUM_INVALID = "payload_enum_invalid"
+    PAYLOAD_BINDING_INVALID = "payload_binding_invalid"
     MODEL_MISMATCH = "model_mismatch"
     VALIDATOR_BOUNDARY_INVALID = "validator_boundary_invalid"
 
@@ -337,6 +368,32 @@ class ClosedResponseValidationError(ResponseValidationError):
             raise ConfigurationError("protocol failure code is invalid")
         super().__init__(message)
         self.code = code
+
+
+def _closed_payload_error_code(error: ValueError | TypeError) -> ProtocolFailureCode:
+    """Classify a local parser failure without retaining model-provided text."""
+
+    message = str(error)
+    if message == "provider payload is malformed JSON":
+        return ProtocolFailureCode.PAYLOAD_JSON_INVALID
+    if message in {
+        "provider payload has invalid keys",
+        "provider JSON contains a duplicate key",
+    }:
+        return ProtocolFailureCode.PAYLOAD_KEYS_INVALID
+    if "outside the editable scope" in message or "canonical policy order" in message:
+        return ProtocolFailureCode.PAYLOAD_SCOPE_INVALID
+    if (
+        "not bounded JSON text" in message
+        or "too large" in message
+        or "exceeds its byte cap" in message
+        or ("exceeds " in message and " characters" in message)
+        or "may contain at most" in message
+    ):
+        return ProtocolFailureCode.PAYLOAD_SIZE_INVALID
+    if message.endswith("family is invalid") or message.endswith("disposition is invalid"):
+        return ProtocolFailureCode.PAYLOAD_ENUM_INVALID
+    return ProtocolFailureCode.PAYLOAD_FIELD_INVALID
 
 
 class AccountingFailureCode(str, Enum):
@@ -556,6 +613,10 @@ class QuarantineError(RuntimeError):
 
 class SandboxError(RuntimeError):
     """A sandbox engine or created worker failed attestation."""
+
+
+class PolicyWorkerOperationalFailure(RuntimeError):
+    """A contained policy worker failed after its cleanup was verified."""
 
 
 class GateConfigurationError(ValueError):
@@ -1070,7 +1131,11 @@ class Usage:
             raise ProtocolValidationError("reasoning_tokens cannot exceed completion_tokens")
         if self.cost_usd is not None and _non_negative_float(self.cost_usd) is None:
             raise ProtocolValidationError("usage cost must be a finite non-negative number")
-        if self.accounting_source not in {"inline", "generation_endpoint"}:
+        if self.accounting_source not in {
+            "inline",
+            "generation_endpoint",
+            "frozen_pricing",
+        }:
             raise ProtocolValidationError("usage accounting source is invalid")
 
 
@@ -1218,6 +1283,7 @@ class ProviderCallRecord:
     request_failure_class: str | None = None
     request_failure_status_code: int | None = None
     response_validation_code: str | None = None
+    accounting_failure_code: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version not in {1, 2, 3}:
@@ -1284,7 +1350,11 @@ class ProviderCallRecord:
             raise ConfigurationError("version 1 provider call has optimizer pricing")
         if self.accounting_complete is not True:
             raise ConfigurationError("provider call must have complete validated accounting")
-        if self.accounting_source not in {"inline", "generation_endpoint"}:
+        if self.accounting_source not in {
+            "inline",
+            "generation_endpoint",
+            "frozen_pricing",
+        }:
             raise ConfigurationError("provider call accounting source is invalid")
         if self.requested_model == "unknown":
             raise ConfigurationError("accounted provider call requires a requested model")
@@ -1397,7 +1467,11 @@ class ProviderCallRecord:
         if self.authoritative_spend_known:
             if self.exposure_basis != "authoritative" or retained_present:
                 raise ConfigurationError("authoritative failed-call exposure is inconsistent")
-            if self.accounting_source not in {"inline", "generation_endpoint"}:
+            if self.accounting_source not in {
+                "inline",
+                "generation_endpoint",
+                "frozen_pricing",
+            }:
                 raise ConfigurationError("authoritative failed-call source is invalid")
             if any(
                 value is None
@@ -1533,7 +1607,8 @@ class ProviderCallRecord:
             elif (
                 self.outcome == "failed_before_send"
                 or not self.locally_accounted
-                or self.accounting_source not in {"inline", "generation_endpoint"}
+                or self.accounting_source
+                not in {"inline", "generation_endpoint", "frozen_pricing"}
             ):
                 raise ConfigurationError("optimizer authoritative accounting is not local")
         else:
@@ -1611,6 +1686,12 @@ class ProviderCallRecord:
             *PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES,
         }:
             raise ConfigurationError("optimizer response validation code is invalid")
+        if self.accounting_failure_code is not None and (
+            not isinstance(self.accounting_failure_code, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{2,63}", self.accounting_failure_code)
+            is None
+        ):
+            raise ConfigurationError("optimizer accounting failure code is invalid")
         if self.request_failure_class not in {
             None,
             "provider_http",
@@ -1689,7 +1770,8 @@ class ProviderCallRecord:
             elif (
                 self.outcome == "failed_before_send"
                 or not self.locally_accounted
-                or self.accounting_source not in {"inline", "generation_endpoint"}
+                or self.accounting_source
+                not in {"inline", "generation_endpoint", "frozen_pricing"}
             ):
                 raise ConfigurationError(
                     "optimizer authoritative accounting is not local"
@@ -1751,6 +1833,13 @@ class ProviderCallRecord:
             and self.accounting_complete
         ):
             raise ConfigurationError("optimizer response validation code is inconsistent")
+        if self.accounting_failure_code is not None and not (
+            self.outcome == "uncertain_accounting"
+            and self.request_started
+            and self.response_received
+            and not self.accounting_complete
+        ):
+            raise ConfigurationError("optimizer accounting failure code is inconsistent")
 
 
 @dataclass(frozen=True)
@@ -2869,7 +2958,13 @@ def _usage_cost(value: object, location: str) -> float | None:
     return normalized
 
 
-def _usage_from_response(response: object, *, require_complete: bool = False) -> Usage:
+def _usage_from_response(
+    response: object,
+    *,
+    require_complete: bool = False,
+    allow_missing_cost: bool = False,
+    tolerate_optional_token_details: bool = False,
+) -> Usage:
     usage = _read_field(response, "usage")
     if usage is None:
         if require_complete:
@@ -2883,16 +2978,22 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
     total_tokens = _usage_int(usage, "total_tokens")
     prompt_details = _present_field(usage, "prompt_tokens_details")
     completion_details = _present_field(usage, "completion_tokens_details")
-    cached_tokens = (
-        None
-        if prompt_details is _MISSING_FIELD or prompt_details is None
-        else _usage_int(prompt_details, "cached_tokens")
-    )
-    reasoning_tokens = (
-        None
-        if completion_details is _MISSING_FIELD or completion_details is None
-        else _usage_int(completion_details, "reasoning_tokens")
-    )
+    try:
+        cached_tokens = (
+            None
+            if prompt_details is _MISSING_FIELD or prompt_details is None
+            else _usage_int(prompt_details, "cached_tokens")
+        )
+        reasoning_tokens = (
+            None
+            if completion_details is _MISSING_FIELD or completion_details is None
+            else _usage_int(completion_details, "reasoning_tokens")
+        )
+    except AccountingValidationError:
+        if not tolerate_optional_token_details:
+            raise
+        cached_tokens = None
+        reasoning_tokens = None
     usage_cost = _usage_cost(_present_field(usage, "cost"), "usage")
     response_cost = _usage_cost(_present_field(response, "cost"), "response")
     if usage_cost is not None and response_cost is not None and usage_cost != response_cost:
@@ -2901,7 +3002,7 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
             code=AccountingFailureCode.INLINE_COST_CONFLICT,
         )
     cost = usage_cost if usage_cost is not None else response_cost
-    if require_complete and cost is None:
+    if require_complete and cost is None and not allow_missing_cost:
         raise AccountingValidationError(
             "response is missing authoritative provider cost accounting",
             code=AccountingFailureCode.INLINE_USAGE_MISSING,
@@ -2928,19 +3029,25 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
         and prompt_tokens is not None
         and cached_tokens > prompt_tokens
     ):
-        raise AccountingValidationError(
-            "cached_tokens cannot exceed prompt_tokens",
-            code=AccountingFailureCode.INLINE_CACHED_EXCEEDS_PROMPT,
-        )
+        if tolerate_optional_token_details:
+            cached_tokens = None
+        else:
+            raise AccountingValidationError(
+                "cached_tokens cannot exceed prompt_tokens",
+                code=AccountingFailureCode.INLINE_CACHED_EXCEEDS_PROMPT,
+            )
     if (
         reasoning_tokens is not None
         and completion_tokens is not None
         and reasoning_tokens > completion_tokens
     ):
-        raise AccountingValidationError(
-            "reasoning_tokens cannot exceed completion_tokens",
-            code=AccountingFailureCode.INLINE_REASONING_EXCEEDS_COMPLETION,
-        )
+        if tolerate_optional_token_details:
+            reasoning_tokens = None
+        else:
+            raise AccountingValidationError(
+                "reasoning_tokens cannot exceed completion_tokens",
+                code=AccountingFailureCode.INLINE_REASONING_EXCEEDS_COMPLETION,
+            )
     try:
         return Usage(
             prompt_tokens=prompt_tokens,
@@ -2957,9 +3064,51 @@ def _usage_from_response(response: object, *, require_complete: bool = False) ->
         ) from exc
 
 
-def _safe_generation_id(response: object) -> str:
-    """Return one locally hardened OpenRouter generation identifier."""
-    value = _read_field(response, "id")
+def _complete_pit_optimizer_usage_with_frozen_pricing(
+    usage: Usage,
+    pricing: "OptimizerPricingSnapshot",
+) -> Usage:
+    """Attach immutable local cost when complete PIT token accounting lacks cost."""
+
+    from core.pit_optimizer_authorization import OptimizerPricingSnapshot
+
+    if not isinstance(usage, Usage) or not isinstance(
+        pricing, OptimizerPricingSnapshot
+    ):
+        raise ConfigurationError("optimizer inline accounting inputs are invalid")
+    if usage.cost_usd is not None:
+        return usage
+    if (
+        pricing.lookup_status != "available"
+        or pricing.prompt_per_million is None
+        or pricing.completion_per_million is None
+        or usage.prompt_tokens is None
+        or usage.completion_tokens is None
+        or usage.total_tokens is None
+        or usage.total_tokens != usage.prompt_tokens + usage.completion_tokens
+    ):
+        raise AccountingValidationError(
+            "optimizer inline accounting cannot be priced locally",
+            code=AccountingFailureCode.INLINE_USAGE_MISSING,
+        )
+    cost = (
+        Decimal(usage.prompt_tokens) * pricing.prompt_per_million
+        + Decimal(usage.completion_tokens) * pricing.completion_per_million
+    ) / Decimal(1_000_000)
+    return Usage(
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        total_tokens=usage.total_tokens,
+        cached_tokens=usage.cached_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        cost_usd=float(cost),
+        accounting_source="frozen_pricing",
+    )
+
+
+def _safe_generation_id_value(value: object) -> str:
+    """Validate one locally hardened OpenRouter generation identifier."""
+
     if value is None:
         raise AccountingValidationError(
             "response is missing a generation accounting identifier",
@@ -2971,6 +3120,12 @@ def _safe_generation_id(response: object) -> str:
             code=AccountingFailureCode.RECOVERY_ID_UNSAFE,
         )
     return value
+
+
+def _safe_generation_id(response: object) -> str:
+    """Return one locally hardened OpenRouter generation identifier."""
+
+    return _safe_generation_id_value(_read_field(response, "id"))
 
 
 class _GenerationTokenBasis(str, Enum):
@@ -3025,6 +3180,8 @@ def _usage_from_generation_record(
     payload: object,
     *,
     generation_id: str,
+    allow_missing_cost: bool = False,
+    tolerate_optional_token_details: bool = False,
 ) -> Usage:
     """Validate one complete authoritative record from OpenRouter's generation endpoint."""
     if not isinstance(payload, Mapping):
@@ -3058,55 +3215,73 @@ def _usage_from_generation_record(
             recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_INVALID,
         ) from exc
     if total_cost is None or usage_cost is None:
-        raise AccountingValidationError(
-            "generation cost accounting is incomplete",
-            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-            recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_MISSING,
-        )
-    if total_cost != usage_cost:
+        if not allow_missing_cost:
+            raise AccountingValidationError(
+                "generation cost accounting is incomplete",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_MISSING,
+            )
+        recovered_cost = None
+    elif total_cost != usage_cost:
         raise AccountingValidationError(
             "generation cost accounting is conflicting",
             code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
             recovery_usage_diagnostic=RecoveryUsageDiagnosticCode.COST_CONFLICT,
         )
+    else:
+        recovered_cost = total_cost
     prompt_tokens, completion_tokens, token_basis = _generation_token_pair(data)
     try:
         cached_tokens = _usage_int(data, "native_tokens_cached")
         reasoning_tokens = _usage_int(data, "native_tokens_reasoning")
     except AccountingValidationError as exc:
-        raise AccountingValidationError(
-            "generation optional token accounting is invalid",
-            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-            recovery_usage_diagnostic=(
-                RecoveryUsageDiagnosticCode.OPTIONAL_TOKEN_INVALID
-            ),
-        ) from exc
+        if tolerate_optional_token_details:
+            cached_tokens = None
+            reasoning_tokens = None
+        else:
+            raise AccountingValidationError(
+                "generation optional token accounting is invalid",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=(
+                    RecoveryUsageDiagnosticCode.OPTIONAL_TOKEN_INVALID
+                ),
+            ) from exc
     if token_basis is _GenerationTokenBasis.NORMALIZED:
         cached_tokens = None
         reasoning_tokens = None
     elif cached_tokens is not None and cached_tokens > prompt_tokens:
-        raise AccountingValidationError(
-            "generation cached token accounting is inconsistent",
-            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-            recovery_usage_diagnostic=(
-                RecoveryUsageDiagnosticCode.CACHED_EXCEEDS_PROMPT
-            ),
-        )
-    elif reasoning_tokens is not None and reasoning_tokens > completion_tokens:
-        raise AccountingValidationError(
-            "generation reasoning token accounting is inconsistent",
-            code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
-            recovery_usage_diagnostic=(
-                RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
-            ),
-        )
+        if tolerate_optional_token_details:
+            cached_tokens = None
+        else:
+            raise AccountingValidationError(
+                "generation cached token accounting is inconsistent",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=(
+                    RecoveryUsageDiagnosticCode.CACHED_EXCEEDS_PROMPT
+                ),
+            )
+    if (
+        token_basis is _GenerationTokenBasis.NATIVE
+        and reasoning_tokens is not None
+        and reasoning_tokens > completion_tokens
+    ):
+        if tolerate_optional_token_details:
+            reasoning_tokens = None
+        else:
+            raise AccountingValidationError(
+                "generation reasoning token accounting is inconsistent",
+                code=AccountingFailureCode.RECOVERY_USAGE_INVALID,
+                recovery_usage_diagnostic=(
+                    RecoveryUsageDiagnosticCode.REASONING_EXCEEDS_COMPLETION
+                ),
+            )
     return Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
         cached_tokens=cached_tokens,
         reasoning_tokens=reasoning_tokens,
-        cost_usd=total_cost,
+        cost_usd=recovered_cost,
         accounting_source="generation_endpoint",
     )
 
@@ -3144,6 +3319,46 @@ def _pit_optimizer_request_failure_provenance(
     ):
         return "transport", None
     return "unknown", None
+
+
+def _pit_optimizer_unexpected_accounting_code(
+    error: BaseException,
+    *,
+    stage: str,
+) -> str:
+    """Return a closed, provider-content-free code for an unclassified receipt failure.
+
+    A paid response can traverse several local-only closure steps after its bytes
+    arrive.  Preserving that fixed stage name makes a fail-closed rejection
+    actionable without retaining a provider exception or any response content.
+    """
+
+    allowed_stages = {
+        "response_metadata",
+        "inline_usage",
+        "receipt_recovery",
+        "accounting_bounds",
+        "response_validation",
+        "artifact_binding",
+        "provider_facts",
+        "payload_digest",
+        "publication",
+    }
+    if stage not in allowed_stages:
+        stage = "response_metadata"
+    if isinstance(error, AssertionError):
+        kind = "assertion"
+    elif isinstance(error, KeyError):
+        kind = "key"
+    elif isinstance(error, TypeError):
+        kind = "type"
+    elif isinstance(error, ValueError):
+        kind = "value"
+    elif isinstance(error, GatewayError):
+        kind = "gateway"
+    else:
+        kind = "internal"
+    return f"accounting_{stage}_{kind}"
 
 
 def _is_retryable(error: BaseException) -> bool:
@@ -3943,6 +4158,12 @@ class OpenRouterGateway:
             return requested
         if facts.outcome == "accepted":
             return None
+        if facts.outcome == "schema_invalid" and (
+            facts.response_validation_code is not None
+            and facts.accounting_complete
+            and facts.accounting_source is not None
+        ):
+            return None
         if facts.outcome == "budget_exceeded":
             return "budget_exhausted"
         return "failed"
@@ -3957,8 +4178,10 @@ class OpenRouterGateway:
     ) -> _PitOptimizerGatewayLifecycle:
         if not isinstance(self.audit_trail, AuditTrail):
             raise AuditError("optimizer audit trail is required")
-        if self.audit_trail.run_id != self.authorization_ledger.manifest.run_id:
-            raise AuditError("optimizer audit run differs from manifest")
+        # AuthorizationLedger.attach_audit_trail() already binds and verifies
+        # the audit identity for both v3 run IDs and v4 campaign IDs.  Repeating
+        # that check here was not only redundant, it also read the v3-only
+        # ``manifest.run_id`` field and aborted every v4 call after reservation.
         key = (authorization_lease.run_manifest_sha256, plan.call_index)
         if key in self._pit_optimizer_lifecycles:
             raise AuditError("optimizer gateway lifecycle is already registered")
@@ -4106,8 +4329,8 @@ class OpenRouterGateway:
             raise AuditError("optimizer started lifecycle event is absent")
         if not facts.request_started and lifecycle.started_event_sha256 is not None:
             raise AuditError("optimizer before-send lifecycle has a start event")
-        if facts.outcome == "accepted" and not response_processed:
-            raise AuditError("optimizer accepted response was not processed by gateway")
+        if facts.outcome in {"accepted", "schema_invalid"} and not response_processed:
+            raise AuditError("optimizer response was not processed by gateway")
         if facts.outcome == "accepted":
             if payload_sha256 is None or _SHA256_RE.fullmatch(payload_sha256) is None:
                 raise AuditError("optimizer accepted artifact digest is invalid")
@@ -4247,6 +4470,7 @@ class OpenRouterGateway:
             request_failure_class=facts.request_failure_class,
             request_failure_status_code=facts.request_failure_status_code,
             response_validation_code=facts.response_validation_code,
+            accounting_failure_code=facts.accounting_failure_code,
         )
 
     def _finalize_pit_optimizer_call(
@@ -4343,7 +4567,7 @@ class OpenRouterGateway:
         *,
         authorization_lease: "AuthorizationRunLease",
         call_budget: "PitOptimizerCallBudget",
-    ) -> "PitOptimizerProviderFacts":
+    ) -> "PitOptimizerProviderFacts | PitOptimizerRoleAttempt":
         """Idempotently complete authorization and return verified terminal facts."""
 
         from core.pit_optimizer_authorization import (
@@ -4351,6 +4575,7 @@ class OpenRouterGateway:
             AuthorizationLedger,
             AuthorizationRunLease,
             PitOptimizerProviderFacts,
+            PitOptimizerRoleAttempt,
         )
 
         if not isinstance(self.authorization_ledger, AuthorizationLedger):
@@ -4407,6 +4632,12 @@ class OpenRouterGateway:
             )
         if not isinstance(facts, PitOptimizerProviderFacts):
             raise AuthorizationError("recovered optimizer facts are invalid")
+        if facts.outcome == "schema_invalid":
+            return PitOptimizerRoleAttempt(
+                plan=plan_snapshot,
+                facts=facts,
+                payload=None,
+            )
         return facts
 
     def request_pit_optimizer_once(
@@ -4420,19 +4651,27 @@ class OpenRouterGateway:
         frozen_pricing: "OptimizerPricingSnapshot",
         wall_deadline: float,
         monotonic: Callable[[], float],
-    ) -> "PitOptimizerRoleCall":
-        """Perform exactly one all-R1 schema-v3 call with durable accounting."""
+    ) -> "PitOptimizerRoleAttempt":
+        """Perform exactly one all-R1 optimizer call with durable accounting."""
 
         from core.pit_optimization_contract import (
             AuthorArtifact,
+            AuthorArtifactV4,
             AuthorInput,
+            AuthorInputV4,
             CriticArtifact,
+            CriticArtifactV4,
             CriticInput,
+            CriticInputV4,
             InvestigatorArtifact,
+            InvestigatorArtifactV4,
             InvestigatorInput,
+            InvestigatorInputV4,
             PIT_OPTIMIZER_V2_SYSTEM_PROMPTS,
+            PIT_OPTIMIZER_V4_SYSTEM_PROMPTS,
             PitOptimizerCallBudget,
             pit_optimizer_response_format,
+            pit_optimizer_v4_response_format,
         )
         from core.pit_optimizer_authorization import (
             AuthorizationError,
@@ -4441,13 +4680,13 @@ class OpenRouterGateway:
             AuthorizationRunLease,
             OptimizerPricingSnapshot,
             PitOptimizerProviderFacts,
-            PitOptimizerRoleCall,
+            PitOptimizerRoleAttempt,
         )
 
         role_inputs = {
-            "investigator": InvestigatorInput,
-            "author": AuthorInput,
-            "critic": CriticInput,
+            "investigator": (InvestigatorInput, InvestigatorInputV4),
+            "author": (AuthorInput, AuthorInputV4),
+            "critic": (CriticInput, CriticInputV4),
         }
         if (
             role not in role_inputs
@@ -4504,8 +4743,21 @@ class OpenRouterGateway:
         if recaptured_pricing != pricing_snapshot:
             raise AuthorizationError("optimizer pricing changed after authentication")
 
-        response_format = pit_optimizer_response_format(role)
-        static_bytes = PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role].encode("utf-8")
+        is_v4 = isinstance(
+            dynamic_input,
+            (InvestigatorInputV4, AuthorInputV4, CriticInputV4),
+        )
+        response_format = (
+            pit_optimizer_v4_response_format(role)
+            if is_v4
+            else pit_optimizer_response_format(role)
+        )
+        system_prompt = (
+            PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[role]
+            if is_v4
+            else PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role]
+        )
+        static_bytes = system_prompt.encode("utf-8")
         static_bytes += json.dumps(
             response_format,
             sort_keys=True,
@@ -4528,6 +4780,7 @@ class OpenRouterGateway:
         ).hexdigest()
         possibly_sent = False
         response_received = False
+        accounting_stage = "response_metadata"
         returned_model: str | None = None
         finish_reason: str | None = None
         request_failure_class: str | None = None
@@ -4556,6 +4809,7 @@ class OpenRouterGateway:
             request_failure_class: str | None = None,
             request_failure_status_code: int | None = None,
             response_validation_code: str | None = None,
+            accounting_failure_code: str | None = None,
             accounting_source: str | None = None,
         ) -> PitOptimizerProviderFacts:
             assert authorization_reservation is not None
@@ -4588,6 +4842,7 @@ class OpenRouterGateway:
                 request_failure_class=request_failure_class,
                 request_failure_status_code=request_failure_status_code,
                 response_validation_code=response_validation_code,
+                accounting_failure_code=accounting_failure_code,
                 accounting_source=accounting_source,
             )
 
@@ -4670,43 +4925,63 @@ class OpenRouterGateway:
                     "OpenRouter SDK construction failed",
                     status_code=_status_code(exc),
                 ) from exc
-            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
-                raise BudgetExceededError("PIT optimizer wall deadline reached")
             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
             if remaining <= 0:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
             messages = [
                 {
                     "role": "system",
-                    "content": PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role],
+                    "content": system_prompt,
                 },
                 {"role": "user", "content": dynamic_bytes.decode("utf-8")},
             ]
             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
             if remaining <= 0:
                 raise BudgetExceededError("PIT optimizer wall deadline reached")
-            remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
-            if remaining <= 0:
-                raise BudgetExceededError("PIT optimizer wall deadline reached")
             audit_sha256 = self._ensure_pit_optimizer_started_event(lifecycle)
             possibly_sent = True
+            generation_id_from_header: str | None = None
+            request_kwargs: dict[str, object] = {
+                "model": REASONER_MODEL,
+                "messages": messages,
+                "response_format": response_format,
+                "stream": False,
+                "max_tokens": plan_snapshot.max_output_tokens,
+                "timeout": min(self.timeout_seconds, remaining),
+                "extra_headers": {"X-Session-Id": f"{self.run_id}:{role}"},
+                "extra_body": {
+                    "provider": {"require_parameters": True},
+                    # DeepSeek R1 keeps its reasoning budget, but returns the
+                    # reasoning trace separately so ``message.content`` can
+                    # remain the strict JSON role payload we validate.
+                    "reasoning": {"exclude": True},
+                },
+            }
             try:
-                response = client.chat.completions.create(
-                    model=REASONER_MODEL,
-                    messages=messages,
-                    response_format=response_format,
-                    stream=False,
-                    max_tokens=plan_snapshot.max_output_tokens,
-                    timeout=min(self.timeout_seconds, remaining),
-                    extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
-                    extra_body={
-                        "provider": {"require_parameters": True},
-                        # DeepSeek R1 keeps its reasoning budget, but returns the
-                        # reasoning trace separately so ``message.content`` can
-                        # remain the strict JSON role payload we validate.
-                        "reasoning": {"exclude": True},
-                    },
-                )
+                completions = client.chat.completions
+                raw_completions = getattr(completions, "with_raw_response", None)
+                raw_create = getattr(raw_completions, "create", None)
+                if not callable(raw_create):
+                    response = completions.create(**request_kwargs)
+                else:
+                    raw_response = raw_create(**request_kwargs)
+                    parse = getattr(raw_response, "parse", None)
+                    headers = getattr(raw_response, "headers", None)
+                    http_response = getattr(raw_response, "http_response", None)
+                    if headers is None:
+                        headers = getattr(http_response, "headers", None)
+                    header_get = getattr(headers, "get", None)
+                    if callable(header_get):
+                        header_value = header_get("x-generation-id")
+                        if header_value is not None:
+                            generation_id_from_header = header_value
+                    raw_json = getattr(http_response, "json", None)
+                    if callable(raw_json):
+                        response = raw_json()
+                    else:
+                        if not callable(parse):
+                            raise GatewayError("OpenRouter raw response is invalid")
+                        response = parse()
             except Exception as exc:
                 lifecycle.response_processed = True
                 (
@@ -4740,19 +5015,52 @@ class OpenRouterGateway:
                 else "unknown"
             )
             recovered_semantics_valid = True
+            accounting_stage = "inline_usage"
             try:
-                usage = _usage_from_response(response, require_complete=True)
-            except AccountingValidationError:
+                usage = _usage_from_response(
+                    response,
+                    require_complete=True,
+                    allow_missing_cost=True,
+                    tolerate_optional_token_details=True,
+                )
+                usage = _complete_pit_optimizer_usage_with_frozen_pricing(
+                    usage,
+                    pricing_snapshot,
+                )
+            except (ResponseValidationError, ValueError):
+                # A received response can be billable even when its inline
+                # usage object is absent or malformed.  Both accounting and
+                # value-shape failures must take the same single bounded
+                # generation-receipt recovery path; otherwise an inline
+                # parsing exception skips the only authoritative recovery.
+                accounting_stage = "receipt_recovery"
                 try:
                     usage, recovered_semantics_valid = (
                         self._recover_pit_optimizer_generation_usage_once(
                             response,
                             REASONER_MODEL,
+                            generation_id_from_header=generation_id_from_header,
+                            pricing_snapshot=pricing_snapshot,
                             wall_deadline=float(wall_deadline),
                             monotonic=monotonic,
                         )
                     )
-                except AccountingValidationError as recovery_exc:
+                except (AccountingValidationError, ValueError) as recovery_exc:
+                    recovery_code = (
+                        recovery_exc.code
+                        if isinstance(recovery_exc, AccountingValidationError)
+                        else AccountingFailureCode.RECOVERY_PAYLOAD_INVALID
+                    )
+                    recovery_attempts = (
+                        recovery_exc.generation_attempts
+                        if isinstance(recovery_exc, AccountingValidationError)
+                        else 1
+                    )
+                    recovery_diagnostic = (
+                        recovery_exc.recovery_usage_diagnostic
+                        if isinstance(recovery_exc, AccountingValidationError)
+                        else None
+                    )
                     facts = provider_facts(
                         outcome="uncertain_accounting",
                         request_started=True,
@@ -4761,31 +5069,16 @@ class OpenRouterGateway:
                         finish_reason=finish_reason,
                         response_schema_valid=False,
                         usage=None,
+                        accounting_failure_code=recovery_code.value,
                     )
                     finalize(facts, Usage())
                     raise AccountingValidationError(
                         "optimizer response accounting is uncertain",
-                        code=recovery_exc.code,
-                        generation_attempts=recovery_exc.generation_attempts,
-                        recovery_usage_diagnostic=(
-                            recovery_exc.recovery_usage_diagnostic
-                        ),
+                        code=recovery_code,
+                        generation_attempts=recovery_attempts,
+                        recovery_usage_diagnostic=recovery_diagnostic,
                     ) from recovery_exc
-            except ResponseValidationError as exc:
-                facts = provider_facts(
-                    outcome="uncertain_accounting",
-                    request_started=True,
-                    response_received=True,
-                    returned_model=returned_model,
-                    finish_reason=finish_reason,
-                    response_schema_valid=False,
-                    usage=None,
-                )
-                finalize(facts, Usage())
-                raise AccountingValidationError(
-                    "optimizer response accounting is uncertain",
-                    code=AccountingFailureCode.INLINE_USAGE_INVALID,
-                ) from exc
+            accounting_stage = "accounting_bounds"
             assert usage.prompt_tokens is not None
             assert usage.completion_tokens is not None
             assert usage.total_tokens is not None
@@ -4815,6 +5108,7 @@ class OpenRouterGateway:
                 )
                 finalize(facts, usage, terminal_code="budget_exhausted")
                 raise BudgetExceededError("optimizer per-call provider cap exceeded")
+            accounting_stage = "response_validation"
             content = (
                 _read_field(choices[0], "message", "content")
                 if isinstance(choices, (list, tuple)) and len(choices) == 1
@@ -4872,14 +5166,25 @@ class OpenRouterGateway:
                     accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
-                raise ResponseValidationError(
-                    "optimizer response schema is invalid"
-                ) from exc
-            expected_payload_type = {
-                "investigator": InvestigatorArtifact,
-                "author": AuthorArtifact,
-                "critic": CriticArtifact,
-            }[role]
+                return PitOptimizerRoleAttempt(
+                    plan=plan_snapshot,
+                    facts=facts,
+                    payload=None,
+                )
+            accounting_stage = "artifact_binding"
+            expected_payload_type = (
+                {
+                    "investigator": InvestigatorArtifactV4,
+                    "author": AuthorArtifactV4,
+                    "critic": CriticArtifactV4,
+                }[role]
+                if is_v4
+                else {
+                    "investigator": InvestigatorArtifact,
+                    "author": AuthorArtifact,
+                    "critic": CriticArtifact,
+                }[role]
+            )
             if not isinstance(completion.payload, expected_payload_type):
                 facts = provider_facts(
                     outcome="schema_invalid",
@@ -4895,12 +5200,14 @@ class OpenRouterGateway:
                     accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
-                raise ResponseValidationError(
-                    "optimizer parser returned the wrong artifact type"
+                return PitOptimizerRoleAttempt(
+                    plan=plan_snapshot,
+                    facts=facts,
+                    payload=None,
                 )
             try:
                 role_snapshot.validate_artifact(completion.payload)
-            except ValueError as exc:
+            except ValueError:
                 facts = provider_facts(
                     outcome="schema_invalid",
                     request_started=True,
@@ -4910,14 +5217,17 @@ class OpenRouterGateway:
                     response_schema_valid=False,
                     usage=usage,
                     response_validation_code=(
-                        ProtocolFailureCode.PAYLOAD_FIELD_INVALID.value
+                        ProtocolFailureCode.PAYLOAD_BINDING_INVALID.value
                     ),
                     accounting_source=usage.accounting_source,
                 )
                 finalize(facts, usage)
-                raise ResponseValidationError(
-                    "optimizer artifact differs from its input"
-                ) from exc
+                return PitOptimizerRoleAttempt(
+                    plan=plan_snapshot,
+                    facts=facts,
+                    payload=None,
+                )
+            accounting_stage = "provider_facts"
             facts = provider_facts(
                 outcome="accepted",
                 request_started=True,
@@ -4928,11 +5238,17 @@ class OpenRouterGateway:
                 usage=usage,
                 accounting_source=usage.accounting_source,
             )
+            accounting_stage = "payload_digest"
             payload_digest = hashlib.sha256(
                 completion.payload.canonical_json_bytes()
             ).hexdigest()
+            accounting_stage = "publication"
             finalize(facts, usage, payload_sha256=payload_digest)
-            return PitOptimizerRoleCall(plan_snapshot, completion.payload, facts)
+            return PitOptimizerRoleAttempt(
+                plan=plan_snapshot,
+                facts=facts,
+                payload=completion.payload,
+            )
         except BaseException as original:
             outer_terminal_code = (
                 "cancelled"
@@ -5014,6 +5330,14 @@ class OpenRouterGateway:
                             ),
                             request_failure_status_code=(
                                 request_failure_status_code if possibly_sent else None
+                            ),
+                            accounting_failure_code=(
+                                _pit_optimizer_unexpected_accounting_code(
+                                    original,
+                                    stage=accounting_stage,
+                                )
+                                if possibly_sent and response_received
+                                else None
                             ),
                         )
                         pending_usage = Usage()
@@ -5288,6 +5612,8 @@ class OpenRouterGateway:
         response: object,
         expected_model: str,
         *,
+        generation_id_from_header: str | None = None,
+        pricing_snapshot: "OptimizerPricingSnapshot",
         wall_deadline: float,
         monotonic: Callable[[], float],
     ) -> tuple[Usage, bool]:
@@ -5299,7 +5625,11 @@ class OpenRouterGateway:
         the response already received, and never retries either request type.
         """
 
-        generation_id = _safe_generation_id(response)
+        generation_id = (
+            _safe_generation_id(response)
+            if generation_id_from_header is None
+            else _safe_generation_id_value(generation_id_from_header)
+        )
         if self._generation_loader is None and not self._generation_loader_is_builtin:
             raise AccountingValidationError(
                 "generation accounting recovery is unavailable",
@@ -5312,6 +5642,18 @@ class OpenRouterGateway:
                 code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
                 generation_attempts=0,
             )
+        # A completed non-streaming response can precede publication of its
+        # generation record.  Wait once before the canary's single permitted
+        # lookup; this does not retry a completion or issue a second lookup.
+        if remaining <= PIT_OPTIMIZER_GENERATION_PUBLICATION_WAIT_SECONDS:
+            raise AccountingValidationError(
+                "generation accounting recovery reached the wall deadline",
+                code=AccountingFailureCode.RECOVERY_DEADLINE_EXHAUSTED,
+                generation_attempts=0,
+            )
+        self._generation_sleeper(
+            PIT_OPTIMIZER_GENERATION_PUBLICATION_WAIT_SECONDS
+        )
         try:
             payload = (
                 self._load_generation_accounting(
@@ -5357,6 +5699,12 @@ class OpenRouterGateway:
             usage = _usage_from_generation_record(
                 payload,
                 generation_id=generation_id,
+                allow_missing_cost=True,
+                tolerate_optional_token_details=True,
+            )
+            usage = _complete_pit_optimizer_usage_with_frozen_pricing(
+                usage,
+                pricing_snapshot,
             )
         except AccountingValidationError as exc:
             raise AccountingValidationError(
@@ -5718,7 +6066,7 @@ class OpenRouterGateway:
         except (ValueError, TypeError) as exc:
             raise ClosedResponseValidationError(
                 "response payload validation failed",
-                ProtocolFailureCode.PAYLOAD_SCHEMA_INVALID,
+                _closed_payload_error_code(exc),
             ) from exc
         normalized_usage = usage or _usage_from_response(
             response, require_complete=require_complete_accounting
@@ -6085,6 +6433,8 @@ class SourceLock:
             stream = os.fdopen(descriptor, "r+b")
         except PreflightError:
             raise
+        except PermissionError as exc:
+            raise PreflightError("source lock permission denied") from exc
         except OSError as exc:
             raise PreflightError("source lock cannot be opened without following links") from exc
         try:
@@ -7513,6 +7863,20 @@ def _record_policy_secondary_errors(
         return
 
 
+def _has_policy_secondary_failure(exc: BaseException) -> bool:
+    """Return whether a worker failure carries cleanup/ownership uncertainty."""
+
+    try:
+        notes = getattr(exc, "__notes__", ())
+        return any(
+            isinstance(note, str)
+            and note.startswith("policy_worker_secondary_failure ")
+            for note in notes
+        )
+    except BaseException:
+        return True
+
+
 class PolicyWorkerSession:
     """One bounded authenticated JSON-lines session owned by a single fold."""
 
@@ -7528,6 +7892,7 @@ class PolicyWorkerSession:
         output_limit_bytes: int | None = None,
         wall_deadline: float | None = None,
         monotonic: Callable[[], float] | None = None,
+        startup_timeout_seconds: float = 30.0,
     ) -> None:
         from core.strategy_policy.worker import (
             DecisionDeterminismGuard,
@@ -7542,9 +7907,17 @@ class PolicyWorkerSession:
             or (monotonic is not None and not callable(monotonic))
         ):
             raise SandboxError("policy worker session timeout is invalid")
+        if (
+            not math.isfinite(startup_timeout_seconds)
+            or startup_timeout_seconds <= 0
+            or startup_timeout_seconds > 30.0
+        ):
+            raise SandboxError("policy worker startup timeout is invalid")
         if output_limit_bytes is not None and (
             type(output_limit_bytes) is not int
-            or not 1 <= output_limit_bytes <= 4 * 1024 * 1024
+            or not 1
+            <= output_limit_bytes
+            <= _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES
         ):
             raise SandboxError("policy worker session output limit is invalid")
         if wall_deadline is not None and (
@@ -7557,6 +7930,7 @@ class PolicyWorkerSession:
         self._daemon = daemon
         self._bootstrap = bootstrap
         self._method_timeout_seconds = method_timeout_seconds
+        self._startup_timeout_seconds = float(startup_timeout_seconds)
         self._fold_timeout_seconds = float(fold_timeout_seconds)
         self._output_limit_bytes = output_limit_bytes
         self._wall_deadline = (
@@ -7567,12 +7941,13 @@ class PolicyWorkerSession:
         self._sequence = 1
         self._previous_hmac = initial_chain_sha256(bootstrap)
         self._guard = DecisionDeterminismGuard()
+        self._ready = False
         self._closed = False
+        self._cleanup_errors: tuple[_PolicySecondaryFailure, ...] | None = None
         self._lock = threading.Lock()
         self._stdout_values: queue.Queue[bytes | BaseException | None] = queue.Queue()
         self._stderr = bytearray()
         self._stderr_sha256 = hashlib.sha256()
-        self._stdout_bytes = 0
         self._stderr_bytes = 0
         self._output_limit_exceeded = threading.Event()
         self._stdout_thread = threading.Thread(
@@ -7588,6 +7963,87 @@ class PolicyWorkerSession:
         self._stdout_thread.start()
         self._stderr_thread.start()
 
+    def _raise_contained_failure(
+        self,
+        exc: BaseException,
+        *,
+        operation: str,
+    ) -> None:
+        cleanup_errors = self.close(primary_error=exc)
+        if cleanup_errors or _has_policy_secondary_failure(exc):
+            raise SandboxError(
+                "policy worker cleanup could not be fully verified"
+            ) from exc
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, SandboxError)):
+            raise exc
+        if isinstance(exc, PolicyWorkerOperationalFailure):
+            raise exc
+        raise PolicyWorkerOperationalFailure(operation) from exc
+
+    def await_ready(self) -> None:
+        from core.strategy_policy.worker import decode_worker_ready
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("policy worker session is closed")
+            if self._ready:
+                raise RuntimeError("policy worker session is already ready")
+            if self._output_limit_exceeded.is_set():
+                output_error = PolicyWorkerOperationalFailure(
+                    "policy worker output limit exceeded"
+                )
+                self.close(primary_error=output_error)
+                raise output_error
+            observed_at = float(self._monotonic())
+            remaining_fold = self._fold_timeout_seconds - (
+                observed_at - self._started_at
+            )
+            remaining_wall = (
+                remaining_fold
+                if self._wall_deadline is None
+                else self._wall_deadline - observed_at
+            )
+            remaining = min(remaining_fold, remaining_wall)
+            if remaining <= 0:
+                timeout_error = TimeoutError("policy worker startup deadline")
+                self._raise_contained_failure(
+                    timeout_error,
+                    operation="policy worker startup failed",
+                )
+            try:
+                try:
+                    result = self._stdout_values.get(
+                        timeout=min(self._startup_timeout_seconds, remaining)
+                    )
+                except queue.Empty as exc:
+                    raise TimeoutError("policy worker startup timeout") from exc
+                if self._output_limit_exceeded.is_set():
+                    raise PolicyWorkerOperationalFailure(
+                        "policy worker output limit exceeded"
+                    )
+                if result is None:
+                    raise RuntimeError("policy worker closed before readiness")
+                if isinstance(result, BaseException):
+                    raise RuntimeError("policy worker output failed") from result
+                if len(result) > 16 * 1024 + 1:
+                    raise SandboxError("policy worker readiness line limit exceeded")
+                try:
+                    ready_line = result.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise SandboxError("policy worker readiness is not UTF-8") from exc
+                try:
+                    decode_worker_ready(ready_line, bootstrap=self._bootstrap)
+                except (TypeError, ValueError) as exc:
+                    raise SandboxError(
+                        "policy worker readiness authentication failed"
+                    ) from exc
+                self._ready = True
+            except BaseException as exc:
+                self._raise_contained_failure(
+                    exc,
+                    operation="policy worker startup failed",
+                )
+
     @property
     def stderr_bytes(self) -> bytes:
         return bytes(self._stderr)
@@ -7599,16 +8055,12 @@ class PolicyWorkerSession:
                 if not raw:
                     self._stdout_values.put(None)
                     return
-                self._stdout_bytes += len(raw)
-                if (
-                    self._output_limit_bytes is not None
-                    and self._stdout_bytes > self._output_limit_bytes
-                ):
-                    self._output_limit_exceeded.set()
-                    self._stdout_values.put(
-                        SandboxError("policy worker stdout output limit exceeded")
-                    )
-                    return
+                # A panel legitimately emits one authenticated response for every
+                # policy decision.  Bounding their cumulative bytes makes the
+                # allowable panel size depend on response verbosity and rejects
+                # ordinary multi-year discovery runs.  Each response remains
+                # independently capped below and is consumed synchronously by
+                # ``call``; stderr retains the cumulative runaway-output limit.
                 self._stdout_values.put(raw)
         except BaseException as exc:
             self._stdout_values.put(exc)
@@ -7627,7 +8079,9 @@ class PolicyWorkerSession:
                 ):
                     self._output_limit_exceeded.set()
                     self._stdout_values.put(
-                        SandboxError("policy worker stderr output limit exceeded")
+                        PolicyWorkerOperationalFailure(
+                            "policy worker stderr output limit exceeded"
+                        )
                     )
                     return
                 capture_limit = min(
@@ -7649,8 +8103,12 @@ class PolicyWorkerSession:
         with self._lock:
             if self._closed:
                 raise RuntimeError("policy worker session is closed")
+            if not self._ready:
+                raise RuntimeError("policy worker session is not ready")
             if self._output_limit_exceeded.is_set():
-                output_error = SandboxError("policy worker output limit exceeded")
+                output_error = PolicyWorkerOperationalFailure(
+                    "policy worker output limit exceeded"
+                )
                 self.close(primary_error=output_error)
                 raise output_error
             observed_at = float(self._monotonic())
@@ -7665,8 +8123,10 @@ class PolicyWorkerSession:
             remaining = min(remaining_fold, remaining_wall)
             if remaining <= 0:
                 timeout_error = TimeoutError("policy worker execution deadline")
-                self.close(primary_error=timeout_error)
-                raise timeout_error
+                self._raise_contained_failure(
+                    timeout_error,
+                    operation="policy worker execution failed",
+                )
             request_line, request = encode_policy_request(
                 bootstrap=self._bootstrap,
                 sequence=self._sequence,
@@ -7684,31 +8144,40 @@ class PolicyWorkerSession:
                 except queue.Empty as exc:
                     raise TimeoutError("policy worker method timeout") from exc
                 if self._output_limit_exceeded.is_set():
-                    raise SandboxError("policy worker output limit exceeded")
+                    raise PolicyWorkerOperationalFailure(
+                        "policy worker output limit exceeded"
+                    )
                 if result is None:
                     raise RuntimeError("policy worker closed before a response")
                 if isinstance(result, BaseException):
                     raise RuntimeError("policy worker output failed") from result
                 if len(result) > 16 * 1024 + 1:
-                    raise ValueError("policy worker response line limit exceeded")
+                    raise SandboxError("policy worker response line limit exceeded")
                 try:
                     response_line = result.decode("utf-8", errors="strict")
                 except UnicodeDecodeError as exc:
-                    raise ValueError("policy worker response is not UTF-8") from exc
-                _response, decision = decode_policy_response(
-                    response_line,
-                    bootstrap=self._bootstrap,
-                    expected_sequence=self._sequence,
-                    expected_request_hmac_sha256=request.hmac_sha256,
-                    expected_method=method,
-                )
+                    raise SandboxError("policy worker response is not UTF-8") from exc
+                try:
+                    _response, decision = decode_policy_response(
+                        response_line,
+                        bootstrap=self._bootstrap,
+                        expected_sequence=self._sequence,
+                        expected_request_hmac_sha256=request.hmac_sha256,
+                        expected_method=method,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise SandboxError(
+                        "policy worker response authentication failed"
+                    ) from exc
                 self._guard.observe(method, snapshot, decision)
                 self._previous_hmac = request.hmac_sha256
                 self._sequence += 1
                 return decision
             except BaseException as exc:
-                self.close(primary_error=exc)
-                raise
+                self._raise_contained_failure(
+                    exc,
+                    operation="policy worker execution failed",
+                )
 
     def validate_determinism(self, probes: tuple[object, ...]) -> None:
         from core.strategy_policy.worker import validate_policy_determinism_probes
@@ -7720,12 +8189,20 @@ class PolicyWorkerSession:
                 self.call(probe.method, probe.unrelated_snapshot)
                 self.call(probe.method, probe.repeated_snapshot)
         except BaseException as exc:
-            self.close(primary_error=exc)
+            cleanup_errors = self.close(primary_error=exc)
+            if cleanup_errors or _has_policy_secondary_failure(exc):
+                raise SandboxError(
+                    "policy worker cleanup could not be fully verified"
+                ) from exc
             raise
 
-    def close(self, *, primary_error: BaseException | None = None) -> None:
+    def close(
+        self,
+        *,
+        primary_error: BaseException | None = None,
+    ) -> tuple[_PolicySecondaryFailure, ...]:
         if self._closed:
-            return
+            return self._cleanup_errors or ()
         self._closed = True
         errors = _cleanup_unowned_policy_process(self._process)
         for thread, action in (
@@ -7781,6 +8258,7 @@ class PolicyWorkerSession:
                     _PolicySecondaryReason.EXCEPTION,
                 )
             )
+        self._cleanup_errors = tuple(errors)
         if errors:
             if primary_error is not None:
                 _record_policy_secondary_errors(primary_error, errors)
@@ -7788,6 +8266,7 @@ class PolicyWorkerSession:
                 raise SandboxError(
                     "policy worker cleanup could not be fully verified"
                 ) from None
+        return self._cleanup_errors
 
 
 class PolicyWorkerRunner:
@@ -7807,6 +8286,7 @@ class PolicyWorkerRunner:
         output_limit_bytes: int | None = None,
         wall_deadline: float | None = None,
         monotonic: Callable[[], float] | None = None,
+        startup_timeout_seconds: float = 30.0,
     ) -> None:
         if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image or "") is None:
             raise SandboxError("policy worker image must be digest pinned")
@@ -7824,7 +8304,9 @@ class PolicyWorkerRunner:
             raise SandboxError("policy worker fold timeout is invalid")
         if output_limit_bytes is not None and (
             type(output_limit_bytes) is not int
-            or not 1 <= output_limit_bytes <= 4 * 1024 * 1024
+            or not 1
+            <= output_limit_bytes
+            <= _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES
         ):
             raise SandboxError("policy worker output limit is invalid")
         if wall_deadline is not None and (
@@ -7834,6 +8316,12 @@ class PolicyWorkerRunner:
             raise SandboxError("policy worker wall deadline is invalid")
         if monotonic is not None and not callable(monotonic):
             raise SandboxError("policy worker monotonic clock is invalid")
+        if (
+            not math.isfinite(startup_timeout_seconds)
+            or startup_timeout_seconds <= 0
+            or startup_timeout_seconds > 30.0
+        ):
+            raise SandboxError("policy worker startup timeout is invalid")
         self.image = image
         self._process_factory = process_factory
         self._control_runner = control_runner
@@ -7863,6 +8351,7 @@ class PolicyWorkerRunner:
             raise SandboxError("policy worker temporary parent is invalid")
         self.temp_parent = parent.resolve()
         self.method_timeout_seconds = float(method_timeout_seconds)
+        self.startup_timeout_seconds = float(startup_timeout_seconds)
         self.fold_timeout_seconds = float(fold_timeout_seconds)
         self.output_limit_bytes = (
             64 * 1024 if output_limit_bytes is None else output_limit_bytes
@@ -8202,14 +8691,22 @@ class PolicyWorkerRunner:
                     output_limit=min(64 * 1024, self.output_limit_bytes),
                 )
             except BaseException as exc:
-                create_error = exc
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    create_error = exc
+                else:
+                    create_error = PolicyWorkerOperationalFailure(
+                        "policy daemon creation failed"
+                    )
+                    create_error.__cause__ = exc
                 created = None
             if create_error is None and (
                 not isinstance(created, ProcessResult)
                 or created.timed_out
                 or created.returncode != 0
             ):
-                create_error = SandboxError("policy daemon creation failed")
+                create_error = PolicyWorkerOperationalFailure(
+                    "policy daemon creation failed"
+                )
             if create_error is not None:
                 daemon = recover_failed_create(create_error)
                 raise create_error
@@ -8243,16 +8740,23 @@ class PolicyWorkerRunner:
                 "--interactive",
                 container_id,
             ]
-            process = self._process_factory(
-                argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                close_fds=True,
-                bufsize=0,
-                env=environment,
-            )
+            try:
+                process = self._process_factory(
+                    argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
+                    close_fds=True,
+                    bufsize=0,
+                    env=environment,
+                )
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise PolicyWorkerOperationalFailure(
+                    "policy daemon attach failed"
+                ) from exc
             bootstrap = WorkerBootstrap.create(interface_version=interface_version)
             session = PolicyWorkerSession(
                 process=process,
@@ -8264,13 +8768,17 @@ class PolicyWorkerRunner:
                 output_limit_bytes=self._session_output_limit_bytes,
                 wall_deadline=self.wall_deadline,
                 monotonic=self._monotonic,
+                startup_timeout_seconds=self.startup_timeout_seconds,
             )
             try:
                 process.stdin.write(bootstrap.to_json().encode("utf-8") + b"\n")
                 process.stdin.flush()
+                session.await_ready()
             except BaseException as exc:
-                session.close(primary_error=exc)
-                raise
+                session._raise_contained_failure(
+                    exc,
+                    operation="policy worker bootstrap failed",
+                )
             return session
         except BaseException as primary_error:
             cleanup_errors: list[_PolicySecondaryFailure] = []
@@ -8293,6 +8801,10 @@ class PolicyWorkerRunner:
                 primary_error,
                 cleanup_errors,
             )
+            if cleanup_errors or _has_policy_secondary_failure(primary_error):
+                raise SandboxError(
+                    "policy worker cleanup could not be fully verified"
+                ) from primary_error
             raise
 
     def client_factory(
@@ -8330,7 +8842,11 @@ class PolicyWorkerRunner:
                     interface_version=interface_version,
                 )
             except BaseException as exc:
-                session.close(primary_error=exc)
+                cleanup_errors = session.close(primary_error=exc)
+                if cleanup_errors or _has_policy_secondary_failure(exc):
+                    raise SandboxError(
+                        "policy worker cleanup could not be fully verified"
+                    ) from exc
                 raise
 
         return create_client
@@ -9300,12 +9816,15 @@ def _parse_unified_diff(
     raw: str,
     *,
     bounds: object | None = None,
+    allow_plain_unified_diff: bool = False,
 ) -> ParsedPatch:
     from core.pit_optimization_contract import PatchBounds
 
     effective_bounds = bounds or PatchBounds(4, 25, 400, _MAX_DIFF_BYTES)
     if not isinstance(effective_bounds, PatchBounds):
         raise PatchPolicyError("patch bounds are invalid")
+    if type(allow_plain_unified_diff) is not bool:
+        raise PatchPolicyError("plain unified diff policy must be boolean")
     if not isinstance(raw, str) or not raw:
         raise PatchPolicyError("patch is blank")
     if len(raw.encode("utf-8")) > effective_bounds.max_diff_bytes:
@@ -9323,15 +9842,21 @@ def _parse_unified_diff(
     index = 0
     while index < len(lines):
         header = lines[index][:-1]
-        if not header.startswith("diff --git "):
-            raise PatchPolicyError("patch must contain only conventional diff --git sections")
-        fields = header.split(" ")
-        if len(fields) != 4 or not fields[2].startswith("a/") or not fields[3].startswith("b/"):
-            raise PatchPolicyError("malformed or combined diff header")
-        old_path = canonical_patch_path(fields[2][2:])
-        new_path = canonical_patch_path(fields[3][2:])
-        if old_path != new_path:
-            raise PatchPolicyError("renames and copies are forbidden")
+        has_git_header = header.startswith("diff --git ")
+        if has_git_header:
+            fields = header.split(" ")
+            if len(fields) != 4 or not fields[2].startswith("a/") or not fields[3].startswith("b/"):
+                raise PatchPolicyError("malformed or combined diff header")
+            old_path = canonical_patch_path(fields[2][2:])
+            new_path = canonical_patch_path(fields[3][2:])
+            if old_path != new_path:
+                raise PatchPolicyError("renames and copies are forbidden")
+        else:
+            if not allow_plain_unified_diff:
+                raise PatchPolicyError("patch must contain only conventional diff --git sections")
+            if not header.startswith("--- a/"):
+                raise PatchPolicyError("plain unified diff requires an old-file header")
+            old_path = canonical_patch_path(header[len("--- a/") :])
         folded_path = old_path.casefold()
         if folded_path in folded and folded[folded_path] != old_path:
             raise PatchPolicyError("case-colliding patch paths are forbidden")
@@ -9340,19 +9865,26 @@ def _parse_unified_diff(
         folded[folded_path] = old_path
         files.append(old_path)
         index += 1
-        if index >= len(lines):
-            raise PatchPolicyError("incomplete diff section")
-        metadata = lines[index][:-1]
-        if not re.fullmatch(r"index [0-9a-fA-F]+\.\.[0-9a-fA-F]+ 100644", metadata):
-            raise PatchPolicyError("target diff mode must be explicitly 100644")
-        index += 1
-        if index + 1 >= len(lines):
-            raise PatchPolicyError("diff section lacks file headers")
-        if lines[index][:-1] != f"--- a/{old_path}" or lines[index + 1][:-1] != f"+++ b/{old_path}":
-            raise PatchPolicyError("malformed or non-matching file headers")
-        index += 2
+        if has_git_header:
+            if index >= len(lines):
+                raise PatchPolicyError("incomplete diff section")
+            metadata = lines[index][:-1]
+            if not re.fullmatch(r"index [0-9a-fA-F]+\.\.[0-9a-fA-F]+ 100644", metadata):
+                raise PatchPolicyError("target diff mode must be explicitly 100644")
+            index += 1
+            if index + 1 >= len(lines):
+                raise PatchPolicyError("diff section lacks file headers")
+            if lines[index][:-1] != f"--- a/{old_path}" or lines[index + 1][:-1] != f"+++ b/{old_path}":
+                raise PatchPolicyError("malformed or non-matching file headers")
+            index += 2
+        else:
+            if index >= len(lines) or lines[index][:-1] != f"+++ b/{old_path}":
+                raise PatchPolicyError("plain unified diff has malformed file headers")
+            index += 1
         section_hunks = 0
-        while index < len(lines) and not lines[index].startswith("diff --git "):
+        while index < len(lines) and not lines[index].startswith("diff --git ") and not (
+            allow_plain_unified_diff and lines[index].startswith("--- a/")
+        ):
             text = lines[index][:-1]
             if text.startswith(_STRUCTURAL_DIFF_PREFIXES) or text.startswith(("diff --cc ", "diff --combined ", "@@@")):
                 raise PatchPolicyError("structural, binary, or combined diffs are forbidden")
@@ -9408,15 +9940,22 @@ def validate_unified_diff(
     editable_paths: Sequence[str] = (),
     gate: str = "test",
     allow_protected_backtest_paths: bool = False,
+    allow_plain_unified_diff: bool = False,
     bounds: object | None = None,
     git: GitCapability | None = None,
 ) -> ParsedPatch:
     """Apply all path, structure, cap, mode, scope, and live-reference policy before Git."""
     if type(allow_protected_backtest_paths) is not bool:
         raise PatchPolicyError("protected backtest path policy must be boolean")
+    if type(allow_plain_unified_diff) is not bool:
+        raise PatchPolicyError("plain unified diff policy must be boolean")
     if allow_protected_backtest_paths and gate != "backtest":
         raise PatchPolicyError("protected backtest paths require the backtest gate")
-    parsed = _parse_unified_diff(raw, bounds=bounds)
+    parsed = _parse_unified_diff(
+        raw,
+        bounds=bounds,
+        allow_plain_unified_diff=allow_plain_unified_diff,
+    )
     try:
         declared = tuple(canonical_patch_path(path) for path in declared_files)
         extra_editable = {canonical_patch_path(path) for path in editable_paths}
@@ -12012,11 +12551,15 @@ class LoopConfig:
         except ImportError:
             pit_gate_type = ()
         try:
-            from core.pit_optimization import PitOptimizationGateConfig
+            from core.pit_optimization import (
+                PitOptimizationGateConfig,
+                PitOptimizerGateConfigV4,
+            )
             from core.pit_optimization_contract import PitOptimizerGateConfig
             optimization_gate_type: tuple[type[object], ...] = (
                 PitOptimizationGateConfig,
                 PitOptimizerGateConfig,
+                PitOptimizerGateConfigV4,
             )
         except ImportError:
             optimization_gate_type = ()
@@ -12061,7 +12604,10 @@ class LoopConfig:
                     raise ConfigurationError(
                         "PIT optimization input must not overlap the permanent runtime"
                     )
-            if isinstance(self.gate, PitOptimizerGateConfig):
+            if isinstance(
+                self.gate,
+                (PitOptimizerGateConfig, PitOptimizerGateConfigV4),
+            ):
                 expected_context = (
                     source,
                     runtime,
@@ -12084,7 +12630,7 @@ class LoopConfig:
             raise ConfigurationError("models must be a validated config")
         if optimization_gate_type and isinstance(
             self.gate,
-            PitOptimizerGateConfig,
+            (PitOptimizerGateConfig, PitOptimizerGateConfigV4),
         ):
             if not isinstance(self.limits, PitOptimizerLoopLimits):
                 raise ConfigurationError(
@@ -12982,7 +13528,10 @@ class AuditTrail:
             raise AuditError("audit manifest source head is invalid")
         if _SHA256_RE.fullmatch(source_fingerprint_sha256) is None:
             raise AuditError("audit manifest source fingerprint is invalid")
-        from core.pit_optimization import PitOptimizationGateConfig
+        from core.pit_optimization import (
+            PitOptimizationGateConfig,
+            PitOptimizerGateConfigV4,
+        )
 
         if isinstance(config.gate, TestGateConfig):
             gate: dict[str, object] = {
@@ -13019,6 +13568,46 @@ class AuditTrail:
                 "prior_discovery_feedback_sha256": (
                     config.gate.prior_discovery_feedback_sha256
                 ),
+            }
+        elif isinstance(config.gate, PitOptimizerGateConfigV4):
+            gate = {
+                "kind": "pit_optimizer_v4",
+                "phase": config.gate.phase,
+                "baseline_run": config.gate.baseline_run,
+                "pit_bundle": config.gate.pit_bundle,
+                "pit_bundle_sha256": config.gate.pit_bundle_sha256,
+                "optimizer_manifest": config.gate.optimizer_manifest,
+                "optimizer_manifest_sha256": config.gate.optimizer_manifest_sha256,
+                "discovery_panel_plan": config.gate.discovery_panel_plan,
+                "discovery_panel_plan_sha256": (
+                    config.gate.discovery_panel_plan_sha256
+                ),
+                "qualification_panel_plan": config.gate.qualification_panel_plan,
+                "qualification_panel_plan_sha256": (
+                    config.gate.qualification_panel_plan_sha256
+                ),
+                "qualification_ledger": config.gate.qualification_ledger,
+                "qualification_ledger_snapshot_sha256": (
+                    config.gate.qualification_ledger_snapshot_sha256
+                ),
+                "readiness_artifact": config.gate.readiness_artifact,
+                "readiness_sha256": config.gate.readiness_sha256,
+                "campaign_checkpoint": config.gate.campaign_checkpoint,
+                "campaign_checkpoint_sha256": (
+                    config.gate.campaign_checkpoint_sha256
+                ),
+                "authorization_window_id": config.gate.authorization_window_id,
+                "authorization_requirement_sha256": (
+                    config.gate.authorization_requirement_sha256
+                ),
+                "source_transmission_authorized": (
+                    config.gate.source_transmission_authorized
+                ),
+                "max_api_calls": config.gate.max_api_calls,
+                "max_tokens": config.gate.max_tokens,
+                "max_iterations": config.gate.max_iterations,
+                "apply": config.gate.apply,
+                "sandbox_image": config.gate.sandbox_image,
             }
         else:
             gate = {
@@ -13306,6 +13895,8 @@ class AuditTrail:
             details["protocol_failure_code"] = record.protocol_failure_code.value
         if record.response_validation_code is not None:
             details["response_validation_code"] = record.response_validation_code
+        if record.accounting_failure_code is not None:
+            details["accounting_failure_code"] = record.accounting_failure_code
         if payload_sha256 is not None:
             details["payload_sha256"] = payload_sha256
         if run_manifest_sha256 is not None:
@@ -13601,6 +14192,7 @@ class AuditTrail:
             request_failure_class=record.request_failure_class,
             request_failure_status_code=record.request_failure_status_code,
             response_validation_code=record.response_validation_code,
+            accounting_failure_code=record.accounting_failure_code,
             accounting_source=record.accounting_source,
         )
 
@@ -13850,7 +14442,7 @@ class AuditTrail:
             lifecycle_digest,
         )
         terminal_code = terminal_details.get("terminal_code")
-        if record.outcome == "accepted":
+        if record.outcome in {"accepted", "schema_invalid"}:
             if terminal_code not in {
                 None,
                 "failed",
@@ -13858,6 +14450,10 @@ class AuditTrail:
                 "budget_exhausted",
             }:
                 raise AuditError("optimizer audit terminal code is invalid")
+            if record.outcome == "schema_invalid" and terminal_code is not None:
+                raise AuditError(
+                    "accounted invalid optimizer audit cannot close the lease"
+                )
         elif terminal_code not in {
             "failed",
             "cancelled",
@@ -13912,6 +14508,10 @@ class AuditTrail:
             expected_details["response_validation_code"] = (
                 record.response_validation_code
             )
+        if record.accounting_failure_code is not None:
+            expected_details["accounting_failure_code"] = (
+                record.accounting_failure_code
+            )
         if record.retained_reservation_tokens is not None:
             expected_details["retained_reservation_tokens"] = (
                 record.retained_reservation_tokens
@@ -13920,10 +14520,10 @@ class AuditTrail:
             raise AuditError("optimizer terminal audit evidence differs")
         if type(terminal_details.get("response_processed")) is not bool:
             raise AuditError("optimizer response processing evidence is invalid")
-        if record.outcome == "accepted" and not terminal_details[
+        if record.outcome in {"accepted", "schema_invalid"} and not terminal_details[
             "response_processed"
         ]:
-            raise AuditError("optimizer accepted response was not processed")
+            raise AuditError("optimizer response was not processed")
         return terminal, facts, budget_state
 
     def verify_terminal_audit_receipt(
@@ -18686,6 +19286,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--readiness-sha256")
     parser.add_argument("--optimizer-manifest", type=Path)
     parser.add_argument("--optimizer-manifest-sha256")
+    parser.add_argument("--discovery-panel-plan", type=Path)
+    parser.add_argument("--discovery-panel-plan-sha256")
+    parser.add_argument("--qualification-panel-plan", type=Path)
+    parser.add_argument("--qualification-panel-plan-sha256")
+    parser.add_argument("--qualification-ledger", type=Path)
+    parser.add_argument("--qualification-ledger-snapshot-sha256")
+    parser.add_argument("--campaign-checkpoint", type=Path)
+    parser.add_argument("--campaign-checkpoint-sha256")
     parser.add_argument("--verified-parity", type=Path)
     parser.add_argument("--verified-parity-sha256")
     parser.add_argument("--optimizer-authorization-window-id")
@@ -18946,6 +19554,189 @@ def _build_pit_optimizer_v3_config(
     return config
 
 
+def _build_pit_optimizer_v4_config(namespace: argparse.Namespace) -> object:
+    """Build a closed schema-v4 gate from authenticated manifest/panel inputs."""
+
+    from core.pit_optimization import PitOptimizerGateConfigV4
+    from core.pit_optimization_contract import load_pit_optimizer_manifest_v4
+    from core.pit_optimizer_evaluation import (
+        _panel_plan_pair_is_consistent,
+        load_discovery_panel_plan,
+        load_qualification_panel_plan,
+    )
+
+    phase = getattr(namespace, "optimization_phase", None)
+    manifest_path = _absolute_cli_path(
+        getattr(namespace, "optimizer_manifest", None),
+        "optimizer manifest",
+    )
+    manifest_sha256 = getattr(namespace, "optimizer_manifest_sha256", None)
+    panel_path = _absolute_cli_path(
+        getattr(namespace, "discovery_panel_plan", None),
+        "discovery panel plan",
+    )
+    panel_sha256 = getattr(namespace, "discovery_panel_plan_sha256", None)
+    qualification_path = _absolute_cli_path(
+        getattr(namespace, "qualification_panel_plan", None),
+        "qualification panel plan",
+    )
+    qualification_sha256 = getattr(
+        namespace,
+        "qualification_panel_plan_sha256",
+        None,
+    )
+    qualification_ledger = _absolute_cli_path(
+        getattr(namespace, "qualification_ledger", None),
+        "qualification ledger",
+    )
+    qualification_ledger_snapshot_sha256 = getattr(
+        namespace,
+        "qualification_ledger_snapshot_sha256",
+        None,
+    )
+    if (
+        _SHA256_RE.fullmatch(manifest_sha256 or "") is None
+        or _SHA256_RE.fullmatch(panel_sha256 or "") is None
+        or _SHA256_RE.fullmatch(qualification_sha256 or "") is None
+        or _SHA256_RE.fullmatch(qualification_ledger_snapshot_sha256 or "")
+        is None
+    ):
+        raise ConfigurationError("optimizer v4 sealed input digest is invalid")
+    try:
+        panel = load_discovery_panel_plan(panel_path)
+        if hashlib.sha256(panel_path.read_bytes()).hexdigest() != panel_sha256:
+            raise ValueError("optimizer v4 discovery panel digest differs")
+        qualification = load_qualification_panel_plan(qualification_path)
+        if (
+            hashlib.sha256(qualification_path.read_bytes()).hexdigest()
+            != qualification_sha256
+        ):
+            raise ValueError("optimizer v4 qualification panel digest differs")
+        _panel_plan_pair_is_consistent(qualification, panel)
+        if (
+            qualification_ledger_snapshot_sha256
+            != panel.qualification_ledger_snapshot_sha256
+        ):
+            raise ValueError("optimizer v4 qualification ledger snapshot differs")
+        manifest = load_pit_optimizer_manifest_v4(
+            manifest_path,
+            expected_sha256=manifest_sha256,
+            discovery_panel_plan=panel,
+        )
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    checkpoint = getattr(namespace, "campaign_checkpoint", None)
+    checkpoint_sha256 = getattr(namespace, "campaign_checkpoint_sha256", None)
+    if (checkpoint is None) != (checkpoint_sha256 is None):
+        raise ConfigurationError(
+            "campaign checkpoint path and SHA-256 must be supplied together"
+        )
+    if manifest.seed_checkpoint_sha256 != checkpoint_sha256:
+        raise ConfigurationError("optimizer v4 manifest checkpoint differs")
+    supplied_requirement = getattr(
+        namespace,
+        "optimizer_authorization_requirement_sha256",
+        None,
+    )
+    authorization_window_id = getattr(
+        namespace,
+        "optimizer_authorization_window_id",
+        None,
+    )
+    if supplied_requirement not in {
+        None,
+        manifest.authorization_requirement.sha256,
+    }:
+        raise ConfigurationError(
+            "optimizer v4 authorization requirement differs from manifest"
+        )
+    if phase == "prepare":
+        if authorization_window_id is not None:
+            raise ConfigurationError(
+                "optimizer v4 prepare cannot carry an authorization window"
+            )
+    elif (
+        authorization_window_id != manifest.authorization_requirement.window_id
+        or supplied_requirement != manifest.authorization_requirement.sha256
+    ):
+        raise ConfigurationError(
+            "optimizer v4 canary authority differs from manifest"
+        )
+    artifact_root = _absolute_cli_path(
+        getattr(namespace, "artifact_root", None),
+        "artifact root",
+    )
+    readiness_artifact = artifact_root / f"{manifest.campaign_id}.readiness.json"
+    try:
+        return PitOptimizerGateConfigV4(
+            phase=phase,
+            baseline_run=_absolute_cli_path(
+                getattr(namespace, "baseline_run", None),
+                "baseline run",
+            ),
+            pit_bundle=_absolute_cli_path(
+                getattr(namespace, "pit_bundle", None),
+                "PIT bundle",
+            ),
+            pit_bundle_sha256=getattr(namespace, "pit_bundle_sha256", None),
+            optimizer_manifest=manifest_path,
+            optimizer_manifest_sha256=manifest_sha256,
+            discovery_panel_plan=panel_path,
+            discovery_panel_plan_sha256=panel_sha256,
+            qualification_panel_plan=qualification_path,
+            qualification_panel_plan_sha256=qualification_sha256,
+            qualification_ledger=qualification_ledger,
+            qualification_ledger_snapshot_sha256=(
+                qualification_ledger_snapshot_sha256
+            ),
+            readiness_artifact=readiness_artifact,
+            readiness_sha256=getattr(namespace, "readiness_sha256", None),
+            campaign_checkpoint=(
+                None
+                if checkpoint is None
+                else _absolute_cli_path(checkpoint, "campaign checkpoint")
+            ),
+            campaign_checkpoint_sha256=checkpoint_sha256,
+            authorization_window_id=authorization_window_id,
+            authorization_requirement_sha256=(
+                manifest.authorization_requirement.sha256
+            ),
+            source_transmission_authorized=getattr(
+                namespace,
+                "authorize_policy_source_transmission",
+                False,
+            ),
+            max_api_calls=getattr(namespace, "max_api_calls", None),
+            max_tokens=getattr(namespace, "max_tokens", None),
+            max_iterations=getattr(namespace, "max_iterations", None),
+            apply=getattr(namespace, "apply", None),
+            source_root=_absolute_cli_path(
+                getattr(namespace, "repo_root", None),
+                "repository root",
+            ),
+            permanent_runtime_root=_absolute_cli_path(
+                getattr(namespace, "permanent_runtime_root", None),
+                "permanent runtime root",
+            ),
+            controller_temp_parent=_absolute_cli_path(
+                getattr(namespace, "controller_temp_parent", None),
+                "controller temporary parent",
+            ),
+            artifact_root=artifact_root,
+            git_executable=_absolute_cli_path(
+                getattr(namespace, "git_executable", None),
+                "Git executable",
+            ),
+            docker_executable=_absolute_cli_path(
+                getattr(namespace, "docker_executable", None),
+                "Docker executable",
+            ),
+            sandbox_image=getattr(namespace, "sandbox_image", None),
+        )
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class PitOptimizerLiveRun:
     """Authenticated schema-v3 readiness paired with injected live capabilities."""
@@ -18955,24 +19746,48 @@ class PitOptimizerLiveRun:
 
 
 @dataclass(frozen=True, slots=True)
+class PitOptimizerLiveRunV4:
+    """Authenticated schema-v4 readiness paired with live capabilities."""
+
+    readiness: object
+    optimizer_services: object
+
+
+@dataclass(frozen=True, slots=True)
 class _PitOptimizerEvaluatorData:
     """Authenticated universe plus the two local evaluator capabilities."""
 
     universe: tuple[str, ...]
+    tradable_tickers: tuple[str, ...]
+    market_reference_tickers: tuple[str, ...]
+    market_context_universe: tuple[str, ...]
     evaluate_candidate: Callable[[Path, object, object, str], object]
     evaluate_baseline: Callable[[object], object]
 
     def __post_init__(self) -> None:
-        if (
-            type(self.universe) is not tuple
-            or not self.universe
-            or len(set(self.universe)) != len(self.universe)
-            or any(
-                not isinstance(symbol, str)
-                or not symbol
-                or symbol != symbol.strip()
-                for symbol in self.universe
+        def valid_tickers(values: object) -> bool:
+            return (
+                type(values) is tuple
+                and bool(values)
+                and len(set(values)) == len(values)
+                and all(
+                    isinstance(symbol, str)
+                    and bool(symbol)
+                    and symbol == symbol.strip()
+                    and symbol == symbol.upper()
+                    for symbol in values
+                )
             )
+
+        if (
+            not valid_tickers(self.universe)
+            or not valid_tickers(self.tradable_tickers)
+            or not valid_tickers(self.market_reference_tickers)
+            or not valid_tickers(self.market_context_universe)
+            or not set(self.universe).issubset(self.tradable_tickers)
+            or set(self.tradable_tickers).intersection(self.market_reference_tickers)
+            or set(self.market_context_universe)
+            != set(self.tradable_tickers).union(self.market_reference_tickers)
             or not callable(self.evaluate_candidate)
             or not callable(self.evaluate_baseline)
         ):
@@ -19063,16 +19878,22 @@ def _build_pit_optimizer_v3_live_run(
     from core.pit_optimization_contract import (
         AuthorArtifact,
         PIT_OPTIMIZER_V2_SYSTEM_PROMPTS,
+        _committed_policy_source_text,
         pit_optimizer_response_format,
     )
     from core.pit_optimizer_artifacts import IncrementalArtifactStore
     from core.pit_optimizer_authorization import (
         AuthorizationLedger,
     )
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_candidate import (
+        materialize_author_candidate_diff,
+        validate_candidate_diff,
+    )
     from core.pit_optimizer_controller import (
+        CandidateEvaluationFailure,
         CandidateValidationOutcome,
         PitOptimizerServices,
+        ProviderCallNotStarted,
         _CandidateCapabilityRegistry,
         _folds_digest,
         _window_identity,
@@ -19093,8 +19914,6 @@ def _build_pit_optimizer_v3_live_run(
         strictly_improves_discovery,
     )
     from core.pit_policy_parity import ParityFoldEvidence, build_fold_evidence
-    from core.strategy_policy.contracts import CapacitySnapshot
-    from core.strategy_policy.worker import PolicyDeterminismProbe
 
     if not isinstance(source_state, SourceState) or source_state.fingerprint is None:
         raise ConfigurationError("PIT optimizer source capability is invalid")
@@ -19154,12 +19973,29 @@ def _build_pit_optimizer_v3_live_run(
             controller_root=controller_temp_parent,
             permanent_runtime_root=permanent_runtime_root,
         )
+        longest_fold_sessions = max(
+            len(fold.sessions)
+            for fold in (
+                *manifest.fold_manifest.discovery_folds,
+                manifest.fold_manifest.hidden_fold,
+            )
+        )
+        fold_scale = max(
+            1,
+            math.ceil(
+                longest_fold_sessions / _POLICY_WORKER_BASE_FOLD_SESSIONS
+            ),
+        )
+        session_output_limit_bytes = min(
+            _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES,
+            output_limit_bytes * fold_scale,
+        )
         return PolicyWorkerRunner(
             image=image,
             engine=docker,
             temp_parent=controller_temp_parent,
             fold_timeout_seconds=child_timeout_seconds,
-            output_limit_bytes=output_limit_bytes,
+            output_limit_bytes=session_output_limit_bytes,
             wall_deadline=wall_deadline,
         )
 
@@ -19174,14 +20010,18 @@ def _build_pit_optimizer_v3_live_run(
             expected_sha256=pit_bundle_sha256,
         ) as bundle:
             scope = _build_verification_scope(bundle, baseline_run)
-        universe = tuple(scope["symbols"])
-        probes = (
-            PolicyDeterminismProbe(
-                "recommend_capacity",
-                CapacitySnapshot(None, 25, 0, 3, 1.0, False),
-                CapacitySnapshot(5, 25, 2, 1, 0.5, True),
-            ),
-        )
+            universe = tuple(scope["symbols"])
+            tradable_tickers = tuple(bundle.tradable_symbols())
+            market_reference_tickers = tuple(bundle.reference_symbols())
+            market_context_universe = tuple(bundle.price_symbols())
+        if (
+            set(universe).intersection(market_reference_tickers)
+            or not set(universe).issubset(tradable_tickers)
+            or set(market_context_universe)
+            != set(tradable_tickers).union(market_reference_tickers)
+        ):
+            raise ConfigurationError("PIT evaluator panel escapes the tradable universe")
+        probes = _optimizer_capacity_determinism_probes()
 
         def evaluate_candidate(
             candidate_root: Path,
@@ -19219,7 +20059,9 @@ def _build_pit_optimizer_v3_live_run(
                     ),
                     benchmark_symbol=manifest.fold_manifest.benchmark,
                 )
-            return build_fold_evidence(fold=fold, result=result)
+            return build_fold_evidence(
+                fold=fold, result=validate_result_universes(result)
+            )
 
         def evaluate_baseline(fold: object) -> object:
             with PITDataBundle(
@@ -19240,10 +20082,28 @@ def _build_pit_optimizer_v3_live_run(
                     ),
                     benchmark_symbol=manifest.fold_manifest.benchmark,
                 )
-            return build_fold_evidence(fold=fold, result=result)
+            return build_fold_evidence(
+                fold=fold, result=validate_result_universes(result)
+            )
+
+        def validate_result_universes(result: object) -> object:
+            config = getattr(result, "config", None)
+            expected = {
+                "tradable_tickers": list(tradable_tickers),
+                "market_reference_tickers": list(market_reference_tickers),
+                "market_context_universe": list(market_context_universe),
+            }
+            if not isinstance(config, Mapping) or any(
+                config.get(name) != value for name, value in expected.items()
+            ):
+                raise ConfigurationError("PIT evaluator universe identities differ")
+            return result
 
         return _PitOptimizerEvaluatorData(
             universe=universe,
+            tradable_tickers=tradable_tickers,
+            market_reference_tickers=market_reference_tickers,
+            market_context_universe=market_context_universe,
             evaluate_candidate=evaluate_candidate,
             evaluate_baseline=evaluate_baseline,
         )
@@ -19351,11 +20211,17 @@ def _build_pit_optimizer_v3_live_run(
         if universe_sha256 != manifest.fold_manifest.universe_sha256:
             raise ConfigurationError("PIT optimizer universe identity differs")
         for relative, expected_sha256 in manifest.policy_source_sha256s:
-            path = config.source_root / relative
+            try:
+                source_text = _committed_policy_source_text(
+                    config.source_root,
+                    relative,
+                )
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "PIT optimizer policy source differs"
+                ) from exc
             if (
-                path.is_symlink()
-                or not path.is_file()
-                or hashlib.sha256(path.read_bytes()).hexdigest()
+                hashlib.sha256(source_text.encode("utf-8")).hexdigest()
                 != expected_sha256
             ):
                 raise ConfigurationError("PIT optimizer policy source differs")
@@ -19497,11 +20363,17 @@ def _build_pit_optimizer_v3_live_run(
             author: AuthorArtifact,
             cumulative_diff: str | None,
         ) -> CandidateValidationOutcome:
+            incremental_diff = author.unified_diff
             try:
+                incremental_diff = materialize_author_candidate_diff(
+                    candidate_root=candidate.root,
+                    author=author,
+                    bounds=manifest.candidate_bounds,
+                )
                 identity, authenticated_cumulative = validate_candidate_diff(
                     authenticated_base_root=config.source_root,
                     candidate_root=candidate.root,
-                    incremental_diff=author.unified_diff,
+                    incremental_diff=incremental_diff,
                     git=git_capability,
                     bounds=manifest.candidate_bounds,
                     source_commit=manifest.source_head,
@@ -19511,11 +20383,52 @@ def _build_pit_optimizer_v3_live_run(
                     ),
                     discovery_manifest_sha256=manifest.fold_manifest.sha256,
                 )
-            except ValueError:
+            except ValueError as exc:
+                message = str(exc)
+                purity_failure = message.startswith("policy ") and any(
+                    marker in message
+                    for marker in (
+                        "forbidden",
+                        "outside the allowlist",
+                        "must be constants",
+                        "must be immutable",
+                        "public symbols differ",
+                    )
+                )
+                failure_code = (
+                    "author_diff_noop"
+                    if "no-op" in message
+                    else (
+                        "author_diff_not_applicable"
+                        if "does not apply" in message
+                        else (
+                            "syntax_failed"
+                            if message
+                            in {
+                                "policy AST syntax is invalid",
+                                "policy source syntax is invalid",
+                            }
+                            else (
+                                "imports_failed"
+                                if "policy import is outside" in message
+                                or "policy contract import is outside" in message
+                                else (
+                                    "purity_failed"
+                                    if purity_failure
+                                    else (
+                                        "author_diff_oversize"
+                                        if "exceeds max_diff_bytes" in message
+                                        else "author_diff_invalid"
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
                 return CandidateValidationOutcome(
                     valid=False,
-                    failure_code="author_diff_invalid",
-                    incremental_diff=author.unified_diff,
+                    failure_code=failure_code,
+                    incremental_diff=incremental_diff,
                     cumulative_diff=cumulative_diff or "",
                     identity=None,
                     changed_paths=author.changed_paths,
@@ -19524,7 +20437,7 @@ def _build_pit_optimizer_v3_live_run(
             return CandidateValidationOutcome(
                 valid=True,
                 failure_code=None,
-                incremental_diff=author.unified_diff,
+                incremental_diff=incremental_diff,
                 cumulative_diff=authenticated_cumulative,
                 identity=identity,
                 changed_paths=identity.changed_paths,
@@ -19564,7 +20477,6 @@ def _build_pit_optimizer_v3_live_run(
         def evaluate_fold(
             candidate_root: Path,
             fold: object,
-            identity_sha256: str,
         ) -> object:
             nonlocal worker_sequence
             require_evaluator_wall_time()
@@ -19586,27 +20498,37 @@ def _build_pit_optimizer_v3_live_run(
                 raise CandidateMutationError(
                     "candidate evaluator evidence identity differs"
                 )
-            evidence_sha256s[(identity_sha256, fold_id)] = evidence.evidence_sha256
             return evidence
 
         def evaluate_discovery(
             workspace: object,
             identity: object,
         ) -> DiscoveryEvaluation:
-            evidence = tuple(
-                evaluate_fold(
-                    workspace.root,
-                    fold,
-                    identity.identity_sha256,
+            candidate_identity_sha256 = identity.identity_sha256
+            try:
+                evidence = tuple(
+                    evaluate_fold(
+                        workspace.root,
+                        fold,
+                    )
+                    for fold in manifest.fold_manifest.discovery_folds
                 )
-                for fold in manifest.fold_manifest.discovery_folds
-            )
+            except (PolicyWorkerOperationalFailure, ValueError) as exc:
+                # A model-authored policy may satisfy static source checks but
+                # return an invalid runtime decision (for example, a negative or
+                # oversized stop distance).  That is candidate feedback, not a
+                # controller/sandbox failure, so keep the optimizer loop alive.
+                raise CandidateEvaluationFailure("worker_failed") from exc
+            for item in evidence:
+                evidence_sha256s[(candidate_identity_sha256, item.fold_id)] = (
+                    item.evidence_sha256
+                )
             aggregates = tuple(item.aggregate for item in evidence)
             baseline = readiness.baseline_discovery.folds
             baseline_sha256 = _folds_digest(baseline)
             incumbent = tuple(incumbent_folds)
             incumbent_sha256 = _folds_digest(incumbent)
-            rankable = all(item.closed_trades >= 1 for item in aggregates)
+            rankable = sum(item.closed_trades for item in aggregates) >= 1
             if rankable:
                 fixed_score = discovery_score_from_folds(
                     aggregates,
@@ -19620,21 +20542,26 @@ def _build_pit_optimizer_v3_live_run(
                     original_baseline_sha256=incumbent_sha256,
                     expected_original_baseline_sha256=incumbent_sha256,
                 )
-                current_score = discovery_score_from_folds(
-                    incumbent,
-                    baseline,
-                    original_baseline_sha256=baseline_sha256,
-                    expected_original_baseline_sha256=baseline_sha256,
+                current_score = (
+                    _unrankable_discovery_score()
+                    if sum(item.closed_trades for item in incumbent) < 1
+                    else discovery_score_from_folds(
+                        incumbent,
+                        baseline,
+                        original_baseline_sha256=baseline_sha256,
+                        expected_original_baseline_sha256=baseline_sha256,
+                    )
                 )
                 improves = strictly_improves_discovery(fixed_score, current_score)
             else:
-                fixed_score = discovery_score_from_folds(
-                    baseline,
-                    baseline,
-                    original_baseline_sha256=baseline_sha256,
-                    expected_original_baseline_sha256=baseline_sha256,
-                )
-                incumbent_score = fixed_score
+                # An unrankable candidate must not enter the discovery objective.
+                # In particular, the sealed baseline can itself contain a
+                # zero-trade fold, which makes a baseline-vs-baseline score
+                # invalid.  DiscoveryEvaluation still carries typed scores,
+                # so use a neutral placeholder that cannot be selected.
+                unrankable_score = _unrankable_discovery_score()
+                fixed_score = unrankable_score
+                incumbent_score = unrankable_score
                 improves = False
             if improves:
                 incumbent_folds[:] = aggregates
@@ -19672,7 +20599,6 @@ def _build_pit_optimizer_v3_live_run(
             repeated = evaluate_fold(
                 workspace.root,
                 fold,
-                identity.identity_sha256,
             ).evidence_sha256
             return DeterminismAttestation(
                 fold_id=fold_id,
@@ -19718,7 +20644,6 @@ def _build_pit_optimizer_v3_live_run(
             candidate = evaluate_fold(
                 workspace.root,
                 fold,
-                identity.identity_sha256,
             )
             hidden_excess = (
                 candidate.aggregate.total_return_pct
@@ -19838,11 +20763,16 @@ def _build_pit_optimizer_v3_live_run(
                 predecessors = tuple(completed_role_calls[-1:])
             else:
                 predecessors = tuple(completed_role_calls[-2:])
-            authorization.bind_controller_role_input(
-                role_input,
-                plan,
-                predecessor_calls=predecessors,
-            )
+            try:
+                authorization.bind_controller_role_input(
+                    role_input,
+                    plan,
+                    predecessor_calls=predecessors,
+                )
+            except Exception as exc:
+                raise ProviderCallNotStarted(
+                    "provider role input was rejected before reservation"
+                ) from exc
             call = gateway.request_pit_optimizer_once(
                 plan.role,
                 role_input,
@@ -19974,6 +20904,1041 @@ def _dispatch_pit_optimizer_v3(
     )
 
 
+def _v4_policy_sources(root: Path) -> tuple[object, ...]:
+    from core.pit_optimization_contract import AuthorSourceFile
+
+    paths = (
+        "core/strategy_policy/entry.py",
+        "core/strategy_policy/risk.py",
+        "core/strategy_policy/exit.py",
+    )
+    result = []
+    for relative in paths:
+        raw = (root / relative).read_bytes()
+        if b"\r" in raw or not raw.endswith(b"\n"):
+            raise ConfigurationError("optimizer v4 policy source is not canonical LF")
+        try:
+            source = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConfigurationError("optimizer v4 policy source is not UTF-8") from exc
+        result.append(AuthorSourceFile.from_source(path=relative, source=source))
+    return tuple(result)
+
+
+def _optimizer_capacity_determinism_probes() -> tuple[object, ...]:
+    """Build contract-current capacity probes shared by v3 and v4 workers."""
+
+    from core.strategy_policy.contracts import (
+        BenchmarkContextV1,
+        CapacitySnapshot,
+        MarketContextV1,
+    )
+    from core.strategy_policy.worker import PolicyDeterminismProbe
+
+    benchmarks = tuple(
+        BenchmarkContextV1(
+            symbol=symbol,
+            close_to_sma_50_fraction=0.05,
+            close_to_sma_200_fraction=0.10,
+            realized_volatility_20d_fraction=0.20,
+        )
+        for symbol in ("SPY", "QQQ", "IWM")
+    )
+    market = MarketContextV1(
+        schema_version=1,
+        session="2026-01-02",
+        oneil_regime="confirmed_uptrend",
+        distribution_days=2,
+        follow_through=True,
+        benchmarks=benchmarks,
+        active_constituent_count=100,
+        breadth_above_50_fraction=0.60,
+        breadth_50_coverage_fraction=1.0,
+        breadth_above_200_fraction=0.50,
+        breadth_200_coverage_fraction=1.0,
+        median_rs_score=75.0,
+        rs_at_least_80_fraction=0.40,
+        rs_coverage_fraction=1.0,
+    )
+    return (
+        PolicyDeterminismProbe(
+            "recommend_capacity",
+            CapacitySnapshot(
+                market=market,
+                configured_max_positions=None,
+                maximum_policy_positions=25,
+                open_position_count=0,
+                eligible_signal_count=3,
+                cash_fraction=1.0,
+                configured_eviction_enabled=False,
+            ),
+            CapacitySnapshot(
+                market=market,
+                configured_max_positions=5,
+                maximum_policy_positions=25,
+                open_position_count=2,
+                eligible_signal_count=1,
+                cash_fraction=0.5,
+                configured_eviction_enabled=True,
+            ),
+        ),
+    )
+
+
+def _v4_worker_runner(
+    config: object,
+    *,
+    limits: PitOptimizerLoopLimits,
+    deadline: float,
+) -> PolicyWorkerRunner:
+    # Catch policy-contract drift before an authorization lease or provider call.
+    _optimizer_capacity_determinism_probes()
+    docker = configure_docker_executable(
+        config.docker_executable,
+        source_root=config.source_root,
+        controller_root=config.controller_temp_parent,
+        permanent_runtime_root=config.permanent_runtime_root,
+    )
+    return PolicyWorkerRunner(
+        image=config.sandbox_image,
+        engine=docker,
+        temp_parent=config.controller_temp_parent,
+        fold_timeout_seconds=limits.child_timeout_seconds,
+        output_limit_bytes=_MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES,
+        wall_deadline=deadline,
+    )
+
+
+def _evaluate_v4_panel(
+    config: object,
+    *,
+    manifest: object,
+    panel: object,
+    candidate_root: Path | None = None,
+    runner: object | None = None,
+    run_label: str,
+) -> object:
+    from core.backtest_engine import PortfolioSimulator
+    from core.pit_data import PITDataBundle
+    from core.pit_optimizer_evaluation import panel_aggregate_summary_from_primitive
+    from core.pit_policy_parity import build_panel_evidence_v4
+
+    tickers = tuple(
+        sorted(
+            {
+                ticker
+                for lineage in panel.lineages
+                for ticker in lineage.executable_tickers
+            }
+        )
+    )
+    if not tickers:
+        raise ConfigurationError("optimizer v4 panel has no executable tickers")
+    policy_client_factory = None
+    if candidate_root is not None:
+        client_factory = getattr(runner, "client_factory", None)
+        if not callable(client_factory):
+            raise ConfigurationError("optimizer v4 worker capability is absent")
+        policy_client_factory = client_factory(
+            candidate_root=candidate_root,
+            interface_version=manifest.policy_interface_version,
+            fold_run_id=run_label,
+            determinism_probes=_optimizer_capacity_determinism_probes(),
+        )
+    with PITDataBundle(
+        config.pit_bundle,
+        expected_sha256=config.pit_bundle_sha256,
+    ) as bundle:
+        if not set(tickers).issubset(bundle.tradable_symbols()):
+            raise ConfigurationError("optimizer v4 panel escapes tradable membership")
+        simulator = PortfolioSimulator(
+            pit_bundle=bundle,
+            benchmark_symbol="SPY",
+            signal_every_n_days=1,
+            policy_client_factory=policy_client_factory,
+        )
+        result = simulator.run(
+            list(tickers),
+            start_date=panel.start_date,
+            end_date=panel.end_date,
+            history_start_date=str(bundle.metadata["warmup_start"]),
+            benchmark_symbol="SPY",
+        )
+    evidence = build_panel_evidence_v4(panel=panel, result=result)
+    return panel_aggregate_summary_from_primitive(evidence["aggregate"])
+
+
+def _prepare_pit_optimizer_v4_production(
+    config: object,
+    *,
+    source_state: SourceState,
+    git_capability: GitCapability,
+    limits: PitOptimizerLoopLimits,
+    restored_diffs: dict[str, str] | None = None,
+) -> object:
+    from core.pit_optimization import PitOptimizerGateConfigV4, prepare_pit_optimizer_v4
+    from core.pit_optimizer_artifacts import canonical_json_bytes
+    from core.pit_optimization_contract import load_pit_optimizer_manifest_v4
+    from core.pit_optimizer_evaluation import (
+        EvaluationPanelSpec,
+        PanelAggregateSummary,
+        QualificationRetirementLedger,
+        QualificationRetirementSnapshot,
+        _panel_plan_pair_is_consistent,
+        load_discovery_panel_plan,
+        load_qualification_panel_plan,
+        panel_aggregate_summary_from_primitive,
+    )
+
+    if not isinstance(config, PitOptimizerGateConfigV4):
+        raise ConfigurationError("optimizer v4 production gate is invalid")
+    if config.phase == "canary":
+        try:
+            bundle_identity_valid = (
+                config.pit_bundle.is_file()
+                and not config.pit_bundle.is_symlink()
+                and _file_sha256(config.pit_bundle) == config.pit_bundle_sha256
+            )
+        except (OSError, ValueError) as exc:
+            raise ConfigurationError("optimizer v4 PIT bundle identity differs") from exc
+        if not bundle_identity_valid:
+            raise ConfigurationError("optimizer v4 PIT bundle identity differs")
+    plan = load_discovery_panel_plan(config.discovery_panel_plan)
+    qualification_plan = load_qualification_panel_plan(
+        config.qualification_panel_plan
+    )
+    if (
+        hashlib.sha256(config.discovery_panel_plan.read_bytes()).hexdigest()
+        != config.discovery_panel_plan_sha256
+        or hashlib.sha256(config.qualification_panel_plan.read_bytes()).hexdigest()
+        != config.qualification_panel_plan_sha256
+    ):
+        raise ConfigurationError("optimizer v4 panel plan digest differs")
+    _panel_plan_pair_is_consistent(qualification_plan, plan)
+    if (
+        config.qualification_ledger_snapshot_sha256
+        != plan.qualification_ledger_snapshot_sha256
+        or not config.qualification_ledger.is_file()
+        or config.qualification_ledger.is_symlink()
+    ):
+        raise ConfigurationError("optimizer v4 qualification ledger differs")
+    qualification_ledger = QualificationRetirementLedger(
+        config.qualification_ledger,
+        plan.qualification_retirement_domain_id,
+    )
+    committed_lineages = {
+        item.security_lineage_id
+        for panel in (
+            plan.quick_panel,
+            plan.discovery_panel,
+            qualification_plan.qualification_panel,
+        )
+        for item in panel.lineages
+    }
+
+    def authenticate_current_qualification_ledger() -> QualificationRetirementSnapshot:
+        current = qualification_ledger.authenticate_ancestor(
+            config.qualification_ledger_snapshot_sha256
+        )
+        if set(current.retired_security_lineage_ids).intersection(
+            committed_lineages
+        ):
+            raise ConfigurationError(
+                "optimizer v4 panel contains a retired lineage"
+            )
+        return current
+
+    qualification_snapshot = authenticate_current_qualification_ledger()
+    readiness_ledger_head = qualification_snapshot.ledger_head_sha256
+    authenticated_baseline: (
+        tuple[PanelAggregateSummary, PanelAggregateSummary] | None
+    ) = None
+    if config.phase == "canary":
+        if (
+            config.readiness_artifact.is_symlink()
+            or not config.readiness_artifact.is_file()
+        ):
+            raise ConfigurationError("optimizer v4 readiness artifact is absent")
+        raw_readiness = config.readiness_artifact.read_bytes()
+        if hashlib.sha256(raw_readiness).hexdigest() != config.readiness_sha256:
+            raise ConfigurationError("optimizer v4 readiness identity differs")
+        try:
+            readiness_primitive = json.loads(raw_readiness)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConfigurationError("optimizer v4 readiness is invalid JSON") from exc
+        if not isinstance(readiness_primitive, dict):
+            raise ConfigurationError("optimizer v4 readiness is not canonical")
+        readiness_ledger_head = readiness_primitive.get(
+            "qualification_ledger_head_sha256"
+        )
+        if (
+            raw_readiness != canonical_json_bytes(readiness_primitive)
+            or readiness_primitive.get("schema_version") != 4
+            or readiness_primitive.get("artifact_type") != "optimizer_readiness"
+            or _SHA256_RE.fullmatch(readiness_ledger_head or "") is None
+        ):
+            raise ConfigurationError("optimizer v4 readiness is not canonical")
+        try:
+            authenticated_baseline = (
+                panel_aggregate_summary_from_primitive(
+                    readiness_primitive.get("baseline_quick")
+                ),
+                panel_aggregate_summary_from_primitive(
+                    readiness_primitive.get("baseline_discovery")
+                ),
+            )
+        except ValueError as exc:
+            raise ConfigurationError(
+                "optimizer v4 readiness baseline is invalid"
+            ) from exc
+        qualification_ledger.authenticate_ancestor(readiness_ledger_head)
+    manifest = load_pit_optimizer_manifest_v4(
+        config.optimizer_manifest,
+        expected_sha256=config.optimizer_manifest_sha256,
+        discovery_panel_plan=plan,
+    )
+    source_head, source_fingerprint = _pit_optimizer_source_identity(
+        config.source_root,
+        git_capability,
+    )
+    if (
+        config.pit_bundle_sha256 != manifest.pit_bundle_sha256
+        or (source_head, source_fingerprint)
+        != (manifest.source_head, manifest.source_fingerprint_sha256)
+        or source_state.head != source_head
+        or recheck_source_unchanged(source_state).source_modified
+        or manifest.authorization_requirement.sha256
+        != config.authorization_requirement_sha256
+    ):
+        raise ConfigurationError("optimizer v4 authenticated inputs differ")
+    baseline_sources = _v4_policy_sources(config.source_root)
+    if tuple(
+        (item.path, item.source_sha256) for item in baseline_sources
+    ) != manifest.policy_authoring_scope.initial_policy_source_sha256s:
+        raise ConfigurationError("optimizer v4 baseline sources differ")
+    deadline = time.monotonic() + limits.wall_timeout_seconds
+    restore_runner = (
+        None
+        if config.campaign_checkpoint is None
+        else _v4_worker_runner(config, limits=limits, deadline=deadline)
+    )
+
+    def verify_inputs(supplied_manifest: object, supplied_plan: object) -> None:
+        if supplied_manifest is not manifest or supplied_plan is not plan:
+            raise ConfigurationError("optimizer v4 readiness inputs changed")
+        if (
+            _pit_optimizer_source_identity(config.source_root, git_capability)
+            != (manifest.source_head, manifest.source_fingerprint_sha256)
+            or recheck_source_unchanged(source_state).source_modified
+        ):
+            raise CandidateMutationError("optimizer v4 source changed")
+        authenticate_current_qualification_ledger()
+
+    def read_seed_artifact(
+        checkpoint_root: Path,
+        relative: object,
+        digest: object,
+    ) -> bytes:
+        if (
+            not isinstance(relative, str)
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+        ):
+            raise ConfigurationError("optimizer v4 seed artifact identity is invalid")
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise ConfigurationError("optimizer v4 seed artifact path is invalid")
+        resolved = (checkpoint_root / path).resolve()
+        try:
+            resolved.relative_to(checkpoint_root.resolve())
+        except ValueError as exc:
+            raise ConfigurationError("optimizer v4 seed artifact escaped") from exc
+        if resolved.is_symlink() or not resolved.is_file():
+            raise ConfigurationError("optimizer v4 seed artifact is absent")
+        raw = resolved.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ConfigurationError("optimizer v4 seed artifact digest differs")
+        return raw
+
+    def restore_seed(
+        kind: str,
+        primitive: Mapping[str, object],
+        checkpoint_root: Path,
+        supplied_plan: object,
+    ) -> object:
+        from core.pit_optimizer_artifacts import SearchCandidateState
+        from core.pit_optimizer_candidate import validate_candidate_sources
+        from core.pit_optimization_contract import SelectedParentIdentity
+        from core.pit_optimizer_controller import (
+            CandidateEvaluationFailure,
+            _panel_v4_artifact,
+        )
+
+        identity_value = primitive.get("candidate_identity")
+        if not isinstance(identity_value, Mapping):
+            raise ConfigurationError("optimizer v4 seed identity is invalid")
+        diff_raw = read_seed_artifact(
+            checkpoint_root,
+            primitive.get("cumulative_diff_artifact"),
+            primitive.get("cumulative_diff_sha256"),
+        )
+        try:
+            cumulative_diff = diff_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConfigurationError("optimizer v4 seed diff is invalid") from exc
+        if hashlib.sha256(cumulative_diff.encode("utf-8")).hexdigest() != identity_value.get(
+            "cumulative_diff_sha256"
+        ):
+            raise ConfigurationError("optimizer v4 seed diff identity differs")
+        source_raw = read_seed_artifact(
+            checkpoint_root,
+            primitive.get("source_bundle_artifact"),
+            primitive.get("source_bundle_sha256"),
+        )
+        try:
+            source_artifact = json.loads(source_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConfigurationError("optimizer v4 seed source is invalid") from exc
+        if source_raw != canonical_json_bytes(source_artifact):
+            raise ConfigurationError("optimizer v4 seed source is not canonical")
+        replacement_sources = source_artifact.get("policy_sources")
+        if not isinstance(replacement_sources, Mapping):
+            raise ConfigurationError("optimizer v4 seed source bundle is invalid")
+        reconstructed = export_candidate(source_state)
+        try:
+            _git(
+                reconstructed.root,
+                "apply",
+                "--check",
+                "--whitespace=error-all",
+                "-",
+                input_bytes=cumulative_diff.encode("utf-8"),
+                git=git_capability,
+            )
+            _git(
+                reconstructed.root,
+                "apply",
+                "--whitespace=error-all",
+                "-",
+                input_bytes=cumulative_diff.encode("utf-8"),
+                git=git_capability,
+            )
+            reconstructed_sources = {
+                item.path: item.source for item in _v4_policy_sources(reconstructed.root)
+            }
+            if reconstructed_sources != dict(replacement_sources):
+                raise ConfigurationError(
+                    "optimizer v4 seed diff and source bundle differ"
+                )
+            reconstructed_sha256s = tuple(
+                (item.path, item.source_sha256)
+                for item in _v4_policy_sources(reconstructed.root)
+            )
+            old_sha256s = identity_value.get("editable_file_sha256s")
+            if (
+                not isinstance(old_sha256s, list)
+                or tuple(tuple(item) for item in old_sha256s)
+                != reconstructed_sha256s
+            ):
+                raise ConfigurationError(
+                    "optimizer v4 seed sources differ from retained identity"
+                )
+        finally:
+            dispose_candidate(reconstructed)
+        seed_parent = SelectedParentIdentity.issue(
+            parent_kind="baseline",
+            parent_id="baseline_policy",
+            source_head=manifest.source_head,
+            policy_sources=baseline_sources,
+        )
+        candidate = export_candidate(source_state)
+        try:
+            identity, reminted_diff = validate_candidate_sources(
+                authenticated_base_root=config.source_root,
+                candidate_root=candidate.root,
+                replacement_sources=replacement_sources,
+                git=git_capability,
+                source_commit=manifest.source_head,
+                policy_interface_version=manifest.policy_interface_version,
+                immutable_constraints_sha256=manifest.immutable_constraints_sha256,
+                discovery_panel_plan_sha256=supplied_plan.sha256,
+                parent_identity_sha256=seed_parent.parent_identity_sha256,
+            )
+            if restored_diffs is not None:
+                restored_diffs[identity.identity_sha256] = reminted_diff
+            quick = _evaluate_v4_panel(
+                config,
+                manifest=manifest,
+                panel=supplied_plan.quick_panel,
+                candidate_root=candidate.root,
+                runner=restore_runner,
+                run_label=f"restore-{kind}-quick",
+            )
+            discovery = _evaluate_v4_panel(
+                config,
+                manifest=manifest,
+                panel=supplied_plan.discovery_panel,
+                candidate_root=candidate.root,
+                runner=restore_runner,
+                run_label=f"restore-{kind}-discovery",
+            )
+        except ValueError as exc:
+            raise CandidateEvaluationFailure("evaluation_failed") from exc
+        finally:
+            dispose_candidate(candidate)
+        quick_digest = hashlib.sha256(
+            canonical_json_bytes({"evidence": _panel_v4_artifact(quick)})
+        ).hexdigest()
+        discovery_digest = hashlib.sha256(
+            canonical_json_bytes({"evidence": _panel_v4_artifact(discovery)})
+        ).hexdigest()
+        return SearchCandidateState(
+            candidate_identity=identity,
+            cumulative_diff_artifact=f"restored-{kind}.diff",
+            cumulative_diff_sha256=hashlib.sha256(
+                reminted_diff.encode("utf-8")
+            ).hexdigest(),
+            source_bundle_artifact=f"restored-{kind}-source.json",
+            source_bundle_sha256=hashlib.sha256(
+                canonical_json_bytes({"policy_sources": dict(replacement_sources)})
+            ).hexdigest(),
+            discovery_evidence_artifact=f"restored-{kind}-discovery.json",
+            discovery_evidence_sha256=discovery_digest,
+            discovery_evidence=discovery,
+            hypothesis=str(primitive.get("hypothesis")),
+            behavioral_summary=str(primitive.get("behavioral_summary")),
+            originating_run_id=str(primitive.get("originating_run_id")),
+            originating_iteration=int(primitive.get("originating_iteration", 0)),
+            quick_evidence_artifact=f"restored-{kind}-quick.json",
+            quick_evidence_sha256=quick_digest,
+            quick_evidence=quick,
+        )
+
+    def evaluate_baseline(panel: EvaluationPanelSpec) -> PanelAggregateSummary:
+        if authenticated_baseline is None:
+            return _evaluate_v4_panel(
+                config,
+                manifest=manifest,
+                panel=panel,
+                run_label=f"baseline-{panel.purpose}",
+            )
+        quick, discovery = authenticated_baseline
+        if panel == plan.quick_panel:
+            return quick
+        if panel == plan.discovery_panel:
+            return discovery
+        raise ConfigurationError("optimizer v4 baseline panel is not authenticated")
+
+    readiness = prepare_pit_optimizer_v4(
+        manifest=manifest,
+        discovery_panel_plan=plan,
+        qualification_panel_plan=qualification_plan,
+        qualification_ledger_snapshot=qualification_snapshot,
+        qualification_readiness_head_sha256=readiness_ledger_head,
+        baseline_sources=baseline_sources,
+        artifact_path=config.readiness_artifact,
+        evaluate_baseline=evaluate_baseline,
+        verify_inputs=verify_inputs,
+        campaign_checkpoint_path=config.campaign_checkpoint,
+        campaign_checkpoint_sha256=config.campaign_checkpoint_sha256,
+        restore_seed=restore_seed,
+    )
+    authenticate_current_qualification_ledger()
+    qualification_ledger.authenticate_ancestor(
+        readiness.qualification_ledger_head_sha256
+    )
+    if config.phase == "canary" and readiness.readiness_sha256 != config.readiness_sha256:
+        raise ConfigurationError("optimizer v4 readiness identity differs")
+    return readiness
+
+
+def _finalize_pit_optimizer_v4_lease(
+    *,
+    attempts: tuple[object, ...],
+    skips: tuple[object, ...],
+    settled: Mapping[int, object],
+    terminal_code: str,
+    resource_totals: Callable[[], tuple[int, int, int]],
+    close_lease: Callable[[str], None],
+) -> None:
+    """Validate exact controller accounting before closing one v4 lease."""
+
+    close_terminal = "failed"
+    validation_failure: BaseException | None = None
+    try:
+        supplied = {
+            item.plan.call_index: item for item in attempts
+        } | {item.call_index: item for item in skips}
+        if supplied != settled:
+            raise ConfigurationError("optimizer v4 final accounting differs")
+        api_calls, total_tokens, incomplete_calls = resource_totals()
+        facts = tuple(item.facts for item in attempts)
+        if (
+            api_calls != sum(1 for item in facts if item.request_started)
+            or total_tokens != sum(item.total_tokens or 0 for item in facts)
+            or incomplete_calls
+            != sum(1 for item in facts if not item.accounting_complete)
+        ):
+            raise ConfigurationError("optimizer v4 resource accounting differs")
+        close_terminal = {
+            "iteration_limit": "completed",
+            "cancelled": "cancelled",
+            "budget_exhausted": "budget_exhausted",
+            "authorization_exhausted": "budget_exhausted",
+        }.get(terminal_code, "failed")
+    except BaseException as exc:
+        validation_failure = exc
+        raise
+    finally:
+        try:
+            close_lease(close_terminal)
+        except BaseException:
+            if validation_failure is None:
+                raise
+
+
+def _build_pit_optimizer_v4_live_run(
+    config: object,
+    *,
+    loop_config: LoopConfig,
+    limits: PitOptimizerLoopLimits,
+    source_state: SourceState,
+    git_capability: GitCapability,
+    gateway_factory: Callable[..., OpenRouterGateway] | None = None,
+) -> PitOptimizerLiveRunV4:
+    from core.pit_optimization import PitOptimizerGateConfigV4
+    from core.pit_optimization_contract import (
+        PIT_OPTIMIZER_V4_SYSTEM_PROMPTS,
+        load_pit_optimizer_manifest_v4,
+        pit_optimizer_v4_response_format,
+    )
+    from core.pit_optimizer_artifacts import IncrementalArtifactStore
+    from core.pit_optimizer_authorization import AuthorizationLedger
+    from core.pit_optimizer_candidate import validate_candidate_sources
+    from core.pit_optimizer_controller import (
+        CandidateParentV4,
+        CandidateValidationOutcomeV4,
+        CandidateWorkspace,
+        PitOptimizerCleanup,
+        PitOptimizerServicesV4,
+    )
+
+    if not isinstance(config, PitOptimizerGateConfigV4) or config.phase != "canary":
+        raise ConfigurationError("optimizer v4 live gate is invalid")
+    if not isinstance(loop_config, LoopConfig) or loop_config.gate is not config:
+        raise ConfigurationError("optimizer v4 live loop configuration changed")
+    if (
+        config.authorization_window_id is None
+        or config.authorization_window_id
+        != load_pit_optimizer_manifest_v4(
+            config.optimizer_manifest,
+            expected_sha256=config.optimizer_manifest_sha256,
+        ).authorization_requirement.window_id
+    ):
+        raise ConfigurationError("optimizer v4 live authority differs")
+    restored_diffs: dict[str, str] = {}
+    readiness = _prepare_pit_optimizer_v4_production(
+        config,
+        source_state=source_state,
+        git_capability=git_capability,
+        limits=limits,
+        restored_diffs=restored_diffs,
+    )
+    manifest = readiness.manifest
+    authorization = AuthorizationLedger(
+        config.permanent_runtime_root / "pit_optimizer_authorization_ledger.jsonl",
+        manifest,
+    )
+    authorization.authenticate_window(
+        window_id=config.authorization_window_id,
+        authorization_requirement_sha256=config.authorization_requirement_sha256,
+    )
+    budget = PitOptimizerResourceLedger(
+        max_calls=config.max_api_calls,
+        max_tokens=config.max_tokens,
+    )
+    dotenv_values = _controller_dotenv_values(config.source_root)
+    known_secrets = tuple(
+        value
+        for value in {
+            os.getenv("OPENROUTER_API_KEY"),
+            os.getenv("OPENROUTER"),
+            dotenv_values.get("OPENROUTER_API_KEY"),
+            dotenv_values.get("OPENROUTER"),
+        }
+        if isinstance(value, str) and value
+    )
+    audit = AuditTrail(
+        config.artifact_root,
+        manifest.campaign_id,
+        known_secrets=known_secrets,
+    )
+    audit.write_manifest(
+        loop_config,
+        source_head=manifest.source_head,
+        source_fingerprint_sha256=manifest.source_fingerprint_sha256,
+    )
+    gateway = (gateway_factory or OpenRouterGateway)(
+        run_id=manifest.campaign_id,
+        pit_optimizer_ledger=budget,
+        timeout_seconds=limits.api_timeout_seconds,
+        max_attempts=1,
+        controller_root=config.source_root,
+        authorization_ledger=authorization,
+        audit_trail=audit,
+    )
+    if not isinstance(gateway, OpenRouterGateway):
+        raise ConfigurationError("optimizer v4 gateway capability is invalid")
+    deadline = time.monotonic() + limits.wall_timeout_seconds
+    pricing = gateway.freeze_pit_optimizer_pricing(
+        model=manifest.model,
+        wall_deadline=deadline,
+        monotonic=time.monotonic,
+    )
+    projections: list[Decimal | None] = []
+    for plan in manifest.call_budgets:
+        static_bytes = PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[plan.role].encode("utf-8")
+        static_bytes += json.dumps(
+            pit_optimizer_v4_response_format(plan.role),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(static_bytes) > plan.max_static_input_bytes:
+            raise BudgetExceededError("optimizer v4 static role input exceeds plan")
+        projections.append(
+            conservative_call_cost_usd(
+                rendered_prompt_bytes=len(static_bytes) + plan.max_dynamic_input_bytes,
+                max_output_tokens=plan.max_output_tokens,
+                pricing=pricing,
+            )
+        )
+    projected_plan_usd = (
+        sum((item for item in projections if item is not None), Decimal("0"))
+        if pricing.lookup_status == "available"
+        else None
+    )
+    if (pricing.lookup_status == "available") != all(
+        item is not None for item in projections
+    ):
+        raise ConfigurationError("optimizer v4 pricing projection is incomplete")
+    runner = _v4_worker_runner(config, limits=limits, deadline=deadline)
+    store = IncrementalArtifactStore(audit.run_root)
+    capabilities: dict[str, Candidate] = {}
+    candidate_diffs = dict(restored_diffs)
+    settled: dict[int, object] = {}
+    finalization_started = False
+
+    def materialize_parent(kind: str, retained: object | None) -> CandidateParentV4:
+        candidate = export_candidate(source_state)
+        try:
+            cumulative_diff = ""
+            if retained is not None:
+                identity_sha256 = retained.candidate_identity.identity_sha256
+                cumulative_diff = candidate_diffs.get(identity_sha256, "")
+                if not cumulative_diff:
+                    raise CandidateMutationError(
+                        "optimizer v4 retained candidate diff is unavailable"
+                    )
+                encoded = cumulative_diff.encode("utf-8")
+                _git(
+                    candidate.root,
+                    "apply",
+                    "--check",
+                    "--whitespace=error-all",
+                    "-",
+                    input_bytes=encoded,
+                    git=git_capability,
+                )
+                _git(
+                    candidate.root,
+                    "apply",
+                    "--whitespace=error-all",
+                    "-",
+                    input_bytes=encoded,
+                    git=git_capability,
+                )
+                observed = derive_authenticated_cumulative_diff(
+                    git=git_capability,
+                    authenticated_base_root=config.source_root,
+                    candidate_root=candidate.root,
+                    editable_paths=manifest.editable_paths,
+                )
+                if not hmac.compare_digest(observed, cumulative_diff):
+                    raise CandidateMutationError(
+                        "optimizer v4 retained candidate reconstruction differs"
+                    )
+            workspace = CandidateWorkspace(
+                workspace_id=f"workspace_{secrets.token_hex(16)}",
+                root=candidate.root.resolve(),
+            )
+            capabilities[workspace.workspace_id] = candidate
+            return CandidateParentV4(
+                workspace=workspace,
+                cumulative_diff=cumulative_diff,
+                policy_sources=_v4_policy_sources(candidate.root),
+            )
+        except BaseException:
+            dispose_candidate(candidate)
+            raise
+
+    def resolve(workspace: CandidateWorkspace) -> Candidate:
+        candidate = capabilities.get(workspace.workspace_id)
+        if candidate is None or candidate.root.resolve() != workspace.root:
+            raise CandidateMutationError("optimizer v4 workspace capability is absent")
+        return candidate
+
+    def validate_and_apply(
+        workspace: CandidateWorkspace,
+        author: object,
+        parent_identity: object,
+    ) -> CandidateValidationOutcomeV4:
+        candidate = resolve(workspace)
+        try:
+            identity, cumulative_diff = validate_candidate_sources(
+                authenticated_base_root=config.source_root,
+                candidate_root=candidate.root,
+                replacement_sources={
+                    item.path: item.source for item in author.policy_sources
+                },
+                git=git_capability,
+                source_commit=manifest.source_head,
+                policy_interface_version=manifest.policy_interface_version,
+                immutable_constraints_sha256=manifest.immutable_constraints_sha256,
+                discovery_panel_plan_sha256=manifest.discovery_panel_plan_sha256,
+                parent_identity_sha256=parent_identity.parent_identity_sha256,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            failure = (
+                "syntax_failed"
+                if "syntax" in message
+                else "imports_failed"
+                if "import" in message
+                else "purity_failed"
+                if "forbidden" in message or "immutable" in message
+                else "source_invalid"
+            )
+            return CandidateValidationOutcomeV4(False, failure, "", None)
+        candidate_diffs[identity.identity_sha256] = cumulative_diff
+        return CandidateValidationOutcomeV4(
+            True,
+            None,
+            cumulative_diff,
+            identity,
+        )
+
+    evaluation_sequence = 0
+
+    def evaluate_candidate(
+        workspace: CandidateWorkspace,
+        identity: object,
+        panel: object,
+    ) -> object:
+        nonlocal evaluation_sequence
+        candidate = resolve(workspace)
+        evaluation_sequence += 1
+        try:
+            return _evaluate_v4_panel(
+                config,
+                manifest=manifest,
+                panel=panel,
+                candidate_root=candidate.root,
+                runner=runner,
+                run_label=f"candidate-{evaluation_sequence:03d}-{panel.purpose}",
+            )
+        except (PolicyWorkerOperationalFailure, ValueError) as exc:
+            from core.pit_optimizer_controller import CandidateEvaluationFailure
+
+            raise CandidateEvaluationFailure("worker_failed") from exc
+
+    def dispose_workspace(workspace: CandidateWorkspace) -> PitOptimizerCleanup:
+        candidate = capabilities.pop(workspace.workspace_id, None)
+        if candidate is None:
+            raise CandidateMutationError("optimizer v4 cleanup capability is absent")
+        dispose_candidate(candidate)
+        modified = recheck_source_unchanged(source_state).source_modified
+        return PitOptimizerCleanup(
+            candidate_removed=not workspace.root.exists(),
+            worker_stopped=True,
+            source_modified=modified,
+        )
+
+    def call_role(
+        plan: object,
+        role_input: object,
+        parser: Callable[[str], object],
+    ) -> object:
+        if plan.role == "investigator":
+            predecessors = tuple(settled[index] for index in range(1, plan.call_index))
+        elif plan.role == "author":
+            predecessors = (settled[plan.call_index - 1],)
+        else:
+            predecessors = (
+                settled[plan.call_index - 2],
+                settled[plan.call_index - 1],
+            )
+        authorization.bind_controller_role_input(
+            role_input,
+            plan,
+            predecessor_attempts=predecessors,
+        )
+        attempt = gateway.request_pit_optimizer_once(
+            plan.role,
+            role_input,
+            parser,
+            call_budget=plan,
+            authorization_lease=lease,
+            frozen_pricing=pricing,
+            wall_deadline=deadline,
+            monotonic=time.monotonic,
+        )
+        settled[plan.call_index] = attempt
+        return attempt
+
+    def settle_invalid_investigator(
+        triggering_plan: object,
+        plans: tuple[object, ...],
+    ) -> object:
+        triggering_attempt = settled.get(triggering_plan.call_index)
+        skips = authorization.skip_unstarted_plans(
+            lease,
+            plans,
+            triggering_attempt=triggering_attempt,
+        )
+        for skip in skips:
+            settled[skip.call_index] = skip
+        return skips
+
+    def verify_inputs(supplied: object) -> None:
+        if supplied is not readiness:
+            raise CandidateMutationError("optimizer v4 readiness capability changed")
+        if (
+            _pit_optimizer_source_identity(config.source_root, git_capability)
+            != (manifest.source_head, manifest.source_fingerprint_sha256)
+            or recheck_source_unchanged(source_state).source_modified
+        ):
+            raise CandidateMutationError("optimizer v4 authenticated inputs changed")
+
+    def finalize_run(
+        attempts: tuple[object, ...],
+        skips: tuple[object, ...],
+        terminal_code: str,
+    ) -> None:
+        nonlocal finalization_started
+        if finalization_started:
+            raise ConfigurationError("optimizer v4 finalizer was reused")
+        finalization_started = True
+        def resource_totals() -> tuple[int, int, int]:
+            snapshot = _pit_optimizer_resource_snapshot(budget)
+            return (
+                snapshot.api_calls,
+                snapshot.total_tokens,
+                snapshot.incomplete_accounting_calls,
+            )
+
+        _finalize_pit_optimizer_v4_lease(
+            attempts=attempts,
+            skips=skips,
+            settled=settled,
+            terminal_code=terminal_code,
+            resource_totals=resource_totals,
+            close_lease=lambda code: authorization.close_run_lease(
+                lease,
+                terminal_code=code,
+            ),
+        )
+
+    lease = authorization.open_run_lease(
+        window_id=config.authorization_window_id,
+        authorization_requirement_sha256=config.authorization_requirement_sha256,
+        run_manifest_sha256=manifest.sha256,
+        pricing_snapshot=pricing,
+        projected_plan_usd=projected_plan_usd,
+    )
+    try:
+        services = PitOptimizerServicesV4(
+            call_role=call_role,
+            materialize_parent=materialize_parent,
+            validate_and_apply=validate_and_apply,
+            evaluate_candidate=evaluate_candidate,
+            dispose_candidate=dispose_workspace,
+            settle_invalid_investigator=settle_invalid_investigator,
+            verify_inputs=verify_inputs,
+            cancellation_requested=lambda: False,
+            prepare_iteration_artifacts=store.prepare_iteration,
+            write_json_artifact=store.write_json_artifact,
+            write_diff_artifact=store.write_diff_artifact,
+            finalize_run=finalize_run,
+        )
+        return PitOptimizerLiveRunV4(
+            readiness=readiness,
+            optimizer_services=services,
+        )
+    except BaseException:
+        for candidate in tuple(capabilities.values()):
+            try:
+                dispose_candidate(candidate)
+            except BaseException:
+                pass
+        capabilities.clear()
+        try:
+            authorization.close_run_lease(lease, terminal_code="failed")
+        except BaseException:
+            pass
+        raise
+
+
+def _dispatch_pit_optimizer_v4(
+    config: object,
+    limits: PitOptimizerLoopLimits,
+    *,
+    prepare: Callable[[object], object],
+    build_live_services: Callable[
+        [object, PitOptimizerLoopLimits], PitOptimizerLiveRunV4
+    ],
+) -> object:
+    """Keep provider construction strictly behind authenticated v4 readiness."""
+
+    from core.pit_optimization import (
+        PitOptimizerGateConfigV4,
+        run_pit_optimizer_v4,
+    )
+    from core.pit_optimizer_controller import (
+        PitOptimizerReadinessV4,
+        PitOptimizerServicesV4,
+    )
+
+    if not isinstance(config, PitOptimizerGateConfigV4):
+        raise ConfigurationError("PIT optimizer v4 gate is invalid")
+    if (
+        not isinstance(limits, PitOptimizerLoopLimits)
+        or (
+            limits.max_api_calls,
+            limits.max_tokens,
+            limits.max_iterations,
+        )
+        != (config.max_api_calls, config.max_tokens, config.max_iterations)
+    ):
+        raise ConfigurationError("PIT optimizer v4 execution limits differ")
+    if config.phase == "prepare":
+        readiness = prepare(config)
+        if not isinstance(readiness, PitOptimizerReadinessV4):
+            raise ConfigurationError("PIT optimizer v4 readiness is invalid")
+        return readiness
+    live = build_live_services(config, limits)
+    if (
+        not isinstance(live, PitOptimizerLiveRunV4)
+        or not isinstance(live.readiness, PitOptimizerReadinessV4)
+        or not isinstance(live.optimizer_services, PitOptimizerServicesV4)
+    ):
+        raise ConfigurationError("PIT optimizer v4 live services are invalid")
+    return run_pit_optimizer_v4(
+        readiness=live.readiness,
+        services=live.optimizer_services,
+    )
+
+
 def _build_cli_config(
     namespace: argparse.Namespace,
 ) -> tuple[LoopConfig, Path, str]:
@@ -20046,9 +22011,17 @@ def _build_cli_config(
         namespace.optimization_prior_discovery_feedback,
         namespace.optimization_prior_discovery_feedback_sha256,
     )
-    optimizer_v3_fields = (
+    optimizer_fields = (
         namespace.optimizer_manifest,
         namespace.optimizer_manifest_sha256,
+        namespace.discovery_panel_plan,
+        namespace.discovery_panel_plan_sha256,
+        namespace.qualification_panel_plan,
+        namespace.qualification_panel_plan_sha256,
+        namespace.qualification_ledger,
+        namespace.qualification_ledger_snapshot_sha256,
+        namespace.campaign_checkpoint,
+        namespace.campaign_checkpoint_sha256,
         namespace.verified_parity,
         namespace.verified_parity_sha256,
         namespace.optimizer_authorization_window_id,
@@ -20057,7 +22030,7 @@ def _build_cli_config(
     if (
         namespace.gate != "pit_optimizer"
         and (
-            any(value is not None for value in optimizer_v3_fields)
+            any(value is not None for value in optimizer_fields)
             or namespace.authorize_policy_source_transmission
         )
     ) or (
@@ -20066,13 +22039,13 @@ def _build_cli_config(
         and namespace.authorize_policy_source_transmission
     ):
         raise ConfigurationError(
-            "schema-v3 optimizer options are accepted only by optimizer canary"
+            "schema-v2 optimizer options are accepted only by optimizer canary"
         )
     all_pit_fields = (
         *pit_shared_fields,
         *diagnosis_fields,
         *optimization_fields,
-        *optimizer_v3_fields,
+        *optimizer_fields,
     )
     if namespace.gate == "test":
         if any(value is not None for value in backtest_fields):
@@ -20243,7 +22216,42 @@ def _build_cli_config(
                 "proposal samples are not supported by the PIT optimizer gate"
             )
         namespace.max_api_calls = max_api_calls
-        gate = _build_pit_optimizer_v3_config(namespace)
+        manifest_path = _absolute_cli_path(
+            namespace.optimizer_manifest,
+            "optimizer manifest",
+        )
+        try:
+            manifest_schema = json.loads(manifest_path.read_bytes()).get(
+                "schema_version"
+            )
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConfigurationError("optimizer manifest is invalid JSON") from exc
+        if manifest_schema == 4:
+            if namespace.verified_parity is not None or (
+                namespace.verified_parity_sha256 is not None
+            ):
+                raise ConfigurationError(
+                    "legacy optimizer parity cannot be supplied to schema v4"
+                )
+            gate = _build_pit_optimizer_v4_config(namespace)
+        else:
+            if any(
+                value is not None
+                for value in (
+                    namespace.discovery_panel_plan,
+                    namespace.discovery_panel_plan_sha256,
+                    namespace.qualification_panel_plan,
+                    namespace.qualification_panel_plan_sha256,
+                    namespace.qualification_ledger,
+                    namespace.qualification_ledger_snapshot_sha256,
+                    namespace.campaign_checkpoint,
+                    namespace.campaign_checkpoint_sha256,
+                )
+            ):
+                raise ConfigurationError(
+                    "schema-v4 checkpoint/panel/ledger options require a v4 manifest"
+                )
+            gate = _build_pit_optimizer_v3_config(namespace)
     limits: LoopLimits | PitOptimizerLoopLimits
     if namespace.gate == "pit_optimizer":
         # DeepSeek R1 is a mandatory-reasoning model.  A short generic HTTP
@@ -20558,6 +22566,7 @@ def _execute_cli_run(
             PitOptimizationGateConfig,
             PitOptimizationLoopResult,
             PitOptimizationRoleCall,
+            PitOptimizerGateConfigV4,
             prepare_pit_optimizer_v3,
             prepare_pit_optimization,
             run_pit_optimization_canary,
@@ -20566,8 +22575,64 @@ def _execute_cli_run(
         from core.pit_optimization_contract import PitOptimizerGateConfig
         from core.pit_optimizer_controller import (
             PitOptimizerReadiness,
+            PitOptimizerReadinessV4,
             PitOptimizerResult,
+            PitOptimizerResultV4,
         )
+        if isinstance(config.gate, PitOptimizerGateConfigV4):
+            if not isinstance(config.limits, PitOptimizerLoopLimits):
+                raise ConfigurationError(
+                    "PIT optimizer v4 execution limits are invalid"
+                )
+            if state.fingerprint is None:
+                raise ConfigurationError("preflight source fingerprint is absent")
+
+            def prepare_v4(gate: object) -> PitOptimizerReadinessV4:
+                nonlocal stage
+                if not isinstance(gate, PitOptimizerGateConfigV4):
+                    raise ConfigurationError("PIT optimizer v4 gate changed")
+                stage = "pit_optimizer_v4_prepare"
+                return _prepare_pit_optimizer_v4_production(
+                    gate,
+                    source_state=state,
+                    git_capability=git_capability,
+                    limits=config.limits,
+                )
+
+            def build_v4(
+                gate: object,
+                limits: PitOptimizerLoopLimits,
+            ) -> PitOptimizerLiveRunV4:
+                nonlocal stage
+                if not isinstance(gate, PitOptimizerGateConfigV4):
+                    raise ConfigurationError("PIT optimizer v4 gate changed")
+                stage = "pit_optimizer_v4_canary"
+                return _build_pit_optimizer_v4_live_run(
+                    gate,
+                    loop_config=config,
+                    limits=limits,
+                    source_state=state,
+                    git_capability=git_capability,
+                )
+
+            v4_result = _dispatch_pit_optimizer_v4(
+                config.gate,
+                config.limits,
+                prepare=prepare_v4,
+                build_live_services=build_v4,
+            )
+            if isinstance(v4_result, PitOptimizerReadinessV4):
+                if recheck_source_unchanged(state).source_modified:
+                    raise CandidateMutationError(
+                        "source changed during PIT optimizer v4 readiness publication"
+                    )
+            elif not isinstance(v4_result, PitOptimizerResultV4):
+                raise ConfigurationError("PIT optimizer v4 returned an invalid result")
+            state.close()
+            state = None
+            loop_returned = True
+            return v4_result
+
         if isinstance(config.gate, PitOptimizerGateConfig):
             if not isinstance(config.limits, PitOptimizerLoopLimits):
                 raise ConfigurationError(
@@ -21341,6 +23406,226 @@ def _pit_optimizer_v3_summary(
     }
 
 
+def _pit_optimizer_v4_summary(result: object) -> dict[str, object]:
+    """Project schema-v4 search status without hashes, source, or credentials."""
+
+    from core.pit_optimizer_controller import PitOptimizerResultV4
+
+    if not isinstance(result, PitOptimizerResultV4):
+        raise ConfigurationError(
+            "CLI execution did not return a PitOptimizerResultV4"
+        )
+    summary = dict(result.to_public_artifact())
+    if any("sha256" in key.lower() for key in summary):
+        raise ConfigurationError("optimizer v4 public summary exposed an opaque digest")
+    if summary.get("apply") is not False:
+        raise ConfigurationError("optimizer v4 public summary is not apply=false")
+    return summary
+
+
+def _pit_optimizer_v4_readiness_summary(
+    result: object,
+) -> dict[str, object]:
+    """Project schema-v4 readiness without exposing opaque identities."""
+
+    from core.pit_optimizer_controller import PitOptimizerReadinessV4
+
+    if not isinstance(result, PitOptimizerReadinessV4):
+        raise ConfigurationError(
+            "CLI execution did not return a PitOptimizerReadinessV4"
+        )
+    return {
+        "schema_version": 4,
+        "phase": "prepare",
+        "status": "ready",
+        "terminal_code": "prepared",
+        "exit_code": 0,
+        "campaign_id": result.manifest.campaign_id,
+        "readiness_artifact": str(result.artifact_path),
+        "discovery_panel": {
+            "quick_lineages": len(result.discovery_panel_plan.quick_panel.lineages),
+            "discovery_lineages": len(
+                result.discovery_panel_plan.discovery_panel.lineages
+            ),
+        },
+        "qualification_panel": {
+            "lineages": len(
+                result.qualification_panel_plan.qualification_panel.lineages
+            ),
+        },
+        "qualification_ledger": {"authenticated": True},
+        "seed_checkpoint_present": result.seed_champion is not None
+        or result.seed_active_branch is not None,
+        "source_modified": False,
+        "cleanup_complete": True,
+    }
+
+
+def _pit_optimizer_v4_prepare_lines(
+    config: PitOptimizerGateConfigV4,
+    readiness: PitOptimizerReadinessV4,
+    limits: PitOptimizerLoopLimits,
+) -> tuple[str, str]:
+    """Render schema-v4 readiness and its exact inert canary command."""
+
+    from core.pit_optimization import PitOptimizerGateConfigV4
+    from core.pit_optimizer_command import (
+        authenticated_python_executable,
+        render_pit_optimizer_v3_command,
+    )
+    from core.pit_optimizer_controller import PitOptimizerReadinessV4
+
+    if (
+        not isinstance(config, PitOptimizerGateConfigV4)
+        or config.phase != "prepare"
+        or not isinstance(readiness, PitOptimizerReadinessV4)
+        or not isinstance(limits, PitOptimizerLoopLimits)
+        or readiness.manifest.sha256 != config.optimizer_manifest_sha256
+        or readiness.discovery_panel_plan.sha256
+        != config.discovery_panel_plan_sha256
+        or readiness.qualification_panel_plan.sha256
+        != config.qualification_panel_plan_sha256
+        or readiness.discovery_panel_plan.qualification_ledger_snapshot_sha256
+        != config.qualification_ledger_snapshot_sha256
+        or readiness.qualification_panel_plan.qualification_ledger_snapshot_sha256
+        != config.qualification_ledger_snapshot_sha256
+        or not isinstance(readiness.qualification_ledger_head_sha256, str)
+    ):
+        raise ConfigurationError(
+            "prepare output requires authenticated schema-v4 readiness"
+        )
+    manifest = readiness.manifest
+    supplied_readiness = Path(readiness.artifact_path)
+    expected_readiness = config.readiness_artifact.resolve(strict=False)
+    if (
+        not supplied_readiness.is_absolute()
+        or supplied_readiness.is_symlink()
+        or not supplied_readiness.is_file()
+        or supplied_readiness.resolve(strict=False) != expected_readiness
+    ):
+        raise ConfigurationError("PIT optimizer v4 derived readiness path differs")
+    if (
+        readiness.readiness_sha256
+        != hashlib.sha256(supplied_readiness.read_bytes()).hexdigest()
+    ):
+        raise ConfigurationError(
+            "prepare output requires authenticated schema-v4 readiness"
+        )
+    authorization = manifest.authorization_requirement
+    if (
+        config.max_api_calls != authorization.max_calls
+        or config.max_tokens != authorization.max_tokens
+        or config.max_iterations != manifest.max_iterations
+        or limits.max_api_calls != config.max_api_calls
+        or limits.max_tokens != config.max_tokens
+        or limits.max_iterations != config.max_iterations
+        or config.apply is not False
+    ):
+        raise ConfigurationError("PIT optimizer v4 prepare ceilings are invalid")
+    context = (
+        config.source_root,
+        config.permanent_runtime_root,
+        config.git_executable,
+        config.controller_temp_parent,
+        config.artifact_root,
+        config.docker_executable,
+        config.sandbox_image,
+    )
+    if any(value is None for value in context):
+        raise ConfigurationError("PIT optimizer v4 prepare execution context is absent")
+    argv = (
+        authenticated_python_executable(),
+        "-B",
+        str((config.source_root / "agent_loop.py").resolve()),
+        "--repo-root",
+        str(config.source_root),
+        "--permanent-runtime-root",
+        str(config.permanent_runtime_root),
+        "--git-executable",
+        str(config.git_executable),
+        "--controller-temp-parent",
+        str(config.controller_temp_parent),
+        "--artifact-root",
+        str(config.artifact_root),
+        "--docker-executable",
+        str(config.docker_executable),
+        "--sandbox-image",
+        config.sandbox_image,
+        "--gate",
+        "pit_optimizer",
+        "--optimization-phase",
+        "canary",
+        "--baseline-run",
+        str(config.baseline_run),
+        "--pit-bundle",
+        str(config.pit_bundle),
+        "--pit-bundle-sha256",
+        config.pit_bundle_sha256,
+        "--optimizer-manifest",
+        str(config.optimizer_manifest),
+        "--optimizer-manifest-sha256",
+        config.optimizer_manifest_sha256,
+        "--discovery-panel-plan",
+        str(config.discovery_panel_plan),
+        "--discovery-panel-plan-sha256",
+        config.discovery_panel_plan_sha256,
+        "--qualification-panel-plan",
+        str(config.qualification_panel_plan),
+        "--qualification-panel-plan-sha256",
+        config.qualification_panel_plan_sha256,
+        "--qualification-ledger",
+        str(config.qualification_ledger),
+        "--qualification-ledger-snapshot-sha256",
+        config.qualification_ledger_snapshot_sha256,
+        "--readiness-sha256",
+        readiness.readiness_sha256,
+        *(
+            (
+                "--campaign-checkpoint",
+                str(config.campaign_checkpoint),
+                "--campaign-checkpoint-sha256",
+                config.campaign_checkpoint_sha256,
+            )
+            if config.campaign_checkpoint is not None
+            and config.campaign_checkpoint_sha256 is not None
+            else ()
+        ),
+        "--optimizer-authorization-window-id",
+        authorization.window_id,
+        "--optimizer-authorization-requirement-sha256",
+        authorization.sha256,
+        "--authorize-policy-source-transmission",
+        *_pit_optimizer_v3_execution_limit_args(limits),
+    )
+    command = render_pit_optimizer_v3_command(argv)
+    ready = {
+        "schema_version": 4,
+        "phase": "ready",
+        "campaign_id": manifest.campaign_id,
+        "readiness_artifact": str(readiness.artifact_path),
+        "discovery_panel_plan": str(config.discovery_panel_plan),
+        "discovery_panel_plan_sha256": config.discovery_panel_plan_sha256,
+        "qualification_panel_plan": str(config.qualification_panel_plan),
+        "qualification_panel_plan_sha256": config.qualification_panel_plan_sha256,
+        "qualification_ledger": str(config.qualification_ledger),
+        "qualification_ledger_snapshot_sha256": (
+            config.qualification_ledger_snapshot_sha256
+        ),
+        "canary_command": command,
+    }
+    return (
+        "PIT_OPTIMIZER_READY="
+        + json.dumps(
+            ready,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ),
+        "PIT_OPTIMIZER_CANARY_COMMAND=" + command,
+    )
+
+
 def _pit_optimizer_v3_execution_limit_args(
     limits: PitOptimizerLoopLimits,
 ) -> tuple[str, ...]:
@@ -21627,11 +23912,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_id=run_id,
             batch_limits=batch_limits,
         )
-        from core.pit_optimization import PitOptimizationLoopResult
+        from core.pit_optimization import (
+            PitOptimizationLoopResult,
+            PitOptimizerGateConfigV4,
+        )
         from core.pit_optimization_contract import PitOptimizerGateConfig
         from core.pit_optimizer_controller import (
             PitOptimizerReadiness,
+            PitOptimizerReadinessV4,
             PitOptimizerResult,
+            PitOptimizerResultV4,
         )
         from pit_diagnosis_agent import PitDiagnosisLoopResult
 
@@ -21644,6 +23934,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(result, PitOptimizationLoopResult)
             else _pit_optimizer_v3_summary(result)
             if isinstance(result, PitOptimizerResult)
+            else _pit_optimizer_v4_summary(result)
+            if isinstance(result, PitOptimizerResultV4)
+            else _pit_optimizer_v4_readiness_summary(result)
+            if isinstance(result, PitOptimizerReadinessV4)
             else {
                 "schema_version": 3,
                 "phase": "prepare",
@@ -21686,7 +23980,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if isinstance(result, PitOptimizationLoopResult):
         for line in result.operator_lines:
             print(line)
-    if isinstance(result, PitOptimizerReadiness):
+    if isinstance(result, PitOptimizerReadinessV4):
+        if (
+            not isinstance(config.gate, PitOptimizerGateConfigV4)
+            or not isinstance(config.limits, PitOptimizerLoopLimits)
+        ):
+            raise ConfigurationError("PIT optimizer v4 readiness gate is invalid")
+        for line in _pit_optimizer_v4_prepare_lines(
+            config.gate,
+            result,
+            config.limits,
+        ):
+            print(line)
+    elif isinstance(result, PitOptimizerReadiness):
         if (
             not isinstance(config.gate, PitOptimizerGateConfig)
             or not isinstance(config.limits, PitOptimizerLoopLimits)
@@ -21708,7 +24014,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_nan=False,
         )
     )
-    return 0 if isinstance(result, PitOptimizerReadiness) else result.exit_code
+    if isinstance(result, (PitOptimizerReadiness, PitOptimizerReadinessV4)):
+        return 0
+    if isinstance(result, PitOptimizerResultV4):
+        return 0 if result.status == "completed" else 1
+    return result.exit_code
 
 
 if __name__ == "__main__":

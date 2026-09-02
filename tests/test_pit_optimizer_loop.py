@@ -110,9 +110,9 @@ def _evidence(
 
 def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
     caps = {
-        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
-        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
-        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
+        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
+        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
+        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
     }
     return tuple(
         contract.PitOptimizerCallBudget(
@@ -125,7 +125,6 @@ def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
             max_input_tokens=caps[role][2],
             max_output_tokens=caps[role][3],
             max_response_bytes=caps[role][4],
-            max_usd=caps[role][5],
         )
         for iteration in (1, 2)
         for ordinal, role in enumerate(contract.OPTIMIZER_V2_ROLES, start=1)
@@ -275,7 +274,6 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
         window_id="window_task7",
         max_calls=6,
         max_tokens=448_000,
-        max_usd=0.40,
         policy_source_scope_sha256=scope.sha256,
         provider_retries=0,
         apply=False,
@@ -283,7 +281,7 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
     constraints = ("causal_only", "no_external_io")
     constraints_sha256 = hashlib.sha256(_canonical_bytes(constraints)).hexdigest()
     manifest = contract.PitOptimizerRunManifest(
-        schema_version=2,
+        schema_version=3,
         run_id="run_task7",
         run_kind="subset_canary",
         model=contract.PIT_OPTIMIZER_R1_MODEL,
@@ -331,7 +329,6 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
         authorization_window_id=None,
         authorization_requirement_sha256=authorization.sha256,
         source_transmission_authorized=False,
-        max_usd=0.40,
         max_api_calls=6,
         max_tokens=448_000,
         max_iterations=2,
@@ -834,22 +831,22 @@ def test_artifact_initialization_store_is_create_only_and_accounting_replaceable
     store = IncrementalArtifactStore(root)
     first_path, first_digest = store.write_json_artifact(
         "run.json",
-        {"schema_version": 2, "run_id": "run_task7"},
+        {"schema_version": 3, "run_id": "run_task7"},
     )
     assert first_path == root / "run.json"
     assert first_digest == hashlib.sha256(first_path.read_bytes()).hexdigest()
     with pytest.raises(FileExistsError):
         store.write_json_artifact(
             "run.json",
-            {"schema_version": 2, "run_id": "run_other"},
+            {"schema_version": 3, "run_id": "run_other"},
         )
     store.write_json_artifact(
         "accounting.json",
-        {"schema_version": 2, "api_calls": 0},
+        {"schema_version": 3, "api_calls": 0},
     )
     replaced_path, replaced_digest = store.write_json_artifact(
         "accounting.json",
-        {"schema_version": 2, "api_calls": 1},
+        {"schema_version": 3, "api_calls": 1},
     )
     assert json.loads(replaced_path.read_bytes())["api_calls"] == 1
     assert replaced_digest == hashlib.sha256(replaced_path.read_bytes()).hexdigest()
@@ -1360,11 +1357,12 @@ def test_focused_candidate_checks_persist_only_controller_derived_scope(
     ]
 
 
-def test_no_discovery_trades_becomes_safe_critic_feedback(
+def test_no_discovery_trades_preserves_aggregate_critic_feedback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Break caught: zero trades could be misclassified as evidence tampering."""
+    """Break caught: zero-trade discovery evidence was discarded before critique."""
+    from types import SimpleNamespace
     from unittest.mock import Mock
 
     import core.pit_optimizer_controller as controller
@@ -1381,14 +1379,19 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
         FoldEvaluationResult,
     )
 
-    readiness = _prepare(_prepare_fixture(tmp_path))
-    state = _run_state(readiness)
-    state.iteration_workspace = CandidateWorkspace(
-        "workspace_zero_trades",
-        tmp_path.resolve(),
+    effective_policy_sha256 = "3" * 64
+    readiness = SimpleNamespace(
+        manifest=SimpleNamespace(effective_policy_sha256=effective_policy_sha256)
     )
-    identity = Mock()
-    identity.identity_sha256 = "a" * 64
+    state = SimpleNamespace(
+        iteration_workspace=CandidateWorkspace(
+            "workspace_zero_trades",
+            tmp_path.resolve(),
+        ),
+        evaluation_failure_code=None,
+        next_iteration=1,
+    )
+    identity = SimpleNamespace(identity_sha256="a" * 64)
     validation = CandidateValidationOutcome(
         True,
         None,
@@ -1401,25 +1404,26 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
     zero = DiscoveryScore(Decimal("0.00"), Decimal("0.00"), Decimal("0.00"))
     folds = tuple(
         FoldEvaluationResult(
-            fold_id=baseline.fold_id,
-            engine_policy_sha256=readiness.manifest.effective_policy_sha256,
+            fold_id=fold_id,
+            engine_policy_sha256=effective_policy_sha256,
             candidate_identity_sha256="a" * 64,
             evidence_sha256=hashlib.sha256(
-                f"zero-trades-{baseline.fold_id}".encode()
+                f"zero-trades-{fold_id}".encode()
             ).hexdigest(),
             aggregate_metrics=replace(
-                baseline,
+                _aggregate(fold_id, total_return),
                 closed_trades=0,
                 excess_total_return_pp=0.0,
             ),
         )
-        for baseline in readiness.baseline_discovery.folds
+        for fold_id, total_return in (("discovery_1", 1.0), ("discovery_2", 2.0))
     )
     services = Mock(spec=PitOptimizerServices)
-    services.evaluate_discovery.return_value = DiscoveryEvaluation(
+    evaluation = DiscoveryEvaluation(
         folds,
         DiscoveryComparison(zero, zero, False, False),
     )
+    services.evaluate_discovery.return_value = evaluation
     payloads: list[Mapping[str, object]] = []
     services.write_json_artifact.side_effect = lambda name, value: (
         payloads.append(value) or (tmp_path / name).resolve(),
@@ -1427,11 +1431,11 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
     )
     monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
 
-    assert _evaluate_iteration_candidate(readiness, state, validation, services) is None
+    assert _evaluate_iteration_candidate(readiness, state, validation, services) is evaluation
     assert state.evaluation_failure_code == "no_discovery_trades"
     assert payloads == [
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "failure_code": "no_discovery_trades",
             "fixed_baseline_comparison": None,
             "incumbent_diagnostics": None,
@@ -1444,7 +1448,7 @@ def test_no_discovery_trades_becomes_safe_critic_feedback(
                 }
                 for item in folds
             ],
-            "engine_policy_sha256": readiness.manifest.effective_policy_sha256,
+            "engine_policy_sha256": effective_policy_sha256,
             "candidate_identity_sha256": "a" * 64,
         }
     ]
@@ -1841,7 +1845,7 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
     )
     from core.pit_optimizer_artifacts import IncrementalArtifactStore
     from core.pit_optimizer_authorization import PitOptimizerRoleCall
-    from core.pit_optimizer_candidate import validate_candidate_diff
+    from core.pit_optimizer_candidate import validate_candidate_sources
     from core.pit_optimizer_controller import (
         CandidateValidationOutcome,
         CandidateWorkspace,
@@ -1989,18 +1993,36 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
         cumulative_diff: str | None,
     ) -> CandidateValidationOutcome:
         assert live[workspace.workspace_id] == workspace.root
-        identity, authenticated_cumulative = validate_candidate_diff(
+        replacement_sources = {
+            path: (workspace.root / path).read_text("utf-8")
+            for path in (
+                "core/strategy_policy/entry.py",
+                "core/strategy_policy/risk.py",
+                "core/strategy_policy/exit.py",
+            )
+        }
+        before_literal, after_literal = (
+            ("None", "True")
+            if author.behavioral_summary.endswith("1")
+            else ("True", "False")
+        )
+        replacement_sources["core/strategy_policy/entry.py"] = replacement_sources[
+            "core/strategy_policy/entry.py"
+        ].replace(f"return {before_literal}", f"return {after_literal}")
+        identity, authenticated_cumulative = validate_candidate_sources(
             authenticated_base_root=Path(inputs["source_root"]).resolve(),
             candidate_root=workspace.root,
-            incremental_diff=author.unified_diff,
+            replacement_sources=replacement_sources,
             git=git_capability,
-            bounds=readiness.manifest.candidate_bounds,
             source_commit=readiness.manifest.source_head,
             policy_interface_version=readiness.manifest.policy_interface_version,
             immutable_constraints_sha256=(
                 readiness.manifest.immutable_constraints_sha256
             ),
-            discovery_manifest_sha256=readiness.manifest.fold_manifest.sha256,
+            discovery_panel_plan_sha256=readiness.manifest.fold_manifest.sha256,
+            parent_identity_sha256=hashlib.sha256(
+                (cumulative_diff or "baseline").encode("utf-8")
+            ).hexdigest(),
         )
         return CandidateValidationOutcome(
             True,
@@ -2525,6 +2547,9 @@ def test_dispatch_with_production_composition_completes_mocked_two_iteration_can
         evaluator_factory_calls.append(kwargs)
         return agent_loop._PitOptimizerEvaluatorData(
             universe=universe,
+            tradable_tickers=universe,
+            market_reference_tickers=("IWM", "QQQ", "SPY"),
+            market_context_universe=(*universe, "IWM", "QQQ", "SPY"),
             evaluate_candidate=evaluate_candidate,
             evaluate_baseline=evaluate_baseline,
         )

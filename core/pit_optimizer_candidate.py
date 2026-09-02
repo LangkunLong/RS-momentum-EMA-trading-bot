@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import InitVar, dataclass
+import difflib
 import hashlib
 import json
 import os
@@ -55,11 +56,17 @@ _DECLARED_SYMBOLS = {
     ),
 }
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_AUTHOR_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(0|[1-9][0-9]*)(?:,([0-9]+))? "
+    r"\+(0|[1-9][0-9]*)(?:,([0-9]+))? @@((?: .*)?)\n$"
+)
+_FULL_SOURCE_TRANSPORT_PREFIX = "PIT_FULL_SOURCE_V1\n"
 _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL = object()
 _CONTRACT_IMPORTS = frozenset(
     {
         "AllocationDecision",
         "AllocationSnapshot",
+        "BenchmarkContextV1",
         "CapacityDecision",
         "CapacitySnapshot",
         "EntryDecision",
@@ -70,7 +77,11 @@ _CONTRACT_IMPORTS = frozenset(
         "ExitAction",
         "ExitDecision",
         "ExitSnapshot",
+        "MarketContextV1",
     }
+)
+_NON_CALLABLE_CONTRACT_IMPORTS = frozenset(
+    {"BenchmarkContextV1", "MarketContextV1"}
 )
 _PURE_BUILTINS = frozenset(
     {
@@ -193,8 +204,42 @@ class CandidateIdentity:
         ) + "\n"
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class CandidateIdentityV4:
+    source_commit: str
+    policy_interface_version: int
+    cumulative_diff_sha256: str
+    editable_file_sha256s: tuple[tuple[str, str], ...]
+    changed_paths: tuple[str, ...]
+    changed_symbols: tuple[str, ...]
+    immutable_constraints_sha256: str
+    discovery_panel_plan_sha256: str
+    parent_identity_sha256: str
+    identity_sha256: str
+    _controller_seal: InitVar[object] = None
+
+    def __post_init__(self, _controller_seal: object) -> None:
+        if _controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
+            raise ValueError("candidate identity must be controller derived")
+        _validate_candidate_identity_v4_fields(self)
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            **_candidate_identity_v4_values(self),
+            "identity_sha256": self.identity_sha256,
+        }
+
+    def to_canonical_json(self) -> str:
+        return json.dumps(
+            self.to_primitive(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n"
+
+
 _AUTHENTICATED_CANDIDATE_IDENTITIES: WeakValueDictionary[
-    int, CandidateIdentity
+    int, CandidateIdentity | CandidateIdentityV4
 ] = WeakValueDictionary()
 
 
@@ -316,7 +361,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                 and len(descendant.targets) == 1
                 and isinstance(descendant.targets[0], ast.Name)
                 and (
-                    isinstance(descendant.value, ast.List)
+                    isinstance(descendant.value, (ast.List, ast.ListComp))
                     or (
                         isinstance(descendant.value, ast.Call)
                         and isinstance(descendant.value.func, ast.Name)
@@ -330,7 +375,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                 isinstance(descendant, ast.AnnAssign)
                 and isinstance(descendant.target, ast.Name)
                 and (
-                    isinstance(descendant.value, ast.List)
+                    isinstance(descendant.value, (ast.List, ast.ListComp))
                     or (
                         isinstance(descendant.value, ast.Call)
                         and isinstance(descendant.value.func, ast.Name)
@@ -417,7 +462,9 @@ def validate_policy_ast(*, path: str, source: str) -> None:
                 if name in _DANGEROUS_CALLS:
                     raise ValueError("policy call is outside the allowlist")
                 if name not in (
-                    _PURE_BUILTINS | imported_contracts | local_functions
+                    _PURE_BUILTINS
+                    | (imported_contracts - _NON_CALLABLE_CONTRACT_IMPORTS)
+                    | local_functions
                 ):
                     raise ValueError("policy call is outside the allowlist")
             elif isinstance(node.func, ast.Attribute):
@@ -447,10 +494,11 @@ def _symbol_nodes(path: str, source: str) -> dict[str, str]:
     nodes: dict[str, str] = {}
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in _ALLOWED_PUBLIC[path]:
-                nodes[node.name] = ast.dump(node, include_attributes=False)
-            elif not node.name.startswith("_"):
-                nodes[node.name] = ast.dump(node, include_attributes=False)
+            # Private top-level helpers are part of the authenticated policy
+            # implementation even though they are not part of its public API.
+            # Track them so a model can safely refine helper-based strategy
+            # logic without producing an empty candidate identity.
+            nodes[node.name] = ast.dump(node, include_attributes=False)
         elif (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
@@ -587,6 +635,22 @@ def _candidate_identity_values(candidate: CandidateIdentity) -> dict[str, object
     }
 
 
+def _candidate_identity_v4_values(
+    candidate: CandidateIdentityV4,
+) -> dict[str, object]:
+    return {
+        "source_commit": candidate.source_commit,
+        "policy_interface_version": candidate.policy_interface_version,
+        "cumulative_diff_sha256": candidate.cumulative_diff_sha256,
+        "editable_file_sha256s": candidate.editable_file_sha256s,
+        "changed_paths": candidate.changed_paths,
+        "changed_symbols": candidate.changed_symbols,
+        "immutable_constraints_sha256": candidate.immutable_constraints_sha256,
+        "discovery_panel_plan_sha256": candidate.discovery_panel_plan_sha256,
+        "parent_identity_sha256": candidate.parent_identity_sha256,
+    }
+
+
 def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
     if re.fullmatch(r"[0-9a-f]{40}", candidate.source_commit or "") is None:
         raise ValueError("candidate identity source commit is invalid")
@@ -642,8 +706,16 @@ def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
         symbol not in allowed
         and not any(
             symbol.startswith(prefix)
-            and re.fullmatch(r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix))
-            is not None
+            and (
+                re.fullmatch(
+                    r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+                or re.fullmatch(
+                    r"_[A-Za-z][A-Za-z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+            )
             for prefix in constant_prefixes
         )
         for symbol in candidate.changed_symbols
@@ -655,13 +727,276 @@ def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
         raise ValueError("candidate identity self-digest is invalid")
 
 
-def validate_candidate_identity(candidate: CandidateIdentity) -> None:
+def _validate_candidate_identity_v4_fields(candidate: CandidateIdentityV4) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}", candidate.source_commit or "") is None:
+        raise ValueError("candidate identity source commit is invalid")
+    if (
+        type(candidate.policy_interface_version) is not int
+        or candidate.policy_interface_version <= 0
+    ):
+        raise ValueError("candidate identity interface version is invalid")
+    for value in (
+        candidate.cumulative_diff_sha256,
+        candidate.immutable_constraints_sha256,
+        candidate.discovery_panel_plan_sha256,
+        candidate.parent_identity_sha256,
+        candidate.identity_sha256,
+    ):
+        if _SHA256_RE.fullmatch(value or "") is None:
+            raise ValueError("candidate identity digest is invalid")
+    if (
+        type(candidate.editable_file_sha256s) is not tuple
+        or tuple(path for path, _digest in candidate.editable_file_sha256s)
+        != EDITABLE_POLICY_PATHS
+        or any(
+            _SHA256_RE.fullmatch(digest or "") is None
+            for _path, digest in candidate.editable_file_sha256s
+        )
+    ):
+        raise ValueError("candidate identity editable hashes are invalid")
+    canonical_paths = tuple(
+        path for path in EDITABLE_POLICY_PATHS if path in candidate.changed_paths
+    )
+    if (
+        type(candidate.changed_paths) is not tuple
+        or candidate.changed_paths != canonical_paths
+    ):
+        raise ValueError("candidate identity changed paths are invalid")
+    if (
+        type(candidate.changed_symbols) is not tuple
+        or len(candidate.changed_symbols) != len(set(candidate.changed_symbols))
+        or any(not isinstance(symbol, str) for symbol in candidate.changed_symbols)
+    ):
+        raise ValueError("candidate identity changed symbols are invalid")
+    allowed = {
+        symbol
+        for path in candidate.changed_paths
+        for symbol in _DECLARED_SYMBOLS[path]
+    }
+    constant_prefixes = tuple(
+        f"{path.removesuffix('.py').replace('/', '.')}."
+        for path in candidate.changed_paths
+    )
+    if any(
+        symbol not in allowed
+        and not any(
+            symbol.startswith(prefix)
+            and (
+                re.fullmatch(
+                    r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+                or re.fullmatch(
+                    r"_[A-Za-z][A-Za-z0-9_]*", symbol.removeprefix(prefix)
+                )
+                is not None
+            )
+            for prefix in constant_prefixes
+        )
+        for symbol in candidate.changed_symbols
+    ):
+        raise ValueError("candidate identity changed symbols are invalid")
+    if candidate.identity_sha256 != _identity_digest(
+        _candidate_identity_v4_values(candidate)
+    ):
+        raise ValueError("candidate identity self-digest is invalid")
+
+
+def validate_candidate_identity(
+    candidate: CandidateIdentity | CandidateIdentityV4,
+) -> None:
     """Authenticate one exact controller-created identity object at consumption."""
-    if not isinstance(candidate, CandidateIdentity):
+    if isinstance(candidate, CandidateIdentity):
+        _validate_candidate_identity_fields(candidate)
+    elif isinstance(candidate, CandidateIdentityV4):
+        _validate_candidate_identity_v4_fields(candidate)
+    else:
         raise ValueError("candidate identity is invalid")
-    _validate_candidate_identity_fields(candidate)
     if _AUTHENTICATED_CANDIDATE_IDENTITIES.get(id(candidate)) is not candidate:
         raise ValueError("candidate identity is not authenticated")
+
+
+def materialize_author_candidate_diff(
+    *,
+    candidate_root: Path,
+    author: AuthorArtifact,
+    bounds: PatchBounds,
+) -> str:
+    """Convert the author transport into a controller-generated unified diff.
+
+    A full-source envelope avoids asking a reasoning model to reproduce hunk
+    coordinates and duplicate context exactly.  It still targets one
+    controller-authenticated policy path, and the resulting diff passes through
+    the same bounds, Git, AST, purity, determinism, and sandbox validation.
+    Conventional unified diffs remain accepted for historical artifacts.
+    """
+
+    if not isinstance(author, AuthorArtifact) or not isinstance(bounds, PatchBounds):
+        raise ValueError("author candidate transport is invalid")
+    transport = author.unified_diff
+    if not transport.startswith(_FULL_SOURCE_TRANSPORT_PREFIX):
+        return transport
+    if len(author.changed_paths) != 1:
+        raise ValueError("full-source author transport requires one policy path")
+    path = author.changed_paths[0]
+    if path not in EDITABLE_POLICY_PATHS:
+        raise ValueError("full-source author transport path is outside scope")
+    replacement = transport.removeprefix(_FULL_SOURCE_TRANSPORT_PREFIX)
+    if (
+        not replacement
+        or "\r" in replacement
+        or "\x00" in replacement
+        or not replacement.endswith("\n")
+    ):
+        raise ValueError("full-source author transport is invalid")
+    before = _read_policy_sources(candidate_root)[path]
+    if replacement == before:
+        raise ValueError("candidate patch is a no-op")
+    rendered = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            replacement.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            n=3,
+            lineterm="\n",
+        )
+    )
+    if not rendered or len(rendered.encode("utf-8")) > bounds.max_diff_bytes:
+        raise ValueError("candidate patch exceeds max_diff_bytes")
+    return rendered
+
+
+def _normalize_author_diff_transport(raw: str) -> str:
+    """Repair only transport delimiters and hunk count metadata before Git checks.
+
+    The model-authored file bodies, paths, hunk start coordinates, and context are
+    left untouched.  A later strict parser and ``git apply --check`` remain the
+    authority for every semantic and applicability property of the candidate.
+    """
+
+    if not isinstance(raw, str) or not raw:
+        return raw
+    candidate = raw if raw.endswith("\n") else raw + "\n"
+    if "\r" in candidate or "\x00" in candidate:
+        return candidate
+    lines = candidate.splitlines(keepends=True)
+    # Some model responses use the standard repo-relative ``--- path`` / ``+++ path``
+    # form instead of Git's ``a/`` / ``b/`` prefixes.  Canonicalize only an exact,
+    # matched pair for one of the sealed editable files.  The strict parser, Git,
+    # AST, scope, and bounds checks below remain authoritative.
+    for header_index in range(len(lines) - 1):
+        old_header = lines[header_index]
+        new_header = lines[header_index + 1]
+        if not old_header.startswith("--- ") or not new_header.startswith("+++ "):
+            continue
+        old_path = old_header[4:].removesuffix("\n")
+        new_path = new_header[4:].removesuffix("\n")
+        if (
+            old_path == new_path
+            and old_path in EDITABLE_POLICY_PATHS
+            and not old_path.startswith("a/")
+            and not new_path.startswith("b/")
+        ):
+            lines[header_index] = f"--- a/{old_path}\n"
+            lines[header_index + 1] = f"+++ b/{new_path}\n"
+    normalized: list[str] = []
+    index = 0
+    while index < len(lines):
+        header = _AUTHOR_HUNK_HEADER_RE.fullmatch(lines[index])
+        if header is None:
+            normalized.append(lines[index])
+            index += 1
+            continue
+        old_count = 0
+        new_count = 0
+        body_index = index + 1
+        while body_index < len(lines):
+            line = lines[body_index]
+            if line.startswith(("@@ ", "diff --git ", "--- a/")):
+                break
+            if line.startswith(" "):
+                old_count += 1
+                new_count += 1
+            elif line.startswith("-"):
+                old_count += 1
+            elif line.startswith("+"):
+                new_count += 1
+            elif line != "\\ No newline at end of file\n":
+                # Do not make a malformed body look valid.  The strict parser
+                # below will reject this unchanged candidate.
+                return candidate
+            body_index += 1
+        declared_old = int(header.group(2) or "1")
+        declared_new = int(header.group(4) or "1")
+        if (declared_old, declared_new) == (old_count, new_count):
+            normalized.append(lines[index])
+        else:
+            normalized.append(
+                f"@@ -{header.group(1)},{old_count} "
+                f"+{header.group(3)},{new_count} @@{header.group(5)}\n"
+            )
+        index += 1
+    return "".join(normalized)
+
+
+def _reanchor_unique_author_hunks(
+    raw: str,
+    source_texts: Mapping[str, str],
+) -> str:
+    """Correct hunk coordinates only when the exact old body has one source match."""
+
+    lines = raw.splitlines(keepends=True)
+    current_path: str | None = None
+    line_delta = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("--- a/"):
+            current_path = line[len("--- a/") :].removesuffix("\n")
+            line_delta = 0
+            index += 1
+            continue
+        header = _AUTHOR_HUNK_HEADER_RE.fullmatch(line)
+        if header is None or current_path not in source_texts:
+            index += 1
+            continue
+        body_index = index + 1
+        old_body: list[str] = []
+        old_count = 0
+        new_count = 0
+        while body_index < len(lines):
+            body = lines[body_index]
+            if body.startswith(("@@ ", "diff --git ", "--- a/")):
+                break
+            if body.startswith(" "):
+                old_body.append(body[1:])
+                old_count += 1
+                new_count += 1
+            elif body.startswith("-") and not body.startswith("--- "):
+                old_body.append(body[1:])
+                old_count += 1
+            elif body.startswith("+") and not body.startswith("+++ "):
+                new_count += 1
+            elif body != "\\ No newline at end of file\n":
+                return raw
+            body_index += 1
+        source_lines = source_texts[current_path].splitlines(keepends=True)
+        matches = [
+            offset
+            for offset in range(len(source_lines) - len(old_body) + 1)
+            if source_lines[offset : offset + len(old_body)] == old_body
+        ]
+        if old_body and len(matches) == 1:
+            old_start = matches[0] + 1
+            new_start = old_start + line_delta
+            lines[index] = (
+                f"@@ -{old_start},{old_count} +{new_start},{new_count} "
+                f"@@{header.group(5)}\n"
+            )
+        line_delta += new_count - old_count
+        index = body_index
+    return "".join(lines)
 
 
 def validate_candidate_diff(
@@ -703,19 +1038,32 @@ def validate_candidate_diff(
     before_bytes = {
         path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
     }
+    candidate_diff = _reanchor_unique_author_hunks(
+        _normalize_author_diff_transport(incremental_diff),
+        before_sources,
+    )
     applied = False
     try:
-        parsed = _parse_unified_diff(incremental_diff, bounds=bounds)
+        # The author contract permits both conventional Git diffs and standard
+        # ``---``/``+++`` unified diffs.  Preserve that contract only for this
+        # PIT ingestion boundary; all scope, bounds, Git-apply, AST, and
+        # cumulative-diff checks remain mandatory.
+        parsed = _parse_unified_diff(
+            candidate_diff,
+            bounds=bounds,
+            allow_plain_unified_diff=True,
+        )
         validate_unified_diff(
             candidate_root,
-            incremental_diff,
+            candidate_diff,
             parsed.files,
             editable_paths=EDITABLE_POLICY_PATHS,
             gate="test",
             bounds=bounds,
             git=git,
+            allow_plain_unified_diff=True,
         )
-        encoded = incremental_diff.encode("utf-8")
+        encoded = candidate_diff.encode("utf-8")
         try:
             _git(
                 candidate_root,
@@ -740,12 +1088,12 @@ def validate_candidate_diff(
         except PreflightError as exc:
             removed_lines = tuple(
                 line[1:]
-                for line in incremental_diff.splitlines(keepends=True)
+                for line in candidate_diff.splitlines(keepends=True)
                 if line.startswith("-") and not line.startswith("--- ")
             )
             added_lines = tuple(
                 line[1:]
-                for line in incremental_diff.splitlines(keepends=True)
+                for line in candidate_diff.splitlines(keepends=True)
                 if line.startswith("+") and not line.startswith("+++ ")
             )
             if removed_lines == added_lines:
@@ -786,13 +1134,11 @@ def validate_candidate_diff(
         ).stdout.decode("ascii", errors="strict").strip()
         if actual_head != source_commit:
             raise ValueError("candidate source commit differs from authenticated base")
-        changed_paths = tuple(
-            path
-            for path in EDITABLE_POLICY_PATHS
-            if base_sources[path] != after_sources[path]
-        )
-        if set(changed_paths) != set(cumulative.files):
-            raise ValueError("candidate changed paths differ from Git cumulative diff")
+        # The authenticated Git cumulative diff is the canonical authority for
+        # file scope.  The decoded source maps above still prove that the patch
+        # is not a no-op and feed symbol derivation, but they must not override
+        # Git's exact line-ending and index semantics when identifying files.
+        changed_paths = tuple(cumulative.files)
         changed_symbols = derive_changed_symbols(
             before_sources=base_sources,
             after_sources=after_sources,
@@ -825,6 +1171,227 @@ def validate_candidate_diff(
             for path, content in before_bytes.items():
                 (candidate_root / path).write_bytes(content)
         if isinstance(exc, (PatchPolicyError, UnicodeDecodeError)):
+            raise ValueError(str(exc)) from exc
+        raise
+
+
+def validate_candidate_sources(
+    *,
+    authenticated_base_root: Path,
+    candidate_root: Path,
+    replacement_sources: Mapping[str, str],
+    git: object,
+    source_commit: str,
+    policy_interface_version: int,
+    immutable_constraints_sha256: str,
+    discovery_panel_plan_sha256: str,
+    parent_identity_sha256: str,
+) -> tuple[CandidateIdentityV4, str]:
+    """Atomically validate and publish one complete three-source candidate."""
+    from agent_loop import PreflightError, _git, derive_authenticated_cumulative_diff
+
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit or "") is None:
+        raise ValueError("candidate source commit is invalid")
+    if type(policy_interface_version) is not int or policy_interface_version <= 0:
+        raise ValueError("candidate policy interface version is invalid")
+    for value, label in (
+        (immutable_constraints_sha256, "immutable constraint"),
+        (discovery_panel_plan_sha256, "discovery panel plan"),
+        (parent_identity_sha256, "parent identity"),
+    ):
+        if _SHA256_RE.fullmatch(value or "") is None:
+            raise ValueError(f"candidate {label} digest is invalid")
+    if not all(
+        isinstance(root, Path) and root.is_absolute() and root.is_dir()
+        for root in (authenticated_base_root, candidate_root)
+    ):
+        raise ValueError("candidate roots must be absolute directories")
+    try:
+        authenticated_base_root = _existing_path_without_links(
+            authenticated_base_root
+        )
+        candidate_root = _existing_path_without_links(candidate_root)
+    except OSError as exc:
+        raise ValueError(
+            "candidate roots contain a link or reparse point"
+        ) from exc
+    if authenticated_base_root == candidate_root:
+        raise ValueError("candidate root must be disposable and distinct from its base")
+    if not isinstance(replacement_sources, Mapping):
+        raise ValueError("candidate replacement sources must be a mapping")
+    try:
+        supplied_sources = dict(replacement_sources)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("candidate replacement sources are invalid") from exc
+    if tuple(path for path in EDITABLE_POLICY_PATHS if path in supplied_sources) != (
+        EDITABLE_POLICY_PATHS
+    ) or set(supplied_sources) != set(EDITABLE_POLICY_PATHS):
+        raise ValueError(
+            "candidate replacement sources must contain exactly the three editable paths"
+        )
+
+    # Parse, compile, and enforce the closed policy language for every supplied
+    # source before the first candidate byte is changed.
+    canonical_sources: dict[str, str] = {}
+    for path in EDITABLE_POLICY_PATHS:
+        source_file = optimization_contract.AuthorSourceFile.from_source(
+            path=path,
+            source=supplied_sources[path],
+        )
+        validate_policy_ast(path=path, source=source_file.source)
+        canonical_sources[path] = source_file.source
+
+    base_sources = _read_policy_sources(authenticated_base_root)
+    before_sources = _read_policy_sources(candidate_root)
+    before_bytes = {
+        path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
+    }
+    comparable_before_sources = {
+        path: source.replace("\r\n", "\n")
+        for path, source in before_sources.items()
+    }
+    if any("\r" in source for source in comparable_before_sources.values()):
+        raise ValueError("candidate parent sources contain invalid line endings")
+    if canonical_sources == comparable_before_sources:
+        raise ValueError("candidate source bundle is a no-op")
+    for path in EDITABLE_POLICY_PATHS:
+        validate_policy_ast(path=path, source=base_sources[path])
+
+    try:
+        actual_head = _git(
+            authenticated_base_root,
+            "rev-parse",
+            "HEAD",
+            git=git,
+        ).stdout.decode("ascii", errors="strict").strip()
+        if actual_head != source_commit:
+            raise ValueError("candidate source commit differs from authenticated base")
+        if _git(
+            authenticated_base_root,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            git=git,
+        ).stdout:
+            raise ValueError("authenticated candidate base is not clean")
+    except (PreflightError, UnicodeDecodeError) as exc:
+        raise ValueError("candidate source provenance cannot be authenticated") from exc
+
+    write_started = False
+    try:
+        for path in EDITABLE_POLICY_PATHS:
+            write_started = True
+            (candidate_root / path).write_bytes(canonical_sources[path].encode("utf-8"))
+
+        after_sources = _read_policy_sources(candidate_root)
+        if after_sources != canonical_sources:
+            raise ValueError("candidate replacement sources were not published exactly")
+        for path in EDITABLE_POLICY_PATHS:
+            validate_policy_ast(path=path, source=after_sources[path])
+
+        status = _git(
+            candidate_root,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            git=git,
+        ).stdout.decode("utf-8", errors="strict")
+        records = tuple(item for item in status.split("\x00") if item)
+        if any(
+            len(item) < 4
+            or item[:2] != " M"
+            or item[3:] not in EDITABLE_POLICY_PATHS
+            for item in records
+        ):
+            raise ValueError("candidate checkout contains out-of-scope changes")
+        changed_names = _git(
+            candidate_root,
+            "diff",
+            "--name-only",
+            "-z",
+            "HEAD",
+            git=git,
+        ).stdout.decode("utf-8", errors="strict")
+        changed_name_set = {
+            item for item in changed_names.split("\x00") if item
+        }
+        if not changed_name_set <= set(EDITABLE_POLICY_PATHS):
+            raise ValueError("candidate checkout contains out-of-scope changes")
+        if _git(
+            candidate_root,
+            "diff",
+            "--summary",
+            "HEAD",
+            git=git,
+        ).stdout:
+            raise ValueError("candidate checkout contains structural or file-mode changes")
+        for path in EDITABLE_POLICY_PATHS:
+            index_entry = _git(
+                candidate_root,
+                "ls-files",
+                "-s",
+                "--",
+                path,
+                git=git,
+            ).stdout.decode("utf-8", errors="strict").strip().split()
+            if (
+                len(index_entry) != 4
+                or index_entry[0] != "100644"
+                or index_entry[2] != "0"
+                or index_entry[3] != path
+            ):
+                raise ValueError("candidate policy source must be a tracked 100644 file")
+
+        _git(candidate_root, "diff", "--check", git=git)
+        cumulative_diff = derive_authenticated_cumulative_diff(
+            git=git,
+            authenticated_base_root=authenticated_base_root,
+            candidate_root=candidate_root,
+            editable_paths=EDITABLE_POLICY_PATHS,
+        )
+        changed_paths = tuple(
+            path for path in EDITABLE_POLICY_PATHS if path in changed_name_set
+        )
+        changed_symbols = derive_changed_symbols(
+            before_sources=base_sources,
+            after_sources=after_sources,
+        )
+        editable_hashes = tuple(
+            (path, hashlib.sha256(after_sources[path].encode("utf-8")).hexdigest())
+            for path in EDITABLE_POLICY_PATHS
+        )
+        values: dict[str, object] = {
+            "source_commit": source_commit,
+            "policy_interface_version": policy_interface_version,
+            "cumulative_diff_sha256": hashlib.sha256(
+                cumulative_diff.encode("utf-8")
+            ).hexdigest(),
+            "editable_file_sha256s": editable_hashes,
+            "changed_paths": changed_paths,
+            "changed_symbols": changed_symbols,
+            "immutable_constraints_sha256": immutable_constraints_sha256,
+            "discovery_panel_plan_sha256": discovery_panel_plan_sha256,
+            "parent_identity_sha256": parent_identity_sha256,
+        }
+        identity = CandidateIdentityV4(
+            **values,
+            identity_sha256=_identity_digest(values),
+            _controller_seal=_CANDIDATE_IDENTITY_CONSTRUCTION_SEAL,
+        )
+        _AUTHENTICATED_CANDIDATE_IDENTITIES[id(identity)] = identity
+        return identity, cumulative_diff
+    except BaseException as exc:
+        rollback_errors: list[OSError] = []
+        if write_started:
+            for path, content in before_bytes.items():
+                try:
+                    (candidate_root / path).write_bytes(content)
+                except OSError as rollback_error:
+                    rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise ValueError("candidate source rollback failed") from exc
+        if isinstance(exc, (PreflightError, UnicodeDecodeError)):
             raise ValueError(str(exc)) from exc
         raise
 
@@ -938,6 +1505,7 @@ def require_source_context_fit(
     return rendered
 __all__ = [
     "CandidateIdentity",
+    "CandidateIdentityV4",
     "EDITABLE_POLICY_PATHS",
     "LEGACY_PATCH_BOUNDS",
     "PIT_OPTIMIZER_PATCH_BOUNDS",
@@ -946,6 +1514,7 @@ __all__ = [
     "require_source_context_fit",
     "validate_author_manifest",
     "validate_candidate_diff",
+    "validate_candidate_sources",
     "validate_candidate_identity",
     "validate_policy_ast",
 ]

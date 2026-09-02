@@ -157,18 +157,25 @@ class LeaderBasketSimulator:
             raise ValueError("end_date must not precede start_date")
 
         benchmark_symbol = benchmark_symbol.upper()
-        universe = tuple(
-            sorted(
-                {
-                    str(t).upper()
-                    for t in (tickers or self.bundle.symbols())
-                    if str(t).upper() != benchmark_symbol
-                }
-            )
+        tradable_tickers = tuple(self.bundle.tradable_symbols())
+        market_reference_tickers = tuple(self.bundle.reference_symbols())
+        requested = (
+            tradable_tickers
+            if tickers is None
+            else tuple(str(ticker).upper() for ticker in tickers)
         )
+        references = set(market_reference_tickers)
+        if references.intersection(requested):
+            raise ValueError(
+                "leader basket reference symbols are observation-only and cannot be traded"
+            )
+        invalid = set(requested).difference(tradable_tickers)
+        if invalid:
+            raise ValueError("leader basket tickers are not tradable PIT membership symbols")
+        universe = tuple(sorted(set(requested)))
         if not universe:
             raise ValueError("leader basket universe cannot contain only the benchmark")
-        symbols = tuple(dict.fromkeys([*universe, benchmark_symbol]))
+        symbols = tuple(dict.fromkeys([*universe, *market_reference_tickers, benchmark_symbol]))
         # Pull a pre-window buffer so the first rebalance can rank leaders
         # using history that predates the evaluation window.  The output
         # remains clipped to [start, end].

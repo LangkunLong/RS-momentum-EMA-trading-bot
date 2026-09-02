@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
+from datetime import date
+from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from collections import Counter
 import argparse
@@ -10,15 +12,20 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import subprocess
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping, Sequence
 
 from core.pit_optimizer_evaluation import (
     AggregateMetric,
+    DiscoveryPanelPlan,
+    EvaluationPanelSpec,
     FoldAggregateSummary,
     FoldManifest,
     FoldSpec,
+    PanelAggregateSummary,
+    load_discovery_panel_plan,
 )
 
 
@@ -403,6 +410,8 @@ def load_parity_reference(path: Path) -> ParityReference:
         raise ValueError("parity reference JSON is invalid") from exc
     if not isinstance(primitive, dict) or raw != _canonical_json_bytes(primitive):
         raise ValueError("parity reference is not canonical JSON")
+    if primitive.get("schema_version") != _REFERENCE_SCHEMA_VERSION:
+        raise ValueError("legacy parity reader accepts schema-v1 artifacts only")
     artifact_sha256 = hashlib.sha256(raw).hexdigest()
     value = dict(primitive)
     value["fold_manifest"] = _manifest_from_primitive(value.get("fold_manifest"))
@@ -511,8 +520,10 @@ def build_fixed_fold_manifest(
     readiness: Mapping[str, object],
     benchmark_sessions: Iterable[str],
     data_identity_sha256: str,
+    first_discovery_session: str | None = None,
+    fold_sessions: int = 60,
 ) -> tuple[FoldManifest, tuple[str, ...]]:
-    """Seal the fixed two-discovery/one-hidden split from calendar labels only."""
+    """Seal three equal contiguous folds from the supplied calendar only."""
 
     _require_digest(data_identity_sha256, "fold data identity")
     evaluation = readiness.get("evaluation_contract")
@@ -542,13 +553,34 @@ def build_fixed_fold_manifest(
     calendar = tuple(str(item) for item in benchmark_sessions)
     if len(calendar) != len(set(calendar)) or tuple(sorted(calendar)) != calendar:
         raise ValueError("benchmark sessions are not unique and chronological")
+    if type(fold_sessions) is not int or not 20 <= fold_sessions <= 252:
+        raise ValueError("fold sessions must be an integer from 20 through 252")
 
-    def fold(fold_id: str, purpose: str, start: str, end: str) -> FoldSpec:
-        sessions = tuple(session for session in calendar if start <= session <= end)
-        return FoldSpec(fold_id, purpose, start, end, sessions)
+    selected_start = (
+        _DISCOVERY_WINDOWS[0][1]
+        if first_discovery_session is None
+        else first_discovery_session
+    )
+    if (
+        not isinstance(selected_start, str)
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}", selected_start) is None
+        or selected_start not in calendar
+    ):
+        raise ValueError("first discovery session is not a benchmark session")
+    start_index = calendar.index(selected_start)
+    selected_sessions = calendar[start_index : start_index + (3 * fold_sessions)]
+    if len(selected_sessions) != 3 * fold_sessions:
+        raise ValueError("benchmark calendar cannot supply three complete folds")
 
-    discoveries = tuple(fold(fold_id, "discovery", start, end) for fold_id, start, end in _DISCOVERY_WINDOWS)
-    hidden = fold(_HIDDEN_WINDOW[0], "hidden", _HIDDEN_WINDOW[1], _HIDDEN_WINDOW[2])
+    def fold(fold_id: str, purpose: str, offset: int) -> FoldSpec:
+        sessions = selected_sessions[offset : offset + fold_sessions]
+        return FoldSpec(fold_id, purpose, sessions[0], sessions[-1], sessions)
+
+    discoveries = (
+        fold("discovery_1", "discovery", 0),
+        fold("discovery_2", "discovery", fold_sessions),
+    )
+    hidden = fold("hidden_1", "hidden", 2 * fold_sessions)
     universe_sha256 = _digest(list(universe))
     return (
         FoldManifest(
@@ -689,6 +721,8 @@ def capture_from_authenticated_inputs(
     reference_source_head: str,
     reference_source_fingerprint_sha256: str,
     benchmark_sessions: Iterable[str],
+    first_discovery_session: str | None = None,
+    fold_sessions: int = 60,
     output: Path,
     evaluate_discovery_fold: Callable[[FoldSpec, tuple[str, ...], str], ParityFoldEvidence],
     pre_persist_check: Callable[[], None],
@@ -711,6 +745,8 @@ def capture_from_authenticated_inputs(
         readiness=readiness,
         benchmark_sessions=benchmark_sessions,
         data_identity_sha256=pit_bundle_sha256,
+        first_discovery_session=first_discovery_session,
+        fold_sessions=fold_sessions,
     )
     evidence = tuple(
         evaluate_discovery_fold(fold, universe, manifest.warmup_start_date) for fold in manifest.discovery_folds
@@ -846,8 +882,8 @@ def _benchmark_calendar(bundle: object, benchmark: str) -> tuple[str, ...]:
     if connection is None:
         raise ValueError("PIT bundle benchmark calendar is unavailable")
     rows = connection.execute(
-        "SELECT trade_date FROM price WHERE ticker=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date",
-        (benchmark, _DISCOVERY_WINDOWS[0][1], _HIDDEN_WINDOW[2]),
+        "SELECT trade_date FROM price WHERE ticker=? AND trade_date>=? ORDER BY trade_date",
+        (benchmark, _DISCOVERY_WINDOWS[0][1]),
     ).fetchall()
     sessions = tuple(str(row[0]) for row in rows)
     if not sessions:
@@ -1052,6 +1088,8 @@ def capture_parity_reference(
     pit_bundle_path: Path,
     output: Path,
     source_root: Path | None = None,
+    first_discovery_session: str | None = None,
+    fold_sessions: int = 60,
 ) -> ParityReference:
     """Authenticate local inputs and capture the inline-policy discovery reference."""
 
@@ -1105,6 +1143,8 @@ def capture_parity_reference(
             reference_source_head=source_head,
             reference_source_fingerprint_sha256=source_fingerprint,
             benchmark_sessions=calendar,
+            first_discovery_session=first_discovery_session,
+            fold_sessions=fold_sessions,
             output=Path(output),
             evaluate_discovery_fold=evaluate,
             pre_persist_check=lambda: _require_unchanged_source(
@@ -1176,27 +1216,491 @@ def verify_parity_reference(
     )
 
 
+def _v4_json_value(value: object) -> object:
+    if isinstance(value, Decimal):
+        return format(value, ".2f")
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _v4_json_value(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if isinstance(value, tuple):
+        return [_v4_json_value(item) for item in value]
+    if isinstance(value, list):
+        return [_v4_json_value(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _v4_json_value(item) for key, item in value.items()}
+    return value
+
+
+def _panel_session(value: object) -> str:
+    import pandas as pd
+
+    return pd.Timestamp(value).date().isoformat()
+
+
+def build_panel_evidence_v4(
+    *,
+    panel: EvaluationPanelSpec,
+    result: object,
+) -> dict[str, object]:
+    """Convert a continuous production run into canonical interface-v2 evidence."""
+
+    if not isinstance(panel, EvaluationPanelSpec) or panel.purpose == "qualification":
+        raise ValueError("parity accepts only quick or discovery panels")
+    equity_curve = getattr(result, "equity_curve", None)
+    benchmark_curve = getattr(result, "benchmark_curve", None)
+    if equity_curve is None or benchmark_curve is None:
+        raise ValueError("panel parity simulation curves are absent")
+    equity = tuple(
+        ParityEquityPoint(_panel_session(session), float(value))
+        for session, value in equity_curve.items()
+    )
+    benchmark = tuple(
+        ParityEquityPoint(_panel_session(session), float(value))
+        for session, value in benchmark_curve.items()
+    )
+    if tuple(point.session for point in equity) != panel.sessions:
+        raise ValueError("panel parity equity sessions differ from the plan")
+    if tuple(point.session for point in benchmark) != panel.sessions:
+        raise ValueError("panel parity benchmark sessions differ from the plan")
+    transaction_log = getattr(result, "transaction_log", None)
+    rows = (
+        []
+        if transaction_log is None or transaction_log.empty
+        else transaction_log.to_dict("records")
+    )
+    transactions: list[ParityTransaction] = []
+    for row in rows:
+        raw_from_symbol = row.get("FromTicker")
+        from_symbol = (
+            None
+            if raw_from_symbol is None
+            or (isinstance(raw_from_symbol, float) and math.isnan(raw_from_symbol))
+            else str(raw_from_symbol)
+        )
+        transactions.append(
+            ParityTransaction(
+                date=_panel_session(row["Date"]),
+                symbol=str(row["Ticker"]),
+                from_symbol=from_symbol,
+                action=str(row["Action"]),
+                price=float(row["Price"]),
+                quantity=float(row["Quantity"]),
+                value=float(row["Value"]),
+                reason=str(row["Reason"]),
+            )
+        )
+    entry_outcomes = tuple(
+        ParityEntryOutcome(**outcome.to_primitive())
+        for outcome in getattr(result, "entry_outcomes", ())
+    )
+    raw_funnel = getattr(result, "signal_funnel", None)
+    if not isinstance(raw_funnel, Mapping):
+        raise ValueError("panel parity signal funnel is absent")
+    funnel = tuple(
+        AggregateMetric(metric_id, raw_funnel[metric_id])
+        for metric_id in sorted(raw_funnel)
+    )
+    closed_trades = getattr(result, "closed_trades", None)
+    if not isinstance(closed_trades, list):
+        raise ValueError("panel parity closed trades are absent")
+    exit_counts = Counter(
+        str(getattr(trade, "exit_reason", None) or "unknown")
+        for trade in closed_trades
+    )
+    exit_attribution = tuple(
+        AggregateMetric(reason, count) for reason, count in sorted(exit_counts.items())
+    )
+    initial_capital = float(getattr(result, "initial_capital", math.nan))
+    if not math.isfinite(initial_capital) or initial_capital <= 0.0:
+        raise ValueError("panel parity initial capital is invalid")
+    turnover_pct = (
+        sum(abs(item.value) for item in transactions) / initial_capital * 100.0
+    )
+    by_session: dict[str, list[ParityTransaction]] = {}
+    for transaction in transactions:
+        by_session.setdefault(transaction.date, []).append(transaction)
+    cash = initial_capital
+    exposure_values: list[float] = []
+    for point in equity:
+        for transaction in by_session.get(point.session, ()):
+            if transaction.action == "BUY":
+                cash -= transaction.value
+            elif transaction.action == "SELL":
+                cash += transaction.value
+        exposure_values.append(
+            0.0
+            if point.equity == 0.0
+            else (point.equity - cash) / point.equity * 100.0
+        )
+    elapsed_days = (
+        date.fromisoformat(panel.end_date) - date.fromisoformat(panel.start_date)
+    ).days
+    from core.pit_optimization import production_equity_cagr_pct
+
+    portfolio_cagr = Decimal(
+        str(
+            production_equity_cagr_pct(
+                equity[0].equity,
+                equity[-1].equity,
+                elapsed_days,
+            )
+        )
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+    aggregate = PanelAggregateSummary(
+        panel_id=panel.purpose,
+        panel_sha256=panel.sha256,
+        starting_equity=equity[0].equity,
+        ending_equity=equity[-1].equity,
+        elapsed_calendar_days=elapsed_days,
+        portfolio_annualized_return_pct=portfolio_cagr,
+        total_return_pct=float(result.total_return_pct),
+        benchmark_return_pct=float(result.benchmark_return_pct),
+        max_drawdown_pct=float(result.max_drawdown_pct),
+        sharpe_ratio=float(result.sharpe_ratio),
+        closed_trades=len(closed_trades),
+        turnover_pct=turnover_pct,
+        average_exposure_pct=(
+            sum(exposure_values) / len(exposure_values) if exposure_values else 0.0
+        ),
+        entry_funnel=funnel,
+        exit_attribution=exit_attribution,
+    )
+    config = getattr(result, "config", None)
+    effective_policy_sha256 = (
+        config.get("effective_engine_policy_sha256")
+        if isinstance(config, Mapping)
+        else None
+    )
+    _require_digest(effective_policy_sha256, "panel parity policy digest")
+    primitive: dict[str, object] = {
+        "panel_id": panel.purpose,
+        "panel_sha256": panel.sha256,
+        "policy_interface_version": 2,
+        "transactions": _v4_json_value(tuple(transactions)),
+        "entry_outcomes": _v4_json_value(entry_outcomes),
+        "equity": _v4_json_value(equity),
+        "benchmark": _v4_json_value(benchmark),
+        "funnel": _v4_json_value(funnel),
+        "aggregate": _v4_json_value(aggregate),
+        "effective_policy_sha256": effective_policy_sha256,
+    }
+    primitive["evidence_sha256"] = _digest(primitive)
+    return primitive
+
+
+def _validate_sandbox_image(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", value) is None
+    ):
+        raise ValueError("panel parity sandbox image is invalid")
+    return value
+
+
+def _v4_run_root(path: Path) -> Path:
+    root = Path(path).resolve(strict=False)
+    if root.exists():
+        raise FileExistsError("panel parity output root already exists")
+    root.parent.mkdir(parents=True, exist_ok=True)
+    if root.parent.is_symlink() or root.is_symlink():
+        raise ValueError("panel parity output root is invalid")
+    return root
+
+
+def _write_v4_run(
+    *,
+    output_root: Path,
+    artifact_name: str,
+    primitive: Mapping[str, object],
+) -> tuple[Path, str]:
+    root = _v4_run_root(output_root)
+    root.mkdir()
+    try:
+        payload = _canonical_json_bytes(primitive)
+        artifact = root / artifact_name
+        with artifact.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+        digest = hashlib.sha256(payload).hexdigest()
+        marker = {
+            "schema_version": 4,
+            "publication_kind": "panel_parity_run",
+            "artifact_name": artifact_name,
+            "artifact_sha256": digest,
+        }
+        with (root / "publication.json").open("xb") as handle:
+            handle.write(_canonical_json_bytes(marker))
+            handle.flush()
+        return artifact, digest
+    except BaseException:
+        try:
+            shutil.rmtree(root)
+        except OSError as cleanup_exc:
+            raise RuntimeError("panel parity cleanup failed") from cleanup_exc
+        raise
+
+
+def _load_v4_reference(path: Path) -> tuple[dict[str, object], str]:
+    resolved = Path(path).resolve()
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ValueError("panel parity reference must be a regular file")
+    raw = resolved.read_bytes()
+    try:
+        primitive = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("panel parity reference JSON is invalid") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    marker = resolved.parent / "publication.json"
+    if marker.is_symlink() or not marker.is_file():
+        raise ValueError("panel parity reference publication marker is absent")
+    marker_raw = marker.read_bytes()
+    try:
+        publication = json.loads(marker_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("panel parity publication JSON is invalid") from exc
+    if (
+        not isinstance(primitive, dict)
+        or raw != _canonical_json_bytes(primitive)
+        or primitive.get("schema_version") != 4
+        or primitive.get("artifact_kind") != "panel_parity_reference"
+        or not isinstance(publication, dict)
+        or marker_raw != _canonical_json_bytes(publication)
+        or set(publication)
+        != {
+            "schema_version",
+            "publication_kind",
+            "artifact_name",
+            "artifact_sha256",
+        }
+        or publication.get("schema_version") != 4
+        or publication.get("publication_kind") != "panel_parity_run"
+        or publication.get("artifact_name") != resolved.name
+        or publication.get("artifact_sha256") != digest
+    ):
+        raise ValueError("panel parity reference identity is invalid")
+    return primitive, digest
+
+
+def _evaluate_discovery_panels_v4(
+    *,
+    plan: DiscoveryPanelPlan,
+    bundle: object,
+) -> tuple[dict[str, object], ...]:
+    from core.backtest_engine import PortfolioSimulator
+    from core.strategy_policy import POLICY_INTERFACE_VERSION
+
+    if POLICY_INTERFACE_VERSION != 2:
+        raise ValueError("panel parity requires policy interface 2")
+    simulator = PortfolioSimulator(
+        pit_bundle=bundle,
+        benchmark_symbol="SPY",
+        signal_every_n_days=_PARITY_SIGNAL_EVERY_N_DAYS,
+    )
+    warmup_start = bundle.metadata["warmup_start"]
+    evidence: list[dict[str, object]] = []
+    for panel in (plan.quick_panel, plan.discovery_panel):
+        tickers = tuple(
+            ticker
+            for lineage in panel.lineages
+            for ticker in lineage.executable_tickers
+        )
+        result = simulator.run(
+            list(tickers),
+            start_date=panel.start_date,
+            end_date=panel.end_date,
+            history_start_date=warmup_start,
+            benchmark_symbol="SPY",
+        )
+        evidence.append(build_panel_evidence_v4(panel=panel, result=result))
+    if len({item["effective_policy_sha256"] for item in evidence}) != 1:
+        raise ValueError("panel parity policy identity differs between panels")
+    return tuple(evidence)
+
+
+def _authenticated_panel_parity_evidence(
+    *,
+    discovery_panel_plan: Path,
+    pit_bundle: Path,
+    pit_bundle_sha256: str,
+    prices_provenance: Path,
+    sandbox_image: str,
+) -> tuple[DiscoveryPanelPlan, tuple[dict[str, object], ...]]:
+    _require_digest(pit_bundle_sha256, "panel parity PIT bundle digest")
+    _validate_sandbox_image(sandbox_image)
+    plan = load_discovery_panel_plan(Path(discovery_panel_plan))
+    if plan.pit_bundle_sha256 != pit_bundle_sha256:
+        raise ValueError("panel parity bundle differs from the discovery plan")
+    from core.pit_data import PITDataBundle
+
+    with PITDataBundle(pit_bundle, expected_sha256=pit_bundle_sha256) as bundle:
+        transition = bundle.load_price_identity_transition_contract(prices_provenance)
+        if transition.prices_provenance_sha256 != plan.prices_provenance_sha256:
+            raise ValueError("panel parity prices provenance differs from the plan")
+        evidence = _evaluate_discovery_panels_v4(plan=plan, bundle=bundle)
+    return plan, evidence
+
+
+def capture_panel_parity_reference_v4(
+    *,
+    discovery_panel_plan: Path,
+    pit_bundle: Path,
+    pit_bundle_sha256: str,
+    prices_provenance: Path,
+    sandbox_image: str,
+    output_root: Path,
+) -> tuple[Path, str, int]:
+    """Capture continuous quick/discovery baseline evidence without a provider."""
+
+    _v4_run_root(output_root)
+    plan, evidence = _authenticated_panel_parity_evidence(
+        discovery_panel_plan=discovery_panel_plan,
+        pit_bundle=pit_bundle,
+        pit_bundle_sha256=pit_bundle_sha256,
+        prices_provenance=prices_provenance,
+        sandbox_image=sandbox_image,
+    )
+    primitive = {
+        "schema_version": 4,
+        "artifact_kind": "panel_parity_reference",
+        "policy_interface_version": 2,
+        "discovery_panel_plan_sha256": plan.sha256,
+        "qualification_plan_sha256": plan.qualification_plan_sha256,
+        "pit_bundle_sha256": pit_bundle_sha256,
+        "prices_provenance_sha256": plan.prices_provenance_sha256,
+        "sandbox_image": sandbox_image,
+        "panel_evidence": list(evidence),
+    }
+    artifact, digest = _write_v4_run(
+        output_root=output_root,
+        artifact_name="parity-reference.json",
+        primitive=primitive,
+    )
+    return artifact, digest, len(evidence)
+
+
+def verify_panel_parity_reference_v4(
+    *,
+    reference: Path,
+    discovery_panel_plan: Path,
+    pit_bundle: Path,
+    pit_bundle_sha256: str,
+    prices_provenance: Path,
+    sandbox_image: str,
+    output_root: Path,
+) -> tuple[Path, str, int]:
+    """Repeat continuous quick/discovery evidence and attest byte equality."""
+
+    _v4_run_root(output_root)
+    reference_value, reference_sha256 = _load_v4_reference(reference)
+    plan, evidence = _authenticated_panel_parity_evidence(
+        discovery_panel_plan=discovery_panel_plan,
+        pit_bundle=pit_bundle,
+        pit_bundle_sha256=pit_bundle_sha256,
+        prices_provenance=prices_provenance,
+        sandbox_image=sandbox_image,
+    )
+    for key, expected in (
+        ("policy_interface_version", 2),
+        ("discovery_panel_plan_sha256", plan.sha256),
+        ("qualification_plan_sha256", plan.qualification_plan_sha256),
+        ("pit_bundle_sha256", pit_bundle_sha256),
+        ("prices_provenance_sha256", plan.prices_provenance_sha256),
+        ("sandbox_image", sandbox_image),
+    ):
+        if reference_value.get(key) != expected:
+            raise ValueError("panel parity reference identity differs")
+    reference_evidence = reference_value.get("panel_evidence")
+    if reference_evidence != list(evidence):
+        raise ValueError("panel parity quick/discovery evidence differs")
+    primitive = {
+        "schema_version": 4,
+        "artifact_kind": "panel_parity_attestation",
+        "policy_interface_version": 2,
+        "reference_artifact_sha256": reference_sha256,
+        "discovery_panel_plan_sha256": plan.sha256,
+        "qualification_plan_sha256": plan.qualification_plan_sha256,
+        "pit_bundle_sha256": pit_bundle_sha256,
+        "prices_provenance_sha256": plan.prices_provenance_sha256,
+        "sandbox_image": sandbox_image,
+        "panel_output_sha256s": [
+            [item["panel_id"], item["evidence_sha256"]] for item in evidence
+        ],
+        "parity_equal": True,
+    }
+    artifact, digest = _write_v4_run(
+        output_root=output_root,
+        artifact_name="parity-attestation.json",
+        primitive=primitive,
+    )
+    return artifact, digest, len(evidence)
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
     capture = commands.add_parser("capture")
     capture.add_argument("--readiness", required=True, type=Path)
     capture.add_argument("--pit-bundle", required=True, type=Path)
     capture.add_argument("--output", required=True, type=Path)
+    capture.add_argument("--first-discovery-session")
+    capture.add_argument("--fold-sessions", type=int, default=60)
     verify = commands.add_parser("verify")
     verify.add_argument("--reference", required=True, type=Path)
     verify.add_argument("--pit-bundle", required=True, type=Path)
     verify.add_argument("--output", required=True, type=Path)
+    capture_v4 = commands.add_parser("capture-v4", allow_abbrev=False)
+    verify_v4 = commands.add_parser("verify-v4", allow_abbrev=False)
+    for command in (capture_v4, verify_v4):
+        command.add_argument("--discovery-panel-plan", required=True, type=Path)
+        command.add_argument("--pit-bundle", required=True, type=Path)
+        command.add_argument("--pit-bundle-sha256", required=True)
+        command.add_argument("--prices-provenance", required=True, type=Path)
+        command.add_argument("--sandbox-image", required=True)
+        command.add_argument("--output-root", required=True, type=Path)
+    verify_v4.add_argument("--reference", required=True, type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "capture-v4":
+        _artifact, digest, panel_count = capture_panel_parity_reference_v4(
+            discovery_panel_plan=args.discovery_panel_plan,
+            pit_bundle=args.pit_bundle,
+            pit_bundle_sha256=args.pit_bundle_sha256,
+            prices_provenance=args.prices_provenance,
+            sandbox_image=args.sandbox_image,
+            output_root=args.output_root,
+        )
+        print(
+            "PIT_POLICY_PANEL_PARITY_REFERENCE "
+            f"sha256={digest} panels={panel_count} policy_interface=2"
+        )
+        return 0
+    if args.command == "verify-v4":
+        _artifact, digest, panel_count = verify_panel_parity_reference_v4(
+            reference=args.reference,
+            discovery_panel_plan=args.discovery_panel_plan,
+            pit_bundle=args.pit_bundle,
+            pit_bundle_sha256=args.pit_bundle_sha256,
+            prices_provenance=args.prices_provenance,
+            sandbox_image=args.sandbox_image,
+            output_root=args.output_root,
+        )
+        print(
+            "PIT_POLICY_PANEL_PARITY_VERIFIED "
+            f"sha256={digest} panels={panel_count} policy_interface=2"
+        )
+        return 0
     if args.command == "capture":
         reference = capture_parity_reference(
             readiness_path=args.readiness,
             pit_bundle_path=args.pit_bundle,
             output=args.output,
+            first_discovery_session=args.first_discovery_session,
+            fold_sessions=args.fold_sessions,
         )
         folds = ",".join(
             f"{fold.fold_id}:{fold.start_date}..{fold.end_date}" for fold in reference.fold_manifest.discovery_folds

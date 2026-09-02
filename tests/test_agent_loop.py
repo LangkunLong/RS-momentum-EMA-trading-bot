@@ -153,6 +153,19 @@ def test_import_is_lazy_and_never_reads_key_or_execution_modules(tmp_path: Path)
     assert not marker.exists()
 
 
+def test_unrankable_discovery_score_is_typed_neutral() -> None:
+    """Break caught: zero-trade candidates could score a zero-trade baseline."""
+    from decimal import Decimal
+
+    from agent_loop import _unrankable_discovery_score
+
+    score = _unrankable_discovery_score()
+
+    assert score.median_excess_return_pp == Decimal("0.00")
+    assert score.worst_excess_return_pp == Decimal("0.00")
+    assert score.max_drawdown_magnitude_pp == Decimal("0.00")
+
+
 def test_task3_state_and_terminal_status_values_are_closed() -> None:
     """Break caught: controller states or exits could drift into ambiguous free-form strings."""
     from agent_loop import LoopState, TerminalStatus
@@ -242,7 +255,7 @@ def test_pit_optimizer_v2_config_parser_has_a_separate_closed_route(
 
 def _minimal_gate_cli_argv(tmp_path: Path, gate: str) -> list[str]:
     root = tmp_path.resolve()
-    return [
+    argv = [
         "--repo-root",
         str(root / "source"),
         "--permanent-runtime-root",
@@ -259,9 +272,10 @@ def _minimal_gate_cli_argv(tmp_path: Path, gate: str) -> list[str]:
         "example.invalid/worker@sha256:" + "1" * 64,
         "--gate",
         gate,
-        "--max-usd",
-        "0.40",
     ]
+    if gate != "pit_optimizer":
+        argv.extend(("--max-usd", "0.40"))
+    return argv
 
 
 @pytest.mark.parametrize(
@@ -10432,6 +10446,22 @@ def test_round3_source_lock_rejects_symlink_without_touching_target(tmp_path: Pa
         lock.close()
     assert error is not None
     assert outside.read_bytes() == b""
+
+
+def test_round3_source_lock_reports_write_permission_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a sandbox denial is misreported as a competing optimizer lock."""
+    import agent_loop
+    from agent_loop import PreflightError, SourceLock
+
+    def deny_open(*_args: object, **_kwargs: object) -> int:
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(agent_loop.os, "open", deny_open)
+    with pytest.raises(PreflightError, match="source lock permission denied"):
+        SourceLock(tmp_path / "agent-loop.lock").acquire()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group containment")

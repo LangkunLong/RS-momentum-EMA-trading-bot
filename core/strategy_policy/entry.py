@@ -14,7 +14,7 @@ def _threshold_code(value: float | None, floor: float, unavailable: str, below: 
 
 
 def evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision:
-    """Apply the fixed CANSLIM entry gates to trusted completed-session facts."""
+    """Apply fixed gates; adaptive code may also inspect ``snapshot.market``."""
     blocking_codes = list(snapshot.technical_blocking_reasons)
     if not snapshot.technical_only:
         for code in (
@@ -25,9 +25,10 @@ def evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision:
         ):
             if code is not None:
                 blocking_codes.append(code)
+    regime_allows_entries = snapshot.market.oneil_regime != "correction"
     market_permitted = (
         (not snapshot.require_bullish_market or snapshot.market_is_bullish or snapshot.cash_deployment_override)
-        and (not snapshot.use_stateful_regime_gate or snapshot.regime_allows_entries)
+        and (not snapshot.use_stateful_regime_gate or regime_allows_entries)
     )
     return EntryDecision(
         qualified=not blocking_codes,
