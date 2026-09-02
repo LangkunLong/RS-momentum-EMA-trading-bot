@@ -3375,7 +3375,7 @@ def _candidate_parent_summary(
         raise IdentityDrift("retained candidate sources differ from identity")
     identity = SelectedParentIdentity.issue(
         parent_kind=kind,
-        parent_id=candidate.candidate_identity.identity_sha256,
+        parent_id=f"candidate_{candidate.candidate_identity.identity_sha256}",
         source_head=readiness.manifest.source_head,
         policy_sources=sources,
     )
