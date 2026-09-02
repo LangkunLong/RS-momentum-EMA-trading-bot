@@ -4920,7 +4920,11 @@ PIT_OPTIMIZER_V4_SYSTEM_PROMPTS = MappingProxyType(
             "hypothesis_id must equal the supplied hypothesis_id exactly. Every evidence_ids value "
             "must be copied exactly from the supplied validation or panel evidence. disposition "
             "must be exactly promote, refine, or abandon; it is advisory and cannot override "
-            "metric-owned champion selection. Do not request or reproduce policy source, raw "
+            "metric-owned champion selection. panel_evidence is a lossless columnar table: each "
+            "bindings value selects a zero-based panel column, every columns array uses that same "
+            "order, and each entry_funnel or exit_attribution values array aligns to those columns; "
+            "a null binding means that candidate evidence is absent. Do not request or reproduce "
+            "policy source, raw "
             "trades, holdings, qualification data, local paths, credentials, provider accounting, "
             "or chain-of-thought. The local closed parser is authoritative."
         ),
@@ -6064,6 +6068,31 @@ class CriticInputV4(_V2Canonical):
     champion_discovery: PanelAggregateSummary
     target_progress: TargetProgressV4
 
+    _PANEL_BINDINGS = (
+        "baseline_quick",
+        "baseline_discovery",
+        "candidate_quick",
+        "candidate_discovery",
+        "selected_parent_quick",
+        "selected_parent_discovery",
+        "champion_discovery",
+    )
+    _PANEL_SCALARS = (
+        "panel_id",
+        "panel_sha256",
+        "starting_equity",
+        "ending_equity",
+        "elapsed_calendar_days",
+        "portfolio_annualized_return_pct",
+        "total_return_pct",
+        "benchmark_return_pct",
+        "max_drawdown_pct",
+        "sharpe_ratio",
+        "closed_trades",
+        "turnover_pct",
+        "average_exposure_pct",
+    )
+
     def __post_init__(self) -> None:
         _validate_role_common_v4(
             schema_version=self.schema_version,
@@ -6188,6 +6217,88 @@ class CriticInputV4(_V2Canonical):
             for key in ("selected_parent_sources", "policy_sources", "source")
         ):
             raise ValueError("critic v4 input cannot expose policy source")
+
+    def _panel_evidence_primitive(self) -> dict[str, object]:
+        semantic_panels = (
+            self.baseline_quick,
+            self.baseline_discovery,
+            self.candidate_quick,
+            self.candidate_discovery,
+            self.selected_parent_summary.quick_panel,
+            self.selected_parent_summary.discovery_panel,
+            self.champion_discovery,
+        )
+        unique_panels: list[PanelAggregateSummary] = []
+        binding_indexes: list[int | None] = []
+        for panel in semantic_panels:
+            if panel is None:
+                binding_indexes.append(None)
+                continue
+            try:
+                index = unique_panels.index(panel)
+            except ValueError:
+                index = len(unique_panels)
+                unique_panels.append(panel)
+            binding_indexes.append(index)
+
+        def metric_series(field: str) -> list[dict[str, object]]:
+            metric_ids = sorted(
+                {
+                    metric.metric_id
+                    for panel in unique_panels
+                    for metric in getattr(panel, field)
+                }
+            )
+            return [
+                {
+                    "metric_id": metric_id,
+                    "values": [
+                        next(
+                            (
+                                metric.value
+                                for metric in getattr(panel, field)
+                                if metric.metric_id == metric_id
+                            ),
+                            None,
+                        )
+                        for panel in unique_panels
+                    ],
+                }
+                for metric_id in metric_ids
+            ]
+
+        return {
+            "bindings": dict(zip(self._PANEL_BINDINGS, binding_indexes, strict=True)),
+            "columns": {
+                field: [_v2_primitive(getattr(panel, field)) for panel in unique_panels]
+                for field in self._PANEL_SCALARS
+            },
+            "entry_funnel": metric_series("entry_funnel"),
+            "exit_attribution": metric_series("exit_attribution"),
+        }
+
+    def to_primitive(self) -> dict[str, object]:
+        primitive = _v2_primitive(self)
+        if not isinstance(primitive, dict):
+            raise ValueError("critic v4 input is not an object")
+        selected_parent = primitive.get("selected_parent_summary")
+        if not isinstance(selected_parent, dict):
+            raise ValueError("critic v4 selected parent primitive is invalid")
+        for field in (
+            "baseline_quick",
+            "baseline_discovery",
+            "candidate_quick",
+            "candidate_discovery",
+            "champion_discovery",
+        ):
+            primitive.pop(field)
+        selected_parent.pop("quick_panel")
+        selected_parent.pop("discovery_panel")
+        primitive["panel_evidence"] = self._panel_evidence_primitive()
+        return primitive
+
+    def canonical_json_bytes(self) -> bytes:
+        return _v2_canonical_bytes(self.to_primitive())
 
     def validate_artifact(self, artifact: CriticArtifactV4) -> None:
         if not isinstance(artifact, CriticArtifactV4):
