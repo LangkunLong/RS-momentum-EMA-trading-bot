@@ -3727,6 +3727,13 @@ def _run_v4_iteration(
             _record_v4_artifact(
                 state,
                 services.write_json_artifact(
+                    "accounting.json",
+                    _v4_accounting_artifact(state),
+                ),
+            )
+            _record_v4_artifact(
+                state,
+                services.write_json_artifact(
                     f"iterations/{iteration:03d}/authorization_skips.json",
                     {
                         "schema_version": 4,
@@ -3934,7 +3941,10 @@ def _run_v4_iteration(
                             else "evaluation_failed"
                         ),
                     )
-                    quick = None
+                    # Preserve a completed quick panel for critic feedback when
+                    # only the larger discovery evaluation failed operationally.
+                    if quick_artifact is None:
+                        quick = None
                     discovery = None
 
         _write_validation_v4(

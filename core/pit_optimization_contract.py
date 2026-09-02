@@ -4138,6 +4138,32 @@ def _v4_response_bounded_text(value: object, field: str, *, max_chars: int) -> s
     return text
 
 
+def _v4_response_text_value(
+    value: object,
+    field: str,
+    *,
+    max_chars: int,
+    allow_empty: bool = False,
+) -> str:
+    """Preserve bounded semantic content even when a reasoner structures it."""
+
+    if value is None and allow_empty:
+        return ""
+    if not isinstance(value, str):
+        if isinstance(value, (dict, list)):
+            value = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        else:
+            raise ValueError(f"{field} must be text or structured JSON")
+    if not value.strip() and allow_empty:
+        return ""
+    return _v4_response_bounded_text(value, field, max_chars=max_chars)
+
+
 def _v4_response_identifier(value: object, field: str) -> str:
     _v4_utf8_bytes(value, field)
     return _v2_response_identifier(value, field)
@@ -4170,6 +4196,7 @@ def _parse_v4_closed_object(
     keys: frozenset[str],
     *,
     max_total_bytes: int,
+    optional_keys: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     if type(max_total_bytes) is not int or max_total_bytes <= 0:
         raise ValueError("provider payload byte cap is invalid")
@@ -4180,9 +4207,14 @@ def _parse_v4_closed_object(
         value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise ValueError("provider payload is malformed JSON") from exc
-    if not isinstance(value, dict) or set(value) != keys:
+    if not optional_keys.issubset(keys):
+        raise ValueError("provider payload optional keys are invalid")
+    if not isinstance(value, dict) or not (keys - optional_keys).issubset(value):
         raise ValueError("provider payload has invalid keys")
-    return value
+    # Reasoning models often add an explanatory metadata key even in JSON mode.
+    # The local artifact keeps only the recognized semantic fields, so harmless
+    # extras neither widen authority nor invalidate otherwise usable work.
+    return {key: value[key] for key in keys if key in value}
 
 
 def _v4_response_list(
@@ -4193,51 +4225,82 @@ def _v4_response_list(
     max_items: int = MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
     max_item_chars: int = MAX_INVESTIGATOR_LIST_ITEM_CHARS,
 ) -> tuple[str, ...]:
-    if type(value) is not list or any(not isinstance(item, str) for item in value):
-        raise ValueError(f"{field} must be a JSON string array")
+    if value is None and allow_empty:
+        return ()
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if type(value) is not list:
+        raise ValueError(f"{field} must be text or a JSON array")
+    if len(value) > max_items:
+        raise ValueError(f"{field} may contain at most {max_items} items")
     normalized_items: list[str] = []
     seen: set[str] = set()
     for item in value:
-        if not item.strip():
-            continue
-        normalized = _v4_response_bounded_text(
+        normalized = _v4_response_text_value(
             item,
             field,
             max_chars=max_item_chars,
+            allow_empty=True,
         )
+        if not normalized:
+            continue
         if normalized in seen:
             continue
         seen.add(normalized)
         normalized_items.append(normalized)
     normalized = tuple(normalized_items)
-    if len(normalized) > max_items:
-        raise ValueError(f"{field} may contain at most {max_items} items")
     if not allow_empty and not normalized:
         raise ValueError(f"{field} cannot be empty")
     return normalized
 
 
 def _v4_response_ids(value: object, field: str) -> tuple[str, ...]:
-    return tuple(
-        _v2_identifier(item, field)
-        for item in _v4_response_list(
-            value,
-            field,
-            allow_empty=True,
-            max_item_chars=128,
-        )
+    # Evidence references are advisory citations into supplied aggregate data.
+    # Panel digests may begin with a digit, so identifier grammar is the wrong
+    # constraint; bounded canonical text preserves exact controller-provided refs.
+    return _v4_response_list(
+        value,
+        field,
+        allow_empty=True,
+        max_item_chars=128,
     )
 
 
 def _v4_focus_areas(value: object, field: str) -> tuple[str, ...]:
-    parsed = _v4_response_list(value, field, allow_empty=False, max_items=3)
-    parsed = tuple(
-        item.casefold().replace("-", "_").replace(" ", "_") for item in parsed
-    )
-    if any(item not in _V4_FOCUS_AREAS for item in parsed):
-        raise ValueError(f"{field} are invalid")
-    canonical = tuple(item for item in _V4_FOCUS_AREAS if item in parsed)
-    return canonical
+    parsed = _v4_response_list(value, field, allow_empty=True, max_items=16)
+    aliases = {
+        "entry": "entry",
+        "entries": "entry",
+        "entry_quality": "entry",
+        "buy": "entry",
+        "buying": "entry",
+        "breakout": "entry",
+        "leadership": "entry",
+        "risk": "risk_sizing",
+        "risk_management": "risk_sizing",
+        "risk_sizing": "risk_sizing",
+        "sizing": "risk_sizing",
+        "position_sizing": "risk_sizing",
+        "allocation": "risk_sizing",
+        "capacity": "risk_sizing",
+        "exit": "exit",
+        "exits": "exit",
+        "sell": "exit",
+        "selling": "exit",
+        "retention": "exit",
+        "winner_retention": "exit",
+    }
+    normalized: set[str] = set()
+    for item in parsed:
+        key = re.sub(r"[^a-z0-9]+", "_", item.casefold()).strip("_")
+        mapped = aliases.get(key)
+        if mapped is not None:
+            normalized.add(mapped)
+    # Focus labels are advisory routing hints, not permissions.  An unfamiliar
+    # but useful strategy mechanism should broaden review, not discard the plan.
+    if not normalized:
+        return _V4_FOCUS_AREAS
+    return tuple(item for item in _V4_FOCUS_AREAS if item in normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -4892,8 +4955,9 @@ _V4_RESPONSE_SCHEMAS = MappingProxyType(
                 "evidence_ids": _v2_list_schema(
                     max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
                     min_items=1,
-                    items=_v2_identifier_schema(
-                        "An ID copied from supplied quick/discovery aggregate evidence."
+                    items=_v2_string_schema(
+                        max_length=128,
+                        min_length=1,
                     ),
                 ),
                 "causal_rationale": _v2_string_schema(
@@ -4981,8 +5045,9 @@ _V4_RESPONSE_SCHEMAS = MappingProxyType(
                 "evidence_ids": _v2_list_schema(
                     max_items=MAX_INVESTIGATOR_OUTPUT_LIST_ITEMS,
                     min_items=0,
-                    items=_v2_identifier_schema(
-                        "An ID copied from supplied validation or panel evidence."
+                    items=_v2_string_schema(
+                        max_length=128,
+                        min_length=1,
                     ),
                 ),
                 "disposition": {
@@ -5079,39 +5144,70 @@ class InvestigatorArtifactV4(_V2Canonical):
                 }
             ),
             max_total_bytes=max_total_bytes,
+            optional_keys=frozenset(
+                {
+                    "focus_areas",
+                    "evidence_ids",
+                    "causal_rationale",
+                    "expected_diagnostic_changes",
+                    "known_risks",
+                    "author_instructions",
+                }
+            ),
         )
+        instructions = _v4_response_list(
+            value.get("author_instructions"),
+            "investigator v4 author instructions",
+            allow_empty=True,
+        )
+        rationale = _v4_response_text_value(
+            value.get("causal_rationale"),
+            "investigator v4 causal rationale",
+            max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
+            allow_empty=True,
+        )
+        if not rationale and not instructions:
+            raise ValueError(
+                "investigator v4 response requires rationale or author instructions"
+            )
+        if not rationale:
+            rationale = instructions[0]
+        if not instructions:
+            instructions = (
+                "Implement the focused strategy change described in causal_rationale.",
+            )
+        expected_changes = _v4_response_list(
+            value.get("expected_diagnostic_changes"),
+            "investigator v4 expected diagnostic changes",
+            allow_empty=True,
+        )
+        if not expected_changes:
+            expected_changes = (
+                "Improve the supplied aggregate portfolio diagnostics.",
+            )
+        evidence_ids = _v4_response_ids(
+            value.get("evidence_ids"),
+            "investigator v4 evidence IDs",
+        )
+        if not evidence_ids:
+            evidence_ids = ("aggregate",)
         return cls(
             hypothesis_id=_v4_response_identifier(
                 value["hypothesis_id"],
                 "investigator v4 hypothesis ID",
             ),
             focus_areas=_v4_focus_areas(
-                value["focus_areas"], "investigator v4 focus areas"
+                value.get("focus_areas"), "investigator v4 focus areas"
             ),
-            evidence_ids=_v4_response_ids(
-                value["evidence_ids"],
-                "investigator v4 evidence IDs",
-            ),
-            causal_rationale=_v4_response_bounded_text(
-                value["causal_rationale"],
-                "investigator v4 causal rationale",
-                max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
-            ),
-            expected_diagnostic_changes=_v4_response_list(
-                value["expected_diagnostic_changes"],
-                "investigator v4 expected diagnostic changes",
-                allow_empty=False,
-            ),
+            evidence_ids=evidence_ids,
+            causal_rationale=rationale,
+            expected_diagnostic_changes=expected_changes,
             known_risks=_v4_response_list(
-                value["known_risks"],
+                value.get("known_risks"),
                 "investigator v4 known risks",
                 allow_empty=True,
             ),
-            author_instructions=_v4_response_list(
-                value["author_instructions"],
-                "investigator v4 author instructions",
-                allow_empty=False,
-            ),
+            author_instructions=instructions,
         )
 
 
@@ -5180,6 +5276,7 @@ class AuthorArtifactV4(_V2Canonical):
                 }
             ),
             max_total_bytes=max_total_bytes,
+            optional_keys=frozenset({"assumptions", "validation_suggestions"}),
         )
         parent_identity_sha256 = value["parent_identity_sha256"]
         _require_digest(parent_identity_sha256, "author v4 parent identity SHA-256")
@@ -5220,10 +5317,10 @@ class AuthorArtifactV4(_V2Canonical):
             ),
             policy_sources=sources,
             assumptions=_v4_response_list(
-                value["assumptions"], "author v4 assumptions", allow_empty=True
+                value.get("assumptions"), "author v4 assumptions", allow_empty=True
             ),
             validation_suggestions=_v4_response_list(
-                value["validation_suggestions"],
+                value.get("validation_suggestions"),
                 "author v4 validation suggestions",
                 allow_empty=True,
             ),
@@ -5369,10 +5466,22 @@ class CriticArtifactV4(_V2Canonical):
                 }
             ),
             max_total_bytes=max_total_bytes,
+            optional_keys=frozenset({"evidence_ids"}),
         )
         disposition = _v2_response_text(
             value["disposition"], "critic v4 disposition"
         ).casefold()
+        disposition = {
+            "accept": "promote",
+            "adopt": "promote",
+            "keep": "promote",
+            "continue": "refine",
+            "iterate": "refine",
+            "revise": "refine",
+            "reject": "abandon",
+            "discard": "abandon",
+            "stop": "abandon",
+        }.get(disposition, disposition)
         if disposition not in _V4_CRITIC_DISPOSITIONS:
             raise ValueError("critic v4 disposition is invalid")
         return cls(
@@ -5380,22 +5489,22 @@ class CriticArtifactV4(_V2Canonical):
                 value["hypothesis_id"],
                 "critic v4 hypothesis ID",
             ),
-            prediction_vs_observation=_v4_response_bounded_text(
+            prediction_vs_observation=_v4_response_text_value(
                 value["prediction_vs_observation"],
                 "critic v4 prediction versus observation",
                 max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
             ),
-            causal_explanation=_v4_response_bounded_text(
+            causal_explanation=_v4_response_text_value(
                 value["causal_explanation"],
                 "critic v4 causal explanation",
                 max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
             ),
             evidence_ids=_v4_response_ids(
-                value["evidence_ids"],
+                value.get("evidence_ids"),
                 "critic v4 evidence IDs",
             ),
             disposition=disposition,
-            next_direction=_v4_response_bounded_text(
+            next_direction=_v4_response_text_value(
                 value["next_direction"],
                 "critic v4 next direction",
                 max_chars=MAX_INVESTIGATOR_RATIONALE_CHARS,
@@ -6038,8 +6147,15 @@ class CriticInputV4(_V2Canonical):
         if self.validation_status.status == "valid":
             if not has_complete_candidate_evidence:
                 raise ValueError("critic v4 valid status requires both candidate panels")
-        elif self.candidate_quick is not None or self.candidate_discovery is not None:
-            raise ValueError("critic v4 nonvalid status cannot carry candidate panels")
+        elif self.candidate_discovery is not None:
+            raise ValueError("critic v4 nonvalid status cannot carry discovery evidence")
+        elif self.candidate_quick is not None and self.validation_status.failure_code not in {
+            "worker_failed",
+            "evaluation_failed",
+        }:
+            raise ValueError(
+                "critic v4 partial quick evidence requires an evaluation failure"
+            )
         _require_v4_panel_summary(
             self.baseline_quick,
             "quick",
