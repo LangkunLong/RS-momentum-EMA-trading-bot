@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, fields
 import difflib
 import hashlib
 import json
@@ -24,6 +24,14 @@ from core.pit_optimization_contract import (
     PitOptimizerCallBudget,
     PolicySourceBundle,
     PolicySourceRecord,
+)
+from core.strategy_policy.contracts import (
+    AllocationSnapshot,
+    CapacitySnapshot,
+    EntrySnapshot,
+    EvictionSnapshot,
+    ExitSnapshot,
+    MarketContextV1,
 )
 
 
@@ -55,6 +63,18 @@ _DECLARED_SYMBOLS = {
         "core.strategy_policy.exit.evaluate_exit",
     ),
 }
+_SNAPSHOT_CONTRACTS = {
+    "evaluate_entry": EntrySnapshot,
+    "recommend_capacity": CapacitySnapshot,
+    "recommend_allocation": AllocationSnapshot,
+    "select_eviction": EvictionSnapshot,
+    "evaluate_exit": ExitSnapshot,
+}
+_SNAPSHOT_FIELDS = {
+    function: frozenset(field.name for field in fields(contract))
+    for function, contract in _SNAPSHOT_CONTRACTS.items()
+}
+_MARKET_CONTEXT_FIELDS = frozenset(field.name for field in fields(MarketContextV1))
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _AUTHOR_HUNK_HEADER_RE = re.compile(
     r"^@@ -(0|[1-9][0-9]*)(?:,([0-9]+))? "
@@ -255,6 +275,58 @@ def _root_name(node: ast.AST) -> str | None:
     return node.id if isinstance(node, ast.Name) else None
 
 
+def _snapshot_attribute_chain(
+    node: ast.Attribute,
+    *,
+    snapshot_name: str,
+) -> tuple[str, ...] | None:
+    """Return a direct snapshot access chain without inferring dynamic aliases."""
+    attributes: list[str] = []
+    current: ast.AST = node
+    while isinstance(current, ast.Attribute):
+        attributes.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name) or current.id != snapshot_name:
+        return None
+    return tuple(reversed(attributes))
+
+
+def _validate_snapshot_attribute_contracts(tree: ast.Module) -> None:
+    """Reject invented direct policy-contract attributes before a worker is started."""
+    for function in (
+        node for node in tree.body if isinstance(node, ast.FunctionDef)
+    ):
+        allowed_snapshot_fields = _SNAPSHOT_FIELDS.get(function.name)
+        if allowed_snapshot_fields is None:
+            continue
+        arguments = (*function.args.posonlyargs, *function.args.args)
+        if (
+            len(arguments) != 1
+            or function.args.vararg is not None
+            or function.args.kwarg is not None
+            or function.args.kwonlyargs
+        ):
+            raise ValueError("policy public function signature differs from the fixed contract")
+        snapshot_name = arguments[0].arg
+        for descendant in ast.walk(function):
+            if not isinstance(descendant, ast.Attribute):
+                continue
+            chain = _snapshot_attribute_chain(
+                descendant,
+                snapshot_name=snapshot_name,
+            )
+            if chain is None:
+                continue
+            if chain[0] not in allowed_snapshot_fields:
+                raise ValueError("policy snapshot attribute is outside the fixed contract")
+            if len(chain) == 1:
+                continue
+            if chain[0] != "market" or len(chain) != 2:
+                raise ValueError("policy nested snapshot attribute is outside the fixed contract")
+            if chain[1] not in _MARKET_CONTEXT_FIELDS:
+                raise ValueError("policy market attribute is outside the fixed contract")
+
+
 def validate_policy_ast(*, path: str, source: str) -> None:
     """Enforce a closed pure-Python policy language without ambient capabilities."""
     if path not in _ALLOWED_PUBLIC or not isinstance(source, str):
@@ -273,6 +345,7 @@ def validate_policy_ast(*, path: str, source: str) -> None:
     public_functions = {name for name in local_functions if not name.startswith("_")}
     if public_functions != set(_ALLOWED_PUBLIC[path]):
         raise ValueError("policy public symbols differ from the closed interface")
+    _validate_snapshot_attribute_contracts(tree)
     imported_contracts: set[str] = set()
     imported_math = False
     for statement in tree.body:
