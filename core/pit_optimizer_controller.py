@@ -476,7 +476,12 @@ class CandidateEvaluationFailure(RuntimeError):
     """A candidate-scoped discovery failure that remains safe for critic feedback."""
 
     def __init__(self, failure_code: str) -> None:
-        if failure_code not in {"worker_failed", "replay_failed"}:
+        if failure_code not in {
+            "allocation_constraints_failed",
+            "evaluation_failed",
+            "replay_failed",
+            "worker_failed",
+        }:
             raise ValueError("candidate evaluation failure code is invalid")
         super().__init__(failure_code)
         self.failure_code = failure_code
@@ -3588,6 +3593,7 @@ def _candidate_failure_code(value: str | None) -> str:
         "imports_failed",
         "purity_failed",
         "determinism_failed",
+        "allocation_constraints_failed",
         "worker_failed",
         "typed_decision_invalid",
         "runtime_invalid",
@@ -3945,11 +3951,7 @@ def _run_v4_iteration(
                 except CandidateEvaluationFailure as exc:
                     validation_status = CandidateValidationStatusV4(
                         status="invalid",
-                        failure_code=(
-                            "worker_failed"
-                            if exc.failure_code == "worker_failed"
-                            else "evaluation_failed"
-                        ),
+                        failure_code=exc.failure_code,
                     )
                     # Preserve a completed quick panel for critic feedback when
                     # only the larger discovery evaluation failed operationally.

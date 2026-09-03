@@ -102,7 +102,9 @@ CANDIDATE_VALIDATION_FAILURE_CODES = frozenset(
         "author_diff_noop",
         "author_diff_not_applicable",
         "author_diff_oversize",
+        "allocation_constraints_failed",
         "determinism_failed",
+        "evaluation_failed",
         "imports_failed",
         "next_context_oversize",
         "no_discovery_trades",
@@ -123,7 +125,9 @@ _VALIDATION_FAILURE_FLAGS = MappingProxyType(
         "imports_failed": (True, False, False, False, False, False),
         "purity_failed": (True, True, False, False, False, False),
         "determinism_failed": (True, True, True, False, False, False),
+        "allocation_constraints_failed": (True, True, True, True, False, True),
         "worker_failed": (True, True, True, True, False, True),
+        "evaluation_failed": (True, True, True, True, True, True),
         "replay_failed": (True, True, True, True, True, True),
         "no_discovery_trades": (True, True, True, True, True, True),
         "next_context_oversize": (True, True, True, True, True, True),
@@ -4094,6 +4098,7 @@ _V4_VALIDATION_STATUSES = ("not_evaluated", "valid", "invalid")
 _V4_VALIDATION_FAILURE_CODES = frozenset(
     {
         "author_output_invalid",
+        "allocation_constraints_failed",
         "source_invalid",
         "syntax_failed",
         "imports_failed",
@@ -4921,7 +4926,10 @@ PIT_OPTIMIZER_V4_SYSTEM_PROMPTS = MappingProxyType(
             "gross_exposure_before, projected_gross_exposure_after_eviction, entry_open, "
             "pending_entries_remaining, capacity_is_uncapped, configured_position_risk_pct, "
             "configured_stop_loss_pct, maximum_position_risk_fraction, maximum_stop_fraction, "
-            "canslim_score, and rs_score. Eviction fields are market, capacity_is_finite, "
+            "canslim_score, and rs_score. Allocation decision limits are hard: risk_fraction must "
+            "not exceed maximum_position_risk_fraction and stop_distance_fraction must not exceed "
+            "maximum_stop_fraction. When adapting either value, explicitly clamp it to its snapshot "
+            "maximum. Eviction fields are market, capacity_is_finite, "
             "capacity_is_full, eviction_enabled, candidate_rs_score, and positions; each position "
             "has slot, entry_price, causal_execution_price, and rs_score. Exit fields are market, "
             "entry_price, original_qty, remaining_qty, stop_price, realized_pnl, canslim_score, "
@@ -4954,7 +4962,10 @@ PIT_OPTIMIZER_V4_SYSTEM_PROMPTS = MappingProxyType(
             "and measured quick/discovery portfolio CAGR behavior relative to the fixed baseline, "
             "current champion, and target. If progress is not material toward the target, direct "
             "the next iteration to a different causal bottleneck rather than restating the same "
-            "tweak. Return exactly one JSON object with exactly these keys "
+            "tweak. allocation_constraints_failed means a candidate exceeded a supplied allocation "
+            "maximum; direct the next author to preserve its adaptive mechanism while clamping "
+            "risk_fraction and stop_distance_fraction to their snapshot maxima. Return exactly one "
+            "JSON object with exactly these keys "
             "and types: hypothesis_id:string; prediction_vs_observation:string; "
             "causal_explanation:string; evidence_ids:array[string]; "
             "disposition:string; and next_direction:string. No other keys are allowed. "

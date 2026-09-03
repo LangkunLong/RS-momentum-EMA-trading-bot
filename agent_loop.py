@@ -20520,7 +20520,9 @@ def _build_pit_optimizer_v3_live_run(
                 # return an invalid runtime decision (for example, a negative or
                 # oversized stop distance).  That is candidate feedback, not a
                 # controller/sandbox failure, so keep the optimizer loop alive.
-                raise CandidateEvaluationFailure("worker_failed") from exc
+                raise CandidateEvaluationFailure(
+                    _candidate_runtime_failure_code(exc)
+                ) from exc
             for item in evidence:
                 evidence_sha256s[(candidate_identity_sha256, item.fold_id)] = (
                     item.evidence_sha256
@@ -20985,6 +20987,23 @@ def _optimizer_capacity_determinism_probes() -> tuple[object, ...]:
             ),
         ),
     )
+
+
+def _candidate_runtime_failure_code(exc: BaseException) -> str:
+    """Map bounded policy-decision failures to one critic-safe category."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    allocation_markers = (
+        "stop_distance_fraction",
+        "risk_fraction",
+        "notional_fraction_cap",
+    )
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if any(marker in str(current) for marker in allocation_markers):
+            return "allocation_constraints_failed"
+        current = current.__cause__ or current.__context__
+    return "worker_failed"
 
 
 def _v4_worker_runner(
@@ -21809,7 +21828,9 @@ def _build_pit_optimizer_v4_live_run(
         except (PolicyWorkerOperationalFailure, ValueError) as exc:
             from core.pit_optimizer_controller import CandidateEvaluationFailure
 
-            raise CandidateEvaluationFailure("worker_failed") from exc
+            raise CandidateEvaluationFailure(
+                _candidate_runtime_failure_code(exc)
+            ) from exc
 
     def dispose_workspace(workspace: CandidateWorkspace) -> PitOptimizerCleanup:
         candidate = capabilities.pop(workspace.workspace_id, None)
