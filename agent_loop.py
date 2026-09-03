@@ -21415,8 +21415,6 @@ def _prepare_pit_optimizer_v4_production(
                     not isinstance(cached_identity, Mapping)
                     or cached_identity.get("identity_sha256")
                     != identity.identity_sha256
-                    or identity_value.get("identity_sha256")
-                    != identity.identity_sha256
                 ):
                     raise ConfigurationError(
                         "optimizer v4 cached seed identity differs"
