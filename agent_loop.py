@@ -21155,6 +21155,7 @@ def _prepare_pit_optimizer_v4_production(
     authenticated_baseline: (
         tuple[PanelAggregateSummary, PanelAggregateSummary] | None
     ) = None
+    authenticated_seed_states: dict[str, Mapping[str, object]] = {}
     if config.phase == "canary":
         if (
             config.readiness_artifact.is_symlink()
@@ -21193,6 +21194,28 @@ def _prepare_pit_optimizer_v4_production(
             raise ConfigurationError(
                 "optimizer v4 readiness baseline is invalid"
             ) from exc
+        for kind, identity_key, state_key in (
+            ("champion", "seed_champion_identity", "seed_champion_state"),
+            ("branch", "seed_branch_identity", "seed_branch_state"),
+        ):
+            expected_identity = readiness_primitive.get(identity_key)
+            cached_state = readiness_primitive.get(state_key)
+            if expected_identity is None:
+                if cached_state is not None:
+                    raise ConfigurationError(
+                        "optimizer v4 readiness seed state is unexpected"
+                    )
+                continue
+            if (
+                not isinstance(expected_identity, str)
+                or _SHA256_RE.fullmatch(expected_identity) is None
+                or not isinstance(cached_state, dict)
+                or not isinstance(cached_state.get("candidate_identity"), dict)
+                or cached_state["candidate_identity"].get("identity_sha256")
+                != expected_identity
+            ):
+                raise ConfigurationError("optimizer v4 readiness seed state is invalid")
+            authenticated_seed_states[kind] = cached_state
         qualification_ledger.authenticate_ancestor(readiness_ledger_head)
     manifest = load_pit_optimizer_manifest_v4(
         config.optimizer_manifest,
@@ -21354,6 +21377,7 @@ def _prepare_pit_optimizer_v4_production(
             policy_sources=baseline_sources,
         )
         candidate = export_candidate(source_state)
+        cached_seed_state = authenticated_seed_states.get(kind)
         try:
             identity, reminted_diff = validate_candidate_sources(
                 authenticated_base_root=config.source_root,
@@ -21368,42 +21392,77 @@ def _prepare_pit_optimizer_v4_production(
             )
             if restored_diffs is not None:
                 restored_diffs[identity.identity_sha256] = reminted_diff
-            quick = _evaluate_v4_panel(
-                config,
-                manifest=manifest,
-                panel=supplied_plan.quick_panel,
-                candidate_root=candidate.root,
-                runner=restore_runner,
-                run_label=f"restore-{kind}-quick",
-            )
-            discovery = _evaluate_v4_panel(
-                config,
-                manifest=manifest,
-                panel=supplied_plan.discovery_panel,
-                candidate_root=candidate.root,
-                runner=restore_runner,
-                run_label=f"restore-{kind}-discovery",
-            )
+            if cached_seed_state is None:
+                quick = _evaluate_v4_panel(
+                    config,
+                    manifest=manifest,
+                    panel=supplied_plan.quick_panel,
+                    candidate_root=candidate.root,
+                    runner=restore_runner,
+                    run_label=f"restore-{kind}-quick",
+                )
+                discovery = _evaluate_v4_panel(
+                    config,
+                    manifest=manifest,
+                    panel=supplied_plan.discovery_panel,
+                    candidate_root=candidate.root,
+                    runner=restore_runner,
+                    run_label=f"restore-{kind}-discovery",
+                )
+            else:
+                cached_identity = cached_seed_state.get("candidate_identity")
+                if (
+                    not isinstance(cached_identity, Mapping)
+                    or cached_identity.get("identity_sha256")
+                    != identity.identity_sha256
+                    or identity_value.get("identity_sha256")
+                    != identity.identity_sha256
+                ):
+                    raise ConfigurationError(
+                        "optimizer v4 cached seed identity differs"
+                    )
+                try:
+                    quick = panel_aggregate_summary_from_primitive(
+                        cached_seed_state.get("quick_evidence")
+                    )
+                    discovery = panel_aggregate_summary_from_primitive(
+                        cached_seed_state.get("discovery_evidence")
+                    )
+                except ValueError as exc:
+                    raise ConfigurationError(
+                        "optimizer v4 cached seed evidence is invalid"
+                    ) from exc
+        except ConfigurationError:
+            raise
         except ValueError as exc:
             raise CandidateEvaluationFailure("evaluation_failed") from exc
         finally:
             dispose_candidate(candidate)
+        reminted_diff_digest = hashlib.sha256(
+            reminted_diff.encode("utf-8")
+        ).hexdigest()
+        source_bundle_digest = hashlib.sha256(
+            canonical_json_bytes({"policy_sources": dict(replacement_sources)})
+        ).hexdigest()
         quick_digest = hashlib.sha256(
             canonical_json_bytes({"evidence": _panel_v4_artifact(quick)})
         ).hexdigest()
         discovery_digest = hashlib.sha256(
             canonical_json_bytes({"evidence": _panel_v4_artifact(discovery)})
         ).hexdigest()
+        if cached_seed_state is not None and (
+            cached_seed_state.get("cumulative_diff_sha256") != reminted_diff_digest
+            or cached_seed_state.get("source_bundle_sha256") != source_bundle_digest
+            or cached_seed_state.get("quick_evidence_sha256") != quick_digest
+            or cached_seed_state.get("discovery_evidence_sha256") != discovery_digest
+        ):
+            raise ConfigurationError("optimizer v4 cached seed evidence differs")
         return SearchCandidateState(
             candidate_identity=identity,
             cumulative_diff_artifact=f"restored-{kind}.diff",
-            cumulative_diff_sha256=hashlib.sha256(
-                reminted_diff.encode("utf-8")
-            ).hexdigest(),
+            cumulative_diff_sha256=reminted_diff_digest,
             source_bundle_artifact=f"restored-{kind}-source.json",
-            source_bundle_sha256=hashlib.sha256(
-                canonical_json_bytes({"policy_sources": dict(replacement_sources)})
-            ).hexdigest(),
+            source_bundle_sha256=source_bundle_digest,
             discovery_evidence_artifact=f"restored-{kind}-discovery.json",
             discovery_evidence_sha256=discovery_digest,
             discovery_evidence=discovery,

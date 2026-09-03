@@ -3159,6 +3159,16 @@ def prepare_pit_optimizer_v4(
         "seed_branch_identity": (
             None if branch is None else branch.candidate_identity.identity_sha256
         ),
+        # Preparation has already reconstructed and evaluated a retained seed on
+        # these exact panels.  Carry its canonical, digest-bound state in the
+        # readiness artifact so the canary can reauthenticate the source and
+        # remint its diff without needlessly evaluating the same seed again.
+        "seed_champion_state": (
+            None if champion is None else champion.to_primitive()
+        ),
+        "seed_branch_state": (
+            None if branch is None else branch.to_primitive()
+        ),
     }
     try:
         output, digest = write_create_only_json(Path(artifact_path), primitive)
