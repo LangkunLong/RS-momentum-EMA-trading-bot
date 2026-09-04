@@ -93,12 +93,33 @@ _EVENT_KINDS = frozenset(
         "round_outcome",
     }
 )
-_ROUND_OUTCOMES = frozenset({"no_novel_hypothesis", "novelty_exhausted", "critic_unavailable"})
+_PRECRITIC_EVIDENCE_KINDS = frozenset(
+    {
+        "rendered_variant",
+        "validation",
+        "semantic_fingerprint",
+        "quick_evaluation",
+        "episode_evaluation",
+        "typed_failure",
+    }
+)
 
 
 def _digest(value: object, label: str) -> str:
     if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _digest_tuple(value: object, label: str, *, required: bool = False) -> tuple[str, ...]:
+    if type(value) is not tuple or any(type(item) is not str for item in value):
+        raise ValueError(f"{label} must be an immutable digest tuple")
+    if required and not value:
+        raise ValueError(f"{label} must not be empty")
+    for item in value:
+        _digest(item, label)
+    if len(set(value)) != len(value):
+        raise ValueError(f"{label} must be unique")
     return value
 
 
@@ -564,81 +585,211 @@ class CleanupResultPayloadV5:
 
 
 @dataclass(frozen=True, slots=True)
+class NoNovelHypothesisAuthorityV5:
+    """Exact controller and investigator facts for one exhausted parent."""
+
+    outcome: Literal["no_novel_hypothesis"]
+    discovery_plan_sha256: str
+    search_state_before_sha256: str
+    search_state_after_sha256: str
+    parent_revision_sha256: str
+    investigator_request_sha256: str
+    investigator_evidence_sha256: str
+    investigator_attempt_sha256s: tuple[str, ...]
+    investigator_artifact_sha256: str
+    selection_outcome_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.outcome != "no_novel_hypothesis":
+            raise ValueError("no-novel authority kind is invalid")
+        for value, label in (
+            (self.discovery_plan_sha256, "no-novel discovery plan"),
+            (self.search_state_before_sha256, "no-novel prior search state"),
+            (self.search_state_after_sha256, "no-novel resulting search state"),
+            (self.parent_revision_sha256, "no-novel parent revision"),
+            (self.investigator_request_sha256, "no-novel investigator request"),
+            (self.investigator_evidence_sha256, "no-novel investigator evidence"),
+            (self.investigator_artifact_sha256, "no-novel investigator artifact"),
+            (self.selection_outcome_sha256, "no-novel selection outcome"),
+        ):
+            _digest(value, label)
+        _digest_tuple(
+            self.investigator_attempt_sha256s,
+            "no-novel investigator attempts",
+            required=True,
+        )
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+@dataclass(frozen=True, slots=True)
+class NoveltyExhaustedAuthorityV5:
+    """Exact ordered per-parent outcomes proving campaign novelty exhaustion."""
+
+    outcome: Literal["novelty_exhausted"]
+    discovery_plan_sha256: str
+    search_state_before_sha256: str
+    search_state_after_sha256: str
+    parent_outcomes: tuple[NoNovelHypothesisAuthorityV5, ...]
+
+    def __post_init__(self) -> None:
+        if self.outcome != "novelty_exhausted":
+            raise ValueError("novelty-exhausted authority kind is invalid")
+        for value, label in (
+            (self.discovery_plan_sha256, "novelty-exhausted discovery plan"),
+            (self.search_state_before_sha256, "novelty-exhausted prior search state"),
+            (self.search_state_after_sha256, "novelty-exhausted resulting search state"),
+        ):
+            _digest(value, label)
+        if (
+            type(self.parent_outcomes) is not tuple
+            or not self.parent_outcomes
+            or any(type(item) is not NoNovelHypothesisAuthorityV5 for item in self.parent_outcomes)
+        ):
+            raise ValueError("novelty-exhausted parent outcomes are invalid")
+        if any(item.discovery_plan_sha256 != self.discovery_plan_sha256 for item in self.parent_outcomes):
+            raise ValueError("novelty exhaustion spans discovery plans")
+        if len({item.parent_revision_sha256 for item in self.parent_outcomes}) != len(self.parent_outcomes):
+            raise ValueError("novelty exhaustion contains a duplicate parent")
+        state_chain = (
+            self.search_state_before_sha256,
+            *(item.search_state_after_sha256 for item in self.parent_outcomes),
+        )
+        expected_chain = (
+            *(item.search_state_before_sha256 for item in self.parent_outcomes),
+            self.search_state_after_sha256,
+        )
+        if state_chain != expected_chain:
+            raise ValueError("novelty exhaustion has a broken search-state chain")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+PreCriticEvidenceKindV5 = Literal[
+    "rendered_variant",
+    "validation",
+    "semantic_fingerprint",
+    "quick_evaluation",
+    "episode_evaluation",
+    "typed_failure",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PreCriticEvidenceIdentityV5:
+    """One typed pre-critic fact retained when no critic slot is available."""
+
+    experiment_id: str
+    evidence_kind: PreCriticEvidenceKindV5
+    evidence_sha256: str
+    episode_ordinal: int | None = None
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "pre-critic evidence experiment")
+        if type(self.evidence_kind) is not str or self.evidence_kind not in _PRECRITIC_EVIDENCE_KINDS:
+            raise ValueError("pre-critic evidence kind is invalid")
+        _digest(self.evidence_sha256, "pre-critic evidence identity")
+        if self.evidence_kind == "episode_evaluation":
+            _count(self.episode_ordinal, "pre-critic episode ordinal", positive=True)
+        elif self.episode_ordinal is not None:
+            raise ValueError("only episode evidence may carry an ordinal")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+@dataclass(frozen=True, slots=True)
+class CriticUnavailableAuthorityV5:
+    """Exact failed critic role plus the complete retained pre-critic batch."""
+
+    outcome: Literal["critic_unavailable"]
+    discovery_plan_sha256: str
+    search_state_before_sha256: str
+    search_state_after_sha256: str
+    parent_revision_sha256: str
+    hypothesis_id: str
+    critic_request_sha256: str
+    critic_evidence_sha256: str
+    critic_attempt_sha256s: tuple[str, ...]
+    experiment_ids: tuple[str, ...]
+    precritic_evidence: tuple[PreCriticEvidenceIdentityV5, ...]
+
+    def __post_init__(self) -> None:
+        if self.outcome != "critic_unavailable":
+            raise ValueError("critic-unavailable authority kind is invalid")
+        for value, label in (
+            (self.discovery_plan_sha256, "critic-unavailable discovery plan"),
+            (self.search_state_before_sha256, "critic-unavailable prior search state"),
+            (self.search_state_after_sha256, "critic-unavailable resulting search state"),
+            (self.parent_revision_sha256, "critic-unavailable parent revision"),
+            (self.critic_request_sha256, "critic-unavailable request"),
+            (self.critic_evidence_sha256, "critic-unavailable evidence"),
+        ):
+            _digest(value, label)
+        _text(self.hypothesis_id, "critic-unavailable hypothesis ID")
+        _digest_tuple(
+            self.critic_attempt_sha256s,
+            "critic-unavailable attempts",
+            required=True,
+        )
+        _digest_tuple(
+            self.experiment_ids,
+            "critic-unavailable experiments",
+            required=True,
+        )
+        if (
+            type(self.precritic_evidence) is not tuple
+            or not self.precritic_evidence
+            or any(type(item) is not PreCriticEvidenceIdentityV5 for item in self.precritic_evidence)
+        ):
+            raise ValueError("critic-unavailable pre-critic evidence is invalid")
+        evidence_keys = tuple(
+            (item.experiment_id, item.evidence_kind, item.episode_ordinal) for item in self.precritic_evidence
+        )
+        if len(set(evidence_keys)) != len(evidence_keys):
+            raise ValueError("critic-unavailable pre-critic evidence is duplicated")
+        evidence_experiment_ids = {item.experiment_id for item in self.precritic_evidence}
+        if evidence_experiment_ids != set(self.experiment_ids):
+            raise ValueError("critic-unavailable evidence differs from its experiment batch")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+RoundOutcomeAuthorityV5 = NoNovelHypothesisAuthorityV5 | NoveltyExhaustedAuthorityV5 | CriticUnavailableAuthorityV5
+
+
+@dataclass(frozen=True, slots=True)
 class RoundOutcomePayloadV5:
     """Authenticated terminal round fact that does not fabricate an experiment."""
 
-    outcome: RoundOutcomeKindV5
     campaign_id: str
     round_index: int
-    discovery_plan_sha256: str
-    search_state_before_ref: ArtifactRefV5
-    search_state_after_ref: ArtifactRefV5
-    parent_revision_sha256: str | None
-    role_request_refs: tuple[ArtifactRefV5, ...]
-    role_attempt_refs: tuple[ArtifactRefV5, ...]
-    evidence_refs: tuple[ArtifactRefV5, ...]
-    experiment_ids: tuple[str, ...] = ()
+    authority: RoundOutcomeAuthorityV5
 
     def __post_init__(self) -> None:
-        if type(self.outcome) is not str or self.outcome not in _ROUND_OUTCOMES:
-            raise ValueError("round outcome is invalid")
         _text(self.campaign_id, "round-outcome campaign ID")
         _count(self.round_index, "round-outcome round", positive=True)
-        _digest(self.discovery_plan_sha256, "round-outcome discovery plan")
-        for reference, label in (
-            (self.search_state_before_ref, "round-outcome prior search state"),
-            (self.search_state_after_ref, "round-outcome resulting search state"),
-        ):
-            if type(reference) is not ArtifactRefV5:
-                raise ValueError(f"{label} reference is invalid")
-        for references, label in (
-            (self.role_request_refs, "round-outcome role requests"),
-            (self.role_attempt_refs, "round-outcome role attempts"),
-            (self.evidence_refs, "round-outcome evidence"),
-        ):
-            if type(references) is not tuple or any(type(reference) is not ArtifactRefV5 for reference in references):
-                raise ValueError(f"{label} references are invalid")
-            if len(set(references)) != len(references):
-                raise ValueError(f"{label} references must be unique")
-        role_and_evidence_refs = self.role_request_refs + self.role_attempt_refs + self.evidence_refs
-        if len(set(role_and_evidence_refs)) != len(role_and_evidence_refs):
-            raise ValueError("round-outcome role and evidence references overlap")
-        if type(self.experiment_ids) is not tuple or any(
-            type(experiment_id) is not str for experiment_id in self.experiment_ids
-        ):
-            raise ValueError("round-outcome experiment IDs are invalid")
-        for experiment_id in self.experiment_ids:
-            _digest(experiment_id, "round-outcome experiment ID")
-        if len(set(self.experiment_ids)) != len(self.experiment_ids):
-            raise ValueError("round-outcome experiment IDs must be unique")
-
-        if self.outcome == "novelty_exhausted":
-            if self.parent_revision_sha256 is not None:
-                raise ValueError("novelty exhaustion cannot select a parent")
-            if self.role_request_refs or self.role_attempt_refs or not self.evidence_refs:
-                raise ValueError("novelty exhaustion must cite only prior novelty evidence")
-            if self.experiment_ids:
-                raise ValueError("novelty exhaustion cannot name experiments")
-            return
-
-        _digest(self.parent_revision_sha256, "round-outcome parent revision")
-        if not self.role_request_refs or not self.role_attempt_refs or not self.evidence_refs:
-            raise ValueError("round outcome lacks authenticated role or evidence facts")
-        if self.outcome == "no_novel_hypothesis":
-            if self.experiment_ids:
-                raise ValueError("no-novel outcome cannot name experiments")
-        elif not self.experiment_ids:
-            raise ValueError("critic-unavailable outcome must name its attempted experiments")
+        if type(self.authority) not in {
+            NoNovelHypothesisAuthorityV5,
+            NoveltyExhaustedAuthorityV5,
+            CriticUnavailableAuthorityV5,
+        }:
+            raise ValueError("round-outcome authority is outside the closed V5 union")
 
     @property
-    def artifact_refs(self) -> tuple[ArtifactRefV5, ...]:
-        return (
-            self.search_state_before_ref,
-            self.search_state_after_ref,
-            *self.role_request_refs,
-            *self.role_attempt_refs,
-            *self.evidence_refs,
-        )
+    def outcome(self) -> RoundOutcomeKindV5:
+        return self.authority.outcome
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
 
 
 RoundEventPayloadV5 = (
@@ -1294,6 +1445,7 @@ def project_investigator_memory_v5(
 __all__ = [
     "ArchiveReducerV5",
     "CleanupResultPayloadV5",
+    "CriticUnavailableAuthorityV5",
     "EpisodeEvidencePayloadV5",
     "ExperimentFeedbackV5",
     "ExperimentIdentityLikeV5",
@@ -1301,6 +1453,10 @@ __all__ = [
     "ExperimentRecordV5",
     "ExperimentStatusV5",
     "InvestigatorMemoryProjectionV5",
+    "NoNovelHypothesisAuthorityV5",
+    "NoveltyExhaustedAuthorityV5",
+    "PreCriticEvidenceIdentityV5",
+    "PreCriticEvidenceKindV5",
     "ProjectionBudgetTooSmallV5",
     "ProjectionLineageAmbiguityCodeV5",
     "ProjectionLineageAmbiguityV5",
@@ -1314,6 +1470,7 @@ __all__ = [
     "RoundEventV5",
     "RoundIntentPayloadV5",
     "RoundOutcomeKindV5",
+    "RoundOutcomeAuthorityV5",
     "RoundOutcomePayloadV5",
     "RoundRecoveryV5",
     "StoredExperimentRecordV5",

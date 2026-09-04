@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from importlib import import_module
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from .contracts import (
     ScenarioPanelEvaluationV5,
     validate_sandbox_profile_resources_v5,
 )
+from .policy_scope import EDITABLE_POLICY_PATHS_V5
 
 
 class SimulationRunnerV5(Protocol):
@@ -69,6 +71,20 @@ class AuthenticatedPitBundleV5(Protocol):
     def load_price_identity_transition_contract(
         self, prices_provenance: str | Path
     ) -> PriceIdentityTransitionContract: ...
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineWorkerBindingV5:
+    """Trusted binding between the declared baseline revision and one worker."""
+
+    policy_revision: PolicyRevisionIdentityV5
+    client: StrategyPolicyClientV3
+
+    def __post_init__(self) -> None:
+        if type(self.policy_revision) is not PolicyRevisionIdentityV5:
+            raise ValueError("baseline worker policy revision is invalid")
+        if not _is_policy_client_v3(self.client):
+            raise TypeError("baseline worker binding contains an invalid client")
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +139,69 @@ class CandidateWorkerFactoryV5(Protocol):
     def __call__(
         self, *, candidate_root: Path, policy_revision: PolicyRevisionIdentityV5
     ) -> CandidateWorkerBindingV5: ...
+
+
+class BaselineWorkerFactoryV5(Protocol):
+    """Create a fresh V3 worker bound to the authenticated baseline revision."""
+
+    def __call__(self) -> BaselineWorkerBindingV5: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _InProcessBaselineWorkerFactoryV5:
+    policy_revision: PolicyRevisionIdentityV5
+
+    def __call__(self) -> BaselineWorkerBindingV5:
+        client = InProcessPolicyClientV3()
+        try:
+            _validate_in_process_revision_v5(self.policy_revision)
+            return BaselineWorkerBindingV5(
+                policy_revision=self.policy_revision,
+                client=client,
+            )
+        except BaseException:
+            client.close()
+            raise
+
+
+def _validate_in_process_revision_v5(
+    policy_revision: PolicyRevisionIdentityV5,
+) -> None:
+    source_root = Path(__file__).resolve(strict=True).parents[2]
+    observed: list[tuple[str, str]] = []
+    for relative_path in EDITABLE_POLICY_PATHS_V5:
+        module_name = relative_path.removesuffix(".py").replace("/", ".")
+        module = import_module(module_name)
+        origin_value = getattr(module, "__file__", None)
+        if type(origin_value) is not str:
+            raise ValueError("in-process baseline module has no source origin")
+        expected = source_root / Path(relative_path)
+        origin = Path(origin_value)
+        try:
+            resolved = origin.resolve(strict=True)
+            if origin.is_symlink() or resolved != expected or not resolved.is_file():
+                raise ValueError("in-process baseline module origin is not trusted")
+            source_bytes = resolved.read_bytes()
+        except OSError as exc:
+            raise ValueError("in-process baseline source cannot be authenticated") from exc
+        observed.append((relative_path, hashlib.sha256(source_bytes).hexdigest()))
+    if tuple(observed) != policy_revision.editable_source_sha256:
+        raise ValueError("in-process baseline source differs from its policy revision")
+
+
+def _bind_baseline_worker_v5(
+    factory: BaselineWorkerFactoryV5,
+    policy_revision: PolicyRevisionIdentityV5,
+) -> StrategyPolicyClientV3:
+    binding = factory()
+    if type(binding) is not BaselineWorkerBindingV5:
+        raise TypeError("baseline worker factory returned an invalid binding")
+    if binding.policy_revision != policy_revision:
+        try:
+            binding.client.close()
+        finally:
+            raise ValueError("baseline worker binding differs from the request")
+    return binding.client
 
 
 class _SingleUseWorkerFactory:
@@ -239,7 +318,7 @@ class PitPanelEvaluatorV5:
         prices_provenance: Path,
         report_builder: EvaluationReportBuilderV5,
         baseline_policy_revision: PolicyRevisionIdentityV5,
-        baseline_worker_factory: StrategyPolicyClientFactoryV3 | None = None,
+        baseline_worker_factory: BaselineWorkerFactoryV5 | None = None,
         simulator_factory: SimulatorFactoryV5 = PortfolioSimulator,
     ) -> None:
         if type(contract) is not EvaluatorContractV5:
@@ -263,7 +342,11 @@ class PitPanelEvaluatorV5:
             raise TypeError("V5 evaluation report builder is invalid")
         if not callable(simulator_factory):
             raise TypeError("V5 simulator factory is invalid")
-        baseline_factory = InProcessPolicyClientV3 if baseline_worker_factory is None else baseline_worker_factory
+        baseline_factory = (
+            _InProcessBaselineWorkerFactoryV5(baseline_policy_revision)
+            if baseline_worker_factory is None
+            else baseline_worker_factory
+        )
         if not callable(baseline_factory):
             raise TypeError("baseline worker factory is invalid")
 
@@ -323,7 +406,7 @@ class PitPanelEvaluatorV5:
         return self._evaluate(
             panel=panel,
             policy_revision=self._baseline_policy_revision,
-            worker_factory=self._baseline_worker_factory,
+            baseline_worker_factory=self._baseline_worker_factory,
             scenario_ids=scenario_ids,
         )
 
@@ -342,7 +425,7 @@ class PitPanelEvaluatorV5:
         return self._evaluate(
             panel=panel,
             policy_revision=policy_revision,
-            worker_factory=None,
+            baseline_worker_factory=None,
             candidate_root=root,
             candidate_worker_factory=worker_factory,
             scenario_ids=scenario_ids,
@@ -353,7 +436,7 @@ class PitPanelEvaluatorV5:
         *,
         panel: EvaluationPanelSpec,
         policy_revision: PolicyRevisionIdentityV5,
-        worker_factory: StrategyPolicyClientFactoryV3 | None,
+        baseline_worker_factory: BaselineWorkerFactoryV5 | None,
         candidate_root: Path | None = None,
         candidate_worker_factory: CandidateWorkerFactoryV5 | None = None,
         scenario_ids: tuple[str, ...],
@@ -370,10 +453,10 @@ class PitPanelEvaluatorV5:
         ):
             raise ValueError("evaluation policy revision changes trusted policy authority")
         policy_identity_sha256 = policy_revision.sha256
-        if (worker_factory is None) == (candidate_worker_factory is None):
+        if (baseline_worker_factory is None) == (candidate_worker_factory is None):
             raise TypeError("evaluation requires exactly one worker factory kind")
-        if worker_factory is not None and not callable(worker_factory):
-            raise TypeError("policy worker factory is invalid")
+        if baseline_worker_factory is not None and not callable(baseline_worker_factory):
+            raise TypeError("baseline policy worker factory is invalid")
         if candidate_worker_factory is not None and not callable(candidate_worker_factory):
             raise TypeError("candidate worker factory is invalid")
         if (candidate_root is None) is not (candidate_worker_factory is None):
@@ -387,8 +470,15 @@ class PitPanelEvaluatorV5:
         scenario_evidence: list[ScenarioPanelEvaluationV5] = []
         for scenario in scenarios:
             candidate_binding: CandidateWorkerBindingV5 | None = None
-            scenario_worker_factory = worker_factory
-            if candidate_worker_factory is not None:
+            scenario_worker_factory: StrategyPolicyClientFactoryV3
+            if baseline_worker_factory is not None:
+                baseline_client = _bind_baseline_worker_v5(
+                    baseline_worker_factory,
+                    policy_revision,
+                )
+                scenario_worker_factory = lambda client=baseline_client: client
+            else:
+                assert candidate_worker_factory is not None
                 assert candidate_root is not None
                 binding = candidate_worker_factory(
                     candidate_root=candidate_root,
@@ -403,7 +493,6 @@ class PitPanelEvaluatorV5:
                         raise ValueError("candidate worker binding differs from the request")
                 candidate_binding = binding
                 scenario_worker_factory = lambda binding=binding: binding.client
-            assert scenario_worker_factory is not None
             single_worker = _SingleUseWorkerFactory(scenario_worker_factory, allocated_workers)
             simulator = self._simulator_factory(
                 pit_bundle=self._pit_bundle,
@@ -528,6 +617,8 @@ class PitPanelEvaluatorV5:
 
 __all__ = [
     "AuthenticatedPitBundleV5",
+    "BaselineWorkerBindingV5",
+    "BaselineWorkerFactoryV5",
     "CandidateWorkerBindingV5",
     "CandidateWorkerFactoryV5",
     "EvaluationReportBuilderV5",

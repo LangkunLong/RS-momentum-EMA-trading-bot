@@ -49,6 +49,8 @@ from .contracts import (
 )
 from .evaluator import (
     AuthenticatedPitBundleV5,
+    BaselineWorkerBindingV5,
+    BaselineWorkerFactoryV5,
     CandidateWorkerBindingV5,
     CandidateWorkerFactoryV5,
     EvaluationReportBuilderV5,
@@ -68,6 +70,8 @@ __all__ = [
     "ArtifactRefV5",
     "AuthenticatedPitBundleV5",
     "AuthenticatedArtifactV5",
+    "BaselineWorkerBindingV5",
+    "BaselineWorkerFactoryV5",
     "CampaignEvidenceV5",
     "CampaignManifestV5",
     "CampaignPanelPlanV5",

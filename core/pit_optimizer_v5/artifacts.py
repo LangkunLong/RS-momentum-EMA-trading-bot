@@ -831,9 +831,6 @@ class LocalArtifactRepositoryV5:
 
     def append_round_payload(self, payload: RoundEventPayloadV5) -> ArtifactRefV5:
         kind = event_kind_for_payload_v5(payload)
-        if isinstance(payload, RoundOutcomePayloadV5):
-            for reference in payload.artifact_refs:
-                self.authenticate(reference)
         primitive = round_event_payload_primitive_v5(payload)
         digest = hashlib.sha256(canonical_json_bytes_v5(primitive)).hexdigest()
         return self._create_only(f"payloads/{kind}/{digest}.json", primitive)
@@ -844,9 +841,6 @@ class LocalArtifactRepositoryV5:
         try:
             primitive = _strict_json_object(authenticated.content, reference)
             payload = _decode_round_payload(expected_kind, primitive)
-            if isinstance(payload, RoundOutcomePayloadV5):
-                for child_reference in payload.artifact_refs:
-                    self.authenticate(child_reference)
         except ArtifactRepositoryFailureV5:
             raise
         except (TypeError, ValueError, ArithmeticError):
