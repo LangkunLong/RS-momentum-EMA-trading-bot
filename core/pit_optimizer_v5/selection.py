@@ -211,6 +211,18 @@ def _quick_cagr_pct(
     return recomputed
 
 
+def _validate_quick_authorities_v5(
+    *,
+    panel_plan: CampaignPanelPlanV5,
+    evaluator_contract: EvaluatorContractV5,
+) -> None:
+    if (
+        panel_plan.pit_bundle_ref.sha256 != evaluator_contract.pit_bundle_sha256
+        or panel_plan.prices_provenance_ref.sha256 != evaluator_contract.prices_provenance_sha256
+    ):
+        raise QuickEvidenceMismatchV5()
+
+
 def _deduplicate_quick_candidates(
     candidates: tuple[QuickScreenCandidateV5, ...],
 ) -> tuple[QuickScreenCandidateV5, ...]:
@@ -238,15 +250,13 @@ def _deduplicate_quick_candidates(
     return tuple(by_fingerprint.values())
 
 
-def select_discovery_survivors_v5(
+def _select_discovery_survivors_v5(
     *,
     candidates: tuple[QuickScreenCandidateV5, ...],
     maximum: int,
     panel_plan: CampaignPanelPlanV5,
     evaluator_contract: EvaluatorContractV5,
 ) -> tuple[QuickScreenCandidateV5, ...]:
-    """Select the default then highest base-scenario quick CAGR, without a score blend."""
-
     _positive_count(maximum, "discovery survivor maximum")
     if (
         type(candidates) is not tuple
@@ -255,6 +265,10 @@ def select_discovery_survivors_v5(
         or type(evaluator_contract) is not EvaluatorContractV5
     ):
         raise ValueError("quick survivor inputs are invalid")
+    _validate_quick_authorities_v5(
+        panel_plan=panel_plan,
+        evaluator_contract=evaluator_contract,
+    )
     eligible = tuple(item for item in candidates if item.is_eligible)
     if not eligible:
         return ()
@@ -297,9 +311,11 @@ def select_manifest_discovery_survivors_v5(
     panel_plan: CampaignPanelPlanV5,
     evaluator_contract: EvaluatorContractV5,
 ) -> tuple[QuickScreenCandidateV5, ...]:
+    """Select manifest-bounded quick survivors under one authenticated authority."""
+
     if type(capabilities) is not SearchCapabilitiesV5:
         raise ValueError("search capabilities are invalid")
-    return select_discovery_survivors_v5(
+    return _select_discovery_survivors_v5(
         candidates=candidates,
         maximum=capabilities.max_discovery_survivors_per_template,
         panel_plan=panel_plan,
@@ -724,7 +740,6 @@ __all__ = [
     "parent_schedule_v5",
     "record_novelty_attempt_v5",
     "reported_champion_v5",
-    "select_discovery_survivors_v5",
     "select_manifest_discovery_survivors_v5",
     "select_novel_hypothesis_v5",
     "select_parent_v5",
