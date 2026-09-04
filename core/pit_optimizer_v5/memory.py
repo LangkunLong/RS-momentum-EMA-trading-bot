@@ -66,6 +66,16 @@ _STATUSES = frozenset(
         "evaluated",
     }
 )
+_TESTABLE_STATUSES = frozenset(
+    {
+        "zero_trade",
+        "quick_rejected",
+        "timed_out",
+        "cancelled",
+        "evaluation_failed",
+        "evaluated",
+    }
+)
 _EVENT_KINDS = frozenset(
     {
         "round_intent",
@@ -82,6 +92,14 @@ def _digest(value: object, label: str) -> str:
     if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError(f"{label} must be a lowercase SHA-256 digest")
     return value
+
+
+def is_testable_experiment_status_v5(status: ExperimentStatusV5) -> bool:
+    """Return whether a final status belongs in the complete critic batch."""
+
+    if type(status) is not str or status not in _STATUSES:
+        raise ValueError("experiment status is invalid")
+    return status in _TESTABLE_STATUSES
 
 
 def _text(value: object, label: str) -> str:
@@ -238,6 +256,11 @@ class ExperimentRecordV5:
         _ordered_unique_refs(self.artifact_refs, "experiment artifact references")
         if self.critic_artifact_ref is not None and type(self.critic_artifact_ref) is not ArtifactRefV5:
             raise ValueError("experiment critic artifact reference is invalid")
+        if is_testable_experiment_status_v5(self.status):
+            if self.critic_review is None or self.critic_artifact_ref is None:
+                raise ValueError("testable experiment requires its complete critic binding")
+        elif self.critic_review is not None or self.critic_artifact_ref is not None:
+            raise ValueError("untestable experiment cannot carry critic fields")
 
         if self.experiment_id != self.experiment_identity.sha256:
             raise ValueError("experiment ID differs from its identity")
@@ -855,6 +878,11 @@ class ExperimentFeedbackV5:
             raise ValueError("complete feedback critic review is invalid")
         if (self.critic_review is None) != (self.critic_artifact_ref is None):
             raise ValueError("complete feedback critic bindings differ")
+        if is_testable_experiment_status_v5(self.status):
+            if self.critic_review is None:
+                raise ValueError("testable complete feedback requires critic fields")
+        elif self.critic_review is not None:
+            raise ValueError("untestable complete feedback cannot carry critic fields")
 
     @classmethod
     def from_stored(cls, stored: StoredExperimentRecordV5) -> "ExperimentFeedbackV5":
@@ -918,6 +946,8 @@ class ExperimentMemorySummaryV5:
         _optional_decimal(self.target_gap_pct, "memory summary target gap")
         if self.critic_review_sha256 is not None:
             _digest(self.critic_review_sha256, "memory summary critic review")
+        if is_testable_experiment_status_v5(self.status) != (self.critic_review_sha256 is not None):
+            raise ValueError("memory summary critic digest differs from status testability")
 
     @classmethod
     def from_stored(cls, stored: StoredExperimentRecordV5) -> "ExperimentMemorySummaryV5":
@@ -976,38 +1006,94 @@ class ProjectionBudgetTooSmallV5(ValueError):
     """The mandatory selected-parent lineage cannot fit the declared role budget."""
 
 
+ProjectionLineageAmbiguityCodeV5 = Literal[
+    "conflicting_parent_lineage",
+    "conflicting_policy_identity",
+    "lineage_cycle",
+]
+
+
+class ProjectionLineageAmbiguityV5(ValueError):
+    """Selected-revision ancestry has no single authenticated interpretation."""
+
+    def __init__(self, code: ProjectionLineageAmbiguityCodeV5, revision_sha256: str) -> None:
+        if code not in {
+            "conflicting_parent_lineage",
+            "conflicting_policy_identity",
+            "lineage_cycle",
+        }:
+            raise ValueError("projection lineage ambiguity code is invalid")
+        self.code = code
+        self.revision_sha256 = _digest(revision_sha256, "ambiguous lineage revision")
+        super().__init__(f"selected-parent lineage is ambiguous: {code}")
+
+
+class ProjectionLineageAuthorityV5(ValueError):
+    """Selected-parent record is absent from or inconsistent with checkpoint authority."""
+
+
 def _selected_parent_lineage_ids(
     stored_records: tuple[StoredExperimentRecordV5, ...],
     selected_parent_revision_sha256: str,
+    selected_parent_experiment_id: str,
 ) -> tuple[str, ...]:
-    by_revision = {
-        item.record.policy_revision.sha256: item
-        for item in stored_records
-        if item.record.policy_revision is not None
-        and item.record.policy_revision.sha256 != item.record.parent_revision_sha256
-    }
-    lineage: list[str] = []
-    seen: set[str] = set()
+    by_revision: dict[str, list[StoredExperimentRecordV5]] = {}
+    for item in stored_records:
+        policy_revision = item.record.policy_revision
+        if policy_revision is not None:
+            by_revision.setdefault(policy_revision.sha256, []).append(item)
+
+    lineage_groups: list[tuple[StoredExperimentRecordV5, ...]] = []
+    seen_revisions: set[str] = set()
     revision = selected_parent_revision_sha256
     while revision in by_revision:
-        stored = by_revision[revision]
-        if stored.record.experiment_id in seen:
-            raise ValueError("selected-parent lineage contains a cycle")
-        seen.add(stored.record.experiment_id)
-        lineage.append(stored.record.experiment_id)
-        revision = stored.record.parent_revision_sha256
-    lineage.reverse()
-    return tuple(lineage)
+        if revision in seen_revisions:
+            raise ProjectionLineageAmbiguityV5("lineage_cycle", revision)
+        seen_revisions.add(revision)
+        revision_records = tuple(by_revision[revision])
+        producer_records = tuple(
+            item
+            for item in revision_records
+            if item.record.status != "exact_duplicate"
+            and item.record.policy_revision is not None
+            and item.record.policy_revision.sha256 != item.record.parent_revision_sha256
+        )
+        if not producer_records:
+            break
+
+        expected_identity = producer_records[0].record.policy_revision
+        if any(item.record.policy_revision != expected_identity for item in producer_records[1:]):
+            raise ProjectionLineageAmbiguityV5("conflicting_policy_identity", revision)
+        parents = {item.record.parent_revision_sha256 for item in producer_records}
+        if len(parents) != 1:
+            raise ProjectionLineageAmbiguityV5("conflicting_parent_lineage", revision)
+
+        # A terminal evaluated record can anchor an archive-selected revision. Other
+        # attempts on the same bytes remain complete feedback, but cannot advance
+        # ancestry on their own.
+        if not any(item.record.status == "evaluated" for item in producer_records):
+            break
+        if not lineage_groups and all(
+            item.record.experiment_id != selected_parent_experiment_id for item in producer_records
+        ):
+            raise ProjectionLineageAuthorityV5("selected-parent record is not a producer of its revision")
+        lineage_groups.append(
+            tuple(sorted(revision_records, key=lambda item: (item.record.round_index, item.record.experiment_id)))
+        )
+        revision = next(iter(parents))
+
+    return tuple(item.record.experiment_id for group in reversed(lineage_groups) for item in group)
 
 
 def project_investigator_memory_v5(
     *,
     stored_records: tuple[StoredExperimentRecordV5, ...],
     selected_parent_revision_sha256: str,
+    selected_parent_record_ref: ArtifactRefV5 | None,
     relevant_mechanism: str,
     maximum_bytes: int,
 ) -> InvestigatorMemoryProjectionV5:
-    """Build a deterministic bounded view without truncating durable feedback."""
+    """Build a bounded view from checkpoint-authorized records without truncating feedback."""
 
     if type(stored_records) is not tuple or any(type(item) is not StoredExperimentRecordV5 for item in stored_records):
         raise ValueError("projection stored records are invalid")
@@ -1020,8 +1106,30 @@ def project_investigator_memory_v5(
     canonical_records = tuple(
         sorted(stored_records, key=lambda item: (item.record.round_index, item.record.experiment_id))
     )
-    lineage_ids = set(_selected_parent_lineage_ids(canonical_records, selected_parent_revision_sha256))
-    lineage = tuple(item for item in canonical_records if item.record.experiment_id in lineage_ids)
+    if selected_parent_record_ref is None:
+        lineage_id_order: tuple[str, ...] = ()
+    else:
+        if type(selected_parent_record_ref) is not ArtifactRefV5:
+            raise ValueError("projection selected-parent record reference is invalid")
+        authoritative = tuple(item for item in canonical_records if item.reference == selected_parent_record_ref)
+        if len(authoritative) != 1:
+            raise ProjectionLineageAuthorityV5("selected-parent record is not checkpoint-authorized")
+        selected_record = authoritative[0].record
+        if (
+            selected_record.status != "evaluated"
+            or selected_record.policy_revision is None
+            or selected_record.policy_revision.sha256 != selected_parent_revision_sha256
+            or selected_record.policy_revision.sha256 == selected_record.parent_revision_sha256
+        ):
+            raise ProjectionLineageAuthorityV5("selected-parent record does not bind an evaluated revision")
+        lineage_id_order = _selected_parent_lineage_ids(
+            canonical_records,
+            selected_parent_revision_sha256,
+            selected_record.experiment_id,
+        )
+    lineage_ids = set(lineage_id_order)
+    records_by_id = {item.record.experiment_id: item for item in canonical_records}
+    lineage = tuple(records_by_id[experiment_id] for experiment_id in lineage_id_order)
     relevant = tuple(
         item
         for item in canonical_records
@@ -1076,6 +1184,9 @@ __all__ = [
     "ExperimentStatusV5",
     "InvestigatorMemoryProjectionV5",
     "ProjectionBudgetTooSmallV5",
+    "ProjectionLineageAmbiguityCodeV5",
+    "ProjectionLineageAmbiguityV5",
+    "ProjectionLineageAuthorityV5",
     "QuickEvidencePayloadV5",
     "RecoveryStepV5",
     "RenderedVariantPayloadV5",
@@ -1088,6 +1199,7 @@ __all__ = [
     "StoredExperimentRecordV5",
     "event_kind_for_payload_v5",
     "fold_round_events_v5",
+    "is_testable_experiment_status_v5",
     "project_investigator_memory_v5",
     "reduce_experiment_journal_v5",
     "round_event_payload_primitive_v5",

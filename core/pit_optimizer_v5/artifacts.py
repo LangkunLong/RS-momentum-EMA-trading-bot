@@ -64,6 +64,7 @@ from core.pit_optimizer_v5.memory import (
     StoredExperimentRecordV5,
     event_kind_for_payload_v5,
     fold_round_events_v5,
+    is_testable_experiment_status_v5,
     reduce_experiment_journal_v5,
     round_event_payload_primitive_v5,
 )
@@ -928,6 +929,8 @@ class LocalArtifactRepositoryV5:
         return reference
 
     def load_critic(self, reference: ArtifactRefV5) -> CriticArtifactV5:
+        if reference.relative_path != f"critics/{reference.sha256}.json":
+            raise ArtifactSchemaFailureV5(reference)
         authenticated = self.authenticate(reference)
         try:
             primitive = _strict_json_object(authenticated.content, reference)
@@ -940,18 +943,35 @@ class LocalArtifactRepositoryV5:
             raise ArtifactNonCanonicalV5(reference)
         return artifact
 
+    def _validate_experiment_critic_binding(
+        self,
+        record: ExperimentRecordV5,
+        *,
+        record_reference: ArtifactRefV5 | None = None,
+    ) -> None:
+        testable = is_testable_experiment_status_v5(record.status)
+        complete_pair = record.critic_review is not None and record.critic_artifact_ref is not None
+        absent_pair = record.critic_review is None and record.critic_artifact_ref is None
+        if (testable and not complete_pair) or (not testable and not absent_pair):
+            if record_reference is not None:
+                raise ArtifactSchemaFailureV5(record_reference)
+            raise ValueError("experiment critic binding differs from status testability")
+        if not testable:
+            return
+        assert record.critic_artifact_ref is not None
+        artifact = self.load_critic(record.critic_artifact_ref)
+        matches = tuple(review for review in artifact.reviews if review.experiment_id == record.experiment_id)
+        if matches != (record.critic_review,):
+            if record_reference is not None:
+                raise ArtifactSchemaFailureV5(record_reference)
+            raise ValueError("experiment review differs from its full critic artifact")
+
     def append_experiment(self, record: ExperimentRecordV5) -> ArtifactRefV5:
         if type(record) is not ExperimentRecordV5:
             raise ValueError("experiment record must use the V5 schema")
         for reference in record.artifact_refs:
             self.authenticate(reference)
-        if (record.critic_review is None) != (record.critic_artifact_ref is None):
-            raise ValueError("experiment review and critic artifact reference must coexist")
-        if record.critic_artifact_ref is not None:
-            artifact = self.load_critic(record.critic_artifact_ref)
-            matches = tuple(review for review in artifact.reviews if review.experiment_id == record.experiment_id)
-            if matches != (record.critic_review,):
-                raise ValueError("experiment review differs from its full critic artifact")
+        self._validate_experiment_critic_binding(record)
         path = f"records/{record.experiment_id}.json"
         reference = self._create_only(path, record.to_primitive())
         if reference.sha256 != record.sha256:
@@ -969,11 +989,7 @@ class LocalArtifactRepositoryV5:
             raise ArtifactSchemaFailureV5(reference) from None
         if record.canonical_json_bytes() != authenticated.content or record.sha256 != reference.sha256:
             raise ArtifactNonCanonicalV5(reference)
-        if record.critic_artifact_ref is not None:
-            artifact = self.load_critic(record.critic_artifact_ref)
-            matches = tuple(review for review in artifact.reviews if review.experiment_id == record.experiment_id)
-            if matches != (record.critic_review,):
-                raise ArtifactSchemaFailureV5(reference)
+        self._validate_experiment_critic_binding(record, record_reference=reference)
         return record
 
     def load_experiment_journal(self) -> tuple[StoredExperimentRecordV5, ...]:
@@ -1001,6 +1017,23 @@ class LocalArtifactRepositoryV5:
         )
         if tuple(item.reference for item in stored) != references:
             raise ValueError("record reference order changed")
+        by_round: dict[int, list[StoredExperimentRecordV5]] = {}
+        for item in stored:
+            by_round.setdefault(item.record.round_index, []).append(item)
+        for round_records in by_round.values():
+            testable = tuple(item for item in round_records if is_testable_experiment_status_v5(item.record.status))
+            if not testable:
+                continue
+            critic_refs = {item.record.critic_artifact_ref for item in testable}
+            if len(critic_refs) != 1 or None in critic_refs:
+                raise ArtifactSchemaFailureV5(testable[0].reference)
+            critic_ref = next(iter(critic_refs))
+            assert critic_ref is not None
+            artifact = self.load_critic(critic_ref)
+            expected_ids = {item.record.experiment_id for item in testable}
+            actual_ids = {review.experiment_id for review in artifact.reviews}
+            if actual_ids != expected_ids:
+                raise ArtifactSchemaFailureV5(critic_ref)
         return stored
 
     def publish_projection(

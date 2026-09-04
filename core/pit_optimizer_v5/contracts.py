@@ -21,6 +21,17 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _EVIDENCE_ID_RE = re.compile(r"v5\.[a-z0-9_.-]{1,120}")
 _SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_ARTIFACT_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_WINDOWS_RESERVED_ARTIFACT_COMPONENTS = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
 _TARGET_QUANTUM_V5 = Decimal("0.01")
 ARTIFACT_ROOT_V5 = ".artifacts/pit-optimizer-v5"
 MAX_ROLE_EVIDENCE_ITEMS_V5 = 96
@@ -300,13 +311,20 @@ class ArtifactRefV5:
     def __post_init__(self) -> None:
         path = _text(self.relative_path, "artifact relative path")
         pure = PurePosixPath(path)
+        unsafe_component = any(
+            _ARTIFACT_COMPONENT_RE.fullmatch(part) is None
+            or part.endswith((".", " "))
+            or ":" in part
+            or part.split(".", 1)[0].upper() in _WINDOWS_RESERVED_ARTIFACT_COMPONENTS
+            for part in pure.parts
+        )
         if (
             "\\" in path
             or pure.is_absolute()
             or not pure.parts
             or pure.as_posix() != path
             or any(part in {"", ".", ".."} for part in pure.parts)
-            or ":" in pure.parts[0]
+            or unsafe_component
         ):
             raise ValueError("artifact path must be canonical POSIX beneath the V5 root")
         _digest(self.sha256, "artifact SHA-256")
