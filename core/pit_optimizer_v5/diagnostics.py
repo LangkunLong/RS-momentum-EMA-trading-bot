@@ -402,8 +402,7 @@ def _validate_episode_quantity_path(
     previous_session_position = -1
     cumulative_quantity = Decimal(0)
     add_on_count = 0
-    bought_execution_value = Decimal(0)
-    bought_quantity = Decimal(0)
+    remaining_entry_price: Decimal | None = None
     for index, (row, change) in enumerate(zip(rows, path, strict=True)):
         session = str(row["Date"])
         session_position = session_positions.get(session)
@@ -428,13 +427,20 @@ def _validate_episode_quantity_path(
         quantity = _d(row["Quantity"], "episode transition quantity", positive=True)
         if action == "BUY":
             expected_action = "entry" if index == 0 else "add_on"
-            cumulative_quantity += quantity
-            bought_quantity += quantity
-            bought_execution_value += quantity * _d(
+            execution_price = _d(
                 row["ExecutionPrice"],
                 "episode buy execution price",
                 positive=True,
             )
+            remaining_value = (
+                Decimal(0)
+                if remaining_entry_price is None
+                else remaining_entry_price * cumulative_quantity
+            )
+            cumulative_quantity += quantity
+            remaining_entry_price = (
+                remaining_value + quantity * execution_price
+            ) / cumulative_quantity
             if expected_action == "add_on":
                 add_on_count += 1
         elif action == "SELL":
@@ -462,11 +468,11 @@ def _validate_episode_quantity_path(
 
     first = rows[0]
     last = rows[-1]
-    weighted_entry_price = bought_execution_value / bought_quantity
     if (
         str(first["Action"]) != "BUY"
         or str(last["Action"]) != "SELL"
         or _q(cumulative_quantity) != 0
+        or remaining_entry_price is None
         or add_on_count != episode.add_on_count
         or episode.entry_session != str(first["Date"])
         or episode.exit_session != str(last["Date"])
@@ -475,7 +481,7 @@ def _validate_episode_quantity_path(
         or episode.exit_reason != str(last["Reason"])
         or not math.isclose(
             episode.entry_price,
-            float(weighted_entry_price),
+            float(remaining_entry_price),
             rel_tol=0.0,
             abs_tol=1e-10,
         )

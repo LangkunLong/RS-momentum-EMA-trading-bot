@@ -5323,24 +5323,11 @@ class PortfolioSimulator:
             if -fill.cash_delta > self._equity + 1e-8:
                 self._add_on_outcomes["cash"] += 1
                 continue
-            prior_buy_rows = [
-                row
-                for row in self._fill_rows
-                if row.get("EpisodeId") == state.episode_id
-                and row.get("Action") == "BUY"
-            ]
-            acquired_quantity = sum(
-                float(row["Quantity"]) for row in prior_buy_rows
-            )
-            acquired_value = sum(
-                float(row["ExecutionPrice"]) * float(row["Quantity"])
-                for row in prior_buy_rows
-            )
             old_stop = trade.stop_price
             new_quantity = current_qty + quantity
             weighted_entry = (
-                acquired_value + fill.execution_price * quantity
-            ) / (acquired_quantity + quantity)
+                trade.entry_price * current_qty + fill.execution_price * quantity
+            ) / new_quantity
             trade.entry_price = weighted_entry
             trade.qty = new_quantity
             trade.remaining_qty = new_quantity
