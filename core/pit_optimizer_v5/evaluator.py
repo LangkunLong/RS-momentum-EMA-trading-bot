@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -62,6 +65,55 @@ class AuthenticatedPitBundleV5(Protocol):
     ) -> PriceIdentityTransitionContract: ...
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateWorkerBindingV5:
+    """Trusted binding between one candidate source tree and one worker."""
+
+    candidate_root: Path
+    policy_identity_sha256: str
+    client: StrategyPolicyClient
+
+    def __post_init__(self) -> None:
+        root = _canonical_candidate_root(self.candidate_root)
+        if type(self.candidate_root) is not type(root) or self.candidate_root != root:
+            raise ValueError("candidate worker root is not canonical")
+        _require_digest(self.policy_identity_sha256, "candidate worker policy identity")
+        if not _is_policy_client(self.client):
+            raise TypeError("candidate worker binding contains an invalid client")
+
+    @property
+    def candidate_root_sha256(self) -> str:
+        return hashlib.sha256(self.candidate_root.as_posix().encode("utf-8")).hexdigest()
+
+    @property
+    def sha256(self) -> str:
+        payload = json.dumps(
+            {
+                "candidate_root_sha256": self.candidate_root_sha256,
+                "policy_identity_sha256": self.policy_identity_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def result_provenance(self) -> dict[str, str]:
+        return {
+            "candidate_root_sha256": self.candidate_root_sha256,
+            "policy_identity_sha256": self.policy_identity_sha256,
+            "binding_sha256": self.sha256,
+        }
+
+
+class CandidateWorkerFactoryV5(Protocol):
+    """Authenticate candidate source and create a worker bound to that source."""
+
+    def __call__(
+        self, *, candidate_root: Path, policy_identity_sha256: str
+    ) -> CandidateWorkerBindingV5: ...
+
+
 class _SingleUseWorkerFactory:
     """Make worker allocation observable and reject object reuse across scenarios."""
 
@@ -105,6 +157,18 @@ def _is_policy_client(value: object) -> bool:
             )
         )
     )
+
+
+def _canonical_candidate_root(value: object) -> Path:
+    if type(value) is not Path and not isinstance(value, Path):
+        raise ValueError("candidate root must be a Path")
+    root = Path(value)
+    if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+        raise ValueError("candidate root must be an absolute non-link directory")
+    try:
+        return root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("candidate root cannot be resolved") from exc
 
 
 def _decimal_number(value: object, label: str, *, positive: bool = False) -> Decimal:
@@ -254,16 +318,18 @@ class PitPanelEvaluatorV5:
         candidate_root: Path,
         panel: EvaluationPanelSpec,
         policy_identity_sha256: str,
-        worker_factory: StrategyPolicyClientFactory,
+        worker_factory: CandidateWorkerFactoryV5,
         scenario_ids: tuple[str, ...],
     ) -> PanelEvaluationV5:
-        root = Path(candidate_root)
-        if not root.is_absolute() or not root.is_dir() or root.is_symlink():
-            raise ValueError("candidate root must be an absolute non-link directory")
+        root = _canonical_candidate_root(candidate_root)
+        if Path(candidate_root) != root:
+            raise ValueError("candidate root must be supplied in canonical form")
         return self._evaluate(
             panel=panel,
             policy_identity_sha256=policy_identity_sha256,
-            worker_factory=worker_factory,
+            worker_factory=None,
+            candidate_root=root,
+            candidate_worker_factory=worker_factory,
             scenario_ids=scenario_ids,
         )
 
@@ -272,14 +338,24 @@ class PitPanelEvaluatorV5:
         *,
         panel: EvaluationPanelSpec,
         policy_identity_sha256: str,
-        worker_factory: StrategyPolicyClientFactory,
+        worker_factory: StrategyPolicyClientFactory | None,
+        candidate_root: Path | None = None,
+        candidate_worker_factory: CandidateWorkerFactoryV5 | None = None,
         scenario_ids: tuple[str, ...],
     ) -> PanelEvaluationV5:
         if type(panel) is not EvaluationPanelSpec:
             raise ValueError("evaluation panel must use the authenticated panel schema")
         _require_digest(policy_identity_sha256, "policy identity")
-        if not callable(worker_factory):
+        if (worker_factory is None) == (candidate_worker_factory is None):
+            raise TypeError("evaluation requires exactly one worker factory kind")
+        if worker_factory is not None and not callable(worker_factory):
             raise TypeError("policy worker factory is invalid")
+        if candidate_worker_factory is not None and not callable(
+            candidate_worker_factory
+        ):
+            raise TypeError("candidate worker factory is invalid")
+        if (candidate_root is None) is not (candidate_worker_factory is None):
+            raise ValueError("candidate worker construction is incompletely bound")
         scenarios = self._requested_scenarios(scenario_ids)
         panel_start = date.fromisoformat(panel.start_date)
         if date.fromisoformat(self._warmup_start) > panel_start:
@@ -288,7 +364,30 @@ class PitPanelEvaluatorV5:
         allocated_workers: list[StrategyPolicyClient] = []
         scenario_evidence: list[ScenarioPanelEvaluationV5] = []
         for scenario in scenarios:
-            single_worker = _SingleUseWorkerFactory(worker_factory, allocated_workers)
+            candidate_binding: CandidateWorkerBindingV5 | None = None
+            scenario_worker_factory = worker_factory
+            if candidate_worker_factory is not None:
+                assert candidate_root is not None
+                binding = candidate_worker_factory(
+                    candidate_root=candidate_root,
+                    policy_identity_sha256=policy_identity_sha256,
+                )
+                if type(binding) is not CandidateWorkerBindingV5:
+                    raise TypeError("candidate worker factory returned an invalid binding")
+                if (
+                    binding.candidate_root != candidate_root
+                    or binding.policy_identity_sha256 != policy_identity_sha256
+                ):
+                    try:
+                        binding.client.close()
+                    finally:
+                        raise ValueError("candidate worker binding differs from the request")
+                candidate_binding = binding
+                scenario_worker_factory = lambda binding=binding: binding.client
+            assert scenario_worker_factory is not None
+            single_worker = _SingleUseWorkerFactory(
+                scenario_worker_factory, allocated_workers
+            )
             simulator = self._simulator_factory(
                 pit_bundle=self._pit_bundle,
                 benchmark_symbol=self._contract.benchmark,
@@ -309,7 +408,13 @@ class PitPanelEvaluatorV5:
             )
             if single_worker.calls != 1:
                 raise ValueError("V5 simulation did not allocate exactly one policy worker")
-            self._validate_result(result, panel=panel, scenario=scenario)
+            self._bind_candidate_result(result, candidate_binding)
+            self._validate_result(
+                result,
+                panel=panel,
+                scenario=scenario,
+                candidate_binding=candidate_binding,
+            )
             report = self._report_builder(
                 panel=panel,
                 scenario=scenario,
@@ -372,6 +477,7 @@ class PitPanelEvaluatorV5:
         *,
         panel: EvaluationPanelSpec,
         scenario: FrictionScenario,
+        candidate_binding: CandidateWorkerBindingV5 | None,
     ) -> None:
         if type(result) is not SimulationResultV5:
             raise ValueError("simulator returned non-V5 aggregate evidence")
@@ -388,9 +494,35 @@ class PitPanelEvaluatorV5:
         }
         if any(config.get(key) != value for key, value in expected.items()):
             raise ValueError("V5 simulation result identity differs from evaluator inputs")
+        expected_binding = (
+            None
+            if candidate_binding is None
+            else candidate_binding.result_provenance()
+        )
+        if config.get("candidate_worker_binding") != expected_binding:
+            raise ValueError("V5 result candidate worker provenance differs")
         if result.benchmark_symbol != self._contract.benchmark:
             raise ValueError("V5 simulation benchmark identity differs")
         _equity_endpoints(result)
+
+    @staticmethod
+    def _bind_candidate_result(
+        result: object, binding: CandidateWorkerBindingV5 | None
+    ) -> None:
+        if type(result) is not SimulationResultV5:
+            return
+        config = result.config
+        if not isinstance(config, Mapping):
+            return
+        expected = None if binding is None else binding.result_provenance()
+        existing = config.get("candidate_worker_binding")
+        if existing is not None and existing != expected:
+            raise ValueError("simulator emitted conflicting candidate worker provenance")
+        result.config = dict(config)
+        if expected is None:
+            result.config.pop("candidate_worker_binding", None)
+        else:
+            result.config["candidate_worker_binding"] = expected
 
 
 def _require_digest(value: object, label: str) -> str:
@@ -405,6 +537,8 @@ def _require_digest(value: object, label: str) -> str:
 
 __all__ = [
     "AuthenticatedPitBundleV5",
+    "CandidateWorkerBindingV5",
+    "CandidateWorkerFactoryV5",
     "EvaluationReportBuilderV5",
     "PitPanelEvaluatorV5",
     "SimulationRunnerV5",

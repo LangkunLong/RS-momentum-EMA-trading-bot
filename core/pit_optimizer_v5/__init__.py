@@ -22,6 +22,8 @@ from .contracts import (
 )
 from .evaluator import (
     AuthenticatedPitBundleV5,
+    CandidateWorkerBindingV5,
+    CandidateWorkerFactoryV5,
     EvaluationReportBuilderV5,
     PitPanelEvaluatorV5,
     SimulationRunnerV5,
@@ -30,6 +32,8 @@ from .evaluator import (
 
 __all__ = [
     "AuthenticatedPitBundleV5",
+    "CandidateWorkerBindingV5",
+    "CandidateWorkerFactoryV5",
     "DistributionSummaryV5",
     "EVALUATOR_SOURCE_PATHS_V5",
     "EvaluationReportBuilderV5",
