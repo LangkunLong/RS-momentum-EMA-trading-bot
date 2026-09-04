@@ -199,6 +199,15 @@ def _validated_context(
         raise ValueError("market reference symbols must not enter the active PIT union")
     if require_active and symbol not in active_symbols:
         raise ValueError("entry feature symbol is not active in the PIT union")
+    if not require_active:
+        lineage_id = bundle.security_lineage_id(symbol)
+        resolved_symbol = bundle.membership_v3.ticker_for_lineage_at(
+            lineage_id, session
+        )
+        if resolved_symbol != symbol:
+            raise ValueError(
+                "holding feature symbol is not the active authenticated price identity"
+            )
     validated_rs = finite_rs_snapshot(rs_snapshot, required_symbols=active_symbols)
     return symbol, active_symbols, validated_rs
 
@@ -226,21 +235,34 @@ def _validated_price_history(price_history: pd.DataFrame, session: date) -> pd.D
         if column not in history.columns:
             continue
         for value in history[column].array:
-            _required_number(value, field=f"price_history {column}")
-    for column in ("Open", "High", "Low", "Close"):
-        if column in history.columns and (history[column].astype(float) <= 0).any():
-            raise ValueError("price_history OHLC values must be positive")
-    if "Volume" in history.columns and (history["Volume"].astype(float) < 0).any():
-        raise ValueError("price_history volume must be nonnegative")
+            number = _optional_number(value, field=f"price_history {column}")
+            if number is None:
+                continue
+            if column in {"Open", "High", "Low", "Close"} and number <= 0:
+                raise ValueError("price_history OHLC values must be positive")
+            if column == "Volume" and number < 0:
+                raise ValueError("price_history volume must be nonnegative")
     if {"Open", "High", "Low", "Close"}.issubset(history.columns):
-        high = history["High"].astype(float)
-        low = history["Low"].astype(float)
-        if (high < history[["Open", "Close"]].astype(float).max(axis=1)).any():
-            raise ValueError("price_history high does not contain open/close")
-        if (low > history[["Open", "Close"]].astype(float).min(axis=1)).any():
-            raise ValueError("price_history low does not contain open/close")
-        if (high < low).any():
-            raise ValueError("price_history high is below low")
+        for row in history[["Open", "High", "Low", "Close"]].itertuples(
+            index=False, name=None
+        ):
+            open_price, high, low, close = (
+                _optional_number(value, field="price_history OHLC") for value in row
+            )
+            if high is not None and low is not None and high < low:
+                raise ValueError("price_history high is below low")
+            if high is not None:
+                observed = tuple(
+                    value for value in (open_price, close) if value is not None
+                )
+                if observed and high < max(observed):
+                    raise ValueError("price_history high does not contain open/close")
+            if low is not None:
+                observed = tuple(
+                    value for value in (open_price, close) if value is not None
+                )
+                if observed and low > min(observed):
+                    raise ValueError("price_history low does not contain open/close")
     return history
 
 
@@ -253,15 +275,19 @@ def _atr_20_fraction(history: pd.DataFrame) -> float | None:
         return None
     if not {"High", "Low", "Close"}.issubset(history.columns):
         return None
-    high = history["High"].astype(float)
-    low = history["Low"].astype(float)
-    close = history["Close"].astype(float)
-    prior_close = close.shift(1)
-    true_range = pd.concat(
-        (high - low, (high - prior_close).abs(), (low - prior_close).abs()),
-        axis=1,
-    ).max(axis=1)
-    value = true_range.iloc[-20:].mean() / close.iloc[-1]
+    high = _finite_window(history, "High", start=-20)
+    low = _finite_window(history, "Low", start=-20)
+    close = _finite_window(history, "Close", start=-21)
+    if high is None or low is None or close is None:
+        return None
+    true_range = np.maximum.reduce(
+        (
+            high - low,
+            np.abs(high - close[:-1]),
+            np.abs(low - close[:-1]),
+        )
+    )
+    value = float(true_range.mean()) / close[-1]
     return _finite_result(value, field="ATR20 fraction")
 
 
@@ -270,8 +296,11 @@ def _breakout_gap_fraction(history: pd.DataFrame) -> float | None:
         return None
     if not {"Open", "Close"}.issubset(history.columns):
         return None
-    prior_close = float(history["Close"].iloc[-2])
-    value = (float(history["Open"].iloc[-1]) - prior_close) / prior_close
+    event_open = _finite_scalar(history["Open"].iloc[-1], field="event open")
+    prior_close = _finite_scalar(history["Close"].iloc[-2], field="prior close")
+    if event_open is None or prior_close is None:
+        return None
+    value = (event_open - prior_close) / prior_close
     return _finite_result(value, field="breakout gap fraction")
 
 
@@ -280,8 +309,11 @@ def _average_dollar_volume_50(history: pd.DataFrame) -> float | None:
         return None
     if not {"Close", "Volume"}.issubset(history.columns):
         return None
-    prior = history.iloc[-51:-1]
-    value = (prior["Close"].astype(float) * prior["Volume"].astype(float)).mean()
+    close = _finite_window(history.iloc[:-1], "Close", start=-50)
+    volume = _finite_window(history.iloc[:-1], "Volume", start=-50)
+    if close is None or volume is None:
+        return None
+    value = (close * volume).mean()
     return _finite_result(value, field="average dollar volume 50")
 
 
@@ -290,19 +322,46 @@ def _distance_from_52_week_high(history: pd.DataFrame) -> float | None:
         return None
     if not {"High", "Close"}.issubset(history.columns):
         return None
-    high = float(history["High"].astype(float).iloc[-252:].max())
-    value = float(history["Close"].iloc[-1]) / high - 1.0
+    highs = _finite_window(history, "High", start=-252)
+    close = _finite_scalar(history["Close"].iloc[-1], field="event close")
+    if highs is None or close is None:
+        return None
+    high = float(highs.max())
+    value = close / high - 1.0
     return _finite_result(value, field="distance from 52-week high")
 
 
 def _volume_ratio_50(history: pd.DataFrame) -> float | None:
     if not _history_is_current(history) or len(history) < 51 or "Volume" not in history.columns:
         return None
-    prior_average = history["Volume"].astype(float).iloc[-51:-1].mean()
+    prior_volume = _finite_window(history.iloc[:-1], "Volume", start=-50)
+    event_volume = _finite_scalar(history["Volume"].iloc[-1], field="event volume")
+    if prior_volume is None or event_volume is None:
+        return None
+    prior_average = prior_volume.mean()
     if prior_average <= 0:
         return None
-    value = float(history["Volume"].iloc[-1]) / prior_average
+    value = event_volume / prior_average
     return _finite_result(value, field="volume ratio 50")
+
+
+def _finite_window(
+    history: pd.DataFrame,
+    column: str,
+    *,
+    start: int,
+) -> np.ndarray | None:
+    values: list[float] = []
+    for raw_value in history[column].iloc[start:].array:
+        value = _optional_number(raw_value, field=f"price_history {column}")
+        if value is None:
+            return None
+        values.append(value)
+    return np.asarray(values, dtype=float)
+
+
+def _finite_scalar(value: object, *, field: str) -> float | None:
+    return _optional_number(value, field=field)
 
 
 def _earnings_acceleration(quarterly: pd.DataFrame) -> float | None:
@@ -387,13 +446,6 @@ def _fundamental_age_days(quarterly: pd.DataFrame, session: date) -> int | None:
 def _validate_optional_series(series: pd.Series, *, field: str) -> None:
     for value in series.array:
         _optional_number(value, field=field)
-
-
-def _required_number(value: object, *, field: str) -> float:
-    number = _optional_number(value, field=field)
-    if number is None:
-        raise ValueError(f"{field} must not be missing")
-    return number
 
 
 def _optional_number(value: object, *, field: str) -> float | None:
