@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
 import hashlib
@@ -27,6 +27,7 @@ from core.pit_optimizer_v5.contracts import (
     InvestigatorArtifactV5,
     MetricPredictionV5,
     ProviderCapabilitiesV5,
+    RoleEvidenceV5,
     canonical_json_bytes_v5,
     canonical_primitive_v5,
     canonical_sha256_v5,
@@ -45,12 +46,62 @@ RoleOutcomeV5 = Literal[
     "accounting_failure",
 ]
 ParsedRoleArtifactV5 = InvestigatorArtifactV5 | StructuralTemplateV5 | CriticArtifactV5
+PrimaryMechanismV5 = Literal[
+    "entry",
+    "risk_sizing",
+    "position_management",
+    "exit",
+    "cross_policy",
+]
+TestableExperimentStatusV5 = Literal[
+    "zero_trade",
+    "quick_rejected",
+    "timed_out",
+    "cancelled",
+    "evaluation_failed",
+    "evaluated",
+]
+EvaluationStageV5 = Literal["quick", "discovery_episode"]
+FailureStageV5 = Literal[
+    "none",
+    "source_validation",
+    "semantic_probe",
+    "quick_evaluation",
+    "campaign_evaluation",
+    "resource",
+]
 
 _ROLE_NAMES = frozenset(("investigator", "author", "critic"))
 _ATTEMPT_KINDS = frozenset(("primary", "retry", "repair"))
+_PRIMARY_MECHANISMS = frozenset(("entry", "risk_sizing", "position_management", "exit", "cross_policy"))
+_TESTABLE_EXPERIMENT_STATUSES = frozenset(
+    (
+        "zero_trade",
+        "quick_rejected",
+        "timed_out",
+        "cancelled",
+        "evaluation_failed",
+        "evaluated",
+    )
+)
+_FAILURE_STAGES = frozenset(
+    (
+        "none",
+        "source_validation",
+        "semantic_probe",
+        "quick_evaluation",
+        "campaign_evaluation",
+        "resource",
+    )
+)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _EVIDENCE_ID_RE = re.compile(r"v5\.[a-z0-9_.-]{1,120}")
-_ABSOLUTE_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/|\\\\)")
+_CANONICAL_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+_FAILURE_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,95}")
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+[\\/]|(?<![A-Za-z0-9])/(?:[^/\s]+/)*[^/\s]+|(?:^|\s)\.\.?[\\/])",
+    re.IGNORECASE,
+)
 _FORBIDDEN_KEY_PARTS = frozenset(
     {
         "accession",
@@ -77,7 +128,6 @@ _FORBIDDEN_KEY_PARTS = frozenset(
         "qualification",
         "raw",
         "row",
-        "rows",
         "secret",
         "security",
         "symbol",
@@ -105,12 +155,96 @@ _FORBIDDEN_COMPOUND_KEYS = frozenset(
         "tickersymbols",
     }
 )
+_FORBIDDEN_KEY_FRAGMENTS = (
+    "apikey",
+    "credential",
+    "filesystempath",
+    "heldout",
+    "password",
+    "rawdata",
+    "rawmarket",
+    "rawrow",
+    "rawvalue",
+    "secret",
+    "securityid",
+    "ticker",
+    "token",
+)
 _MAX_ROLE_REQUEST_BYTES = 256 * 1024
 _SENSITIVE_VALUE_RE = re.compile(
-    r"(?:\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]{8,}|\bapi[_ -]?key\s*[:=])",
+    r"(?:"
+    r"\bbearer\s+\S+"
+    r"|\bbasic\s+[A-Za-z0-9+/=]{8,}"
+    r"|\bsk-[A-Za-z0-9_-]{8,}"
+    r"|\bgh[pousr]_[A-Za-z0-9]{20,}"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|\bAIza[A-Za-z0-9_-]{20,}"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+    r"|\bAKIA[A-Z0-9]{16}\b"
+    r"|-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----"
+    r"|\b(?:api[_ -]?key|access[_ -]?key|authorization|client[_ -]?secret|password|passwd|pwd|secret|token)\b\s*[:=]\s*\S+"
+    r")",
     re.IGNORECASE,
 )
-_TICKER_VALUE_RE = re.compile(r"(?:\$?[A-Z]{1,5}|[A-Z]{1,5}\.(?:TO|US))")
+_TICKER_VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?P<cash>\$)?(?P<symbol>[A-Z]{1,5})(?P<suffix>\.(?:TO|US))?(?![A-Za-z0-9])"
+)
+_TICKER_CONTEXT_RE = re.compile(
+    r"\b(?:(?:tickers?|symbols?|securit(?:y|ies))\s*(?::|=|\bare\b|\bis\b)|leaders?\s*[:=])\s*"
+    r"\$?[A-Za-z]{1,5}(?:\.(?:TO|US))?(?:\s*,\s*\$?[A-Za-z]{1,5}(?:\.(?:TO|US))?)*",
+    re.IGNORECASE,
+)
+_SAFE_UPPERCASE_TEXT_TOKENS = frozenset(
+    {
+        "ATR",
+        "CAGR",
+        "EMA",
+        "JSON",
+        "MAE",
+        "MFE",
+        "PIT",
+        "RS",
+        "USD",
+        "V3",
+        "V4",
+        "V5",
+    }
+)
+_ALLOWED_EVIDENCE_METRIC_PREFIXES = (
+    "archive.",
+    "distribution.",
+    "entry.",
+    "episode.",
+    "exit.",
+    "failure.",
+    "policy.",
+    "quick.",
+    "report.",
+    "rolling.",
+    "semantic.",
+    "slice.",
+)
+_FORBIDDEN_METRIC_PARTS = frozenset(
+    {
+        "credential",
+        "date",
+        "day",
+        "file",
+        "password",
+        "path",
+        "price",
+        "prices",
+        "raw",
+        "row",
+        "secret",
+        "security",
+        "session",
+        "symbol",
+        "ticker",
+        "token",
+        "volume",
+    }
+)
 
 
 def _role(value: object) -> RoleNameV5:
@@ -141,6 +275,35 @@ def _count(value: object, label: str, *, positive: bool = False) -> int:
     if type(value) is not int or value < (1 if positive else 0):
         qualifier = "positive" if positive else "non-negative"
         raise ValueError(f"{label} must be a {qualifier} integer")
+    return value
+
+
+def _primary_mechanism(value: object) -> PrimaryMechanismV5:
+    if type(value) is not str or value not in _PRIMARY_MECHANISMS:
+        raise ValueError("primary mechanism is invalid")
+    return value  # type: ignore[return-value]
+
+
+def _canonical_id(value: object, label: str) -> str:
+    if type(value) is not str or _CANONICAL_ID_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a canonical lowercase identifier")
+    return value
+
+
+def _evidence_id_tuple(value: object, label: str, *, required: bool = False) -> tuple[str, ...]:
+    if (
+        type(value) is not tuple
+        or (required and not value)
+        or any(type(item) is not str or _EVIDENCE_ID_RE.fullmatch(item) is None for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError(f"{label} must contain unique V5 evidence IDs")
+    return value
+
+
+def _finite_decimal(value: object, label: str) -> Decimal:
+    if type(value) is not Decimal or not value.is_finite():
+        raise ValueError(f"{label} must be a finite Decimal")
     return value
 
 
@@ -584,32 +747,334 @@ def _forbidden_key(key: str) -> bool:
     separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", separated).lower().strip("_")
     collapsed = normalized.replace("_", "")
-    return bool(_FORBIDDEN_KEY_PARTS.intersection(normalized.split("_")) or collapsed in _FORBIDDEN_COMPOUND_KEYS)
+    return bool(
+        _FORBIDDEN_KEY_PARTS.intersection(normalized.split("_"))
+        or collapsed in _FORBIDDEN_COMPOUND_KEYS
+        or any(fragment in collapsed for fragment in _FORBIDDEN_KEY_FRAGMENTS)
+    )
 
 
-def _validate_aggregate_only(value: object, *, allow_policy_source: bool = False) -> None:
+def _validate_safe_text(value: object, label: str) -> str:
+    text = _text(value, label)
+    if (
+        "\\" in text
+        or _ABSOLUTE_PATH_RE.search(text)
+        or _SENSITIVE_VALUE_RE.search(text)
+        or _TICKER_CONTEXT_RE.search(text)
+    ):
+        raise ValueError(f"{label} contains path or credential material")
+    for match in _TICKER_VALUE_RE.finditer(text):
+        if (
+            match.group("cash") is not None
+            or match.group("suffix") is not None
+            or match.group("symbol") not in _SAFE_UPPERCASE_TEXT_TOKENS
+        ):
+            raise ValueError(f"{label} contains symbol-like material")
+    return text
+
+
+def _validate_metric_id(value: object) -> str:
+    metric_id = _canonical_id(value, "aggregate metric ID")
+    metric_parts = frozenset(re.split(r"[._-]+", metric_id))
+    collapsed = metric_id.replace("_", "").replace("-", "").replace(".", "")
+    if (
+        not metric_id.startswith(_ALLOWED_EVIDENCE_METRIC_PREFIXES)
+        or _FORBIDDEN_METRIC_PARTS.intersection(metric_parts)
+        or any(fragment in collapsed for fragment in _FORBIDDEN_KEY_FRAGMENTS)
+        or re.search(r"(?:^|[._-])value(?:$|[._-])", metric_id)
+        or re.search(r"\d{4}[._-]\d{2}[._-]\d{2}", metric_id)
+    ):
+        raise ValueError("aggregate metric ID is outside the closed provider namespace")
+    return metric_id
+
+
+def _scan_aggregate_value(value: object) -> None:
+    """Defense in depth after closed typed decoding; never establishes structure."""
+
     if value is None or type(value) in {bool, int, float}:
         return
     if type(value) is str:
-        if not allow_policy_source and (
-            "\\" in value
-            or _ABSOLUTE_PATH_RE.search(value)
-            or _SENSITIVE_VALUE_RE.search(value)
-            or _TICKER_VALUE_RE.fullmatch(value)
-        ):
-            raise ValueError("role input contains non-aggregate or sensitive text")
+        _validate_safe_text(value, "role aggregate text")
         return
-    if type(value) is tuple:
+    if type(value) in {list, tuple}:
         for item in value:
-            _validate_aggregate_only(item, allow_policy_source=allow_policy_source)
+            _scan_aggregate_value(item)
         return
     if isinstance(value, Mapping):
         for key, item in value.items():
-            if type(key) is not str or (not allow_policy_source and _forbidden_key(key)):
+            if type(key) is not str or _forbidden_key(key):
                 raise ValueError("role input contains a forbidden non-aggregate field")
-            _validate_aggregate_only(item, allow_policy_source=allow_policy_source)
+            _scan_aggregate_value(item)
         return
     raise ValueError("role input is not a closed immutable JSON value")
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveFamilyAggregateV5:
+    """One bounded archive-family fact set; no candidate rows or symbols."""
+
+    primary_mechanism: PrimaryMechanismV5
+    candidate_count: int
+    leader_revision_sha256: str
+    evidence_ids: tuple[str, ...]
+    kind: Literal["archive_family"] = field(init=False, default="archive_family")
+
+    def __post_init__(self) -> None:
+        _primary_mechanism(self.primary_mechanism)
+        _count(self.candidate_count, "archive family candidate count", positive=True)
+        _digest(self.leader_revision_sha256, "archive family leader revision")
+        _evidence_id_tuple(self.evidence_ids, "archive family evidence", required=True)
+
+
+@dataclass(frozen=True, slots=True)
+class CriticDirectionAggregateV5:
+    """Complete prior critic direction with only aggregate evidence references."""
+
+    experiment_id: str
+    primary_mechanism: PrimaryMechanismV5
+    prediction_vs_observation: str
+    causal_explanation: str
+    disposition: Literal["promote", "refine", "abandon"]
+    next_direction: str
+    evidence_ids: tuple[str, ...]
+    kind: Literal["critic_direction"] = field(init=False, default="critic_direction")
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "critic-direction experiment")
+        _primary_mechanism(self.primary_mechanism)
+        _validate_safe_text(self.prediction_vs_observation, "critic prediction comparison")
+        _validate_safe_text(self.causal_explanation, "critic causal explanation")
+        if self.disposition not in {"promote", "refine", "abandon"}:
+            raise ValueError("critic direction disposition is invalid")
+        _validate_safe_text(self.next_direction, "critic next direction")
+        _evidence_id_tuple(self.evidence_ids, "critic direction evidence", required=True)
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigatorRoleInputV5:
+    aggregate_evaluator_evidence: tuple[str, ...]
+    archive_family_summaries: tuple[ArchiveFamilyAggregateV5, ...]
+    critic_directions: tuple[CriticDirectionAggregateV5, ...]
+
+    def __post_init__(self) -> None:
+        _evidence_id_tuple(
+            self.aggregate_evaluator_evidence,
+            "investigator evaluator evidence",
+            required=True,
+        )
+        if type(self.archive_family_summaries) is not tuple or any(
+            type(item) is not ArchiveFamilyAggregateV5 for item in self.archive_family_summaries
+        ):
+            raise ValueError("investigator archive summaries are invalid")
+        mechanisms = tuple(item.primary_mechanism for item in self.archive_family_summaries)
+        if len(set(mechanisms)) != len(mechanisms):
+            raise ValueError("investigator archive families must be unique")
+        if type(self.critic_directions) is not tuple or any(
+            type(item) is not CriticDirectionAggregateV5 for item in self.critic_directions
+        ):
+            raise ValueError("investigator critic directions are invalid")
+        experiments = tuple(item.experiment_id for item in self.critic_directions)
+        if len(set(experiments)) != len(experiments):
+            raise ValueError("investigator critic directions must be unique by experiment")
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorPolicyContractsV5:
+    immutable_constraints_sha256: str
+    policy_interface_version: Literal[3]
+    policy_scope_sha256: str
+    trusted_policy_runtime_sha256: str
+
+    def __post_init__(self) -> None:
+        _digest(self.immutable_constraints_sha256, "author immutable constraints")
+        if type(self.policy_interface_version) is not int or self.policy_interface_version != 3:
+            raise ValueError("author policy interface must be exactly V3")
+        _digest(self.policy_scope_sha256, "author policy scope")
+        _digest(self.trusted_policy_runtime_sha256, "author trusted runtime")
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorRoleInputV5:
+    editable_sources: tuple[SourceFileV5, ...]
+    full_source_escape: bool
+    hypothesis: HypothesisV5
+    policy_contracts: AuthorPolicyContractsV5
+
+    def __post_init__(self) -> None:
+        if type(self.editable_sources) is not tuple or any(
+            type(item) is not SourceFileV5 for item in self.editable_sources
+        ):
+            raise ValueError("author editable sources are invalid")
+        paths = tuple(item.path for item in self.editable_sources)
+        if len(set(paths)) != len(paths):
+            raise ValueError("author editable source paths must be unique")
+        if type(self.full_source_escape) is not bool:
+            raise ValueError("author full-source mode is invalid")
+        if type(self.hypothesis) is not HypothesisV5:
+            raise ValueError("author hypothesis is invalid")
+        if type(self.policy_contracts) is not AuthorPolicyContractsV5:
+            raise ValueError("author policy contracts are invalid")
+        _validate_hypothesis_text(self.hypothesis)
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioAggregateV5:
+    """Evidence references for one aggregate evaluator scenario, never observations."""
+
+    stage: EvaluationStageV5
+    episode_ordinal: int | None
+    scenario_id: Literal["gross", "base", "stress"]
+    evidence_ids: tuple[str, ...]
+    kind: Literal["scenario_aggregate"] = field(init=False, default="scenario_aggregate")
+
+    def __post_init__(self) -> None:
+        if self.stage not in {"quick", "discovery_episode"}:
+            raise ValueError("scenario aggregate stage is invalid")
+        if self.stage == "quick":
+            if self.episode_ordinal is not None:
+                raise ValueError("quick scenario aggregate cannot carry an episode ordinal")
+        elif type(self.episode_ordinal) is not int or self.episode_ordinal not in {1, 2, 3, 4}:
+            raise ValueError("discovery scenario aggregate requires ordinal 1 through 4")
+        if self.scenario_id not in {"gross", "base", "stress"}:
+            raise ValueError("scenario aggregate ID is invalid")
+        _evidence_id_tuple(self.evidence_ids, "scenario aggregate evidence", required=True)
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentEvaluationAggregateV5:
+    experiment_id: str
+    status: TestableExperimentStatusV5
+    scenarios: tuple[ScenarioAggregateV5, ...]
+    kind: Literal["experiment_evaluation"] = field(init=False, default="experiment_evaluation")
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "evaluation aggregate experiment")
+        if self.status not in _TESTABLE_EXPERIMENT_STATUSES:
+            raise ValueError("evaluation aggregate status is invalid")
+        if type(self.scenarios) is not tuple or any(type(item) is not ScenarioAggregateV5 for item in self.scenarios):
+            raise ValueError("evaluation aggregate scenarios are invalid")
+        keys = tuple((item.stage, item.episode_ordinal, item.scenario_id) for item in self.scenarios)
+        if len(set(keys)) != len(keys):
+            raise ValueError("evaluation aggregate scenarios must be unique")
+        if self.status == "evaluated":
+            expected = (
+                *(("quick", None, scenario) for scenario in ("gross", "base", "stress")),
+                *(
+                    ("discovery_episode", ordinal, scenario)
+                    for ordinal in (1, 2, 3, 4)
+                    for scenario in ("gross", "base", "stress")
+                ),
+            )
+            if keys != expected:
+                raise ValueError("evaluated experiment must carry the complete canonical scenario grid")
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentPredictionAggregateV5:
+    experiment_id: str
+    predicted_changes: tuple[MetricPredictionV5, ...]
+    kind: Literal["experiment_prediction"] = field(init=False, default="experiment_prediction")
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "prediction aggregate experiment")
+        if (
+            type(self.predicted_changes) is not tuple
+            or not self.predicted_changes
+            or any(type(item) is not MetricPredictionV5 for item in self.predicted_changes)
+        ):
+            raise ValueError("experiment predictions are invalid")
+        metric_ids = tuple(item.metric_id for item in self.predicted_changes)
+        if len(set(metric_ids)) != len(metric_ids):
+            raise ValueError("experiment prediction metrics must be unique")
+        for prediction in self.predicted_changes:
+            _canonical_id(prediction.metric_id, "prediction metric ID")
+            _validate_safe_text(prediction.rationale, "prediction rationale")
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentSemanticDifferenceAggregateV5:
+    experiment_id: str
+    parent_fingerprint_sha256: str
+    candidate_fingerprint_sha256: str
+    classification: Literal[
+        "behavioral_equivalent_on_suite_v1",
+        "behaviorally_distinct_on_suite_v1",
+    ]
+    differing_decision_count: int
+    evidence_ids: tuple[str, ...]
+    suite_id: Literal["pit-policy-v3-probes-v1"] = field(
+        init=False,
+        default="pit-policy-v3-probes-v1",
+    )
+    kind: Literal["semantic_difference"] = field(init=False, default="semantic_difference")
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "semantic aggregate experiment")
+        _digest(self.parent_fingerprint_sha256, "semantic parent fingerprint")
+        _digest(self.candidate_fingerprint_sha256, "semantic candidate fingerprint")
+        if self.classification not in {
+            "behavioral_equivalent_on_suite_v1",
+            "behaviorally_distinct_on_suite_v1",
+        }:
+            raise ValueError("semantic aggregate classification is invalid")
+        _count(self.differing_decision_count, "semantic differing-decision count")
+        if (self.classification == "behavioral_equivalent_on_suite_v1") != (self.differing_decision_count == 0):
+            raise ValueError("semantic aggregate classification differs from its decision count")
+        _evidence_id_tuple(self.evidence_ids, "semantic aggregate evidence", required=True)
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentFailureAggregateV5:
+    experiment_id: str
+    stage: FailureStageV5
+    failure_code: str | None
+    evidence_ids: tuple[str, ...]
+    kind: Literal["typed_failure"] = field(init=False, default="typed_failure")
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "failure aggregate experiment")
+        if self.stage not in _FAILURE_STAGES:
+            raise ValueError("failure aggregate stage is invalid")
+        if self.failure_code is not None and (
+            type(self.failure_code) is not str or _FAILURE_CODE_RE.fullmatch(self.failure_code) is None
+        ):
+            raise ValueError("failure aggregate code is invalid")
+        if (self.stage == "none") != (self.failure_code is None):
+            raise ValueError("failure aggregate stage differs from its code")
+        _evidence_id_tuple(self.evidence_ids, "failure aggregate evidence", required=True)
+
+
+@dataclass(frozen=True, slots=True)
+class CriticRoleInputV5:
+    evaluation_summaries: tuple[ExperimentEvaluationAggregateV5, ...]
+    predictions: tuple[ExperimentPredictionAggregateV5, ...]
+    semantic_differences: tuple[ExperimentSemanticDifferenceAggregateV5, ...]
+    typed_failures: tuple[ExperimentFailureAggregateV5, ...]
+
+    def __post_init__(self) -> None:
+        expected_types = (
+            (self.evaluation_summaries, ExperimentEvaluationAggregateV5),
+            (self.predictions, ExperimentPredictionAggregateV5),
+            (self.semantic_differences, ExperimentSemanticDifferenceAggregateV5),
+            (self.typed_failures, ExperimentFailureAggregateV5),
+        )
+        for values, expected in expected_types:
+            if type(values) is not tuple or any(type(item) is not expected for item in values):
+                raise ValueError("critic role input contains an invalid aggregate section")
+            ids = tuple(item.experiment_id for item in values)
+            if len(set(ids)) != len(ids):
+                raise ValueError("critic aggregate experiments must be unique")
+
+
+RoleInputV5 = InvestigatorRoleInputV5 | AuthorRoleInputV5 | CriticRoleInputV5
+
+
+def _validate_hypothesis_text(hypothesis: HypothesisV5) -> None:
+    _validate_safe_text(hypothesis.causal_claim, "hypothesis causal claim")
+    _validate_safe_text(hypothesis.author_instructions, "hypothesis author instructions")
+    for prediction in hypothesis.predicted_changes:
+        _canonical_id(prediction.metric_id, "hypothesis prediction metric ID")
+        _validate_safe_text(prediction.rationale, "hypothesis prediction rationale")
 
 
 def _decode_prediction(value: object) -> MetricPredictionV5:
@@ -653,142 +1118,102 @@ def _decode_hypothesis(value: object) -> HypothesisV5:
     )
 
 
-def _validate_batch_rows(value: object, experiment_ids: tuple[str, ...], label: str) -> None:
-    if type(value) is not tuple or len(value) != len(experiment_ids):
-        raise ValueError(f"critic {label} must cover the complete experiment batch")
-    actual: list[str] = []
-    for row in value:
-        if not isinstance(row, Mapping) or "experiment_id" not in row:
-            raise ValueError(f"critic {label} row is invalid")
-        experiment_id = row["experiment_id"]
-        if type(experiment_id) is not str:
-            raise ValueError(f"critic {label} experiment ID is invalid")
-        actual.append(experiment_id)
-    if tuple(actual) != experiment_ids:
-        raise ValueError(f"critic {label} differs from the complete experiment batch")
+def _referenced_evidence_ids(role_input: RoleInputV5) -> tuple[str, ...]:
+    if type(role_input) is InvestigatorRoleInputV5:
+        return (
+            *role_input.aggregate_evaluator_evidence,
+            *(evidence_id for row in role_input.archive_family_summaries for evidence_id in row.evidence_ids),
+            *(evidence_id for row in role_input.critic_directions for evidence_id in row.evidence_ids),
+        )
+    if type(role_input) is AuthorRoleInputV5:
+        return role_input.hypothesis.evidence_ids
+    assert type(role_input) is CriticRoleInputV5
+    return (
+        *(
+            evidence_id
+            for row in role_input.evaluation_summaries
+            for scenario in row.scenarios
+            for evidence_id in scenario.evidence_ids
+        ),
+        *(evidence_id for row in role_input.semantic_differences for evidence_id in row.evidence_ids),
+        *(evidence_id for row in role_input.typed_failures for evidence_id in row.evidence_ids),
+    )
 
 
 def _validate_role_input(
     *,
     role: RoleNameV5,
-    role_input: Mapping[str, object],
+    role_input: RoleInputV5,
     binding: RoleBindingV5,
     schema_authority: RoleSchemaAuthorityV5,
     issued_ids: frozenset[str],
 ) -> None:
     if role == "investigator":
-        item = _exact_mapping(
-            role_input,
-            frozenset(
-                (
-                    "aggregate_evaluator_evidence",
-                    "archive_family_summaries",
-                    "critic_directions",
-                )
-            ),
-        )
-        if any(type(item[name]) is not tuple for name in item):
-            raise ValueError("investigator input sections must be immutable arrays")
-        _validate_aggregate_only(item)
-        return
-    if role == "author":
-        item = _exact_mapping(
-            role_input,
-            frozenset(
-                (
-                    "editable_sources",
-                    "full_source_escape",
-                    "hypothesis",
-                    "policy_contracts",
-                )
-            ),
-        )
-        if type(item["full_source_escape"]) is not bool or item["full_source_escape"] is not (
-            schema_authority.allow_full_source_escape
-        ):
+        if type(role_input) is not InvestigatorRoleInputV5:
+            raise ValueError("investigator input must use its closed V5 schema")
+        _scan_aggregate_value(canonical_primitive_v5(role_input))
+    elif role == "author":
+        if type(role_input) is not AuthorRoleInputV5:
+            raise ValueError("author input must use its closed V5 schema")
+        if role_input.full_source_escape is not schema_authority.allow_full_source_escape:
             raise ValueError("author full-source mode differs from its schema authority")
-        hypothesis_value = canonical_primitive_v5(item["hypothesis"])
-        hypothesis = _decode_hypothesis(hypothesis_value)
+        hypothesis = role_input.hypothesis
         if hypothesis.hypothesis_id != binding.hypothesis_id:
             raise ValueError("author hypothesis differs from its expected binding")
-        if not set(hypothesis.evidence_ids).issubset(issued_ids):
-            raise ValueError("author hypothesis cites evidence that was not issued")
-        contracts = _exact_mapping(
-            item["policy_contracts"],
-            frozenset(
-                (
-                    "immutable_constraints_sha256",
-                    "policy_interface_version",
-                    "policy_scope_sha256",
-                    "trusted_policy_runtime_sha256",
-                )
-            ),
-        )
-        if (
-            type(contracts["policy_interface_version"]) is not int
-            or contracts["policy_interface_version"] != 3
-            or contracts["policy_scope_sha256"] != schema_authority.policy_scope_sha256
-        ):
+        if role_input.policy_contracts.policy_scope_sha256 != schema_authority.policy_scope_sha256:
             raise ValueError("author V3 policy contracts differ from schema authority")
-        _digest(contracts["immutable_constraints_sha256"], "author immutable constraints")
-        _digest(contracts["trusted_policy_runtime_sha256"], "author trusted runtime")
-        sources = item["editable_sources"]
-        if type(sources) is not tuple:
-            raise ValueError("author editable sources must be an immutable array")
-        decoded_sources = tuple(
-            SourceFileV5(
-                path=_exact_mapping(source, frozenset(("path", "source")))["path"],  # type: ignore[arg-type]
-                source=_exact_mapping(source, frozenset(("path", "source")))["source"],  # type: ignore[arg-type]
-            )
-            for source in sources
-        )
-        if tuple(source.path for source in decoded_sources) != schema_authority.author_policy_paths:
+        if tuple(source.path for source in role_input.editable_sources) != schema_authority.author_policy_paths:
             raise ValueError("author sources differ from their exact path authority")
-        _validate_aggregate_only(_freeze_json(hypothesis_value))
-        _validate_aggregate_only(contracts)
-        return
-    item = _exact_mapping(
-        role_input,
-        frozenset(
-            (
-                "evaluation_summaries",
-                "predictions",
-                "semantic_differences",
-                "typed_failures",
-            )
-        ),
-    )
-    for label, value in item.items():
-        _validate_batch_rows(value, binding.experiment_ids, label)
-    _validate_aggregate_only(item)
+        _validate_hypothesis_text(hypothesis)
+    else:
+        if type(role_input) is not CriticRoleInputV5:
+            raise ValueError("critic input must use its closed V5 schema")
+        for label, values in (
+            ("evaluation summaries", role_input.evaluation_summaries),
+            ("predictions", role_input.predictions),
+            ("semantic differences", role_input.semantic_differences),
+            ("typed failures", role_input.typed_failures),
+        ):
+            if tuple(item.experiment_id for item in values) != binding.experiment_ids:
+                raise ValueError(f"critic {label} differs from the complete experiment batch")
+        _scan_aggregate_value(canonical_primitive_v5(role_input))
+    referenced = _referenced_evidence_ids(role_input)
+    if not set(referenced).issubset(issued_ids):
+        raise ValueError("role input references evidence that was not issued")
+    if set(referenced) != issued_ids:
+        raise ValueError("role request includes evidence outside its closed role input")
+    if role == "author" and len(referenced) != len(issued_ids):
+        raise ValueError("author evidence must exactly match its hypothesis citations")
 
 
 @dataclass(frozen=True, slots=True)
 class RoleRequestV5:
     role: RoleNameV5
-    messages: tuple[Mapping[str, object], ...]
-    response_schema_sha256: str
-    issued_evidence: tuple[IssuedEvidenceV5, ...]
+    role_input: RoleInputV5
+    role_evidence: RoleEvidenceV5
     expected_binding: RoleBindingV5
     max_output_tokens: int
     schema_authority: RoleSchemaAuthorityV5
+    messages: tuple[Mapping[str, object], ...] = field(init=False, repr=False)
+    response_schema_sha256: str = field(init=False)
+    issued_evidence: tuple[IssuedEvidenceV5, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         role = _role(self.role)
         if type(self.schema_authority) is not RoleSchemaAuthorityV5 or self.schema_authority.role != role:
             raise ValueError("role request schema authority differs from its role")
-        if _digest(self.response_schema_sha256, "role response schema") != self.schema_authority.sha256:
-            raise ValueError("role response schema digest differs from its canonical bytes")
         if type(self.expected_binding) is not RoleBindingV5:
             raise ValueError("role request binding is invalid")
         _count(self.max_output_tokens, "role maximum output tokens", positive=True)
-        if type(self.issued_evidence) is not tuple or any(
-            type(item) is not IssuedEvidenceV5 for item in self.issued_evidence
-        ):
-            raise ValueError("role issued evidence is invalid")
-        issued_ids = tuple(item.evidence_id for item in self.issued_evidence)
-        if len(set(issued_ids)) != len(issued_ids):
-            raise ValueError("role issued evidence IDs must be unique")
+        expected_input_type = {
+            "investigator": InvestigatorRoleInputV5,
+            "author": AuthorRoleInputV5,
+            "critic": CriticRoleInputV5,
+        }[role]
+        if type(self.role_input) is not expected_input_type:
+            raise ValueError("role input differs from its closed V5 role schema")
+        if type(self.role_evidence) is not RoleEvidenceV5 or not self.role_evidence.items:
+            raise ValueError("role request requires bounded V5 aggregate evidence")
         if role == "investigator" and (
             self.expected_binding.hypothesis_id is not None or self.expected_binding.experiment_ids
         ):
@@ -799,37 +1224,44 @@ class RoleRequestV5:
             self.expected_binding.hypothesis_id is None or not self.expected_binding.experiment_ids
         ):
             raise ValueError("critic binding requires a hypothesis and complete experiment batch")
-        frozen = _freeze_json(self.messages)
-        if type(frozen) is not tuple or len(frozen) != 1 or not isinstance(frozen[0], Mapping):
-            raise ValueError("role request must contain one immutable user message")
-        message = _exact_mapping(frozen[0], frozenset(("content", "role")))
-        if message["role"] != "user" or type(message["role"]) is not str:
-            raise ValueError("role request message role is invalid")
-        content = _exact_mapping(
-            message["content"],
-            frozenset(("binding", "evidence", "role_input")),
-        )
-        if canonical_primitive_v5(content["binding"]) != canonical_primitive_v5(self.expected_binding.to_primitive()):
-            raise ValueError("role request message binding differs")
-        evidence = content["evidence"]
-        if type(evidence) is not tuple or len(evidence) != len(self.issued_evidence):
-            raise ValueError("role request evidence payloads are incomplete")
-        for supplied, issued in zip(evidence, self.issued_evidence, strict=True):
-            row = _exact_mapping(supplied, frozenset(("evidence_id", "payload")))
-            if row["evidence_id"] != issued.evidence_id or canonical_sha256_v5(row["payload"]) != issued.payload_sha256:
-                raise ValueError("role request evidence payload differs from its issued digest")
-            _validate_aggregate_only(row["payload"])
-        role_input = content["role_input"]
-        if not isinstance(role_input, Mapping):
-            raise ValueError("role request input is invalid")
+        evidence_rows: list[dict[str, object]] = []
+        issued: list[IssuedEvidenceV5] = []
+        for item in self.role_evidence.items:
+            _validate_metric_id(item.metric_id)
+            payload = {
+                "metric_id": item.metric_id,
+                "value": canonical_primitive_v5(item.value),
+            }
+            evidence_rows.append({"evidence_id": item.evidence_id, "payload": payload})
+            issued.append(
+                IssuedEvidenceV5(
+                    evidence_id=item.evidence_id,
+                    payload_sha256=canonical_sha256_v5(payload),
+                )
+            )
         _validate_role_input(
             role=role,
-            role_input=role_input,
+            role_input=self.role_input,
             binding=self.expected_binding,
             schema_authority=self.schema_authority,
-            issued_ids=frozenset(issued_ids),
+            issued_ids=frozenset(item.evidence_id for item in self.role_evidence.items),
         )
-        object.__setattr__(self, "messages", frozen)
+        messages = _freeze_json(
+            (
+                {
+                    "role": "user",
+                    "content": {
+                        "binding": self.expected_binding.to_primitive(),
+                        "evidence": evidence_rows,
+                        "role_input": canonical_primitive_v5(self.role_input),
+                    },
+                },
+            )
+        )
+        assert type(messages) is tuple
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "response_schema_sha256", self.schema_authority.sha256)
+        object.__setattr__(self, "issued_evidence", tuple(issued))
         if len(canonical_json_bytes_v5(self.to_primitive())) > _MAX_ROLE_REQUEST_BYTES:
             raise ValueError("role request exceeds its aggregate input bound")
 
@@ -852,44 +1284,18 @@ class RoleRequestV5:
 def build_role_request_v5(
     *,
     role: RoleNameV5,
-    role_input: Mapping[str, object],
-    evidence_payloads: tuple[tuple[str, object], ...],
+    role_input: RoleInputV5,
+    issued_evidence: RoleEvidenceV5,
     expected_binding: RoleBindingV5,
     schema_authority: RoleSchemaAuthorityV5,
     max_output_tokens: int,
 ) -> RoleRequestV5:
-    """Construct an authenticated aggregate-only request without prompt-text inference."""
+    """Construct a request only from closed typed and bounded aggregate evidence."""
 
-    canonical_role = _role(role)
-    if not isinstance(role_input, Mapping):
-        raise ValueError("role input must be a mapping")
-    if type(evidence_payloads) is not tuple or any(
-        type(item) is not tuple or len(item) != 2 or type(item[0]) is not str for item in evidence_payloads
-    ):
-        raise ValueError("role evidence payloads are invalid")
-    issued = tuple(
-        IssuedEvidenceV5(evidence_id=evidence_id, payload_sha256=canonical_sha256_v5(payload))
-        for evidence_id, payload in evidence_payloads
-    )
-    canonical_role_input = canonical_primitive_v5(role_input)
-    canonical_evidence_payloads = tuple(
-        (evidence_id, canonical_primitive_v5(payload)) for evidence_id, payload in evidence_payloads
-    )
-    message = {
-        "role": "user",
-        "content": {
-            "binding": expected_binding.to_primitive(),
-            "evidence": [
-                {"evidence_id": evidence_id, "payload": payload} for evidence_id, payload in canonical_evidence_payloads
-            ],
-            "role_input": canonical_role_input,
-        },
-    }
     return RoleRequestV5(
-        role=canonical_role,
-        messages=(message,),
-        response_schema_sha256=schema_authority.sha256,
-        issued_evidence=issued,
+        role=_role(role),
+        role_input=role_input,
+        role_evidence=issued_evidence,
         expected_binding=expected_binding,
         max_output_tokens=max_output_tokens,
         schema_authority=schema_authority,
@@ -2230,16 +2636,29 @@ class FixtureRoleRunnerV5:
 
 
 __all__ = [
+    "ArchiveFamilyAggregateV5",
+    "AuthorPolicyContractsV5",
+    "AuthorRoleInputV5",
     "AuthorizedRoleRunnerV5",
     "AuthorizedRoleSlotV5",
     "CompletionProvider",
     "CompletionResultV5",
+    "CriticDirectionAggregateV5",
+    "CriticRoleInputV5",
+    "EvaluationStageV5",
+    "ExperimentEvaluationAggregateV5",
+    "ExperimentFailureAggregateV5",
+    "ExperimentPredictionAggregateV5",
+    "ExperimentSemanticDifferenceAggregateV5",
+    "FailureStageV5",
     "FixtureRoleRunnerV5",
     "GatewayCompletionProviderV5",
     "IssuedEvidenceV5",
+    "InvestigatorRoleInputV5",
     "OneShotJsonCompletionV5",
     "ParsedRoleArtifactV5",
     "ProviderCompletionRequestV5",
+    "PrimaryMechanismV5",
     "RecoveredRoleTerminalV5",
     "RoleAccountingFailureV5",
     "RoleAttemptFactsV5",
@@ -2252,6 +2671,7 @@ __all__ = [
     "RoleFailureV5",
     "RoleNameV5",
     "RoleOutcomeV5",
+    "RoleInputV5",
     "RoleRequestV5",
     "RoleResponseSchemaFailureV5",
     "RoleRunnerV5",
@@ -2260,6 +2680,8 @@ __all__ = [
     "RoleTerminalReceiptV5",
     "RoleTransportFailureV5",
     "RoleUsageFactsV5",
+    "ScenarioAggregateV5",
+    "TestableExperimentStatusV5",
     "build_role_request_v5",
     "parse_and_bind_role_artifact",
     "role_schema_authority_from_manifest_v5",
