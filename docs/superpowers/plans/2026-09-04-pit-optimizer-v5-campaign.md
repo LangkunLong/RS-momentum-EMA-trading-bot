@@ -127,6 +127,7 @@ class QualificationAttemptCommitmentV5:
     prices_provenance_ref: ArtifactRefV5
     execution_profile_ref: ArtifactRefV5
     evaluator_contract_ref: ArtifactRefV5
+    scenario_grid_ref: ArtifactRefV5
     baseline_authority_ref: ArtifactRefV5
     sandbox_profile_ref: ArtifactRefV5
     retirement_domain_id: str
