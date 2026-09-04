@@ -478,6 +478,95 @@ class EntryAttemptOutcome:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PositionQuantityChangeV5:
+    """One immutable V5 position-size transition."""
+
+    session: str
+    action: str
+    quantity_after: float
+    execution_price: float
+    reason: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.action not in {"entry", "add_on", "scale_out", "exit"}
+            or str(pd.Timestamp(self.session).date()) != self.session
+            or not math.isfinite(self.quantity_after)
+            or self.quantity_after < 0
+            or not math.isfinite(self.execution_price)
+            or self.execution_price <= 0
+            or not self.reason
+        ):
+            raise ValueError("V5 position quantity evidence is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class PositionEpisode:
+    """Causal, immutable evidence for one fully closed V5 position."""
+
+    episode_id: str
+    entry_symbol: str
+    exit_symbol: str
+    entry_session: str
+    exit_session: str
+    entry_price: float
+    exit_price: float
+    maximum_completed_bar_price: float | None
+    minimum_completed_bar_price: float | None
+    realized_return_pct: float
+    quantity_path: tuple[PositionQuantityChangeV5, ...]
+    add_on_count: int
+    holding_sessions: int
+    exit_reason: str
+
+    def __post_init__(self) -> None:
+        _validate_position_episode_v5(self)
+
+
+# Explicit alias for consumers that suffix every optimizer-V5 evidence type.
+PositionEpisodeV5 = PositionEpisode
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioObservationV5:
+    """End-of-session V5 cash, exposure, equity, and regime evidence."""
+
+    session: str
+    cash: float
+    gross_long_notional: float
+    total_equity: float
+    oneil_regime: str
+
+    def __post_init__(self) -> None:
+        if (
+            str(pd.Timestamp(self.session).date()) != self.session
+            or not all(
+                math.isfinite(item)
+                for item in (self.cash, self.gross_long_notional, self.total_equity)
+            )
+            or self.cash < -1e-9
+            or self.gross_long_notional < 0
+            or self.total_equity <= 0
+            or not self.oneil_regime
+        ):
+            raise ValueError("V5 portfolio observation evidence is invalid")
+
+
+@dataclass
+class _PositionEpisodeStateV5:
+    episode_id: str
+    entry_symbol: str
+    current_symbol: str
+    entry_session: str
+    entry_price: float
+    maximum_completed_bar_price: float | None
+    minimum_completed_bar_price: float | None
+    quantity_path: list[PositionQuantityChangeV5]
+    add_on_count: int = 0
+    holding_sessions: int = 0
+
+
 @dataclass
 class SimulationResult:
     trades: List[Trade] = field(default_factory=list)
@@ -660,6 +749,9 @@ class SimulationResultV5(SimulationResult):
 
     fill_log: pd.DataFrame = field(default_factory=pd.DataFrame)
     fill_cost_totals: dict[str, float] = field(default_factory=dict)
+    position_episodes: tuple[PositionEpisode, ...] = ()
+    portfolio_observations: tuple[PortfolioObservationV5, ...] = ()
+    policy_intent_outcomes: dict[str, int] = field(default_factory=dict)
 
 
 class PerformanceReport:
@@ -1392,6 +1484,252 @@ def _checkpoint_origin_advisory_request(
     return number
 
 
+def _quantity_change_to_primitive(
+    change: PositionQuantityChangeV5,
+) -> dict[str, str | float]:
+    return {
+        "session": change.session,
+        "action": change.action,
+        "quantity_after": change.quantity_after,
+        "execution_price": change.execution_price,
+        "reason": change.reason,
+    }
+
+
+def _quantity_change_from_primitive(value: object) -> PositionQuantityChangeV5:
+    if not isinstance(value, Mapping) or set(value) != {
+        "session", "action", "quantity_after", "execution_price", "reason"
+    }:
+        raise ValueError("V5 position quantity evidence is invalid")
+    try:
+        session = str(pd.Timestamp(value["session"]).date())
+        action = str(value["action"])
+        quantity = float(value["quantity_after"])
+        price = float(value["execution_price"])
+        reason = str(value["reason"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("V5 position quantity evidence is invalid") from exc
+    if (
+        action not in {"entry", "add_on", "scale_out", "exit"}
+        or not math.isfinite(quantity)
+        or quantity < 0
+        or not math.isfinite(price)
+        or price <= 0
+        or not reason
+    ):
+        raise ValueError("V5 position quantity evidence is invalid")
+    return PositionQuantityChangeV5(session, action, quantity, price, reason)
+
+
+def _episode_to_primitive(episode: PositionEpisodeV5) -> dict[str, Any]:
+    return {
+        "episode_id": episode.episode_id,
+        "entry_symbol": episode.entry_symbol,
+        "exit_symbol": episode.exit_symbol,
+        "entry_session": episode.entry_session,
+        "exit_session": episode.exit_session,
+        "entry_price": episode.entry_price,
+        "exit_price": episode.exit_price,
+        "maximum_completed_bar_price": episode.maximum_completed_bar_price,
+        "minimum_completed_bar_price": episode.minimum_completed_bar_price,
+        "realized_return_pct": episode.realized_return_pct,
+        "quantity_path": [
+            _quantity_change_to_primitive(item) for item in episode.quantity_path
+        ],
+        "add_on_count": episode.add_on_count,
+        "holding_sessions": episode.holding_sessions,
+        "exit_reason": episode.exit_reason,
+    }
+
+
+def _episode_from_primitive(value: object) -> PositionEpisodeV5:
+    expected = {
+        "episode_id", "entry_symbol", "exit_symbol", "entry_session", "exit_session",
+        "entry_price", "exit_price", "maximum_completed_bar_price",
+        "minimum_completed_bar_price", "realized_return_pct", "quantity_path",
+        "add_on_count", "holding_sessions", "exit_reason",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("V5 position episode evidence is invalid")
+    try:
+        quantity_path = tuple(
+            _quantity_change_from_primitive(item) for item in value["quantity_path"]
+        )
+        episode = PositionEpisodeV5(
+            episode_id=str(value["episode_id"]),
+            entry_symbol=str(value["entry_symbol"]),
+            exit_symbol=str(value["exit_symbol"]),
+            entry_session=str(pd.Timestamp(value["entry_session"]).date()),
+            exit_session=str(pd.Timestamp(value["exit_session"]).date()),
+            entry_price=float(value["entry_price"]),
+            exit_price=float(value["exit_price"]),
+            maximum_completed_bar_price=(
+                None if value["maximum_completed_bar_price"] is None
+                else float(value["maximum_completed_bar_price"])
+            ),
+            minimum_completed_bar_price=(
+                None if value["minimum_completed_bar_price"] is None
+                else float(value["minimum_completed_bar_price"])
+            ),
+            realized_return_pct=float(value["realized_return_pct"]),
+            quantity_path=quantity_path,
+            add_on_count=int(value["add_on_count"]),
+            holding_sessions=int(value["holding_sessions"]),
+            exit_reason=str(value["exit_reason"]),
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("V5 position episode evidence is invalid") from exc
+    _validate_position_episode_v5(episode)
+    return episode
+
+
+def _episode_state_to_primitive(state: _PositionEpisodeStateV5) -> dict[str, Any]:
+    return {
+        "episode_id": state.episode_id,
+        "entry_symbol": state.entry_symbol,
+        "current_symbol": state.current_symbol,
+        "entry_session": state.entry_session,
+        "entry_price": state.entry_price,
+        "maximum_completed_bar_price": state.maximum_completed_bar_price,
+        "minimum_completed_bar_price": state.minimum_completed_bar_price,
+        "quantity_path": [
+            _quantity_change_to_primitive(item) for item in state.quantity_path
+        ],
+        "add_on_count": state.add_on_count,
+        "holding_sessions": state.holding_sessions,
+    }
+
+
+def _episode_state_from_primitive(value: object) -> _PositionEpisodeStateV5:
+    expected = {
+        "episode_id", "entry_symbol", "current_symbol", "entry_session", "entry_price",
+        "maximum_completed_bar_price", "minimum_completed_bar_price", "quantity_path",
+        "add_on_count", "holding_sessions",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("V5 open position episode evidence is invalid")
+    try:
+        state = _PositionEpisodeStateV5(
+            episode_id=str(value["episode_id"]),
+            entry_symbol=str(value["entry_symbol"]),
+            current_symbol=str(value["current_symbol"]),
+            entry_session=str(pd.Timestamp(value["entry_session"]).date()),
+            entry_price=float(value["entry_price"]),
+            maximum_completed_bar_price=(
+                None if value["maximum_completed_bar_price"] is None
+                else float(value["maximum_completed_bar_price"])
+            ),
+            minimum_completed_bar_price=(
+                None if value["minimum_completed_bar_price"] is None
+                else float(value["minimum_completed_bar_price"])
+            ),
+            quantity_path=[
+                _quantity_change_from_primitive(item) for item in value["quantity_path"]
+            ],
+            add_on_count=int(value["add_on_count"]),
+            holding_sessions=int(value["holding_sessions"]),
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("V5 open position episode evidence is invalid") from exc
+    if (
+        not state.episode_id
+        or not state.entry_symbol
+        or not state.current_symbol
+        or not math.isfinite(state.entry_price)
+        or state.entry_price <= 0
+        or state.add_on_count < 0
+        or state.holding_sessions < 0
+        or not state.quantity_path
+    ):
+        raise ValueError("V5 open position episode evidence is invalid")
+    return state
+
+
+def _observation_to_primitive(observation: PortfolioObservationV5) -> dict[str, object]:
+    return {
+        "session": observation.session,
+        "cash": observation.cash,
+        "gross_long_notional": observation.gross_long_notional,
+        "total_equity": observation.total_equity,
+        "oneil_regime": observation.oneil_regime,
+    }
+
+
+def _observation_from_primitive(value: object) -> PortfolioObservationV5:
+    if not isinstance(value, Mapping) or set(value) != {
+        "session", "cash", "gross_long_notional", "total_equity", "oneil_regime"
+    }:
+        raise ValueError("V5 portfolio observation evidence is invalid")
+    try:
+        observation = PortfolioObservationV5(
+            session=str(pd.Timestamp(value["session"]).date()),
+            cash=float(value["cash"]),
+            gross_long_notional=float(value["gross_long_notional"]),
+            total_equity=float(value["total_equity"]),
+            oneil_regime=str(value["oneil_regime"]),
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("V5 portfolio observation evidence is invalid") from exc
+    if (
+        not all(math.isfinite(item) for item in (
+            observation.cash, observation.gross_long_notional, observation.total_equity
+        ))
+        or observation.cash < -1e-9
+        or observation.gross_long_notional < 0
+        or observation.total_equity <= 0
+        or not observation.oneil_regime
+    ):
+        raise ValueError("V5 portfolio observation evidence is invalid")
+    return observation
+
+
+def _validate_position_episode_v5(episode: PositionEpisodeV5) -> None:
+    if (
+        not episode.episode_id
+        or not episode.entry_symbol
+        or not episode.exit_symbol
+        or not episode.exit_reason
+        or str(pd.Timestamp(episode.entry_session).date()) != episode.entry_session
+        or str(pd.Timestamp(episode.exit_session).date()) != episode.exit_session
+        or episode.entry_session > episode.exit_session
+        or type(episode.add_on_count) is not int
+        or episode.add_on_count < 0
+        or type(episode.holding_sessions) is not int
+        or episode.holding_sessions < 0
+        or type(episode.quantity_path) is not tuple
+        or not episode.quantity_path
+        or any(type(item) is not PositionQuantityChangeV5 for item in episode.quantity_path)
+        or episode.quantity_path[0].action != "entry"
+        or sum(item.action == "add_on" for item in episode.quantity_path)
+        != episode.add_on_count
+        or episode.quantity_path[-1].quantity_after > 1e-9
+    ):
+        raise ValueError("V5 position episode evidence is invalid")
+    numbers = (episode.entry_price, episode.exit_price, episode.realized_return_pct)
+    if not all(math.isfinite(item) for item in numbers) or min(numbers[:2]) <= 0:
+        raise ValueError("V5 position episode evidence is invalid")
+    marks = (
+        episode.maximum_completed_bar_price,
+        episode.minimum_completed_bar_price,
+    )
+    if any(item is not None and (not math.isfinite(item) or item <= 0) for item in marks):
+        raise ValueError("V5 position episode evidence is invalid")
+    if (marks[0] is None) != (marks[1] is None) or (
+        marks[0] is not None and marks[1] is not None and marks[0] < marks[1]
+    ):
+        raise ValueError("V5 position episode evidence is invalid")
+
+
+def _new_policy_intent_outcomes_v5() -> dict[str, int]:
+    return {
+        "queued": 0,
+        "executed_next_open": 0,
+        "delayed_missing_open_sessions": 0,
+        "preempted_by_stop": 0,
+        "unexecuted_terminal": 0,
+    }
+
+
 def _strategy_checkpoint_identity(
     simulator: "PortfolioSimulator",
     *,
@@ -1459,7 +1797,7 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
         raise ValueError("portfolio state log offset is invalid")
     outputs: dict[str, list[Any]] = {
         "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
-        "entry_outcomes": [], "fills": [],
+        "entry_outcomes": [], "fills": [], "portfolio_observations": [],
     }
     expected_day = 0
     consumed = 0
@@ -1492,6 +1830,10 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
                 outputs["signals"].extend(event.get("signals", []))
                 outputs["entry_outcomes"].extend(event.get("entry_outcomes", []))
                 outputs["fills"].extend(event.get("fills", []))
+                observations = event.get("portfolio_observations", [])
+                if not isinstance(observations, list) or len(observations) > 1:
+                    raise ValueError("portfolio state log V5 observations are invalid")
+                outputs["portfolio_observations"].extend(observations)
             elif kind == "final":
                 outputs["transactions"].extend(event.get("transactions", []))
                 outputs["fills"].extend(event.get("fills", []))
@@ -1507,6 +1849,11 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
                     ):
                         raise ValueError("portfolio final equity record is invalid")
                     outputs["equity"][-1]["equity"] = float(final_equity)
+                final_observation = event.get("portfolio_observation")
+                if final_observation is not None:
+                    if not outputs["portfolio_observations"]:
+                        raise ValueError("portfolio final observation has no session")
+                    outputs["portfolio_observations"][-1] = final_observation
             else:
                 raise ValueError("portfolio state log contains an unknown record")
     if expected_day != next_day_index:
@@ -1830,6 +2177,12 @@ class PortfolioSimulator:
         self._fill_cost_totals = (
             self._new_fill_cost_totals() if self._v5_enabled else {}
         )
+        self._position_episode_states: dict[str, _PositionEpisodeStateV5] = {}
+        self._position_episodes: list[PositionEpisodeV5] = []
+        self._portfolio_observations: list[PortfolioObservationV5] = []
+        self._policy_intent_outcomes = (
+            _new_policy_intent_outcomes_v5() if self._v5_enabled else {}
+        )
         self._weekly_snapshots: List[dict] = []
         self._signal_rows: List[dict] = []
         self._entry_outcomes: List[EntryAttemptOutcome] = []
@@ -2073,7 +2426,7 @@ class PortfolioSimulator:
         origin_requested_min_canslim_score = self.requested_min_canslim_score
         restored_outputs: dict[str, list[Any]] = {
             "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
-            "entry_outcomes": [], "fills": [],
+            "entry_outcomes": [], "fills": [], "portfolio_observations": [],
         }
         if checkpoint is not None and resume:
             checkpoint_state = _load_checkpoint_json(checkpoint)
@@ -2255,6 +2608,34 @@ class PortfolioSimulator:
                 ):
                     raise ValueError("portfolio checkpoint fill-cost totals are invalid")
                 self._fill_cost_totals = restored_totals
+                self._position_episodes = [
+                    _episode_from_primitive(item)
+                    for item in checkpoint_state.get("position_episodes", [])
+                ]
+                raw_states = checkpoint_state.get("position_episode_states")
+                if not isinstance(raw_states, Mapping):
+                    raise ValueError("portfolio checkpoint V5 episode states are invalid")
+                self._position_episode_states = {
+                    str(symbol): _episode_state_from_primitive(item)
+                    for symbol, item in raw_states.items()
+                }
+                if set(self._position_episode_states) != set(self._open_positions):
+                    raise ValueError("portfolio checkpoint V5 episode states disagree")
+                self._portfolio_observations = [
+                    _observation_from_primitive(item)
+                    for item in restored_outputs["portfolio_observations"]
+                ]
+                raw_policy_outcomes = checkpoint_state.get("policy_intent_outcomes")
+                if (
+                    not isinstance(raw_policy_outcomes, Mapping)
+                    or set(raw_policy_outcomes) != set(_new_policy_intent_outcomes_v5())
+                ):
+                    raise ValueError("portfolio checkpoint V5 policy outcomes are invalid")
+                self._policy_intent_outcomes = {
+                    str(key): int(value) for key, value in raw_policy_outcomes.items()
+                }
+                if any(value < 0 for value in self._policy_intent_outcomes.values()):
+                    raise ValueError("portfolio checkpoint V5 policy outcomes are invalid")
             equity_series = {
                 str(row["date"]): float(row["equity"])
                 for row in restored_outputs["equity"]
@@ -2298,6 +2679,10 @@ class PortfolioSimulator:
                     held_before_open,
                 )
                 if stopped_at_open:
+                    self._policy_intent_outcomes["preempted_by_stop"] += sum(
+                        pending.symbol in stopped_at_open
+                        for pending in pending_policy_exits
+                    )
                     pending_policy_exits = [
                         pending
                         for pending in pending_policy_exits
@@ -2392,6 +2777,7 @@ class PortfolioSimulator:
                     )
                     if queued is not None:
                         pending_policy_exits.append(queued)
+                        self._policy_intent_outcomes["queued"] += 1
             else:
                 self._apply_identity_transitions(ticker_ohlcv, eval_date)
                 for pending_idx, pending in enumerate(pending_entries):
@@ -2420,6 +2806,13 @@ class PortfolioSimulator:
                 )
 
             equity_series[date_str] = self._mark_equity(ticker_ohlcv, eval_date)
+            if self._v5_enabled:
+                self._record_v5_portfolio_observation(
+                    ticker_ohlcv=ticker_ohlcv,
+                    eval_date=eval_date,
+                    oneil_regime=market.oneil_regime,
+                    expected_equity=equity_series[date_str],
+                )
 
             benchmark_bar = benchmark_df.loc[:eval_date]
             if not benchmark_bar.empty:
@@ -2448,6 +2841,9 @@ class PortfolioSimulator:
                 }
                 if self._v5_enabled:
                     day_event["fills"] = self._fill_rows[fill_start:]
+                    day_event["portfolio_observations"] = [
+                        _observation_to_primitive(self._portfolio_observations[-1])
+                    ]
                 offset = _append_checkpoint_jsonl(
                     state_log,
                     day_event,
@@ -2495,6 +2891,10 @@ class PortfolioSimulator:
         last_date = pd.Timestamp(trading_days[-1])
         final_transaction_start = len(self._transactions)
         final_fill_start = len(self._fill_rows)
+        if self._v5_enabled and pending_policy_exits:
+            self._policy_intent_outcomes["unexecuted_terminal"] += len(
+                pending_policy_exits
+            )
         for symbol in list(self._open_positions.keys()):
             ohlcv = ticker_ohlcv.get(symbol)
             if ohlcv is None:
@@ -2504,7 +2904,21 @@ class PortfolioSimulator:
                 exit_price = float(bar["Close"].iloc[-1])
                 self._close_trade(symbol, exit_price, "end_of_test", str(last_date.date()))
         if self._v5_enabled:
+            if self._open_positions or self._position_episode_states:
+                raise ValueError("V5 terminal liquidation evidence is incomplete")
             equity_series[str(last_date.date())] = self._equity
+            if not self._portfolio_observations:
+                raise ValueError("V5 portfolio observations are absent")
+            previous_observation = self._portfolio_observations[-1]
+            if previous_observation.session != str(last_date.date()):
+                raise ValueError("V5 terminal observation session differs")
+            self._portfolio_observations[-1] = PortfolioObservationV5(
+                session=previous_observation.session,
+                cash=self._equity,
+                gross_long_notional=0.0,
+                total_equity=self._equity,
+                oneil_regime=previous_observation.oneil_regime,
+            )
 
         if state_stream is not None:
             final_event = {
@@ -2515,6 +2929,9 @@ class PortfolioSimulator:
                 final_event["fills"] = self._fill_rows[final_fill_start:]
                 final_event["date"] = str(last_date.date())
                 final_event["equity"] = self._equity
+                final_event["portfolio_observation"] = _observation_to_primitive(
+                    self._portfolio_observations[-1]
+                )
             final_offset = _append_checkpoint_jsonl(
                 state_log,
                 final_event,
@@ -2556,6 +2973,9 @@ class PortfolioSimulator:
             result_kwargs.update(
                 fill_log=pd.DataFrame(self._fill_rows),
                 fill_cost_totals=dict(self._fill_cost_totals),
+                position_episodes=tuple(self._position_episodes),
+                portfolio_observations=tuple(self._portfolio_observations),
+                policy_intent_outcomes=dict(self._policy_intent_outcomes),
             )
         result = result_type(**result_kwargs)
         if checkpoint is not None:
@@ -2605,6 +3025,12 @@ class PortfolioSimulator:
         self._fill_rows = []
         self._fill_cost_totals = (
             self._new_fill_cost_totals() if self._v5_enabled else {}
+        )
+        self._position_episode_states = {}
+        self._position_episodes = []
+        self._portfolio_observations = []
+        self._policy_intent_outcomes = (
+            _new_policy_intent_outcomes_v5() if self._v5_enabled else {}
         )
         self._weekly_snapshots = []
         self._signal_rows = []
@@ -2976,6 +3402,14 @@ class PortfolioSimulator:
                         for pending in (pending_policy_exits or [])
                     ],
                     "fill_cost_totals": dict(self._fill_cost_totals),
+                    "position_episodes": [
+                        _episode_to_primitive(item) for item in self._position_episodes
+                    ],
+                    "position_episode_states": {
+                        symbol: _episode_state_to_primitive(state)
+                        for symbol, state in self._position_episode_states.items()
+                    },
+                    "policy_intent_outcomes": dict(self._policy_intent_outcomes),
                 }
             )
         if result_config is not None:
@@ -3085,6 +3519,18 @@ class PortfolioSimulator:
                 fill_cost_totals={
                     str(key): float(value)
                     for key, value in checkpoint.get("fill_cost_totals", {}).items()
+                },
+                position_episodes=tuple(
+                    _episode_from_primitive(item)
+                    for item in checkpoint.get("position_episodes", [])
+                ),
+                portfolio_observations=tuple(
+                    _observation_from_primitive(item)
+                    for item in outputs.get("portfolio_observations", [])
+                ),
+                policy_intent_outcomes={
+                    str(key): int(value)
+                    for key, value in checkpoint.get("policy_intent_outcomes", {}).items()
                 },
             )
         return result_type(**result_kwargs)
@@ -3771,6 +4217,31 @@ class PortfolioSimulator:
             ),
         )
         self._open_positions[symbol] = trade
+        episode_id: str | None = None
+        if self._v5_enabled:
+            episode_id = f"position-{len(self._position_episodes) + len(self._position_episode_states) + 1:08d}"
+            if episode_id in {
+                episode.episode_id for episode in self._position_episodes
+            }:
+                raise ValueError("V5 position episode identity was reused")
+            self._position_episode_states[symbol] = _PositionEpisodeStateV5(
+                episode_id=episode_id,
+                entry_symbol=symbol,
+                current_symbol=symbol,
+                entry_session=date_str,
+                entry_price=entry_price,
+                maximum_completed_bar_price=None,
+                minimum_completed_bar_price=None,
+                quantity_path=[
+                    PositionQuantityChangeV5(
+                        session=date_str,
+                        action="entry",
+                        quantity_after=transition.quantity,
+                        execution_price=entry_price,
+                        reason=str(signal.get("signal_reason", "Signal")),
+                    )
+                ],
+            )
         if entry_fill is not None:
             self._equity = round(self._equity + entry_fill.cash_delta, 2)
             if self._equity < -1e-9:
@@ -3780,6 +4251,7 @@ class PortfolioSimulator:
                 ticker=symbol,
                 reason=str(signal.get("signal_reason", "Signal")),
                 fill=entry_fill,
+                episode_id=episode_id,
             )
         else:
             self._equity -= transition.buy_notional
@@ -4217,7 +4689,14 @@ class PortfolioSimulator:
                 stop_price=trade.stop_price,
             )
             if resolved is not None and resolved.kind == "gap_stop":
-                self._close_trade(symbol, resolved.price, "stop_loss", date_str)
+                self._close_trade(
+                    symbol,
+                    resolved.price,
+                    "stop_loss",
+                    date_str,
+                    stop_reference_kind=resolved.kind,
+                    stop_price=trade.stop_price,
+                )
                 stopped.add(symbol)
         return stopped
 
@@ -4239,10 +4718,12 @@ class PortfolioSimulator:
             frame = ticker_ohlcv.get(pending.symbol)
             bar = exact_session_row(frame, eval_date) if frame is not None else None
             if bar is None or "Open" not in bar.index:
+                self._policy_intent_outcomes["delayed_missing_open_sessions"] += 1
                 survivors.append(pending)
                 continue
             open_price = _finite_signal_number(bar["Open"])
             if open_price is None or open_price <= 0:
+                self._policy_intent_outcomes["delayed_missing_open_sessions"] += 1
                 survivors.append(pending)
                 continue
             close_action = pending.actions[-1]
@@ -4252,6 +4733,7 @@ class PortfolioSimulator:
                 close_action.reason,
                 date_str,
             )
+            self._policy_intent_outcomes["executed_next_open"] += 1
             exited.add(pending.symbol)
         return survivors, exited
 
@@ -4280,7 +4762,14 @@ class PortfolioSimulator:
                 stop_price=trade.stop_price,
             )
             if resolved is not None:
-                self._close_trade(symbol, resolved.price, "stop_loss", date_str)
+                self._close_trade(
+                    symbol,
+                    resolved.price,
+                    "stop_loss",
+                    date_str,
+                    stop_reference_kind=resolved.kind,
+                    stop_price=trade.stop_price,
+                )
                 stopped.add(symbol)
         return stopped
 
@@ -4305,6 +4794,12 @@ class PortfolioSimulator:
         date_str = str(eval_date.date())
 
         trade.days_held += 1
+        self._update_v5_position_episode_mark(
+            symbol=symbol,
+            session=date_str,
+            high=high,
+            low=low,
+        )
         trade.peak_close = max(trade.peak_close or trade.entry_price, close)
         history = ohlcv.loc[:eval_date]
         ema_today: float | None = None
@@ -4375,7 +4870,11 @@ class PortfolioSimulator:
         close_actions = tuple(
             action for action in decision.actions if action.kind == "close"
         )
-        if not close_actions or next_session is None:
+        if not close_actions:
+            return None
+        if next_session is None:
+            self._policy_intent_outcomes["queued"] += 1
+            self._policy_intent_outcomes["unexecuted_terminal"] += 1
             return None
         return PendingPolicyExit(
             symbol=symbol,
@@ -4434,6 +4933,11 @@ class PortfolioSimulator:
                 continue
             if transition.successor in self._open_positions:
                 raise ValueError("identity transition successor is already open")
+            episode_state = self._position_episode_states.pop(
+                transition.predecessor, None
+            )
+            if self._v5_enabled and episode_state is None:
+                raise ValueError("identity transition lacks V5 episode evidence")
             successor_frame = ticker_ohlcv.get(transition.successor)
             if successor_frame is None:
                 raise ValueError("identity transition successor has no price data")
@@ -4442,6 +4946,9 @@ class PortfolioSimulator:
                 raise ValueError("identity transition successor lacks a valid transition bar")
             trade.symbol = transition.successor
             self._open_positions[transition.successor] = trade
+            if episode_state is not None:
+                episode_state.current_symbol = transition.successor
+                self._position_episode_states[transition.successor] = episode_state
             quantity = float(trade.remaining_qty or 0.0)
             if quantity > 1e-12:
                 self._transactions.append({
@@ -4490,6 +4997,9 @@ class PortfolioSimulator:
         trade = self._open_positions.get(symbol)
         if trade is None or not trade.remaining_qty:
             return
+        episode_state = self._position_episode_states.get(symbol)
+        if self._v5_enabled and episode_state is None:
+            raise ValueError("V5 scale-out lacks position episode evidence")
 
         scale_qty = sell_qty if sell_qty is not None else trade.remaining_qty * self.scale_out_fraction
         if scale_qty <= 0:
@@ -4519,6 +5029,7 @@ class PortfolioSimulator:
                 ticker=symbol,
                 reason=reason,
                 fill=fill,
+                episode_id=(episode_state.episode_id if episode_state else None),
             )
         else:
             self._equity += exit_price * scale_qty
@@ -4530,11 +5041,33 @@ class PortfolioSimulator:
             quantity=scale_qty,
             reason=reason,
         )
+        if episode_state is not None:
+            episode_state.quantity_path.append(
+                PositionQuantityChangeV5(
+                    session=date_str,
+                    action="scale_out",
+                    quantity_after=max(float(trade.remaining_qty or 0.0), 0.0),
+                    execution_price=execution_price,
+                    reason=reason,
+                )
+            )
 
-    def _close_trade(self, symbol: str, exit_price: float, reason: str, date_str: str) -> None:
+    def _close_trade(
+        self,
+        symbol: str,
+        exit_price: float,
+        reason: str,
+        date_str: str,
+        *,
+        stop_reference_kind: str | None = None,
+        stop_price: float | None = None,
+    ) -> None:
         trade = self._open_positions.pop(symbol, None)
         if trade is None:
             return
+        episode_state = self._position_episode_states.pop(symbol, None)
+        if self._v5_enabled and episode_state is None:
+            raise ValueError("V5 close lacks position episode evidence")
 
         remaining_qty = max(float(trade.remaining_qty or 0.0), 0.0)
         execution_price = exit_price
@@ -4557,6 +5090,9 @@ class PortfolioSimulator:
                 ticker=symbol,
                 reason=reason,
                 fill=fill,
+                episode_id=(episode_state.episode_id if episode_state else None),
+                stop_reference_kind=stop_reference_kind,
+                stop_price=stop_price,
             )
         else:
             self._equity += exit_price * remaining_qty
@@ -4574,6 +5110,27 @@ class PortfolioSimulator:
         trade.exit_date = date_str
         trade.exit_reason = reason
         self._trades.append(trade)
+        if episode_state is not None:
+            if remaining_qty > 1e-12:
+                episode_state.quantity_path.append(
+                    PositionQuantityChangeV5(
+                        session=date_str,
+                        action="exit",
+                        quantity_after=0.0,
+                        execution_price=execution_price,
+                        reason=reason,
+                    )
+                )
+            self._finalize_v5_position_episode(
+                state=episode_state,
+                exit_session=date_str,
+                exit_price=(
+                    execution_price
+                    if remaining_qty > 1e-12
+                    else episode_state.quantity_path[-1].execution_price
+                ),
+                exit_reason=reason,
+            )
 
     def _record_v5_fill(
         self,
@@ -4582,6 +5139,9 @@ class PortfolioSimulator:
         ticker: str,
         reason: str,
         fill: ExecutionFill,
+        episode_id: str | None,
+        stop_reference_kind: str | None = None,
+        stop_price: float | None = None,
     ) -> None:
         if not self._v5_enabled:
             raise ValueError("fill-cost evidence is available only under V5")
@@ -4602,6 +5162,7 @@ class PortfolioSimulator:
                 "Ticker": ticker,
                 "Action": fill.side,
                 "Reason": reason,
+                "EpisodeId": episode_id,
                 "ReferencePrice": fill.reference_price,
                 "ExecutionPrice": fill.execution_price,
                 "Quantity": fill.quantity,
@@ -4612,6 +5173,8 @@ class PortfolioSimulator:
                 "MarketImpactCostUSD": fill.market_impact_cost_usd,
                 "CashDelta": fill.cash_delta,
                 "TotalFrictionUSD": total_friction,
+                "StopReferenceKind": stop_reference_kind,
+                "StopPrice": stop_price,
             }
         )
         for cost_field, value in (
@@ -4624,6 +5187,109 @@ class PortfolioSimulator:
                 self._fill_cost_totals[cost_field] + value,
                 2,
             )
+
+    def _update_v5_position_episode_mark(
+        self,
+        *,
+        symbol: str,
+        session: str,
+        high: float,
+        low: float,
+    ) -> None:
+        state = self._position_episode_states.get(symbol)
+        if state is None:
+            raise ValueError("V5 completed-bar mark lacks position episode evidence")
+        if (
+            not math.isfinite(high)
+            or not math.isfinite(low)
+            or high <= 0
+            or low <= 0
+            or high < low
+        ):
+            raise ValueError("V5 completed-bar mark is invalid")
+        if session < state.entry_session:
+            raise ValueError("V5 completed-bar mark precedes entry")
+        state.maximum_completed_bar_price = (
+            high
+            if state.maximum_completed_bar_price is None
+            else max(state.maximum_completed_bar_price, high)
+        )
+        state.minimum_completed_bar_price = (
+            low
+            if state.minimum_completed_bar_price is None
+            else min(state.minimum_completed_bar_price, low)
+        )
+        state.holding_sessions += 1
+
+    def _finalize_v5_position_episode(
+        self,
+        *,
+        state: _PositionEpisodeStateV5,
+        exit_session: str,
+        exit_price: float,
+        exit_reason: str,
+    ) -> None:
+        rows = [
+            row for row in self._fill_rows
+            if row.get("EpisodeId") == state.episode_id
+        ]
+        buy_cash = -sum(
+            float(row["CashDelta"]) for row in rows if row.get("Action") == "BUY"
+        )
+        net_cash = sum(float(row["CashDelta"]) for row in rows)
+        if buy_cash <= 0 or not math.isfinite(net_cash):
+            raise ValueError("V5 episode fill cash does not reconcile")
+        episode = PositionEpisodeV5(
+            episode_id=state.episode_id,
+            entry_symbol=state.entry_symbol,
+            exit_symbol=state.current_symbol,
+            entry_session=state.entry_session,
+            exit_session=exit_session,
+            entry_price=state.entry_price,
+            exit_price=exit_price,
+            maximum_completed_bar_price=state.maximum_completed_bar_price,
+            minimum_completed_bar_price=state.minimum_completed_bar_price,
+            realized_return_pct=net_cash / buy_cash * 100.0,
+            quantity_path=tuple(state.quantity_path),
+            add_on_count=state.add_on_count,
+            holding_sessions=state.holding_sessions,
+            exit_reason=exit_reason,
+        )
+        _validate_position_episode_v5(episode)
+        self._position_episodes.append(episode)
+
+    def _record_v5_portfolio_observation(
+        self,
+        *,
+        ticker_ohlcv: Mapping[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+        oneil_regime: str,
+        expected_equity: float,
+    ) -> None:
+        gross = 0.0
+        for symbol, trade in self._open_positions.items():
+            frame = ticker_ohlcv.get(symbol)
+            bar = exact_session_row(frame, eval_date) if frame is not None else None
+            if bar is None or "Close" not in bar.index:
+                raise ValueError("V5 position lacks a completed-session close")
+            close = _finite_signal_number(bar["Close"])
+            if close is None or close <= 0:
+                raise ValueError("V5 position completed-session close is invalid")
+            gross += close * float(trade.remaining_qty or 0.0)
+        observed_equity = self._equity + gross
+        if not math.isclose(
+            observed_equity, expected_equity, rel_tol=0.0, abs_tol=1e-8
+        ):
+            raise ValueError("V5 portfolio observation does not reconcile to equity")
+        self._portfolio_observations.append(
+            PortfolioObservationV5(
+                session=str(eval_date.date()),
+                cash=self._equity,
+                gross_long_notional=gross,
+                total_equity=observed_equity,
+                oneil_regime=oneil_regime,
+            )
+        )
 
     def _mark_equity(self, ticker_ohlcv: Dict[str, pd.DataFrame], eval_date: pd.Timestamp) -> float:
         market_value = self._equity

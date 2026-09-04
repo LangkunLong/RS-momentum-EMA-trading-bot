@@ -17,6 +17,9 @@ from core.backtest_fills import FrictionScenario
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_EVIDENCE_ID_RE = re.compile(r"v5\.[a-z0-9_.-]{1,120}")
+MAX_ROLE_EVIDENCE_ITEMS_V5 = 96
+MAX_ROLE_EVIDENCE_BYTES_V5 = 16 * 1024
 
 # This is a closed semantic-runtime set, not a repository hash.  In particular,
 # documentation, orchestration, provider, and CLI files do not affect evaluator
@@ -525,6 +528,81 @@ class EvaluationReportV5:
 
 
 @dataclass(frozen=True, slots=True)
+class RoleEvidenceItemV5:
+    """One symbol-neutral aggregate exposed across the provider boundary."""
+
+    evidence_id: str
+    metric_id: str
+    value: Decimal | int | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.evidence_id) is not str
+            or _EVIDENCE_ID_RE.fullmatch(self.evidence_id) is None
+        ):
+            raise ValueError("role evidence ID is invalid")
+        _text(self.metric_id, "role evidence metric ID")
+        if self.value is not None:
+            if type(self.value) is int:
+                if self.value < 0:
+                    raise ValueError("role evidence integer must be non-negative")
+            else:
+                _decimal(self.value, "role evidence value")
+
+    def to_primitive(self) -> dict[str, str | int | None]:
+        value: str | int | None = self.value
+        if type(value) is Decimal:
+            value = _decimal_primitive(value)
+        return {
+            "evidence_id": self.evidence_id,
+            "metric_id": self.metric_id,
+            "value": value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RoleEvidenceV5:
+    """Deterministically bounded provider-facing report projection."""
+
+    schema_version: Literal[5]
+    items: tuple[RoleEvidenceItemV5, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("role evidence schema must be V5")
+        if (
+            type(self.items) is not tuple
+            or len(self.items) > MAX_ROLE_EVIDENCE_ITEMS_V5
+            or any(type(item) is not RoleEvidenceItemV5 for item in self.items)
+        ):
+            raise ValueError("role evidence items are invalid or unbounded")
+        ids = tuple(item.evidence_id for item in self.items)
+        if len(set(ids)) != len(ids):
+            raise ValueError("role evidence IDs must be unique")
+        if len(self.canonical_json_bytes()) > MAX_ROLE_EVIDENCE_BYTES_V5:
+            raise ValueError("role evidence exceeds the provider byte bound")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "items": [item.to_primitive() for item in self.items],
+        }
+
+    def canonical_json_bytes(self) -> bytes:
+        return json.dumps(
+            self.to_primitive(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_json_bytes()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class ScenarioPanelEvaluationV5:
     scenario_id: str
     starting_equity: Decimal
@@ -608,8 +686,12 @@ __all__ = [
     "EvaluationSliceV5",
     "EvaluatorContractV5",
     "MetricCountV5",
+    "MAX_ROLE_EVIDENCE_BYTES_V5",
+    "MAX_ROLE_EVIDENCE_ITEMS_V5",
     "PanelEvaluationV5",
     "RollingReturnV5",
+    "RoleEvidenceItemV5",
+    "RoleEvidenceV5",
     "SandboxProfileV5",
     "SandboxResourceManifestV5",
     "ScenarioPanelEvaluationV5",
