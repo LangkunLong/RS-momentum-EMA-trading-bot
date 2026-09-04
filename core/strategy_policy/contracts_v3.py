@@ -220,9 +220,18 @@ def _decode_nested(nested_type: type[object], value: object, name: str) -> objec
     for field in fields(nested_type):
         raw_item = converted[field.name]
         if field.name == "affiliations":
-            if type(raw_item) is not list:
+            if type(raw_item) is not list or any(
+                type(item) is not str for item in raw_item
+            ):
                 _fail(field.name)
             converted[field.name] = tuple(raw_item)
+        elif field.name == "fundamental_age_days":
+            if raw_item is not None and type(raw_item) is not int:
+                _fail(field.name)
+        elif raw_item is not None:
+            if type(raw_item) not in {int, float}:
+                _fail(field.name)
+            _number(raw_item, field.name)
     try:
         return nested_type(**converted)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -273,8 +282,8 @@ class PortfolioFeaturesV3(_CanonicalContractV3):
         for name in ("sector_exposures", "industry_exposures"):
             exposures = _validate_exposures(getattr(self, name), name)
             total = math.fsum(value for _key, value in exposures)
-            if total > gross and not _same(total, gross):
-                raise ValueError(f"{name} exceed gross exposure")
+            if not _same(total, gross):
+                raise ValueError(f"{name} do not reconcile to gross exposure")
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,7 +473,7 @@ class AddOnSnapshotV3(_CanonicalContractV3):
             raise ValueError("add-on unrealized return does not reconcile")
         if favorable < 0 or favorable < unrealized:
             raise ValueError("add-on favorable excursion does not reconcile")
-        if adverse > 0 or adverse > unrealized:
+        if adverse < -1 or adverse > 0 or adverse > unrealized:
             raise ValueError("add-on adverse excursion does not reconcile")
         if (
             self.open_position_risk_fraction > self.current_notional_fraction
@@ -549,7 +558,9 @@ class ExitSnapshotV3(_CanonicalContractV3):
         expected_favorable = float(self.base.peak_close) / float(self.base.entry_price) - 1.0
         if not _same(favorable, expected_favorable) or favorable < 0:
             raise ValueError("exit favorable excursion does not reconcile")
-        if adverse > 0 or adverse > unrealized:
+        if favorable < unrealized:
+            raise ValueError("exit favorable excursion is below current return")
+        if adverse < -1 or adverse > 0 or adverse > unrealized:
             raise ValueError("exit adverse excursion does not reconcile")
 
 
@@ -566,9 +577,14 @@ def validate_add_on_decision(
     if not decision.add:
         return decision
     cap = decision.notional_fraction_cap
-    if cap is None or cap <= snapshot.current_notional_fraction:
-        if cap is not None:
+    if cap is not None:
+        if cap <= snapshot.current_notional_fraction:
             raise ValueError("add-on notional cap must exceed current position notional")
+        maximum_funded_cap = (
+            snapshot.current_notional_fraction + snapshot.remaining_cash_fraction
+        )
+        if cap > maximum_funded_cap and not _same(cap, maximum_funded_cap):
+            raise ValueError("add-on notional cap exceeds available cash")
     if snapshot.remaining_cash_fraction <= 0:
         raise ValueError("add-on requires remaining cash")
     if snapshot.open_position_risk_fraction + decision.risk_fraction > 1:
