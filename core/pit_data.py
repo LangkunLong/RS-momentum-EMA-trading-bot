@@ -37,7 +37,7 @@ from datetime import date, datetime
 from itertools import groupby
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import pandas as pd
 
@@ -182,15 +182,27 @@ class PriceIdentityTransitionContract:
 
     def resolve_open_holding(self, ticker: str, on_date: date | str) -> str:
         """Return an approved identity or fail closed after an ended identity."""
-        ticker_validator = (
-            _canonical_ticker_v3
-            if any(
-                char.isdigit()
-                for identity_ticker in self.identities
-                for char in identity_ticker
-            )
-            else _canonical_ticker
+        return self._resolve_open_holding(
+            ticker,
+            on_date,
+            ticker_validator=_canonical_ticker,
         )
+
+    def resolve_open_holding_v3(self, ticker: str, on_date: date | str) -> str:
+        """Resolve a schema-V3 identity using its explicit ticker syntax."""
+        return self._resolve_open_holding(
+            ticker,
+            on_date,
+            ticker_validator=_canonical_ticker_v3,
+        )
+
+    def _resolve_open_holding(
+        self,
+        ticker: str,
+        on_date: date | str,
+        *,
+        ticker_validator: Callable[[object], str],
+    ) -> str:
         symbol = ticker_validator(ticker)
         when = date.fromisoformat(on_date) if isinstance(on_date, str) else on_date
         if not isinstance(when, date):

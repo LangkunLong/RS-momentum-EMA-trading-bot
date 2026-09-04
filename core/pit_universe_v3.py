@@ -241,7 +241,12 @@ class PointInTimeUniverseV3:
             raise ValueError(
                 f"security lineage must have exactly one active price identity: {lineage}"
             )
-        return active[0]
+        resolved = self.identity_transition_contract.resolve_open_holding_v3(
+            active[0], when
+        )
+        if resolved != active[0]:
+            raise ValueError("active price identity disagrees with its transition contract")
+        return resolved
 
     def affiliations_at(self, as_of: str | date) -> Mapping[str, frozenset[str]]:
         lineage_affiliations = self.lineage_affiliations_at(as_of)
