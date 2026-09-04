@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import date
 from decimal import Decimal
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
@@ -108,6 +109,24 @@ def _date(value: object, label: str) -> date:
     if parsed.isoformat() != value:
         raise ValueError(f"{label} must be an ISO calendar date")
     return parsed
+
+
+def _validate_ordered_disjoint_date_intervals_v5(
+    intervals: tuple[tuple[str, str], ...], label: str
+) -> None:
+    """Require chronologically ordered, non-overlapping closed date intervals."""
+
+    parsed = tuple(
+        (_date(start, f"{label} start date"), _date(end, f"{label} end date"))
+        for start, end in intervals
+    )
+    if any(
+        left_end >= right_start
+        for (_, left_end), (right_start, _) in pairwise(parsed)
+    ):
+        raise ValueError(
+            f"{label} must be chronological and disjoint under inclusive-date semantics"
+        )
 
 
 def _decimal_primitive(value: Decimal) -> str:
@@ -490,6 +509,10 @@ class CampaignPanelPlanV5:
             raise ValueError("campaign episode IDs must be unique")
         if len({item.panel_ref.sha256 for item in self.discovery}) != 4:
             raise ValueError("campaign discovery panel identities must be unique")
+        _validate_ordered_disjoint_date_intervals_v5(
+            tuple((item.start_date, item.end_date) for item in self.discovery),
+            "campaign discovery episodes",
+        )
 
     @property
     def discovery_plan_sha256(self) -> str:
@@ -1237,16 +1260,10 @@ class CampaignEvidenceV5:
             raise ValueError("campaign evidence episode IDs must be unique")
         if len({item.evaluation.panel_sha256 for item in self.episodes}) != 4:
             raise ValueError("campaign evidence panel identities must be unique")
-        ranges = tuple(
-            (_date(item.start_date, "evidence start date"), _date(item.end_date, "evidence end date"))
-            for item in self.episodes
+        _validate_ordered_disjoint_date_intervals_v5(
+            tuple((item.start_date, item.end_date) for item in self.episodes),
+            "campaign evidence episodes",
         )
-        if any(
-            left_start <= right_end and right_start <= left_end
-            for index, (left_start, left_end) in enumerate(ranges)
-            for right_start, right_end in ranges[index + 1 :]
-        ):
-            raise ValueError("campaign discovery episode date intervals must be disjoint")
         if len({item.evaluation.evaluator_contract_sha256 for item in self.episodes}) != 1:
             raise ValueError("campaign evidence must share one evaluator identity")
         if len({item.evaluation.policy_identity_sha256 for item in self.episodes}) != 1:
