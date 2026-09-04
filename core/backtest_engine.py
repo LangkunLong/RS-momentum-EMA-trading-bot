@@ -53,7 +53,11 @@ from core.canslim.m_market_direction import MarketRegime, MarketRegimeTracker
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
 from core.canslim.i_institutional import evaluate_i
-from core.industry_group import get_top_groups, load_industry_map
+from core.industry_group import (
+    get_top_groups,
+    load_industry_map,
+    load_pit_industry_assignments_as_of,
+)
 from core.data_client import clear_session_cache, fetch_bulk_ohlcv
 from core.engine_policy import (
     build_effective_engine_policy,
@@ -63,6 +67,10 @@ from core.engine_policy import (
 from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
 from core.momentum_analysis import calculate_rs_snapshot
 from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
+from core.pit_feature_snapshot import (
+    build_entry_features_v3,
+    build_holding_features_v3,
+)
 from core.pit_diagnosis.fact_cache import (
     _PreparedPatternHistory,
     _detect_prepared_base,
@@ -71,6 +79,8 @@ from core.pit_diagnosis.fact_cache import (
 from core.pit_diagnosis.patterns import BasePolicy
 from core.strategy_policy import (
     POLICY_INTERFACE_VERSION,
+    POLICY_INTERFACE_VERSION_V3,
+    AddOnDecisionV3,
     AllocationDecision,
     AllocationSnapshot,
     CapacityDecision,
@@ -86,6 +96,8 @@ from core.strategy_policy import (
     MarketContextV1,
     StrategyPolicyClient,
     StrategyPolicyClientFactory,
+    StrategyPolicyAdapterV3,
+    validate_add_on_decision,
     validate_allocation_decision,
     validate_capacity_decision,
     validate_eviction_decision,
@@ -127,6 +139,7 @@ DEFAULT_MIN_TECHNICAL_SCORE = 70.0
 DEFAULT_BULK_PRICE_FETCH_THRESHOLD = 25
 BENCHMARK = "SPY"
 MAXIMUM_POLICY_POSITIONS = 25
+MAXIMUM_ADD_ONS_PER_POSITION = 2
 
 
 _INERT_REQUEST_POLICY_SOURCES = {
@@ -307,6 +320,90 @@ class PendingPolicyExit:
             )
         except (TypeError, ValueError, KeyError) as exc:
             raise ValueError("pending policy exit checkpoint is invalid") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class PendingAddOn:
+    """Completed-session add-on intent authorized for a later exact open."""
+
+    symbol: str
+    signal_date: str
+    target_entry_date: str
+    risk_fraction: float
+    notional_fraction_cap: float | None
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.symbol) is not str
+            or not self.symbol
+            or self.symbol != self.symbol.upper()
+        ):
+            raise ValueError("pending add-on symbol is invalid")
+        try:
+            signal_date = str(pd.Timestamp(self.signal_date).date())
+            target_date = str(pd.Timestamp(self.target_entry_date).date())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pending add-on date is invalid") from exc
+        if (
+            signal_date != self.signal_date
+            or target_date != self.target_entry_date
+            or target_date <= signal_date
+            or type(self.risk_fraction) is not float
+            or not math.isfinite(self.risk_fraction)
+            or self.risk_fraction <= 0
+            or self.risk_fraction > 1
+            or (
+                self.notional_fraction_cap is not None
+                and (
+                    type(self.notional_fraction_cap) is not float
+                    or not math.isfinite(self.notional_fraction_cap)
+                    or self.notional_fraction_cap <= 0
+                    or self.notional_fraction_cap > 1
+                )
+            )
+            or type(self.reason_code) is not str
+            or not self.reason_code
+        ):
+            raise ValueError("pending add-on is invalid")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "symbol": self.symbol,
+            "signal_date": self.signal_date,
+            "target_entry_date": self.target_entry_date,
+            "risk_fraction": self.risk_fraction,
+            "notional_fraction_cap": self.notional_fraction_cap,
+            "reason_code": self.reason_code,
+        }
+
+    @classmethod
+    def from_primitive(cls, raw: Mapping[str, object]) -> "PendingAddOn":
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "symbol",
+            "signal_date",
+            "target_entry_date",
+            "risk_fraction",
+            "notional_fraction_cap",
+            "reason_code",
+        }:
+            raise ValueError("pending add-on checkpoint is invalid")
+        try:
+            cap = raw["notional_fraction_cap"]
+            if type(raw["risk_fraction"]) is not float or (
+                cap is not None and type(cap) is not float
+            ):
+                raise ValueError("pending add-on checkpoint is invalid")
+            return cls(
+                symbol=str(raw["symbol"]),
+                signal_date=str(raw["signal_date"]),
+                target_entry_date=str(raw["target_entry_date"]),
+                risk_fraction=float(raw["risk_fraction"]),
+                notional_fraction_cap=None if cap is None else float(cap),
+                reason_code=str(raw["reason_code"]),
+            )
+        except (TypeError, ValueError, KeyError, OverflowError) as exc:
+            raise ValueError("pending add-on checkpoint is invalid") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -752,6 +849,7 @@ class SimulationResultV5(SimulationResult):
     position_episodes: tuple[PositionEpisode, ...] = ()
     portfolio_observations: tuple[PortfolioObservationV5, ...] = ()
     policy_intent_outcomes: dict[str, int] = field(default_factory=dict)
+    add_on_outcomes: dict[str, int] = field(default_factory=dict)
 
 
 class PerformanceReport:
@@ -1730,6 +1828,20 @@ def _new_policy_intent_outcomes_v5() -> dict[str, int]:
     }
 
 
+def _new_add_on_outcomes_v5() -> dict[str, int]:
+    return {
+        "queued": 0,
+        "executed": 0,
+        "cancelled": 0,
+        "already_pending": 0,
+        "invalid_price": 0,
+        "risk": 0,
+        "cash": 0,
+        "cap": 0,
+        "no_position": 0,
+    }
+
+
 def _strategy_checkpoint_identity(
     simulator: "PortfolioSimulator",
     *,
@@ -1880,7 +1992,7 @@ def _portfolio_checkpoint_fingerprint(
     effective_history_start = start_date if history_start_date is None else history_start_date
     config = {
         "schema_version": simulator._checkpoint_schema,
-        "policy_interface_version": POLICY_INTERFACE_VERSION,
+        "policy_interface_version": simulator._policy_interface_version(),
         "bundle_sha256": bundle_sha256,
         "code_identity": code_identity,
         "strategy_identity": (
@@ -2144,7 +2256,7 @@ class PortfolioSimulator:
             self.strategy if not self._strategy_was_injected else None
         )
         if isinstance(self.strategy, CanslimStrategy):
-            self.strategy._policy_client_provider = self._adapter_policy_client
+            self.strategy._policy_client_provider = self._entry_evaluation_policy_client
         try:
             self.strategy.min_rs_score = MIN_RS_SCORE
             self.strategy.min_canslim_score = MIN_COMPOSITE_SCORE
@@ -2183,6 +2295,9 @@ class PortfolioSimulator:
         self._policy_intent_outcomes = (
             _new_policy_intent_outcomes_v5() if self._v5_enabled else {}
         )
+        self._add_on_outcomes = (
+            _new_add_on_outcomes_v5() if self._v5_enabled else {}
+        )
         self._weekly_snapshots: List[dict] = []
         self._signal_rows: List[dict] = []
         self._entry_outcomes: List[EntryAttemptOutcome] = []
@@ -2200,6 +2315,9 @@ class PortfolioSimulator:
             else InProcessPolicyClient
         )
         self._policy_client: StrategyPolicyClient | None = None
+        self._v3_all_closes: pd.DataFrame | None = None
+        self._v3_ticker_ohlcv: Mapping[str, pd.DataFrame] | None = None
+        self._v3_peak_equity = float(initial_capital)
         self._strict_pit_pattern_histories: dict[str, _PreparedPatternHistory] = {}
         self._strict_pit_history_frames: dict[str, pd.DataFrame] = {}
         self._strict_pit_base_policy = BasePolicy.canonical_v1()
@@ -2223,7 +2341,7 @@ class PortfolioSimulator:
                 if self.pit_bundle is not None
                 else None
             )
-            strategy._policy_client_provider = self._adapter_policy_client
+            strategy._policy_client_provider = self._entry_evaluation_policy_client
         except Exception as exc:
             raise ValueError("owned built-in strategy policy synchronization failed") from exc
 
@@ -2231,6 +2349,21 @@ class PortfolioSimulator:
         """Return the run-local client; direct private-adapter tests use baseline."""
 
         return self._policy_client or InProcessPolicyClient()
+
+    def _entry_evaluation_policy_client(self) -> StrategyPolicyClient:
+        """Keep raw fact extraction V2; the engine applies V3 at its boundary."""
+
+        client = self._policy_client
+        if client is not None and client.interface_version == POLICY_INTERFACE_VERSION_V3:
+            return InProcessPolicyClient()
+        return client or InProcessPolicyClient()
+
+    def _policy_interface_version(self) -> int:
+        client = self._policy_client
+        return client.interface_version if client is not None else POLICY_INTERFACE_VERSION
+
+    def _using_policy_v3(self) -> bool:
+        return self._policy_interface_version() == POLICY_INTERFACE_VERSION_V3
 
     def _live_inert_request_contract(
         self,
@@ -2306,8 +2439,19 @@ class PortfolioSimulator:
         client = self._policy_client_factory()
         try:
             self._policy_client = client
-            if client.interface_version != POLICY_INTERFACE_VERSION:
+            if client.interface_version not in {
+                POLICY_INTERFACE_VERSION,
+                POLICY_INTERFACE_VERSION_V3,
+            }:
                 raise ValueError("policy interface version mismatch")
+            if client.interface_version == POLICY_INTERFACE_VERSION_V3 and (
+                not self._v5_enabled
+                or self.pit_bundle is None
+                or self.pit_bundle.metadata.get("schema_version") != "3"
+            ):
+                raise ValueError(
+                    "policy interface V3 requires V5 execution and a schema-V3 PIT bundle"
+                )
             return self._run_with_policy_client_active(
                 tickers,
                 lookback_weeks,
@@ -2515,6 +2659,8 @@ class PortfolioSimulator:
         else:
             print(f"Downloading price data for {len(all_tickers)} tickers...")
             ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, history_start, end_ts)
+        if self._using_policy_v3():
+            self._v3_ticker_ohlcv = ticker_ohlcv
         if benchmark not in ticker_ohlcv:
             if state_stream is not None:
                 state_stream.close()
@@ -2527,6 +2673,8 @@ class PortfolioSimulator:
         else:
             print(f"Downloading RS universe closes for {len(universe)} tickers...")
             all_closes = self.data_fetcher.fetch_rs_universe_closes(universe, history_start, end_ts)
+        if self._using_policy_v3():
+            self._v3_all_closes = all_closes
 
         benchmark_df = ticker_ohlcv[benchmark]
         benchmark_sessions = benchmark_df.loc[history_start:end_ts].index
@@ -2593,6 +2741,18 @@ class PortfolioSimulator:
                 if self._v5_enabled
                 else []
             )
+            pending_add_ons = (
+                [
+                    PendingAddOn.from_primitive(value)
+                    for value in checkpoint_state["pending_add_ons"]
+                ]
+                if self._v5_enabled
+                else []
+            )
+            if len({pending.symbol for pending in pending_add_ons}) != len(
+                pending_add_ons
+            ):
+                raise ValueError("portfolio checkpoint has duplicate pending add-ons")
             self._fill_rows = list(restored_outputs["fills"])
             if self._v5_enabled:
                 raw_totals = checkpoint_state.get("fill_cost_totals")
@@ -2636,10 +2796,26 @@ class PortfolioSimulator:
                 }
                 if any(value < 0 for value in self._policy_intent_outcomes.values()):
                     raise ValueError("portfolio checkpoint V5 policy outcomes are invalid")
+                raw_add_on_outcomes = checkpoint_state.get("add_on_outcomes")
+                if (
+                    not isinstance(raw_add_on_outcomes, Mapping)
+                    or set(raw_add_on_outcomes) != set(_new_add_on_outcomes_v5())
+                ):
+                    raise ValueError("portfolio checkpoint V5 add-on outcomes are invalid")
+                self._add_on_outcomes = {
+                    str(key): int(value) for key, value in raw_add_on_outcomes.items()
+                }
+                if any(value < 0 for value in self._add_on_outcomes.values()):
+                    raise ValueError("portfolio checkpoint V5 add-on outcomes are invalid")
             equity_series = {
                 str(row["date"]): float(row["equity"])
                 for row in restored_outputs["equity"]
             }
+            if self._using_policy_v3() and equity_series:
+                self._v3_peak_equity = max(
+                    self._v3_peak_equity,
+                    *equity_series.values(),
+                )
             benchmark_series = {
                 str(row["date"]): float(row["equity"])
                 for row in restored_outputs["benchmark"]
@@ -2654,6 +2830,7 @@ class PortfolioSimulator:
             benchmark_start_price = None
             pending_entries = []
             pending_policy_exits = []
+            pending_add_ons = []
 
         total_days = len(trading_days)
         for day_idx, eval_date in enumerate(trading_days[next_day_index:], start=next_day_index):
@@ -2667,11 +2844,16 @@ class PortfolioSimulator:
 
             if self._v5_enabled:
                 remaps = self._apply_identity_transitions(ticker_ohlcv, eval_date)
-                pending_entries, pending_policy_exits = self._remap_v5_pending_actions(
+                pending_entries, pending_policy_exits, pending_add_ons = self._remap_v5_pending_actions(
                     pending_entries,
                     pending_policy_exits,
+                    pending_add_ons,
                     remaps,
                 )
+                if len({pending.symbol for pending in pending_add_ons}) != len(
+                    pending_add_ons
+                ):
+                    raise ValueError("identity remap collided pending add-ons")
                 held_before_open = set(self._open_positions)
                 stopped_at_open = self._apply_v5_opening_gap_stops(
                     ticker_ohlcv,
@@ -2688,12 +2870,35 @@ class PortfolioSimulator:
                         for pending in pending_policy_exits
                         if pending.symbol not in stopped_at_open
                     ]
+                    cancelled = sum(
+                        pending.symbol in stopped_at_open
+                        for pending in pending_add_ons
+                    )
+                    self._add_on_outcomes["cancelled"] += cancelled
+                    pending_add_ons = [
+                        pending
+                        for pending in pending_add_ons
+                        if pending.symbol not in stopped_at_open
+                    ]
                     pending_entries = [
                         pending
                         for pending in pending_entries
                         if str(pending.signal.get("symbol", "")).upper()
                         not in stopped_at_open
                     ]
+                exit_intent_symbols = {
+                    pending.symbol for pending in pending_policy_exits
+                }
+                conflicting_add_ons = sum(
+                    pending.symbol in exit_intent_symbols
+                    for pending in pending_add_ons
+                )
+                self._add_on_outcomes["cancelled"] += conflicting_add_ons
+                pending_add_ons = [
+                    pending
+                    for pending in pending_add_ons
+                    if pending.symbol not in exit_intent_symbols
+                ]
                 pending_policy_exits, policy_exited = (
                     self._execute_v5_pending_policy_exits(
                         pending_policy_exits,
@@ -2708,11 +2913,25 @@ class PortfolioSimulator:
                         if str(pending.signal.get("symbol", "")).upper()
                         not in policy_exited
                     ]
+                    cancelled = sum(
+                        pending.symbol in policy_exited for pending in pending_add_ons
+                    )
+                    self._add_on_outcomes["cancelled"] += cancelled
+                    pending_add_ons = [
+                        pending
+                        for pending in pending_add_ons
+                        if pending.symbol not in policy_exited
+                    ]
                 for pending_idx, pending in enumerate(pending_entries):
                     self._pending_entries_remaining = len(pending_entries) - pending_idx
                     self._enter_position(pending, ticker_ohlcv, eval_date)
                 self._pending_entries_remaining = 0
                 pending_entries = []
+                pending_add_ons = self._execute_v5_pending_add_ons(
+                    pending_add_ons,
+                    ticker_ohlcv,
+                    eval_date,
+                )
                 intraday_stopped = self._apply_v5_intraday_stops(
                     ticker_ohlcv,
                     eval_date,
@@ -2721,6 +2940,16 @@ class PortfolioSimulator:
                     pending_policy_exits = [
                         pending
                         for pending in pending_policy_exits
+                        if pending.symbol not in intraday_stopped
+                    ]
+                    cancelled = sum(
+                        pending.symbol in intraday_stopped
+                        for pending in pending_add_ons
+                    )
+                    self._add_on_outcomes["cancelled"] += cancelled
+                    pending_add_ons = [
+                        pending
+                        for pending in pending_add_ons
                         if pending.symbol not in intraday_stopped
                     ]
 
@@ -2762,6 +2991,9 @@ class PortfolioSimulator:
                 already_pending = {
                     pending.symbol for pending in pending_policy_exits
                 }
+                pending_add_symbols = {
+                    pending.symbol for pending in pending_add_ons
+                }
                 for symbol in list(self._open_positions):
                     if symbol in already_pending:
                         continue
@@ -2778,6 +3010,28 @@ class PortfolioSimulator:
                     if queued is not None:
                         pending_policy_exits.append(queued)
                         self._policy_intent_outcomes["queued"] += 1
+                        cancelled = sum(
+                            pending.symbol == symbol for pending in pending_add_ons
+                        )
+                        self._add_on_outcomes["cancelled"] += cancelled
+                        pending_add_ons = [
+                            pending
+                            for pending in pending_add_ons
+                            if pending.symbol != symbol
+                        ]
+                        pending_add_symbols.discard(symbol)
+                        continue
+                    add_on = self._queue_v3_add_on_after_close(
+                        symbol=symbol,
+                        ohlcv=ohlcv,
+                        eval_date=eval_date,
+                        market=market,
+                        next_session=next_session,
+                        already_pending=symbol in pending_add_symbols,
+                    )
+                    if add_on is not None:
+                        pending_add_ons.append(add_on)
+                        pending_add_symbols.add(symbol)
             else:
                 self._apply_identity_transitions(ticker_ohlcv, eval_date)
                 for pending_idx, pending in enumerate(pending_entries):
@@ -2806,6 +3060,11 @@ class PortfolioSimulator:
                 )
 
             equity_series[date_str] = self._mark_equity(ticker_ohlcv, eval_date)
+            if self._using_policy_v3():
+                self._v3_peak_equity = max(
+                    self._v3_peak_equity,
+                    equity_series[date_str],
+                )
             if self._v5_enabled:
                 self._record_v5_portfolio_observation(
                     ticker_ohlcv=ticker_ohlcv,
@@ -2867,6 +3126,7 @@ class PortfolioSimulator:
                         regime_tracker=regime_tracker,
                         pending_entries=pending_entries,
                         pending_policy_exits=pending_policy_exits,
+                        pending_add_ons=pending_add_ons,
                         benchmark_start_price=benchmark_start_price,
                         origin_requested_min_rs_score=origin_requested_min_rs_score,
                         origin_requested_min_canslim_score=(
@@ -2895,6 +3155,8 @@ class PortfolioSimulator:
             self._policy_intent_outcomes["unexecuted_terminal"] += len(
                 pending_policy_exits
             )
+        if self._v5_enabled and pending_add_ons:
+            self._add_on_outcomes["cancelled"] += len(pending_add_ons)
         for symbol in list(self._open_positions.keys()):
             ohlcv = ticker_ohlcv.get(symbol)
             if ohlcv is None:
@@ -2976,6 +3238,7 @@ class PortfolioSimulator:
                 position_episodes=tuple(self._position_episodes),
                 portfolio_observations=tuple(self._portfolio_observations),
                 policy_intent_outcomes=dict(self._policy_intent_outcomes),
+                add_on_outcomes=dict(self._add_on_outcomes),
             )
         result = result_type(**result_kwargs)
         if checkpoint is not None:
@@ -2991,6 +3254,7 @@ class PortfolioSimulator:
                     regime_tracker=regime_tracker,
                     pending_entries=[],
                     pending_policy_exits=[],
+                    pending_add_ons=[],
                     benchmark_start_price=benchmark_start_price,
                     origin_requested_min_rs_score=origin_requested_min_rs_score,
                     origin_requested_min_canslim_score=(
@@ -3032,6 +3296,9 @@ class PortfolioSimulator:
         self._policy_intent_outcomes = (
             _new_policy_intent_outcomes_v5() if self._v5_enabled else {}
         )
+        self._add_on_outcomes = (
+            _new_add_on_outcomes_v5() if self._v5_enabled else {}
+        )
         self._weekly_snapshots = []
         self._signal_rows = []
         self._entry_outcomes = []
@@ -3044,6 +3311,9 @@ class PortfolioSimulator:
         self._exit_policy_snapshots = {}
         self._regime_tracker = MarketRegimeTracker()
         self._market_context_cache: dict[str, MarketContextV1] = {}
+        self._v3_all_closes = None
+        self._v3_ticker_ohlcv = None
+        self._v3_peak_equity = float(self.initial_capital)
         self._reset_strict_pit_pattern_cache()
 
     @staticmethod
@@ -3312,7 +3582,7 @@ class PortfolioSimulator:
             "industry_group_min_size": self.industry_group_min_size,
             "effective_engine_policy": self._effective_engine_policy,
             "effective_engine_policy_sha256": self._effective_engine_policy_sha256,
-            "policy_interface_version": POLICY_INTERFACE_VERSION,
+            "policy_interface_version": self._policy_interface_version(),
             "start_date": str(start_ts.date()),
             "history_start_date": str(effective_history_start.date()),
             "end_date": str(end_ts.date()),
@@ -3349,6 +3619,7 @@ class PortfolioSimulator:
         regime_tracker: MarketRegimeTracker,
         pending_entries: list[PendingEntry],
         pending_policy_exits: list[PendingPolicyExit] | None = None,
+        pending_add_ons: list[PendingAddOn] | None = None,
         benchmark_start_price: Optional[float],
         origin_requested_min_rs_score: float | None,
         origin_requested_min_canslim_score: float | None,
@@ -3401,6 +3672,10 @@ class PortfolioSimulator:
                         pending.to_primitive()
                         for pending in (pending_policy_exits or [])
                     ],
+                    "pending_add_ons": [
+                        pending.to_primitive()
+                        for pending in (pending_add_ons or [])
+                    ],
                     "fill_cost_totals": dict(self._fill_cost_totals),
                     "position_episodes": [
                         _episode_to_primitive(item) for item in self._position_episodes
@@ -3410,6 +3685,7 @@ class PortfolioSimulator:
                         for symbol, state in self._position_episode_states.items()
                     },
                     "policy_intent_outcomes": dict(self._policy_intent_outcomes),
+                    "add_on_outcomes": dict(self._add_on_outcomes),
                 }
             )
         if result_config is not None:
@@ -3532,8 +3808,113 @@ class PortfolioSimulator:
                     str(key): int(value)
                     for key, value in checkpoint.get("policy_intent_outcomes", {}).items()
                 },
+                add_on_outcomes={
+                    str(key): int(value)
+                    for key, value in checkpoint.get("add_on_outcomes", {}).items()
+                },
             )
         return result_type(**result_kwargs)
+
+    def _v3_rs_snapshot(self, session: pd.Timestamp) -> dict[str, float]:
+        if self._v3_all_closes is None or self.pit_bundle is None:
+            raise ValueError("V3 policy feature context is unavailable")
+        eligible = self.pit_bundle.members_at(session).intersection(
+            self.pit_bundle.tradable_symbols()
+        )
+        return _calculate_rs_snapshot(
+            self._v3_all_closes,
+            session,
+            eligible_tickers=eligible,
+        )
+
+    def _v3_entry_features(
+        self,
+        *,
+        symbol: str,
+        session: pd.Timestamp,
+        history: pd.DataFrame,
+        rs_snapshot: Mapping[str, float] | None = None,
+    ):
+        if self.pit_bundle is None:
+            raise ValueError("V3 entry features require a PIT bundle")
+        return build_entry_features_v3(
+            bundle=self.pit_bundle,
+            symbol=symbol,
+            session=session.date(),
+            price_history=history.loc[:session],
+            rs_snapshot=(
+                rs_snapshot
+                if rs_snapshot is not None
+                else self._v3_rs_snapshot(session)
+            ),
+        )
+
+    def _v3_holding_features(
+        self,
+        *,
+        symbol: str,
+        session: pd.Timestamp,
+        history: pd.DataFrame,
+    ):
+        if self.pit_bundle is None:
+            raise ValueError("V3 holding features require a PIT bundle")
+        return build_holding_features_v3(
+            bundle=self.pit_bundle,
+            symbol=symbol,
+            session=session.date(),
+            price_history=history.loc[:session],
+            rs_snapshot=self._v3_rs_snapshot(session),
+        )
+
+    def _v3_portfolio_features(
+        self,
+        *,
+        ticker_ohlcv: Mapping[str, pd.DataFrame],
+        session: pd.Timestamp,
+        use_open: bool,
+        pending_entry_count: int,
+    ):
+        if self.pit_bundle is None:
+            raise ValueError("V3 portfolio features require a PIT bundle")
+        assignments = load_pit_industry_assignments_as_of(
+            self.pit_bundle,
+            session=session.date(),
+            symbols=self._open_positions,
+        )
+        notionals: list[float] = []
+        risks: list[float] = []
+        industries: dict[str, float] = {}
+        gross = 0.0
+        for symbol, trade in self._open_positions.items():
+            frame = ticker_ohlcv.get(symbol)
+            bar = exact_session_row(frame, session) if frame is not None else None
+            field = "Open" if use_open else "Close"
+            if bar is None or field not in bar.index:
+                raise ValueError("V3 portfolio position price is unavailable")
+            price = _finite_signal_number(bar[field])
+            if price is None or price <= 0:
+                raise ValueError("V3 portfolio position price is invalid")
+            quantity = float(trade.remaining_qty or 0.0)
+            notional = price * quantity
+            risk = max(trade.entry_price - trade.stop_price, 0.0) * quantity
+            notionals.append(notional)
+            risks.append(min(risk, notional))
+            gross += notional
+            assignment = assignments.get(symbol)
+            group = assignment.group_id if assignment is not None else "unclassified"
+            industries[group] = industries.get(group, 0.0) + notional
+        equity = self._equity + gross
+        sectors = {"unclassified": gross} if gross > 0 else {}
+        return StrategyPolicyAdapterV3.build_portfolio_features(
+            equity=equity,
+            cash=self._equity,
+            peak_equity=max(self._v3_peak_equity, equity),
+            position_notionals=notionals,
+            position_open_risks=risks,
+            pending_entry_count=pending_entry_count,
+            sector_notionals=sectors,
+            industry_notionals=industries,
+        )
 
     def _canonicalize_signal_row(
         self,
@@ -3546,6 +3927,7 @@ class PortfolioSimulator:
         market_state: dict[str, Any],
         market: MarketContextV1,
         entry_facts: CanslimEntryFacts | None = None,
+        rs_snapshot: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
         """Rebuild the authoritative entry decision at the execution boundary."""
 
@@ -3583,8 +3965,19 @@ class PortfolioSimulator:
             market=market,
         )
         client = self._policy_client or InProcessPolicyClient()
+        policy_snapshot: object = snapshot
+        if self._using_policy_v3():
+            policy_snapshot = StrategyPolicyAdapterV3.build_entry_snapshot(
+                base=snapshot,
+                features=self._v3_entry_features(
+                    symbol=str(ticker).upper(),
+                    session=eval_date,
+                    history=ticker_history,
+                    rs_snapshot=rs_snapshot,
+                ),
+            )
         decision = self._validate_entry_policy_decision(
-            client.evaluate_entry(snapshot)
+            client.evaluate_entry(policy_snapshot)  # type: ignore[arg-type]
         )
         entry_eligible = decision.qualified
         entry_blocking_reasons = decision.blocking_codes
@@ -3663,6 +4056,8 @@ class PortfolioSimulator:
         eligible_signal_count: int,
         cash_fraction: float,
         market: MarketContextV1,
+        ticker_ohlcv: Mapping[str, pd.DataFrame] | None = None,
+        eval_date: pd.Timestamp | None = None,
     ) -> CapacityDecision:
         snapshot = CapacitySnapshot(
             market=market,
@@ -3673,7 +4068,22 @@ class PortfolioSimulator:
             cash_fraction=cash_fraction,
             configured_eviction_enabled=self.enable_eviction,
         )
-        decision = self._adapter_policy_client().recommend_capacity(snapshot)
+        policy_snapshot: object = snapshot
+        if self._using_policy_v3():
+            if ticker_ohlcv is None or eval_date is None:
+                raise ValueError("V3 capacity context is unavailable")
+            policy_snapshot = StrategyPolicyAdapterV3.build_capacity_snapshot(
+                base=snapshot,
+                portfolio=self._v3_portfolio_features(
+                    ticker_ohlcv=ticker_ohlcv,
+                    session=eval_date,
+                    use_open=False,
+                    pending_entry_count=eligible_signal_count,
+                ),
+            )
+        decision = self._adapter_policy_client().recommend_capacity(  # type: ignore[arg-type]
+            policy_snapshot
+        )
         if type(decision) is not CapacityDecision:
             raise ValueError("capacity policy decision is invalid")
         return validate_capacity_decision(snapshot, decision)
@@ -3803,6 +4213,7 @@ class PortfolioSimulator:
                 market_state=effective_market_state,
                 market=market,
                 entry_facts=entry_facts,
+                rs_snapshot=rs_snapshot,
             )
             self._signal_rows.append(row)
             if row.get("buy_signal_without_market", row.get("buy_signal", False)):
@@ -3852,6 +4263,8 @@ class PortfolioSimulator:
             eligible_signal_count=len(signals),
             cash_fraction=min(cash_fraction, 1.0),
             market=market,
+            ticker_ohlcv=ticker_ohlcv,
+            eval_date=eval_date,
         )
         if capacity.max_positions is None:
             candidate_limit = len(signals)
@@ -4405,8 +4818,65 @@ class PortfolioSimulator:
             ticker_ohlcv=ticker_ohlcv,
             entry_date=entry_date,
         )
+        policy_eviction_snapshot: object = eviction_snapshot
+        if self._using_policy_v3():
+            signal_session = pd.Timestamp(signal_date).normalize()
+            portfolio = self._v3_portfolio_features(
+                ticker_ohlcv=ticker_ohlcv,
+                session=entry_date,
+                use_open=True,
+                pending_entry_count=max(self._pending_entries_remaining, 1),
+            )
+            positions = []
+            for base_position, (open_symbol, open_trade) in zip(
+                eviction_snapshot.positions,
+                self._open_positions.items(),
+                strict=True,
+            ):
+                open_frame = ticker_ohlcv.get(open_symbol)
+                if open_frame is None or base_position.causal_execution_price is None:
+                    raise ValueError("V3 eviction position context is unavailable")
+                positions.append(
+                    StrategyPolicyAdapterV3.build_eviction_position(
+                        base=base_position,
+                        features=self._v3_holding_features(
+                            symbol=open_symbol,
+                            session=signal_session,
+                            history=open_frame,
+                        ),
+                        current_price=base_position.causal_execution_price,
+                        current_notional=(
+                            base_position.causal_execution_price
+                            * float(open_trade.remaining_qty or 0.0)
+                        ),
+                        equity=self._equity
+                        + sum(
+                            float(position.causal_execution_price or 0.0)
+                            * float(trade.remaining_qty or 0.0)
+                            for position, trade in zip(
+                                eviction_snapshot.positions,
+                                self._open_positions.values(),
+                                strict=True,
+                            )
+                        ),
+                        days_held=open_trade.days_held,
+                    )
+                )
+            candidate_frame = ticker_ohlcv.get(symbol)
+            if candidate_frame is None:
+                raise ValueError("V3 eviction candidate context is unavailable")
+            policy_eviction_snapshot = StrategyPolicyAdapterV3.build_eviction_snapshot(
+                base=eviction_snapshot,
+                candidate=self._v3_entry_features(
+                    symbol=symbol,
+                    session=signal_session,
+                    history=candidate_frame,
+                ),
+                positions=positions,
+                portfolio=portfolio,
+            )
         eviction = self._adapter_policy_client().select_eviction(
-            eviction_snapshot
+            policy_eviction_snapshot  # type: ignore[arg-type]
         )
         if type(eviction) is not EvictionDecision:
             raise ValueError("eviction policy decision is invalid")
@@ -4454,8 +4924,27 @@ class PortfolioSimulator:
             canslim_score=_finite_signal_number(signal.get("canslim_score")),
             rs_score=_finite_signal_number(signal.get("rs_score")),
         )
+        policy_allocation_snapshot: object = allocation_snapshot
+        if self._using_policy_v3():
+            candidate_frame = ticker_ohlcv.get(symbol)
+            if candidate_frame is None:
+                raise ValueError("V3 allocation candidate context is unavailable")
+            policy_allocation_snapshot = StrategyPolicyAdapterV3.build_allocation_snapshot(
+                base=allocation_snapshot,
+                candidate=self._v3_entry_features(
+                    symbol=symbol,
+                    session=pd.Timestamp(signal_date).normalize(),
+                    history=candidate_frame,
+                ),
+                portfolio=self._v3_portfolio_features(
+                    ticker_ohlcv=ticker_ohlcv,
+                    session=entry_date,
+                    use_open=True,
+                    pending_entry_count=max(self._pending_entries_remaining, 1),
+                ),
+            )
         recommendation = self._adapter_policy_client().recommend_allocation(
-            allocation_snapshot
+            policy_allocation_snapshot  # type: ignore[arg-type]
         )
         if type(recommendation) is not AllocationDecision:
             raise ValueError("allocation policy decision is invalid")
@@ -4737,6 +5226,161 @@ class PortfolioSimulator:
             exited.add(pending.symbol)
         return survivors, exited
 
+    def _execute_v5_pending_add_ons(
+        self,
+        pending_add_ons: list[PendingAddOn],
+        ticker_ohlcv: Mapping[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+    ) -> list[PendingAddOn]:
+        survivors: list[PendingAddOn] = []
+        date_str = str(eval_date.date())
+        for pending in pending_add_ons:
+            trade = self._open_positions.get(pending.symbol)
+            if trade is None or not trade.remaining_qty:
+                self._add_on_outcomes["no_position"] += 1
+                continue
+            if pd.Timestamp(pending.target_entry_date).normalize() > eval_date.normalize():
+                survivors.append(pending)
+                continue
+            state = self._position_episode_states.get(pending.symbol)
+            if state is None:
+                raise ValueError("V5 add-on lacks position episode evidence")
+            if state.add_on_count >= MAXIMUM_ADD_ONS_PER_POSITION:
+                self._add_on_outcomes["cap"] += 1
+                continue
+            frame = ticker_ohlcv.get(pending.symbol)
+            bar = exact_session_row(frame, eval_date) if frame is not None else None
+            if bar is None or "Open" not in bar.index:
+                survivors.append(pending)
+                continue
+            reference_price = _finite_signal_number(bar["Open"])
+            if reference_price is None or reference_price <= 0:
+                self._add_on_outcomes["invalid_price"] += 1
+                continue
+            scenario = self.friction_scenario
+            if scenario is None:
+                raise ValueError("V5 friction scenario is missing")
+            total_equity = self._mark_open_equity(dict(ticker_ohlcv), eval_date)
+            if not math.isfinite(total_equity) or total_equity <= 0:
+                self._add_on_outcomes["risk"] += 1
+                continue
+            if pending.risk_fraction > 0.01:
+                self._add_on_outcomes["risk"] += 1
+                continue
+            execution_price = reference_price * (
+                1
+                + (scenario.half_spread_bps + scenario.market_impact_bps)
+                / 10_000.0
+            )
+            cash_per_share = execution_price * (
+                1 + scenario.commission_bps / 10_000.0
+            )
+            current_qty = float(trade.remaining_qty)
+            current_notional = reference_price * current_qty
+            engine_cap_fraction = min(
+                self.position_risk_pct / self.stop_loss_pct,
+                1.0,
+            )
+            aggregate_cap_fraction = min(
+                engine_cap_fraction,
+                pending.notional_fraction_cap
+                if pending.notional_fraction_cap is not None
+                else engine_cap_fraction,
+            )
+            available_notional = (
+                total_equity * aggregate_cap_fraction - current_notional
+            )
+            if available_notional <= 1e-12:
+                self._add_on_outcomes["cap"] += 1
+                continue
+            if self._equity <= 1e-12:
+                self._add_on_outcomes["cash"] += 1
+                continue
+            current_risk = max(trade.entry_price - trade.stop_price, 0.0) * current_qty
+            incremental_risk_budget = min(
+                total_equity * pending.risk_fraction,
+                total_equity * 0.01 - current_risk,
+            )
+            loss_per_share = max(execution_price - trade.stop_price, 0.0)
+            if loss_per_share > 0 and incremental_risk_budget <= 1e-12:
+                self._add_on_outcomes["risk"] += 1
+                continue
+            quantity = min(
+                self._equity / cash_per_share,
+                available_notional / execution_price,
+            )
+            if loss_per_share > 0:
+                quantity = min(quantity, incremental_risk_budget / loss_per_share)
+            if not math.isfinite(quantity) or quantity <= 1e-12:
+                self._add_on_outcomes["risk"] += 1
+                continue
+            fill = apply_friction(
+                side="BUY",
+                reference_price=reference_price,
+                quantity=quantity,
+                scenario=scenario,
+            )
+            if -fill.cash_delta > self._equity + 1e-8:
+                self._add_on_outcomes["cash"] += 1
+                continue
+            prior_buy_rows = [
+                row
+                for row in self._fill_rows
+                if row.get("EpisodeId") == state.episode_id
+                and row.get("Action") == "BUY"
+            ]
+            acquired_quantity = sum(
+                float(row["Quantity"]) for row in prior_buy_rows
+            )
+            acquired_value = sum(
+                float(row["ExecutionPrice"]) * float(row["Quantity"])
+                for row in prior_buy_rows
+            )
+            old_stop = trade.stop_price
+            new_quantity = current_qty + quantity
+            weighted_entry = (
+                acquired_value + fill.execution_price * quantity
+            ) / (acquired_quantity + quantity)
+            trade.entry_price = weighted_entry
+            trade.qty = new_quantity
+            trade.remaining_qty = new_quantity
+            trade.peak_close = max(trade.peak_close or weighted_entry, weighted_entry)
+            trade.realized_pnl -= fill.commission_usd
+            if trade.stop_price != old_stop:
+                raise ValueError("add-on loosened the existing protective stop")
+            self._equity = round(self._equity + fill.cash_delta, 2)
+            if self._equity < -1e-9:
+                raise ValueError("V5 add-on would create leverage")
+            reason = f"add_on:{pending.reason_code}"
+            self._record_v5_fill(
+                date=date_str,
+                ticker=pending.symbol,
+                reason=reason,
+                fill=fill,
+                episode_id=state.episode_id,
+            )
+            self._record_transaction(
+                date=date_str,
+                ticker=pending.symbol,
+                action="ADD",
+                price=fill.execution_price,
+                quantity=quantity,
+                reason=reason,
+            )
+            state.add_on_count += 1
+            state.entry_price = weighted_entry
+            state.quantity_path.append(
+                PositionQuantityChangeV5(
+                    session=date_str,
+                    action="add_on",
+                    quantity_after=new_quantity,
+                    execution_price=fill.execution_price,
+                    reason=reason,
+                )
+            )
+            self._add_on_outcomes["executed"] += 1
+        return survivors
+
     def _apply_v5_intraday_stops(
         self,
         ticker_ohlcv: Mapping[str, pd.DataFrame],
@@ -4841,7 +5485,26 @@ class PortfolioSimulator:
             protective_stop_candidates=tuple(sorted(stop_candidates)),
             market=market,
         )
-        decision = self._adapter_policy_client().evaluate_exit(snapshot)
+        policy_snapshot: object = snapshot
+        if self._using_policy_v3():
+            if self._v3_ticker_ohlcv is None:
+                raise ValueError("V3 exit portfolio context is unavailable")
+            episode_state = self._position_episode_states.get(symbol)
+            if episode_state is None or episode_state.minimum_completed_bar_price is None:
+                raise ValueError("V3 exit episode context is unavailable")
+            policy_snapshot = StrategyPolicyAdapterV3.build_exit_snapshot(
+                base=snapshot,
+                features=self._v3_holding_features(
+                    symbol=symbol,
+                    session=eval_date,
+                    history=ohlcv,
+                ),
+                equity=self._mark_equity(dict(self._v3_ticker_ohlcv), eval_date),
+                lowest_price=episode_state.minimum_completed_bar_price,
+            )
+        decision = self._adapter_policy_client().evaluate_exit(  # type: ignore[arg-type]
+            policy_snapshot
+        )
         if type(decision) is not ExitDecision:
             raise ValueError("exit policy decision is invalid")
         decision = validate_exit_decision(snapshot, decision)
@@ -4883,14 +5546,99 @@ class PortfolioSimulator:
             actions=close_actions,
         )
 
+    def _queue_v3_add_on_after_close(
+        self,
+        *,
+        symbol: str,
+        ohlcv: pd.DataFrame,
+        eval_date: pd.Timestamp,
+        market: MarketContextV1,
+        next_session: pd.Timestamp | None,
+        already_pending: bool,
+    ) -> PendingAddOn | None:
+        if not self._using_policy_v3():
+            return None
+        trade = self._open_positions.get(symbol)
+        state = self._position_episode_states.get(symbol)
+        if trade is None or state is None or not trade.remaining_qty:
+            self._add_on_outcomes["no_position"] += 1
+            return None
+        if already_pending:
+            self._add_on_outcomes["already_pending"] += 1
+            return None
+        if state.add_on_count >= MAXIMUM_ADD_ONS_PER_POSITION or next_session is None:
+            self._add_on_outcomes["cap"] += 1
+            return None
+        bar = exact_session_row(ohlcv, eval_date)
+        if bar is None or "Close" not in bar.index:
+            self._add_on_outcomes["invalid_price"] += 1
+            return None
+        close = _finite_signal_number(bar["Close"])
+        if close is None or close <= 0:
+            self._add_on_outcomes["invalid_price"] += 1
+            return None
+        if (
+            state.maximum_completed_bar_price is None
+            or state.minimum_completed_bar_price is None
+        ):
+            raise ValueError("V3 add-on episode extrema are unavailable")
+        if self._v3_ticker_ohlcv is None:
+            raise ValueError("V3 add-on portfolio context is unavailable")
+        total_equity = self._mark_equity(dict(self._v3_ticker_ohlcv), eval_date)
+        current_qty = float(trade.remaining_qty)
+        open_risk = max(trade.entry_price - trade.stop_price, 0.0) * current_qty
+        snapshot = StrategyPolicyAdapterV3.build_add_on_snapshot(
+            market=market,
+            entry_price=trade.entry_price,
+            current_price=close,
+            current_quantity=current_qty,
+            equity=total_equity,
+            cash=self._equity,
+            open_position_risk=open_risk,
+            days_held=trade.days_held,
+            add_on_count=state.add_on_count,
+            highest_price=max(
+                state.maximum_completed_bar_price,
+                trade.entry_price,
+                close,
+            ),
+            lowest_price=min(
+                state.minimum_completed_bar_price,
+                trade.entry_price,
+                close,
+            ),
+            features=self._v3_holding_features(
+                symbol=symbol,
+                session=eval_date,
+                history=ohlcv,
+            ),
+        )
+        decision = self._adapter_policy_client().evaluate_add_on(snapshot)  # type: ignore[attr-defined]
+        if type(decision) is not AddOnDecisionV3:
+            raise ValueError("add-on policy decision is invalid")
+        decision = validate_add_on_decision(snapshot, decision)
+        if not decision.add:
+            return None
+        pending = PendingAddOn(
+            symbol=symbol,
+            signal_date=str(eval_date.date()),
+            target_entry_date=str(next_session.date()),
+            risk_fraction=decision.risk_fraction,
+            notional_fraction_cap=decision.notional_fraction_cap,
+            reason_code=decision.reason_code,
+        )
+        self._add_on_outcomes["queued"] += 1
+        return pending
+
     @staticmethod
     def _remap_v5_pending_actions(
         pending_entries: list[PendingEntry],
         pending_exits: list[PendingPolicyExit],
+        pending_add_ons: list[PendingAddOn],
         remaps: Mapping[str, str],
-    ) -> tuple[list[PendingEntry], list[PendingPolicyExit]]:
+    ) -> tuple[list[PendingEntry], list[PendingPolicyExit], list[PendingAddOn]]:
         if not remaps:
-            return pending_entries, pending_exits
+            return pending_entries, pending_exits, pending_add_ons
         remapped_entries: list[PendingEntry] = []
         for pending in pending_entries:
             symbol = str(pending.signal.get("symbol", "")).upper()
@@ -4912,7 +5660,18 @@ class PortfolioSimulator:
             )
             for pending in pending_exits
         ]
-        return remapped_entries, remapped_exits
+        remapped_add_ons = [
+            PendingAddOn(
+                symbol=remaps.get(pending.symbol, pending.symbol),
+                signal_date=pending.signal_date,
+                target_entry_date=pending.target_entry_date,
+                risk_fraction=pending.risk_fraction,
+                notional_fraction_cap=pending.notional_fraction_cap,
+                reason_code=pending.reason_code,
+            )
+            for pending in pending_add_ons
+        ]
+        return remapped_entries, remapped_exits, remapped_add_ons
 
     def _apply_identity_transitions(
         self,

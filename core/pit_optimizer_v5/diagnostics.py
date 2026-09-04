@@ -402,6 +402,8 @@ def _validate_episode_quantity_path(
     previous_session_position = -1
     cumulative_quantity = Decimal(0)
     add_on_count = 0
+    bought_execution_value = Decimal(0)
+    bought_quantity = Decimal(0)
     for index, (row, change) in enumerate(zip(rows, path, strict=True)):
         session = str(row["Date"])
         session_position = session_positions.get(session)
@@ -427,6 +429,12 @@ def _validate_episode_quantity_path(
         if action == "BUY":
             expected_action = "entry" if index == 0 else "add_on"
             cumulative_quantity += quantity
+            bought_quantity += quantity
+            bought_execution_value += quantity * _d(
+                row["ExecutionPrice"],
+                "episode buy execution price",
+                positive=True,
+            )
             if expected_action == "add_on":
                 add_on_count += 1
         elif action == "SELL":
@@ -454,6 +462,7 @@ def _validate_episode_quantity_path(
 
     first = rows[0]
     last = rows[-1]
+    weighted_entry_price = bought_execution_value / bought_quantity
     if (
         str(first["Action"]) != "BUY"
         or str(last["Action"]) != "SELL"
@@ -466,7 +475,7 @@ def _validate_episode_quantity_path(
         or episode.exit_reason != str(last["Reason"])
         or not math.isclose(
             episode.entry_price,
-            float(first["ExecutionPrice"]),
+            float(weighted_entry_price),
             rel_tol=0.0,
             abs_tol=1e-10,
         )
