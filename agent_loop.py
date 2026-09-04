@@ -21030,6 +21030,83 @@ def _v4_worker_runner(
     )
 
 
+def _v4_prices_provenance_path(
+    raw_path: str,
+    *,
+    allowed_root: Path,
+) -> Path:
+    """Resolve one manifest path without crossing the authenticated source root."""
+
+    root = Path(allowed_root)
+    try:
+        root_info = root.lstat()
+    except OSError as exc:
+        raise ConfigurationError(
+            "optimizer v4 prices provenance root is unavailable"
+        ) from exc
+    if (
+        not root.is_absolute()
+        or not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or _has_reparse_point(root)
+    ):
+        raise ConfigurationError(
+            "optimizer v4 prices provenance root is not canonical"
+        )
+    selected = Path(raw_path)
+    if not raw_path or (not selected.is_absolute() and selected.drive):
+        raise ConfigurationError("optimizer v4 prices provenance path is invalid")
+    try:
+        relative = (
+            selected.relative_to(root)
+            if selected.is_absolute()
+            else selected
+        )
+    except ValueError as exc:
+        raise ConfigurationError(
+            "optimizer v4 prices provenance escapes the source root"
+        ) from exc
+    if not relative.parts or any(part == ".." for part in relative.parts):
+        raise ConfigurationError(
+            "optimizer v4 prices provenance path contains traversal"
+        )
+
+    candidate = root.joinpath(*relative.parts)
+    current = root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise ConfigurationError(
+                "optimizer v4 prices provenance path is unavailable"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or _has_reparse_point(current):
+            raise ConfigurationError(
+                "optimizer v4 prices provenance path contains a link or reparse point"
+            )
+        final = index == len(relative.parts) - 1
+        if (final and not stat.S_ISREG(info.st_mode)) or (
+            not final and not stat.S_ISDIR(info.st_mode)
+        ):
+            raise ConfigurationError(
+                "optimizer v4 prices provenance path is not a regular file"
+            )
+
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ConfigurationError(
+            "optimizer v4 prices provenance path cannot be resolved"
+        ) from exc
+    if not _is_relative_to(resolved, resolved_root):
+        raise ConfigurationError(
+            "optimizer v4 prices provenance escapes the source root"
+        )
+    return resolved
+
+
 def _evaluate_v4_panel(
     config: object,
     *,
@@ -21079,14 +21156,12 @@ def _evaluate_v4_panel(
         or not raw_prices_provenance
     ):
         raise ConfigurationError("optimizer v4 prices provenance is not authenticated")
-    prices_provenance = Path(raw_prices_provenance)
-    if not prices_provenance.is_absolute():
-        prices_provenance = config.source_root / prices_provenance
-    prices_provenance = prices_provenance.resolve(strict=False)
+    prices_provenance = _v4_prices_provenance_path(
+        raw_prices_provenance,
+        allowed_root=config.source_root,
+    )
     if (
-        prices_provenance.is_symlink()
-        or not prices_provenance.is_file()
-        or _file_sha256(prices_provenance) != plan.prices_provenance_sha256
+        _file_sha256(prices_provenance) != plan.prices_provenance_sha256
     ):
         raise ConfigurationError("optimizer v4 prices provenance differs from the plan")
 
