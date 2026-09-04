@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 import hashlib
 import json
 import math
@@ -493,6 +493,28 @@ class StructuralTemplateV5:
         return _sha256(self.to_primitive())
 
 
+def _validated_template_assignment_digests_v5(
+    *,
+    template: StructuralTemplateV5,
+    assignment: VariantAssignmentV5,
+) -> tuple[str, str]:
+    """Validate one exact template assignment and return its bound digests."""
+
+    axis_names = tuple(axis.name for axis in template.axes)
+    assignment_names = tuple(name for name, _ in assignment.values)
+    if assignment_names != axis_names:
+        raise ValueError(
+            "experiment assignment axes must exactly match the structural template"
+        )
+    for axis, (_, value) in zip(template.axes, assignment.values, strict=True):
+        permitted_values = tuple(_literal_identity(item) for item in axis.values)
+        if _literal_identity(value) not in permitted_values:
+            raise ValueError(
+                "experiment assignment value is outside its strictly typed template axis"
+            )
+    return template.sha256, assignment.sha256
+
+
 @dataclass(frozen=True, slots=True)
 class RenderedVariantV5:
     """A rendered assignment whose source bytes exactly match its policy identity."""
@@ -527,9 +549,9 @@ class RenderedVariantV5:
 
 @dataclass(frozen=True, slots=True)
 class ExperimentIdentityV5:
-    """Identity of one policy-or-pre-validation failure in one evaluation context."""
+    """Identity of one validated policy revision in one evaluation context."""
 
-    policy_revision_sha256: str | None
+    policy_revision_sha256: str
     parent_revision_sha256: str
     hypothesis_sha256: str
     template_sha256: str
@@ -538,8 +560,7 @@ class ExperimentIdentityV5:
     discovery_plan_sha256: str
 
     def __post_init__(self) -> None:
-        if self.policy_revision_sha256 is not None:
-            _digest(self.policy_revision_sha256, "experiment policy revision")
+        _digest(self.policy_revision_sha256, "experiment policy revision")
         for value, label in (
             (self.parent_revision_sha256, "experiment parent revision"),
             (self.hypothesis_sha256, "experiment hypothesis"),
@@ -553,6 +574,48 @@ class ExperimentIdentityV5:
 
     def to_primitive(self) -> dict[str, object]:
         """Return all policy lineage and evaluation-context bindings."""
+
+        return {
+            "policy_revision_sha256": self.policy_revision_sha256,
+            "parent_revision_sha256": self.parent_revision_sha256,
+            "hypothesis_sha256": self.hypothesis_sha256,
+            "template_sha256": self.template_sha256,
+            "assignment_sha256": self.assignment_sha256,
+            "round_index": self.round_index,
+            "discovery_plan_sha256": self.discovery_plan_sha256,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self.to_primitive())
+
+
+@dataclass(frozen=True, slots=True)
+class PreValidationInvalidExperimentIdentityV5:
+    """Typed identity for a variant rejected before policy revision validation."""
+
+    parent_revision_sha256: str
+    hypothesis_sha256: str
+    template_sha256: str
+    assignment_sha256: str
+    round_index: int
+    discovery_plan_sha256: str
+    policy_revision_sha256: None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.parent_revision_sha256, "experiment parent revision"),
+            (self.hypothesis_sha256, "experiment hypothesis"),
+            (self.template_sha256, "experiment template"),
+            (self.assignment_sha256, "experiment assignment"),
+            (self.discovery_plan_sha256, "experiment discovery plan"),
+        ):
+            _digest(value, label)
+        if type(self.round_index) is not int or self.round_index <= 0:
+            raise ValueError("experiment round index must be a positive integer")
+
+    def to_primitive(self) -> dict[str, object]:
+        """Return explicit null policy identity and all pre-validation bindings."""
 
         return {
             "policy_revision_sha256": self.policy_revision_sha256,
@@ -611,12 +674,16 @@ def derive_experiment_identity_v5(
         raise ValueError("experiment parent revision differs from its template")
     if template.hypothesis_id != hypothesis.hypothesis_id:
         raise ValueError("experiment hypothesis differs from its template")
+    template_sha256, assignment_sha256 = _validated_template_assignment_digests_v5(
+        template=template,
+        assignment=assignment,
+    )
     return ExperimentIdentityV5(
         policy_revision_sha256=policy_revision.sha256,
         parent_revision_sha256=parent_revision_sha256,
         hypothesis_sha256=_sha256(hypothesis),
-        template_sha256=template.sha256,
-        assignment_sha256=assignment.sha256,
+        template_sha256=template_sha256,
+        assignment_sha256=assignment_sha256,
         round_index=round_index,
         discovery_plan_sha256=discovery_plan_sha256,
     )
@@ -630,7 +697,7 @@ def derive_pre_validation_invalid_experiment_identity_v5(
     assignment: VariantAssignmentV5,
     round_index: int,
     discovery_plan_sha256: str,
-) -> ExperimentIdentityV5:
+) -> PreValidationInvalidExperimentIdentityV5:
     """Construct the sole identity form permitted before policy validation succeeds."""
 
     if type(hypothesis) is not HypothesisV5:
@@ -643,12 +710,15 @@ def derive_pre_validation_invalid_experiment_identity_v5(
         raise ValueError("pre-validation experiment parent differs from its template")
     if template.hypothesis_id != hypothesis.hypothesis_id:
         raise ValueError("pre-validation experiment hypothesis differs from its template")
-    return ExperimentIdentityV5(
-        policy_revision_sha256=None,
+    template_sha256, assignment_sha256 = _validated_template_assignment_digests_v5(
+        template=template,
+        assignment=assignment,
+    )
+    return PreValidationInvalidExperimentIdentityV5(
         parent_revision_sha256=parent_revision_sha256,
         hypothesis_sha256=_sha256(hypothesis),
-        template_sha256=template.sha256,
-        assignment_sha256=assignment.sha256,
+        template_sha256=template_sha256,
+        assignment_sha256=assignment_sha256,
         round_index=round_index,
         discovery_plan_sha256=discovery_plan_sha256,
     )
@@ -676,6 +746,7 @@ __all__ = [
     "LiteralAxisV5",
     "LiteralValueV5",
     "PolicyRevisionIdentityV5",
+    "PreValidationInvalidExperimentIdentityV5",
     "RenderedVariantV5",
     "SourceBundleV5",
     "SourceFileV5",
