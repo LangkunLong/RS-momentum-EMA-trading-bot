@@ -182,7 +182,16 @@ class PriceIdentityTransitionContract:
 
     def resolve_open_holding(self, ticker: str, on_date: date | str) -> str:
         """Return an approved identity or fail closed after an ended identity."""
-        symbol = _canonical_ticker(ticker)
+        ticker_validator = (
+            _canonical_ticker_v3
+            if any(
+                char.isdigit()
+                for identity_ticker in self.identities
+                for char in identity_ticker
+            )
+            else _canonical_ticker
+        )
+        symbol = ticker_validator(ticker)
         when = date.fromisoformat(on_date) if isinstance(on_date, str) else on_date
         if not isinstance(when, date):
             raise ValueError("holding transition date is invalid")
@@ -260,6 +269,15 @@ def _regular_file(path: str | Path) -> Path:
 
 
 def _canonical_ticker(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("ticker must be text")
+    ticker = value.strip().upper()
+    if not ticker or len(ticker) > 8 or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-" for char in ticker):
+        raise ValueError("ticker is not canonical")
+    return ticker
+
+
+def _canonical_ticker_v3(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("ticker must be text")
     ticker = value.strip().upper()
@@ -574,7 +592,12 @@ class PITDataBundle:
 
     def _load_symbols(self) -> frozenset[str]:
         prices = self._connection.execute("SELECT DISTINCT ticker FROM price").fetchall()
-        return frozenset(_canonical_ticker(row[0]) for row in prices)
+        return frozenset(self._canonical_bundle_ticker(row[0]) for row in prices)
+
+    def _canonical_bundle_ticker(self, value: object) -> str:
+        if self.metadata["schema_version"] == "3":
+            return _canonical_ticker_v3(value)
+        return _canonical_ticker(value)
 
     def _validate_integrity(self) -> None:
         if self.metadata["schema_version"] == "3":
@@ -623,7 +646,8 @@ class PITDataBundle:
                 (
                     row
                     for row in nonmember_fundamental
-                    if _canonical_ticker(row[0]) not in self._tradable_symbols
+                    if self._canonical_bundle_ticker(row[0])
+                    not in self._tradable_symbols
                 ),
                 None,
             )
@@ -636,7 +660,7 @@ class PITDataBundle:
             raise ValueError("point-in-time bundle contains fundamentals outside membership")
         if self.metadata["schema_version"] in {"2", "3"}:
             fundamental_symbols = {
-                _canonical_ticker(row[0])
+                self._canonical_bundle_ticker(row[0])
                 for row in self._connection.execute(
                     "SELECT DISTINCT ticker FROM fundamentals"
                 ).fetchall()
@@ -737,7 +761,7 @@ class PITDataBundle:
     def security_lineage_id(self, ticker: str) -> str:
         """Return a tradable's authenticated price-identity chain identifier."""
 
-        symbol = _canonical_ticker(ticker)
+        symbol = self._canonical_bundle_ticker(ticker)
         if symbol not in self._tradable_symbols:
             raise ValueError("security lineage is available only for tradable symbols")
         if self._security_lineage_ids is None:
@@ -781,8 +805,13 @@ class PITDataBundle:
             "factor_anchor",
         }
         identities: dict[str, Mapping[str, object]] = {}
+        identity_ticker = (
+            _canonical_ticker_v3
+            if self.metadata["schema_version"] == "3"
+            else _canonical_ticker
+        )
         for raw_ticker, raw_identity in raw_contracts.items():
-            ticker = _canonical_ticker(raw_ticker)
+            ticker = identity_ticker(raw_ticker)
             if ticker != raw_ticker or not isinstance(raw_identity, dict) or set(raw_identity) != expected_fields:
                 raise ValueError("prices provenance contains an invalid identity contract row")
             start = date.fromisoformat(str(raw_identity["admitted_start"]))
@@ -828,12 +857,21 @@ class PITDataBundle:
                         "prices provenance contains an invalid explicit identity transition"
                     )
                 try:
+                    predecessor = _canonical_ticker_v3(
+                        raw_transition["predecessor"]
+                    )
+                    successor = _canonical_ticker_v3(raw_transition["successor"])
+                    if (
+                        predecessor != raw_transition["predecessor"]
+                        or successor != raw_transition["successor"]
+                    ):
+                        raise ValueError
                     transition = IdentityTransition(
                         effective_date=date.fromisoformat(
                             str(raw_transition["effective_date"])
                         ),
-                        predecessor=_canonical_ticker(raw_transition["predecessor"]),
-                        successor=_canonical_ticker(raw_transition["successor"]),
+                        predecessor=predecessor,
+                        successor=successor,
                         chain_id=str(raw_transition["chain_id"]),
                         continuity_kind=str(raw_transition["continuity_kind"]),
                     )
@@ -1047,7 +1085,12 @@ class PITDataBundle:
         start_date: pd.Timestamp,
         end_date: pd.Timestamp,
     ) -> pd.DataFrame:
-        symbols = tuple(sorted({_canonical_ticker(ticker) for ticker in tickers}))
+        canonical_ticker = getattr(
+            self, "_canonical_bundle_ticker", _canonical_ticker
+        )
+        symbols = tuple(
+            sorted({canonical_ticker(ticker) for ticker in tickers})
+        )
         if not symbols:
             return pd.DataFrame()
         if pd.Timestamp(end_date) > self.data_cutoff:
@@ -1065,7 +1108,7 @@ class PITDataBundle:
         if frame.empty:
             return frame
         frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="raise").dt.normalize()
-        frame["ticker"] = frame["ticker"].map(_canonical_ticker)
+        frame["ticker"] = frame["ticker"].map(canonical_ticker)
         if frame.duplicated(["trade_date", "ticker"]).any():
             raise ValueError("point-in-time price bundle contains duplicate bars")
         for column in ("Open", "High", "Low", "Close", "Volume"):
@@ -1122,7 +1165,7 @@ class PITDataBundle:
     ) -> dict[str, Any]:
         """Return only fundamental records publicly available by *as_of_date*."""
 
-        ticker = _canonical_ticker(symbol)
+        ticker = self._canonical_bundle_ticker(symbol)
         if pd.Timestamp(as_of_date) > self.data_cutoff:
             raise ValueError("requested fundamental date exceeds point-in-time bundle cutoff")
         cutoff = pd.Timestamp(as_of_date).date().isoformat()
@@ -1163,7 +1206,7 @@ class PITDataBundle:
 
         bounds: dict[str, tuple[date, date]] = {}
         for raw_ticker, raw_bounds in date_bounds.items():
-            ticker = _canonical_ticker(raw_ticker)
+            ticker = self._canonical_bundle_ticker(raw_ticker)
             if ticker in bounds or not isinstance(raw_bounds, tuple) or len(raw_bounds) != 2:
                 raise ValueError("fundamental state date bounds are invalid")
             start = pd.Timestamp(raw_bounds[0]).date()
@@ -1189,7 +1232,7 @@ class PITDataBundle:
         )
         ticker_groups = iter(groupby(
             rows,
-            key=lambda row: _canonical_ticker(row["ticker"]),
+            key=lambda row: self._canonical_bundle_ticker(row["ticker"]),
         ))
         next_group = next(ticker_groups, None)
         for ticker in symbols:
@@ -1374,7 +1417,7 @@ class PITDataBundle:
         mutating the forward cache backwards.
         """
 
-        ticker = _canonical_ticker(symbol)
+        ticker = self._canonical_bundle_ticker(symbol)
         timestamp = pd.Timestamp(as_of_date)
         if timestamp > self.data_cutoff:
             raise ValueError("requested fundamental date exceeds point-in-time bundle cutoff")
