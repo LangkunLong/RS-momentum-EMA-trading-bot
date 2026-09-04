@@ -281,6 +281,12 @@ class PortfolioFeaturesV3(_CanonicalContractV3):
         _integer(self.pending_entry_count, "pending_entry_count")
         for name in ("sector_exposures", "industry_exposures"):
             exposures = _validate_exposures(getattr(self, name), name)
+            if gross == 0.0:
+                if exposures:
+                    raise ValueError(f"{name} must be empty at zero gross exposure")
+                continue
+            if not exposures:
+                raise ValueError(f"{name} must not be empty for positive gross exposure")
             total = math.fsum(value for _key, value in exposures)
             if not _same(total, gross):
                 raise ValueError(f"{name} do not reconcile to gross exposure")
