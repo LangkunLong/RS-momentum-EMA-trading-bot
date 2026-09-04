@@ -327,17 +327,59 @@ def _validate_snapshot_attribute_contracts(tree: ast.Module) -> None:
                 raise ValueError("policy market attribute is outside the fixed contract")
 
 
+def validate_policy_source_ast(
+    *,
+    path: str,
+    source: str,
+    required_public_symbols: tuple[str, ...],
+) -> ast.Module:
+    """Parse one complete policy module and enforce its exact public function surface.
+
+    This panel-independent structural service is intentionally narrower than the
+    legacy V2/V4 policy-language validator below.  Callers with a different
+    policy interface can reuse the parse/compile/export checks while retaining
+    their own closed import, contract, and authoring-scope rules.
+    """
+
+    if (
+        type(path) is not str
+        or not path
+        or type(source) is not str
+        or type(required_public_symbols) is not tuple
+        or not required_public_symbols
+        or len(required_public_symbols) != len(set(required_public_symbols))
+        or any(
+            type(symbol) is not str or not symbol.isidentifier()
+            for symbol in required_public_symbols
+        )
+    ):
+        raise ValueError("policy source AST contract is invalid")
+    try:
+        tree = ast.parse(source, filename=path)
+        compile(tree, path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, TypeError) as exc:
+        raise ValueError("policy AST syntax is invalid") from exc
+    if any(isinstance(node, ast.AsyncFunctionDef) for node in tree.body):
+        raise ValueError("policy async definitions are forbidden")
+    public_functions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+    }
+    if public_functions != set(required_public_symbols):
+        raise ValueError("policy public symbols differ from the closed interface")
+    return tree
+
+
 def validate_policy_ast(*, path: str, source: str) -> None:
     """Enforce a closed pure-Python policy language without ambient capabilities."""
     if path not in _ALLOWED_PUBLIC or not isinstance(source, str):
         raise ValueError("policy AST path is invalid")
-    try:
-        tree = ast.parse(source, filename=path)
-        compile(tree, path, "exec", dont_inherit=True)
-    except SyntaxError as exc:
-        raise ValueError("policy AST syntax is invalid") from exc
-    if any(isinstance(node, ast.AsyncFunctionDef) for node in tree.body):
-        raise ValueError("policy async definitions are forbidden")
+    tree = validate_policy_source_ast(
+        path=path,
+        source=source,
+        required_public_symbols=tuple(sorted(_ALLOWED_PUBLIC[path])),
+    )
 
     local_functions = {
         node.name for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -1590,4 +1632,5 @@ __all__ = [
     "validate_candidate_sources",
     "validate_candidate_identity",
     "validate_policy_ast",
+    "validate_policy_source_ast",
 ]
