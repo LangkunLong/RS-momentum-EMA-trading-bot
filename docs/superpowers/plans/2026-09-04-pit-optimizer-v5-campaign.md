@@ -110,6 +110,7 @@ class ConfirmationAttemptCommitmentV5:
     prices_provenance_ref: ArtifactRefV5
     execution_profile_ref: ArtifactRefV5
     evaluator_contract_ref: ArtifactRefV5
+    scenario_grid_ref: ArtifactRefV5
     baseline_authority_ref: ArtifactRefV5
     sandbox_profile_ref: ArtifactRefV5
     retirement_domain_id: str
@@ -187,8 +188,9 @@ confirmation plan; it binds the frozen discovery champion and every evaluator de
 resolvable authenticated reference. Create `QualificationAttemptCommitmentV5` only after a
 completed `ConfirmationOutcomeV5` whose qualification-eligibility gate recomputes true, plus a
 separate operator decision. A failed or ineligible confirmation cannot be overridden by approval.
-Their exact lineage compositions are opened
-only by the later `confirm` or `qualify` command.
+Both attempt commitments bind an authenticated immutable friction/scenario-grid identity alongside
+the execution profile and evaluator contract. Their exact lineage compositions are opened only by
+the later `confirm` or `qualify` command.
 
 `RetirementLedgerLocatorV5.relative_path` follows the same containment and canonical-path rules as
 an artifact reference but names the one mutable append-only ledger. Its create-only pre-open
@@ -565,14 +567,18 @@ Do not expose or reserve the qualification panel in this task.
 
 Require retirement on success and failure, zero provider calls, exact three-universe coverage,
 out-of-time and out-of-security separation, same-panel baseline/candidate identity, closed
-`QualificationOutcomeV5` gate recomputation, and no mutation of search memory.
+`QualificationOutcomeV5` gate recomputation, authenticated equality of the baseline and candidate
+friction/scenario-grid identity (matching the qualification attempt commitment), and no mutation of
+search memory.
 
 - [ ] **Step 2: Implement the V5 qualification adapter**
 
 Reuse the existing create-only retirement ledger. Implement and register both
 `build-qualification-attempt` and `qualify` in `core/pit_optimizer_v5/cli.py`. Reconstruct the
-candidate only inside a disposable workspace, run baseline and candidate with the same V5 execution
-and sandbox profiles, write the closed `QualificationOutcomeV5`, and clean up before returning.
+candidate only inside a disposable workspace, run baseline and candidate with the same V5 execution,
+sandbox, and authenticated friction/scenario-grid identities, verify those identities match the
+attempt commitment and each evidence record, write the closed `QualificationOutcomeV5`, and clean
+up before returning.
 
 - [ ] **Step 3: Run focused holdout checks**
 
@@ -597,9 +603,11 @@ python -B -m core.pit_optimizer_v5.cli build-qualification-attempt --confirmatio
 Expected: a create-only `QualificationAttemptCommitmentV5` contains authenticated relative
 references for every required input, including the mutable retirement-ledger locator and exact
 immutable pre-open snapshot, and binds the exact confirmed policy before the held-out plan is opened.
+It also binds the immutable friction/scenario-grid reference used by both baseline and candidate.
 The builder reparses candidate/baseline evidence and fails closed unless confirmation status is
-`completed` and `eligible_to_request_qualification` recomputes true; operator approval authorizes the
-eligible stage but cannot bypass that evidence gate.
+`completed`, `eligible_to_request_qualification` recomputes true, and the qualification scenario-grid
+identity is authenticated and equal for the attempt, baseline, and candidate; operator approval
+authorizes the eligible stage but cannot bypass that evidence gate.
 
 - [ ] **Step 6: Execute the committed attempt**
 
@@ -608,8 +616,9 @@ python -B -m core.pit_optimizer_v5.cli qualify --attempt .artifacts/pit-optimize
 ```
 
 Success means the candidate's net annualized portfolio return is at least the manifest target and
-strictly exceeds the same-panel V5 baseline. Report trade count, exposure, drawdown, costs, and
-episode/year evidence, but do not convert them into a weighted score.
+strictly exceeds the same-panel V5 baseline evaluated under the exact shared authenticated
+friction/scenario-grid identity. Report trade count, exposure, drawdown, costs, and episode/year
+evidence, but do not convert them into a weighted score.
 
 ### Task 8: Prepare Full Replay Without Starting It
 
