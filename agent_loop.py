@@ -7896,6 +7896,7 @@ class PolicyWorkerSession:
         monotonic: Callable[[], float] | None = None,
         startup_timeout_seconds: float = 30.0,
     ) -> None:
+        from core.strategy_policy import SUPPORTED_POLICY_INTERFACE_VERSIONS
         from core.strategy_policy.worker import (
             DecisionDeterminismGuard,
             initial_chain_sha256,
@@ -7927,10 +7928,17 @@ class PolicyWorkerSession:
             or not math.isfinite(float(wall_deadline))
         ):
             raise SandboxError("policy worker session wall deadline is invalid")
+        policy_interface_version = getattr(bootstrap, "interface_version", None)
+        if (
+            type(policy_interface_version) is not int
+            or policy_interface_version not in SUPPORTED_POLICY_INTERFACE_VERSIONS
+        ):
+            raise SandboxError("policy worker interface version is unsupported")
         self._process = process
         self.package_root = package_root
         self._daemon = daemon
         self._bootstrap = bootstrap
+        self._policy_interface_version = policy_interface_version
         self._method_timeout_seconds = method_timeout_seconds
         self._startup_timeout_seconds = float(startup_timeout_seconds)
         self._fold_timeout_seconds = float(fold_timeout_seconds)
@@ -8171,7 +8179,12 @@ class PolicyWorkerSession:
                     raise SandboxError(
                         "policy worker response authentication failed"
                     ) from exc
-                self._guard.observe(method, snapshot, decision)
+                self._guard.observe(
+                    method,
+                    snapshot,
+                    decision,
+                    interface_version=self._policy_interface_version,
+                )
                 self._previous_hmac = request.hmac_sha256
                 self._sequence += 1
                 return decision
