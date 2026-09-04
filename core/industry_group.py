@@ -4,13 +4,107 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+import sqlite3
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
+from typing import Protocol
 
 from config import settings
 from core.data_client import fetch_company_profile
 
 logger = logging.getLogger(__name__)
+
+
+class _AuthenticatedBundle(Protocol):
+    """Narrow authenticated-bundle surface needed by PIT classification reads."""
+
+    metadata: Mapping[str, str]
+    _connection: sqlite3.Connection
+
+
+@dataclass(frozen=True, slots=True)
+class PITIndustryAssignment:
+    """One classification that was publicly effective by a completed session."""
+
+    as_of_date: date
+    group_id: str
+
+
+def load_pit_industry_assignments_as_of(
+    bundle: _AuthenticatedBundle,
+    *,
+    session: date,
+    symbols: Iterable[str],
+) -> Mapping[str, PITIndustryAssignment]:
+    """Return each requested symbol's latest authenticated classification.
+
+    The schema-V3 bundle stores public/effective classification dates in
+    ``industry_group_snapshots.as_of_date``.  This adapter deliberately queries
+    only rows on or before ``session`` and selects the latest row per symbol; it
+    never consults the current provider/cache used by :func:`load_industry_map`.
+
+    Args:
+        bundle: Open, authenticated, query-only schema-V3 PIT bundle.
+        session: Completed session whose public information set is requested.
+        symbols: Canonical active-union symbols (plus an optional held symbol).
+
+    Returns:
+        Mapping from symbols with an available assignment to immutable records.
+
+    Raises:
+        ValueError: If the request or stored classification row is malformed.
+    """
+    if type(session) is not date:
+        raise ValueError("industry as-of session must be a date")
+    if bundle.metadata.get("schema_version") != "3":
+        raise ValueError("PIT industry assignments require a schema-V3 bundle")
+
+    requested = frozenset(_pit_symbol(symbol) for symbol in symbols)
+    if not requested:
+        return MappingProxyType({})
+
+    try:
+        rows = bundle._connection.execute(
+            "SELECT symbol, as_of_date, group_id FROM industry_group_snapshots "
+            "WHERE as_of_date <= ? ORDER BY symbol, as_of_date",
+            (session.isoformat(),),
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("schema-V3 bundle has no readable PIT industry snapshots") from exc
+
+    result: dict[str, PITIndustryAssignment] = {}
+    for row in rows:
+        symbol = _pit_symbol(row[0])
+        if symbol not in requested:
+            continue
+        try:
+            as_of_date = date.fromisoformat(str(row[1]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("PIT industry assignment date is invalid") from exc
+        if as_of_date > session:
+            raise ValueError("PIT industry assignment is after the requested session")
+        group_id = row[2]
+        if (
+            not isinstance(group_id, str)
+            or not group_id
+            or group_id.strip() != group_id
+            or any(ord(character) < 32 for character in group_id)
+        ):
+            raise ValueError("PIT industry group_id is invalid")
+        previous = result.get(symbol)
+        if previous is not None and as_of_date <= previous.as_of_date:
+            raise ValueError("PIT industry assignments are not uniquely ordered")
+        result[symbol] = PITIndustryAssignment(as_of_date, group_id)
+    return MappingProxyType(result)
+
+
+def _pit_symbol(value: object) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value or value.upper() != value:
+        raise ValueError("PIT industry symbol must be canonical uppercase text")
+    return value
 
 
 def get_top_groups(
