@@ -7,10 +7,12 @@ from collections import OrderedDict
 from dataclasses import dataclass, fields
 import hashlib
 import hmac
+from importlib import import_module
 import json
 import secrets
 import sys
-from typing import Mapping
+from types import ModuleType
+from typing import Callable, Mapping
 
 from .contracts import (
     AllocationDecision,
@@ -34,6 +36,14 @@ POLICY_METHODS = (
     "select_eviction",
     "evaluate_exit",
 )
+POLICY_METHODS_V3 = (
+    "evaluate_entry",
+    "recommend_capacity",
+    "recommend_allocation",
+    "select_eviction",
+    "evaluate_add_on",
+    "evaluate_exit",
+)
 _METHOD_TYPES = {
     "evaluate_entry": (EntrySnapshot, EntryDecision),
     "recommend_capacity": (CapacitySnapshot, CapacityDecision),
@@ -41,6 +51,32 @@ _METHOD_TYPES = {
     "select_eviction": (EvictionSnapshot, EvictionDecision),
     "evaluate_exit": (ExitSnapshot, ExitDecision),
 }
+_SUPPORTED_INTERFACE_VERSIONS = frozenset({2, 3})
+
+
+def _method_types(interface_version: int) -> Mapping[str, tuple[type[object], type[object]]]:
+    if type(interface_version) is not int or interface_version not in _SUPPORTED_INTERFACE_VERSIONS:
+        raise ValueError("policy interface version is unsupported")
+    if interface_version == 2:
+        return _METHOD_TYPES
+    from .contracts_v3 import (
+        AddOnDecisionV3,
+        AddOnSnapshotV3,
+        AllocationSnapshotV3,
+        CapacitySnapshotV3,
+        EntrySnapshotV3,
+        EvictionSnapshotV3,
+        ExitSnapshotV3,
+    )
+
+    return {
+        "evaluate_entry": (EntrySnapshotV3, EntryDecision),
+        "recommend_capacity": (CapacitySnapshotV3, CapacityDecision),
+        "recommend_allocation": (AllocationSnapshotV3, AllocationDecision),
+        "select_eviction": (EvictionSnapshotV3, EvictionDecision),
+        "evaluate_add_on": (AddOnSnapshotV3, AddOnDecisionV3),
+        "evaluate_exit": (ExitSnapshotV3, ExitDecision),
+    }
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -103,8 +139,7 @@ class WorkerBootstrap:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("worker bootstrap schema is unsupported")
-        if type(self.interface_version) is not int or self.interface_version <= 0:
-            raise ValueError("worker bootstrap interface is invalid")
+        _method_types(self.interface_version)
         _b64(self.nonce_b64, 16, "nonce")
         _b64(self.hmac_key_b64, 32, "HMAC key")
 
@@ -148,8 +183,7 @@ class WorkerReady:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("worker ready schema is unsupported")
-        if type(self.interface_version) is not int or self.interface_version <= 0:
-            raise ValueError("worker ready interface is invalid")
+        _method_types(self.interface_version)
         if self.status != "ready":
             raise ValueError("worker ready status is invalid")
         _sha256(self.hmac_sha256, "ready HMAC")
@@ -168,7 +202,7 @@ class PolicyRequestEnvelope:
         if type(self.sequence) is not int or self.sequence <= 0:
             raise ValueError("policy sequence is invalid")
         _sha256(self.previous_hmac_sha256, "request chain")
-        if self.method not in _METHOD_TYPES:
+        if self.method not in frozenset(POLICY_METHODS).union(POLICY_METHODS_V3):
             raise ValueError("policy method is invalid")
         _sha256(self.payload_sha256, "request payload hash")
         if not isinstance(self.payload, Mapping):
@@ -189,7 +223,7 @@ class PolicyResponseEnvelope:
         if type(self.sequence) is not int or self.sequence <= 0:
             raise ValueError("policy sequence is invalid")
         _sha256(self.request_hmac_sha256, "response request binding")
-        if self.method not in _METHOD_TYPES:
+        if self.method not in frozenset(POLICY_METHODS).union(POLICY_METHODS_V3):
             raise ValueError("policy method is invalid")
         _sha256(self.payload_sha256, "response payload hash")
         if not isinstance(self.payload, Mapping):
@@ -245,17 +279,24 @@ def decode_worker_ready(raw: str, *, bootstrap: WorkerBootstrap) -> WorkerReady:
     return ready
 
 
-def _require_method_pair(method: str, value: object, *, response: bool) -> type[object]:
-    if method not in _METHOD_TYPES:
+def _require_method_pair(
+    method: str,
+    value: object,
+    *,
+    response: bool,
+    interface_version: int = 2,
+) -> type[object]:
+    method_types = _method_types(interface_version)
+    if method not in method_types:
         raise ValueError("policy method is invalid")
-    expected = _METHOD_TYPES[method][1 if response else 0]
+    expected = method_types[method][1 if response else 0]
     if type(value) is not expected:
         raise ValueError("policy method/payload pairing is invalid")
     return expected
 
 
 def _contract_from_payload(contract_type: type[object], payload: object) -> object:
-    """Rebuild interface-v2 contracts, including their nested market context."""
+    """Rebuild the version-selected closed contract from a scalar payload."""
     if not isinstance(payload, dict):
         raise ValueError("policy payload is invalid")
     raw = _canonical_bytes(payload).decode("utf-8")
@@ -273,7 +314,12 @@ def encode_policy_request(
     method: str,
     snapshot: object,
 ) -> tuple[str, PolicyRequestEnvelope]:
-    _require_method_pair(method, snapshot, response=False)
+    _require_method_pair(
+        method,
+        snapshot,
+        response=False,
+        interface_version=bootstrap.interface_version,
+    )
     if type(sequence) is not int or sequence <= 0:
         raise ValueError("policy sequence is invalid")
     _sha256(previous_hmac_sha256, "request chain")
@@ -328,9 +374,10 @@ def decode_policy_request(
     if value["previous_hmac_sha256"] != expected_previous_hmac_sha256:
         raise ValueError("policy request chain is invalid")
     method = value["method"]
-    if not isinstance(method, str) or method not in _METHOD_TYPES:
+    method_types = _method_types(bootstrap.interface_version)
+    if not isinstance(method, str) or method not in method_types:
         raise ValueError("policy method is invalid")
-    expected_type = _METHOD_TYPES[method][0]
+    expected_type = method_types[method][0]
     parsed = _contract_from_payload(expected_type, value["payload"])
     payload_sha256 = hashlib.sha256(_canonical_bytes(value["payload"])).hexdigest()
     if value["payload_sha256"] != payload_sha256:
@@ -351,7 +398,12 @@ def encode_policy_response(
     method: str,
     decision: object,
 ) -> tuple[str, PolicyResponseEnvelope]:
-    _require_method_pair(method, decision, response=True)
+    _require_method_pair(
+        method,
+        decision,
+        response=True,
+        interface_version=bootstrap.interface_version,
+    )
     if type(sequence) is not int or sequence <= 0:
         raise ValueError("policy sequence is invalid")
     _sha256(request_hmac_sha256, "response request binding")
@@ -408,9 +460,10 @@ def decode_policy_response(
         raise ValueError("policy response request binding is invalid")
     if value["method"] != expected_method:
         raise ValueError("policy response method binding is invalid")
-    if expected_method not in _METHOD_TYPES:
+    method_types = _method_types(bootstrap.interface_version)
+    if expected_method not in method_types:
         raise ValueError("policy method is invalid")
-    expected_type = _METHOD_TYPES[expected_method][1]
+    expected_type = method_types[expected_method][1]
     parsed = _contract_from_payload(expected_type, value["payload"])
     payload_sha256 = hashlib.sha256(_canonical_bytes(value["payload"])).hexdigest()
     if value["payload_sha256"] != payload_sha256:
@@ -428,10 +481,21 @@ class PolicyDeterminismProbe:
     method: str
     repeated_snapshot: object
     unrelated_snapshot: object
+    interface_version: int = 2
 
     def __post_init__(self) -> None:
-        _require_method_pair(self.method, self.repeated_snapshot, response=False)
-        _require_method_pair(self.method, self.unrelated_snapshot, response=False)
+        _require_method_pair(
+            self.method,
+            self.repeated_snapshot,
+            response=False,
+            interface_version=self.interface_version,
+        )
+        _require_method_pair(
+            self.method,
+            self.unrelated_snapshot,
+            response=False,
+            interface_version=self.interface_version,
+        )
         if _canonical_bytes(self.repeated_snapshot.to_primitive()) == _canonical_bytes(  # type: ignore[attr-defined]
             self.unrelated_snapshot.to_primitive()  # type: ignore[attr-defined]
         ):
@@ -444,9 +508,9 @@ def validate_policy_determinism_probes(
     """Validate the bounded, method-unique probe set before worker allocation."""
     if (
         type(probes) is not tuple
-        or not 1 <= len(probes) <= 5
+        or not 1 <= len(probes) <= 6
         or any(type(item) is not PolicyDeterminismProbe for item in probes)
-        or len({item.method for item in probes}) != len(probes)
+        or len({(item.interface_version, item.method) for item in probes}) != len(probes)
     ):
         raise ValueError("policy determinism probes are invalid")
     return probes  # type: ignore[return-value]
@@ -465,9 +529,20 @@ class DecisionDeterminismGuard:
     def observed_count(self) -> int:
         return len(self._observed)
 
-    def observe(self, method: str, snapshot: object, decision: object) -> None:
-        _require_method_pair(method, snapshot, response=False)
-        _require_method_pair(method, decision, response=True)
+    def observe(
+        self,
+        method: str,
+        snapshot: object,
+        decision: object,
+        *,
+        interface_version: int = 2,
+    ) -> None:
+        _require_method_pair(
+            method, snapshot, response=False, interface_version=interface_version
+        )
+        _require_method_pair(
+            method, decision, response=True, interface_version=interface_version
+        )
         key = (method, _canonical_bytes(snapshot.to_primitive()))  # type: ignore[attr-defined]
         rendered = _canonical_bytes(decision.to_primitive())  # type: ignore[attr-defined]
         previous = self._observed.get(key)
@@ -481,9 +556,44 @@ class DecisionDeterminismGuard:
             raise ValueError("candidate_nondeterminism")
 
 
+def _policy_dispatch(interface_version: int) -> dict[str, Callable[[object], object]]:
+    if interface_version == 2:
+        from . import entry, exit, risk
+
+        return {
+            "evaluate_entry": entry.evaluate_entry,
+            "recommend_capacity": risk.recommend_capacity,
+            "recommend_allocation": risk.recommend_allocation,
+            "select_eviction": risk.select_eviction,
+            "evaluate_exit": exit.evaluate_exit,
+        }
+    _method_types(interface_version)
+    module_exports = {
+        "entry": ("evaluate_entry",),
+        "risk": ("recommend_capacity", "recommend_allocation", "select_eviction"),
+        "position": ("evaluate_add_on",),
+        "exit": ("evaluate_exit",),
+    }
+    modules: dict[str, ModuleType] = {}
+    for module_name in module_exports:
+        module = import_module(f".v3.{module_name}", __package__)
+        if not isinstance(module, ModuleType):
+            raise TypeError("V3 policy module is invalid")
+        modules[module_name] = module
+    dispatch: dict[str, Callable[[object], object]] = {}
+    for module_name, exports in module_exports.items():
+        for export in exports:
+            function = getattr(modules[module_name], export, None)
+            if not callable(function):
+                raise TypeError(f"V3 policy export {module_name}.{export} is invalid")
+            dispatch[export] = function
+    if tuple(dispatch) != POLICY_METHODS_V3:
+        raise ValueError("V3 policy exports do not match the interface")
+    return dispatch
+
+
 def worker_main() -> int:
-    """Run one trusted wrapper around candidate policy modules."""
-    from . import entry, exit, risk
+    """Run one trusted wrapper around version-selected candidate policy modules."""
 
     bootstrap_raw = sys.stdin.buffer.readline(MAX_POLICY_LINE_BYTES + 2)
     if not bootstrap_raw or len(bootstrap_raw) > MAX_POLICY_LINE_BYTES + 1:
@@ -492,18 +602,12 @@ def worker_main() -> int:
         bootstrap = WorkerBootstrap.from_json(bootstrap_raw.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, ValueError):
         return 2
-    dispatch = {
-        "evaluate_entry": entry.evaluate_entry,
-        "recommend_capacity": risk.recommend_capacity,
-        "recommend_allocation": risk.recommend_allocation,
-        "select_eviction": risk.select_eviction,
-        "evaluate_exit": exit.evaluate_exit,
-    }
     try:
+        dispatch = _policy_dispatch(bootstrap.interface_version)
         ready = encode_worker_ready(bootstrap=bootstrap)
         sys.stdout.buffer.write(ready.encode("utf-8") + b"\n")
         sys.stdout.buffer.flush()
-    except (OSError, ValueError):
+    except (ImportError, OSError, TypeError, ValueError):
         return 2
     sequence = 1
     previous_hmac = initial_chain_sha256(bootstrap)
@@ -521,6 +625,10 @@ def worker_main() -> int:
                 expected_previous_hmac_sha256=previous_hmac,
             )
             decision = dispatch[request.method](snapshot)
+            if request.method == "evaluate_add_on":
+                from .contracts_v3 import validate_add_on_decision
+
+                validate_add_on_decision(snapshot, decision)
             line, _response = encode_policy_response(
                 bootstrap=bootstrap,
                 sequence=sequence,
@@ -544,6 +652,7 @@ __all__ = [
     "DecisionDeterminismGuard",
     "MAX_POLICY_LINE_BYTES",
     "POLICY_METHODS",
+    "POLICY_METHODS_V3",
     "PolicyDeterminismProbe",
     "PolicyRequestEnvelope",
     "PolicyResponseEnvelope",
