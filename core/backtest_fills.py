@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from typing import Literal
@@ -9,6 +11,57 @@ from typing import Literal
 
 Side = Literal["BUY", "SELL"]
 StopKind = Literal["gap_stop", "intraday_stop"]
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionProfileV5:
+    """Closed identity for the optimizer V5 execution semantics."""
+
+    schema_version: Literal[5]
+    close_policy_exit_timing: Literal["next_open"]
+    gap_stop_rule: Literal["open_then_stop"]
+    end_of_test_rule: Literal["last_session_close"]
+    friction_model: Literal[
+        "half_spread_plus_market_impact_plus_commission_bps"
+    ]
+
+    def __post_init__(self) -> None:
+        expected = (
+            5,
+            "next_open",
+            "open_then_stop",
+            "last_session_close",
+            "half_spread_plus_market_impact_plus_commission_bps",
+        )
+        actual = (
+            self.schema_version,
+            self.close_policy_exit_timing,
+            self.gap_stop_rule,
+            self.end_of_test_rule,
+            self.friction_model,
+        )
+        if actual != expected or type(self.schema_version) is not int:
+            raise ValueError("execution profile must be the canonical V5 profile")
+
+    def to_primitive(self) -> dict[str, int | str]:
+        """Return every profile field in its stable serialized form."""
+        return {
+            "schema_version": self.schema_version,
+            "close_policy_exit_timing": self.close_policy_exit_timing,
+            "gap_stop_rule": self.gap_stop_rule,
+            "end_of_test_rule": self.end_of_test_rule,
+            "friction_model": self.friction_model,
+        }
+
+    @property
+    def sha256(self) -> str:
+        payload = json.dumps(
+            self.to_primitive(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
 
 def _number(value: object, field: str, *, positive: bool = False) -> float:

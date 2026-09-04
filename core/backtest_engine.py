@@ -42,6 +42,13 @@ from core.canslim.entry_contract import (
     CanslimEntryFacts,
     build_entry_facts,
 )
+from core.backtest_fills import (
+    ExecutionFill,
+    ExecutionProfileV5,
+    FrictionScenario,
+    apply_friction,
+    resolve_long_stop,
+)
 from core.canslim.m_market_direction import MarketRegime, MarketRegimeTracker
 from core.canslim.a_annual_earnings import evaluate_a
 from core.canslim.c_current_earnings import evaluate_c
@@ -73,6 +80,7 @@ from core.strategy_policy import (
     EvictionDecision,
     EvictionPosition,
     EvictionSnapshot,
+    ExitAction,
     ExitDecision,
     ExitSnapshot,
     MarketContextV1,
@@ -230,6 +238,75 @@ class PendingEntry:
                 json.dumps(market, sort_keys=True, separators=(",", ":"))
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPolicyExit:
+    """Close-derived actions authorized for a later session open."""
+
+    symbol: str
+    signal_date: str
+    target_entry_date: str
+    actions: tuple[ExitAction, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.symbol, str)
+            or not self.symbol
+            or self.symbol != self.symbol.upper()
+        ):
+            raise ValueError("pending policy exit symbol is invalid")
+        try:
+            signal_date = str(pd.Timestamp(self.signal_date).date())
+            target_date = str(pd.Timestamp(self.target_entry_date).date())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pending policy exit date is invalid") from exc
+        if signal_date != self.signal_date or target_date != self.target_entry_date:
+            raise ValueError("pending policy exit date is not canonical")
+        if (
+            type(self.actions) is not tuple
+            or not self.actions
+            or any(type(action) is not ExitAction for action in self.actions)
+        ):
+            raise ValueError("pending policy exit actions are invalid")
+        if any(action.kind != "close" for action in self.actions):
+            raise ValueError("pending policy exits may contain only close actions")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "symbol": self.symbol,
+            "signal_date": self.signal_date,
+            "target_entry_date": self.target_entry_date,
+            "actions": [action.to_primitive() for action in self.actions],
+        }
+
+    @classmethod
+    def from_primitive(cls, raw: Mapping[str, object]) -> "PendingPolicyExit":
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "symbol",
+            "signal_date",
+            "target_entry_date",
+            "actions",
+        }:
+            raise ValueError("pending policy exit checkpoint is invalid")
+        actions = raw.get("actions")
+        if type(actions) is not list:
+            raise ValueError("pending policy exit checkpoint is invalid")
+        try:
+            restored_actions = tuple(
+                ExitAction.from_canonical_json(
+                    json.dumps(action, sort_keys=True, separators=(",", ":"))
+                )
+                for action in actions
+            )
+            return cls(
+                symbol=str(raw["symbol"]),
+                signal_date=str(raw["signal_date"]),
+                target_entry_date=str(raw["target_entry_date"]),
+                actions=restored_actions,
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("pending policy exit checkpoint is invalid") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +491,8 @@ class SimulationResult:
     execution_diagnostics: dict[str, int] = field(default_factory=dict)
     benchmark_symbol: str = BENCHMARK
     entry_outcomes: tuple[EntryAttemptOutcome, ...] = ()
+    fill_log: pd.DataFrame = field(default_factory=pd.DataFrame)
+    fill_cost_totals: dict[str, float] = field(default_factory=dict)
 
     @property
     def signal_funnel(self) -> dict[str, int]:
@@ -1211,6 +1290,7 @@ def _new_execution_diagnostics() -> dict[str, int]:
 
 
 _PORTFOLIO_CHECKPOINT_SCHEMA = 4
+_PORTFOLIO_CHECKPOINT_SCHEMA_V5 = 5
 _BUILTIN_CANSLIM_STRATEGY_CHECKPOINT_VERSION = 1
 _MISSING_CHECKPOINT_IDENTITY = object()
 
@@ -1280,7 +1360,10 @@ def _load_checkpoint_json(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("portfolio checkpoint is invalid") from exc
-    if not isinstance(value, dict) or value.get("schema_version") != _PORTFOLIO_CHECKPOINT_SCHEMA:
+    if not isinstance(value, dict) or value.get("schema_version") not in {
+        _PORTFOLIO_CHECKPOINT_SCHEMA,
+        _PORTFOLIO_CHECKPOINT_SCHEMA_V5,
+    }:
         raise ValueError("portfolio checkpoint schema is unsupported")
     return value
 
@@ -1370,7 +1453,7 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
         raise ValueError("portfolio state log offset is invalid")
     outputs: dict[str, list[Any]] = {
         "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
-        "entry_outcomes": [],
+        "entry_outcomes": [], "fills": [],
     }
     expected_day = 0
     consumed = 0
@@ -1402,8 +1485,22 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
                 outputs["weekly"].extend(event.get("weekly", []))
                 outputs["signals"].extend(event.get("signals", []))
                 outputs["entry_outcomes"].extend(event.get("entry_outcomes", []))
+                outputs["fills"].extend(event.get("fills", []))
             elif kind == "final":
                 outputs["transactions"].extend(event.get("transactions", []))
+                outputs["fills"].extend(event.get("fills", []))
+                final_date = event.get("date")
+                final_equity = event.get("equity")
+                if final_date is not None or final_equity is not None:
+                    if (
+                        not outputs["equity"]
+                        or final_date != outputs["equity"][-1]["date"]
+                        or isinstance(final_equity, bool)
+                        or not isinstance(final_equity, (int, float))
+                        or not math.isfinite(float(final_equity))
+                    ):
+                        raise ValueError("portfolio final equity record is invalid")
+                    outputs["equity"][-1]["equity"] = float(final_equity)
             else:
                 raise ValueError("portfolio state log contains an unknown record")
     if expected_day != next_day_index:
@@ -1429,7 +1526,7 @@ def _portfolio_checkpoint_fingerprint(
     simulator._verify_effective_engine_policy()
     effective_history_start = start_date if history_start_date is None else history_start_date
     config = {
-        "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
+        "schema_version": simulator._checkpoint_schema,
         "policy_interface_version": POLICY_INTERFACE_VERSION,
         "bundle_sha256": bundle_sha256,
         "code_identity": code_identity,
@@ -1497,6 +1594,23 @@ def _portfolio_checkpoint_fingerprint(
         "enable_eviction": simulator.enable_eviction,
         "effective_engine_policy_sha256": simulator._effective_engine_policy_sha256,
     }
+    if simulator._v5_enabled:
+        profile = simulator.execution_profile
+        scenario = simulator.friction_scenario
+        if profile is None or scenario is None:
+            raise ValueError("V5 execution configuration is incomplete")
+        config.update(
+            {
+                "execution_profile": profile.to_primitive(),
+                "execution_profile_sha256": simulator.execution_profile_sha256,
+                "friction_scenario": {
+                    "scenario_id": scenario.scenario_id,
+                    "half_spread_bps": scenario.half_spread_bps,
+                    "market_impact_bps": scenario.market_impact_bps,
+                    "commission_bps": scenario.commission_bps,
+                },
+            }
+        )
     return hashlib.sha256(_checkpoint_bytes(config)).hexdigest()
 
 
@@ -1578,7 +1692,17 @@ class PortfolioSimulator:
         pit_bundle: Optional[PITDataBundle] = None,
         identity_transition_contract: Optional[PriceIdentityTransitionContract] = None,
         policy_client_factory: StrategyPolicyClientFactory | None = None,
+        execution_profile: ExecutionProfileV5 | None = None,
+        friction_scenario: FrictionScenario | None = None,
     ) -> None:
+        if (execution_profile is None) != (friction_scenario is None):
+            raise ValueError(
+                "execution_profile and friction_scenario must be supplied together"
+            )
+        if execution_profile is not None and type(execution_profile) is not ExecutionProfileV5:
+            raise ValueError("execution_profile must be an ExecutionProfileV5")
+        if friction_scenario is not None and type(friction_scenario) is not FrictionScenario:
+            raise ValueError("friction_scenario must be a FrictionScenario")
         validate_inert_request_compatibility(
             {
                 "min_rs_score": min_rs_score,
@@ -1629,6 +1753,17 @@ class PortfolioSimulator:
         self.cash_deployment_threshold_pct = cash_deployment_threshold_pct
         self.technical_only = technical_only
         self.pit_bundle = pit_bundle
+        self.execution_profile = execution_profile
+        self.friction_scenario = friction_scenario
+        self.execution_profile_sha256 = (
+            execution_profile.sha256 if execution_profile is not None else None
+        )
+        self._v5_enabled = execution_profile is not None
+        self._checkpoint_schema = (
+            _PORTFOLIO_CHECKPOINT_SCHEMA_V5
+            if self._v5_enabled
+            else _PORTFOLIO_CHECKPOINT_SCHEMA
+        )
         self.require_proper_base = bool(pit_bundle is not None and not technical_only)
         self.identity_transition_contract = identity_transition_contract
         self.take_profit_pct = take_profit_pct
@@ -1685,6 +1820,8 @@ class PortfolioSimulator:
         self._open_positions: Dict[str, Trade] = {}
         self._trades: List[Trade] = []
         self._transactions: List[dict] = []
+        self._fill_rows: List[dict] = []
+        self._fill_cost_totals = self._new_fill_cost_totals()
         self._weekly_snapshots: List[dict] = []
         self._signal_rows: List[dict] = []
         self._entry_outcomes: List[EntryAttemptOutcome] = []
@@ -1928,10 +2065,30 @@ class PortfolioSimulator:
         origin_requested_min_canslim_score = self.requested_min_canslim_score
         restored_outputs: dict[str, list[Any]] = {
             "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
-            "entry_outcomes": [],
+            "entry_outcomes": [], "fills": [],
         }
         if checkpoint is not None and resume:
             checkpoint_state = _load_checkpoint_json(checkpoint)
+            if checkpoint_state.get("schema_version") != self._checkpoint_schema:
+                raise ValueError("portfolio checkpoint execution schema is incompatible")
+            if self._v5_enabled and (
+                self.execution_profile is None
+                or self.friction_scenario is None
+                or checkpoint_state.get("execution_profile")
+                != self.execution_profile.to_primitive()
+                or checkpoint_state.get("execution_profile_sha256")
+                != self.execution_profile_sha256
+                or checkpoint_state.get("friction_scenario")
+                != {
+                    "scenario_id": self.friction_scenario.scenario_id,
+                    "half_spread_bps": self.friction_scenario.half_spread_bps,
+                    "market_impact_bps": self.friction_scenario.market_impact_bps,
+                    "commission_bps": self.friction_scenario.commission_bps,
+                }
+            ):
+                raise ValueError(
+                    "portfolio checkpoint V5 execution identity is incompatible"
+                )
             if (
                 checkpoint_state.get("entry_outcome_schema_version")
                 != ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION
@@ -2067,6 +2224,29 @@ class PortfolioSimulator:
                 PendingEntry.from_primitive(value)
                 for value in checkpoint_state["pending_entries"]
             ]
+            pending_policy_exits = (
+                [
+                    PendingPolicyExit.from_primitive(value)
+                    for value in checkpoint_state["pending_policy_exits"]
+                ]
+                if self._v5_enabled
+                else []
+            )
+            self._fill_rows = list(restored_outputs["fills"])
+            if self._v5_enabled:
+                raw_totals = checkpoint_state.get("fill_cost_totals")
+                expected_fields = set(self._new_fill_cost_totals())
+                if not isinstance(raw_totals, Mapping) or set(raw_totals) != expected_fields:
+                    raise ValueError("portfolio checkpoint fill-cost totals are invalid")
+                restored_totals = {
+                    str(key): float(value) for key, value in raw_totals.items()
+                }
+                if any(
+                    not math.isfinite(value) or value < 0
+                    for value in restored_totals.values()
+                ):
+                    raise ValueError("portfolio checkpoint fill-cost totals are invalid")
+                self._fill_cost_totals = restored_totals
             equity_series = {
                 str(row["date"]): float(row["equity"])
                 for row in restored_outputs["equity"]
@@ -2084,6 +2264,7 @@ class PortfolioSimulator:
             benchmark_series = {}
             benchmark_start_price = None
             pending_entries = []
+            pending_policy_exits = []
 
         total_days = len(trading_days)
         for day_idx, eval_date in enumerate(trading_days[next_day_index:], start=next_day_index):
@@ -2091,7 +2272,65 @@ class PortfolioSimulator:
             signal_start = len(self._signal_rows)
             outcome_start = len(self._entry_outcomes)
             transaction_start = len(self._transactions)
+            fill_start = len(self._fill_rows)
             weekly_start = len(self._weekly_snapshots)
+            date_str = str(eval_date.date())
+
+            if self._v5_enabled:
+                remaps = self._apply_identity_transitions(ticker_ohlcv, eval_date)
+                pending_entries, pending_policy_exits = self._remap_v5_pending_actions(
+                    pending_entries,
+                    pending_policy_exits,
+                    remaps,
+                )
+                held_before_open = set(self._open_positions)
+                stopped_at_open = self._apply_v5_opening_gap_stops(
+                    ticker_ohlcv,
+                    eval_date,
+                    held_before_open,
+                )
+                if stopped_at_open:
+                    pending_policy_exits = [
+                        pending
+                        for pending in pending_policy_exits
+                        if pending.symbol not in stopped_at_open
+                    ]
+                    pending_entries = [
+                        pending
+                        for pending in pending_entries
+                        if str(pending.signal.get("symbol", "")).upper()
+                        not in stopped_at_open
+                    ]
+                pending_policy_exits, policy_exited = (
+                    self._execute_v5_pending_policy_exits(
+                        pending_policy_exits,
+                        ticker_ohlcv,
+                        eval_date,
+                    )
+                )
+                if policy_exited:
+                    pending_entries = [
+                        pending
+                        for pending in pending_entries
+                        if str(pending.signal.get("symbol", "")).upper()
+                        not in policy_exited
+                    ]
+                for pending_idx, pending in enumerate(pending_entries):
+                    self._pending_entries_remaining = len(pending_entries) - pending_idx
+                    self._enter_position(pending, ticker_ohlcv, eval_date)
+                self._pending_entries_remaining = 0
+                pending_entries = []
+                intraday_stopped = self._apply_v5_intraday_stops(
+                    ticker_ohlcv,
+                    eval_date,
+                )
+                if intraday_stopped:
+                    pending_policy_exits = [
+                        pending
+                        for pending in pending_policy_exits
+                        if pending.symbol not in intraday_stopped
+                    ]
+
             if day_idx > 0:
                 hist = benchmark_df.loc[:eval_date]
                 if len(hist) >= 2:
@@ -2121,20 +2360,41 @@ class PortfolioSimulator:
                 market_state=market_state,
             )
 
-            date_str = str(eval_date.date())
-
-            self._apply_identity_transitions(ticker_ohlcv, eval_date)
-
-            for pending_idx, pending in enumerate(pending_entries):
-                self._pending_entries_remaining = len(pending_entries) - pending_idx
-                self._enter_position(pending, ticker_ohlcv, eval_date)
-            self._pending_entries_remaining = 0
-            pending_entries = []
-
-            for symbol in list(self._open_positions.keys()):
-                ohlcv = ticker_ohlcv.get(symbol)
-                if ohlcv is not None:
-                    self._check_exits(symbol, ohlcv, eval_date, market=market)
+            if self._v5_enabled:
+                next_session = (
+                    pd.Timestamp(trading_days[day_idx + 1])
+                    if day_idx + 1 < total_days
+                    else None
+                )
+                already_pending = {
+                    pending.symbol for pending in pending_policy_exits
+                }
+                for symbol in list(self._open_positions):
+                    if symbol in already_pending:
+                        continue
+                    ohlcv = ticker_ohlcv.get(symbol)
+                    if ohlcv is None:
+                        continue
+                    queued = self._check_exits_v5_after_close(
+                        symbol,
+                        ohlcv,
+                        eval_date,
+                        market=market,
+                        next_session=next_session,
+                    )
+                    if queued is not None:
+                        pending_policy_exits.append(queued)
+            else:
+                self._apply_identity_transitions(ticker_ohlcv, eval_date)
+                for pending_idx, pending in enumerate(pending_entries):
+                    self._pending_entries_remaining = len(pending_entries) - pending_idx
+                    self._enter_position(pending, ticker_ohlcv, eval_date)
+                self._pending_entries_remaining = 0
+                pending_entries = []
+                for symbol in list(self._open_positions.keys()):
+                    ohlcv = ticker_ohlcv.get(symbol)
+                    if ohlcv is not None:
+                        self._check_exits(symbol, ohlcv, eval_date, market=market)
 
             is_signal_day = day_idx % self.signal_every_n_days == 0
             if is_signal_day:
@@ -2164,7 +2424,7 @@ class PortfolioSimulator:
 
             if state_stream is not None:
                 date_key = str(eval_date.date())
-                offset = _append_checkpoint_jsonl(state_log, {
+                day_event = {
                     "kind": "day",
                     "day_index": day_idx,
                     "date": date_key,
@@ -2177,7 +2437,15 @@ class PortfolioSimulator:
                     ],
                     "transactions": self._transactions[transaction_start:],
                     "weekly": self._weekly_snapshots[weekly_start:],
-                }, stream=state_stream, sync=False)
+                }
+                if self._v5_enabled:
+                    day_event["fills"] = self._fill_rows[fill_start:]
+                offset = _append_checkpoint_jsonl(
+                    state_log,
+                    day_event,
+                    stream=state_stream,
+                    sync=False,
+                )
                 checkpoint_due = (
                     (day_idx + 1) % checkpoint_every_days == 0
                     or day_idx == total_days - 1
@@ -2194,6 +2462,7 @@ class PortfolioSimulator:
                         state_log_offset=offset,
                         regime_tracker=regime_tracker,
                         pending_entries=pending_entries,
+                        pending_policy_exits=pending_policy_exits,
                         benchmark_start_price=benchmark_start_price,
                         origin_requested_min_rs_score=origin_requested_min_rs_score,
                         origin_requested_min_canslim_score=(
@@ -2217,6 +2486,7 @@ class PortfolioSimulator:
 
         last_date = pd.Timestamp(trading_days[-1])
         final_transaction_start = len(self._transactions)
+        final_fill_start = len(self._fill_rows)
         for symbol in list(self._open_positions.keys()):
             ohlcv = ticker_ohlcv.get(symbol)
             if ohlcv is None:
@@ -2225,12 +2495,24 @@ class PortfolioSimulator:
             if not bar.empty:
                 exit_price = float(bar["Close"].iloc[-1])
                 self._close_trade(symbol, exit_price, "end_of_test", str(last_date.date()))
+        if self._v5_enabled:
+            equity_series[str(last_date.date())] = self._equity
 
         if state_stream is not None:
-            final_offset = _append_checkpoint_jsonl(state_log, {
+            final_event = {
                 "kind": "final",
                 "transactions": self._transactions[final_transaction_start:],
-            }, stream=state_stream, sync=True)
+            }
+            if self._v5_enabled:
+                final_event["fills"] = self._fill_rows[final_fill_start:]
+                final_event["date"] = str(last_date.date())
+                final_event["equity"] = self._equity
+            final_offset = _append_checkpoint_jsonl(
+                state_log,
+                final_event,
+                stream=state_stream,
+                sync=True,
+            )
         else:
             final_offset = 0
         result_config = self._result_config(
@@ -2260,6 +2542,8 @@ class PortfolioSimulator:
             execution_diagnostics=dict(self._execution_diagnostics),
             entry_outcomes=tuple(self._entry_outcomes),
             benchmark_symbol=benchmark,
+            fill_log=pd.DataFrame(self._fill_rows),
+            fill_cost_totals=dict(self._fill_cost_totals),
         )
         if checkpoint is not None:
             _write_checkpoint_json(
@@ -2273,6 +2557,7 @@ class PortfolioSimulator:
                     state_log_offset=final_offset,
                     regime_tracker=regime_tracker,
                     pending_entries=[],
+                    pending_policy_exits=[],
                     benchmark_start_price=benchmark_start_price,
                     origin_requested_min_rs_score=origin_requested_min_rs_score,
                     origin_requested_min_canslim_score=(
@@ -2304,6 +2589,8 @@ class PortfolioSimulator:
         self._open_positions = {}
         self._trades = []
         self._transactions = []
+        self._fill_rows = []
+        self._fill_cost_totals = self._new_fill_cost_totals()
         self._weekly_snapshots = []
         self._signal_rows = []
         self._entry_outcomes = []
@@ -2317,6 +2604,15 @@ class PortfolioSimulator:
         self._regime_tracker = MarketRegimeTracker()
         self._market_context_cache: dict[str, MarketContextV1] = {}
         self._reset_strict_pit_pattern_cache()
+
+    @staticmethod
+    def _new_fill_cost_totals() -> dict[str, float]:
+        return {
+            "commission_usd": 0.0,
+            "spread_cost_usd": 0.0,
+            "market_impact_cost_usd": 0.0,
+            "total_friction_usd": 0.0,
+        }
 
     def _market_context_for_session(
         self,
@@ -2525,7 +2821,7 @@ class PortfolioSimulator:
                 else all_closes.columns
             )
         )
-        return {
+        config = {
             "tickers": tickers,
             "candidate_universe_count": len(tickers),
             "rs_universe_count": len(all_closes.columns),
@@ -2580,6 +2876,25 @@ class PortfolioSimulator:
             "history_start_date": str(effective_history_start.date()),
             "end_date": str(end_ts.date()),
         }
+        if self._v5_enabled:
+            profile = self.execution_profile
+            scenario = self.friction_scenario
+            if profile is None or scenario is None:
+                raise ValueError("V5 execution configuration is incomplete")
+            config.update(
+                {
+                    "execution_profile": profile.to_primitive(),
+                    "execution_profile_sha256": self.execution_profile_sha256,
+                    "friction_scenario": {
+                        "scenario_id": scenario.scenario_id,
+                        "half_spread_bps": scenario.half_spread_bps,
+                        "market_impact_bps": scenario.market_impact_bps,
+                        "commission_bps": scenario.commission_bps,
+                    },
+                    "fill_cost_totals": dict(self._fill_cost_totals),
+                }
+            )
+        return config
 
     def _checkpoint_payload(
         self,
@@ -2592,6 +2907,7 @@ class PortfolioSimulator:
         state_log_offset: int,
         regime_tracker: MarketRegimeTracker,
         pending_entries: list[PendingEntry],
+        pending_policy_exits: list[PendingPolicyExit] | None = None,
         benchmark_start_price: Optional[float],
         origin_requested_min_rs_score: float | None,
         origin_requested_min_canslim_score: float | None,
@@ -2600,7 +2916,7 @@ class PortfolioSimulator:
     ) -> dict[str, Any]:
         self._verify_effective_engine_policy()
         payload: dict[str, Any] = {
-            "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
+            "schema_version": self._checkpoint_schema,
             "fingerprint": fingerprint,
             "code_identity": code_identity,
             "strategy_identity": strategy_identity,
@@ -2627,6 +2943,26 @@ class PortfolioSimulator:
             ),
             "regime": _regime_checkpoint_state(regime_tracker),
         }
+        if self._v5_enabled:
+            if self.execution_profile is None or self.friction_scenario is None:
+                raise ValueError("V5 execution configuration is incomplete")
+            payload.update(
+                {
+                    "execution_profile": self.execution_profile.to_primitive(),
+                    "execution_profile_sha256": self.execution_profile_sha256,
+                    "friction_scenario": {
+                        "scenario_id": self.friction_scenario.scenario_id,
+                        "half_spread_bps": self.friction_scenario.half_spread_bps,
+                        "market_impact_bps": self.friction_scenario.market_impact_bps,
+                        "commission_bps": self.friction_scenario.commission_bps,
+                    },
+                    "pending_policy_exits": [
+                        pending.to_primitive()
+                        for pending in (pending_policy_exits or [])
+                    ],
+                    "fill_cost_totals": dict(self._fill_cost_totals),
+                }
+            )
         if result_config is not None:
             payload["result_config"] = result_config
         return _checkpoint_json_safe(payload)
@@ -2724,6 +3060,11 @@ class PortfolioSimulator:
             },
             entry_outcomes=checkpoint_outcomes,
             benchmark_symbol=benchmark,
+            fill_log=pd.DataFrame(outputs.get("fills", [])),
+            fill_cost_totals={
+                str(key): float(value)
+                for key, value in checkpoint.get("fill_cost_totals", {}).items()
+            },
         )
 
     def _canonicalize_signal_row(
@@ -3150,6 +3491,7 @@ class PortfolioSimulator:
         eviction_symbol: str | None = None
         eviction_price: float | None = None
         eviction_notional = 0.0
+        eviction_cash_proceeds = 0.0
         if eviction.slot is not None:
             eviction_symbol, eviction_trade, eviction_price = priced_positions[
                 eviction.slot
@@ -3157,6 +3499,17 @@ class PortfolioSimulator:
             eviction_notional = eviction_price * float(
                 eviction_trade.remaining_qty or 0.0
             )
+            eviction_cash_proceeds = eviction_notional
+            if self._v5_enabled:
+                scenario = self.friction_scenario
+                if scenario is None:
+                    raise ValueError("V5 friction scenario is missing")
+                eviction_cash_proceeds = apply_friction(
+                    side="SELL",
+                    reference_price=eviction_price,
+                    quantity=float(eviction_trade.remaining_qty or 0.0),
+                    scenario=scenario,
+                ).cash_delta
 
         portfolio_equity = self._equity + gross_before
         projected = ProjectedEntryTransition(
@@ -3165,7 +3518,7 @@ class PortfolioSimulator:
             eviction_price=eviction_price,
             entry_open=entry_open,
             portfolio_equity_at_entry_open=portfolio_equity,
-            projected_cash=self._equity + eviction_notional,
+            projected_cash=self._equity + eviction_cash_proceeds,
             projected_gross_long_notional=gross_before - eviction_notional,
         )
         self._projected_entry_states[id(projected)] = (
@@ -3228,19 +3581,35 @@ class PortfolioSimulator:
             buy_notional = min(buy_notional, engine_notional_cap)
         if not math.isfinite(buy_notional) or buy_notional <= 0:
             raise ValueError("buy notional is invalid")
+        entry_fill_price = projection.entry_open
+        cash_per_share = projection.entry_open
+        if self._v5_enabled:
+            scenario = self.friction_scenario
+            if scenario is None:
+                raise ValueError("V5 friction scenario is missing")
+            entry_fill_price = projection.entry_open * (
+                1
+                + (
+                    scenario.half_spread_bps
+                    + scenario.market_impact_bps
+                )
+                / 10_000.0
+            )
+            cash_per_share = entry_fill_price * (
+                1 + scenario.commission_bps / 10_000.0
+            )
         stop_price = round(
-            projection.entry_open
-            * (1 - recommendation.stop_distance_fraction),
+            entry_fill_price * (1 - recommendation.stop_distance_fraction),
             2,
         )
         if (
             not math.isfinite(stop_price)
             or stop_price <= 0
-            or stop_price >= projection.entry_open
+            or stop_price >= entry_fill_price
         ):
             raise ValueError("derived entry stop is invalid")
 
-        loss_per_share = projection.entry_open - stop_price
+        loss_per_share = entry_fill_price - stop_price
         recommended_budget = (
             projection.portfolio_equity_at_entry_open
             * recommendation.risk_fraction
@@ -3256,7 +3625,7 @@ class PortfolioSimulator:
         ):
             raise ValueError("derived entry risk budget is invalid")
 
-        quantity = buy_notional / projection.entry_open
+        quantity = buy_notional / cash_per_share
         if not math.isfinite(quantity) or quantity <= 0:
             raise ValueError("derived entry quantity is invalid")
         quantity = min(
@@ -3266,13 +3635,26 @@ class PortfolioSimulator:
         )
         if not math.isfinite(quantity) or quantity <= 0:
             raise ValueError("derived entry quantity is invalid")
-        buy_notional = quantity * projection.entry_open
+        gross_entry_notional = quantity * entry_fill_price
+        if self._v5_enabled:
+            scenario = self.friction_scenario
+            if scenario is None:
+                raise ValueError("V5 friction scenario is missing")
+            fill = apply_friction(
+                side="BUY",
+                reference_price=projection.entry_open,
+                quantity=quantity,
+                scenario=scenario,
+            )
+            buy_notional = -fill.cash_delta
+        else:
+            buy_notional = gross_entry_notional
         if not math.isfinite(buy_notional) or buy_notional <= 0:
             raise ValueError("buy notional is invalid")
         if projection.projected_cash + 1e-12 < buy_notional:
             raise ValueError("projected cash is below buy notional")
         if (
-            projection.projected_gross_long_notional + buy_notional
+            projection.projected_gross_long_notional + gross_entry_notional
             > projection.portfolio_equity_at_entry_open + 1e-12
         ):
             raise ValueError("projected gross long notional exceeds equity")
@@ -3325,23 +3707,52 @@ class PortfolioSimulator:
         if abs(self._equity - projection.projected_cash) > 1e-8:
             raise ValueError("projected cash disagrees before entry apply")
 
+        entry_price = projection.entry_open
+        entry_fill: ExecutionFill | None = None
+        if self._v5_enabled:
+            scenario = self.friction_scenario
+            if scenario is None:
+                raise ValueError("V5 friction scenario is missing")
+            entry_fill = apply_friction(
+                side="BUY",
+                reference_price=projection.entry_open,
+                quantity=transition.quantity,
+                scenario=scenario,
+            )
+            if abs(-entry_fill.cash_delta - transition.buy_notional) > 1e-8:
+                raise ValueError("validated entry cash disagrees with execution fill")
+            entry_price = entry_fill.execution_price
         trade = Trade(
             symbol=symbol,
             entry_date=date_str,
-            entry_price=projection.entry_open,
+            entry_price=entry_price,
             qty=transition.quantity,
             stop_price=transition.stop_price,
             canslim_score=_finite_signal_number(signal.get("canslim_score")) or 0.0,
             rs_score=_finite_signal_number(signal.get("rs_score")) or 0.0,
             entry_reason=str(signal.get("signal_reason", "Signal")),
+            realized_pnl=(
+                -entry_fill.commission_usd if entry_fill is not None else 0.0
+            ),
         )
         self._open_positions[symbol] = trade
-        self._equity -= transition.buy_notional
+        if entry_fill is not None:
+            self._equity = round(self._equity + entry_fill.cash_delta, 2)
+            if self._equity < -1e-9:
+                raise ValueError("V5 entry would create leverage")
+            self._record_v5_fill(
+                date=date_str,
+                ticker=symbol,
+                reason=str(signal.get("signal_reason", "Signal")),
+                fill=entry_fill,
+            )
+        else:
+            self._equity -= transition.buy_notional
         self._record_transaction(
             date=date_str,
             ticker=symbol,
             action="BUY",
-            price=projection.entry_open,
+            price=entry_price,
             quantity=transition.quantity,
             reason=str(signal.get("signal_reason", "Signal")),
         )
@@ -3745,18 +4156,240 @@ class PortfolioSimulator:
         self._exit_policy_snapshots[id(decision)] = snapshot
         self._apply_exit_decision(symbol, trade, decision, close, date_str)
 
+    def _apply_v5_opening_gap_stops(
+        self,
+        ticker_ohlcv: Mapping[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+        held_before_open: set[str],
+    ) -> set[str]:
+        stopped: set[str] = set()
+        date_str = str(eval_date.date())
+        for symbol in sorted(held_before_open):
+            trade = self._open_positions.get(symbol)
+            frame = ticker_ohlcv.get(symbol)
+            bar = exact_session_row(frame, eval_date) if frame is not None else None
+            if trade is None or bar is None or "Open" not in bar.index:
+                continue
+            open_price = _finite_signal_number(bar["Open"])
+            low_price = _finite_signal_number(
+                bar["Low"] if "Low" in bar.index else bar.get("Close")
+            )
+            if open_price is None or open_price <= 0 or low_price is None or low_price <= 0:
+                continue
+            resolved = resolve_long_stop(
+                open_price=open_price,
+                low_price=low_price,
+                stop_price=trade.stop_price,
+            )
+            if resolved is not None and resolved.kind == "gap_stop":
+                self._close_trade(symbol, resolved.price, "stop_loss", date_str)
+                stopped.add(symbol)
+        return stopped
+
+    def _execute_v5_pending_policy_exits(
+        self,
+        pending_exits: list[PendingPolicyExit],
+        ticker_ohlcv: Mapping[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+    ) -> tuple[list[PendingPolicyExit], set[str]]:
+        survivors: list[PendingPolicyExit] = []
+        exited: set[str] = set()
+        date_str = str(eval_date.date())
+        for pending in pending_exits:
+            if pending.symbol not in self._open_positions:
+                continue
+            if pd.Timestamp(pending.target_entry_date).normalize() > eval_date.normalize():
+                survivors.append(pending)
+                continue
+            frame = ticker_ohlcv.get(pending.symbol)
+            open_price = _causal_open_price(frame, eval_date) if frame is not None else None
+            if open_price is None:
+                survivors.append(pending)
+                continue
+            close_action = pending.actions[-1]
+            self._close_trade(
+                pending.symbol,
+                open_price,
+                close_action.reason,
+                date_str,
+            )
+            exited.add(pending.symbol)
+        return survivors, exited
+
+    def _apply_v5_intraday_stops(
+        self,
+        ticker_ohlcv: Mapping[str, pd.DataFrame],
+        eval_date: pd.Timestamp,
+    ) -> set[str]:
+        stopped: set[str] = set()
+        date_str = str(eval_date.date())
+        for symbol in sorted(self._open_positions):
+            trade = self._open_positions.get(symbol)
+            frame = ticker_ohlcv.get(symbol)
+            bar = exact_session_row(frame, eval_date) if frame is not None else None
+            if trade is None or bar is None or "Open" not in bar.index:
+                continue
+            open_price = _finite_signal_number(bar["Open"])
+            low_price = _finite_signal_number(
+                bar["Low"] if "Low" in bar.index else bar.get("Close")
+            )
+            if open_price is None or open_price <= 0 or low_price is None or low_price <= 0:
+                continue
+            resolved = resolve_long_stop(
+                open_price=open_price,
+                low_price=low_price,
+                stop_price=trade.stop_price,
+            )
+            if resolved is not None and resolved.kind == "intraday_stop":
+                self._close_trade(symbol, resolved.price, "stop_loss", date_str)
+                stopped.add(symbol)
+        return stopped
+
+    def _check_exits_v5_after_close(
+        self,
+        symbol: str,
+        ohlcv: pd.DataFrame,
+        eval_date: pd.Timestamp,
+        *,
+        market: MarketContextV1,
+        next_session: pd.Timestamp | None,
+    ) -> PendingPolicyExit | None:
+        trade = self._open_positions.get(symbol)
+        if trade is None:
+            return None
+        bar = exact_session_row(ohlcv, eval_date)
+        if bar is None:
+            return None
+        high = float(bar["High"] if "High" in bar.index else bar["Close"])
+        low = float(bar["Low"] if "Low" in bar.index else bar["Close"])
+        close = float(bar["Close"])
+        date_str = str(eval_date.date())
+
+        trade.days_held += 1
+        trade.peak_close = max(trade.peak_close or trade.entry_price, close)
+        history = ohlcv.loc[:eval_date]
+        ema_today: float | None = None
+        if len(history) >= self.ma_exit_period:
+            raw_ema_today = history["Close"].ewm(
+                span=self.ma_exit_period,
+                adjust=False,
+            ).mean().iloc[-1]
+            if pd.notna(raw_ema_today):
+                candidate = float(raw_ema_today)
+                if math.isfinite(candidate) and candidate > 0:
+                    ema_today = candidate
+        consecutive_closes_below_ema = False
+        if len(history) >= self.ma_exit_period + self.ma_consecutive:
+            ema = history["Close"].ewm(span=self.ma_exit_period, adjust=False).mean()
+            last_closes = history["Close"].iloc[-self.ma_consecutive:]
+            last_ema = ema.iloc[-self.ma_consecutive:]
+            consecutive_closes_below_ema = bool(
+                (last_closes.values < last_ema.values).all()
+            )
+
+        breakeven_will_be_armed = bool(
+            trade.breakeven_armed
+            or high >= trade.entry_price * (1 + self.breakeven_trigger_pct)
+        )
+        stop_candidates = {trade.stop_price}
+        if breakeven_will_be_armed:
+            stop_candidates.add(trade.entry_price)
+            if ema_today is not None:
+                stop_candidates.add(round(ema_today, 2))
+        snapshot = self._build_exit_snapshot(
+            trade=trade,
+            current_high=high,
+            current_low=low,
+            current_close=close,
+            history_session_count=len(history),
+            ema_today=ema_today,
+            consecutive_closes_below_ema=consecutive_closes_below_ema,
+            protective_stop_candidates=tuple(sorted(stop_candidates)),
+            market=market,
+        )
+        decision = self._adapter_policy_client().evaluate_exit(snapshot)
+        if type(decision) is not ExitDecision:
+            raise ValueError("exit policy decision is invalid")
+        decision = validate_exit_decision(snapshot, decision)
+
+        trade.eight_week_hold = decision.early_winner_hold
+        trade.breakeven_armed = decision.breakeven_armed
+        trade.ema_trailing_active = decision.ema_trailing_active
+        if decision.next_stop_price is not None:
+            trade.stop_price = decision.next_stop_price
+        for action in decision.actions:
+            if action.kind != "scale_out":
+                continue
+            if (
+                action.trigger_gain_fraction is None
+                or action.fraction_of_original_quantity is None
+            ):
+                raise ValueError("exit scale-out action is invalid")
+            self._scale_out_trade(
+                symbol,
+                trade.entry_price * (1 + action.trigger_gain_fraction),
+                date_str,
+                action.reason,
+                sell_qty=trade.qty * action.fraction_of_original_quantity,
+            )
+        trade.scale_out_tier = decision.scale_out_tier
+        close_actions = tuple(
+            action for action in decision.actions if action.kind == "close"
+        )
+        if not close_actions or next_session is None:
+            return None
+        return PendingPolicyExit(
+            symbol=symbol,
+            signal_date=date_str,
+            target_entry_date=str(next_session.date()),
+            actions=close_actions,
+        )
+
+    @staticmethod
+    def _remap_v5_pending_actions(
+        pending_entries: list[PendingEntry],
+        pending_exits: list[PendingPolicyExit],
+        remaps: Mapping[str, str],
+    ) -> tuple[list[PendingEntry], list[PendingPolicyExit]]:
+        if not remaps:
+            return pending_entries, pending_exits
+        remapped_entries: list[PendingEntry] = []
+        for pending in pending_entries:
+            symbol = str(pending.signal.get("symbol", "")).upper()
+            successor = remaps.get(symbol)
+            if successor is None:
+                remapped_entries.append(pending)
+                continue
+            signal = dict(pending.signal)
+            signal["symbol"] = successor
+            remapped_entries.append(
+                PendingEntry(signal=signal, capacity=pending.capacity, market=pending.market)
+            )
+        remapped_exits = [
+            PendingPolicyExit(
+                symbol=remaps.get(pending.symbol, pending.symbol),
+                signal_date=pending.signal_date,
+                target_entry_date=pending.target_entry_date,
+                actions=pending.actions,
+            )
+            for pending in pending_exits
+        ]
+        return remapped_entries, remapped_exits
+
     def _apply_identity_transitions(
         self,
         ticker_ohlcv: Dict[str, pd.DataFrame],
         eval_date: pd.Timestamp,
-    ) -> None:
+    ) -> dict[str, str]:
         contract = self.identity_transition_contract
         if contract is None:
-            return
+            return {}
+        remaps: dict[str, str] = {}
         effective = eval_date.date()
         for transition in contract.transitions:
             if transition.effective_date != effective:
                 continue
+            remaps[transition.predecessor] = transition.successor
             trade = self._open_positions.pop(transition.predecessor, None)
             if trade is None:
                 continue
@@ -3782,6 +4415,7 @@ class PortfolioSimulator:
                     "Value": 0.0,
                     "Reason": "pit_identity_transfer",
                 })
+        return remaps
 
     def _update_protective_stop(self, trade: Trade, history: pd.DataFrame, high: float) -> None:
         """Ratchet stops using only end-of-bar information.
@@ -3823,15 +4457,37 @@ class PortfolioSimulator:
             return
         trade.remaining_qty = (trade.remaining_qty or 0.0) - scale_qty
         trade.scaled_out_qty += scale_qty
-        trade.scale_out_price = exit_price
-        proceeds = exit_price * scale_qty
-        trade.realized_pnl += (exit_price - trade.entry_price) * scale_qty
-        self._equity += proceeds
+        execution_price = exit_price
+        fill: ExecutionFill | None = None
+        if self._v5_enabled:
+            scenario = self.friction_scenario
+            if scenario is None:
+                raise ValueError("V5 friction scenario is missing")
+            fill = apply_friction(
+                side="SELL",
+                reference_price=exit_price,
+                quantity=scale_qty,
+                scenario=scenario,
+            )
+            execution_price = fill.execution_price
+        trade.scale_out_price = execution_price
+        trade.realized_pnl += (execution_price - trade.entry_price) * scale_qty
+        if fill is not None:
+            trade.realized_pnl -= fill.commission_usd
+            self._equity = round(self._equity + fill.cash_delta, 2)
+            self._record_v5_fill(
+                date=date_str,
+                ticker=symbol,
+                reason=reason,
+                fill=fill,
+            )
+        else:
+            self._equity += exit_price * scale_qty
         self._record_transaction(
             date=date_str,
             ticker=symbol,
             action="SELL",
-            price=exit_price,
+            price=execution_price,
             quantity=scale_qty,
             reason=reason,
         )
@@ -3842,22 +4498,84 @@ class PortfolioSimulator:
             return
 
         remaining_qty = max(float(trade.remaining_qty or 0.0), 0.0)
-        proceeds = exit_price * remaining_qty
-        self._equity += proceeds
+        execution_price = exit_price
+        fill: ExecutionFill | None = None
+        if self._v5_enabled and remaining_qty > 1e-12:
+            scenario = self.friction_scenario
+            if scenario is None:
+                raise ValueError("V5 friction scenario is missing")
+            fill = apply_friction(
+                side="SELL",
+                reference_price=exit_price,
+                quantity=remaining_qty,
+                scenario=scenario,
+            )
+            execution_price = fill.execution_price
+            trade.realized_pnl -= fill.commission_usd
+            self._equity = round(self._equity + fill.cash_delta, 2)
+            self._record_v5_fill(
+                date=date_str,
+                ticker=symbol,
+                reason=reason,
+                fill=fill,
+            )
+        else:
+            self._equity += exit_price * remaining_qty
         if remaining_qty > 1e-12:
             self._record_transaction(
                 date=date_str,
                 ticker=symbol,
                 action="SELL",
-                price=exit_price,
+                price=execution_price,
                 quantity=remaining_qty,
                 reason=reason,
             )
 
-        trade.exit_price = exit_price
+        trade.exit_price = execution_price
         trade.exit_date = date_str
         trade.exit_reason = reason
         self._trades.append(trade)
+
+    def _record_v5_fill(
+        self,
+        *,
+        date: str,
+        ticker: str,
+        reason: str,
+        fill: ExecutionFill,
+    ) -> None:
+        if not self._v5_enabled:
+            raise ValueError("fill-cost evidence is available only under V5")
+        slippage = round(fill.spread_cost_usd + fill.market_impact_cost_usd, 2)
+        total_friction = round(slippage + fill.commission_usd, 2)
+        self._fill_rows.append(
+            {
+                "Date": date,
+                "Ticker": ticker,
+                "Action": fill.side,
+                "Reason": reason,
+                "ReferencePrice": fill.reference_price,
+                "ExecutionPrice": fill.execution_price,
+                "Quantity": fill.quantity,
+                "GrossValue": fill.gross_value,
+                "CommissionUSD": fill.commission_usd,
+                "SlippageUSD": slippage,
+                "SpreadCostUSD": fill.spread_cost_usd,
+                "MarketImpactCostUSD": fill.market_impact_cost_usd,
+                "CashDelta": fill.cash_delta,
+                "TotalFrictionUSD": total_friction,
+            }
+        )
+        for cost_field, value in (
+            ("commission_usd", fill.commission_usd),
+            ("spread_cost_usd", fill.spread_cost_usd),
+            ("market_impact_cost_usd", fill.market_impact_cost_usd),
+            ("total_friction_usd", total_friction),
+        ):
+            self._fill_cost_totals[cost_field] = round(
+                self._fill_cost_totals[cost_field] + value,
+                2,
+            )
 
     def _mark_equity(self, ticker_ohlcv: Dict[str, pd.DataFrame], eval_date: pd.Timestamp) -> float:
         market_value = self._equity
