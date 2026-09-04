@@ -64,10 +64,36 @@ SemanticClassificationV5 = Literal[
     "behavioral_equivalent_on_suite_v1",
     "behaviorally_distinct_on_suite_v1",
 ]
+ProbeOutcomeRoleV5 = Literal[
+    "client_interface_lookup",
+    "client_interface_value",
+    "client_method_lookup",
+    "client_method_surface",
+    "client_close_lookup",
+    "client_close_surface",
+    "decision",
+    "policy_timeout",
+    "policy_execution",
+    "decision_protocol",
+]
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PROBE_ID_RE = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 _MAX_DECISION_JSON_BYTES = 16 * 1024
+_PROBE_OUTCOME_ROLES = frozenset(
+    {
+        "client_interface_lookup",
+        "client_interface_value",
+        "client_method_lookup",
+        "client_method_surface",
+        "client_close_lookup",
+        "client_close_surface",
+        "decision",
+        "policy_timeout",
+        "policy_execution",
+        "decision_protocol",
+    }
+)
 
 _METHOD_CONTRACTS: dict[str, tuple[type[object], type[object]]] = {
     "evaluate_entry": (EntrySnapshotV3, EntryDecision),
@@ -178,17 +204,21 @@ class PolicyProbeFailureV5(ValueError):
         *,
         probe_id: str | None = None,
         method: str | None = None,
-        exception_types: tuple[str, ...] = (),
+        outcome_roles: tuple[ProbeOutcomeRoleV5, ...] = (),
     ) -> None:
         if probe_id is not None:
             _probe_id(probe_id)
         if method is not None and method not in PROBE_METHODS_V5:
             raise ValueError("probe failure method is invalid")
-        if type(exception_types) is not tuple or any(type(item) is not str or not item for item in exception_types):
-            raise ValueError("probe failure exception types are invalid")
+        if (
+            type(outcome_roles) is not tuple
+            or len(outcome_roles) > 2
+            or any(type(item) is not str or item not in _PROBE_OUTCOME_ROLES for item in outcome_roles)
+        ):
+            raise ValueError("probe failure outcome roles are invalid")
         self.probe_id = probe_id
         self.method = method
-        self.exception_types = exception_types
+        self.outcome_roles = outcome_roles
         super().__init__(self.failure_code)
 
 
@@ -840,52 +870,91 @@ class SemanticFingerprintComparisonV5:
 
 @dataclass(frozen=True, slots=True)
 class _CallOutcome:
+    role: ProbeOutcomeRoleV5
     decision_json: bytes | None
-    failure_kind: Literal["timeout", "protocol", "execution"] | None
-    exception_type: str | None
+    exception_class: type[Exception] | None = None
 
     def __post_init__(self) -> None:
-        if (self.decision_json is None) == (self.failure_kind is None):
-            raise ValueError("probe call outcome must carry exactly one result")
-        if self.failure_kind is None:
-            if self.exception_type is not None:
-                raise ValueError("successful probe outcome cannot carry an exception")
-        elif type(self.exception_type) is not str or not self.exception_type:
-            raise ValueError("failed probe outcome requires an exception type")
-
-
-def _exception_type(exc: Exception) -> str:
-    return _qualified_type(type(exc))
+        if type(self.role) is not str or self.role not in _PROBE_OUTCOME_ROLES:
+            raise ValueError("probe call outcome role is invalid")
+        if self.role == "decision":
+            if type(self.decision_json) is not bytes or self.exception_class is not None:
+                raise ValueError("successful probe outcome is invalid")
+            return
+        if self.decision_json is not None:
+            raise ValueError("failed probe outcome cannot carry a decision")
+        exception_required = self.role in {
+            "client_method_lookup",
+            "policy_timeout",
+            "policy_execution",
+            "decision_protocol",
+        }
+        if exception_required != (self.exception_class is not None):
+            raise ValueError("failed probe outcome exception identity is invalid")
+        if self.exception_class is not None and (
+            not isinstance(self.exception_class, type) or not issubclass(self.exception_class, Exception)
+        ):
+            raise ValueError("failed probe outcome exception identity is invalid")
 
 
 def _call_case(client: StrategyPolicyClientV3, case: PolicyProbeCaseV5) -> _CallOutcome:
     try:
         method = getattr(client, case.method)
-        if not callable(method):
-            raise TypeError("policy probe client method is not callable")
+    except Exception as exc:
+        return _CallOutcome("client_method_lookup", None, type(exc))
+    if not callable(method):
+        return _CallOutcome("client_method_surface", None)
+
+    try:
         decision = method(case.snapshot)
+    except TimeoutError as exc:
+        return _CallOutcome("policy_timeout", None, type(exc))
+    except Exception as exc:
+        return _CallOutcome("policy_execution", None, type(exc))
+
+    try:
         decision_json = _canonical_decision_bytes(case.method, decision)
         _validate_decision_for_snapshot(case, decision)
-        return _CallOutcome(decision_json, None, None)
-    except TimeoutError as exc:
-        return _CallOutcome(None, "timeout", _exception_type(exc))
-    except (TypeError, ValueError, RuntimeError) as exc:
-        return _CallOutcome(None, "protocol", _exception_type(exc))
+        return _CallOutcome("decision", decision_json)
     except Exception as exc:
-        return _CallOutcome(None, "execution", _exception_type(exc))
+        return _CallOutcome("decision_protocol", None, type(exc))
 
 
 def _validate_client(client: object) -> StrategyPolicyClientV3:
+    interface_lookup_failed = False
     try:
         interface_version = client.interface_version  # type: ignore[attr-defined]
-    except Exception as exc:
+    except Exception:
+        interface_lookup_failed = True
+        interface_version = None
+    if interface_lookup_failed:
         raise PolicyProbeProtocolFailureV5(
-            exception_types=(_exception_type(exc),),
-        ) from None
+            outcome_roles=("client_interface_lookup",),
+        )
     if type(interface_version) is not int or interface_version != POLICY_INTERFACE_VERSION_V3:
-        raise PolicyProbeProtocolFailureV5()
-    if any(not callable(getattr(client, method, None)) for method in (*PROBE_METHODS_V5, "close")):
-        raise PolicyProbeProtocolFailureV5()
+        raise PolicyProbeProtocolFailureV5(
+            outcome_roles=("client_interface_value",),
+        )
+    for member_name in (*PROBE_METHODS_V5, "close"):
+        method = member_name if member_name in PROBE_METHODS_V5 else None
+        lookup_role: ProbeOutcomeRoleV5 = "client_method_lookup" if method is not None else "client_close_lookup"
+        surface_role: ProbeOutcomeRoleV5 = "client_method_surface" if method is not None else "client_close_surface"
+        lookup_failed = False
+        try:
+            member = getattr(client, member_name)
+        except Exception:
+            lookup_failed = True
+            member = None
+        if lookup_failed:
+            raise PolicyProbeProtocolFailureV5(
+                method=method,
+                outcome_roles=(lookup_role,),
+            )
+        if not callable(member):
+            raise PolicyProbeProtocolFailureV5(
+                method=method,
+                outcome_roles=(surface_role,),
+            )
     return client  # type: ignore[return-value]
 
 
@@ -904,30 +973,40 @@ def _raise_failed_outcome(
     first: _CallOutcome,
     second: _CallOutcome,
 ) -> None:
-    exception_types = tuple(item.exception_type for item in (first, second) if item.exception_type is not None)
-    if "timeout" in {first.failure_kind, second.failure_kind}:
-        raise PolicyProbeTimeoutV5(
-            probe_id=case.probe_id,
-            method=case.method,
-            exception_types=exception_types,
-        )
-    if "protocol" in {first.failure_kind, second.failure_kind}:
-        raise PolicyProbeProtocolFailureV5(
-            probe_id=case.probe_id,
-            method=case.method,
-            exception_types=exception_types,
-        )
-    signatures = tuple((item.failure_kind, item.exception_type) for item in (first, second))
+    outcome_roles = (first.role, second.role)
+    signatures = tuple((item.role, item.exception_class) for item in (first, second))
     if signatures[0] != signatures[1]:
         raise PolicyProbeExceptionMismatchV5(
             probe_id=case.probe_id,
             method=case.method,
-            exception_types=exception_types,
+            outcome_roles=outcome_roles,
         )
-    raise PolicyProbeExecutionFailureV5(
+    if first.role == "policy_timeout":
+        raise PolicyProbeTimeoutV5(
+            probe_id=case.probe_id,
+            method=case.method,
+            outcome_roles=outcome_roles,
+        )
+    if first.role in {
+        "client_method_lookup",
+        "client_method_surface",
+        "decision_protocol",
+    }:
+        raise PolicyProbeProtocolFailureV5(
+            probe_id=case.probe_id,
+            method=case.method,
+            outcome_roles=outcome_roles,
+        )
+    if first.role == "policy_execution":
+        raise PolicyProbeExecutionFailureV5(
+            probe_id=case.probe_id,
+            method=case.method,
+            outcome_roles=outcome_roles,
+        )
+    raise PolicyProbeSuiteFailureV5(
         probe_id=case.probe_id,
         method=case.method,
-        exception_types=exception_types,
+        outcome_roles=outcome_roles,
     )
 
 
@@ -948,12 +1027,13 @@ def fingerprint_policy_client_v5(
     observations: list[ProbeObservationV5] = []
     for case in _PROBE_SUITE_V1:
         first, second = outcomes[case.probe_id]
-        if first.failure_kind is not None or second.failure_kind is not None:
+        if first.role != "decision" or second.role != "decision":
             _raise_failed_outcome(case, first, second)
         if first.decision_json != second.decision_json:
             raise PolicyProbeNondeterminismV5(
                 probe_id=case.probe_id,
                 method=case.method,
+                outcome_roles=(first.role, second.role),
             )
         if first.decision_json is None:
             raise PolicyProbeSuiteFailureV5(
@@ -1013,6 +1093,7 @@ __all__ = [
     "BEHAVIORAL_EQUIVALENT_ON_SUITE_V1",
     "PROBE_METHODS_V5",
     "PROBE_SUITE_ID_V5",
+    "ProbeOutcomeRoleV5",
     "PolicyProbeCaseV5",
     "PolicyProbeExceptionMismatchV5",
     "PolicyProbeExecutionFailureV5",
