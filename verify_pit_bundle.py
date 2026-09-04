@@ -28,6 +28,13 @@ def _regular_file(path: str | Path, *, label: str) -> Path:
     return value.resolve()
 
 
+def _manifest_v3(path: Path) -> dict[str, Any]:
+    resolved, value = bundle_builder._json_input_v3(path, label="manifest")
+    if resolved.read_bytes() != pit_canonical_json_bytes(value):
+        raise ValueError("schema-V3 manifest is not canonical JSON")
+    return dict(value)
+
+
 def _compare_manifest(actual: dict[str, Any], expected: dict[str, Any]) -> None:
     normalized = dict(actual)
     normalized["symbols"] = normalized.pop("symbol_count")
@@ -102,7 +109,7 @@ def _verify_exact_sources(
 
 
 def _database_rows(bundle_path: Path, table: str, columns: str, order: str) -> list[tuple[Any, ...]]:
-    uri = f"file:{bundle_path.as_posix()}?mode=ro&immutable=1"
+    uri = f"{bundle_path.as_uri()}?mode=ro&immutable=1"
     connection = sqlite3.connect(uri, uri=True)
     try:
         return [tuple(row) for row in connection.execute(
@@ -118,11 +125,14 @@ def _verify_v3(
     bundle_path: Path,
     args: argparse.Namespace,
     manifest: dict[str, Any],
+    manifest_path: Path,
+    manifest_sha256: str,
 ) -> tuple[
     dict[str, object],
     list[tuple[Any, ...]],
     dict[str, object],
     dict[str, Path],
+    dict[str, str],
 ]:
     paths = {
         name: _regular_file(getattr(args, name), label=name.replace("_", " "))
@@ -137,6 +147,7 @@ def _verify_v3(
             "industry_provenance",
         )
     }
+    paths["manifest"] = manifest_path
     metadata_keys = {
         "membership_csv": "membership_source_sha256",
         "prices_csv": "prices_source_sha256",
@@ -148,6 +159,8 @@ def _verify_v3(
         "industry_provenance": "industry_provenance_sha256",
     }
     before = {name: sha256_file(path) for name, path in paths.items()}
+    if before["manifest"] != manifest_sha256:
+        raise ValueError("manifest changed before schema-V3 verification")
     for name, metadata_key in metadata_keys.items():
         if before[name] != bundle.metadata.get(metadata_key):
             raise ValueError(f"exact source digest mismatch: {name}")
@@ -294,7 +307,7 @@ def _verify_v3(
     }
     if before != {name: sha256_file(path) for name, path in paths.items()}:
         raise ValueError("a checked input changed during schema-V3 verification")
-    return summary, industry, augmented_manifest, paths
+    return summary, industry, augmented_manifest, paths, before
 
 
 def _write_report(path: str | Path, report: Mapping[str, object]) -> None:
@@ -337,6 +350,8 @@ def main() -> int:
     args = parser.parse_args()
 
     bundle_path = _regular_file(args.bundle, label="bundle")
+    manifest_path = _regular_file(args.manifest, label="manifest")
+    manifest_sha256 = sha256_file(manifest_path)
     report_path = None
     if args.report_output is not None:
         report_path = Path(args.report_output).resolve()
@@ -361,11 +376,13 @@ def main() -> int:
                     "schema-V3 verification requires --industry-csv, "
                     "--industry-provenance, and --report-output"
                 )
-            summary, _industry, actual, checked_paths = _verify_v3(
+            summary, _industry, actual, checked_paths, checked_digests = _verify_v3(
                 bundle=bundle,
                 bundle_path=bundle_path,
                 args=args,
                 manifest=actual,
+                manifest_path=manifest_path,
+                manifest_sha256=manifest_sha256,
             )
         else:
             if (
@@ -375,30 +392,33 @@ def main() -> int:
             ):
                 parser.error("industry and report arguments are schema-V3-only")
             _verify_exact_sources(bundle, args, actual)
-    manifest_path = _regular_file(args.manifest, label="manifest")
-    try:
-        expected = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError("manifest JSON is invalid") from exc
-    if not isinstance(expected, dict):
-        raise ValueError("manifest must contain a JSON object")
+    if schema_version == "3":
+        expected = _manifest_v3(manifest_path)
+    else:
+        try:
+            expected = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("manifest JSON is invalid") from exc
+        if not isinstance(expected, dict):
+            raise ValueError("manifest must contain a JSON object")
     _compare_manifest(actual, expected)
     if schema_version == "3":
         assert report_path is not None
-        if sha256_file(bundle_path) != args.sha256:
-            raise ValueError("bundle changed during schema-V3 verification")
-        input_digests = {
-            name: sha256_file(path) for name, path in sorted(checked_paths.items())
-        }
-        input_digests["manifest"] = sha256_file(manifest_path)
         report = {
-            "bundle_sha256": sha256_file(bundle_path),
-            "checked_inputs": input_digests,
+            "bundle_sha256": args.sha256,
+            "checked_inputs": dict(sorted(checked_digests.items())),
             "kind": "pit_bundle_verification_v3",
             "membership_summary": summary,
             "schema_version": 3,
             "status": "verified",
         }
+        if sha256_file(bundle_path) != args.sha256:
+            raise ValueError("bundle changed during schema-V3 verification")
+        current_digests = {
+            name: sha256_file(path) for name, path in sorted(checked_paths.items())
+        }
+        if current_digests != dict(sorted(checked_digests.items())):
+            raise ValueError("a checked input changed before report publication")
         _write_report(report_path, report)
     print(json.dumps(actual, sort_keys=True))
     return 0

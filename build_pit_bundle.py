@@ -654,13 +654,13 @@ def _v3_provenance_metadata(
     }
     if membership_provenance.get("universe_event_counts") != expected_universe_counts:
         raise ValueError("schema-V3 membership provenance universe counts are inconsistent")
-    raw_inputs = membership_provenance.get("inputs")
-    if (
-        not isinstance(raw_inputs, list)
-        or [item.get("universe_id") for item in raw_inputs if isinstance(item, dict)]
-        != list(_V3_SOURCE_UNIVERSES)
-    ):
-        raise ValueError("schema-V3 membership provenance source bindings are invalid")
+    membership_inputs = _validated_v3_membership_inputs(
+        membership_provenance.get("inputs"),
+        universe_event_counts=expected_universe_counts,
+        coalesced_transition_count=int(
+            membership_provenance["coalesced_transition_count"]
+        ),
+    )
 
     if prices_provenance.get("prices_sha256") != prices_sha:
         raise ValueError("prices provenance does not bind the prices CSV")
@@ -780,7 +780,7 @@ def _v3_provenance_metadata(
     if len(exclusions) != len(raw_exclusions):
         raise ValueError("prices provenance has duplicate price exclusions")
 
-    membership_inputs_sha = pit_canonical_json_sha256(raw_inputs)
+    membership_inputs_sha = pit_canonical_json_sha256(membership_inputs)
     security_names_sha = _digest(
         fundamentals_provenance.get("security_names_csv_sha256"),
         field="security_names_csv_sha256",
@@ -844,6 +844,93 @@ def _required_v3_text(source: Mapping[str, object], key: str) -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError(f"provenance field is required: {key}")
     return value
+
+
+def _v3_utc_timestamp(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError(f"{field} must be a canonical UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a canonical UTC timestamp") from exc
+    if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+        raise ValueError(f"{field} must be a canonical UTC timestamp")
+    return value
+
+
+def _validated_v3_membership_inputs(
+    raw_inputs: object,
+    *,
+    universe_event_counts: Mapping[str, int],
+    coalesced_transition_count: int,
+) -> list[dict[str, object]]:
+    binding_keys = {
+        "event_count",
+        "membership_sha256",
+        "provenance_sha256",
+        "retrieved_at_utc",
+        "source_kind",
+        "universe_id",
+    }
+    if not isinstance(raw_inputs, list) or len(raw_inputs) != len(
+        _V3_SOURCE_UNIVERSES
+    ):
+        raise ValueError("schema-V3 membership provenance source bindings are invalid")
+    validated: list[dict[str, object]] = []
+    removed_event_count = 0
+    for expected_universe, raw_binding in zip(
+        _V3_SOURCE_UNIVERSES, raw_inputs, strict=True
+    ):
+        if not isinstance(raw_binding, dict) or set(raw_binding) != binding_keys:
+            raise ValueError(
+                "schema-V3 membership provenance source binding schema is invalid"
+            )
+        if raw_binding["universe_id"] != expected_universe:
+            raise ValueError(
+                "schema-V3 membership provenance source binding order is invalid"
+            )
+        event_count = raw_binding["event_count"]
+        if type(event_count) is not int or event_count <= 0:
+            raise ValueError(
+                "schema-V3 membership provenance source event_count is invalid"
+            )
+        output_count = universe_event_counts[expected_universe]
+        event_difference = event_count - output_count
+        if event_difference < 0 or event_difference % 2:
+            raise ValueError(
+                "schema-V3 membership provenance source event counts are inconsistent"
+            )
+        removed_event_count += event_difference
+        membership_digest = raw_binding["membership_sha256"]
+        provenance_digest = raw_binding["provenance_sha256"]
+        if not isinstance(membership_digest, str) or not isinstance(
+            provenance_digest, str
+        ):
+            raise ValueError(
+                "schema-V3 membership provenance source digests are invalid"
+            )
+        validated.append(
+            {
+                "event_count": event_count,
+                "membership_sha256": _digest(
+                    membership_digest, field="membership input membership_sha256"
+                ),
+                "provenance_sha256": _digest(
+                    provenance_digest, field="membership input provenance_sha256"
+                ),
+                "retrieved_at_utc": _v3_utc_timestamp(
+                    raw_binding["retrieved_at_utc"],
+                    field="membership input retrieved_at_utc",
+                ),
+                "source_kind": _required_v3_text(raw_binding, "source_kind"),
+                "universe_id": expected_universe,
+            }
+        )
+    if removed_event_count != 2 * coalesced_transition_count:
+        raise ValueError(
+            "schema-V3 membership provenance coalesced event count is inconsistent"
+        )
+    return validated
 
 
 def _integrity_gate_v3(
@@ -1261,7 +1348,12 @@ def main() -> int:
         os.close(descriptor)
         temp_manifest = Path(temp_name)
         temp_paths.append(temp_manifest)
-        temp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        manifest_payload = (
+            pit_canonical_json(manifest) + "\n"
+            if args.schema_version == "3"
+            else json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
+        temp_manifest.write_text(manifest_payload, encoding="utf-8", newline="\n")
         staged.append((temp_manifest, manifest_path))
         if before_hashes != {path: sha256_file(path) for path in inputs}:
             raise ValueError("an input changed before bundle publication")
