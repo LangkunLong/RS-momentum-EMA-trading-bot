@@ -319,6 +319,7 @@ def _validate_episodes(
             raise ValueError("V5 no-fill result changed terminal cash")
         return episodes
     session_set = set(sessions)
+    session_positions = {session: index for index, session in enumerate(sessions)}
     if any(str(item) not in session_set for item in fills["Date"]):
         raise ValueError("V5 fill session falls outside the authenticated panel")
     if fills["EpisodeId"].isna().any() or set(fills["EpisodeId"]) != set(ids):
@@ -341,6 +342,11 @@ def _validate_episodes(
         ):
             raise ValueError("V5 episode identity differs from closed trade evidence")
         episode_fills = fills[fills["EpisodeId"] == episode.episode_id]
+        _validate_episode_quantity_path(
+            episode=episode,
+            episode_fills=episode_fills,
+            session_positions=session_positions,
+        )
         buys = episode_fills[episode_fills["Action"] == "BUY"]
         sells = episode_fills[episode_fills["Action"] == "SELL"]
         if len(buys) != episode.add_on_count + 1 or sells.empty:
@@ -378,6 +384,100 @@ def _validate_episodes(
     if _money(initial + cash_change) != ending:
         raise ValueError("V5 fill cash does not reconcile initial and ending equity")
     return episodes
+
+
+def _validate_episode_quantity_path(
+    *,
+    episode: PositionEpisodeV5,
+    episode_fills: pd.DataFrame,
+    session_positions: Mapping[str, int],
+) -> None:
+    """Require one immutable quantity transition for every ordered episode fill."""
+
+    rows = episode_fills.to_dict("records")
+    path = episode.quantity_path
+    if len(rows) != len(path) or not rows:
+        raise ValueError("V5 episode quantity path does not match its fill count")
+    duplicate_keys: set[tuple[object, ...]] = set()
+    previous_session_position = -1
+    cumulative_quantity = Decimal(0)
+    add_on_count = 0
+    for index, (row, change) in enumerate(zip(rows, path, strict=True)):
+        session = str(row["Date"])
+        session_position = session_positions.get(session)
+        if session_position is None or session_position < previous_session_position:
+            raise ValueError("V5 episode fills are not in causal session order")
+        previous_session_position = session_position
+        duplicate_key = (
+            session,
+            str(row["Ticker"]),
+            str(row["Action"]),
+            str(row["Reason"]),
+            str(row["ReferencePrice"]),
+            str(row["ExecutionPrice"]),
+            str(row["Quantity"]),
+            str(row["CashDelta"]),
+        )
+        if duplicate_key in duplicate_keys:
+            raise ValueError("V5 episode contains a duplicate fill transition")
+        duplicate_keys.add(duplicate_key)
+
+        action = str(row["Action"])
+        quantity = _d(row["Quantity"], "episode transition quantity", positive=True)
+        if action == "BUY":
+            expected_action = "entry" if index == 0 else "add_on"
+            cumulative_quantity += quantity
+            if expected_action == "add_on":
+                add_on_count += 1
+        elif action == "SELL":
+            if index == 0 or quantity > cumulative_quantity:
+                raise ValueError("V5 episode sell exceeds its causal open quantity")
+            cumulative_quantity -= quantity
+            expected_action = "exit" if _q(cumulative_quantity) == 0 else "scale_out"
+        else:
+            raise ValueError("V5 episode fill action is invalid")
+
+        if (
+            change.action != expected_action
+            or change.session != session
+            or change.reason != str(row["Reason"])
+            or not math.isclose(
+                change.execution_price,
+                float(row["ExecutionPrice"]),
+                rel_tol=0.0,
+                abs_tol=1e-10,
+            )
+            or _q(_d(change.quantity_after, "episode cumulative quantity"))
+            != _q(cumulative_quantity)
+        ):
+            raise ValueError("V5 episode quantity transition differs from fill evidence")
+
+    first = rows[0]
+    last = rows[-1]
+    if (
+        str(first["Action"]) != "BUY"
+        or str(last["Action"]) != "SELL"
+        or _q(cumulative_quantity) != 0
+        or add_on_count != episode.add_on_count
+        or episode.entry_session != str(first["Date"])
+        or episode.exit_session != str(last["Date"])
+        or episode.entry_symbol != str(first["Ticker"])
+        or episode.exit_symbol != str(last["Ticker"])
+        or episode.exit_reason != str(last["Reason"])
+        or not math.isclose(
+            episode.entry_price,
+            float(first["ExecutionPrice"]),
+            rel_tol=0.0,
+            abs_tol=1e-10,
+        )
+        or not math.isclose(
+            episode.exit_price,
+            float(last["ExecutionPrice"]),
+            rel_tol=0.0,
+            abs_tol=1e-10,
+        )
+    ):
+        raise ValueError("V5 episode endpoints do not reconcile to ordered fills")
 
 
 def _distribution(values: Iterable[Decimal]) -> DistributionSummaryV5 | None:
