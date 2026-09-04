@@ -39,24 +39,40 @@ MAX_ROLE_EVIDENCE_BYTES_V5 = 16 * 1024
 
 # This is a closed semantic-runtime set, not a repository hash.  In particular,
 # documentation, orchestration, provider, and CLI files do not affect evaluator
-# identity.  diagnostics.py is deliberately required before the source identity
-# can be issued, even though it is introduced by the next implementation task.
+# identity.  The four editable ``strategy_policy/v3`` modules are also excluded:
+# their exact bytes are authenticated separately by PolicyRevisionIdentityV5.
+# diagnostics.py is deliberately required before the source identity can be
+# issued, even though it is introduced by the next implementation task.
 EVALUATOR_SOURCE_PATHS_V5 = (
     "backtest.py",
     "core/backtest_engine.py",
     "core/backtest_fills.py",
+    "core/canslim/fiscal_periods.py",
+    "core/canslim/l_leader_laggard.py",
+    "core/industry_group.py",
     "core/momentum_analysis.py",
     "core/pit_data.py",
     "core/pit_diagnosis/fact_cache.py",
     "core/pit_diagnosis/patterns.py",
+    "core/pit_feature_snapshot.py",
     "core/pit_optimizer_evaluation.py",
+    "core/pit_optimizer_v5/candidate_ir.py",
     "core/pit_optimizer_v5/contracts.py",
     "core/pit_optimizer_v5/diagnostics.py",
     "core/pit_optimizer_v5/evaluator.py",
+    "core/pit_optimizer_v5/policy_scope.py",
+    "core/pit_provenance.py",
+    "core/pit_universe_v3.py",
     "core/strategy_policy/__init__.py",
+    "core/strategy_policy/adapter_v3.py",
     "core/strategy_policy/contracts.py",
+    "core/strategy_policy/contracts_v3.py",
+    "core/strategy_policy/entry.py",
+    "core/strategy_policy/exit.py",
     "core/strategy_policy/market_context.py",
+    "core/strategy_policy/risk.py",
     "core/strategy_policy/runtime.py",
+    "core/strategy_policy/v3/__init__.py",
     "core/strategy_policy/worker.py",
     "core/trading_sessions.py",
 )
@@ -779,6 +795,7 @@ class EvaluatorContractV5:
     prices_provenance_sha256: str
     identity_transition_contract_sha256: str
     baseline_source_bundle_sha256: str
+    baseline_policy_revision_sha256: str
     friction_grid: tuple[FrictionScenario, ...]
     selection_scenario_id: str
     benchmark: Literal["SPY"] = "SPY"
@@ -798,6 +815,7 @@ class EvaluatorContractV5:
                 "identity transition contract SHA-256",
             ),
             (self.baseline_source_bundle_sha256, "baseline source bundle SHA-256"),
+            (self.baseline_policy_revision_sha256, "baseline policy revision SHA-256"),
         ):
             _digest(value, label)
         if type(self.friction_grid) is not tuple or any(

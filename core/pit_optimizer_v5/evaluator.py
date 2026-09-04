@@ -16,9 +16,14 @@ from core.backtest_fills import ExecutionProfileV5, FrictionScenario
 from core.pit_data import PriceIdentityTransitionContract
 from core.pit_optimizer_evaluation import EvaluationPanelSpec
 from core.pit_provenance import pit_canonical_json_sha256
-from core.strategy_policy import StrategyPolicyClient, StrategyPolicyClientFactory
-from core.strategy_policy.runtime import InProcessPolicyClient
+from core.strategy_policy import (
+    POLICY_INTERFACE_VERSION_V3,
+    StrategyPolicyClientFactoryV3,
+    StrategyPolicyClientV3,
+)
+from core.strategy_policy.runtime import InProcessPolicyClientV3
 
+from .candidate_ir import PolicyRevisionIdentityV5
 from .contracts import (
     EvaluationReportV5,
     EvaluatorContractV5,
@@ -71,16 +76,21 @@ class CandidateWorkerBindingV5:
     """Trusted binding between one candidate source tree and one worker."""
 
     candidate_root: Path
-    policy_identity_sha256: str
-    client: StrategyPolicyClient
+    policy_revision: PolicyRevisionIdentityV5
+    client: StrategyPolicyClientV3
 
     def __post_init__(self) -> None:
         root = _canonical_candidate_root(self.candidate_root)
         if type(self.candidate_root) is not type(root) or self.candidate_root != root:
             raise ValueError("candidate worker root is not canonical")
-        _require_digest(self.policy_identity_sha256, "candidate worker policy identity")
-        if not _is_policy_client(self.client):
+        if type(self.policy_revision) is not PolicyRevisionIdentityV5:
+            raise ValueError("candidate worker policy revision is invalid")
+        if not _is_policy_client_v3(self.client):
             raise TypeError("candidate worker binding contains an invalid client")
+
+    @property
+    def policy_identity_sha256(self) -> str:
+        return self.policy_revision.sha256
 
     @property
     def candidate_root_sha256(self) -> str:
@@ -111,7 +121,7 @@ class CandidateWorkerFactoryV5(Protocol):
     """Authenticate candidate source and create a worker bound to that source."""
 
     def __call__(
-        self, *, candidate_root: Path, policy_identity_sha256: str
+        self, *, candidate_root: Path, policy_revision: PolicyRevisionIdentityV5
     ) -> CandidateWorkerBindingV5: ...
 
 
@@ -120,19 +130,19 @@ class _SingleUseWorkerFactory:
 
     def __init__(
         self,
-        delegate: StrategyPolicyClientFactory,
-        allocated_workers: list[StrategyPolicyClient],
+        delegate: StrategyPolicyClientFactoryV3,
+        allocated_workers: list[StrategyPolicyClientV3],
     ) -> None:
         self._delegate = delegate
         self._allocated_workers = allocated_workers
         self.calls = 0
 
-    def __call__(self) -> StrategyPolicyClient:
+    def __call__(self) -> StrategyPolicyClientV3:
         if self.calls:
             raise ValueError("a V5 simulator may allocate exactly one policy worker")
         self.calls += 1
         worker = self._delegate()
-        if not _is_policy_client(worker):
+        if not _is_policy_client_v3(worker):
             raise TypeError("policy worker factory returned an invalid client")
         if any(worker is previous for previous in self._allocated_workers):
             try:
@@ -143,9 +153,10 @@ class _SingleUseWorkerFactory:
         return worker
 
 
-def _is_policy_client(value: object) -> bool:
+def _is_policy_client_v3(value: object) -> bool:
     return (
         type(getattr(value, "interface_version", None)) is int
+        and value.interface_version == POLICY_INTERFACE_VERSION_V3  # type: ignore[attr-defined]
         and all(
             callable(getattr(value, method, None))
             for method in (
@@ -153,6 +164,7 @@ def _is_policy_client(value: object) -> bool:
                 "recommend_capacity",
                 "recommend_allocation",
                 "select_eviction",
+                "evaluate_add_on",
                 "evaluate_exit",
                 "close",
             )
@@ -194,11 +206,7 @@ def _scenario_primitive(scenario: FrictionScenario) -> dict[str, int | str]:
 
 
 def _panel_tickers(panel: EvaluationPanelSpec) -> list[str]:
-    return [
-        ticker
-        for lineage in panel.lineages
-        for ticker in lineage.executable_tickers
-    ]
+    return [ticker for lineage in panel.lineages for ticker in lineage.executable_tickers]
 
 
 def _equity_endpoints(result: SimulationResultV5) -> tuple[Decimal, Decimal]:
@@ -230,7 +238,8 @@ class PitPanelEvaluatorV5:
         pit_bundle: AuthenticatedPitBundleV5,
         prices_provenance: Path,
         report_builder: EvaluationReportBuilderV5,
-        baseline_worker_factory: StrategyPolicyClientFactory | None = None,
+        baseline_policy_revision: PolicyRevisionIdentityV5,
+        baseline_worker_factory: StrategyPolicyClientFactoryV3 | None = None,
         simulator_factory: SimulatorFactoryV5 = PortfolioSimulator,
     ) -> None:
         if type(contract) is not EvaluatorContractV5:
@@ -239,6 +248,10 @@ class PitPanelEvaluatorV5:
             raise ValueError("sandbox profile must use schema V5")
         if type(execution_profile) is not ExecutionProfileV5:
             raise ValueError("execution profile must use schema V5")
+        if type(baseline_policy_revision) is not PolicyRevisionIdentityV5:
+            raise ValueError("baseline policy revision must use the V5 identity schema")
+        if baseline_policy_revision.sha256 != contract.baseline_policy_revision_sha256:
+            raise ValueError("baseline policy revision differs from evaluator contract")
         validate_sandbox_profile_resources_v5(sandbox_profile, resource_manifest)
         if sandbox_profile.sha256 != contract.sandbox_profile_sha256:
             raise ValueError("sandbox profile identity differs from evaluator contract")
@@ -250,11 +263,7 @@ class PitPanelEvaluatorV5:
             raise TypeError("V5 evaluation report builder is invalid")
         if not callable(simulator_factory):
             raise TypeError("V5 simulator factory is invalid")
-        baseline_factory = (
-            InProcessPolicyClient
-            if baseline_worker_factory is None
-            else baseline_worker_factory
-        )
+        baseline_factory = InProcessPolicyClientV3 if baseline_worker_factory is None else baseline_worker_factory
         if not callable(baseline_factory):
             raise TypeError("baseline worker factory is invalid")
 
@@ -272,15 +281,10 @@ class PitPanelEvaluatorV5:
             raise ValueError("price identity transition contract is invalid")
         if transition.prices_provenance_sha256 != provenance_sha256:
             raise ValueError("prices provenance identity differs from evaluator contract")
-        canonical_identities = {
-            ticker: dict(identity)
-            for ticker, identity in transition.identities.items()
-        }
+        canonical_identities = {ticker: dict(identity) for ticker, identity in transition.identities.items()}
         if (
-            transition.request_contracts_sha256
-            != contract.identity_transition_contract_sha256
-            or pit_canonical_json_sha256(canonical_identities)
-            != contract.identity_transition_contract_sha256
+            transition.request_contracts_sha256 != contract.identity_transition_contract_sha256
+            or pit_canonical_json_sha256(canonical_identities) != contract.identity_transition_contract_sha256
         ):
             raise ValueError("identity transition contract identity differs")
 
@@ -302,6 +306,7 @@ class PitPanelEvaluatorV5:
         self._transition_contract = transition
         self._warmup_start = warmup_start
         self._report_builder = report_builder
+        self._baseline_policy_revision = baseline_policy_revision
         self._baseline_worker_factory = baseline_factory
         self._simulator_factory = simulator_factory
 
@@ -317,7 +322,7 @@ class PitPanelEvaluatorV5:
     ) -> PanelEvaluationV5:
         return self._evaluate(
             panel=panel,
-            policy_identity_sha256=self._contract.baseline_source_bundle_sha256,
+            policy_revision=self._baseline_policy_revision,
             worker_factory=self._baseline_worker_factory,
             scenario_ids=scenario_ids,
         )
@@ -327,7 +332,7 @@ class PitPanelEvaluatorV5:
         *,
         candidate_root: Path,
         panel: EvaluationPanelSpec,
-        policy_identity_sha256: str,
+        policy_revision: PolicyRevisionIdentityV5,
         worker_factory: CandidateWorkerFactoryV5,
         scenario_ids: tuple[str, ...],
     ) -> PanelEvaluationV5:
@@ -336,7 +341,7 @@ class PitPanelEvaluatorV5:
             raise ValueError("candidate root must be supplied in canonical form")
         return self._evaluate(
             panel=panel,
-            policy_identity_sha256=policy_identity_sha256,
+            policy_revision=policy_revision,
             worker_factory=None,
             candidate_root=root,
             candidate_worker_factory=worker_factory,
@@ -347,22 +352,29 @@ class PitPanelEvaluatorV5:
         self,
         *,
         panel: EvaluationPanelSpec,
-        policy_identity_sha256: str,
-        worker_factory: StrategyPolicyClientFactory | None,
+        policy_revision: PolicyRevisionIdentityV5,
+        worker_factory: StrategyPolicyClientFactoryV3 | None,
         candidate_root: Path | None = None,
         candidate_worker_factory: CandidateWorkerFactoryV5 | None = None,
         scenario_ids: tuple[str, ...],
     ) -> PanelEvaluationV5:
         if type(panel) is not EvaluationPanelSpec:
             raise ValueError("evaluation panel must use the authenticated panel schema")
-        _require_digest(policy_identity_sha256, "policy identity")
+        if type(policy_revision) is not PolicyRevisionIdentityV5:
+            raise ValueError("evaluation policy revision must use the V5 identity schema")
+        if (
+            policy_revision.trusted_policy_runtime_sha256
+            != self._baseline_policy_revision.trusted_policy_runtime_sha256
+            or policy_revision.immutable_constraints_sha256
+            != self._baseline_policy_revision.immutable_constraints_sha256
+        ):
+            raise ValueError("evaluation policy revision changes trusted policy authority")
+        policy_identity_sha256 = policy_revision.sha256
         if (worker_factory is None) == (candidate_worker_factory is None):
             raise TypeError("evaluation requires exactly one worker factory kind")
         if worker_factory is not None and not callable(worker_factory):
             raise TypeError("policy worker factory is invalid")
-        if candidate_worker_factory is not None and not callable(
-            candidate_worker_factory
-        ):
+        if candidate_worker_factory is not None and not callable(candidate_worker_factory):
             raise TypeError("candidate worker factory is invalid")
         if (candidate_root is None) is not (candidate_worker_factory is None):
             raise ValueError("candidate worker construction is incompletely bound")
@@ -371,7 +383,7 @@ class PitPanelEvaluatorV5:
         if date.fromisoformat(self._warmup_start) > panel_start:
             raise ValueError("PIT bundle warmup begins after the panel")
 
-        allocated_workers: list[StrategyPolicyClient] = []
+        allocated_workers: list[StrategyPolicyClientV3] = []
         scenario_evidence: list[ScenarioPanelEvaluationV5] = []
         for scenario in scenarios:
             candidate_binding: CandidateWorkerBindingV5 | None = None
@@ -380,14 +392,11 @@ class PitPanelEvaluatorV5:
                 assert candidate_root is not None
                 binding = candidate_worker_factory(
                     candidate_root=candidate_root,
-                    policy_identity_sha256=policy_identity_sha256,
+                    policy_revision=policy_revision,
                 )
                 if type(binding) is not CandidateWorkerBindingV5:
                     raise TypeError("candidate worker factory returned an invalid binding")
-                if (
-                    binding.candidate_root != candidate_root
-                    or binding.policy_identity_sha256 != policy_identity_sha256
-                ):
+                if binding.candidate_root != candidate_root or binding.policy_revision != policy_revision:
                     try:
                         binding.client.close()
                     finally:
@@ -395,9 +404,7 @@ class PitPanelEvaluatorV5:
                 candidate_binding = binding
                 scenario_worker_factory = lambda binding=binding: binding.client
             assert scenario_worker_factory is not None
-            single_worker = _SingleUseWorkerFactory(
-                scenario_worker_factory, allocated_workers
-            )
+            single_worker = _SingleUseWorkerFactory(scenario_worker_factory, allocated_workers)
             simulator = self._simulator_factory(
                 pit_bundle=self._pit_bundle,
                 benchmark_symbol=self._contract.benchmark,
@@ -449,23 +456,15 @@ class PitPanelEvaluatorV5:
             policy_identity_sha256=policy_identity_sha256,
             start_date=panel.start_date,
             end_date=panel.end_date,
-            elapsed_calendar_days=(
-                date.fromisoformat(panel.end_date) - date.fromisoformat(panel.start_date)
-            ).days,
+            elapsed_calendar_days=(date.fromisoformat(panel.end_date) - date.fromisoformat(panel.start_date)).days,
             selection_scenario_id=self._contract.selection_scenario_id,
             scenarios=tuple(scenario_evidence),
         )
 
-    def _requested_scenarios(
-        self, scenario_ids: tuple[str, ...]
-    ) -> tuple[FrictionScenario, ...]:
-        if type(scenario_ids) is not tuple or not scenario_ids or any(
-            type(item) is not str for item in scenario_ids
-        ):
+    def _requested_scenarios(self, scenario_ids: tuple[str, ...]) -> tuple[FrictionScenario, ...]:
+        if type(scenario_ids) is not tuple or not scenario_ids or any(type(item) is not str for item in scenario_ids):
             raise ValueError("requested scenarios must be a non-empty tuple")
-        grid_by_id = {
-            scenario.scenario_id: scenario for scenario in self._contract.friction_grid
-        }
+        grid_by_id = {scenario.scenario_id: scenario for scenario in self._contract.friction_grid}
         if len(set(scenario_ids)) != len(scenario_ids) or any(
             scenario_id not in grid_by_id for scenario_id in scenario_ids
         ):
@@ -473,9 +472,7 @@ class PitPanelEvaluatorV5:
         if self._contract.selection_scenario_id not in scenario_ids:
             raise ValueError("requested scenarios must contain the selection scenario")
         canonical = tuple(
-            scenario.scenario_id
-            for scenario in self._contract.friction_grid
-            if scenario.scenario_id in scenario_ids
+            scenario.scenario_id for scenario in self._contract.friction_grid if scenario.scenario_id in scenario_ids
         )
         if scenario_ids != canonical:
             raise ValueError("requested scenarios are not in canonical grid order")
@@ -504,11 +501,7 @@ class PitPanelEvaluatorV5:
         }
         if any(config.get(key) != value for key, value in expected.items()):
             raise ValueError("V5 simulation result identity differs from evaluator inputs")
-        expected_binding = (
-            None
-            if candidate_binding is None
-            else candidate_binding.result_provenance()
-        )
+        expected_binding = None if candidate_binding is None else candidate_binding.result_provenance()
         if config.get("candidate_worker_binding") != expected_binding:
             raise ValueError("V5 result candidate worker provenance differs")
         if result.benchmark_symbol != self._contract.benchmark:
@@ -516,9 +509,7 @@ class PitPanelEvaluatorV5:
         _equity_endpoints(result)
 
     @staticmethod
-    def _bind_candidate_result(
-        result: object, binding: CandidateWorkerBindingV5 | None
-    ) -> None:
+    def _bind_candidate_result(result: object, binding: CandidateWorkerBindingV5 | None) -> None:
         if type(result) is not SimulationResultV5:
             return
         config = result.config
@@ -533,16 +524,6 @@ class PitPanelEvaluatorV5:
             result.config.pop("candidate_worker_binding", None)
         else:
             result.config["candidate_worker_binding"] = expected
-
-
-def _require_digest(value: object, label: str) -> str:
-    if (
-        type(value) is not str
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return value
 
 
 __all__ = [

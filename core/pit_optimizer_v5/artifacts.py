@@ -60,6 +60,7 @@ from core.pit_optimizer_v5.memory import (
     RoundEventPayloadV5,
     RoundEventV5,
     RoundIntentPayloadV5,
+    RoundOutcomePayloadV5,
     RoundRecoveryV5,
     StoredExperimentRecordV5,
     event_kind_for_payload_v5,
@@ -554,6 +555,8 @@ def _decode_round_payload(expected_kind: str, value: object) -> RoundEventPayloa
         return _decode_dataclass(ResourceLeasePayloadV5, body)
     if expected_kind == "cleanup_result":
         return _decode_dataclass(CleanupResultPayloadV5, body)
+    if expected_kind == "round_outcome":
+        return _decode_dataclass(RoundOutcomePayloadV5, body)
     raise ArtifactSchemaFailureV5()
 
 
@@ -828,6 +831,9 @@ class LocalArtifactRepositoryV5:
 
     def append_round_payload(self, payload: RoundEventPayloadV5) -> ArtifactRefV5:
         kind = event_kind_for_payload_v5(payload)
+        if isinstance(payload, RoundOutcomePayloadV5):
+            for reference in payload.artifact_refs:
+                self.authenticate(reference)
         primitive = round_event_payload_primitive_v5(payload)
         digest = hashlib.sha256(canonical_json_bytes_v5(primitive)).hexdigest()
         return self._create_only(f"payloads/{kind}/{digest}.json", primitive)
@@ -838,6 +844,9 @@ class LocalArtifactRepositoryV5:
         try:
             primitive = _strict_json_object(authenticated.content, reference)
             payload = _decode_round_payload(expected_kind, primitive)
+            if isinstance(payload, RoundOutcomePayloadV5):
+                for child_reference in payload.artifact_refs:
+                    self.authenticate(child_reference)
         except ArtifactRepositoryFailureV5:
             raise
         except (TypeError, ValueError, ArithmeticError):
@@ -852,6 +861,8 @@ class LocalArtifactRepositoryV5:
         payload = self.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
         event.validate_payload(payload)
         prior = self.load_round_events(campaign_id=event.campaign_id, round_index=event.round_index)
+        if prior and prior[-1].event_kind == "round_outcome":
+            raise ValueError("cannot append after a terminal round outcome")
         if event.sequence != len(prior):
             raise ValueError("round event sequence is not the next durable position")
         expected_prior = None if not prior else prior[-1].sha256

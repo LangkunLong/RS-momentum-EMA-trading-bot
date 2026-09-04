@@ -51,6 +51,12 @@ RoundEventKindV5 = Literal[
     "episode_evidence",
     "resource_lease",
     "cleanup_result",
+    "round_outcome",
+]
+RoundOutcomeKindV5 = Literal[
+    "no_novel_hypothesis",
+    "novelty_exhausted",
+    "critic_unavailable",
 ]
 
 _STATUSES = frozenset(
@@ -84,8 +90,10 @@ _EVENT_KINDS = frozenset(
         "episode_evidence",
         "resource_lease",
         "cleanup_result",
+        "round_outcome",
     }
 )
+_ROUND_OUTCOMES = frozenset({"no_novel_hypothesis", "novelty_exhausted", "critic_unavailable"})
 
 
 def _digest(value: object, label: str) -> str:
@@ -555,6 +563,84 @@ class CleanupResultPayloadV5:
             _text(self.failure_code, "cleanup failure code")
 
 
+@dataclass(frozen=True, slots=True)
+class RoundOutcomePayloadV5:
+    """Authenticated terminal round fact that does not fabricate an experiment."""
+
+    outcome: RoundOutcomeKindV5
+    campaign_id: str
+    round_index: int
+    discovery_plan_sha256: str
+    search_state_before_ref: ArtifactRefV5
+    search_state_after_ref: ArtifactRefV5
+    parent_revision_sha256: str | None
+    role_request_refs: tuple[ArtifactRefV5, ...]
+    role_attempt_refs: tuple[ArtifactRefV5, ...]
+    evidence_refs: tuple[ArtifactRefV5, ...]
+    experiment_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.outcome) is not str or self.outcome not in _ROUND_OUTCOMES:
+            raise ValueError("round outcome is invalid")
+        _text(self.campaign_id, "round-outcome campaign ID")
+        _count(self.round_index, "round-outcome round", positive=True)
+        _digest(self.discovery_plan_sha256, "round-outcome discovery plan")
+        for reference, label in (
+            (self.search_state_before_ref, "round-outcome prior search state"),
+            (self.search_state_after_ref, "round-outcome resulting search state"),
+        ):
+            if type(reference) is not ArtifactRefV5:
+                raise ValueError(f"{label} reference is invalid")
+        for references, label in (
+            (self.role_request_refs, "round-outcome role requests"),
+            (self.role_attempt_refs, "round-outcome role attempts"),
+            (self.evidence_refs, "round-outcome evidence"),
+        ):
+            if type(references) is not tuple or any(type(reference) is not ArtifactRefV5 for reference in references):
+                raise ValueError(f"{label} references are invalid")
+            if len(set(references)) != len(references):
+                raise ValueError(f"{label} references must be unique")
+        role_and_evidence_refs = self.role_request_refs + self.role_attempt_refs + self.evidence_refs
+        if len(set(role_and_evidence_refs)) != len(role_and_evidence_refs):
+            raise ValueError("round-outcome role and evidence references overlap")
+        if type(self.experiment_ids) is not tuple or any(
+            type(experiment_id) is not str for experiment_id in self.experiment_ids
+        ):
+            raise ValueError("round-outcome experiment IDs are invalid")
+        for experiment_id in self.experiment_ids:
+            _digest(experiment_id, "round-outcome experiment ID")
+        if len(set(self.experiment_ids)) != len(self.experiment_ids):
+            raise ValueError("round-outcome experiment IDs must be unique")
+
+        if self.outcome == "novelty_exhausted":
+            if self.parent_revision_sha256 is not None:
+                raise ValueError("novelty exhaustion cannot select a parent")
+            if self.role_request_refs or self.role_attempt_refs or not self.evidence_refs:
+                raise ValueError("novelty exhaustion must cite only prior novelty evidence")
+            if self.experiment_ids:
+                raise ValueError("novelty exhaustion cannot name experiments")
+            return
+
+        _digest(self.parent_revision_sha256, "round-outcome parent revision")
+        if not self.role_request_refs or not self.role_attempt_refs or not self.evidence_refs:
+            raise ValueError("round outcome lacks authenticated role or evidence facts")
+        if self.outcome == "no_novel_hypothesis":
+            if self.experiment_ids:
+                raise ValueError("no-novel outcome cannot name experiments")
+        elif not self.experiment_ids:
+            raise ValueError("critic-unavailable outcome must name its attempted experiments")
+
+    @property
+    def artifact_refs(self) -> tuple[ArtifactRefV5, ...]:
+        return (
+            self.search_state_before_ref,
+            self.search_state_after_ref,
+            *self.role_request_refs,
+            *self.role_attempt_refs,
+            *self.evidence_refs,
+        )
+
+
 RoundEventPayloadV5 = (
     RoundIntentPayloadV5
     | RenderedVariantPayloadV5
@@ -562,6 +648,7 @@ RoundEventPayloadV5 = (
     | EpisodeEvidencePayloadV5
     | ResourceLeasePayloadV5
     | CleanupResultPayloadV5
+    | RoundOutcomePayloadV5
 )
 
 _PAYLOAD_TYPES: dict[str, type[object]] = {
@@ -571,6 +658,7 @@ _PAYLOAD_TYPES: dict[str, type[object]] = {
     "episode_evidence": EpisodeEvidencePayloadV5,
     "resource_lease": ResourceLeasePayloadV5,
     "cleanup_result": CleanupResultPayloadV5,
+    "round_outcome": RoundOutcomePayloadV5,
 }
 
 
@@ -649,7 +737,12 @@ class RoundEventV5:
         }:
             if self.experiment_id is None:
                 raise ValueError("experiment-local event requires an experiment ID")
-        elif self.event_kind in {"round_intent", "resource_lease", "cleanup_result"}:
+        elif self.event_kind in {
+            "round_intent",
+            "resource_lease",
+            "cleanup_result",
+            "round_outcome",
+        }:
             if self.experiment_id is not None:
                 raise ValueError("campaign-level event cannot name an experiment")
         if type(self.payload_ref) is not ArtifactRefV5:
@@ -667,6 +760,9 @@ class RoundEventV5:
         if isinstance(payload, ResourceLeasePayloadV5):
             if payload.owner_campaign_id != self.campaign_id:
                 raise ValueError("resource lease differs from its campaign")
+        if isinstance(payload, RoundOutcomePayloadV5):
+            if payload.campaign_id != self.campaign_id or payload.round_index != self.round_index:
+                raise ValueError("round outcome differs from its event authority")
 
     def to_primitive(self) -> dict[str, object]:
         return {
@@ -739,6 +835,21 @@ class RoundRecoveryV5:
             type(item) is not RecoveryStepV5 for item in self.missing_steps
         ):
             raise ValueError("recovery missing steps are invalid")
+        terminal_positions = tuple(
+            index for index, payload in enumerate(self.payloads) if isinstance(payload, RoundOutcomePayloadV5)
+        )
+        if len(terminal_positions) > 1:
+            raise ValueError("round recovery contains multiple terminal outcomes")
+        if terminal_positions and terminal_positions[0] != len(self.payloads) - 1:
+            raise ValueError("round outcome must be the final durable event")
+        if terminal_positions and self.missing_steps:
+            raise ValueError("terminal round recovery cannot schedule more local steps")
+
+    @property
+    def terminal_outcome(self) -> RoundOutcomePayloadV5 | None:
+        if self.payloads and isinstance(self.payloads[-1], RoundOutcomePayloadV5):
+            return self.payloads[-1]
+        return None
 
 
 def fold_round_events_v5(
@@ -772,6 +883,13 @@ def fold_round_events_v5(
     if len(set(expected_steps)) != len(expected_steps):
         raise ValueError("expected recovery steps must be unique")
 
+    terminal = next(
+        (payload for payload in payloads if isinstance(payload, RoundOutcomePayloadV5)),
+        None,
+    )
+    if terminal is not None and not isinstance(payloads[-1], RoundOutcomePayloadV5):
+        raise ValueError("round outcome must be the final durable event")
+
     completed: set[RecoveryStepV5] = set()
     for event, payload in zip(events, payloads, strict=True):
         episode_ordinal = payload.episode.episode_ordinal if isinstance(payload, EpisodeEvidencePayloadV5) else None
@@ -787,7 +905,7 @@ def fold_round_events_v5(
     return RoundRecoveryV5(
         events=events,
         payloads=payloads,
-        missing_steps=tuple(step for step in expected_steps if step not in completed),
+        missing_steps=(() if terminal is not None else tuple(step for step in expected_steps if step not in completed)),
     )
 
 
@@ -1195,6 +1313,8 @@ __all__ = [
     "RoundEventPayloadV5",
     "RoundEventV5",
     "RoundIntentPayloadV5",
+    "RoundOutcomeKindV5",
+    "RoundOutcomePayloadV5",
     "RoundRecoveryV5",
     "StoredExperimentRecordV5",
     "event_kind_for_payload_v5",
