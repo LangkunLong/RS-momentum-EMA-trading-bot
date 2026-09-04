@@ -42,6 +42,7 @@ from typing import Any, Iterable, Mapping
 import pandas as pd
 
 from core.leader_evaluation import PointInTimeUniverse
+from core.pit_universe_v3 import PointInTimeUniverseV3
 from core.pit_provenance import (
     PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
     PIT_PUBLIC_DATES_ATTR,
@@ -121,6 +122,12 @@ _REQUIRED_V2_METADATA = {
     "non_tradable_reference_symbols_sha256",
     "source_universe",
 }
+_REQUIRED_V3_METADATA = {
+    "non_tradable_reference_symbols_json",
+    "non_tradable_reference_symbols_sha256",
+    "source_universes_json",
+}
+_V3_SOURCE_UNIVERSES = ("nasdaq100", "russell2000", "sp500")
 _SAME_ISSUER_CONTINUITIES = {
     "same_issuer_rename",
     "same_issuer_ticker_reuse",
@@ -256,7 +263,9 @@ def _canonical_ticker(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("ticker must be text")
     ticker = value.strip().upper()
-    if not ticker or len(ticker) > 8 or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-" for char in ticker):
+    if not ticker or len(ticker) > 8 or any(
+        char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-" for char in ticker
+    ):
         raise ValueError("ticker is not canonical")
     return ticker
 
@@ -278,7 +287,13 @@ def _json_file(path: str | Path) -> tuple[Path, Mapping[str, object]]:
 class PITDataBundle:
     """Validated, read-only point-in-time price/fundamental data bundle."""
 
-    def __init__(self, path: str | Path, *, expected_sha256: str) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        expected_sha256: str,
+        prices_provenance: str | Path | None = None,
+    ) -> None:
         resolved_path = _regular_file(path)
         self.path: Path | None = resolved_path
         expected = _validated_expected_sha256(expected_sha256)
@@ -287,11 +302,17 @@ class PITDataBundle:
             raise ValueError("point-in-time bundle SHA-256 does not match the expected digest")
         self.sha256 = actual
         uri = f"{resolved_path.as_uri()}?mode=ro"
-        self._initialize_connection(sqlite3.connect(uri, uri=True))
+        self._initialize_connection(
+            sqlite3.connect(uri, uri=True), prices_provenance=prices_provenance
+        )
 
     @classmethod
     def from_authenticated_bytes(
-        cls, data: bytes, *, expected_sha256: str
+        cls,
+        data: bytes,
+        *,
+        expected_sha256: str,
+        prices_provenance: str | Path | None = None,
     ) -> "PITDataBundle":
         """Open immutable authenticated SQLite bytes as a query-only memory bundle.
 
@@ -315,10 +336,17 @@ class PITDataBundle:
         bundle = cls.__new__(cls)
         bundle.path = None
         bundle.sha256 = actual
-        bundle._initialize_connection(connection)
+        bundle._initialize_connection(
+            connection, prices_provenance=prices_provenance
+        )
         return bundle
 
-    def _initialize_connection(self, connection: sqlite3.Connection) -> None:
+    def _initialize_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        prices_provenance: str | Path | None = None,
+    ) -> None:
         """Apply one shared read-only validation initializer to an open connection."""
 
         self._connection = connection
@@ -327,22 +355,45 @@ class PITDataBundle:
             self._connection.execute("PRAGMA query_only=ON")
             self._validate_schema()
             self.metadata = self._load_metadata()
-            self.membership = self._load_membership()
-            self._tradable_symbols = frozenset(
-                event.ticker for event in self.membership.events
-            )
-            self._reference_symbols = frozenset(
-                PIT_NON_TRADABLE_REFERENCE_SYMBOLS
-                if self.metadata["schema_version"] == "2"
-                else ("SPY",)
-            )
-            self._price_symbols = self._load_symbols()
-            self._symbols = (
-                self._price_symbols
-                if self.metadata["schema_version"] == "2"
-                else self._price_symbols.union(self._tradable_symbols)
-            )
             self._security_lineage_ids: Mapping[str, str] | None = None
+            if self.metadata["schema_version"] == "3":
+                self._reference_symbols = frozenset(
+                    PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+                )
+                self._price_symbols = self._load_symbols()
+                self._tradable_symbols = self._price_symbols.difference(
+                    self._reference_symbols
+                )
+                if prices_provenance is None:
+                    raise ValueError(
+                        "schema V3 requires authenticated prices provenance at initialization"
+                    )
+                identity_contract = self.load_price_identity_transition_contract(
+                    prices_provenance
+                )
+                self.membership_v3 = self._load_membership_v3(identity_contract)
+                if self.membership_v3.all_tickers() != self._tradable_symbols:
+                    raise ValueError(
+                        "membership lineage bindings and price identities disagree"
+                    )
+                self._price_identity_transition_contract = identity_contract
+                self._symbols = self._price_symbols
+            else:
+                self.membership = self._load_membership()
+                self._tradable_symbols = frozenset(
+                    event.ticker for event in self.membership.events
+                )
+                self._reference_symbols = frozenset(
+                    PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+                    if self.metadata["schema_version"] == "2"
+                    else ("SPY",)
+                )
+                self._price_symbols = self._load_symbols()
+                self._symbols = (
+                    self._price_symbols
+                    if self.metadata["schema_version"] == "2"
+                    else self._price_symbols.union(self._tradable_symbols)
+                )
             self._validate_integrity()
             self._fundamentals_provider_cache: dict[str, _FundamentalsProviderState] = {}
         except Exception:
@@ -374,18 +425,44 @@ class PITDataBundle:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        missing = _REQUIRED_TABLES - tables
+        schema_version_row = None
+        if "dataset_metadata" in tables:
+            try:
+                schema_version_row = self._connection.execute(
+                    "SELECT value FROM dataset_metadata WHERE key='schema_version'"
+                ).fetchone()
+            except sqlite3.DatabaseError:
+                schema_version_row = None
+        schema_version = (
+            str(schema_version_row[0]) if schema_version_row is not None else None
+        )
+        required_tables = (
+            (_REQUIRED_TABLES - {"membership"}).union({"membership_v3"})
+            if schema_version == "3"
+            else _REQUIRED_TABLES
+        )
+        missing = required_tables - tables
         if missing:
             raise ValueError(f"point-in-time bundle is missing tables: {sorted(missing)}")
         if not {"key", "value"}.issubset(self._table_columns("dataset_metadata")):
             raise ValueError("dataset_metadata columns are invalid")
-        if not {"effective_date", "ticker", "member"}.issubset(self._table_columns("membership")):
+        if schema_version == "3":
+            if not {
+                "effective_date",
+                "security_lineage_id",
+                "universe_id",
+                "member",
+            }.issubset(self._table_columns("membership_v3")):
+                raise ValueError("membership_v3 columns are invalid")
+        elif not {"effective_date", "ticker", "member"}.issubset(
+            self._table_columns("membership")
+        ):
             raise ValueError("membership columns are invalid")
         if not _REQUIRED_PRICE_COLUMNS.issubset(self._table_columns("price")):
             raise ValueError("price columns are invalid")
         if not _REQUIRED_FUNDAMENTAL_COLUMNS.issubset(self._table_columns("fundamentals")):
             raise ValueError("fundamentals columns are invalid")
-        for table in sorted(_REQUIRED_TABLES - {"dataset_metadata"}):
+        for table in sorted(required_tables - {"dataset_metadata"}):
             count = int(self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             if count == 0:
                 raise ValueError(f"point-in-time bundle table is empty: {table}")
@@ -394,18 +471,24 @@ class PITDataBundle:
         rows = self._connection.execute("SELECT key, value FROM dataset_metadata").fetchall()
         metadata = {str(row[0]): str(row[1]) for row in rows}
         schema_version = metadata.get("schema_version")
-        if schema_version not in {"1", "2"}:
-            raise ValueError("point-in-time bundle schema_version must be 1 or 2")
+        if schema_version not in {"1", "2", "3"}:
+            raise ValueError("point-in-time bundle schema_version must be 1, 2, or 3")
         required = _REQUIRED_METADATA.union(
-            _REQUIRED_V2_METADATA if schema_version == "2" else ()
+            _REQUIRED_V2_METADATA
+            if schema_version == "2"
+            else _REQUIRED_V3_METADATA
+            if schema_version == "3"
+            else ()
         )
+        if schema_version == "3":
+            required = required.difference({"membership_symbol_map_sha256"})
         missing = required.difference(metadata)
         if missing:
             raise ValueError(f"point-in-time bundle metadata is incomplete: {sorted(missing)}")
-        expected_kind = "canslim_pit_v2" if schema_version == "2" else "canslim_pit_v1"
+        expected_kind = f"canslim_pit_v{schema_version}"
         if metadata.get("bundle_kind") != expected_kind:
             raise ValueError("point-in-time bundle kind is invalid")
-        if schema_version == "2":
+        if schema_version in {"2", "3"}:
             reference_values = list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
             if (
                 metadata["non_tradable_reference_symbols_json"]
@@ -416,8 +499,12 @@ class PITDataBundle:
                 raise ValueError(
                     "point-in-time bundle reference-symbol metadata is invalid"
                 )
-            if metadata["source_universe"] != "sp500":
+            if schema_version == "2" and metadata["source_universe"] != "sp500":
                 raise ValueError("point-in-time bundle source universe is invalid")
+            if schema_version == "3" and metadata["source_universes_json"] != pit_canonical_json(
+                list(_V3_SOURCE_UNIVERSES)
+            ):
+                raise ValueError("point-in-time bundle source universes are invalid")
         cutoff = metadata.get("data_cutoff", "").strip()
         if not cutoff:
             raise ValueError("point-in-time bundle data_cutoff is required")
@@ -456,14 +543,51 @@ class PITDataBundle:
             )
         return PointInTimeUniverse.from_rows(normalized)
 
+    def _load_membership_v3(
+        self, identity_contract: PriceIdentityTransitionContract
+    ) -> PointInTimeUniverseV3:
+        rows = self._connection.execute(
+            "SELECT effective_date, security_lineage_id, universe_id, member "
+            "FROM membership_v3 "
+            "ORDER BY effective_date, security_lineage_id, universe_id"
+        ).fetchall()
+        normalized: list[dict[str, object]] = []
+        for row in rows:
+            member = row[3]
+            if type(member) is not int or member not in {0, 1}:
+                raise ValueError("membership_v3 member must be integer 0 or 1")
+            try:
+                effective_date = date.fromisoformat(str(row[0]))
+            except ValueError as exc:
+                raise ValueError("membership_v3 effective_date is invalid") from exc
+            if effective_date > self.data_cutoff.date():
+                raise ValueError("membership_v3 event exceeds point-in-time bundle cutoff")
+            normalized.append(
+                {
+                    "effective_date": effective_date.isoformat(),
+                    "security_lineage_id": str(row[1]),
+                    "universe_id": str(row[2]),
+                    "member": bool(member),
+                }
+            )
+        return PointInTimeUniverseV3.from_rows(normalized, identity_contract)
+
     def _load_symbols(self) -> frozenset[str]:
         prices = self._connection.execute("SELECT DISTINCT ticker FROM price").fetchall()
         return frozenset(_canonical_ticker(row[0]) for row in prices)
 
     def _validate_integrity(self) -> None:
-        duplicate_membership = self._connection.execute(
-            "SELECT 1 FROM membership GROUP BY effective_date,ticker HAVING COUNT(*) > 1 LIMIT 1"
-        ).fetchone()
+        if self.metadata["schema_version"] == "3":
+            duplicate_membership = self._connection.execute(
+                "SELECT 1 FROM membership_v3 "
+                "GROUP BY effective_date,security_lineage_id,universe_id "
+                "HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone()
+        else:
+            duplicate_membership = self._connection.execute(
+                "SELECT 1 FROM membership "
+                "GROUP BY effective_date,ticker HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone()
         duplicate_prices = self._connection.execute(
             "SELECT 1 FROM price GROUP BY trade_date,ticker HAVING COUNT(*) > 1 LIMIT 1"
         ).fetchone()
@@ -479,20 +603,38 @@ class PITDataBundle:
         ).fetchone()
         if bad_fundamental:
             raise ValueError("point-in-time bundle contains an invalid fundamental public date")
+        membership_table = (
+            "membership_v3"
+            if self.metadata["schema_version"] == "3"
+            else "membership"
+        )
         after_cutoff = self._connection.execute(
-            "SELECT 1 FROM membership WHERE effective_date > ? UNION ALL "
+            f"SELECT 1 FROM {membership_table} WHERE effective_date > ? UNION ALL "
             "SELECT 1 FROM price WHERE trade_date > ? LIMIT 1",
             (self.metadata["data_cutoff"], self.metadata["data_cutoff"]),
         ).fetchone()
         if after_cutoff:
             raise ValueError("point-in-time bundle contains rows after data_cutoff")
-        nonmember_fundamental = self._connection.execute(
-            "SELECT 1 FROM fundamentals f WHERE NOT EXISTS "
-            "(SELECT 1 FROM membership m WHERE m.ticker=f.ticker) LIMIT 1"
-        ).fetchone()
+        if self.metadata["schema_version"] == "3":
+            nonmember_fundamental = self._connection.execute(
+                "SELECT ticker FROM fundamentals"
+            ).fetchall()
+            nonmember_fundamental = next(
+                (
+                    row
+                    for row in nonmember_fundamental
+                    if _canonical_ticker(row[0]) not in self._tradable_symbols
+                ),
+                None,
+            )
+        else:
+            nonmember_fundamental = self._connection.execute(
+                "SELECT 1 FROM fundamentals f WHERE NOT EXISTS "
+                "(SELECT 1 FROM membership m WHERE m.ticker=f.ticker) LIMIT 1"
+            ).fetchone()
         if nonmember_fundamental:
             raise ValueError("point-in-time bundle contains fundamentals outside membership")
-        if self.metadata["schema_version"] == "2":
+        if self.metadata["schema_version"] in {"2", "3"}:
             fundamental_symbols = {
                 _canonical_ticker(row[0])
                 for row in self._connection.execute(
@@ -555,9 +697,12 @@ class PITDataBundle:
         ]
         if not spy_days:
             raise ValueError("point-in-time bundle has no evaluation-period SPY sessions")
-        counts = [len(self.membership.members_at(day)) for day in spy_days]
-        if min(counts) < 495 or max(counts) > 510:
-            raise ValueError("point-in-time bundle membership count is outside 495 through 510")
+        if self.metadata["schema_version"] != "3":
+            counts = [len(self.membership.members_at(day)) for day in spy_days]
+            if min(counts) < 495 or max(counts) > 510:
+                raise ValueError(
+                    "point-in-time bundle membership count is outside 495 through 510"
+                )
 
     @property
     def data_cutoff(self) -> pd.Timestamp:
@@ -659,39 +804,108 @@ class PITDataBundle:
                 "prices provenance identities do not exactly cover tradables plus references"
             )
 
-        events_by_date: dict[date, dict[bool, list[str]]] = {}
-        for event in self.membership.events:
-            grouped = events_by_date.setdefault(event.effective_date, {True: [], False: []})
-            grouped[event.member].append(event.ticker)
         transitions: list[IdentityTransition] = []
-        for effective, grouped in sorted(events_by_date.items()):
-            for predecessor in sorted(grouped[False]):
-                predecessor_identity = identities.get(predecessor)
-                if predecessor_identity is None:
-                    continue
-                predecessor_kind = str(predecessor_identity["continuity_kind"])
-                if predecessor_kind not in _SAME_ISSUER_CONTINUITIES:
-                    continue
-                chain_id = str(predecessor_identity["chain_id"])
-                successors = [
-                    successor
-                    for successor in grouped[True]
-                    if successor in identities
-                    and str(identities[successor]["chain_id"]) == chain_id
-                    and str(identities[successor]["continuity_kind"]) in _SAME_ISSUER_CONTINUITIES
-                ]
-                if len(successors) > 1:
-                    raise ValueError("prices provenance has an ambiguous same-issuer transition")
-                if successors:
-                    transitions.append(
-                        IdentityTransition(
-                            effective,
-                            predecessor,
-                            successors[0],
-                            chain_id,
-                            str(identities[successors[0]]["continuity_kind"]),
-                        )
+        if self.metadata["schema_version"] == "3":
+            raw_transitions = provenance.get("price_identity_transitions")
+            if not isinstance(raw_transitions, list):
+                raise ValueError(
+                    "schema V3 prices provenance has no explicit identity transitions"
+                )
+            expected_transition_fields = {
+                "effective_date",
+                "predecessor",
+                "successor",
+                "chain_id",
+                "continuity_kind",
+            }
+            previous_transition: tuple[date, str, str, str, str] | None = None
+            for raw_transition in raw_transitions:
+                if (
+                    not isinstance(raw_transition, dict)
+                    or set(raw_transition) != expected_transition_fields
+                ):
+                    raise ValueError(
+                        "prices provenance contains an invalid explicit identity transition"
                     )
+                try:
+                    transition = IdentityTransition(
+                        effective_date=date.fromisoformat(
+                            str(raw_transition["effective_date"])
+                        ),
+                        predecessor=_canonical_ticker(raw_transition["predecessor"]),
+                        successor=_canonical_ticker(raw_transition["successor"]),
+                        chain_id=str(raw_transition["chain_id"]),
+                        continuity_kind=str(raw_transition["continuity_kind"]),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "prices provenance contains an invalid explicit identity transition"
+                    ) from exc
+                transition_key = (
+                    transition.effective_date,
+                    transition.predecessor,
+                    transition.successor,
+                    transition.chain_id,
+                    transition.continuity_kind,
+                )
+                if (
+                    previous_transition is not None
+                    and transition_key <= previous_transition
+                ):
+                    raise ValueError(
+                        "explicit price identity transitions are not canonical-sorted"
+                    )
+                if (
+                    transition.predecessor == transition.successor
+                    or _SECURITY_LINEAGE_ID_RE.fullmatch(transition.chain_id) is None
+                    or transition.continuity_kind not in _SAME_ISSUER_CONTINUITIES
+                    or transition.effective_date > self.data_cutoff.date()
+                ):
+                    raise ValueError(
+                        "prices provenance contains an invalid explicit identity transition"
+                    )
+                transitions.append(transition)
+                previous_transition = transition_key
+        else:
+            events_by_date: dict[date, dict[bool, list[str]]] = {}
+            for event in self.membership.events:
+                grouped = events_by_date.setdefault(
+                    event.effective_date, {True: [], False: []}
+                )
+                grouped[event.member].append(event.ticker)
+            for effective, grouped in sorted(events_by_date.items()):
+                for predecessor in sorted(grouped[False]):
+                    predecessor_identity = identities.get(predecessor)
+                    if predecessor_identity is None:
+                        continue
+                    predecessor_kind = str(predecessor_identity["continuity_kind"])
+                    if predecessor_kind not in _SAME_ISSUER_CONTINUITIES:
+                        continue
+                    chain_id = str(predecessor_identity["chain_id"])
+                    successors = [
+                        successor
+                        for successor in grouped[True]
+                        if successor in identities
+                        and str(identities[successor]["chain_id"]) == chain_id
+                        and str(identities[successor]["continuity_kind"])
+                        in _SAME_ISSUER_CONTINUITIES
+                    ]
+                    if len(successors) > 1:
+                        raise ValueError(
+                            "prices provenance has an ambiguous same-issuer transition"
+                        )
+                    if successors:
+                        transitions.append(
+                            IdentityTransition(
+                                effective,
+                                predecessor,
+                                successors[0],
+                                chain_id,
+                                str(
+                                    identities[successors[0]]["continuity_kind"]
+                                ),
+                            )
+                        )
         contract = PriceIdentityTransitionContract(
             provenance_sha,
             contract_sha,
@@ -715,9 +929,16 @@ class PITDataBundle:
         fundamental_coverage = self._connection.execute(
             "SELECT MIN(public_date), MAX(public_date), COUNT(*), COUNT(DISTINCT ticker) FROM fundamentals"
         ).fetchone()
-        membership_coverage = self._connection.execute(
-            "SELECT MIN(effective_date), MAX(effective_date), COUNT(*), COUNT(DISTINCT ticker) FROM membership"
-        ).fetchone()
+        if self.metadata["schema_version"] == "3":
+            membership_coverage = self._connection.execute(
+                "SELECT MIN(effective_date), MAX(effective_date), COUNT(*), "
+                "COUNT(DISTINCT security_lineage_id) FROM membership_v3"
+            ).fetchone()
+        else:
+            membership_coverage = self._connection.execute(
+                "SELECT MIN(effective_date), MAX(effective_date), COUNT(*), "
+                "COUNT(DISTINCT ticker) FROM membership"
+            ).fetchone()
         spy_days = [
             str(row[0])
             for row in self._connection.execute(
@@ -725,7 +946,7 @@ class PITDataBundle:
                 (self.metadata["evaluation_start"],),
             ).fetchall()
         ]
-        membership_counts = [len(self.membership.members_at(day)) for day in spy_days]
+        membership_counts = [len(self.members_at(day)) for day in spy_days]
         reference_coverage = {
             reference: {
                 "first_date": coverage[0],
@@ -769,24 +990,56 @@ class PITDataBundle:
             "data_cutoff": str(self.data_cutoff.date()),
             "evaluation_start": self.metadata["evaluation_start"],
             "warmup_start": self.metadata["warmup_start"],
-            "membership_events": len(self.membership.events),
+            "membership_events": (
+                len(self.membership_v3.events)
+                if self.metadata["schema_version"] == "3"
+                else len(self.membership.events)
+            ),
             "symbol_count": len(self._symbols),
             "metadata": dict(sorted(self.metadata.items())),
             "coverage": coverage_manifest,
         }
-        if self.metadata["schema_version"] == "2":
+        if self.metadata["schema_version"] in {"2", "3"}:
             manifest["non_tradable_reference_symbols"] = list(
                 self.reference_symbols()
             )
             coverage_manifest["references"] = reference_coverage
         return manifest
 
-    def members_at(self, when: str | datetime | pd.Timestamp) -> frozenset[str]:
+    def members_at(
+        self, when: str | date | datetime | pd.Timestamp
+    ) -> frozenset[str]:
         if isinstance(when, datetime):
             when = when.date().isoformat()
         elif isinstance(when, pd.Timestamp):
             when = when.date().isoformat()
+        if self.metadata["schema_version"] == "3":
+            return self.membership_v3.members_at(when)
         return self.membership.members_at(when)
+
+    def affiliations_at(
+        self, as_of: str | date
+    ) -> Mapping[str, frozenset[str]]:
+        """Return active tickers and all of their current universe affiliations."""
+
+        if self.metadata["schema_version"] != "3":
+            return MappingProxyType(
+                {
+                    ticker: frozenset({"sp500"})
+                    for ticker in sorted(self.members_at(as_of))
+                }
+            )
+        return self.membership_v3.affiliations_at(as_of)
+
+    def security_lineages_at(self, as_of: str | date) -> frozenset[str]:
+        """Return the deduplicated active security-lineage opportunity set."""
+
+        if self.metadata["schema_version"] != "3":
+            return frozenset(
+                self.security_lineage_id(ticker)
+                for ticker in self.members_at(as_of)
+            )
+        return self.membership_v3.lineages_at(as_of)
 
     def _query_prices(
         self,
