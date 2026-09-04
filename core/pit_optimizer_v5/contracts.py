@@ -66,12 +66,7 @@ def _digest(value: object, label: str) -> str:
 
 
 def _text(value: object, label: str) -> str:
-    if (
-        type(value) is not str
-        or not value
-        or value != value.strip()
-        or "\x00" in value
-    ):
+    if type(value) is not str or not value or value != value.strip() or "\x00" in value:
         raise ValueError(f"{label} must be non-empty canonical text")
     return value
 
@@ -111,22 +106,12 @@ def _date(value: object, label: str) -> date:
     return parsed
 
 
-def _validate_ordered_disjoint_date_intervals_v5(
-    intervals: tuple[tuple[str, str], ...], label: str
-) -> None:
+def _validate_ordered_disjoint_date_intervals_v5(intervals: tuple[tuple[str, str], ...], label: str) -> None:
     """Require chronologically ordered, non-overlapping closed date intervals."""
 
-    parsed = tuple(
-        (_date(start, f"{label} start date"), _date(end, f"{label} end date"))
-        for start, end in intervals
-    )
-    if any(
-        left_end >= right_start
-        for (_, left_end), (right_start, _) in pairwise(parsed)
-    ):
-        raise ValueError(
-            f"{label} must be chronological and disjoint under inclusive-date semantics"
-        )
+    parsed = tuple((_date(start, f"{label} start date"), _date(end, f"{label} end date")) for start, end in intervals)
+    if any(left_end >= right_start for (_, left_end), (right_start, _) in pairwise(parsed)):
+        raise ValueError(f"{label} must be chronological and disjoint under inclusive-date semantics")
 
 
 def _decimal_primitive(value: Decimal) -> str:
@@ -152,10 +137,7 @@ def _primitive(value: object) -> object:
     if isinstance(value, tuple):
         return [_primitive(item) for item in value]
     if isinstance(value, Mapping):
-        return {
-            str(key): _primitive(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
+        return {str(key): _primitive(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
     return value
 
 
@@ -170,26 +152,45 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def canonical_primitive_v5(value: object) -> object:
+    """Return the dependency-leaf canonical primitive used by V5 identities.
+
+    Infrastructure modules may build closed envelopes around this primitive,
+    but they must not silently choose a second Decimal or tuple encoding.
+    """
+
+    return _primitive(value)
+
+
+def canonical_json_bytes_v5(value: object) -> bytes:
+    """Encode one V5 semantic value as compact canonical UTF-8 JSON."""
+
+    return json.dumps(
+        canonical_primitive_v5(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_sha256_v5(value: object) -> str:
+    """Hash the canonical V5 semantic representation of ``value``."""
+
+    return hashlib.sha256(canonical_json_bytes_v5(value)).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class AnnualizedReturnTargetV5:
     target_pct: Decimal
-    metric_id: Literal["portfolio_annualized_return_pct"] = (
-        "portfolio_annualized_return_pct"
-    )
+    metric_id: Literal["portfolio_annualized_return_pct"] = "portfolio_annualized_return_pct"
     basis: Literal["absolute"] = "absolute"
 
     def __post_init__(self) -> None:
         target = _decimal(self.target_pct, "annualized return target")
-        if (
-            target <= 0
-            or target != target.quantize(_TARGET_QUANTUM_V5)
-            or target.as_tuple().exponent != -2
-        ):
+        if target <= 0 or target != target.quantize(_TARGET_QUANTUM_V5) or target.as_tuple().exponent != -2:
             raise ValueError("annualized return target must be positive with two decimals")
-        if (
-            type(self.metric_id) is not str
-            or self.metric_id != "portfolio_annualized_return_pct"
-        ):
+        if type(self.metric_id) is not str or self.metric_id != "portfolio_annualized_return_pct":
             raise ValueError("annualized return target metric is invalid")
         if type(self.basis) is not str or self.basis != "absolute":
             raise ValueError("annualized return target basis is invalid")
@@ -285,9 +286,7 @@ class ProviderCapabilitiesV5:
         )
         if self.maximum_output_tokens_per_role > self.maximum_total_tokens:
             raise ValueError("per-role output token bound exceeds total token bound")
-        if self.maximum_usd is not None and _decimal(
-            self.maximum_usd, "maximum provider USD"
-        ) <= 0:
+        if self.maximum_usd is not None and _decimal(self.maximum_usd, "maximum provider USD") <= 0:
             raise ValueError("maximum provider USD must be positive")
         _count(self.automatic_retries, "automatic retries")
         _count(self.schema_repair_calls, "schema repair calls")
@@ -312,10 +311,11 @@ class ArtifactRefV5:
             raise ValueError("artifact path must be canonical POSIX beneath the V5 root")
         _digest(self.sha256, "artifact SHA-256")
 
+    def to_primitive(self) -> dict[str, str]:
+        return {"relative_path": self.relative_path, "sha256": self.sha256}
 
-ArtifactGraphFailureCodeV5 = Literal[
-    "missing", "relocated", "cycle", "digest_mismatch"
-]
+
+ArtifactGraphFailureCodeV5 = Literal["missing", "relocated", "cycle", "digest_mismatch"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,13 +376,13 @@ class ArtifactIndexV5:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
             raise ValueError("artifact index schema must be V5")
-        if type(self.child_references) is not tuple or not self.child_references or any(
-            type(item) is not ArtifactRefV5 for item in self.child_references
+        if (
+            type(self.child_references) is not tuple
+            or not self.child_references
+            or any(type(item) is not ArtifactRefV5 for item in self.child_references)
         ):
             raise ValueError("artifact index child references are invalid")
-        keys = tuple(
-            (item.relative_path, item.sha256) for item in self.child_references
-        )
+        keys = tuple((item.relative_path, item.sha256) for item in self.child_references)
         if keys != tuple(sorted(set(keys))):
             raise ValueError("artifact index child references must be unique and canonical")
 
@@ -404,17 +404,12 @@ class ArtifactGraphVerificationV5:
             type(item) is not AuthenticatedArtifactV5 for item in self.authenticated
         ):
             raise ValueError("artifact graph authenticated nodes are invalid")
-        keys = tuple(
-            (item.reference.relative_path, item.reference.sha256)
-            for item in self.authenticated
-        )
+        keys = tuple((item.reference.relative_path, item.reference.sha256) for item in self.authenticated)
         if len(set(keys)) != len(keys):
             raise ValueError("artifact graph authenticated nodes must be unique")
         if self.failure is not None and type(self.failure) is not ArtifactGraphFailureV5:
             raise ValueError("artifact graph failure is invalid")
-        if self.failure is None and self.manifest_ref not in tuple(
-            item.reference for item in self.authenticated
-        ):
+        if self.failure is None and self.manifest_ref not in tuple(item.reference for item in self.authenticated):
             raise ValueError("verified artifact graph must include its manifest")
 
     @property
@@ -482,9 +477,7 @@ class CampaignPanelPlanV5:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
             raise ValueError("campaign panel plan schema must be V5")
-        if type(self.pit_bundle_ref) is not ArtifactRefV5 or type(
-            self.prices_provenance_ref
-        ) is not ArtifactRefV5:
+        if type(self.pit_bundle_ref) is not ArtifactRefV5 or type(self.prices_provenance_ref) is not ArtifactRefV5:
             raise ValueError("campaign panel data references are invalid")
         for value, label in (
             (self.partition_seed_sha256, "partition seed SHA-256"),
@@ -601,9 +594,7 @@ class CampaignManifestV5:
             raise ValueError("campaign artifact references are invalid")
         if len({item.relative_path for item in references}) != len(references):
             raise ValueError("campaign artifact reference paths must be unique")
-        if type(self.source_commit) is not str or _SOURCE_COMMIT_RE.fullmatch(
-            self.source_commit
-        ) is None:
+        if type(self.source_commit) is not str or _SOURCE_COMMIT_RE.fullmatch(self.source_commit) is None:
             raise ValueError("campaign source commit must be a lowercase Git SHA-1")
         if (
             type(self.apply) is not bool
@@ -641,15 +632,9 @@ def evaluator_source_sha256(source_sha256_by_path: Mapping[str, str]) -> str:
         raise ValueError("evaluator source map is incomplete or contains unrelated paths")
     canonical: dict[str, str] = {}
     for path in expected:
-        if (
-            PurePosixPath(path).as_posix() != path
-            or path.startswith("/")
-            or ".." in PurePosixPath(path).parts
-        ):
+        if PurePosixPath(path).as_posix() != path or path.startswith("/") or ".." in PurePosixPath(path).parts:
             raise ValueError("evaluator source path is not canonical")
-        canonical[path] = _digest(
-            source_sha256_by_path[path], f"evaluator source digest for {path}"
-        )
+        canonical[path] = _digest(source_sha256_by_path[path], f"evaluator source digest for {path}")
     return _sha256(canonical)
 
 
@@ -694,9 +679,7 @@ class SandboxProfileV5:
         name = _text(self.image_name, "sandbox image name")
         if "@" in name or any(character.isspace() for character in name):
             raise ValueError("sandbox image name must not contain an embedded digest")
-        if type(self.image_digest) is not str or _IMAGE_DIGEST_RE.fullmatch(
-            self.image_digest
-        ) is None:
+        if type(self.image_digest) is not str or _IMAGE_DIGEST_RE.fullmatch(self.image_digest) is None:
             raise ValueError("sandbox image digest must be a canonical sha256 digest")
         _digest(self.runtime_source_sha256, "sandbox runtime source SHA-256")
         if (
@@ -748,9 +731,7 @@ def sandbox_profile_from_manifest_v5(
     )
 
 
-def validate_sandbox_profile_resources_v5(
-    profile: SandboxProfileV5, resources: SandboxResourceManifestV5
-) -> None:
+def validate_sandbox_profile_resources_v5(profile: SandboxProfileV5, resources: SandboxResourceManifestV5) -> None:
     """Require exact equality with the campaign's authenticated resource inputs."""
 
     if type(profile) is not SandboxProfileV5:
@@ -763,11 +744,7 @@ def validate_sandbox_profile_resources_v5(
         )
     except AttributeError as exc:
         raise ValueError("campaign resource manifest is incomplete") from exc
-    if (
-        type(expected[0]) is not Decimal
-        or type(expected[1]) is not int
-        or type(expected[2]) is not int
-    ):
+    if type(expected[0]) is not Decimal or type(expected[1]) is not int or type(expected[2]) is not int:
         raise ValueError("campaign resource manifest values are invalid")
     actual = (profile.cpu_limit, profile.memory_limit_mib, profile.output_limit_bytes)
     if actual != expected:
@@ -894,10 +871,7 @@ class DistributionSummaryV5:
     maximum: Decimal
 
     def __post_init__(self) -> None:
-        values = tuple(
-            _decimal(getattr(self, item.name), f"distribution {item.name}")
-            for item in fields(self)
-        )
+        values = tuple(_decimal(getattr(self, item.name), f"distribution {item.name}") for item in fields(self))
         if values != tuple(sorted(values)):
             raise ValueError("distribution summary must be monotonic")
 
@@ -994,8 +968,7 @@ class EvaluationReportV5:
             "calendar_year_slices": "calendar_year",
         }[label]
         if type(value) is not tuple or any(
-            type(item) is not EvaluationSliceV5 or item.dimension != expected_dimension
-            for item in value
+            type(item) is not EvaluationSliceV5 or item.dimension != expected_dimension for item in value
         ):
             raise ValueError(f"report {label} must contain matching V5 slices")
         labels = tuple(item.label for item in value)
@@ -1020,10 +993,7 @@ class RoleEvidenceItemV5:
     value: Decimal | int | None
 
     def __post_init__(self) -> None:
-        if (
-            type(self.evidence_id) is not str
-            or _EVIDENCE_ID_RE.fullmatch(self.evidence_id) is None
-        ):
+        if type(self.evidence_id) is not str or _EVIDENCE_ID_RE.fullmatch(self.evidence_id) is None:
             raise ValueError("role evidence ID is invalid")
         _text(self.metric_id, "role evidence metric ID")
         if self.value is not None:
@@ -1127,14 +1097,14 @@ class PanelEvaluationV5:
         end = _date(self.end_date, "panel end date")
         if start >= end:
             raise ValueError("panel date range is invalid")
-        elapsed = _count(
-            self.elapsed_calendar_days, "panel elapsed calendar days", positive=True
-        )
+        elapsed = _count(self.elapsed_calendar_days, "panel elapsed calendar days", positive=True)
         if elapsed != (end - start).days:
             raise ValueError("panel elapsed calendar days differ from panel bounds")
         _text(self.selection_scenario_id, "panel selection scenario ID")
-        if type(self.scenarios) is not tuple or not self.scenarios or any(
-            type(item) is not ScenarioPanelEvaluationV5 for item in self.scenarios
+        if (
+            type(self.scenarios) is not tuple
+            or not self.scenarios
+            or any(type(item) is not ScenarioPanelEvaluationV5 for item in self.scenarios)
         ):
             raise ValueError("panel scenarios must be non-empty V5 evidence")
         ids = tuple(item.scenario_id for item in self.scenarios)
@@ -1153,19 +1123,13 @@ def selected_scenario(evaluation: PanelEvaluationV5) -> ScenarioPanelEvaluationV
 
     if type(evaluation) is not PanelEvaluationV5:
         raise ValueError("evaluation must be PanelEvaluationV5 evidence")
-    matches = tuple(
-        item
-        for item in evaluation.scenarios
-        if item.scenario_id == evaluation.selection_scenario_id
-    )
+    matches = tuple(item for item in evaluation.scenarios if item.scenario_id == evaluation.selection_scenario_id)
     if len(matches) != 1:
         raise ValueError("panel selection scenario must resolve exactly once")
     return matches[0]
 
 
-def validate_episode_plan_panel_v5(
-    episode: EpisodePlanV5, panel: EvaluationPanelSpec
-) -> None:
+def validate_episode_plan_panel_v5(episode: EpisodePlanV5, panel: EvaluationPanelSpec) -> None:
     """Bind duplicated episode fields to an already authenticated panel."""
 
     if type(episode) is not EpisodePlanV5:
@@ -1211,9 +1175,7 @@ class ValidationResultV5:
             if self.failure_code is None:
                 raise ValueError("invalid result requires a failure code")
             _text(self.failure_code, "validation failure code")
-        if type(self.changed_symbols) is not tuple or any(
-            type(item) is not str for item in self.changed_symbols
-        ):
+        if type(self.changed_symbols) is not tuple or any(type(item) is not str for item in self.changed_symbols):
             raise ValueError("changed symbols are invalid")
         tuple(_text(item, "changed symbol") for item in self.changed_symbols)
         if len(set(self.changed_symbols)) != len(self.changed_symbols):
@@ -1233,10 +1195,7 @@ class EpisodeEvaluationV5:
         _count(self.episode_ordinal, "evaluated episode ordinal", positive=True)
         if type(self.evaluation) is not PanelEvaluationV5:
             raise ValueError("episode evaluation must wrap V5 panel evidence")
-        if (
-            self.start_date != self.evaluation.start_date
-            or self.end_date != self.evaluation.end_date
-        ):
+        if self.start_date != self.evaluation.start_date or self.end_date != self.evaluation.end_date:
             raise ValueError("episode dates differ from the authenticated panel evaluation")
 
 
@@ -1270,10 +1229,7 @@ class CampaignEvidenceV5:
             raise ValueError("campaign evidence must share one policy identity")
         if len({item.evaluation.selection_scenario_id for item in self.episodes}) != 1:
             raise ValueError("campaign evidence must share one selected scenario")
-        expected_closed_trades = sum(
-            selected_scenario(item.evaluation).report.closed_trades
-            for item in self.episodes
-        )
+        expected_closed_trades = sum(selected_scenario(item.evaluation).report.closed_trades for item in self.episodes)
         _count(self.closed_trades, "campaign closed trades")
         if self.closed_trades != expected_closed_trades:
             raise ValueError("campaign closed trades differ from selected-scenario evidence")
@@ -1317,10 +1273,8 @@ def validate_campaign_evidence_v5(
             or actual.start_date != planned.start_date
             or actual.end_date != planned.end_date
             or actual.evaluation.panel_sha256 != planned.panel_ref.sha256
-            or actual.evaluation.selection_scenario_id
-            != evaluator_contract.selection_scenario_id
-            or actual.evaluation.sandbox_profile_sha256
-            != evaluator_contract.sandbox_profile_sha256
+            or actual.evaluation.selection_scenario_id != evaluator_contract.selection_scenario_id
+            or actual.evaluation.sandbox_profile_sha256 != evaluator_contract.sandbox_profile_sha256
         ):
             raise ValueError("campaign episode differs from its authenticated plan")
 
@@ -1344,12 +1298,9 @@ def validate_campaign_manifest_bindings_v5(
         or manifest.panel_plan_ref.sha256 != panel_plan.sha256
         or manifest.evaluator_contract_ref.sha256 != evaluator_contract.sha256
         or panel_plan.pit_bundle_ref.sha256 != evaluator_contract.pit_bundle_sha256
-        or panel_plan.prices_provenance_ref.sha256
-        != evaluator_contract.prices_provenance_sha256
-        or manifest.execution_profile_ref.sha256
-        != evaluator_contract.execution_profile_sha256
-        or manifest.sandbox_profile_ref.sha256
-        != evaluator_contract.sandbox_profile_sha256
+        or panel_plan.prices_provenance_ref.sha256 != evaluator_contract.prices_provenance_sha256
+        or manifest.execution_profile_ref.sha256 != evaluator_contract.execution_profile_sha256
+        or manifest.sandbox_profile_ref.sha256 != evaluator_contract.sandbox_profile_sha256
     ):
         raise ValueError("campaign manifest identities are inconsistent")
 
@@ -1358,9 +1309,7 @@ def validate_campaign_manifest_bindings_v5(
 class HypothesisV5:
     hypothesis_id: str
     rank: int
-    primary_mechanism: Literal[
-        "entry", "risk_sizing", "position_management", "exit", "cross_policy"
-    ]
+    primary_mechanism: Literal["entry", "risk_sizing", "position_management", "exit", "cross_policy"]
     causal_claim: str
     predicted_changes: tuple[MetricPredictionV5, ...]
     evidence_ids: tuple[str, ...]
@@ -1378,8 +1327,10 @@ class HypothesisV5:
         }:
             raise ValueError("hypothesis primary mechanism is invalid")
         _text(self.causal_claim, "hypothesis causal claim")
-        if type(self.predicted_changes) is not tuple or not self.predicted_changes or any(
-            type(item) is not MetricPredictionV5 for item in self.predicted_changes
+        if (
+            type(self.predicted_changes) is not tuple
+            or not self.predicted_changes
+            or any(type(item) is not MetricPredictionV5 for item in self.predicted_changes)
         ):
             raise ValueError("hypothesis metric predictions are invalid")
         metric_ids = tuple(item.metric_id for item in self.predicted_changes)
@@ -1388,36 +1339,32 @@ class HypothesisV5:
         _evidence_ids(self.evidence_ids, "hypothesis evidence IDs")
         _text(self.author_instructions, "hypothesis author instructions")
 
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
 
 @dataclass(frozen=True, slots=True)
 class InvestigatorArtifactV5:
     hypotheses: tuple[HypothesisV5, ...]
 
     def __post_init__(self) -> None:
-        if type(self.hypotheses) is not tuple or any(
-            type(item) is not HypothesisV5 for item in self.hypotheses
-        ):
+        if type(self.hypotheses) is not tuple or any(type(item) is not HypothesisV5 for item in self.hypotheses):
             raise ValueError("investigator hypotheses are invalid")
         ids = tuple(item.hypothesis_id for item in self.hypotheses)
         if len(set(ids)) != len(ids):
             raise ValueError("investigator hypothesis IDs must be unique")
 
-    def validate_for(
-        self, *, manifest: CampaignManifestV5, issued_evidence: RoleEvidenceV5
-    ) -> None:
+    def validate_for(self, *, manifest: CampaignManifestV5, issued_evidence: RoleEvidenceV5) -> None:
         if type(manifest) is not CampaignManifestV5:
             raise ValueError("investigator manifest must use the V5 schema")
         expected_count = manifest.search.hypotheses_per_investigator
-        if len(self.hypotheses) != expected_count or tuple(
-            item.rank for item in self.hypotheses
-        ) != tuple(range(1, expected_count + 1)):
+        if len(self.hypotheses) != expected_count or tuple(item.rank for item in self.hypotheses) != tuple(
+            range(1, expected_count + 1)
+        ):
             raise ValueError("investigator hypothesis count or ranks differ from the manifest")
         _validate_role_evidence_bindings_v5(
-            tuple(
-                evidence_id
-                for hypothesis in self.hypotheses
-                for evidence_id in hypothesis.evidence_ids
-            ),
+            tuple(evidence_id for hypothesis in self.hypotheses for evidence_id in hypothesis.evidence_ids),
             issued_evidence,
         )
 
@@ -1451,6 +1398,10 @@ class CriticReviewV5:
             raise ValueError("critic disposition is invalid")
         _text(self.next_direction, "critic next direction")
 
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
 
 @dataclass(frozen=True, slots=True)
 class CriticArtifactV5:
@@ -1460,9 +1411,7 @@ class CriticArtifactV5:
     evidence_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if type(self.reviews) is not tuple or any(
-            type(item) is not CriticReviewV5 for item in self.reviews
-        ):
+        if type(self.reviews) is not tuple or any(type(item) is not CriticReviewV5 for item in self.reviews):
             raise ValueError("critic reviews are invalid")
         ids = tuple(item.experiment_id for item in self.reviews)
         if len(set(ids)) != len(ids):
@@ -1477,9 +1426,7 @@ class CriticArtifactV5:
         testable_experiment_ids: tuple[str, ...],
         issued_evidence: RoleEvidenceV5,
     ) -> None:
-        if type(testable_experiment_ids) is not tuple or any(
-            type(item) is not str for item in testable_experiment_ids
-        ):
+        if type(testable_experiment_ids) is not tuple or any(type(item) is not str for item in testable_experiment_ids):
             raise ValueError("testable experiment IDs are invalid")
         tuple(_text(item, "testable experiment ID") for item in testable_experiment_ids)
         if len(set(testable_experiment_ids)) != len(testable_experiment_ids):
@@ -1489,19 +1436,17 @@ class CriticArtifactV5:
         _validate_role_evidence_bindings_v5(
             (
                 *self.evidence_ids,
-                *(
-                    evidence_id
-                    for review in self.reviews
-                    for evidence_id in review.evidence_ids
-                ),
+                *(evidence_id for review in self.reviews for evidence_id in review.evidence_ids),
             ),
             issued_evidence,
         )
 
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
 
-def _validate_role_evidence_bindings_v5(
-    referenced_ids: tuple[str, ...], issued_evidence: RoleEvidenceV5
-) -> None:
+
+def _validate_role_evidence_bindings_v5(referenced_ids: tuple[str, ...], issued_evidence: RoleEvidenceV5) -> None:
     if type(issued_evidence) is not RoleEvidenceV5:
         raise ValueError("issued role evidence must use the V5 schema")
     issued = {item.evidence_id for item in issued_evidence.items}
@@ -1550,6 +1495,9 @@ __all__ = [
     "SearchCapabilitiesV5",
     "SliceMetricsV5",
     "ValidationResultV5",
+    "canonical_json_bytes_v5",
+    "canonical_primitive_v5",
+    "canonical_sha256_v5",
     "evaluator_source_map_v5",
     "evaluator_source_sha256",
     "initial_friction_grid_v5",
