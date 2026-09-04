@@ -167,6 +167,31 @@ def resolve_long_stop(
     return None
 
 
+def _allocate_rounded_costs(
+    *, total_cents: int, raw_costs: tuple[float, ...]
+) -> tuple[float, ...]:
+    """Allocate an exact rounded total across non-negative cost components."""
+    if total_cents < 0:
+        raise ValueError("rounded friction total must be non-negative")
+    if total_cents == 0:
+        return tuple(0.0 for _ in raw_costs)
+    raw_total = sum(raw_costs)
+    if not math.isfinite(raw_total) or raw_total <= 0.0:
+        raise ValueError("positive rounded friction requires positive raw costs")
+
+    quotas = [total_cents * cost / raw_total for cost in raw_costs]
+    allocated = [math.floor(quota) for quota in quotas]
+    remainder = total_cents - sum(allocated)
+    order = sorted(
+        range(len(quotas)),
+        key=lambda index: (quotas[index] - allocated[index], -index),
+        reverse=True,
+    )
+    for index in order[:remainder]:
+        allocated[index] += 1
+    return tuple(cents / 100.0 for cents in allocated)
+
+
 def apply_friction(
     *, side: Side, reference_price: float, quantity: float, scenario: FrictionScenario
 ) -> ExecutionFill:
@@ -194,6 +219,18 @@ def apply_friction(
         if resolved_side == "BUY"
         else gross_unrounded - commission_unrounded
     )
+    cash_delta = round(cash_unrounded, 2)
+    reference_cents = int(round(reference_value * quantity_value * 100))
+    cash_delta_cents = int(round(cash_delta * 100))
+    total_friction_cents = (
+        -cash_delta_cents - reference_cents
+        if resolved_side == "BUY"
+        else reference_cents - cash_delta_cents
+    )
+    commission, spread, impact = _allocate_rounded_costs(
+        total_cents=total_friction_cents,
+        raw_costs=(commission_unrounded, spread_unrounded, impact_unrounded),
+    )
 
     return ExecutionFill(
         side=resolved_side,
@@ -201,8 +238,8 @@ def apply_friction(
         execution_price=execution_price,
         quantity=quantity_value,
         gross_value=round(gross_unrounded, 2),
-        commission_usd=round(commission_unrounded, 2),
-        spread_cost_usd=round(spread_unrounded, 2),
-        market_impact_cost_usd=round(impact_unrounded, 2),
-        cash_delta=round(cash_unrounded, 2),
+        commission_usd=commission,
+        spread_cost_usd=spread,
+        market_impact_cost_usd=impact,
+        cash_delta=cash_delta,
     )

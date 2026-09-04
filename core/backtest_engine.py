@@ -491,8 +491,6 @@ class SimulationResult:
     execution_diagnostics: dict[str, int] = field(default_factory=dict)
     benchmark_symbol: str = BENCHMARK
     entry_outcomes: tuple[EntryAttemptOutcome, ...] = ()
-    fill_log: pd.DataFrame = field(default_factory=pd.DataFrame)
-    fill_cost_totals: dict[str, float] = field(default_factory=dict)
 
     @property
     def signal_funnel(self) -> dict[str, int]:
@@ -654,6 +652,14 @@ class SimulationResult:
     @property
     def benchmark_sharpe_ratio(self) -> float:
         return PerformanceReport.compute_metrics(self.benchmark_curve).get("sharpe_ratio", 0.0)
+
+
+@dataclass
+class SimulationResultV5(SimulationResult):
+    """V5-only result envelope containing explicit fill-cost evidence."""
+
+    fill_log: pd.DataFrame = field(default_factory=pd.DataFrame)
+    fill_cost_totals: dict[str, float] = field(default_factory=dict)
 
 
 class PerformanceReport:
@@ -1821,7 +1827,9 @@ class PortfolioSimulator:
         self._trades: List[Trade] = []
         self._transactions: List[dict] = []
         self._fill_rows: List[dict] = []
-        self._fill_cost_totals = self._new_fill_cost_totals()
+        self._fill_cost_totals = (
+            self._new_fill_cost_totals() if self._v5_enabled else {}
+        )
         self._weekly_snapshots: List[dict] = []
         self._signal_rows: List[dict] = []
         self._entry_outcomes: List[EntryAttemptOutcome] = []
@@ -2530,21 +2538,26 @@ class PortfolioSimulator:
                 origin_requested_min_canslim_score,
             ),
         )
-        result = SimulationResult(
-            trades=self._trades,
-            equity_curve=pd.Series(equity_series),
-            benchmark_curve=pd.Series(benchmark_series),
-            initial_capital=self.initial_capital,
-            config=result_config,
-            transaction_log=pd.DataFrame(self._transactions),
-            weekly_holdings=pd.DataFrame(self._weekly_snapshots),
-            signal_log=pd.DataFrame(self._signal_rows),
-            execution_diagnostics=dict(self._execution_diagnostics),
-            entry_outcomes=tuple(self._entry_outcomes),
-            benchmark_symbol=benchmark,
-            fill_log=pd.DataFrame(self._fill_rows),
-            fill_cost_totals=dict(self._fill_cost_totals),
-        )
+        result_type = SimulationResultV5 if self._v5_enabled else SimulationResult
+        result_kwargs: dict[str, Any] = {
+            "trades": self._trades,
+            "equity_curve": pd.Series(equity_series),
+            "benchmark_curve": pd.Series(benchmark_series),
+            "initial_capital": self.initial_capital,
+            "config": result_config,
+            "transaction_log": pd.DataFrame(self._transactions),
+            "weekly_holdings": pd.DataFrame(self._weekly_snapshots),
+            "signal_log": pd.DataFrame(self._signal_rows),
+            "execution_diagnostics": dict(self._execution_diagnostics),
+            "entry_outcomes": tuple(self._entry_outcomes),
+            "benchmark_symbol": benchmark,
+        }
+        if self._v5_enabled:
+            result_kwargs.update(
+                fill_log=pd.DataFrame(self._fill_rows),
+                fill_cost_totals=dict(self._fill_cost_totals),
+            )
+        result = result_type(**result_kwargs)
         if checkpoint is not None:
             _write_checkpoint_json(
                 checkpoint,
@@ -2590,7 +2603,9 @@ class PortfolioSimulator:
         self._trades = []
         self._transactions = []
         self._fill_rows = []
-        self._fill_cost_totals = self._new_fill_cost_totals()
+        self._fill_cost_totals = (
+            self._new_fill_cost_totals() if self._v5_enabled else {}
+        )
         self._weekly_snapshots = []
         self._signal_rows = []
         self._entry_outcomes = []
@@ -3045,27 +3060,34 @@ class PortfolioSimulator:
             index=pd.to_datetime([row["date"] for row in outputs["benchmark"]]),
             dtype=float,
         )
-        return SimulationResult(
-            trades=[_trade_from_checkpoint(value) for value in checkpoint["trades"]],
-            equity_curve=equity,
-            benchmark_curve=benchmark_curve,
-            initial_capital=self.initial_capital,
-            config=result_config,
-            transaction_log=pd.DataFrame(outputs["transactions"]),
-            weekly_holdings=pd.DataFrame(outputs["weekly"]),
-            signal_log=pd.DataFrame(outputs["signals"]),
-            execution_diagnostics={
+        result_type = SimulationResultV5 if self._v5_enabled else SimulationResult
+        result_kwargs: dict[str, Any] = {
+            "trades": [
+                _trade_from_checkpoint(value) for value in checkpoint["trades"]
+            ],
+            "equity_curve": equity,
+            "benchmark_curve": benchmark_curve,
+            "initial_capital": self.initial_capital,
+            "config": result_config,
+            "transaction_log": pd.DataFrame(outputs["transactions"]),
+            "weekly_holdings": pd.DataFrame(outputs["weekly"]),
+            "signal_log": pd.DataFrame(outputs["signals"]),
+            "execution_diagnostics": {
                 str(key): int(value)
                 for key, value in checkpoint["execution_diagnostics"].items()
             },
-            entry_outcomes=checkpoint_outcomes,
-            benchmark_symbol=benchmark,
-            fill_log=pd.DataFrame(outputs.get("fills", [])),
-            fill_cost_totals={
-                str(key): float(value)
-                for key, value in checkpoint.get("fill_cost_totals", {}).items()
-            },
-        )
+            "entry_outcomes": checkpoint_outcomes,
+            "benchmark_symbol": benchmark,
+        }
+        if self._v5_enabled:
+            result_kwargs.update(
+                fill_log=pd.DataFrame(outputs.get("fills", [])),
+                fill_cost_totals={
+                    str(key): float(value)
+                    for key, value in checkpoint.get("fill_cost_totals", {}).items()
+                },
+            )
+        return result_type(**result_kwargs)
 
     def _canonicalize_signal_row(
         self,
@@ -3496,6 +3518,19 @@ class PortfolioSimulator:
             eviction_symbol, eviction_trade, eviction_price = priced_positions[
                 eviction.slot
             ]
+            if self._v5_enabled:
+                eviction_frame = ticker_ohlcv.get(eviction_symbol)
+                eviction_bar = (
+                    exact_session_row(eviction_frame, entry_date)
+                    if eviction_frame is not None
+                    else None
+                )
+                if eviction_bar is None or "Open" not in eviction_bar.index:
+                    return None
+                exact_eviction_open = _finite_signal_number(eviction_bar["Open"])
+                if exact_eviction_open is None or exact_eviction_open <= 0:
+                    return None
+                eviction_price = exact_eviction_open
             eviction_notional = eviction_price * float(
                 eviction_trade.remaining_qty or 0.0
             )
@@ -4202,8 +4237,12 @@ class PortfolioSimulator:
                 survivors.append(pending)
                 continue
             frame = ticker_ohlcv.get(pending.symbol)
-            open_price = _causal_open_price(frame, eval_date) if frame is not None else None
-            if open_price is None:
+            bar = exact_session_row(frame, eval_date) if frame is not None else None
+            if bar is None or "Open" not in bar.index:
+                survivors.append(pending)
+                continue
+            open_price = _finite_signal_number(bar["Open"])
+            if open_price is None or open_price <= 0:
                 survivors.append(pending)
                 continue
             close_action = pending.actions[-1]
@@ -4240,7 +4279,7 @@ class PortfolioSimulator:
                 low_price=low_price,
                 stop_price=trade.stop_price,
             )
-            if resolved is not None and resolved.kind == "intraday_stop":
+            if resolved is not None:
                 self._close_trade(symbol, resolved.price, "stop_loss", date_str)
                 stopped.add(symbol)
         return stopped
@@ -4548,6 +4587,15 @@ class PortfolioSimulator:
             raise ValueError("fill-cost evidence is available only under V5")
         slippage = round(fill.spread_cost_usd + fill.market_impact_cost_usd, 2)
         total_friction = round(slippage + fill.commission_usd, 2)
+        reference_value = round(fill.reference_price * fill.quantity, 2)
+        cash_friction = round(
+            abs(fill.cash_delta) - reference_value
+            if fill.side == "BUY"
+            else reference_value - fill.cash_delta,
+            2,
+        )
+        if total_friction != cash_friction:
+            raise ValueError("fill-cost evidence does not reconcile with cash delta")
         self._fill_rows.append(
             {
                 "Date": date,
