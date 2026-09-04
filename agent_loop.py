@@ -21040,9 +21040,55 @@ def _evaluate_v4_panel(
     run_label: str,
 ) -> object:
     from core.backtest_engine import PortfolioSimulator
-    from core.pit_data import PITDataBundle
-    from core.pit_optimizer_evaluation import panel_aggregate_summary_from_primitive
+    from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
+    from core.pit_optimizer_evaluation import (
+        load_discovery_panel_plan,
+        panel_aggregate_summary_from_primitive,
+    )
     from core.pit_policy_parity import build_panel_evidence_v4
+    from core.pit_provenance import pit_canonical_json_sha256
+
+    plan = load_discovery_panel_plan(config.discovery_panel_plan)
+    if (
+        _file_sha256(config.discovery_panel_plan)
+        != config.discovery_panel_plan_sha256
+        or plan.sha256 != manifest.discovery_panel_plan_sha256
+    ):
+        raise ConfigurationError("optimizer v4 discovery panel identity differs")
+    baseline_manifest_path = config.baseline_run / "run_manifest.json"
+    if baseline_manifest_path.is_symlink() or not baseline_manifest_path.is_file():
+        raise ConfigurationError("optimizer v4 baseline manifest is absent")
+    try:
+        baseline_manifest = json.loads(baseline_manifest_path.read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigurationError("optimizer v4 baseline manifest is invalid") from exc
+    if not isinstance(baseline_manifest, Mapping):
+        raise ConfigurationError("optimizer v4 baseline manifest is invalid")
+    baseline_inputs = baseline_manifest.get("input_sha256")
+    baseline_arguments = baseline_manifest.get("arguments")
+    raw_prices_provenance = (
+        baseline_arguments.get("prices_provenance")
+        if isinstance(baseline_arguments, Mapping)
+        else None
+    )
+    if (
+        not isinstance(baseline_inputs, Mapping)
+        or baseline_inputs.get("prices_provenance") != plan.prices_provenance_sha256
+        or baseline_manifest.get("bundle_sha256") != config.pit_bundle_sha256
+        or not isinstance(raw_prices_provenance, str)
+        or not raw_prices_provenance
+    ):
+        raise ConfigurationError("optimizer v4 prices provenance is not authenticated")
+    prices_provenance = Path(raw_prices_provenance)
+    if not prices_provenance.is_absolute():
+        prices_provenance = config.source_root / prices_provenance
+    prices_provenance = prices_provenance.resolve(strict=False)
+    if (
+        prices_provenance.is_symlink()
+        or not prices_provenance.is_file()
+        or _file_sha256(prices_provenance) != plan.prices_provenance_sha256
+    ):
+        raise ConfigurationError("optimizer v4 prices provenance differs from the plan")
 
     tickers = tuple(
         sorted(
@@ -21055,27 +21101,45 @@ def _evaluate_v4_panel(
     )
     if not tickers:
         raise ConfigurationError("optimizer v4 panel has no executable tickers")
-    policy_client_factory = None
-    if candidate_root is not None:
-        client_factory = getattr(runner, "client_factory", None)
-        if not callable(client_factory):
-            raise ConfigurationError("optimizer v4 worker capability is absent")
-        policy_client_factory = client_factory(
-            candidate_root=candidate_root,
-            interface_version=manifest.policy_interface_version,
-            fold_run_id=run_label,
-            determinism_probes=_optimizer_capacity_determinism_probes(),
-        )
     with PITDataBundle(
         config.pit_bundle,
         expected_sha256=config.pit_bundle_sha256,
     ) as bundle:
         if not set(tickers).issubset(bundle.tradable_symbols()):
             raise ConfigurationError("optimizer v4 panel escapes tradable membership")
+        transition = bundle.load_price_identity_transition_contract(prices_provenance)
+        if type(transition) is not PriceIdentityTransitionContract:
+            raise ConfigurationError(
+                "optimizer v4 identity transition contract is invalid"
+            )
+        canonical_identities = {
+            ticker: dict(identity)
+            for ticker, identity in transition.identities.items()
+        }
+        if (
+            transition.prices_provenance_sha256 != plan.prices_provenance_sha256
+            or transition.request_contracts_sha256
+            != bundle.metadata.get("price_identity_request_contracts_sha256")
+            or pit_canonical_json_sha256(canonical_identities)
+            != transition.request_contracts_sha256
+        ):
+            raise ConfigurationError("optimizer v4 identity transition contract differs")
+        policy_client_factory = None
+        if candidate_root is not None:
+            client_factory = getattr(runner, "client_factory", None)
+            if not callable(client_factory):
+                raise ConfigurationError("optimizer v4 worker capability is absent")
+            policy_client_factory = client_factory(
+                candidate_root=candidate_root,
+                interface_version=manifest.policy_interface_version,
+                fold_run_id=run_label,
+                determinism_probes=_optimizer_capacity_determinism_probes(),
+            )
         simulator = PortfolioSimulator(
             pit_bundle=bundle,
             benchmark_symbol="SPY",
             signal_every_n_days=1,
+            identity_transition_contract=transition,
             policy_client_factory=policy_client_factory,
         )
         result = simulator.run(
@@ -21085,7 +21149,11 @@ def _evaluate_v4_panel(
             history_start_date=str(bundle.metadata["warmup_start"]),
             benchmark_symbol="SPY",
         )
-    evidence = build_panel_evidence_v4(panel=panel, result=result)
+    evidence = build_panel_evidence_v4(
+        panel=panel,
+        result=result,
+        identity_transition_contract=transition,
+    )
     return panel_aggregate_summary_from_primitive(evidence["aggregate"])
 
 

@@ -15,6 +15,7 @@ from core.backtest_engine import PortfolioSimulator, SimulationResultV5
 from core.backtest_fills import ExecutionProfileV5, FrictionScenario
 from core.pit_data import PriceIdentityTransitionContract
 from core.pit_optimizer_evaluation import EvaluationPanelSpec
+from core.pit_provenance import pit_canonical_json_sha256
 from core.strategy_policy import StrategyPolicyClient, StrategyPolicyClientFactory
 from core.strategy_policy.runtime import InProcessPolicyClient
 
@@ -260,16 +261,25 @@ class PitPanelEvaluatorV5:
         provenance = Path(prices_provenance)
         if not provenance.is_absolute() or not provenance.is_file() or provenance.is_symlink():
             raise ValueError("prices provenance must be an absolute regular non-link file")
+        provenance_sha256 = hashlib.sha256(provenance.read_bytes()).hexdigest()
+        if provenance_sha256 != contract.prices_provenance_sha256:
+            raise ValueError("prices provenance identity differs from evaluator contract")
         loader = getattr(pit_bundle, "load_price_identity_transition_contract", None)
         if not callable(loader):
             raise TypeError("PIT bundle cannot load price identity transitions")
         transition = loader(provenance)
         if type(transition) is not PriceIdentityTransitionContract:
             raise ValueError("price identity transition contract is invalid")
-        if transition.prices_provenance_sha256 != contract.prices_provenance_sha256:
+        if transition.prices_provenance_sha256 != provenance_sha256:
             raise ValueError("prices provenance identity differs from evaluator contract")
+        canonical_identities = {
+            ticker: dict(identity)
+            for ticker, identity in transition.identities.items()
+        }
         if (
             transition.request_contracts_sha256
+            != contract.identity_transition_contract_sha256
+            or pit_canonical_json_sha256(canonical_identities)
             != contract.identity_transition_contract_sha256
         ):
             raise ValueError("identity transition contract identity differs")

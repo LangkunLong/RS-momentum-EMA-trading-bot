@@ -27,6 +27,8 @@ from core.pit_optimizer_evaluation import (
     PanelAggregateSummary,
     load_discovery_panel_plan,
 )
+from core.pit_data import PriceIdentityTransitionContract
+from core.pit_provenance import pit_canonical_json_sha256
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -1243,6 +1245,7 @@ def build_panel_evidence_v4(
     *,
     panel: EvaluationPanelSpec,
     result: object,
+    identity_transition_contract: PriceIdentityTransitionContract | None = None,
 ) -> dict[str, object]:
     """Convert a continuous production run into canonical interface-v2 evidence."""
 
@@ -1386,6 +1389,27 @@ def build_panel_evidence_v4(
         "aggregate": _v4_json_value(aggregate),
         "effective_policy_sha256": effective_policy_sha256,
     }
+    if identity_transition_contract is not None:
+        if type(identity_transition_contract) is not PriceIdentityTransitionContract:
+            raise ValueError("panel parity identity transition contract is invalid")
+        _require_digest(
+            identity_transition_contract.prices_provenance_sha256,
+            "panel parity prices provenance digest",
+        )
+        _require_digest(
+            identity_transition_contract.request_contracts_sha256,
+            "panel parity identity transition contract digest",
+        )
+        primitive.update(
+            {
+                "prices_provenance_sha256": (
+                    identity_transition_contract.prices_provenance_sha256
+                ),
+                "identity_transition_contract_sha256": (
+                    identity_transition_contract.request_contracts_sha256
+                ),
+            }
+        )
     primitive["evidence_sha256"] = _digest(primitive)
     return primitive
 
@@ -1487,6 +1511,7 @@ def _evaluate_discovery_panels_v4(
     *,
     plan: DiscoveryPanelPlan,
     bundle: object,
+    identity_transition_contract: PriceIdentityTransitionContract,
 ) -> tuple[dict[str, object], ...]:
     from core.backtest_engine import PortfolioSimulator
     from core.strategy_policy import POLICY_INTERFACE_VERSION
@@ -1497,6 +1522,7 @@ def _evaluate_discovery_panels_v4(
         pit_bundle=bundle,
         benchmark_symbol="SPY",
         signal_every_n_days=_PARITY_SIGNAL_EVERY_N_DAYS,
+        identity_transition_contract=identity_transition_contract,
     )
     warmup_start = bundle.metadata["warmup_start"]
     evidence: list[dict[str, object]] = []
@@ -1513,7 +1539,13 @@ def _evaluate_discovery_panels_v4(
             history_start_date=warmup_start,
             benchmark_symbol="SPY",
         )
-        evidence.append(build_panel_evidence_v4(panel=panel, result=result))
+        evidence.append(
+            build_panel_evidence_v4(
+                panel=panel,
+                result=result,
+                identity_transition_contract=identity_transition_contract,
+            )
+        )
     if len({item["effective_policy_sha256"] for item in evidence}) != 1:
         raise ValueError("panel parity policy identity differs between panels")
     return tuple(evidence)
@@ -1526,7 +1558,11 @@ def _authenticated_panel_parity_evidence(
     pit_bundle_sha256: str,
     prices_provenance: Path,
     sandbox_image: str,
-) -> tuple[DiscoveryPanelPlan, tuple[dict[str, object], ...]]:
+) -> tuple[
+    DiscoveryPanelPlan,
+    PriceIdentityTransitionContract,
+    tuple[dict[str, object], ...],
+]:
     _require_digest(pit_bundle_sha256, "panel parity PIT bundle digest")
     _validate_sandbox_image(sandbox_image)
     plan = load_discovery_panel_plan(Path(discovery_panel_plan))
@@ -1536,10 +1572,27 @@ def _authenticated_panel_parity_evidence(
 
     with PITDataBundle(pit_bundle, expected_sha256=pit_bundle_sha256) as bundle:
         transition = bundle.load_price_identity_transition_contract(prices_provenance)
+        if type(transition) is not PriceIdentityTransitionContract:
+            raise ValueError("panel parity identity transition contract is invalid")
         if transition.prices_provenance_sha256 != plan.prices_provenance_sha256:
             raise ValueError("panel parity prices provenance differs from the plan")
-        evidence = _evaluate_discovery_panels_v4(plan=plan, bundle=bundle)
-    return plan, evidence
+        canonical_identities = {
+            ticker: dict(identity)
+            for ticker, identity in transition.identities.items()
+        }
+        if (
+            transition.request_contracts_sha256
+            != bundle.metadata.get("price_identity_request_contracts_sha256")
+            or pit_canonical_json_sha256(canonical_identities)
+            != transition.request_contracts_sha256
+        ):
+            raise ValueError("panel parity identity transition contract differs from the bundle")
+        evidence = _evaluate_discovery_panels_v4(
+            plan=plan,
+            bundle=bundle,
+            identity_transition_contract=transition,
+        )
+    return plan, transition, evidence
 
 
 def capture_panel_parity_reference_v4(
@@ -1554,7 +1607,7 @@ def capture_panel_parity_reference_v4(
     """Capture continuous quick/discovery baseline evidence without a provider."""
 
     _v4_run_root(output_root)
-    plan, evidence = _authenticated_panel_parity_evidence(
+    plan, transition, evidence = _authenticated_panel_parity_evidence(
         discovery_panel_plan=discovery_panel_plan,
         pit_bundle=pit_bundle,
         pit_bundle_sha256=pit_bundle_sha256,
@@ -1569,6 +1622,9 @@ def capture_panel_parity_reference_v4(
         "qualification_plan_sha256": plan.qualification_plan_sha256,
         "pit_bundle_sha256": pit_bundle_sha256,
         "prices_provenance_sha256": plan.prices_provenance_sha256,
+        "identity_transition_contract_sha256": (
+            transition.request_contracts_sha256
+        ),
         "sandbox_image": sandbox_image,
         "panel_evidence": list(evidence),
     }
@@ -1594,7 +1650,7 @@ def verify_panel_parity_reference_v4(
 
     _v4_run_root(output_root)
     reference_value, reference_sha256 = _load_v4_reference(reference)
-    plan, evidence = _authenticated_panel_parity_evidence(
+    plan, transition, evidence = _authenticated_panel_parity_evidence(
         discovery_panel_plan=discovery_panel_plan,
         pit_bundle=pit_bundle,
         pit_bundle_sha256=pit_bundle_sha256,
@@ -1607,6 +1663,10 @@ def verify_panel_parity_reference_v4(
         ("qualification_plan_sha256", plan.qualification_plan_sha256),
         ("pit_bundle_sha256", pit_bundle_sha256),
         ("prices_provenance_sha256", plan.prices_provenance_sha256),
+        (
+            "identity_transition_contract_sha256",
+            transition.request_contracts_sha256,
+        ),
         ("sandbox_image", sandbox_image),
     ):
         if reference_value.get(key) != expected:
@@ -1623,6 +1683,9 @@ def verify_panel_parity_reference_v4(
         "qualification_plan_sha256": plan.qualification_plan_sha256,
         "pit_bundle_sha256": pit_bundle_sha256,
         "prices_provenance_sha256": plan.prices_provenance_sha256,
+        "identity_transition_contract_sha256": (
+            transition.request_contracts_sha256
+        ),
         "sandbox_image": sandbox_image,
         "panel_output_sha256s": [
             [item["panel_id"], item["evidence_sha256"]] for item in evidence
