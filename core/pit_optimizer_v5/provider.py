@@ -15,6 +15,7 @@ from typing import Literal, Protocol, runtime_checkable
 
 from core.pit_optimizer_v5.candidate_ir import (
     LiteralAxisV5,
+    PolicyRevisionIdentityV5,
     SourceFileV5,
     SourceOperationV5,
     StructuralTemplateV5,
@@ -880,17 +881,13 @@ class InvestigatorRoleInputV5:
 
 @dataclass(frozen=True, slots=True)
 class AuthorPolicyContractsV5:
-    immutable_constraints_sha256: str
-    policy_interface_version: Literal[3]
+    parent_revision: PolicyRevisionIdentityV5
     policy_scope_sha256: str
-    trusted_policy_runtime_sha256: str
 
     def __post_init__(self) -> None:
-        _digest(self.immutable_constraints_sha256, "author immutable constraints")
-        if type(self.policy_interface_version) is not int or self.policy_interface_version != 3:
-            raise ValueError("author policy interface must be exactly V3")
+        if type(self.parent_revision) is not PolicyRevisionIdentityV5:
+            raise ValueError("author parent revision must use the exact V5 identity")
         _digest(self.policy_scope_sha256, "author policy scope")
-        _digest(self.trusted_policy_runtime_sha256, "author trusted runtime")
 
 
 @dataclass(frozen=True, slots=True)
@@ -914,6 +911,9 @@ class AuthorRoleInputV5:
             raise ValueError("author hypothesis is invalid")
         if type(self.policy_contracts) is not AuthorPolicyContractsV5:
             raise ValueError("author policy contracts are invalid")
+        source_authority = dict(self.policy_contracts.parent_revision.editable_source_sha256)
+        if any(source_authority.get(source.path) != source.sha256 for source in self.editable_sources):
+            raise ValueError("author source bytes differ from the authenticated parent revision")
         _validate_hypothesis_text(self.hypothesis)
 
 
@@ -1118,7 +1118,9 @@ def _decode_hypothesis(value: object) -> HypothesisV5:
     )
 
 
-def _referenced_evidence_ids(role_input: RoleInputV5) -> tuple[str, ...]:
+def _role_citation_sequence(role_input: RoleInputV5) -> tuple[str, ...]:
+    """Return the one authoritative citation order for each closed role input."""
+
     if type(role_input) is InvestigatorRoleInputV5:
         return (
             *role_input.aggregate_evaluator_evidence,
@@ -1146,7 +1148,7 @@ def _validate_role_input(
     role_input: RoleInputV5,
     binding: RoleBindingV5,
     schema_authority: RoleSchemaAuthorityV5,
-    issued_ids: frozenset[str],
+    issued_ids: tuple[str, ...],
 ) -> None:
     if role == "investigator":
         if type(role_input) is not InvestigatorRoleInputV5:
@@ -1162,8 +1164,20 @@ def _validate_role_input(
             raise ValueError("author hypothesis differs from its expected binding")
         if role_input.policy_contracts.policy_scope_sha256 != schema_authority.policy_scope_sha256:
             raise ValueError("author V3 policy contracts differ from schema authority")
+        parent_revision = role_input.policy_contracts.parent_revision
+        if parent_revision.sha256 != binding.parent_revision_sha256:
+            raise ValueError("author parent revision differs from its expected binding")
         if tuple(source.path for source in role_input.editable_sources) != schema_authority.author_policy_paths:
             raise ValueError("author sources differ from their exact path authority")
+        authorized_paths = frozenset(schema_authority.author_policy_paths)
+        expected_sources = tuple(
+            source_identity
+            for source_identity in parent_revision.editable_source_sha256
+            if source_identity[0] in authorized_paths
+        )
+        actual_sources = tuple((source.path, source.sha256) for source in role_input.editable_sources)
+        if actual_sources != expected_sources:
+            raise ValueError("author source bytes differ from the authenticated parent revision")
         _validate_hypothesis_text(hypothesis)
     else:
         if type(role_input) is not CriticRoleInputV5:
@@ -1177,13 +1191,11 @@ def _validate_role_input(
             if tuple(item.experiment_id for item in values) != binding.experiment_ids:
                 raise ValueError(f"critic {label} differs from the complete experiment batch")
         _scan_aggregate_value(canonical_primitive_v5(role_input))
-    referenced = _referenced_evidence_ids(role_input)
-    if not set(referenced).issubset(issued_ids):
-        raise ValueError("role input references evidence that was not issued")
-    if set(referenced) != issued_ids:
-        raise ValueError("role request includes evidence outside its closed role input")
-    if role == "author" and len(referenced) != len(issued_ids):
-        raise ValueError("author evidence must exactly match its hypothesis citations")
+    _evidence_id_tuple(issued_ids, "issued role evidence", required=True)
+    citations = _role_citation_sequence(role_input)
+    _evidence_id_tuple(citations, "role citation sequence", required=True)
+    if citations != issued_ids:
+        raise ValueError("role citations must exactly match issued evidence order")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1244,7 +1256,7 @@ class RoleRequestV5:
             role_input=self.role_input,
             binding=self.expected_binding,
             schema_authority=self.schema_authority,
-            issued_ids=frozenset(item.evidence_id for item in self.role_evidence.items),
+            issued_ids=tuple(item.evidence_id for item in self.role_evidence.items),
         )
         messages = _freeze_json(
             (
