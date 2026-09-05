@@ -11,7 +11,6 @@ import math
 import re
 from typing import Literal
 
-from core.pit_optimizer_candidate import validate_policy_source_ast
 from core.pit_optimizer_v5.contracts import HypothesisV5
 from core.pit_optimizer_v5.policy_scope import (
     EDITABLE_POLICY_PATHS_V5,
@@ -490,6 +489,24 @@ def _policy_numeric_local_names_v5(
             return numeric
 
 
+def _parse_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
+    """Parse and compile one V5 source without importing the legacy optimizer."""
+
+    try:
+        tree = ast.parse(source, filename=path)
+        compile(tree, path, "exec", dont_inherit=True)
+    except (SyntaxError, TypeError, ValueError) as exc:
+        raise ValueError("V5 policy AST syntax is invalid") from exc
+    public_functions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+    }
+    if public_functions != set(REQUIRED_POLICY_EXPORTS_V5[path]):
+        raise ValueError("V5 policy public symbols differ from the closed interface")
+    return tree
+
+
 def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
     """Validate one bounded, capability-closed V3 policy module.
 
@@ -503,11 +520,7 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
         raise ValueError("V5 policy source authority is invalid")
     if len(source.encode("utf-8")) > _MAX_POLICY_SOURCE_BYTES_V5:
         raise ValueError("V5 policy source exceeds the bounded AST envelope")
-    tree = validate_policy_source_ast(
-        path=path,
-        source=source,
-        required_public_symbols=REQUIRED_POLICY_EXPORTS_V5[path],
-    )
+    tree = _parse_policy_source_ast_v5(path=path, source=source)
     nodes = tuple(ast.walk(tree))
     if len(nodes) > _MAX_POLICY_AST_NODES_V5:
         raise ValueError("V5 policy AST exceeds the bounded node envelope")

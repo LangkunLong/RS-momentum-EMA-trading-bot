@@ -1,0 +1,40 @@
+FROM python:3.13.14-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6
+
+ARG PIT_V5_RUNTIME_SOURCE_SHA256
+RUN test "${#PIT_V5_RUNTIME_SOURCE_SHA256}" -eq 64 \
+    && case "$PIT_V5_RUNTIME_SOURCE_SHA256" in *[!0-9a-f]*) exit 1;; esac
+
+RUN groupadd --gid 65532 pit-evaluator \
+    && useradd --uid 65532 --gid 65532 --no-create-home --home-dir /nonexistent pit-evaluator
+
+WORKDIR /opt/pit-evaluator
+COPY requirements-lock.txt /opt/pit-evaluator/requirements-lock.txt
+RUN python -m pip install --no-cache-dir --requirement /opt/pit-evaluator/requirements-lock.txt
+
+# Dockerfile.pit-optimizer-v5.dockerignore admits only the authenticated
+# EVALUATOR_SOURCE_PATHS_V5 closure under these roots.  Installing it in the
+# interpreter-owned path lets ``python -P`` ignore the untrusted mount cwd.
+COPY backtest.py /usr/local/lib/python3.13/site-packages/backtest.py
+COPY config/ /usr/local/lib/python3.13/site-packages/config/
+COPY core/ /usr/local/lib/python3.13/site-packages/core/
+
+RUN test -f /usr/local/lib/python3.13/site-packages/core/pit_optimizer_v5/probe_entry.py \
+    && test -f /usr/local/lib/python3.13/site-packages/core/pit_optimizer_v5/probes.py \
+    && test -f /usr/local/lib/python3.13/site-packages/core/strategy_policy/worker.py \
+    && test ! -e /usr/local/lib/python3.13/site-packages/core/strategy_policy/v3/entry.py \
+    && test ! -e /usr/local/lib/python3.13/site-packages/core/strategy_policy/v3/risk.py \
+    && test ! -e /usr/local/lib/python3.13/site-packages/core/strategy_policy/v3/position.py \
+    && test ! -e /usr/local/lib/python3.13/site-packages/core/strategy_policy/v3/exit.py
+
+LABEL io.trading-bot.pit-v5.runtime-kind="evaluator-probe-v5" \
+    io.trading-bot.pit-v5.runtime-source-sha256="$PIT_V5_RUNTIME_SOURCE_SHA256"
+
+ENV LANG=C \
+    LC_ALL=C \
+    PYTHONHASHSEED=0 \
+    PYTHONNOUSERSITE=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+USER 65532:65532
+WORKDIR /
+ENTRYPOINT ["python"]

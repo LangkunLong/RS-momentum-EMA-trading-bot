@@ -52,6 +52,9 @@ from core.pit_optimizer_v5.sandbox import (
     ContainerExecutionResultV5,
     ContainerExecutorV5,
     DockerPanelRequestV5,
+    EVALUATOR_RUNTIME_KIND_LABEL_V5,
+    EVALUATOR_RUNTIME_KIND_V5,
+    EVALUATOR_RUNTIME_SOURCE_LABEL_V5,
     ExecutionLeaseV5,
     ExecutionReservationV5,
     SandboxMountFactoryV5,
@@ -377,8 +380,9 @@ class ExecutionReservationRecordV5:
         ):
             raise ValueError("container execution reservation is invalid")
         separator = self.command_argv.index("--")
-        semantic_probe = self.command_argv[separator + 2 : separator + 6] == (
+        semantic_probe = self.command_argv[separator + 2 : separator + 7] == (
             "python",
+            "-P",
             "-B",
             "-m",
             "core.pit_optimizer_v5.probe_entry",
@@ -1392,6 +1396,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     "pull": "never",
                     "user": "65532:65532",
                     "entrypoint": "python",
+                    "python_flags": ("-P", "-B"),
                     "workdirs": (
                         ("semantic_probe", "/"),
                         ("panel_evaluation", "/pit/source"),
@@ -2241,24 +2246,17 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             )
             or len({value.split("=", 1)[0] for value in image_environment})
             != len(image_environment)
-            or image_labels is not None
-            and (
-                type(image_labels) is not dict
-                or any(
-                    type(key) is not str
-                    or not key
-                    or "\x00" in key
-                    or type(value) is not str
-                    or "\x00" in value
-                    for key, value in image_labels.items()
-                )
-            )
+            or image_labels
+            != {
+                EVALUATOR_RUNTIME_KIND_LABEL_V5: EVALUATOR_RUNTIME_KIND_V5,
+                EVALUATOR_RUNTIME_SOURCE_LABEL_V5: self._profile.runtime_source_sha256,
+            }
         ):
             raise ValueError("sandbox image differs from its immutable authority")
         return (
             image_id,
             tuple(image_environment),
-            tuple(sorted((image_labels or {}).items())),
+            tuple(sorted(image_labels.items())),
         )
 
     @staticmethod
@@ -2990,8 +2988,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         expected_command = list(reservation.command_argv[separator + 3 :])
         expected_working_directory = (
             "/"
-            if expected_command[:3]
-            == ["-B", "-m", "core.pit_optimizer_v5.probe_entry"]
+            if expected_command[:4]
+            == ["-P", "-B", "-m", "core.pit_optimizer_v5.probe_entry"]
             else "/pit/source"
         )
         network = item.get("NetworkSettings") if type(item) is dict else None

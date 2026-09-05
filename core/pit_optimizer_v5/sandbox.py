@@ -74,6 +74,9 @@ MountKindV5 = Literal["source", "data", "output"]
 MountModeV5 = Literal["read_only", "bounded_write_only"]
 
 _FAILURES = frozenset(get_args(SandboxFailureCodeV5))
+EVALUATOR_RUNTIME_SOURCE_LABEL_V5 = "io.trading-bot.pit-v5.runtime-source-sha256"
+EVALUATOR_RUNTIME_KIND_LABEL_V5 = "io.trading-bot.pit-v5.runtime-kind"
+EVALUATOR_RUNTIME_KIND_V5 = "evaluator-probe-v5"
 
 
 def _digest(value: object, label: str) -> str:
@@ -172,6 +175,8 @@ def derive_trusted_probe_runtime_authority_v5(
         type(evaluator_contract) is not EvaluatorContractV5
         or type(sandbox_profile) is not SandboxProfileV5
         or evaluator_contract.sandbox_profile_sha256 != sandbox_profile.sha256
+        or evaluator_contract.evaluator_source_sha256
+        != sandbox_profile.runtime_source_sha256
     ):
         raise ValueError("trusted probe runtime authority is invalid")
     return canonical_sha256_v5(
@@ -272,6 +277,8 @@ class DockerPanelRequestV5:
             or self.manifest.evaluator_contract_ref.sha256 != self.evaluator_contract.sha256
             or self.manifest.sandbox_profile_ref.sha256 != self.sandbox_profile.sha256
             or self.evaluator_contract.sandbox_profile_sha256 != self.sandbox_profile.sha256
+            or self.evaluator_contract.evaluator_source_sha256
+            != self.sandbox_profile.runtime_source_sha256
         ):
             raise ValueError("Docker panel request differs from campaign authority")
         if (
@@ -826,6 +833,7 @@ def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
         "--",
         request.sandbox_profile.image_reference,
         "python",
+        "-P",
         "-B",
         "-m",
         )
@@ -1499,6 +1507,8 @@ class DockerCandidateRuntimeV5:
             or manifest.evaluator_contract_ref.sha256 != evaluator_contract.sha256
             or manifest.sandbox_profile_ref.sha256 != sandbox_profile.sha256
             or evaluator_contract.sandbox_profile_sha256 != sandbox_profile.sha256
+            or evaluator_contract.evaluator_source_sha256
+            != sandbox_profile.runtime_source_sha256
         ):
             raise ValueError("Docker candidate runtime authority is inconsistent")
         self._manifest = manifest
@@ -1843,6 +1853,9 @@ __all__ = [
     "decode_panel_evaluation_v5",
     "decode_semantic_fingerprint_output_v5",
     "derive_trusted_probe_runtime_authority_v5",
+    "EVALUATOR_RUNTIME_KIND_LABEL_V5",
+    "EVALUATOR_RUNTIME_KIND_V5",
+    "EVALUATOR_RUNTIME_SOURCE_LABEL_V5",
     "derive_sandbox_mount_authorities_v5",
     "derive_execution_lease_id_v5",
     "execution_output_name_v5",
