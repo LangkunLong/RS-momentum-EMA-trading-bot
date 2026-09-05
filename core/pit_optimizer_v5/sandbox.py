@@ -333,7 +333,6 @@ class ContainerCommandV5:
             {
                 "request_sha256": self.request.sha256,
                 "argv": self.argv,
-                "remaining_timeout_seconds": self.remaining_timeout_seconds,
             }
         )
 
@@ -354,6 +353,33 @@ class ExecutionLeaseV5:
         _digest(self.request_sha256, "execution lease request")
         _digest(self.command_sha256, "execution lease command")
         _digest(self.output_mount_authority_sha256, "execution lease output authority")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionReservationV5:
+    """Driver reservation that binds cleanup identities before any process launch."""
+
+    command: ContainerCommandV5
+    leases: tuple[ExecutionLeaseV5, ...]
+    opaque_reservation: object
+
+    def __post_init__(self) -> None:
+        if type(self.command) is not ContainerCommandV5:
+            raise ValueError("execution reservation command is invalid")
+        if (
+            type(self.leases) is not tuple
+            or tuple(item.role_kind for item in self.leases) != ("evaluator_process", "container")
+            or any(
+                type(item) is not ExecutionLeaseV5
+                or item.request_sha256 != self.command.request.sha256
+                or item.command_sha256 != self.command.sha256
+                or item.output_mount_authority_sha256 != self.command.request.output_mount.content_authority_sha256
+                for item in self.leases
+            )
+        ):
+            raise ValueError("execution reservation leases are invalid")
+        if self.opaque_reservation is None:
+            raise ValueError("execution reservation requires an opaque driver handle")
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,17 +443,26 @@ class DockerPanelOutcomeV5:
 
 @runtime_checkable
 class ContainerExecutorV5(Protocol):
-    """Execute one exact command with no shell and enforce its timeout/output bounds."""
+    """Reserve durably first, then start or reconcile exactly one execution."""
 
-    def execute(self, command: ContainerCommandV5) -> ContainerExecutionResultV5: ...
+    def reserve(self, command: ContainerCommandV5) -> ExecutionReservationV5: ...
 
-    def recover(
+    def start(self, reservation: ExecutionReservationV5) -> None: ...
+
+    def collect(
+        self,
+        reservation: ExecutionReservationV5,
+        *,
+        remaining_timeout_seconds: float,
+    ) -> ContainerExecutionResultV5: ...
+
+    def reconcile(
         self,
         *,
         request: DockerPanelRequestV5,
         authority: CandidateExecutionAuthorityV5,
         remaining_timeout_seconds: float,
-    ) -> ContainerExecutionResultV5 | None: ...
+    ) -> ExecutionReservationV5 | None: ...
 
     def cleanup(self, *, owner: WorkspaceOwnerV5, leases: tuple[OwnedLeaseV5, ...]) -> CleanupResultPayloadV5: ...
 
@@ -690,6 +725,33 @@ class DockerPanelEvaluatorV5:
         owned = tuple(item.owned_lease for item in result.leases)
         return result.leases if len({item.payload.lease_id for item in owned}) == len(owned) else None
 
+    @classmethod
+    def _bound_reservation(
+        cls,
+        request: DockerPanelRequestV5,
+        command_sha256: str,
+        reservation: ExecutionReservationV5,
+    ) -> tuple[ExecutionLeaseV5, ...] | None:
+        if (
+            type(reservation) is not ExecutionReservationV5
+            or reservation.command.request != request
+            or reservation.command.sha256 != command_sha256
+        ):
+            return None
+        probe = ContainerExecutionResultV5(
+            "timed_out",
+            None,
+            BoundedOutputBytesV5(
+                None,
+                0,
+                request.sha256,
+                command_sha256,
+                request.output_mount.content_authority_sha256,
+            ),
+            reservation.leases,
+        )
+        return cls._bound_execution(request, command_sha256, probe)
+
     @staticmethod
     def _execution_authority(
         request: DockerPanelRequestV5,
@@ -763,17 +825,30 @@ class DockerPanelEvaluatorV5:
             return self._failure("timed_out")
         command = ContainerCommandV5(request, build_docker_argv_v5(request), remaining)
         try:
-            result = self._executor.execute(command)
+            reservation = self._executor.reserve(command)
         except BaseException:
             return self._failure("driver_failed")
-        if type(result) is not ContainerExecutionResultV5:
-            return self._failure("driver_failed")
-        execution_leases = self._bound_execution(request, command.sha256, result)
+        execution_leases = self._bound_reservation(request, command.sha256, reservation)
         if execution_leases is None:
             return self._failure("foreign_lease")
         owned_leases = tuple(item.owned_lease for item in execution_leases)
         authority = self._execution_authority(request, command.sha256, execution_leases)
         registrar.register_execution(authority, owned_leases)
+        try:
+            started = self._executor.start(reservation)
+            if started is not None:
+                return self._failure("driver_failed", execution_leases)
+            result = self._executor.collect(
+                reservation,
+                remaining_timeout_seconds=remaining,
+            )
+        except BaseException:
+            return self._failure("driver_failed", execution_leases)
+        if type(result) is not ContainerExecutionResultV5:
+            return self._failure("driver_failed", execution_leases)
+        bound_result = self._bound_execution(request, command.sha256, result)
+        if bound_result != execution_leases:
+            return self._failure("foreign_lease", execution_leases)
         return self._consume_result(request, result, execution_leases)
 
     def recover(
@@ -801,27 +876,37 @@ class DockerPanelEvaluatorV5:
         if remaining == 0:
             return self._failure("timed_out")
         try:
-            result = self._executor.recover(
+            reservation = self._executor.reconcile(
                 request=request,
                 authority=authority,
                 remaining_timeout_seconds=remaining,
             )
         except BaseException:
             return self._failure("driver_failed")
-        if result is None:
+        if reservation is None:
             return self._failure("missing_output")
-        if type(result) is not ContainerExecutionResultV5:
-            return self._failure("driver_failed")
-        execution_leases = self._bound_execution(
+        execution_leases = self._bound_reservation(
             request,
             authority.command_sha256,
-            result,
+            reservation,
         )
         if (
             execution_leases is None
             or tuple(item.owned_lease.payload for item in execution_leases) != authority.lease_payloads
         ):
             return self._failure("foreign_lease")
+        try:
+            result = self._executor.collect(
+                reservation,
+                remaining_timeout_seconds=remaining,
+            )
+        except BaseException:
+            return self._failure("driver_failed", execution_leases)
+        if type(result) is not ContainerExecutionResultV5:
+            return self._failure("driver_failed", execution_leases)
+        bound_result = self._bound_execution(request, authority.command_sha256, result)
+        if bound_result != execution_leases:
+            return self._failure("foreign_lease", execution_leases)
         return self._consume_result(request, result, execution_leases)
 
     def cleanup(self, *, owner: WorkspaceOwnerV5, leases: tuple[ExecutionLeaseV5, ...]) -> CleanupResultPayloadV5:
@@ -1210,6 +1295,7 @@ __all__ = [
     "DockerPanelOutcomeV5",
     "DockerPanelRequestV5",
     "ExecutionLeaseV5",
+    "ExecutionReservationV5",
     "ExecutionRoleV5",
     "MountKindV5",
     "MountModeV5",

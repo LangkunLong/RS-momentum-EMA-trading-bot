@@ -1481,6 +1481,45 @@ class LocalArtifactRepositoryV5:
             raise ArtifactSchemaFailureV5()
         return None if not matches else matches[0]
 
+    def _candidate_execution_orphan(
+        self,
+        *,
+        campaign_id: str,
+        round_index: int,
+        key: CandidateExecutionKeyV5,
+    ) -> tuple[CandidateExecutionAuthorityV5, ArtifactRefV5] | None:
+        indexed = {
+            event.payload_ref
+            for event in self.load_round_events(
+                campaign_id=campaign_id,
+                round_index=round_index,
+            )
+            if event.event_kind == "candidate_execution"
+        }
+        try:
+            names = self._names(("payloads", "candidate_execution"))
+        except ArtifactMissingV5:
+            return None
+        matches: list[tuple[CandidateExecutionAuthorityV5, ArtifactRefV5]] = []
+        for name in names:
+            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                raise ArtifactSchemaFailureV5()
+            relative = f"payloads/candidate_execution/{name}"
+            reference = ArtifactRefV5(relative, name.removesuffix(".json"))
+            if reference in indexed:
+                continue
+            payload = self.load_round_payload(
+                reference,
+                expected_kind="candidate_execution",
+            )
+            if not isinstance(payload, CandidateExecutionAuthorityV5):
+                raise ArtifactSchemaFailureV5(reference)
+            if payload.campaign_id == campaign_id and payload.round_index == round_index and payload.key == key:
+                matches.append((payload, reference))
+        if len(matches) > 1:
+            raise ArtifactSchemaFailureV5()
+        return None if not matches else matches[0]
+
     def append_candidate_execution(self, authority: CandidateExecutionAuthorityV5) -> ArtifactRefV5:
         if type(authority) is not CandidateExecutionAuthorityV5:
             raise ValueError("candidate execution authority is invalid")
@@ -1488,14 +1527,14 @@ class LocalArtifactRepositoryV5:
             campaign_id=authority.campaign_id,
             round_index=authority.round_index,
         )
-        if (
-            self.load_candidate_execution(
-                campaign_id=authority.campaign_id,
-                round_index=authority.round_index,
-                key=authority.key,
-            )
-            is not None
-        ):
+        indexed = self.load_candidate_execution(
+            campaign_id=authority.campaign_id,
+            round_index=authority.round_index,
+            key=authority.key,
+        )
+        if indexed is not None:
+            if indexed[0] == authority:
+                return indexed[1]
             raise ArtifactExistsV5()
         existing_lease_ids = {payload.lease_id for item in existing for payload in item.lease_payloads}
         if any(payload.lease_id in existing_lease_ids for payload in authority.lease_payloads):
@@ -1504,7 +1543,17 @@ class LocalArtifactRepositoryV5:
             campaign_id=authority.campaign_id,
             round_index=authority.round_index,
         )
-        payload_ref = self.append_round_payload(authority)
+        orphan = self._candidate_execution_orphan(
+            campaign_id=authority.campaign_id,
+            round_index=authority.round_index,
+            key=authority.key,
+        )
+        if orphan is not None:
+            if orphan[0] != authority:
+                raise ArtifactExistsV5(orphan[1])
+            payload_ref = orphan[1]
+        else:
+            payload_ref = self.append_round_payload(authority)
         event = RoundEventV5(
             campaign_id=authority.campaign_id,
             round_index=authority.round_index,
