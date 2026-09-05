@@ -870,7 +870,6 @@ class _Runtime:
         return package
 
     def _recover_projection(self) -> SearchProjectionV5:
-        deadline = self._deadline("recovery", self.inputs.manifest.resources.round_wall_timeout_seconds)
         reducer = self.dependencies.archive_reducers.recovery_reducer(self.inputs)
         checkpoint, state = self.dependencies.persistence.recover_projection(reducer)
         if type(state) is not SearchStateV5 or state.archive.capacity != self.inputs.manifest.search.archive_capacity:
@@ -884,9 +883,32 @@ class _Runtime:
             for reference in refs
         )
         projection = SearchProjectionV5(checkpoint=checkpoint, state=state, stored_records=stored)
-        self._check_finished(deadline)
         self.projection = projection
+        if not self._adopt_completed_projection(projection):
+            self._deadline("recovery", self.inputs.manifest.resources.round_wall_timeout_seconds)
         return projection
+
+    def _adopt_completed_projection(self, projection: SearchProjectionV5) -> bool:
+        if projection.state.next_round_index != self.inputs.round_index + 1:
+            return False
+        checkpoint = projection.checkpoint
+        if type(checkpoint) is not RepositoryCheckpointV5:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        completed_rounds = tuple(sorted({item.record.round_index for item in projection.stored_records}))
+        current = tuple(
+            item.reference for item in projection.stored_records if item.record.round_index == self.inputs.round_index
+        )
+        if (
+            not current
+            or not completed_rounds
+            or completed_rounds[-1] != self.inputs.round_index
+            or checkpoint.generation != len(completed_rounds)
+            or checkpoint.record_refs != tuple(item.reference for item in projection.stored_records)
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        self.record_refs = current
+        self.checkpoint = checkpoint
+        return True
 
     def _recover_owned_leases(self) -> tuple[OwnedLeaseV5, ...]:
         if self._owned_leases:
@@ -993,6 +1015,28 @@ class _Runtime:
             raise _RuntimeAbort(RuntimeFailureV5("cleanup", "cleanup_failed"))
         return result
 
+    def _completed_result(self, *, parent: ParentCandidateV5 | None) -> FeedbackRoundResultV5:
+        if type(self.checkpoint) is not RepositoryCheckpointV5 or not self.record_refs:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        cleanup_failure: RuntimeFailureV5 | None = None
+        try:
+            cleanup = self._cleanup()
+        except _RuntimeAbort as abort:
+            cleanup_failure = abort.failure
+            cleanup = self.journal.cleanup_payload()
+        return FeedbackRoundResultV5(
+            status="completed",
+            campaign_id=self.inputs.campaign_id,
+            round_index=self.inputs.round_index,
+            parent=parent,
+            terminal_outcome=None,
+            record_refs=self.record_refs,
+            checkpoint=self.checkpoint,
+            cleanup=cleanup,
+            failure=None,
+            cleanup_failure=cleanup_failure,
+        )
+
     def _terminal_result(
         self,
         authority: NoNovelHypothesisAuthorityV5 | NoveltyExhaustedAuthorityV5 | CriticUnavailableAuthorityV5,
@@ -1027,6 +1071,8 @@ class _Runtime:
         )
 
     def _failure_result(self, failure: RuntimeFailureV5) -> FeedbackRoundResultV5:
+        if self.checkpoint is not None:
+            return self._completed_result(parent=self.parent)
         payload = RoundOutcomePayloadV5(
             campaign_id=self.inputs.campaign_id,
             round_index=self.inputs.round_index,
@@ -1958,7 +2004,7 @@ class _Runtime:
                 key=lambda item: (item.relative_path, item.sha256),
             )
         )
-        deadline = self._deadline("checkpoint", self.inputs.manifest.resources.round_wall_timeout_seconds)
+        self._deadline("checkpoint", self.inputs.manifest.resources.round_wall_timeout_seconds)
         expected_generation = 1 if projection.checkpoint is None else projection.checkpoint.generation + 1
         checkpoint = self.dependencies.persistence.publish_projection(
             record_refs=all_refs,
@@ -1971,13 +2017,15 @@ class _Runtime:
             or checkpoint.record_refs != all_refs
         ):
             raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
-        self.record_refs = refs
+        current_refs = tuple(sorted(refs, key=lambda item: (item.relative_path, item.sha256)))
+        self.record_refs = current_refs
         self.checkpoint = checkpoint
-        self._check_finished(deadline)
-        return refs, checkpoint
+        return current_refs, checkpoint
 
     def run(self) -> FeedbackRoundResultV5:
         projection = self._recover_projection()
+        if self.checkpoint is not None:
+            return self._completed_result(parent=None)
         self._recover_owned_leases()
 
         terminal = self.journal.terminal_payload()
@@ -2003,36 +2051,6 @@ class _Runtime:
                 )
             return self._terminal_result(terminal.authority)
 
-        if projection.state.next_round_index == self.inputs.round_index + 1:
-            if projection.checkpoint is None:
-                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
-            current = tuple(
-                item.reference
-                for item in projection.stored_records
-                if item.record.round_index == self.inputs.round_index
-            )
-            if not current:
-                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
-            self.record_refs = current
-            self.checkpoint = projection.checkpoint
-            cleanup_failure: RuntimeFailureV5 | None = None
-            try:
-                cleanup = self._cleanup()
-            except _RuntimeAbort as abort:
-                cleanup_failure = abort.failure
-                cleanup = self.journal.cleanup_payload()
-            return FeedbackRoundResultV5(
-                status="completed",
-                campaign_id=self.inputs.campaign_id,
-                round_index=self.inputs.round_index,
-                parent=None,
-                terminal_outcome=None,
-                record_refs=current,
-                checkpoint=projection.checkpoint,
-                cleanup=cleanup,
-                failure=None,
-                cleanup_failure=cleanup_failure,
-            )
         if projection.state.next_round_index != self.inputs.round_index:
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
 
@@ -2193,29 +2211,12 @@ class _Runtime:
             raise _RuntimeAbort(RuntimeFailureV5("finalization", "stage_failed")) from None
         records = self._require_exact_records(records, expected_records)
         self._check_finished(deadline)
-        refs, checkpoint = self._publish(
+        self._publish(
             projection=projection,
             candidates=candidates,
             records=records,
         )
-        cleanup_failure: RuntimeFailureV5 | None = None
-        try:
-            cleanup = self._cleanup()
-        except _RuntimeAbort as abort:
-            cleanup_failure = abort.failure
-            cleanup = self.journal.cleanup_payload()
-        return FeedbackRoundResultV5(
-            status="completed",
-            campaign_id=self.inputs.campaign_id,
-            round_index=self.inputs.round_index,
-            parent=parent,
-            terminal_outcome=None,
-            record_refs=refs,
-            checkpoint=checkpoint,
-            cleanup=cleanup,
-            failure=None,
-            cleanup_failure=cleanup_failure,
-        )
+        return self._completed_result(parent=parent)
 
 
 def run_feedback_round_v5(
@@ -2241,12 +2242,41 @@ def run_feedback_round_v5(
             failure=failure,
         )
 
+    def committed_result() -> FeedbackRoundResultV5:
+        assert runtime is not None and type(runtime.checkpoint) is RepositoryCheckpointV5
+        try:
+            return runtime._completed_result(parent=runtime.parent)
+        except BaseException:
+            try:
+                cleanup = runtime.journal.cleanup_payload()
+            except BaseException:
+                cleanup = None
+            cleanup_failure = (
+                None
+                if cleanup is not None and cleanup.cleanup_complete
+                else RuntimeFailureV5("cleanup", "cleanup_failed")
+            )
+            return FeedbackRoundResultV5(
+                status="completed",
+                campaign_id=inputs.campaign_id,
+                round_index=inputs.round_index,
+                parent=runtime.parent,
+                terminal_outcome=None,
+                record_refs=runtime.record_refs,
+                checkpoint=runtime.checkpoint,
+                cleanup=cleanup,
+                failure=None,
+                cleanup_failure=cleanup_failure,
+            )
+
     try:
         runtime = _Runtime(inputs, dependencies)
         return runtime.run()
     except _RuntimeAbort as abort:
         if runtime is None:
             return bare_failure(abort.failure)
+        if runtime.checkpoint is not None:
+            return committed_result()
         try:
             return runtime._failure_result(abort.failure)
         except BaseException:
@@ -2255,6 +2285,8 @@ def run_feedback_round_v5(
         failure = RuntimeFailureV5("recovery", "stage_failed")
         if runtime is None:
             return bare_failure(failure)
+        if runtime.checkpoint is not None:
+            return committed_result()
         try:
             return runtime._failure_result(failure)
         except BaseException:
