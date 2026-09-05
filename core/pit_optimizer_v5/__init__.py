@@ -81,6 +81,7 @@ from .sandbox import (
     DockerPanelRequestV5,
     ExecutionLeaseV5,
     ExecutionReservationV5,
+    ReservationDispositionV5,
     RuntimeDockerPanelEvaluatorV5,
     RuntimeLeaseRegistrarV5,
     SandboxAdapterErrorV5,
@@ -89,6 +90,7 @@ from .sandbox import (
     SandboxMountHandleV5,
     build_docker_argv_v5,
     decode_panel_evaluation_v5,
+    derive_execution_lease_id_v5,
     derive_sandbox_mount_authorities_v5,
 )
 from .workspace import (
@@ -170,6 +172,7 @@ __all__ = [
     "RuntimeFailureV5",
     "RuntimeDockerPanelEvaluatorV5",
     "RuntimeLeaseRegistrarV5",
+    "ReservationDispositionV5",
     "SandboxAdapterErrorV5",
     "SandboxFailureV5",
     "SandboxMountFactoryV5",
@@ -196,6 +199,7 @@ __all__ = [
     "evaluator_source_sha256",
     "build_docker_argv_v5",
     "decode_panel_evaluation_v5",
+    "derive_execution_lease_id_v5",
     "derive_sandbox_mount_authorities_v5",
     "initial_friction_grid_v5",
     "investigator_hypothesis_schema_bounds_v5",

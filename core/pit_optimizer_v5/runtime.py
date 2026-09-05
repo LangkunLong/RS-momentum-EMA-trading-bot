@@ -1068,6 +1068,23 @@ class _Runtime:
             or match[0].owner_token_sha256 != self.inputs.owner_token_sha256
         ):
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        # Exact lookup may have promoted an authenticated artifact-before-index
+        # execution reservation. Refresh the journal head before any subsequent
+        # evidence append, then adopt the original cleanup handles before the
+        # caller enters the recover-only evaluator branch.
+        try:
+            refreshed = _Journal(self.inputs, self.dependencies.persistence)
+        except BaseException:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "stage_failed")) from None
+        durable = tuple(
+            payload
+            for event, payload in zip(refreshed.events, refreshed.payloads, strict=True)
+            if event.payload_ref == match[1] and payload == match[0]
+        )
+        if durable != (match[0],):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        self.journal = refreshed
+        self._recover_owned_leases()
         return match[0]
 
     def _register_execution(

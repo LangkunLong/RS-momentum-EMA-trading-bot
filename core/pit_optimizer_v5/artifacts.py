@@ -1465,6 +1465,42 @@ class LocalArtifactRepositoryV5:
         if type(key) is not CandidateExecutionKeyV5:
             raise ValueError("candidate execution lookup key is invalid")
         events = self.load_round_events(campaign_id=campaign_id, round_index=round_index)
+        indexed = self._indexed_candidate_execution(events=events, key=key)
+        orphan = self._candidate_execution_orphan(
+            campaign_id=campaign_id,
+            round_index=round_index,
+            key=key,
+            events=events,
+        )
+        if indexed is not None:
+            if orphan is not None:
+                raise ArtifactSchemaFailureV5(orphan[1])
+            return indexed
+        if orphan is None:
+            return None
+        authority, payload_ref = orphan
+        event = RoundEventV5(
+            campaign_id=campaign_id,
+            round_index=round_index,
+            sequence=len(events),
+            prior_event_sha256=None if not events else events[-1].sha256,
+            event_kind="candidate_execution",
+            experiment_id=authority.key.experiment_id,
+            payload_ref=payload_ref,
+        )
+        self.append_round_event(event)
+        promoted_events = self.load_round_events(campaign_id=campaign_id, round_index=round_index)
+        promoted = self._indexed_candidate_execution(events=promoted_events, key=key)
+        if promoted != orphan:
+            raise ArtifactNonCanonicalV5(payload_ref)
+        return promoted
+
+    def _indexed_candidate_execution(
+        self,
+        *,
+        events: tuple[RoundEventV5, ...],
+        key: CandidateExecutionKeyV5,
+    ) -> tuple[CandidateExecutionAuthorityV5, ArtifactRefV5] | None:
         matches: list[tuple[CandidateExecutionAuthorityV5, ArtifactRefV5]] = []
         for event in events:
             if event.event_kind != "candidate_execution":
@@ -1487,15 +1523,14 @@ class LocalArtifactRepositoryV5:
         campaign_id: str,
         round_index: int,
         key: CandidateExecutionKeyV5,
+        events: tuple[RoundEventV5, ...] | None = None,
     ) -> tuple[CandidateExecutionAuthorityV5, ArtifactRefV5] | None:
-        indexed = {
-            event.payload_ref
-            for event in self.load_round_events(
+        if events is None:
+            events = self.load_round_events(
                 campaign_id=campaign_id,
                 round_index=round_index,
             )
-            if event.event_kind == "candidate_execution"
-        }
+        indexed = {event.payload_ref for event in events if event.event_kind == "candidate_execution"}
         try:
             names = self._names(("payloads", "candidate_execution"))
         except ArtifactMissingV5:
@@ -1539,31 +1574,7 @@ class LocalArtifactRepositoryV5:
         existing_lease_ids = {payload.lease_id for item in existing for payload in item.lease_payloads}
         if any(payload.lease_id in existing_lease_ids for payload in authority.lease_payloads):
             raise ArtifactExistsV5()
-        prior = self.load_round_events(
-            campaign_id=authority.campaign_id,
-            round_index=authority.round_index,
-        )
-        orphan = self._candidate_execution_orphan(
-            campaign_id=authority.campaign_id,
-            round_index=authority.round_index,
-            key=authority.key,
-        )
-        if orphan is not None:
-            if orphan[0] != authority:
-                raise ArtifactExistsV5(orphan[1])
-            payload_ref = orphan[1]
-        else:
-            payload_ref = self.append_round_payload(authority)
-        event = RoundEventV5(
-            campaign_id=authority.campaign_id,
-            round_index=authority.round_index,
-            sequence=len(prior),
-            prior_event_sha256=None if not prior else prior[-1].sha256,
-            event_kind="candidate_execution",
-            experiment_id=authority.key.experiment_id,
-            payload_ref=payload_ref,
-        )
-        self.append_round_event(event)
+        payload_ref = self.append_round_payload(authority)
         reloaded = self.load_candidate_execution(
             campaign_id=authority.campaign_id,
             round_index=authority.round_index,

@@ -64,6 +64,7 @@ SandboxFailureCodeV5 = Literal[
 ]
 ContainerStatusV5 = Literal["succeeded", "cancelled", "timed_out", "nonzero_exit", "failed"]
 ExecutionRoleV5 = Literal["evaluator_process", "container"]
+ReservationDispositionV5 = Literal["created", "existing"]
 MountKindV5 = Literal["source", "data", "output"]
 MountModeV5 = Literal["read_only", "bounded_write_only"]
 
@@ -355,12 +356,29 @@ class ExecutionLeaseV5:
         _digest(self.output_mount_authority_sha256, "execution lease output authority")
 
 
+def derive_execution_lease_id_v5(command_sha256: str, role_kind: ExecutionRoleV5) -> str:
+    """Return the sole lease identity permitted for one command role."""
+
+    _digest(command_sha256, "execution lease command")
+    if role_kind not in {"evaluator_process", "container"}:
+        raise ValueError("execution lease role is invalid")
+    return canonical_sha256_v5(
+        {
+            "schema_version": 5,
+            "authority_kind": "candidate_execution_lease",
+            "command_sha256": command_sha256,
+            "role_kind": role_kind,
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionReservationV5:
     """Driver reservation that binds cleanup identities before any process launch."""
 
     command: ContainerCommandV5
     leases: tuple[ExecutionLeaseV5, ...]
+    disposition: ReservationDispositionV5
     opaque_reservation: object
 
     def __post_init__(self) -> None:
@@ -374,10 +392,14 @@ class ExecutionReservationV5:
                 or item.request_sha256 != self.command.request.sha256
                 or item.command_sha256 != self.command.sha256
                 or item.output_mount_authority_sha256 != self.command.request.output_mount.content_authority_sha256
+                or item.owned_lease.payload.lease_id
+                != derive_execution_lease_id_v5(self.command.sha256, item.role_kind)
                 for item in self.leases
             )
         ):
             raise ValueError("execution reservation leases are invalid")
+        if type(self.disposition) is not str or self.disposition not in {"created", "existing"}:
+            raise ValueError("execution reservation disposition is invalid")
         if self.opaque_reservation is None:
             raise ValueError("execution reservation requires an opaque driver handle")
 
@@ -443,7 +465,13 @@ class DockerPanelOutcomeV5:
 
 @runtime_checkable
 class ContainerExecutorV5(Protocol):
-    """Reserve durably first, then start or reconcile exactly one execution."""
+    """Reserve durably first, then start or reconcile exactly one execution.
+
+    ``reserve`` is an atomic create-or-load operation keyed by the command digest.
+    Repeated calls must return the same deterministic lease identities and report
+    ``existing`` after the first reservation. Collecting an existing reservation
+    reconciles that exact execution and must never create or start another one.
+    """
 
     def reserve(self, command: ContainerCommandV5) -> ExecutionReservationV5: ...
 
@@ -731,11 +759,14 @@ class DockerPanelEvaluatorV5:
         request: DockerPanelRequestV5,
         command_sha256: str,
         reservation: ExecutionReservationV5,
+        *,
+        required_disposition: ReservationDispositionV5 | None = None,
     ) -> tuple[ExecutionLeaseV5, ...] | None:
         if (
             type(reservation) is not ExecutionReservationV5
             or reservation.command.request != request
             or reservation.command.sha256 != command_sha256
+            or (required_disposition is not None and reservation.disposition != required_disposition)
         ):
             return None
         probe = ContainerExecutionResultV5(
@@ -835,9 +866,10 @@ class DockerPanelEvaluatorV5:
         authority = self._execution_authority(request, command.sha256, execution_leases)
         registrar.register_execution(authority, owned_leases)
         try:
-            started = self._executor.start(reservation)
-            if started is not None:
-                return self._failure("driver_failed", execution_leases)
+            if reservation.disposition == "created":
+                started = self._executor.start(reservation)
+                if started is not None:
+                    return self._failure("driver_failed", execution_leases)
             result = self._executor.collect(
                 reservation,
                 remaining_timeout_seconds=remaining,
@@ -889,6 +921,7 @@ class DockerPanelEvaluatorV5:
             request,
             authority.command_sha256,
             reservation,
+            required_disposition="existing",
         )
         if (
             execution_leases is None
@@ -1301,6 +1334,7 @@ __all__ = [
     "MountModeV5",
     "RuntimeDockerPanelEvaluatorV5",
     "RuntimeLeaseRegistrarV5",
+    "ReservationDispositionV5",
     "SandboxAdapterErrorV5",
     "SandboxFailureCodeV5",
     "SandboxFailureV5",
@@ -1309,4 +1343,5 @@ __all__ = [
     "build_docker_argv_v5",
     "decode_panel_evaluation_v5",
     "derive_sandbox_mount_authorities_v5",
+    "derive_execution_lease_id_v5",
 ]
