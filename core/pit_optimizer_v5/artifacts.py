@@ -51,6 +51,7 @@ from core.pit_optimizer_v5.contracts import (
 )
 from core.pit_optimizer_v5.memory import (
     ArchiveReducerV5,
+    CandidateStageResultPayloadV5,
     CleanupResultPayloadV5,
     EpisodeEvidencePayloadV5,
     ExperimentRecordV5,
@@ -642,6 +643,40 @@ def _decode_round_payload(expected_kind: str, value: object) -> RoundEventPayloa
     if expected_kind == "rendered_variant":
         item = _exact_keys(body, {"variant"})
         return RenderedVariantPayloadV5(variant=_decode_rendered_variant(item["variant"]))
+    if expected_kind == "candidate_stage_result":
+        item = _exact_keys(
+            body,
+            {
+                "experiment_id",
+                "stage",
+                "stage_index",
+                "outcome",
+                "validation",
+                "semantic_fingerprint",
+                "failure_code",
+                "failure_ref",
+                "episode_ordinal",
+            },
+        )
+        return CandidateStageResultPayloadV5(
+            experiment_id=item["experiment_id"],  # type: ignore[arg-type]
+            stage=item["stage"],  # type: ignore[arg-type]
+            stage_index=item["stage_index"],  # type: ignore[arg-type]
+            outcome=item["outcome"],  # type: ignore[arg-type]
+            validation=(
+                None if item["validation"] is None else _decode_dataclass(ValidationResultV5, item["validation"])
+            ),
+            semantic_fingerprint=(
+                None
+                if item["semantic_fingerprint"] is None
+                else _decode_semantic_fingerprint(item["semantic_fingerprint"])
+            ),
+            failure_code=item["failure_code"],  # type: ignore[arg-type]
+            failure_ref=(
+                None if item["failure_ref"] is None else _decode_dataclass(ArtifactRefV5, item["failure_ref"])
+            ),
+            episode_ordinal=item["episode_ordinal"],  # type: ignore[arg-type]
+        )
     if expected_kind == "quick_evidence":
         item = _exact_keys(body, {"experiment_id", "semantic_fingerprint", "evaluation"})
         return QuickEvidencePayloadV5(
@@ -1258,6 +1293,8 @@ class LocalArtifactRepositoryV5:
     def append_round_payload(self, payload: RoundEventPayloadV5) -> ArtifactRefV5:
         if isinstance(payload, RoleCompletionPayloadV5):
             self.load_role_invocation(payload)
+        if isinstance(payload, CandidateStageResultPayloadV5):
+            self._validate_candidate_stage_failure(payload)
         kind = event_kind_for_payload_v5(payload)
         primitive = round_event_payload_primitive_v5(payload)
         digest = hashlib.sha256(canonical_json_bytes_v5(primitive)).hexdigest()
@@ -1277,7 +1314,48 @@ class LocalArtifactRepositoryV5:
             raise ArtifactNonCanonicalV5(reference)
         if isinstance(payload, RoleCompletionPayloadV5):
             self.load_role_invocation(payload)
+        if isinstance(payload, CandidateStageResultPayloadV5):
+            self._validate_candidate_stage_failure(payload)
         return payload
+
+    def _validate_candidate_stage_failure(self, payload: CandidateStageResultPayloadV5) -> None:
+        if payload.failure_ref is None:
+            return
+        authenticated = self.authenticate(payload.failure_ref)
+        try:
+            envelope = _exact_keys(
+                _strict_json_object(authenticated.content, payload.failure_ref),
+                {"schema_version", "artifact_type", "payload"},
+                payload.failure_ref,
+            )
+            body = _exact_keys(
+                envelope["payload"],
+                {"code", "stage", "experiment_id"},
+                payload.failure_ref,
+            )
+            if (
+                type(envelope["schema_version"]) is not int
+                or envelope["schema_version"] != 5
+                or envelope["artifact_type"] != "typed_failure"
+                or body
+                != {
+                    "code": payload.failure_code,
+                    "stage": payload.stage,
+                    "experiment_id": payload.experiment_id,
+                }
+            ):
+                raise ArtifactSchemaFailureV5(payload.failure_ref)
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (TypeError, ValueError, ArithmeticError):
+            raise ArtifactSchemaFailureV5(payload.failure_ref) from None
+        expected = {
+            "schema_version": 5,
+            "artifact_type": "typed_failure",
+            "payload": body,
+        }
+        if canonical_json_bytes_v5(expected) != authenticated.content:
+            raise ArtifactNonCanonicalV5(payload.failure_ref)
 
     def append_round_event(self, event: RoundEventV5) -> ArtifactRefV5:
         if type(event) is not RoundEventV5:
@@ -1285,8 +1363,6 @@ class LocalArtifactRepositoryV5:
         payload = self.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
         event.validate_payload(payload)
         prior = self.load_round_events(campaign_id=event.campaign_id, round_index=event.round_index)
-        if prior and prior[-1].event_kind == "round_outcome":
-            raise ValueError("cannot append after a terminal round outcome")
         if event.sequence != len(prior):
             raise ValueError("round event sequence is not the next durable position")
         expected_prior = None if not prior else prior[-1].sha256
@@ -1295,6 +1371,15 @@ class LocalArtifactRepositoryV5:
         prior_payloads = tuple(
             self.load_round_payload(item.payload_ref, expected_kind=item.event_kind) for item in prior
         )
+        terminal_seen = any(isinstance(item, RoundOutcomePayloadV5) for item in prior_payloads)
+        cleanup_seen = tuple(item for item in prior_payloads if isinstance(item, CleanupResultPayloadV5))
+        if terminal_seen and not isinstance(payload, CleanupResultPayloadV5):
+            raise ValueError("only cleanup may follow a terminal round outcome")
+        if cleanup_seen:
+            if cleanup_seen[-1].cleanup_complete:
+                raise ValueError("cannot append after complete cleanup")
+            if not isinstance(payload, CleanupResultPayloadV5):
+                raise ValueError("only cleanup retry may follow incomplete cleanup")
         fold_round_events_v5(
             events=(*prior, event),
             payloads=(*prior_payloads, payload),

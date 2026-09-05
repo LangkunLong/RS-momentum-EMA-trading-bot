@@ -38,6 +38,10 @@ from core.pit_optimizer_v5.contracts import (
 )
 from core.pit_optimizer_v5.memory import (
     ArchiveReducerV5,
+    CandidateStageFailureCodeV5,
+    CandidateStageOutcomeV5,
+    CandidateStageResultPayloadV5,
+    CandidateStageV5,
     CleanupResultPayloadV5,
     CriticUnavailableAuthorityV5,
     EpisodeEvidencePayloadV5,
@@ -53,6 +57,7 @@ from core.pit_optimizer_v5.memory import (
     RoundEventV5,
     RoundIntentPayloadV5,
     RoundOutcomePayloadV5,
+    RuntimeFailureAuthorityV5,
     StoredExperimentRecordV5,
     is_testable_experiment_status_v5,
 )
@@ -79,6 +84,7 @@ from core.pit_optimizer_v5.search import (
     ParentCandidateV5,
     SearchStateV5,
     campaign_cagr_pct,
+    expected_target_gap_pct_v5,
 )
 from core.pit_optimizer_v5.selection import (
     ScheduledHypothesisV5,
@@ -378,6 +384,7 @@ class FeedbackRoundResultV5:
     checkpoint: RepositoryCheckpointV5 | None
     cleanup: CleanupResultPayloadV5 | None
     failure: RuntimeFailureV5 | None
+    cleanup_failure: RuntimeFailureV5 | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {
@@ -403,9 +410,23 @@ class FeedbackRoundResultV5:
             raise ValueError("feedback-round cleanup result is invalid")
         if self.failure is not None and type(self.failure) is not RuntimeFailureV5:
             raise ValueError("feedback-round failure is invalid")
+        if self.cleanup_failure is not None and (
+            type(self.cleanup_failure) is not RuntimeFailureV5
+            or self.cleanup_failure.stage != "cleanup"
+            or self.cleanup_failure.code not in {"cleanup_failed", "deadline_exceeded", "invalid_dependency_result"}
+        ):
+            raise ValueError("feedback-round cleanup failure is invalid")
         if self.status == "failed":
-            if self.failure is None or self.terminal_outcome is not None:
-                raise ValueError("failed feedback round requires only a typed failure")
+            if self.failure is None:
+                raise ValueError("failed feedback round requires its typed primary failure")
+            if self.terminal_outcome is not None and (
+                type(self.terminal_outcome.authority) is not RuntimeFailureAuthorityV5
+                or self.terminal_outcome.authority.stage != self.failure.stage
+                or self.terminal_outcome.authority.failure_code != self.failure.code
+                or self.terminal_outcome.authority.role != self.failure.role
+                or self.terminal_outcome.authority.experiment_id != self.failure.experiment_id
+            ):
+                raise ValueError("failed feedback round differs from its durable primary failure")
         elif self.failure is not None:
             raise ValueError("successful or terminal feedback round cannot carry a failure")
         if self.status in {"no_novel_hypothesis", "novelty_exhausted", "critic_unavailable"}:
@@ -413,7 +434,7 @@ class FeedbackRoundResultV5:
                 raise ValueError("terminal feedback round differs from its durable outcome")
             if self.record_refs or self.checkpoint is not None:
                 raise ValueError("terminal non-promoting feedback round cannot carry promotion authority")
-        elif self.terminal_outcome is not None:
+        elif self.status != "failed" and self.terminal_outcome is not None:
             raise ValueError("nonterminal feedback round cannot carry a terminal outcome")
         if self.status == "completed" and self.checkpoint is None:
             raise ValueError("completed feedback round requires its checkpoint")
@@ -672,7 +693,7 @@ class _Journal:
         )
         if len(matches) > 1:
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role=role))
-        return None if not matches else matches[0]
+        return None if not matches else matches[-1]
 
     def find_experiment_payloads(self, experiment_id: str) -> tuple[RoundEventPayloadV5, ...]:
         result: list[RoundEventPayloadV5] = []
@@ -694,9 +715,9 @@ class _Journal:
 
     def cleanup_payload(self) -> CleanupResultPayloadV5 | None:
         matches = tuple(payload for payload in self.payloads if isinstance(payload, CleanupResultPayloadV5))
-        if len(matches) > 1:
+        if any(item.cleanup_complete for item in matches[:-1]):
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
-        return None if not matches else matches[0]
+        return None if not matches else matches[-1]
 
     def terminal_payload(self) -> RoundOutcomePayloadV5 | None:
         matches = tuple(payload for payload in self.payloads if isinstance(payload, RoundOutcomePayloadV5))
@@ -716,6 +737,7 @@ class _Journal:
                 RoleCompletionPayloadV5: "role_completion",
                 RoundIntentPayloadV5: "round_intent",
                 RenderedVariantPayloadV5: "rendered_variant",
+                CandidateStageResultPayloadV5: "candidate_stage_result",
                 QuickEvidencePayloadV5: "quick_evidence",
                 EpisodeEvidencePayloadV5: "episode_evidence",
                 ResourceLeasePayloadV5: "resource_lease",
@@ -913,9 +935,15 @@ class _Runtime:
 
     def _cleanup(self) -> CleanupResultPayloadV5:
         prior = self.journal.cleanup_payload()
-        if prior is not None:
+        if prior is not None and prior.cleanup_complete:
             return prior
         leases = self._recover_owned_leases()
+        expected = {
+            "workspace": sum(item.payload.resource_kind == "workspace" for item in leases),
+            "policy_worker": sum(item.payload.resource_kind == "policy_worker" for item in leases),
+            "evaluator_process": sum(item.payload.resource_kind == "evaluator_process" for item in leases),
+            "container": sum(item.payload.resource_kind == "container" for item in leases),
+        }
         now = self.dependencies.clock.monotonic()
         if type(now) is not float or not math.isfinite(now):
             raise _RuntimeAbort(RuntimeFailureV5("cleanup", "invalid_dependency_result"))
@@ -926,13 +954,17 @@ class _Runtime:
         try:
             result = self.dependencies.cleanup.cleanup(leases, deadline=deadline)
         except BaseException:
+            self.journal.append(
+                CleanupResultPayloadV5(
+                    owned_workspaces=expected["workspace"],
+                    owned_policy_workers=expected["policy_worker"],
+                    owned_evaluators=expected["evaluator_process"],
+                    owned_containers=expected["container"],
+                    cleanup_complete=False,
+                    failure_code="cleanup_execution_failed",
+                )
+            )
             raise _RuntimeAbort(RuntimeFailureV5("cleanup", "cleanup_failed")) from None
-        expected = {
-            "workspace": sum(item.payload.resource_kind == "workspace" for item in leases),
-            "policy_worker": sum(item.payload.resource_kind == "policy_worker" for item in leases),
-            "evaluator_process": sum(item.payload.resource_kind == "evaluator_process" for item in leases),
-            "container": sum(item.payload.resource_kind == "container" for item in leases),
-        }
         if type(result) is not CleanupResultPayloadV5 or (
             result.owned_workspaces,
             result.owned_policy_workers,
@@ -944,8 +976,19 @@ class _Runtime:
             expected["evaluator_process"],
             expected["container"],
         ):
+            self.journal.append(
+                CleanupResultPayloadV5(
+                    owned_workspaces=expected["workspace"],
+                    owned_policy_workers=expected["policy_worker"],
+                    owned_evaluators=expected["evaluator_process"],
+                    owned_containers=expected["container"],
+                    cleanup_complete=False,
+                    failure_code="invalid_dependency_result",
+                )
+            )
             raise _RuntimeAbort(RuntimeFailureV5("cleanup", "invalid_dependency_result"))
         self.journal.append(result)
+        self._check_finished(deadline)
         if not result.cleanup_complete:
             raise _RuntimeAbort(RuntimeFailureV5("cleanup", "cleanup_failed"))
         return result
@@ -954,7 +997,6 @@ class _Runtime:
         self,
         authority: NoNovelHypothesisAuthorityV5 | NoveltyExhaustedAuthorityV5 | CriticUnavailableAuthorityV5,
     ) -> FeedbackRoundResultV5:
-        cleanup = self._cleanup()
         payload = RoundOutcomePayloadV5(
             campaign_id=self.inputs.campaign_id,
             round_index=self.inputs.round_index,
@@ -965,6 +1007,12 @@ class _Runtime:
             self.journal.append(payload)
         elif prior != payload:
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        cleanup_failure: RuntimeFailureV5 | None = None
+        try:
+            cleanup = self._cleanup()
+        except _RuntimeAbort as abort:
+            cleanup_failure = abort.failure
+            cleanup = self.journal.cleanup_payload()
         return FeedbackRoundResultV5(
             status=payload.outcome,
             campaign_id=self.inputs.campaign_id,
@@ -975,6 +1023,51 @@ class _Runtime:
             checkpoint=None,
             cleanup=cleanup,
             failure=None,
+            cleanup_failure=cleanup_failure,
+        )
+
+    def _failure_result(self, failure: RuntimeFailureV5) -> FeedbackRoundResultV5:
+        payload = RoundOutcomePayloadV5(
+            campaign_id=self.inputs.campaign_id,
+            round_index=self.inputs.round_index,
+            authority=RuntimeFailureAuthorityV5(
+                outcome="runtime_failed",
+                stage=failure.stage,
+                failure_code=failure.code,
+                role=failure.role,
+                experiment_id=failure.experiment_id,
+            ),
+        )
+        prior = self.journal.terminal_payload()
+        if prior is None:
+            self.journal.append(payload)
+        elif type(prior.authority) is RuntimeFailureAuthorityV5:
+            payload = prior
+            failure = RuntimeFailureV5(
+                stage=prior.authority.stage,
+                code=prior.authority.failure_code,
+                role=prior.authority.role,
+                experiment_id=prior.authority.experiment_id,
+            )
+        else:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        cleanup_failure: RuntimeFailureV5 | None = None
+        try:
+            cleanup = self._cleanup()
+        except _RuntimeAbort as abort:
+            cleanup_failure = abort.failure
+            cleanup = self.journal.cleanup_payload()
+        return FeedbackRoundResultV5(
+            status="failed",
+            campaign_id=self.inputs.campaign_id,
+            round_index=self.inputs.round_index,
+            parent=self.parent,
+            terminal_outcome=payload,
+            record_refs=self.record_refs,
+            checkpoint=self.checkpoint,
+            cleanup=cleanup,
+            failure=failure,
+            cleanup_failure=cleanup_failure,
         )
 
     def _validate_terminal_novelty(
@@ -1004,9 +1097,15 @@ class _Runtime:
     def _existing_payload(
         self,
         experiment_id: str,
-        payload_type: type[RenderedVariantPayloadV5] | type[QuickEvidencePayloadV5] | type[EpisodeEvidencePayloadV5],
+        payload_type: (
+            type[RenderedVariantPayloadV5]
+            | type[CandidateStageResultPayloadV5]
+            | type[QuickEvidencePayloadV5]
+            | type[EpisodeEvidencePayloadV5]
+        ),
         *,
         episode_ordinal: int | None = None,
+        candidate_stage: CandidateStageV5 | None = None,
     ) -> RoundEventPayloadV5 | None:
         matches = tuple(
             item
@@ -1016,10 +1115,91 @@ class _Runtime:
                 episode_ordinal is None
                 or (type(item) is EpisodeEvidencePayloadV5 and item.episode.episode_ordinal == episode_ordinal)
             )
+            and (
+                candidate_stage is None
+                or (type(item) is CandidateStageResultPayloadV5 and item.stage == candidate_stage)
+            )
         )
         if len(matches) > 1:
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=experiment_id))
         return None if not matches else matches[0]
+
+    @staticmethod
+    def _artifact_refs(*groups: tuple[ArtifactRefV5, ...]) -> tuple[ArtifactRefV5, ...]:
+        return tuple(
+            sorted(
+                {reference for group in groups for reference in group},
+                key=lambda item: (item.relative_path, item.sha256),
+            )
+        )
+
+    def _candidate_stage(
+        self,
+        experiment_id: str,
+        stage: CandidateStageV5,
+    ) -> CandidateStageResultPayloadV5 | None:
+        payload = self._existing_payload(
+            experiment_id,
+            CandidateStageResultPayloadV5,
+            candidate_stage=stage,
+        )
+        if payload is not None and type(payload) is not CandidateStageResultPayloadV5:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=experiment_id))
+        return payload
+
+    def _record_candidate_failure(
+        self,
+        candidate: CandidateEvidenceV5,
+        *,
+        stage: CandidateStageV5,
+        outcome: CandidateStageOutcomeV5,
+        code: CandidateStageFailureCodeV5,
+        episode_ordinal: int | None = None,
+    ) -> CandidateEvidenceV5:
+        reference = self.dependencies.persistence.append_input(
+            artifact_kind="typed_failure",
+            value={"code": code, "stage": stage, "experiment_id": candidate.experiment_id},
+        )
+        payload = CandidateStageResultPayloadV5(
+            experiment_id=candidate.experiment_id,
+            stage=stage,
+            stage_index={
+                "validation": 1,
+                "semantic_probe": 2,
+                "quick_evaluation": 3,
+                "discovery_evaluation": 4,
+            }[stage],
+            outcome=outcome,
+            failure_code=code,
+            failure_ref=reference,
+            episode_ordinal=episode_ordinal,
+        )
+        event = self.journal.append(payload, experiment_id=candidate.experiment_id)
+        return replace(
+            candidate,
+            status="evaluation_failed",
+            failure_code=code,
+            artifact_refs=self._artifact_refs(candidate.artifact_refs, (reference, event.payload_ref)),
+        )
+
+    def _recover_candidate_failure(
+        self,
+        candidate: CandidateEvidenceV5,
+        payload: CandidateStageResultPayloadV5,
+    ) -> CandidateEvidenceV5:
+        if payload.failure_code is None or payload.failure_ref is None:
+            raise _RuntimeAbort(
+                RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=candidate.experiment_id)
+            )
+        return replace(
+            candidate,
+            status="evaluation_failed",
+            failure_code=payload.failure_code,
+            artifact_refs=self._artifact_refs(
+                candidate.artifact_refs,
+                (payload.failure_ref, self.journal.payload_reference(payload)),
+            ),
+        )
 
     def _validate_quick(self, evaluation: PanelEvaluationV5, identity: ExperimentIdentityV5) -> None:
         plan = self.inputs.panel_plan.quick
@@ -1058,24 +1238,6 @@ class _Runtime:
             or tuple(item.scenario_id for item in evaluation.scenarios) != expected_scenarios
         ):
             raise ValueError("episode evidence authority mismatch")
-
-    def _failed_candidate(
-        self,
-        candidate: CandidateEvidenceV5,
-        *,
-        code: str,
-        stage: RuntimeStageV5,
-    ) -> CandidateEvidenceV5:
-        reference = self.dependencies.persistence.append_input(
-            artifact_kind="typed_failure",
-            value={"code": code, "stage": stage, "experiment_id": candidate.experiment_id},
-        )
-        return replace(
-            candidate,
-            status="evaluation_failed",
-            failure_code=code,
-            artifact_refs=(*candidate.artifact_refs, reference),
-        )
 
     def _materialized_variant(
         self,
@@ -1149,24 +1311,54 @@ class _Runtime:
             existed = False
 
         materialized = self._materialized_variant(variant=variant, identity=identity, existed=existed)
-        deadline = self._deadline("validation", self.inputs.manifest.resources.mechanics_timeout_seconds)
-        try:
-            validation = self.dependencies.candidates.validate(materialized, deadline=deadline)
-        except BaseException:
-            validation = ValidationResultV5(valid=False, failure_code="validation_execution_failed", changed_symbols=())
-        if type(validation) is not ValidationResultV5:
-            raise _RuntimeAbort(
-                RuntimeFailureV5("validation", "invalid_dependency_result", experiment_id=identity.sha256)
+        validation_stage = self._candidate_stage(identity.sha256, "validation")
+        if validation_stage is None:
+            deadline = self._deadline("validation", self.inputs.manifest.resources.mechanics_timeout_seconds)
+            failure_ref: ArtifactRefV5 | None = None
+            try:
+                validation = self.dependencies.candidates.validate(materialized, deadline=deadline)
+                if type(validation) is not ValidationResultV5:
+                    raise TypeError
+                validation_outcome: CandidateStageOutcomeV5 = (
+                    "validation_valid" if validation.valid else "validation_invalid"
+                )
+            except _RuntimeAbort:
+                raise
+            except BaseException:
+                validation = ValidationResultV5(
+                    valid=False,
+                    failure_code="validation_execution_failed",
+                    changed_symbols=(),
+                )
+                validation_outcome = "validation_failed"
+                failure_ref = self.dependencies.persistence.append_input(
+                    artifact_kind="typed_failure",
+                    value={
+                        "code": "validation_execution_failed",
+                        "stage": "validation",
+                        "experiment_id": identity.sha256,
+                    },
+                )
+            validation_stage = CandidateStageResultPayloadV5(
+                experiment_id=identity.sha256,
+                stage="validation",
+                stage_index=1,
+                outcome=validation_outcome,
+                validation=validation,
+                failure_code=("validation_execution_failed" if failure_ref is not None else None),
+                failure_ref=failure_ref,
             )
-        validation_ref = self.dependencies.persistence.append_input(
-            artifact_kind="validation",
-            value=validation,
-        )
-        references = tuple(
-            sorted(
-                {render_ref, materialized.source_bundle_ref, validation_ref},
-                key=lambda item: (item.relative_path, item.sha256),
-            )
+            validation_event = self.journal.append(validation_stage, experiment_id=identity.sha256)
+            validation_stage_ref = validation_event.payload_ref
+            self._check_finished(deadline, experiment_id=identity.sha256)
+        else:
+            assert validation_stage.validation is not None
+            validation = validation_stage.validation
+            validation_stage_ref = self.journal.payload_reference(validation_stage)
+            failure_ref = validation_stage.failure_ref
+        references = self._artifact_refs(
+            (render_ref, materialized.source_bundle_ref, validation_stage_ref),
+            (() if failure_ref is None else (failure_ref,)),
         )
         if not validation.valid:
             invalid_identity = derive_pre_validation_invalid_experiment_identity_v5(
@@ -1210,8 +1402,102 @@ class _Runtime:
             artifact_refs=references,
         )
         if candidate.status == "exact_duplicate":
-            return candidate
+            semantic_stage = self._candidate_stage(identity.sha256, "semantic_probe")
+            if semantic_stage is None:
+                semantic_event = self.journal.append(
+                    CandidateStageResultPayloadV5(
+                        experiment_id=identity.sha256,
+                        stage="semantic_probe",
+                        stage_index=2,
+                        outcome="exact_duplicate",
+                    ),
+                    experiment_id=identity.sha256,
+                )
+                semantic_ref = semantic_event.payload_ref
+            elif semantic_stage.outcome == "exact_duplicate":
+                semantic_ref = self.journal.payload_reference(semantic_stage)
+            else:
+                raise _RuntimeAbort(
+                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                )
+            return replace(candidate, artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)))
 
+        semantic_stage = self._candidate_stage(identity.sha256, "semantic_probe")
+        if semantic_stage is not None:
+            semantic_ref = self.journal.payload_reference(semantic_stage)
+            if semantic_stage.outcome == "semantic_probe_failed":
+                return self._recover_candidate_failure(candidate, semantic_stage)
+            if semantic_stage.outcome not in {"behavioral_equivalent", "behaviorally_distinct"}:
+                raise _RuntimeAbort(
+                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                )
+            assert semantic_stage.semantic_fingerprint is not None
+            fingerprint = semantic_stage.semantic_fingerprint
+            candidate = replace(
+                candidate,
+                semantic_fingerprint=fingerprint,
+                status=(
+                    "behavioral_equivalent" if semantic_stage.outcome == "behavioral_equivalent" else "quick_ready"
+                ),
+                artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)),
+            )
+            if candidate.status == "behavioral_equivalent":
+                return candidate
+        else:
+            probe_deadline = self._deadline("semantic_probe", self.inputs.manifest.resources.mechanics_timeout_seconds)
+            try:
+                fingerprint = self.dependencies.candidates.fingerprint(materialized, deadline=probe_deadline)
+                if type(fingerprint) is not SemanticFingerprintV5:
+                    raise TypeError
+                comparison = classify_semantic_fingerprints_v5(
+                    self.inputs.baseline.semantic_fingerprint
+                    if parent.origin == "baseline"
+                    else self._parent_fingerprint(parent, materialized, probe_deadline),
+                    fingerprint,
+                )
+            except _RuntimeAbort:
+                raise
+            except BaseException:
+                failed = self._record_candidate_failure(
+                    candidate,
+                    stage="semantic_probe",
+                    outcome="semantic_probe_failed",
+                    code="semantic_probe_failed",
+                )
+                self._check_finished(probe_deadline, experiment_id=identity.sha256)
+                return failed
+            semantic_outcome: CandidateStageOutcomeV5 = (
+                "behavioral_equivalent"
+                if comparison.classification == BEHAVIORAL_EQUIVALENT_ON_SUITE_V1
+                else "behaviorally_distinct"
+            )
+            semantic_event = self.journal.append(
+                CandidateStageResultPayloadV5(
+                    experiment_id=identity.sha256,
+                    stage="semantic_probe",
+                    stage_index=2,
+                    outcome=semantic_outcome,
+                    semantic_fingerprint=fingerprint,
+                ),
+                experiment_id=identity.sha256,
+            )
+            candidate = replace(
+                candidate,
+                semantic_fingerprint=fingerprint,
+                status=("behavioral_equivalent" if semantic_outcome == "behavioral_equivalent" else "quick_ready"),
+                artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_event.payload_ref,)),
+            )
+            self._check_finished(probe_deadline, experiment_id=identity.sha256)
+            if candidate.status == "behavioral_equivalent":
+                return candidate
+
+        quick_failure = self._candidate_stage(identity.sha256, "quick_evaluation")
+        if quick_failure is not None:
+            if quick_failure.outcome != "quick_evaluation_failed":
+                raise _RuntimeAbort(
+                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                )
+            return self._recover_candidate_failure(candidate, quick_failure)
         existing_quick = self._existing_payload(identity.sha256, QuickEvidencePayloadV5)
         if existing_quick is not None:
             if type(existing_quick) is not QuickEvidencePayloadV5 or existing_quick.experiment_id != identity.sha256:
@@ -1224,52 +1510,16 @@ class _Runtime:
                 raise _RuntimeAbort(
                     RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
                 ) from None
-            if existing_quick.semantic_fingerprint.fingerprint_sha256 == parent.semantic_fingerprint_sha256:
+            if existing_quick.semantic_fingerprint != candidate.semantic_fingerprint:
                 raise _RuntimeAbort(
                     RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
                 )
             return replace(
                 candidate,
-                semantic_fingerprint=existing_quick.semantic_fingerprint,
                 quick_evidence=existing_quick.evaluation,
-                artifact_refs=tuple(
-                    sorted(
-                        {*candidate.artifact_refs, self.journal.payload_reference(existing_quick)},
-                        key=lambda item: (item.relative_path, item.sha256),
-                    )
-                ),
-            )
-
-        probe_deadline = self._deadline("semantic_probe", self.inputs.manifest.resources.mechanics_timeout_seconds)
-        try:
-            fingerprint = self.dependencies.candidates.fingerprint(materialized, deadline=probe_deadline)
-            if type(fingerprint) is not SemanticFingerprintV5:
-                raise TypeError
-            comparison = classify_semantic_fingerprints_v5(
-                self.inputs.baseline.semantic_fingerprint
-                if parent.origin == "baseline"
-                else self._parent_fingerprint(parent, materialized, probe_deadline),
-                fingerprint,
-            )
-            self._check_finished(probe_deadline, experiment_id=identity.sha256)
-        except _RuntimeAbort:
-            raise
-        except BaseException:
-            return self._failed_candidate(candidate, code="semantic_probe_failed", stage="semantic_probe")
-        if comparison.classification == BEHAVIORAL_EQUIVALENT_ON_SUITE_V1:
-            fingerprint_ref = self.dependencies.persistence.append_input(
-                artifact_kind="semantic_fingerprint",
-                value=fingerprint,
-            )
-            return replace(
-                candidate,
-                semantic_fingerprint=fingerprint,
-                status="behavioral_equivalent",
-                artifact_refs=tuple(
-                    sorted(
-                        {*candidate.artifact_refs, fingerprint_ref},
-                        key=lambda item: (item.relative_path, item.sha256),
-                    )
+                artifact_refs=self._artifact_refs(
+                    candidate.artifact_refs,
+                    (self.journal.payload_reference(existing_quick),),
                 ),
             )
 
@@ -1277,46 +1527,31 @@ class _Runtime:
         try:
             quick = self.dependencies.candidates.evaluate_quick(materialized, deadline=quick_deadline)
             self._validate_quick(quick, identity)
-            self._check_finished(quick_deadline, experiment_id=identity.sha256)
         except _RuntimeAbort:
             raise
         except BaseException:
-            fingerprint_ref = self.dependencies.persistence.append_input(
-                artifact_kind="semantic_fingerprint",
-                value=fingerprint,
-            )
-            return self._failed_candidate(
-                replace(
-                    candidate,
-                    semantic_fingerprint=fingerprint,
-                    artifact_refs=tuple(
-                        sorted(
-                            {*candidate.artifact_refs, fingerprint_ref},
-                            key=lambda item: (item.relative_path, item.sha256),
-                        )
-                    ),
-                ),
-                code="quick_evaluation_failed",
+            failed = self._record_candidate_failure(
+                candidate,
                 stage="quick_evaluation",
+                outcome="quick_evaluation_failed",
+                code="quick_evaluation_failed",
             )
+            self._check_finished(quick_deadline, experiment_id=identity.sha256)
+            return failed
+        assert candidate.semantic_fingerprint is not None
         quick_event = self.journal.append(
             QuickEvidencePayloadV5(
                 experiment_id=identity.sha256,
-                semantic_fingerprint=fingerprint,
+                semantic_fingerprint=candidate.semantic_fingerprint,
                 evaluation=quick,
             ),
             experiment_id=identity.sha256,
         )
+        self._check_finished(quick_deadline, experiment_id=identity.sha256)
         return replace(
             candidate,
-            semantic_fingerprint=fingerprint,
             quick_evidence=quick,
-            artifact_refs=tuple(
-                sorted(
-                    {*candidate.artifact_refs, quick_event.payload_ref},
-                    key=lambda item: (item.relative_path, item.sha256),
-                )
-            ),
+            artifact_refs=self._artifact_refs(candidate.artifact_refs, (quick_event.payload_ref,)),
         )
 
     def _parent_fingerprint(
@@ -1416,9 +1651,14 @@ class _Runtime:
                 continue
             identity = candidate.experiment_identity
             assert type(identity) is ExperimentIdentityV5
+            durable_failure = self._candidate_stage(identity.sha256, "discovery_evaluation")
+            if durable_failure is not None and durable_failure.outcome != "discovery_evaluation_failed":
+                raise _RuntimeAbort(
+                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                )
             episodes: list[EpisodeEvaluationV5] = []
             references = set(candidate.artifact_refs)
-            failed = False
+            recovered_failure = False
             for plan in episode_order:
                 existing = self._existing_payload(
                     identity.sha256,
@@ -1440,6 +1680,26 @@ class _Runtime:
                     episode = existing.episode
                     references.add(self.journal.payload_reference(existing))
                 else:
+                    if durable_failure is not None:
+                        if durable_failure.episode_ordinal != plan.episode_ordinal:
+                            raise _RuntimeAbort(
+                                RuntimeFailureV5(
+                                    "recovery",
+                                    "invalid_dependency_result",
+                                    experiment_id=identity.sha256,
+                                )
+                            )
+                        partial = replace(
+                            candidate,
+                            discovery_episodes=tuple(sorted(episodes, key=lambda item: item.episode_ordinal)),
+                            artifact_refs=self._artifact_refs(
+                                tuple(references),
+                                (self.journal.payload_reference(durable_failure),),
+                            ),
+                        )
+                        result.append(self._recover_candidate_failure(partial, durable_failure))
+                        recovered_failure = True
+                        break
                     deadline = self._deadline(
                         "discovery_evaluation",
                         self.inputs.manifest.resources.discovery_episode_timeout_seconds,
@@ -1451,32 +1711,39 @@ class _Runtime:
                             deadline=deadline,
                         )
                         self._validate_episode(episode, plan, identity)
-                        self._check_finished(deadline, experiment_id=identity.sha256)
                     except _RuntimeAbort:
                         raise
                     except BaseException:
-                        failed = True
+                        partial = replace(
+                            candidate,
+                            discovery_episodes=tuple(sorted(episodes, key=lambda item: item.episode_ordinal)),
+                            artifact_refs=tuple(sorted(references, key=lambda item: (item.relative_path, item.sha256))),
+                        )
+                        result.append(
+                            self._record_candidate_failure(
+                                partial,
+                                stage="discovery_evaluation",
+                                outcome="discovery_evaluation_failed",
+                                code="discovery_evaluation_failed",
+                                episode_ordinal=plan.episode_ordinal,
+                            )
+                        )
+                        self._check_finished(deadline, experiment_id=identity.sha256)
+                        recovered_failure = True
                         break
                     event = self.journal.append(
                         EpisodeEvidencePayloadV5(experiment_id=identity.sha256, episode=episode),
                         experiment_id=identity.sha256,
                     )
                     references.add(event.payload_ref)
+                    self._check_finished(deadline, experiment_id=identity.sha256)
                 episodes.append(episode)
-            if failed:
-                partial = replace(
-                    candidate,
-                    discovery_episodes=tuple(sorted(episodes, key=lambda item: item.episode_ordinal)),
-                    artifact_refs=tuple(sorted(references, key=lambda item: (item.relative_path, item.sha256))),
-                )
-                result.append(
-                    self._failed_candidate(
-                        partial,
-                        code="discovery_evaluation_failed",
-                        stage="discovery_evaluation",
-                    )
-                )
+            if recovered_failure:
                 continue
+            if durable_failure is not None:
+                raise _RuntimeAbort(
+                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                )
             canonical = canonicalize_discovery_evidence_v5(tuple(episodes))
             score = campaign_cagr_pct(
                 episodes=canonical,
@@ -1553,16 +1820,96 @@ class _Runtime:
                 for episode in candidate.discovery_episodes
             )
             if candidate.failure_code is not None:
+                failure_payloads = tuple(
+                    item
+                    for item in self.journal.find_experiment_payloads(experiment_id)
+                    if type(item) is CandidateStageResultPayloadV5
+                    and item.failure_code == candidate.failure_code
+                    and item.failure_ref is not None
+                )
+                if len(failure_payloads) != 1:
+                    raise _RuntimeAbort(
+                        RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=experiment_id)
+                    )
+                failure_ref = failure_payloads[0].failure_ref
+                assert failure_ref is not None
                 evidence.append(
                     PreCriticEvidenceIdentityV5(
                         experiment_id=experiment_id,
                         evidence_kind="typed_failure",
-                        evidence_sha256=canonical_sha256_v5(
-                            {"code": candidate.failure_code, "experiment_id": experiment_id}
-                        ),
+                        evidence_sha256=failure_ref.sha256,
                     )
                 )
         return tuple(evidence)
+
+    def _expected_records(
+        self,
+        *,
+        parent: ParentCandidateV5,
+        decision: ScheduledHypothesisV5,
+        template: StructuralTemplateV5,
+        candidates: tuple[CandidateEvidenceV5, ...],
+        critic: CriticArtifactV5,
+        critic_ref: ArtifactRefV5,
+    ) -> tuple[ExperimentRecordV5, ...]:
+        reviews = {review.experiment_id: review for review in critic.reviews}
+        expected_review_ids = tuple(
+            candidate.experiment_id for candidate in candidates if is_testable_experiment_status_v5(candidate.status)
+        )
+        if tuple(reviews) != expected_review_ids:
+            raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+        records: list[ExperimentRecordV5] = []
+        try:
+            for candidate in candidates:
+                testable = is_testable_experiment_status_v5(candidate.status)
+                campaign = candidate.campaign_evidence
+                records.append(
+                    ExperimentRecordV5(
+                        experiment_id=candidate.experiment_id,
+                        experiment_identity=candidate.experiment_identity,
+                        round_index=self.inputs.round_index,
+                        parent_revision_sha256=parent.policy_identity_sha256,
+                        parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
+                        hypothesis=decision.hypothesis,
+                        template=template,
+                        template_sha256=template.sha256,
+                        variant_assignment=candidate.materialized.variant.assignment,
+                        policy_revision=(
+                            None
+                            if type(candidate.experiment_identity) is PreValidationInvalidExperimentIdentityV5
+                            else candidate.materialized.variant.policy_revision
+                        ),
+                        semantic_fingerprint=candidate.semantic_fingerprint,
+                        status=candidate.status,  # type: ignore[arg-type]
+                        validation=candidate.validation,
+                        quick_evidence=candidate.quick_evidence,
+                        discovery_episodes=candidate.discovery_episodes,
+                        campaign_evidence=campaign,
+                        target_gap_pct=(
+                            None
+                            if campaign is None
+                            else expected_target_gap_pct_v5(
+                                target=self.inputs.manifest.target,
+                                campaign_cagr=campaign.campaign_cagr_pct,
+                            )
+                        ),
+                        critic_review=(reviews[candidate.experiment_id] if testable else None),
+                        artifact_refs=candidate.artifact_refs,
+                        critic_artifact_ref=(critic_ref if testable else None),
+                    )
+                )
+        except (KeyError, TypeError, ValueError):
+            raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result")) from None
+        return tuple(records)
+
+    @staticmethod
+    def _require_exact_records(
+        records: object,
+        expected_records: tuple[ExperimentRecordV5, ...],
+    ) -> tuple[ExperimentRecordV5, ...]:
+        if type(records) is not tuple or records != expected_records:
+            raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+        return records
 
     def _round_intent(self, payload: RoundIntentPayloadV5) -> None:
         matches = tuple(item for item in self.journal.payloads if type(item) is RoundIntentPayloadV5)
@@ -1612,16 +1959,21 @@ class _Runtime:
             )
         )
         deadline = self._deadline("checkpoint", self.inputs.manifest.resources.round_wall_timeout_seconds)
+        expected_generation = 1 if projection.checkpoint is None else projection.checkpoint.generation + 1
         checkpoint = self.dependencies.persistence.publish_projection(
             record_refs=all_refs,
             reducer=reducer,
-            generation=1 if projection.checkpoint is None else projection.checkpoint.generation + 1,
+            generation=expected_generation,
         )
-        if type(checkpoint) is not RepositoryCheckpointV5 or checkpoint.record_refs != all_refs:
+        if (
+            type(checkpoint) is not RepositoryCheckpointV5
+            or checkpoint.generation != expected_generation
+            or checkpoint.record_refs != all_refs
+        ):
             raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
-        self._check_finished(deadline)
         self.record_refs = refs
         self.checkpoint = checkpoint
+        self._check_finished(deadline)
         return refs, checkpoint
 
     def run(self) -> FeedbackRoundResultV5:
@@ -1640,6 +1992,15 @@ class _Runtime:
                 )
             except BaseException:
                 self.parent = None
+            if type(terminal.authority) is RuntimeFailureAuthorityV5:
+                return self._failure_result(
+                    RuntimeFailureV5(
+                        stage=terminal.authority.stage,
+                        code=terminal.authority.failure_code,
+                        role=terminal.authority.role,
+                        experiment_id=terminal.authority.experiment_id,
+                    )
+                )
             return self._terminal_result(terminal.authority)
 
         if projection.state.next_round_index == self.inputs.round_index + 1:
@@ -1654,7 +2015,12 @@ class _Runtime:
                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
             self.record_refs = current
             self.checkpoint = projection.checkpoint
-            cleanup = self._cleanup()
+            cleanup_failure: RuntimeFailureV5 | None = None
+            try:
+                cleanup = self._cleanup()
+            except _RuntimeAbort as abort:
+                cleanup_failure = abort.failure
+                cleanup = self.journal.cleanup_payload()
             return FeedbackRoundResultV5(
                 status="completed",
                 campaign_id=self.inputs.campaign_id,
@@ -1665,6 +2031,7 @@ class _Runtime:
                 checkpoint=projection.checkpoint,
                 cleanup=cleanup,
                 failure=None,
+                cleanup_failure=cleanup_failure,
             )
         if projection.state.next_round_index != self.inputs.round_index:
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
@@ -1804,8 +2171,7 @@ class _Runtime:
         critic_ref = self.dependencies.persistence.append_critic(critic)
 
         deadline = self._deadline("finalization", self.inputs.manifest.resources.round_wall_timeout_seconds)
-        records = self.dependencies.records.build_records(
-            inputs=self.inputs,
+        expected_records = self._expected_records(
             parent=parent,
             decision=decision,
             template=template,
@@ -1813,26 +2179,31 @@ class _Runtime:
             critic=critic,
             critic_ref=critic_ref,
         )
-        if (
-            type(records) is not tuple
-            or any(type(item) is not ExperimentRecordV5 for item in records)
-            or tuple(item.experiment_id for item in records) != tuple(item.experiment_id for item in candidates)
-            or any(
-                item.round_index != self.inputs.round_index
-                or item.parent_revision_sha256 != parent.policy_identity_sha256
-                or item.hypothesis != decision.hypothesis
-                or item.template != template
-                for item in records
+        try:
+            records = self.dependencies.records.build_records(
+                inputs=self.inputs,
+                parent=parent,
+                decision=decision,
+                template=template,
+                candidates=candidates,
+                critic=critic,
+                critic_ref=critic_ref,
             )
-        ):
-            raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+        except BaseException:
+            raise _RuntimeAbort(RuntimeFailureV5("finalization", "stage_failed")) from None
+        records = self._require_exact_records(records, expected_records)
         self._check_finished(deadline)
         refs, checkpoint = self._publish(
             projection=projection,
             candidates=candidates,
             records=records,
         )
-        cleanup = self._cleanup()
+        cleanup_failure: RuntimeFailureV5 | None = None
+        try:
+            cleanup = self._cleanup()
+        except _RuntimeAbort as abort:
+            cleanup_failure = abort.failure
+            cleanup = self.journal.cleanup_payload()
         return FeedbackRoundResultV5(
             status="completed",
             campaign_id=self.inputs.campaign_id,
@@ -1843,6 +2214,7 @@ class _Runtime:
             checkpoint=checkpoint,
             cleanup=cleanup,
             failure=None,
+            cleanup_failure=cleanup_failure,
         )
 
 
@@ -1854,33 +2226,39 @@ def run_feedback_round_v5(
 
     if type(inputs) is not FeedbackRoundInputV5 or type(dependencies) is not FeedbackRoundDependenciesV5:
         raise ValueError("feedback-round entry requires exact V5 input and dependencies")
-    runtime = _Runtime(inputs, dependencies)
+    runtime: _Runtime | None = None
 
-    def failed(failure: RuntimeFailureV5) -> FeedbackRoundResultV5:
-        cleanup = runtime.journal.cleanup_payload()
-        if cleanup is None and (runtime.journal.lease_payloads() or runtime.checkpoint is not None):
-            try:
-                cleanup = runtime._cleanup()
-            except _RuntimeAbort as cleanup_abort:
-                failure = cleanup_abort.failure
+    def bare_failure(failure: RuntimeFailureV5) -> FeedbackRoundResultV5:
         return FeedbackRoundResultV5(
             status="failed",
             campaign_id=inputs.campaign_id,
             round_index=inputs.round_index,
-            parent=runtime.parent,
+            parent=(None if runtime is None else runtime.parent),
             terminal_outcome=None,
-            record_refs=runtime.record_refs,
-            checkpoint=runtime.checkpoint,
-            cleanup=cleanup,
+            record_refs=(() if runtime is None else runtime.record_refs),
+            checkpoint=(None if runtime is None else runtime.checkpoint),
+            cleanup=None,
             failure=failure,
         )
 
     try:
+        runtime = _Runtime(inputs, dependencies)
         return runtime.run()
     except _RuntimeAbort as abort:
-        return failed(abort.failure)
+        if runtime is None:
+            return bare_failure(abort.failure)
+        try:
+            return runtime._failure_result(abort.failure)
+        except BaseException:
+            return bare_failure(abort.failure)
     except BaseException:
-        return failed(RuntimeFailureV5("recovery", "stage_failed"))
+        failure = RuntimeFailureV5("recovery", "stage_failed")
+        if runtime is None:
+            return bare_failure(failure)
+        try:
+            return runtime._failure_result(failure)
+        except BaseException:
+            return bare_failure(failure)
 
 
 __all__ = [

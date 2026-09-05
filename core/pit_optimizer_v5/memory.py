@@ -49,6 +49,7 @@ RoundEventKindV5 = Literal[
     "round_intent",
     "role_completion",
     "rendered_variant",
+    "candidate_stage_result",
     "quick_evidence",
     "episode_evidence",
     "resource_lease",
@@ -59,6 +60,54 @@ RoundOutcomeKindV5 = Literal[
     "no_novel_hypothesis",
     "novelty_exhausted",
     "critic_unavailable",
+    "runtime_failed",
+]
+CandidateStageV5 = Literal["validation", "semantic_probe", "quick_evaluation", "discovery_evaluation"]
+CandidateStageOutcomeV5 = Literal[
+    "validation_valid",
+    "validation_invalid",
+    "validation_failed",
+    "exact_duplicate",
+    "behavioral_equivalent",
+    "behaviorally_distinct",
+    "semantic_probe_failed",
+    "quick_evaluation_failed",
+    "discovery_evaluation_failed",
+]
+CandidateStageFailureCodeV5 = Literal[
+    "validation_execution_failed",
+    "semantic_probe_failed",
+    "quick_evaluation_failed",
+    "discovery_evaluation_failed",
+]
+RoundFailureStageV5 = Literal[
+    "recovery",
+    "parent_selection",
+    "investigator",
+    "novelty",
+    "author",
+    "rendering",
+    "materialization",
+    "validation",
+    "semantic_probe",
+    "quick_evaluation",
+    "survivor_selection",
+    "discovery_evaluation",
+    "critic",
+    "finalization",
+    "checkpoint",
+    "cleanup",
+]
+RoundFailureCodeV5 = Literal[
+    "cancelled",
+    "deadline_exceeded",
+    "invalid_dependency_result",
+    "stage_failed",
+    "role_unrecoverable",
+    "role_rejected",
+    "no_testable_experiments",
+    "foreign_lease",
+    "cleanup_failed",
 ]
 
 _STATUSES = frozenset(
@@ -89,11 +138,72 @@ _EVENT_KINDS = frozenset(
         "round_intent",
         "role_completion",
         "rendered_variant",
+        "candidate_stage_result",
         "quick_evidence",
         "episode_evidence",
         "resource_lease",
         "cleanup_result",
         "round_outcome",
+    }
+)
+_CANDIDATE_STAGE_INDEX = {
+    "validation": 1,
+    "semantic_probe": 2,
+    "quick_evaluation": 3,
+    "discovery_evaluation": 4,
+}
+_CANDIDATE_STAGE_OUTCOMES = frozenset(
+    {
+        "validation_valid",
+        "validation_invalid",
+        "validation_failed",
+        "exact_duplicate",
+        "behavioral_equivalent",
+        "behaviorally_distinct",
+        "semantic_probe_failed",
+        "quick_evaluation_failed",
+        "discovery_evaluation_failed",
+    }
+)
+_CANDIDATE_STAGE_FAILURE_CODES = frozenset(
+    {
+        "validation_execution_failed",
+        "semantic_probe_failed",
+        "quick_evaluation_failed",
+        "discovery_evaluation_failed",
+    }
+)
+_ROUND_FAILURE_STAGES = frozenset(
+    {
+        "recovery",
+        "parent_selection",
+        "investigator",
+        "novelty",
+        "author",
+        "rendering",
+        "materialization",
+        "validation",
+        "semantic_probe",
+        "quick_evaluation",
+        "survivor_selection",
+        "discovery_evaluation",
+        "critic",
+        "finalization",
+        "checkpoint",
+        "cleanup",
+    }
+)
+_ROUND_FAILURE_CODES = frozenset(
+    {
+        "cancelled",
+        "deadline_exceeded",
+        "invalid_dependency_result",
+        "stage_failed",
+        "role_unrecoverable",
+        "role_rejected",
+        "no_testable_experiments",
+        "foreign_lease",
+        "cleanup_failed",
     }
 )
 _PRECRITIC_EVIDENCE_KINDS = frozenset(
@@ -584,6 +694,82 @@ class RenderedVariantPayloadV5:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateStageResultPayloadV5:
+    """One indexed, durable local candidate-stage result."""
+
+    experiment_id: str
+    stage: CandidateStageV5
+    stage_index: int
+    outcome: CandidateStageOutcomeV5
+    validation: ValidationResultV5 | None = None
+    semantic_fingerprint: SemanticFingerprintV5 | None = None
+    failure_code: CandidateStageFailureCodeV5 | None = None
+    failure_ref: ArtifactRefV5 | None = None
+    episode_ordinal: int | None = None
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "candidate-stage experiment ID")
+        expected_index = _CANDIDATE_STAGE_INDEX.get(self.stage)
+        if type(self.stage_index) is not int or self.stage_index != expected_index:
+            raise ValueError("candidate-stage index differs from its stage")
+        if self.outcome not in _CANDIDATE_STAGE_OUTCOMES:
+            raise ValueError("candidate-stage outcome is invalid")
+        expected_stage = {
+            "validation_valid": "validation",
+            "validation_invalid": "validation",
+            "validation_failed": "validation",
+            "exact_duplicate": "semantic_probe",
+            "behavioral_equivalent": "semantic_probe",
+            "behaviorally_distinct": "semantic_probe",
+            "semantic_probe_failed": "semantic_probe",
+            "quick_evaluation_failed": "quick_evaluation",
+            "discovery_evaluation_failed": "discovery_evaluation",
+        }[self.outcome]
+        if self.stage != expected_stage:
+            raise ValueError("candidate-stage outcome differs from its stage")
+
+        validation_outcomes = {"validation_valid", "validation_invalid", "validation_failed"}
+        semantic_outcomes = {"behavioral_equivalent", "behaviorally_distinct"}
+        failure_outcomes = {
+            "validation_failed": "validation_execution_failed",
+            "semantic_probe_failed": "semantic_probe_failed",
+            "quick_evaluation_failed": "quick_evaluation_failed",
+            "discovery_evaluation_failed": "discovery_evaluation_failed",
+        }
+        if self.outcome in validation_outcomes:
+            if type(self.validation) is not ValidationResultV5:
+                raise ValueError("validation stage requires its exact result")
+            expected_valid = self.outcome == "validation_valid"
+            if self.validation.valid != expected_valid:
+                raise ValueError("validation stage outcome differs from its result")
+        elif self.validation is not None:
+            raise ValueError("non-validation stage cannot carry validation evidence")
+        if self.outcome in semantic_outcomes:
+            if type(self.semantic_fingerprint) is not SemanticFingerprintV5:
+                raise ValueError("semantic stage requires its exact fingerprint")
+        elif self.semantic_fingerprint is not None:
+            raise ValueError("non-semantic result cannot carry a fingerprint")
+
+        expected_failure = failure_outcomes.get(self.outcome)
+        if expected_failure is None:
+            if self.failure_code is not None or self.failure_ref is not None:
+                raise ValueError("successful candidate stage cannot carry failure authority")
+        elif (
+            self.failure_code != expected_failure
+            or self.failure_code not in _CANDIDATE_STAGE_FAILURE_CODES
+            or type(self.failure_ref) is not ArtifactRefV5
+            or self.failure_ref.relative_path != f"inputs/typed_failure/{self.failure_ref.sha256}.json"
+        ):
+            raise ValueError("failed candidate stage lacks its exact typed failure reference")
+        if self.outcome == "discovery_evaluation_failed":
+            ordinal = _count(self.episode_ordinal, "failed discovery episode ordinal", positive=True)
+            if ordinal > 4:
+                raise ValueError("failed discovery episode ordinal is outside the fixed panel")
+        elif self.episode_ordinal is not None:
+            raise ValueError("only discovery failure can carry an episode ordinal")
+
+
+@dataclass(frozen=True, slots=True)
 class QuickEvidencePayloadV5:
     experiment_id: str
     semantic_fingerprint: SemanticFingerprintV5
@@ -832,7 +1018,37 @@ class CriticUnavailableAuthorityV5:
         return canonical_sha256_v5(self)
 
 
-RoundOutcomeAuthorityV5 = NoNovelHypothesisAuthorityV5 | NoveltyExhaustedAuthorityV5 | CriticUnavailableAuthorityV5
+@dataclass(frozen=True, slots=True)
+class RuntimeFailureAuthorityV5:
+    """Sanitized durable primary failure recorded before owned cleanup."""
+
+    outcome: Literal["runtime_failed"]
+    stage: RoundFailureStageV5
+    failure_code: RoundFailureCodeV5
+    role: RoleNameV5 | None = None
+    experiment_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.outcome != "runtime_failed":
+            raise ValueError("runtime-failure authority kind is invalid")
+        if self.stage not in _ROUND_FAILURE_STAGES or self.failure_code not in _ROUND_FAILURE_CODES:
+            raise ValueError("runtime-failure authority is outside the closed taxonomy")
+        if self.role is not None and self.role not in {"investigator", "author", "critic"}:
+            raise ValueError("runtime-failure role is invalid")
+        if self.experiment_id is not None:
+            _digest(self.experiment_id, "runtime-failure experiment")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+RoundOutcomeAuthorityV5 = (
+    NoNovelHypothesisAuthorityV5
+    | NoveltyExhaustedAuthorityV5
+    | CriticUnavailableAuthorityV5
+    | RuntimeFailureAuthorityV5
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -850,6 +1066,7 @@ class RoundOutcomePayloadV5:
             NoNovelHypothesisAuthorityV5,
             NoveltyExhaustedAuthorityV5,
             CriticUnavailableAuthorityV5,
+            RuntimeFailureAuthorityV5,
         }:
             raise ValueError("round-outcome authority is outside the closed V5 union")
 
@@ -866,6 +1083,7 @@ RoundEventPayloadV5 = (
     RoundIntentPayloadV5
     | RoleCompletionPayloadV5
     | RenderedVariantPayloadV5
+    | CandidateStageResultPayloadV5
     | QuickEvidencePayloadV5
     | EpisodeEvidencePayloadV5
     | ResourceLeasePayloadV5
@@ -877,6 +1095,7 @@ _PAYLOAD_TYPES: dict[str, type[object]] = {
     "round_intent": RoundIntentPayloadV5,
     "role_completion": RoleCompletionPayloadV5,
     "rendered_variant": RenderedVariantPayloadV5,
+    "candidate_stage_result": CandidateStageResultPayloadV5,
     "quick_evidence": QuickEvidencePayloadV5,
     "episode_evidence": EpisodeEvidencePayloadV5,
     "resource_lease": ResourceLeasePayloadV5,
@@ -907,6 +1126,20 @@ def round_event_payload_primitive_v5(
                 "source_bundle": payload.variant.source_bundle.to_primitive(),
                 "policy_revision": payload.variant.policy_revision.to_primitive(),
             }
+        }
+    elif isinstance(payload, CandidateStageResultPayloadV5):
+        body = {
+            "experiment_id": payload.experiment_id,
+            "stage": payload.stage,
+            "stage_index": payload.stage_index,
+            "outcome": payload.outcome,
+            "validation": canonical_primitive_v5(payload.validation),
+            "semantic_fingerprint": (
+                None if payload.semantic_fingerprint is None else payload.semantic_fingerprint.to_primitive()
+            ),
+            "failure_code": payload.failure_code,
+            "failure_ref": None if payload.failure_ref is None else payload.failure_ref.to_primitive(),
+            "episode_ordinal": payload.episode_ordinal,
         }
     elif isinstance(payload, QuickEvidencePayloadV5):
         body = {
@@ -955,6 +1188,7 @@ class RoundEventV5:
             _digest(self.experiment_id, "round-event experiment ID")
         if self.event_kind in {
             "rendered_variant",
+            "candidate_stage_result",
             "quick_evidence",
             "episode_evidence",
         }:
@@ -978,7 +1212,7 @@ class RoundEventV5:
     def validate_payload(self, payload: RoundEventPayloadV5) -> None:
         if type(payload) is not _PAYLOAD_TYPES[self.event_kind]:
             raise ValueError("round-event kind differs from its decoded payload schema")
-        if isinstance(payload, (QuickEvidencePayloadV5, EpisodeEvidencePayloadV5)):
+        if isinstance(payload, (CandidateStageResultPayloadV5, QuickEvidencePayloadV5, EpisodeEvidencePayloadV5)):
             if payload.experiment_id != self.experiment_id:
                 raise ValueError("round-event experiment differs from its payload")
         if isinstance(payload, ResourceLeasePayloadV5):
@@ -1046,6 +1280,7 @@ class RecoveryStepV5:
             raise ValueError("only role recovery steps carry role bindings")
         if self.event_kind in {
             "rendered_variant",
+            "candidate_stage_result",
             "quick_evidence",
             "episode_evidence",
         }:
@@ -1075,16 +1310,96 @@ class RoundRecoveryV5:
         )
         if len(terminal_positions) > 1:
             raise ValueError("round recovery contains multiple terminal outcomes")
-        if terminal_positions and terminal_positions[0] != len(self.payloads) - 1:
-            raise ValueError("round outcome must be the final durable event")
+        if terminal_positions and any(
+            not isinstance(payload, CleanupResultPayloadV5) for payload in self.payloads[terminal_positions[0] + 1 :]
+        ):
+            raise ValueError("only cleanup may follow a primary round outcome")
         if terminal_positions and self.missing_steps:
             raise ValueError("terminal round recovery cannot schedule more local steps")
 
     @property
     def terminal_outcome(self) -> RoundOutcomePayloadV5 | None:
-        if self.payloads and isinstance(self.payloads[-1], RoundOutcomePayloadV5):
-            return self.payloads[-1]
-        return None
+        return next((item for item in self.payloads if isinstance(item, RoundOutcomePayloadV5)), None)
+
+
+def _validate_candidate_stage_chain_v5(
+    events: tuple[RoundEventV5, ...],
+    payloads: tuple[RoundEventPayloadV5, ...],
+) -> None:
+    states: dict[str, str] = {}
+    fingerprints: dict[str, SemanticFingerprintV5] = {}
+    episode_ordinals: dict[str, set[int]] = {}
+    critic_complete = False
+    for event, payload in zip(events, payloads, strict=True):
+        if isinstance(payload, RoleCompletionPayloadV5) and payload.role == "critic":
+            critic_complete = True
+            continue
+        if (
+            isinstance(
+                payload,
+                (
+                    RenderedVariantPayloadV5,
+                    CandidateStageResultPayloadV5,
+                    QuickEvidencePayloadV5,
+                    EpisodeEvidencePayloadV5,
+                ),
+            )
+            and critic_complete
+        ):
+            raise ValueError("candidate work cannot follow critic completion")
+        experiment_id = event.experiment_id
+        if isinstance(payload, RenderedVariantPayloadV5):
+            assert experiment_id is not None
+            if experiment_id in states:
+                raise ValueError("rendered candidate is duplicated")
+            states[experiment_id] = "rendered"
+            episode_ordinals[experiment_id] = set()
+            continue
+        if isinstance(payload, CandidateStageResultPayloadV5):
+            assert experiment_id is not None
+            state = states.get(experiment_id)
+            if payload.stage == "validation":
+                if state != "rendered":
+                    raise ValueError("candidate validation is duplicated or out of order")
+                states[experiment_id] = "validated" if payload.outcome == "validation_valid" else "terminal"
+            elif payload.stage == "semantic_probe":
+                if state != "validated":
+                    raise ValueError("candidate semantic result is duplicated or out of order")
+                if payload.outcome == "behaviorally_distinct":
+                    assert payload.semantic_fingerprint is not None
+                    fingerprints[experiment_id] = payload.semantic_fingerprint
+                    states[experiment_id] = "distinct"
+                else:
+                    states[experiment_id] = "terminal"
+            elif payload.stage == "quick_evaluation":
+                if state != "distinct":
+                    raise ValueError("candidate quick failure is duplicated or out of order")
+                states[experiment_id] = "terminal"
+            elif payload.stage == "discovery_evaluation":
+                if state not in {"quick", "episodes"}:
+                    raise ValueError("candidate discovery failure is duplicated or out of order")
+                assert payload.episode_ordinal is not None
+                if payload.episode_ordinal in episode_ordinals[experiment_id]:
+                    raise ValueError("candidate discovery failure duplicates completed evidence")
+                states[experiment_id] = "terminal"
+            continue
+        if isinstance(payload, QuickEvidencePayloadV5):
+            assert experiment_id is not None
+            if states.get(experiment_id) != "distinct":
+                raise ValueError("candidate quick evidence is duplicated or out of order")
+            if payload.semantic_fingerprint != fingerprints.get(experiment_id):
+                raise ValueError("candidate quick evidence differs from its durable semantic result")
+            states[experiment_id] = "quick"
+            continue
+        if isinstance(payload, EpisodeEvidencePayloadV5):
+            assert experiment_id is not None
+            if states.get(experiment_id) not in {"quick", "episodes"}:
+                raise ValueError("candidate episode evidence is duplicated or out of order")
+            ordinal = payload.episode.episode_ordinal
+            if ordinal in episode_ordinals[experiment_id] or len(episode_ordinals[experiment_id]) >= 4:
+                raise ValueError("candidate episode evidence is duplicated or exceeds the fixed panel")
+            episode_ordinals[experiment_id].add(ordinal)
+            states[experiment_id] = "episodes"
 
 
 def fold_round_events_v5(
@@ -1118,16 +1433,36 @@ def fold_round_events_v5(
     if len(set(expected_steps)) != len(expected_steps):
         raise ValueError("expected recovery steps must be unique")
 
-    terminal = next(
-        (payload for payload in payloads if isinstance(payload, RoundOutcomePayloadV5)),
-        None,
+    terminal_positions = tuple(
+        index for index, payload in enumerate(payloads) if isinstance(payload, RoundOutcomePayloadV5)
     )
-    if terminal is not None and not isinstance(payloads[-1], RoundOutcomePayloadV5):
-        raise ValueError("round outcome must be the final durable event")
+    if len(terminal_positions) > 1:
+        raise ValueError("round recovery contains multiple primary outcomes")
+    terminal = None if not terminal_positions else payloads[terminal_positions[0]]
+    if terminal_positions:
+        terminal_position = terminal_positions[0]
+        if any(isinstance(item, CleanupResultPayloadV5) for item in payloads[:terminal_position]):
+            raise ValueError("cleanup cannot precede a primary round outcome")
+        if any(not isinstance(item, CleanupResultPayloadV5) for item in payloads[terminal_position + 1 :]):
+            raise ValueError("only cleanup may follow a primary round outcome")
+
+    cleanup_positions = tuple(
+        index for index, payload in enumerate(payloads) if isinstance(payload, CleanupResultPayloadV5)
+    )
+    complete_cleanup_positions = tuple(
+        index
+        for index in cleanup_positions
+        if isinstance(payloads[index], CleanupResultPayloadV5) and payloads[index].cleanup_complete
+    )
+    if len(complete_cleanup_positions) > 1 or (
+        complete_cleanup_positions and complete_cleanup_positions[0] != len(payloads) - 1
+    ):
+        raise ValueError("complete cleanup must close the durable round chain")
 
     role_completions = tuple(payload for payload in payloads if isinstance(payload, RoleCompletionPayloadV5))
     if tuple(item.role_position for item in role_completions) != tuple(range(1, len(role_completions) + 1)):
         raise ValueError("durable role completions are not the canonical round prefix")
+    _validate_candidate_stage_chain_v5(events, payloads)
 
     completed: set[RecoveryStepV5] = set()
     for event, payload in zip(events, payloads, strict=True):
@@ -1534,6 +1869,10 @@ def project_investigator_memory_v5(
 
 __all__ = [
     "ArchiveReducerV5",
+    "CandidateStageFailureCodeV5",
+    "CandidateStageOutcomeV5",
+    "CandidateStageResultPayloadV5",
+    "CandidateStageV5",
     "CleanupResultPayloadV5",
     "CriticUnavailableAuthorityV5",
     "EpisodeEvidencePayloadV5",
@@ -1563,6 +1902,7 @@ __all__ = [
     "RoundOutcomeKindV5",
     "RoundOutcomeAuthorityV5",
     "RoundOutcomePayloadV5",
+    "RuntimeFailureAuthorityV5",
     "RoundRecoveryV5",
     "StoredExperimentRecordV5",
     "event_kind_for_payload_v5",
