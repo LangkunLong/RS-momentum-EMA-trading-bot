@@ -58,6 +58,13 @@ from .evaluator import (
     SimulationRunnerV5,
     SimulatorFactoryV5,
 )
+from .runtime import (
+    FeedbackRoundDependenciesV5,
+    FeedbackRoundInputV5,
+    FeedbackRoundResultV5,
+    RuntimeFailureV5,
+    run_feedback_round_v5,
+)
 
 __all__ = [
     "ARTIFACT_ROOT_V5",
@@ -87,6 +94,9 @@ __all__ = [
     "EvaluationReportV5",
     "EvaluationSliceV5",
     "EvaluatorContractV5",
+    "FeedbackRoundDependenciesV5",
+    "FeedbackRoundInputV5",
+    "FeedbackRoundResultV5",
     "HypothesisV5",
     "InvestigatorArtifactV5",
     "MetricCountV5",
@@ -96,6 +106,7 @@ __all__ = [
     "ProviderCapabilitiesV5",
     "ResourceCapabilitiesV5",
     "RollingReturnV5",
+    "RuntimeFailureV5",
     "SandboxProfileV5",
     "SandboxResourceManifestV5",
     "ScenarioPanelEvaluationV5",
@@ -110,6 +121,7 @@ __all__ = [
     "investigator_hypothesis_schema_bounds_v5",
     "sandbox_profile_from_manifest_v5",
     "selected_scenario",
+    "run_feedback_round_v5",
     "validate_campaign_evidence_v5",
     "validate_campaign_manifest_bindings_v5",
     "validate_episode_plan_panel_v5",
