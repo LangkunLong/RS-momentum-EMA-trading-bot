@@ -369,11 +369,104 @@ def _raise_windows_ntstatus(status: int, name: str) -> None:
     error = int(convert(ctypes.c_ulong(status & 0xFFFFFFFF)))
     if error in {2, 3}:  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
         raise FileNotFoundError(name)
+    if error in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+        raise FileExistsError(name)
     if error in {5, 32}:  # ACCESS_DENIED / SHARING_VIOLATION
         raise PermissionError(error, "Windows relative entry could not be pinned", name)
     if error == 267:  # ERROR_DIRECTORY
         raise NotADirectoryError(name)
     raise OSError(error, "Windows relative entry open failed", name)
+
+
+def _create_windows_directory_at(parent: _DirectoryAccess, name: str) -> int:
+    """Atomically create and pin one directory relative to ``parent``."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    child = _closed_name(name)
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", ctypes.POINTER(ctypes.c_ushort)),
+        ]
+
+    class _ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(_UnicodeString)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", wintypes.LPVOID),
+            ("SecurityQualityOfService", wintypes.LPVOID),
+        ]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+    encoded = child.encode("utf-16-le")
+    name_buffer = (ctypes.c_ushort * (len(encoded) // 2 + 1))()
+    ctypes.memmove(name_buffer, encoded, len(encoded))
+    unicode_name = _UnicodeString(
+        len(encoded),
+        len(encoded),
+        ctypes.cast(name_buffer, ctypes.POINTER(ctypes.c_ushort)),
+    )
+    attributes = _ObjectAttributes(
+        ctypes.sizeof(_ObjectAttributes),
+        wintypes.HANDLE(_windows_directory_handle(parent)),
+        ctypes.pointer(unicode_name),
+        0x00000040,  # OBJ_CASE_INSENSITIVE
+        None,
+        None,
+    )
+    io_status = _IoStatusBlock()
+    handle = wintypes.HANDLE()
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    nt_create = ntdll.NtCreateFile
+    nt_create.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.ULONG,
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.LPVOID,
+        wintypes.ULONG,
+    )
+    nt_create.restype = ctypes.c_long
+    status = int(
+        nt_create(
+            ctypes.byref(handle),
+            0x00000001 | 0x00000080 | 0x00010000 | 0x00100000,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            0x00000010,  # FILE_ATTRIBUTE_DIRECTORY
+            0x00000001 | 0x00000002,  # read/write sharing; deny delete/rename
+            2,  # FILE_CREATE: fail atomically if the child exists
+            0x00000001 | 0x00000020 | 0x00200000,
+            None,
+            0,
+        )
+    )
+    if status < 0:
+        _raise_windows_ntstatus(status, child)
+    raw = int(handle.value)
+    try:
+        file_attributes, _volume_serial, _file_id, _links = _windows_handle_information(raw)
+        if file_attributes & 0x00000400 or not file_attributes & 0x00000010:
+            raise ValueError("created directory is a reparse point or non-directory")
+        parent.assert_current()
+        return raw
+    except BaseException:
+        _close_windows_raw_handle(raw)
+        raise
 
 
 def _open_windows_delete_handle_at(
@@ -813,6 +906,46 @@ def remove_owned_tree_in_directory_v5(
     raise ValueError("filesystem cleanup target remains")
 
 
+def create_directory_in_directory_v5(
+    parent: _DirectoryAccess,
+    name: str,
+) -> _DirectoryAccess:
+    """Atomically create one owned child and return a held exact capability.
+
+    The production adapters are intentionally Windows-only: POSIX cannot both
+    create a directory and receive its descriptor in one namespace operation.
+    """
+
+    child = _closed_name(name)
+    parent.assert_current()
+    if os.name != "nt":
+        raise RuntimeError("atomic directory creation requires the Windows production adapter")
+    handle = _create_windows_directory_at(parent, child)
+    information = _windows_handle_information(handle)
+    identity = (parent.identity[0], information[2])
+    try:
+        access = acquire_directory_v5(
+            parent.path,
+            (child,),
+            create=False,
+            expected_root_identity=parent.identity,
+        )
+        if access.identity[1] != information[2]:
+            access.close()
+            raise ValueError("created directory identity changed while binding authority")
+        parent.assert_current()
+    except BaseException:
+        try:
+            _remove_open_windows_tree(handle, expected_identity=identity)
+        finally:
+            _close_windows_raw_handle(handle)
+        raise
+    # ``access`` independently pins the same child before creation authority is
+    # released, so no namespace gap exists between create and adoption.
+    _close_windows_raw_handle(handle)
+    return access
+
+
 def directory_entry_names_v5(directory: _DirectoryAccess) -> tuple[str, ...]:
     """List closed names from a held directory, never from a reopened path."""
 
@@ -918,6 +1051,7 @@ def write_new_regular_in_directory_v5(
 __all__ = [
     "acquire_absolute_directory_v5",
     "acquire_directory_v5",
+    "create_directory_in_directory_v5",
     "directory_child_absent_v5",
     "directory_entry_names_v5",
     "directory_is_empty_v5",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 import hashlib
 import ntpath
@@ -18,6 +19,7 @@ from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 from core.pit_optimizer_v5.production_fs import (
     acquire_absolute_directory_v5,
     acquire_directory_v5,
+    create_directory_in_directory_v5,
     directory_child_absent_v5,
     directory_is_empty_v5,
     hash_regular_in_directory_v5,
@@ -284,6 +286,8 @@ class WorkspaceReadyRecordV5:
     lease_id: str
     lease_sha256: str
     workspace_identity_sha256: str
+    workspace_device: int
+    workspace_inode: int
 
     def __post_init__(self) -> None:
         if (
@@ -292,6 +296,10 @@ class WorkspaceReadyRecordV5:
             or not self.lease_id
             or not re.fullmatch(r"[0-9a-f]{64}", self.lease_sha256)
             or not re.fullmatch(r"[0-9a-f]{64}", self.workspace_identity_sha256)
+            or type(self.workspace_device) is not int
+            or type(self.workspace_inode) is not int
+            or self.workspace_device < 0
+            or self.workspace_inode <= 0
         ):
             raise ValueError("workspace ready record is invalid")
 
@@ -308,6 +316,10 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         repository: LocalArtifactRepositoryV5,
         owner: WorkspaceOwnerV5,
     ) -> None:
+        if os.name != "nt":
+            raise RuntimeError(
+                "the concrete V5 Git workspace adapter requires Windows handle authority"
+            )
         if (
             type(roots) is not WorkspaceRootsV5
             or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
@@ -505,6 +517,7 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         if len(set(paths)) != len(paths):
             raise WorkspaceDriverBoundaryErrorV5("driver_failed")
         entries.sort(key=lambda item: "/".join(item[0]))
+        owned_directories: dict[tuple[str, ...], tuple[int, int]] = {(): target_identity}
         for parts, _mode in entries:
             relative = "/".join(parts)
             content = self._run_git(
@@ -513,12 +526,32 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
                 f"{self._source_commit}:{relative}",
             )
             try:
-                with acquire_directory_v5(
-                    target_root,
-                    parts[:-1],
-                    create=True,
-                    expected_root_identity=target_identity,
-                ) as parent:
+                with ExitStack() as stack:
+                    parent = stack.enter_context(
+                        acquire_absolute_directory_v5(
+                            target_root,
+                            expected_identity=target_identity,
+                        )
+                    )
+                    prefix: tuple[str, ...] = ()
+                    for part in parts[:-1]:
+                        child_prefix = (*prefix, part)
+                        expected = owned_directories.get(child_prefix)
+                        if expected is None:
+                            child = create_directory_in_directory_v5(parent, part)
+                            owned_directories[child_prefix] = child.identity
+                        else:
+                            child = acquire_directory_v5(
+                                parent.path,
+                                (part,),
+                                create=False,
+                                expected_root_identity=parent.identity,
+                            )
+                            if child.identity != expected:
+                                child.close()
+                                raise ValueError("workspace export directory identity changed")
+                        parent = stack.enter_context(child)
+                        prefix = child_prefix
                     write_new_regular_in_directory_v5(parent, parts[-1], content)
             except (OSError, ValueError):
                 raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
@@ -539,12 +572,11 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         destination_root = Path(destination_capability.path)
         if lease.workspace_root_identity_sha256 != workspace_root.root_identity_sha256:
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-        target = destination_root / lease.workspace_relative_path
         key = lease.lease_token_sha256
         with self._repository.adapter_state_transition(namespace="workspace", key=key):
             registered = self._active_record_unlocked(lease.payload.lease_id)
             if registered is None:
-                if self._retirement(key) is not None or _lstat_optional(target) is not None:
+                if self._retirement(key) is not None:
                     raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
                 self._repository.append_typed_state(
                     namespace="workspace-reservation",
@@ -563,69 +595,77 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
                 if opened is None:
                     raise WorkspaceDriverBoundaryErrorV5("driver_failed")
                 return opened
-            existing = _lstat_optional(target)
-            if existing is not None:
-                # A reservation without a ready/identity record cannot prove an
-                # existing name belongs to it.  Never infer ownership from a
-                # predictable path and delete a potentially foreign tree.
-                raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
             created_identity: tuple[int, int] | None = None
+            ready_persisted = False
             try:
-                with acquire_directory_v5(
+                with acquire_absolute_directory_v5(
                     destination_root,
-                    (lease.workspace_relative_path,),
-                    create=True,
-                    expected_root_identity=(
+                    expected_identity=(
                         destination_capability.device,
                         destination_capability.inode,
                     ),
-                ) as target_access:
-                    created_identity = target_access.identity
-                    if not directory_is_empty_v5(target_access):
-                        raise WorkspaceDriverBoundaryErrorV5("driver_failed")
-                    self._export_commit(source, target_access.path, target_access.identity)
-                    target_path = target_access.path
-                    target_info = target_path.lstat()
-                    if _metadata_identity(target_info) != target_access.identity:
-                        raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
+                ) as destination_access:
+                    try:
+                        target_access = create_directory_in_directory_v5(
+                            destination_access,
+                            lease.workspace_relative_path,
+                        )
+                    except FileExistsError:
+                        raise WorkspaceDriverBoundaryErrorV5("foreign_lease") from None
+                    with target_access:
+                        created_identity = target_access.identity
+                        if not directory_is_empty_v5(target_access):
+                            raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+                        self._export_commit(source, target_access.path, target_access.identity)
+                        target_path = target_access.path
+                        target_info = target_path.lstat()
+                        if _metadata_identity(target_info) != target_access.identity:
+                            raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
+                        identity = _directory_identity(
+                            target_path,
+                            target_info,
+                            lease_sha256=lease.sha256,
+                        )
+                        self._repository.append_typed_state(
+                            namespace="workspace-ready",
+                            key=key,
+                            value=WorkspaceReadyRecordV5(
+                                5,
+                                self.driver_identity_sha256,
+                                lease.payload.lease_id,
+                                lease.sha256,
+                                identity,
+                                target_access.identity[0],
+                                target_access.identity[1],
+                            ),
+                        )
+                        ready_persisted = True
+                opened = self._open_owned_unlocked(
+                    workspace_root=workspace_root,
+                    lease=lease,
+                    require_ready=True,
+                )
+                if opened is None:
+                    raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+                return opened
             except BaseException:
-                try:
-                    with acquire_absolute_directory_v5(
-                        destination_root,
-                        expected_identity=(
-                            destination_capability.device,
-                            destination_capability.inode,
-                        ),
-                    ) as destination_access:
-                        if created_identity is not None:
+                if created_identity is not None and not ready_persisted:
+                    try:
+                        with acquire_absolute_directory_v5(
+                            destination_root,
+                            expected_identity=(
+                                destination_capability.device,
+                                destination_capability.inode,
+                            ),
+                        ) as destination_access:
                             self._remove_exact_tree(
                                 destination_access,
                                 lease.workspace_relative_path,
                                 created_identity,
                             )
-                except (OSError, ValueError, WorkspaceDriverBoundaryErrorV5):
-                    pass
+                    except (OSError, ValueError, WorkspaceDriverBoundaryErrorV5):
+                        pass
                 raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
-            identity = _directory_identity(target_path, target_info, lease_sha256=lease.sha256)
-            self._repository.append_typed_state(
-                namespace="workspace-ready",
-                key=key,
-                value=WorkspaceReadyRecordV5(
-                    5,
-                    self.driver_identity_sha256,
-                    lease.payload.lease_id,
-                    lease.sha256,
-                    identity,
-                ),
-            )
-            opened = self._open_owned_unlocked(
-                workspace_root=workspace_root,
-                lease=lease,
-                require_ready=True,
-            )
-            if opened is None:
-                raise WorkspaceDriverBoundaryErrorV5("driver_failed")
-            return opened
 
     def _retirement(self, key: str) -> WorkspaceLeaseRetirementV5 | None:
         retirement = self._repository.load_typed_state(
@@ -718,12 +758,20 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             ) as target_access:
                 target = target_access.path
                 info = target.lstat()
-                if _metadata_identity(info) != target_access.identity or target.parent != root:
+                ready = self._ready(lease.lease_token_sha256)
+                if (
+                    _metadata_identity(info) != target_access.identity
+                    or target.parent != root
+                    or (
+                        ready is not None
+                        and target_access.identity
+                        != (ready.workspace_device, ready.workspace_inode)
+                    )
+                ):
                     raise ValueError("workspace target identity changed")
                 identity = _directory_identity(target, info, lease_sha256=lease.sha256)
         except (OSError, ValueError):
             raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
-        ready = self._ready(lease.lease_token_sha256)
         if require_ready and ready is None:
             raise WorkspaceDriverBoundaryErrorV5("driver_failed")
         if ready is not None and (

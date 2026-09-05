@@ -29,6 +29,7 @@ from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
 from core.pit_optimizer_v5.production_fs import (
     acquire_absolute_directory_v5,
     acquire_directory_v5,
+    create_directory_in_directory_v5,
     directory_child_absent_v5,
     directory_entry_names_v5,
     hash_regular_in_directory_v5,
@@ -368,26 +369,92 @@ class ExecutionPhaseRecordV5:
     schema_version: Literal[5]
     executor_identity_sha256: str
     command_sha256: str
-    phase: Literal["launch_claim", "created", "start_claim", "started"]
+    phase: Literal["launch_claim", "created", "start_claim", "started", "collected"]
     attestation_sha256: str | None
+    container_identity_sha256: str | None = None
+    lifecycle_status: Literal["created", "running", "exited"] | None = None
+    network_attestation_sha256: str | None = None
+    state_attestation_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if (
             self.schema_version != 5
             or re.fullmatch(r"[0-9a-f]{64}", self.executor_identity_sha256) is None
             or re.fullmatch(r"[0-9a-f]{64}", self.command_sha256) is None
-            or self.phase not in {"launch_claim", "created", "start_claim", "started"}
+            or self.phase not in {"launch_claim", "created", "start_claim", "started", "collected"}
             or (
                 self.attestation_sha256 is None
-                if self.phase in {"created", "started"}
+                if self.phase in {"created", "started", "collected"}
                 else self.attestation_sha256 is not None
             )
             or (
                 self.attestation_sha256 is not None
                 and re.fullmatch(r"[0-9a-f]{64}", self.attestation_sha256) is None
             )
+            or (
+                self.phase in {"launch_claim", "start_claim"}
+                and any(
+                    item is not None
+                    for item in (
+                        self.container_identity_sha256,
+                        self.lifecycle_status,
+                        self.network_attestation_sha256,
+                        self.state_attestation_sha256,
+                    )
+                )
+            )
+            or (
+                self.phase in {"created", "started", "collected"}
+                and (
+                    re.fullmatch(r"[0-9a-f]{64}", self.container_identity_sha256 or "")
+                    is None
+                    or re.fullmatch(r"[0-9a-f]{64}", self.network_attestation_sha256 or "")
+                    is None
+                    or re.fullmatch(r"[0-9a-f]{64}", self.state_attestation_sha256 or "")
+                    is None
+                    or self.lifecycle_status
+                    not in (
+                        {"created"}
+                        if self.phase == "created"
+                        else {"exited"}
+                        if self.phase == "collected"
+                        else {"running", "exited"}
+                    )
+                )
+            )
         ):
             raise ValueError("container execution phase is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionContainerIdentityRecordV5:
+    schema_version: Literal[5]
+    executor_identity_sha256: str
+    command_sha256: str
+    container_id: str
+    created_at: str
+    stable_attestation_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 5
+            or re.fullmatch(r"[0-9a-f]{64}", self.executor_identity_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.command_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.container_id) is None
+            or type(self.created_at) is not str
+            or len(self.created_at) > 128
+            or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z",
+                self.created_at,
+            )
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.stable_attestation_sha256) is None
+        ):
+            raise ValueError("container execution identity record is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,6 +561,18 @@ class _PinnedControlTransactionV5:
 
 
 @dataclass(frozen=True, slots=True)
+class _ContainerInspectionV5:
+    raw: dict[str, object]
+    container_id: str
+    created_at: str
+    stable_attestation_sha256: str
+    network_authority: dict[str, object]
+    network_attestation_sha256: str
+    state_authority: dict[str, object]
+    state_attestation_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ExecutionLeaseCapabilityV5:
     executor_identity_sha256: str
     command_sha256: str
@@ -517,6 +596,10 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         output_root: Path,
         repository: LocalArtifactRepositoryV5,
     ) -> None:
+        if os.name != "nt":
+            raise RuntimeError(
+                "the concrete V5 sandbox mount adapter requires Windows handle authority"
+            )
         if (
             type(manifest) is not CampaignManifestV5
             or type(evaluator_contract) is not EvaluatorContractV5
@@ -1033,6 +1116,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         control_root: Path,
         repository: LocalArtifactRepositoryV5,
     ) -> None:
+        if os.name != "nt":
+            raise RuntimeError(
+                "the concrete V5 Docker executor requires Windows handle authority"
+            )
         if (
             type(manifest) is not CampaignManifestV5
             or type(sandbox_profile) is not SandboxProfileV5
@@ -1159,6 +1246,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "--memory-swap",
             f"{self._profile.memory_limit_mib}m",
             "--no-healthcheck",
+            "--stop-signal",
+            "SIGTERM",
+            "--stop-timeout",
+            "10",
             "--privileged=false",
             "--ipc",
             "private",
@@ -1324,7 +1415,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     def _phase(
         self,
         command_sha256: str,
-        phase: Literal["launch_claim", "created", "start_claim", "started"],
+        phase: Literal["launch_claim", "created", "start_claim", "started", "collected"],
     ) -> ExecutionPhaseRecordV5 | None:
         record = self._repository.load_typed_state(
             namespace=f"container-{phase.replace('_', '-')}",
@@ -1342,8 +1433,13 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     def _append_phase(
         self,
         command_sha256: str,
-        phase: Literal["launch_claim", "created", "start_claim", "started"],
+        phase: Literal["launch_claim", "created", "start_claim", "started", "collected"],
         attestation_sha256: str | None = None,
+        *,
+        container_identity_sha256: str | None = None,
+        lifecycle_status: Literal["created", "running", "exited"] | None = None,
+        network_attestation_sha256: str | None = None,
+        state_attestation_sha256: str | None = None,
     ) -> ExecutionPhaseRecordV5:
         record = ExecutionPhaseRecordV5(
             5,
@@ -1351,6 +1447,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             command_sha256,
             phase,
             attestation_sha256,
+            container_identity_sha256,
+            lifecycle_status,
+            network_attestation_sha256,
+            state_attestation_sha256,
         )
         self._repository.append_typed_state(
             namespace=f"container-{phase.replace('_', '-')}",
@@ -1358,6 +1458,46 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             value=record,
         )
         return record
+
+    def _container_identity(
+        self,
+        command_sha256: str,
+    ) -> ExecutionContainerIdentityRecordV5 | None:
+        record = self._repository.load_typed_state(
+            namespace="container-identity",
+            key=command_sha256,
+            value_type=ExecutionContainerIdentityRecordV5,
+        )
+        if record is not None and (
+            record.executor_identity_sha256 != self.executor_identity_sha256
+            or record.command_sha256 != command_sha256
+        ):
+            raise ValueError("container identity record is foreign")
+        return record
+
+    def _persist_container_identity(
+        self,
+        reservation: ExecutionReservationRecordV5,
+        inspection: _ContainerInspectionV5,
+    ) -> ExecutionContainerIdentityRecordV5:
+        expected = ExecutionContainerIdentityRecordV5(
+            5,
+            self.executor_identity_sha256,
+            reservation.command_sha256,
+            inspection.container_id,
+            inspection.created_at,
+            inspection.stable_attestation_sha256,
+        )
+        existing = self._container_identity(reservation.command_sha256)
+        if existing is None:
+            self._repository.append_typed_state(
+                namespace="container-identity",
+                key=reservation.command_sha256,
+                value=expected,
+            )
+        elif existing != expected:
+            raise ValueError("container identity changed")
+        return expected
 
     def _control_record(
         self,
@@ -1417,12 +1557,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             key=reservation.command_sha256,
             value_type=ExecutionControlRecordV5,
         )
-        existing = _lstat_optional(target)
-        if existing is None and ready is not None:
-            raise ValueError("container control directory disappeared")
-        if existing is not None and ready is None:
-            raise ValueError("container control directory predates durable authority")
         created_identity: tuple[int, int] | None = None
+        ready_persisted = ready is not None
         try:
             with ExitStack() as stack:
                 root = stack.enter_context(
@@ -1434,27 +1570,40 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         ),
                     )
                 )
-                target_access = stack.enter_context(
-                    acquire_directory_v5(
-                        root.path,
-                        (reservation.control_relative_path,),
-                        create=existing is None,
-                        expected_root_identity=root.identity,
-                    )
-                )
-                if existing is None:
+                if ready is None:
+                    try:
+                        target_access = stack.enter_context(
+                            create_directory_in_directory_v5(
+                                root,
+                                reservation.control_relative_path,
+                            )
+                        )
+                    except FileExistsError:
+                        raise ValueError(
+                            "container control directory predates durable authority"
+                        ) from None
                     created_identity = target_access.identity
-                children = {
-                    name: stack.enter_context(
+                else:
+                    target_access = stack.enter_context(
                         acquire_directory_v5(
-                            target_access.path,
-                            (name,),
-                            create=ready is None,
-                            expected_root_identity=target_access.identity,
+                            root.path,
+                            (reservation.control_relative_path,),
+                            create=False,
+                            expected_root_identity=root.identity,
                         )
                     )
-                    for name in _CONTROL_CHILDREN_V5
-                }
+                children = {}
+                for name in _CONTROL_CHILDREN_V5:
+                    if ready is None:
+                        child = create_directory_in_directory_v5(target_access, name)
+                    else:
+                        child = acquire_directory_v5(
+                            target_access.path,
+                            (name,),
+                            create=False,
+                            expected_root_identity=target_access.identity,
+                        )
+                    children[name] = stack.enter_context(child)
                 config = children["config"]
                 try:
                     config_stream, config_info = open_regular_in_directory_v5(
@@ -1502,10 +1651,11 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         key=reservation.command_sha256,
                         value=expected,
                     )
+                    ready_persisted = True
                 elif ready != expected:
                     raise ValueError("container control directory is foreign")
         except (OSError, ValueError):
-            if created_identity is not None:
+            if created_identity is not None and not ready_persisted:
                 try:
                     with acquire_absolute_directory_v5(
                         self._control_root,
@@ -1719,7 +1869,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     def _inspect_image(
         self,
         transaction: _PinnedControlTransactionV5,
-    ) -> tuple[str, tuple[str, ...]]:
+    ) -> tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]]:
         result = self._control(
             transaction,
             ("image", "inspect", self._profile.image_reference),
@@ -1734,6 +1884,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             repo_digests = item["RepoDigests"]
             image_config = item["Config"]
             image_environment = image_config["Env"]
+            image_labels = image_config.get("Labels")
         except (json.JSONDecodeError, IndexError, KeyError, TypeError):
             raise ValueError("sandbox image inspection is malformed") from None
         if (
@@ -1749,9 +1900,25 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             )
             or len({value.split("=", 1)[0] for value in image_environment})
             != len(image_environment)
+            or image_labels is not None
+            and (
+                type(image_labels) is not dict
+                or any(
+                    type(key) is not str
+                    or not key
+                    or "\x00" in key
+                    or type(value) is not str
+                    or "\x00" in value
+                    for key, value in image_labels.items()
+                )
+            )
         ):
             raise ValueError("sandbox image differs from its immutable authority")
-        return image_id, tuple(image_environment)
+        return (
+            image_id,
+            tuple(image_environment),
+            tuple(sorted((image_labels or {}).items())),
+        )
 
     @staticmethod
     def _closed_config_authority(
@@ -1784,29 +1951,17 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "Volumes": None,
             "WorkingDir": "/pit/source",
             "Entrypoint": ["python"],
+            "NetworkDisabled": False,
+            "MacAddress": "",
             "OnBuild": None,
             "Labels": expected_labels,
-            "StopSignal": "",
-            "StopTimeout": None,
+            "StopSignal": "SIGTERM",
+            "StopTimeout": 10,
             "Shell": None,
         }
-        optional_defaults = {
-            "ExposedPorts",
-            "ArgsEscaped",
-            "Volumes",
-            "OnBuild",
-            "StopSignal",
-            "StopTimeout",
-            "Shell",
-        }
-        if set(config) - set(expected) or any(
-            key not in config and key not in optional_defaults for key in expected
-        ):
+        if set(config) != set(expected):
             raise ValueError("container config contains an open execution field")
-        normalized = {
-            key: config[key] if key in config else value
-            for key, value in expected.items()
-        }
+        normalized = {key: config[key] for key in expected}
         if normalized != expected:
             raise ValueError("container config differs from executor authority")
         return normalized
@@ -2004,18 +2159,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "Ulimits",
         }
         nullable_maps = {"PortBindings", "Sysctls", "StorageOpt", "Annotations"}
-        optional_defaults = {
-            "CgroupnsMode",
-            "ConsoleSize",
-            "DeviceCgroupRules",
-            "Init",
-            "KernelMemory",
-            "KernelMemoryTCP",
-            "Annotations",
-        }
-        if set(host) - set(expected) or any(
-            key not in host and key not in optional_defaults for key in expected
-        ):
+        if set(host) != set(expected):
             raise ValueError("container HostConfig contains an open execution field")
         normalized: dict[str, object] = {}
         for key, expected_value in expected.items():
@@ -2057,8 +2201,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "MacAddress",
             "Networks",
         }
-        required = allowed - {"Bridge", "HairpinMode", "LinkLocalIPv6Address", "LinkLocalIPv6PrefixLen"}
-        if set(network) - allowed or not required.issubset(network):
+        if set(network) != allowed:
             raise ValueError("container NetworkSettings contains an open execution field")
         dynamic_id = network.get("SandboxID")
         sandbox_key = network.get("SandboxKey")
@@ -2089,12 +2232,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "GlobalIPv6PrefixLen",
             "DNSNames",
         }
-        if type(none_network) is not dict or set(none_network) - none_allowed:
+        if type(none_network) is not dict or set(none_network) != none_allowed:
             raise ValueError("container none-network fields are open or malformed")
         for key in ("NetworkID", "EndpointID"):
             value = none_network.get(key, "")
             if type(value) is not str or (value and re.fullmatch(r"[0-9a-f]{64}", value) is None):
                 raise ValueError("container none-network identity is malformed")
+        if bool(none_network["NetworkID"]) is not bool(none_network["EndpointID"]):
+            raise ValueError("container none-network identity is incomplete")
         empty_values = {
             "IPAMConfig": {},
             "Links": [],
@@ -2139,15 +2284,77 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 value = type(expected)()
             if value != expected:
                 raise ValueError("container NetworkSettings exposes connectivity")
+        if bool(dynamic_id) is not bool(sandbox_key) or (sandbox_key and len(sandbox_key) > 4096):
+            raise ValueError("container network namespace identity is incomplete")
+        normalized_none = {
+            "IPAMConfig": none_network["IPAMConfig"] or {},
+            "Links": none_network["Links"] or [],
+            "Aliases": none_network["Aliases"] or [],
+            "MacAddress": none_network["MacAddress"],
+            "DriverOpts": none_network["DriverOpts"] or {},
+            "GwPriority": none_network["GwPriority"],
+            "NetworkID": none_network["NetworkID"],
+            "EndpointID": none_network["EndpointID"],
+            "Gateway": none_network["Gateway"],
+            "IPAddress": none_network["IPAddress"],
+            "IPPrefixLen": none_network["IPPrefixLen"],
+            "IPv6Gateway": none_network["IPv6Gateway"],
+            "GlobalIPv6Address": none_network["GlobalIPv6Address"],
+            "GlobalIPv6PrefixLen": none_network["GlobalIPv6PrefixLen"],
+            "DNSNames": none_network["DNSNames"] or [],
+        }
         return {
-            "mode": "none",
-            "ports": {},
-            "addresses": (),
-            "aliases": (),
+            "Bridge": network["Bridge"],
+            "SandboxID": dynamic_id,
+            "SandboxKey": sandbox_key,
+            "Ports": network["Ports"] or {},
+            "HairpinMode": network["HairpinMode"],
+            "LinkLocalIPv6Address": network["LinkLocalIPv6Address"],
+            "LinkLocalIPv6PrefixLen": network["LinkLocalIPv6PrefixLen"],
+            "SecondaryIPAddresses": network["SecondaryIPAddresses"] or [],
+            "SecondaryIPv6Addresses": network["SecondaryIPv6Addresses"] or [],
+            "EndpointID": network["EndpointID"],
+            "Gateway": network["Gateway"],
+            "GlobalIPv6Address": network["GlobalIPv6Address"],
+            "GlobalIPv6PrefixLen": network["GlobalIPv6PrefixLen"],
+            "IPAddress": network["IPAddress"],
+            "IPPrefixLen": network["IPPrefixLen"],
+            "IPv6Gateway": network["IPv6Gateway"],
+            "MacAddress": network["MacAddress"],
+            "Networks": {"none": normalized_none},
         }
 
     @staticmethod
-    def _closed_state(state: object) -> None:
+    def _network_lifecycle(
+        authority: dict[str, object],
+        status: Literal["created", "running", "exited"],
+    ) -> Literal["empty", "private"]:
+        none_network = authority["Networks"]
+        assert type(none_network) is dict
+        none_authority = none_network["none"]
+        assert type(none_authority) is dict
+        values = (
+            authority["SandboxID"],
+            authority["SandboxKey"],
+            none_authority["NetworkID"],
+            none_authority["EndpointID"],
+        )
+        empty = all(value == "" for value in values)
+        private = all(type(value) is str and value != "" for value in values)
+        if status == "created" and not empty:
+            raise ValueError("created container unexpectedly owns a network namespace")
+        if status == "running" and not private:
+            raise ValueError("running container lacks its private none-network namespace")
+        if status == "exited" and not (empty or private):
+            raise ValueError("exited container network namespace transition is incomplete")
+        return "empty" if empty else "private"
+
+    @staticmethod
+    def _closed_state(
+        state: object,
+        *,
+        allowed_statuses: tuple[Literal["created", "running", "exited"], ...],
+    ) -> dict[str, object]:
         expected_keys = {
             "Status",
             "Running",
@@ -2165,14 +2372,15 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             raise ValueError("container State contains an open execution field")
         status = state["Status"]
         if (
-            status not in {"created", "running", "exited", "dead", "removing"}
+            type(allowed_statuses) is not tuple
+            or not allowed_statuses
+            or status not in allowed_statuses
             or type(state["Running"]) is not bool
             or state["Running"] is not (status == "running")
             or state["Paused"] is not False
             or state["Restarting"] is not False
-            or type(state["OOMKilled"]) is not bool
-            or type(state["Dead"]) is not bool
-            or state["Dead"] is not (status == "dead")
+            or state["OOMKilled"] is not False
+            or state["Dead"] is not False
             or type(state["Pid"]) is not int
             or state["Pid"] < 0
             or type(state["ExitCode"]) is not int
@@ -2182,8 +2390,31 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 or len(state[key]) > 4096
                 for key in ("Error", "StartedAt", "FinishedAt")
             )
+            or state["Error"] != ""
         ):
             raise ValueError("container State differs from the closed lifecycle")
+        zero_time = "0001-01-01T00:00:00Z"
+        if status == "created" and (
+            state["Pid"] != 0
+            or state["ExitCode"] != 0
+            or state["StartedAt"] != zero_time
+            or state["FinishedAt"] != zero_time
+        ):
+            raise ValueError("container created state differs from the closed lifecycle")
+        if status == "running" and (
+            state["Pid"] <= 0
+            or state["ExitCode"] != 0
+            or state["StartedAt"] == zero_time
+            or state["FinishedAt"] != zero_time
+        ):
+            raise ValueError("container running state differs from the closed lifecycle")
+        if status == "exited" and (
+            state["Pid"] != 0
+            or state["StartedAt"] == zero_time
+            or state["FinishedAt"] == zero_time
+        ):
+            raise ValueError("container exited state differs from the closed lifecycle")
+        return {key: state[key] for key in sorted(expected_keys)}
 
     @staticmethod
     def _closed_resolved_mount_authority(
@@ -2220,39 +2451,178 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             raise ValueError("container resolved mounts differ from executor authority")
         return tuple(sorted(actual))
 
+    @staticmethod
+    def _closed_top_level_authority(
+        item: dict[str, object],
+        *,
+        container_name: str,
+        container_id: str,
+        image_id: str,
+        expected_command: list[str],
+    ) -> dict[str, object]:
+        required = {
+            "Id",
+            "Created",
+            "Path",
+            "Args",
+            "State",
+            "Image",
+            "ResolvConfPath",
+            "HostnamePath",
+            "HostsPath",
+            "LogPath",
+            "Name",
+            "RestartCount",
+            "Driver",
+            "Platform",
+            "MountLabel",
+            "ProcessLabel",
+            "AppArmorProfile",
+            "ExecIDs",
+            "HostConfig",
+            "GraphDriver",
+            "Mounts",
+            "Config",
+            "NetworkSettings",
+        }
+        optional = {"SizeRw", "SizeRootFs", "ImageManifestDescriptor"}
+        if not required.issubset(item) or set(item) - required - optional:
+            raise ValueError("container inspection contains an open top-level field")
+        created_at = item["Created"]
+        driver = item["Driver"]
+        graph = item["GraphDriver"]
+        if (
+            item["Id"] != container_id
+            or item["Name"] != f"/{container_name}"
+            or item["Image"] != image_id
+            or item["Path"] != "python"
+            or item["Args"] != expected_command
+            or type(created_at) is not str
+            or len(created_at) > 128
+            or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z",
+                created_at,
+            )
+            is None
+            or item["RestartCount"] != 0
+            or type(driver) is not str
+            or not driver
+            or len(driver) > 128
+            or item["Platform"] != "linux"
+            or item["LogPath"] != ""
+            or item["ExecIDs"] is not None
+            and item["ExecIDs"] != []
+        ):
+            raise ValueError("container top-level identity differs from executor authority")
+        if type(graph) is not dict or set(graph) != {"Data", "Name"}:
+            raise ValueError("container graph-driver authority is malformed")
+        graph_data = graph["Data"]
+        if (
+            graph["Name"] != driver
+            or type(graph_data) is not dict
+            or any(
+                type(key) is not str
+                or not key
+                or "\x00" in key
+                or type(value) is not str
+                or "\x00" in value
+                or len(value) > 4096
+                for key, value in graph_data.items()
+            )
+        ):
+            raise ValueError("container graph-driver authority differs")
+        engine_paths = {}
+        for key in ("ResolvConfPath", "HostnamePath", "HostsPath"):
+            value = item[key]
+            if (
+                type(value) is not str
+                or not value
+                or "\x00" in value
+                or len(value) > 4096
+                or container_id not in value.casefold()
+            ):
+                raise ValueError("container engine path differs from exact identity")
+            engine_paths[key] = value
+        security_labels = {}
+        for key in ("MountLabel", "ProcessLabel", "AppArmorProfile"):
+            value = item[key]
+            if type(value) is not str or "\x00" in value or len(value) > 4096:
+                raise ValueError("container security label is malformed")
+            security_labels[key] = value
+        if security_labels["AppArmorProfile"] not in {"", "docker-default"}:
+            raise ValueError("container AppArmor profile is outside closed authority")
+        size_authority = {}
+        for key in ("SizeRw", "SizeRootFs"):
+            value = item.get(key)
+            if value not in {None, 0}:
+                raise ValueError("container writable-layer size differs from read-only authority")
+            size_authority[key] = value
+        manifest_descriptor = item.get("ImageManifestDescriptor")
+        if manifest_descriptor is not None and type(manifest_descriptor) is not dict:
+            raise ValueError("container image manifest descriptor is malformed")
+        return {
+            "Id": container_id,
+            "Created": created_at,
+            "Path": "python",
+            "Args": expected_command,
+            "Image": image_id,
+            "Name": f"/{container_name}",
+            "RestartCount": 0,
+            "Driver": driver,
+            "Platform": "linux",
+            "EnginePaths": engine_paths,
+            "SecurityLabels": security_labels,
+            "ExecIDs": (),
+            "GraphDriver": {"Name": driver, "Data": graph_data},
+            "Sizes": size_authority,
+            "ImageManifestDescriptor": manifest_descriptor,
+        }
+
     def _inspect_container(
         self,
         *,
         transaction: _PinnedControlTransactionV5,
         reservation: ExecutionReservationRecordV5,
-        image_authority: tuple[str, tuple[str, ...]],
-    ) -> tuple[dict[str, object], str] | None:
+        image_authority: tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]],
+        container_id: str | None,
+        allowed_statuses: tuple[Literal["created", "running", "exited"], ...],
+    ) -> _ContainerInspectionV5 | None:
         if transaction.command_sha256 != reservation.command_sha256:
             raise ValueError("container inspection transaction is foreign")
+        if container_id is not None and re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+            raise ValueError("container inspection identity is invalid")
+        reference = reservation.container_name if container_id is None else container_id
         result = self._control(
             transaction,
-            ("inspect", reservation.container_name),
+            ("inspect", reference),
             timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
         )
         if not self._successful(result):
+            field = "{{.Names}}" if container_id is None else "{{.ID}}"
+            filter_value = (
+                f"name=^{reservation.container_name}$"
+                if container_id is None
+                else f"id={container_id}"
+            )
             listing = self._control(
                 transaction,
                 (
                     "container",
                     "ls",
                     "--all",
+                    "--no-trunc",
                     "--format",
-                    "{{.Names}}",
+                    field,
                     "--filter",
-                    f"name=^{reservation.container_name}$",
+                    filter_value,
                 ),
                 timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
                 output_limit=64 * 1024,
             )
             if not self._successful(listing):
                 raise ValueError("container absence could not be proven")
-            names = tuple(line.strip() for line in listing.stdout.splitlines() if line.strip())
-            if reservation.container_name in names:
+            observed = tuple(line.strip() for line in listing.stdout.splitlines() if line.strip())
+            if observed:
                 raise ValueError("named container could not be authenticated")
             return None
         try:
@@ -2264,23 +2634,33 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             state = item["State"]
         except (json.JSONDecodeError, IndexError, KeyError, TypeError):
             raise ValueError("container inspection is malformed") from None
-        expected_labels = {
+        pit_labels = {
             "pit-v5.executor": self.executor_identity_sha256,
             "pit-v5.command": reservation.command_sha256,
             "pit-v5.owner": self._owner.sha256,
         }
-        image_id, expected_environment = image_authority
+        image_id, expected_environment, image_labels = image_authority
+        expected_labels = dict(image_labels)
+        expected_labels.update(pit_labels)
         separator = reservation.command_argv.index("--")
         expected_command = list(reservation.command_argv[separator + 3 :])
         network = item.get("NetworkSettings") if type(item) is dict else None
+        observed_id = item.get("Id") if type(item) is dict else None
         if (
             type(item) is not dict
-            or item.get("Name") != f"/{reservation.container_name}"
-            or item.get("Image") != image_id
-            or item.get("Path") != "python"
-            or item.get("Args") != expected_command
+            or type(observed_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", observed_id) is None
+            or container_id is not None
+            and observed_id != container_id
         ):
             raise ValueError("container isolation differs from executor authority")
+        top_authority = self._closed_top_level_authority(
+            item,
+            container_name=reservation.container_name,
+            container_id=observed_id,
+            image_id=image_id,
+            expected_command=expected_command,
+        )
         config_authority = self._closed_config_authority(
             config,
             container_name=reservation.container_name,
@@ -2294,30 +2674,124 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             expected_mounts=reservation.expected_mounts,
         )
         network_authority = self._closed_network_authority(network)
-        self._closed_state(state)
+        state_authority = self._closed_state(state, allowed_statuses=allowed_statuses)
+        status = state_authority["Status"]
+        assert status in {"created", "running", "exited"}
+        self._network_lifecycle(network_authority, status)
         mount_authority = self._closed_resolved_mount_authority(
             mounts,
             reservation.expected_mounts,
         )
-        attestation = canonical_sha256_v5(
+        stable_attestation = canonical_sha256_v5(
             {
-                "name": item.get("Name"),
-                "image": item.get("Image"),
-                "path": item.get("Path"),
-                "arguments": item.get("Args"),
+                "top": top_authority,
                 "config": config_authority,
                 "host": host_authority,
-                "network": network_authority,
                 "mounts": mount_authority,
             }
         )
-        return item, attestation
+        return _ContainerInspectionV5(
+            item,
+            observed_id,
+            top_authority["Created"],  # type: ignore[arg-type]
+            stable_attestation,
+            network_authority,
+            canonical_sha256_v5(network_authority),
+            state_authority,
+            canonical_sha256_v5(state_authority),
+        )
+
+    @staticmethod
+    def _phase_attestation(
+        identity: ExecutionContainerIdentityRecordV5,
+        inspection: _ContainerInspectionV5,
+    ) -> str:
+        return canonical_sha256_v5(
+            {
+                "container_identity_sha256": identity.sha256,
+                "lifecycle": inspection.state_authority["Status"],
+                "network": inspection.network_authority,
+                "state": inspection.state_authority,
+            }
+        )
+
+    def _append_observed_phase(
+        self,
+        *,
+        command_sha256: str,
+        phase: Literal["created", "started", "collected"],
+        identity: ExecutionContainerIdentityRecordV5,
+        inspection: _ContainerInspectionV5,
+    ) -> ExecutionPhaseRecordV5:
+        status = inspection.state_authority["Status"]
+        assert status in {"created", "running", "exited"}
+        return self._append_phase(
+            command_sha256,
+            phase,
+            self._phase_attestation(identity, inspection),
+            container_identity_sha256=identity.sha256,
+            lifecycle_status=status,  # type: ignore[arg-type]
+            network_attestation_sha256=inspection.network_attestation_sha256,
+            state_attestation_sha256=inspection.state_attestation_sha256,
+        )
+
+    @staticmethod
+    def _require_stable_container_identity(
+        identity: ExecutionContainerIdentityRecordV5,
+        inspection: _ContainerInspectionV5,
+    ) -> None:
+        if (
+            inspection.container_id != identity.container_id
+            or inspection.created_at != identity.created_at
+            or inspection.stable_attestation_sha256 != identity.stable_attestation_sha256
+        ):
+            raise ValueError("container identity or stable isolation authority changed")
+
+    def _require_phase_transition(
+        self,
+        phase: ExecutionPhaseRecordV5,
+        identity: ExecutionContainerIdentityRecordV5,
+        inspection: _ContainerInspectionV5,
+        *,
+        permit_running_to_exited: bool,
+    ) -> None:
+        self._require_stable_container_identity(identity, inspection)
+        current_status = inspection.state_authority["Status"]
+        current_network = self._network_lifecycle(
+            inspection.network_authority,
+            current_status,  # type: ignore[arg-type]
+        )
+        if (
+            phase.container_identity_sha256 != identity.sha256
+            or phase.lifecycle_status is None
+            or phase.network_attestation_sha256 is None
+            or phase.state_attestation_sha256 is None
+        ):
+            raise ValueError("container phase identity is incomplete")
+        if current_status == phase.lifecycle_status:
+            if (
+                inspection.network_attestation_sha256 != phase.network_attestation_sha256
+                or inspection.state_attestation_sha256 != phase.state_attestation_sha256
+                or self._phase_attestation(identity, inspection) != phase.attestation_sha256
+            ):
+                raise ValueError("container phase authority changed")
+            return
+        if not (
+            permit_running_to_exited
+            and phase.lifecycle_status == "running"
+            and current_status == "exited"
+            and (
+                inspection.network_attestation_sha256 == phase.network_attestation_sha256
+                or current_network == "empty"
+            )
+        ):
+            raise ValueError("container lifecycle transition is outside authority")
 
     def start(self, reservation: ExecutionReservationV5) -> None:
         command = reservation.command
         record = self._authorize_reservation(reservation)
         with self._repository.adapter_state_transition(namespace="container-execution", key=command.sha256):
-            if self._terminal_record(command.sha256) is not None or self._phase(command.sha256, "started") is not None:
+            if self._terminal_record(command.sha256) is not None:
                 return
             launch_claim = self._phase(command.sha256, "launch_claim")
             launch_is_new = launch_claim is None
@@ -2329,12 +2803,37 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     image_authority = self._inspect_image(transaction)
                     with self._mount_factory.pinned_request(command.request):
                         created = self._phase(command.sha256, "created")
-                        inspection = self._inspect_container(
-                            transaction=transaction,
-                            reservation=record,
-                            image_authority=image_authority,
-                        )
-                        if created is None and inspection is None and launch_is_new:
+                        started = self._phase(command.sha256, "started")
+                        identity = self._container_identity(command.sha256)
+                        if (created is None) is not (identity is None):
+                            if identity is None:
+                                raise ValueError("created phase lacks exact container identity")
+                        if identity is None:
+                            inspection = self._inspect_container(
+                                transaction=transaction,
+                                reservation=record,
+                                image_authority=image_authority,
+                                container_id=None,
+                                allowed_statuses=("created",),
+                            )
+                            if inspection is not None and launch_is_new:
+                                raise ValueError("container name predates exact launch authority")
+                        else:
+                            inspection = self._inspect_container(
+                                transaction=transaction,
+                                reservation=record,
+                                image_authority=image_authority,
+                                container_id=identity.container_id,
+                                allowed_statuses=("created", "running", "exited"),
+                            )
+                            if inspection is None:
+                                raise ValueError("owned container identity disappeared")
+                            self._require_stable_container_identity(identity, inspection)
+                        if created is not None and created.container_identity_sha256 != identity.sha256:
+                            raise ValueError("created phase binds a foreign container identity")
+                        if started is not None and started.container_identity_sha256 != identity.sha256:
+                            raise ValueError("started phase binds a foreign container identity")
+                        if identity is None and inspection is None and launch_is_new:
                             runtime = self._runtime_argv(command)
                             result = self._control(
                                 transaction,
@@ -2342,37 +2841,65 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                                 timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
                                 output_limit=64 * 1024,
                             )
+                            created_id = result.stdout.strip() if self._successful(result) else ""
+                            if created_id and re.fullmatch(r"[0-9a-f]{64}", created_id) is None:
+                                raise ValueError("Docker create returned a malformed container identity")
                             inspection = self._inspect_container(
                                 transaction=transaction,
                                 reservation=record,
                                 image_authority=image_authority,
+                                container_id=created_id or None,
+                                allowed_statuses=("created",),
                             )
                             if not self._successful(result) and inspection is None:
                                 self._persist_failure(command)
                                 return
-                        if created is None:
-                            if inspection is None:
-                                self._persist_failure(command)
-                                return
-                            created = self._append_phase(
-                                command.sha256,
-                                "created",
-                                inspection[1],
-                            )
-                        elif inspection is None or created.attestation_sha256 != inspection[1]:
+                            if inspection is not None and created_id and inspection.container_id != created_id:
+                                raise ValueError("Docker create identity differs from exact inspection")
+                        elif identity is None and inspection is None:
                             self._persist_failure(command)
+                            return
+                        if identity is None:
+                            assert inspection is not None
+                            identity = self._persist_container_identity(record, inspection)
+                        if created is None:
+                            assert inspection is not None
+                            created = self._append_observed_phase(
+                                command_sha256=command.sha256,
+                                phase="created",
+                                identity=identity,
+                                inspection=inspection,
+                            )
+                        elif inspection is None:
+                            raise ValueError("created container is absent")
+                        elif inspection.state_authority["Status"] == "created":
+                            self._require_phase_transition(
+                                created,
+                                identity,
+                                inspection,
+                                permit_running_to_exited=False,
+                            )
+                        else:
+                            self._require_stable_container_identity(identity, inspection)
+                        if started is not None:
+                            assert inspection is not None
+                            self._require_phase_transition(
+                                started,
+                                identity,
+                                inspection,
+                                permit_running_to_exited=True,
+                            )
                             return
                         start_claim = self._phase(command.sha256, "start_claim")
                         start_is_new = start_claim is None
                         if start_is_new:
                             self._append_phase(command.sha256, "start_claim")
-                        state = inspection[0]["State"]
-                        assert type(state) is dict
-                        status = state.get("Status")
+                        assert inspection is not None
+                        status = inspection.state_authority["Status"]
                         if status == "created" and start_is_new:
                             result = self._control(
                                 transaction,
-                                ("start", record.container_name),
+                                ("start", identity.container_id),
                                 timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
                                 output_limit=64 * 1024,
                             )
@@ -2380,19 +2907,30 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                                 transaction=transaction,
                                 reservation=record,
                                 image_authority=image_authority,
+                                container_id=identity.container_id,
+                                allowed_statuses=("running", "exited"),
                             )
                             if not self._successful(result) and inspection is None:
                                 self._persist_failure(command)
                                 return
+                        elif status == "created":
+                            self._persist_failure(command)
+                            return
+                        elif start_is_new:
+                            raise ValueError("container started outside exact start authority")
                         if inspection is None:
                             self._persist_failure(command)
                             return
-                        state = inspection[0]["State"]
-                        assert type(state) is dict
-                        if state.get("Status") not in {"running", "exited"}:
+                        self._require_stable_container_identity(identity, inspection)
+                        if inspection.state_authority["Status"] not in {"running", "exited"}:
                             self._persist_failure(command)
                             return
-                        self._append_phase(command.sha256, "started", inspection[1])
+                        self._append_observed_phase(
+                            command_sha256=command.sha256,
+                            phase="started",
+                            identity=identity,
+                            inspection=inspection,
+                        )
             except Exception:
                 self._persist_failure(command)
 
@@ -2521,7 +3059,15 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             terminal = self._terminal_record(command.sha256)
             if terminal is not None:
                 return self._result_from_terminal(command, terminal)
-            if self._phase(command.sha256, "started") is None:
+            created = self._phase(command.sha256, "created")
+            started = self._phase(command.sha256, "started")
+            identity = self._container_identity(command.sha256)
+            if created is None or started is None or identity is None:
+                return self._result_from_terminal(command, self._persist_failure(command))
+            if (
+                created.container_identity_sha256 != identity.sha256
+                or started.container_identity_sha256 != identity.sha256
+            ):
                 return self._result_from_terminal(command, self._persist_failure(command))
             self._ensure_control(record)
             try:
@@ -2531,25 +3077,72 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         transaction=transaction,
                         reservation=record,
                         image_authority=image_authority,
+                        container_id=identity.container_id,
+                        allowed_statuses=("running", "exited"),
                     )
                     if inspection is None:
                         return self._result_from_terminal(command, self._persist_failure(command))
-                    state = inspection[0]["State"]
-                    assert type(state) is dict
-                    if state.get("Running") is True:
+                    self._require_stable_container_identity(identity, inspection)
+                    self._require_phase_transition(
+                        started,
+                        identity,
+                        inspection,
+                        permit_running_to_exited=True,
+                    )
+                    waited_exit_code: int | None = None
+                    if inspection.state_authority["Status"] == "running":
                         waited = self._control(
                             transaction,
-                            ("wait", record.container_name),
+                            ("wait", identity.container_id),
                             timeout=remaining_timeout_seconds,
                             output_limit=64 * 1024,
                         )
                         if getattr(waited, "timed_out", None) is True:
-                            self._control(
+                            stopped = self._control(
                                 transaction,
-                                ("stop", "--time", "0", record.container_name),
+                                ("stop", "--time", "0", identity.container_id),
                                 timeout=float(self._manifest.resources.cleanup_timeout_seconds),
                                 output_limit=64 * 1024,
                             )
+                            if not self._successful(stopped):
+                                return self._result_from_terminal(
+                                    command,
+                                    self._persist_failure(command),
+                                )
+                            inspection = self._inspect_container(
+                                transaction=transaction,
+                                reservation=record,
+                                image_authority=image_authority,
+                                container_id=identity.container_id,
+                                allowed_statuses=("exited",),
+                            )
+                            if inspection is None:
+                                return self._result_from_terminal(
+                                    command,
+                                    self._persist_failure(command),
+                                )
+                            self._require_stable_container_identity(identity, inspection)
+                            self._require_phase_transition(
+                                started,
+                                identity,
+                                inspection,
+                                permit_running_to_exited=True,
+                            )
+                            collected = self._phase(command.sha256, "collected")
+                            if collected is None:
+                                self._append_observed_phase(
+                                    command_sha256=command.sha256,
+                                    phase="collected",
+                                    identity=identity,
+                                    inspection=inspection,
+                                )
+                            else:
+                                self._require_phase_transition(
+                                    collected,
+                                    identity,
+                                    inspection,
+                                    permit_running_to_exited=False,
+                                )
                             terminal = self._persist_terminal(
                                 command,
                                 status="timed_out",
@@ -2559,20 +3152,51 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             return self._result_from_terminal(command, terminal)
                         if not self._successful(waited):
                             return self._result_from_terminal(command, self._persist_failure(command))
+                        wait_lines = tuple(
+                            line.strip() for line in waited.stdout.splitlines() if line.strip()
+                        )
+                        if len(wait_lines) != 1 or re.fullmatch(r"-?[0-9]+", wait_lines[0]) is None:
+                            return self._result_from_terminal(command, self._persist_failure(command))
+                        waited_exit_code = int(wait_lines[0])
                         inspection = self._inspect_container(
                             transaction=transaction,
                             reservation=record,
                             image_authority=image_authority,
+                            container_id=identity.container_id,
+                            allowed_statuses=("exited",),
                         )
                         if inspection is None:
                             return self._result_from_terminal(command, self._persist_failure(command))
-                        state = inspection[0]["State"]
-                        assert type(state) is dict
-                    if state.get("Running") is True or state.get("Status") != "exited":
+                        self._require_stable_container_identity(identity, inspection)
+                        self._require_phase_transition(
+                            started,
+                            identity,
+                            inspection,
+                            permit_running_to_exited=True,
+                        )
+                    state = inspection.state_authority
+                    if state["Status"] != "exited":
                         return self._result_from_terminal(command, self._persist_failure(command))
-                    exit_code = state.get("ExitCode")
-                    if type(exit_code) is not int:
+                    exit_code = state["ExitCode"]
+                    if type(exit_code) is not int or (
+                        waited_exit_code is not None and waited_exit_code != exit_code
+                    ):
                         return self._result_from_terminal(command, self._persist_failure(command))
+                    collected = self._phase(command.sha256, "collected")
+                    if collected is None:
+                        self._append_observed_phase(
+                            command_sha256=command.sha256,
+                            phase="collected",
+                            identity=identity,
+                            inspection=inspection,
+                        )
+                    else:
+                        self._require_phase_transition(
+                            collected,
+                            identity,
+                            inspection,
+                            permit_running_to_exited=False,
+                        )
                     output = self._read_output(command) if exit_code == 0 else None
                     terminal = self._persist_terminal(
                         command,
@@ -2662,15 +3286,64 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 self._ensure_control(record)
                 with self._pinned_control_transaction(record) as transaction:
                     image_authority = self._inspect_image(transaction)
-                    inspection = self._inspect_container(
-                        transaction=transaction,
-                        reservation=record,
-                        image_authority=image_authority,
-                    )
-                    if inspection is not None:
+                    identity = self._container_identity(command_sha256)
+                    created = self._phase(command_sha256, "created")
+                    started = self._phase(command_sha256, "started")
+                    if identity is None:
+                        if created is not None or started is not None:
+                            raise ValueError("container phase exists without exact identity")
+                        inspection = self._inspect_container(
+                            transaction=transaction,
+                            reservation=record,
+                            image_authority=image_authority,
+                            container_id=None,
+                            allowed_statuses=("created", "running", "exited"),
+                        )
+                        if inspection is not None:
+                            raise ValueError("container name exists without durable identity")
+                    else:
+                        if (
+                            created is not None
+                            and created.container_identity_sha256 != identity.sha256
+                            or started is not None
+                            and started.container_identity_sha256 != identity.sha256
+                        ):
+                            raise ValueError("container phase binds a foreign exact identity")
+                        inspection = self._inspect_container(
+                            transaction=transaction,
+                            reservation=record,
+                            image_authority=image_authority,
+                            container_id=identity.container_id,
+                            allowed_statuses=("created", "running", "exited"),
+                        )
+                    if identity is not None and inspection is not None:
+                        self._require_stable_container_identity(identity, inspection)
+                        if started is not None:
+                            self._require_phase_transition(
+                                started,
+                                identity,
+                                inspection,
+                                permit_running_to_exited=True,
+                            )
+                        elif created is not None:
+                            self._require_phase_transition(
+                                created,
+                                identity,
+                                inspection,
+                                permit_running_to_exited=False,
+                            )
+                        elif inspection.state_authority["Status"] == "created":
+                            self._append_observed_phase(
+                                command_sha256=command_sha256,
+                                phase="created",
+                                identity=identity,
+                                inspection=inspection,
+                            )
+                        else:
+                            raise ValueError("unphased container lifecycle is outside authority")
                         removed = self._control(
                             transaction,
-                            ("rm", "--force", record.container_name),
+                            ("rm", "--force", identity.container_id),
                             timeout=float(self._manifest.resources.cleanup_timeout_seconds),
                             output_limit=64 * 1024,
                         )
@@ -2680,8 +3353,18 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             transaction=transaction,
                             reservation=record,
                             image_authority=image_authority,
+                            container_id=identity.container_id,
+                            allowed_statuses=("created", "running", "exited"),
                         ) is not None:
                             raise ValueError("owned container remains after cleanup")
+                    if self._inspect_container(
+                        transaction=transaction,
+                        reservation=record,
+                        image_authority=image_authority,
+                        container_id=None,
+                        allowed_statuses=("created", "running", "exited"),
+                    ) is not None:
+                        raise ValueError("deterministic container name was replaced during cleanup")
                 self._repository.append_typed_state(
                     namespace="container-cleanup-container-absent",
                     key=command_sha256,
@@ -2754,6 +3437,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
 
 __all__ = [
     "ExecutionCleanupRecordV5",
+    "ExecutionContainerIdentityRecordV5",
     "ExecutionControlRecordV5",
     "ExecutionPhaseRecordV5",
     "ExecutionReservationRecordV5",
