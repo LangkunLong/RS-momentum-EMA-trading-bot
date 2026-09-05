@@ -97,6 +97,7 @@ class SandboxResourceManifestV5(Protocol):
 
     evaluation_cpu_limit: Decimal
     evaluation_memory_mib: int
+    evaluation_pid_limit: int
     evaluation_output_limit_bytes: int
 
 
@@ -569,6 +570,7 @@ class ResourceCapabilitiesV5:
     max_parallel_evaluations: int = 2
     evaluation_cpu_limit: Decimal = Decimal("1")
     evaluation_memory_mib: int = 1024
+    evaluation_pid_limit: int = 32
     evaluation_output_limit_bytes: int = 67_108_864
     policy_method_timeout_seconds: int = 1
     worker_startup_timeout_seconds: int = 30
@@ -720,6 +722,7 @@ class SandboxProfileV5:
     cpu_limit: Decimal
     memory_limit_mib: int
     output_limit_bytes: int
+    pid_limit: int = 32
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
@@ -742,6 +745,7 @@ class SandboxProfileV5:
             raise ValueError("sandbox CPU limit must be positive")
         _count(self.memory_limit_mib, "sandbox memory limit", positive=True)
         _count(self.output_limit_bytes, "sandbox output limit", positive=True)
+        _count(self.pid_limit, "sandbox PID limit", positive=True)
 
     @property
     def image_reference(self) -> str:
@@ -776,6 +780,7 @@ def sandbox_profile_from_manifest_v5(
         cpu_limit=resources.evaluation_cpu_limit,
         memory_limit_mib=resources.evaluation_memory_mib,
         output_limit_bytes=resources.evaluation_output_limit_bytes,
+        pid_limit=resources.evaluation_pid_limit,
     )
 
 
@@ -789,12 +794,23 @@ def validate_sandbox_profile_resources_v5(profile: SandboxProfileV5, resources: 
             resources.evaluation_cpu_limit,
             resources.evaluation_memory_mib,
             resources.evaluation_output_limit_bytes,
+            resources.evaluation_pid_limit,
         )
     except AttributeError as exc:
         raise ValueError("campaign resource manifest is incomplete") from exc
-    if type(expected[0]) is not Decimal or type(expected[1]) is not int or type(expected[2]) is not int:
+    if (
+        type(expected[0]) is not Decimal
+        or type(expected[1]) is not int
+        or type(expected[2]) is not int
+        or type(expected[3]) is not int
+    ):
         raise ValueError("campaign resource manifest values are invalid")
-    actual = (profile.cpu_limit, profile.memory_limit_mib, profile.output_limit_bytes)
+    actual = (
+        profile.cpu_limit,
+        profile.memory_limit_mib,
+        profile.output_limit_bytes,
+        profile.pid_limit,
+    )
     if actual != expected:
         raise ValueError("sandbox resources differ from the campaign manifest")
 

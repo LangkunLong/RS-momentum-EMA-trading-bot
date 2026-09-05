@@ -589,6 +589,32 @@ class CandidateRuntimeV5(Protocol):
     ) -> EpisodeEvaluationV5: ...
 
 
+class CandidateLeaseRegistrarV5(Protocol):
+    def __call__(self, leases: tuple[OwnedLeaseV5, ...]) -> None: ...
+
+
+@runtime_checkable
+class LeaseAwareCandidateRuntimeV5(Protocol):
+    """Candidate evaluator that durably registers owned leases before evidence use."""
+
+    def evaluate_quick_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        *,
+        deadline: StageDeadlineV5,
+        register_leases: CandidateLeaseRegistrarV5,
+    ) -> PanelEvaluationV5: ...
+
+    def evaluate_episode_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        episode: EpisodePlanV5,
+        *,
+        deadline: StageDeadlineV5,
+        register_leases: CandidateLeaseRegistrarV5,
+    ) -> EpisodeEvaluationV5: ...
+
+
 @runtime_checkable
 class ExperimentRecordFactoryV5(Protocol):
     def build_records(
@@ -1571,7 +1597,14 @@ class _Runtime:
 
         quick_deadline = self._deadline("quick_evaluation", self.inputs.manifest.resources.quick_timeout_seconds)
         try:
-            quick = self.dependencies.candidates.evaluate_quick(materialized, deadline=quick_deadline)
+            if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
+                quick = self.dependencies.candidates.evaluate_quick_registered(
+                    materialized,
+                    deadline=quick_deadline,
+                    register_leases=self._register_leases,
+                )
+            else:
+                quick = self.dependencies.candidates.evaluate_quick(materialized, deadline=quick_deadline)
             self._validate_quick(quick, identity)
         except _RuntimeAbort:
             raise
@@ -1751,11 +1784,19 @@ class _Runtime:
                         self.inputs.manifest.resources.discovery_episode_timeout_seconds,
                     )
                     try:
-                        episode = self.dependencies.candidates.evaluate_episode(
-                            candidate.materialized,
-                            plan,
-                            deadline=deadline,
-                        )
+                        if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
+                            episode = self.dependencies.candidates.evaluate_episode_registered(
+                                candidate.materialized,
+                                plan,
+                                deadline=deadline,
+                                register_leases=self._register_leases,
+                            )
+                        else:
+                            episode = self.dependencies.candidates.evaluate_episode(
+                                candidate.materialized,
+                                plan,
+                                deadline=deadline,
+                            )
                         self._validate_episode(episode, plan, identity)
                     except _RuntimeAbort:
                         raise
@@ -2296,12 +2337,14 @@ def run_feedback_round_v5(
 __all__ = [
     "ArchiveReducerFactoryV5",
     "CandidateEvidenceV5",
+    "CandidateLeaseRegistrarV5",
     "CandidateRuntimeV5",
     "ExperimentRecordFactoryV5",
     "FeedbackRoundDependenciesV5",
     "FeedbackRoundInputV5",
     "FeedbackRoundResultV5",
     "MaterializedVariantV5",
+    "LeaseAwareCandidateRuntimeV5",
     "NoveltyResolutionV5",
     "NoveltyResolverV5",
     "OwnedCleanupV5",
