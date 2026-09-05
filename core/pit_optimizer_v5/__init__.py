@@ -59,7 +59,10 @@ from .evaluator import (
     SimulatorFactoryV5,
 )
 from .runtime import (
-    CandidateLeaseRegistrarV5,
+    CandidateExecutionAuthorityV5,
+    CandidateExecutionKeyV5,
+    CandidateExecutionPersistenceV5,
+    CandidateExecutionRegistrarV5,
     FeedbackRoundDependenciesV5,
     FeedbackRoundInputV5,
     FeedbackRoundResultV5,
@@ -124,7 +127,10 @@ __all__ = [
     "CandidateWorkerBindingV5",
     "CandidateWorkerFactoryV5",
     "CandidateBaseOperationsV5",
-    "CandidateLeaseRegistrarV5",
+    "CandidateExecutionAuthorityV5",
+    "CandidateExecutionKeyV5",
+    "CandidateExecutionPersistenceV5",
+    "CandidateExecutionRegistrarV5",
     "CriticArtifactV5",
     "CriticReviewV5",
     "ContainerExecutionResultV5",

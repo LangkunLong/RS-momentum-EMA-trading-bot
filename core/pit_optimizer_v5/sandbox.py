@@ -33,7 +33,9 @@ from core.pit_optimizer_v5.contracts import (
 from core.pit_optimizer_v5.memory import CleanupResultPayloadV5
 from core.pit_optimizer_v5.probes import SemanticFingerprintV5
 from core.pit_optimizer_v5.runtime import (
-    CandidateLeaseRegistrarV5,
+    CandidateExecutionAuthorityV5,
+    CandidateExecutionKeyV5,
+    CandidateExecutionRegistrarV5,
     CandidateRuntimeV5,
     FeedbackRoundInputV5,
     LeaseAwareCandidateRuntimeV5,
@@ -196,6 +198,7 @@ def derive_sandbox_mount_authorities_v5(
 class DockerPanelRequestV5:
     owner: WorkspaceOwnerV5
     manifest: CampaignManifestV5
+    execution_key: CandidateExecutionKeyV5
     policy_revision: PolicyRevisionIdentityV5
     evaluator_contract: EvaluatorContractV5
     sandbox_profile: SandboxProfileV5
@@ -209,6 +212,7 @@ class DockerPanelRequestV5:
         if (
             type(self.owner) is not WorkspaceOwnerV5
             or type(self.manifest) is not CampaignManifestV5
+            or type(self.execution_key) is not CandidateExecutionKeyV5
             or type(self.policy_revision) is not PolicyRevisionIdentityV5
             or type(self.evaluator_contract) is not EvaluatorContractV5
             or type(self.sandbox_profile) is not SandboxProfileV5
@@ -223,6 +227,11 @@ class DockerPanelRequestV5:
             or self.evaluator_contract.sandbox_profile_sha256 != self.sandbox_profile.sha256
         ):
             raise ValueError("Docker panel request differs from campaign authority")
+        if (self.execution_key.stage == "quick_evaluation" and self.panel.episode_ordinal is not None) or (
+            self.execution_key.stage == "discovery_evaluation"
+            and self.execution_key.episode_ordinal != self.panel.episode_ordinal
+        ):
+            raise ValueError("Docker panel execution key differs from its panel")
         validate_sandbox_profile_resources_v5(self.sandbox_profile, self.manifest.resources)
         declared = tuple(item.scenario_id for item in self.evaluator_contract.friction_grid)
         if self.scenario_ids not in {(self.evaluator_contract.selection_scenario_id,), declared}:
@@ -397,6 +406,8 @@ class DockerPanelOutcomeV5:
             raise ValueError("Docker panel outcome must contain exactly one result")
         if self.evaluation is not None and type(self.evaluation) is not PanelEvaluationV5:
             raise ValueError("Docker panel outcome evaluation is invalid")
+        if self.failure is not None and type(self.failure) is not SandboxFailureV5:
+            raise ValueError("Docker panel outcome failure is invalid")
 
 
 @runtime_checkable
@@ -405,12 +416,24 @@ class ContainerExecutorV5(Protocol):
 
     def execute(self, command: ContainerCommandV5) -> ContainerExecutionResultV5: ...
 
+    def recover(
+        self,
+        *,
+        request: DockerPanelRequestV5,
+        authority: CandidateExecutionAuthorityV5,
+        remaining_timeout_seconds: float,
+    ) -> ContainerExecutionResultV5 | None: ...
+
     def cleanup(self, *, owner: WorkspaceOwnerV5, leases: tuple[OwnedLeaseV5, ...]) -> CleanupResultPayloadV5: ...
 
 
 @runtime_checkable
 class RuntimeLeaseRegistrarV5(Protocol):
-    def register_leases(self, leases: tuple[OwnedLeaseV5, ...]) -> None: ...
+    def register_execution(
+        self,
+        authority: CandidateExecutionAuthorityV5,
+        leases: tuple[OwnedLeaseV5, ...],
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -636,13 +659,13 @@ class DockerPanelEvaluatorV5:
     @staticmethod
     def _bound_execution(
         request: DockerPanelRequestV5,
-        command: ContainerCommandV5,
+        command_sha256: str,
         result: ContainerExecutionResultV5,
     ) -> tuple[ExecutionLeaseV5, ...] | None:
         expected_output = request.output_mount.content_authority_sha256
         if (
             result.output.request_sha256 != request.sha256
-            or result.output.command_sha256 != command.sha256
+            or result.output.command_sha256 != command_sha256
             or result.output.output_mount_authority_sha256 != expected_output
             or tuple(item.role_kind for item in result.leases) != ("evaluator_process", "container")
         ):
@@ -651,7 +674,7 @@ class DockerPanelEvaluatorV5:
             owned = execution_lease.owned_lease
             if (
                 execution_lease.request_sha256 != request.sha256
-                or execution_lease.command_sha256 != command.sha256
+                or execution_lease.command_sha256 != command_sha256
                 or execution_lease.output_mount_authority_sha256 != expected_output
                 or owned.round_index != request.owner.round_index
                 or owned.payload.owner_campaign_id != request.owner.campaign_id
@@ -661,39 +684,29 @@ class DockerPanelEvaluatorV5:
         owned = tuple(item.owned_lease for item in result.leases)
         return result.leases if len({item.payload.lease_id for item in owned}) == len(owned) else None
 
-    def evaluate(
+    @staticmethod
+    def _execution_authority(
+        request: DockerPanelRequestV5,
+        command_sha256: str,
+        leases: tuple[ExecutionLeaseV5, ...],
+    ) -> CandidateExecutionAuthorityV5:
+        return CandidateExecutionAuthorityV5(
+            campaign_id=request.owner.campaign_id,
+            round_index=request.owner.round_index,
+            owner_token_sha256=request.owner.owner_token_sha256,
+            key=request.execution_key,
+            request_sha256=request.sha256,
+            command_sha256=command_sha256,
+            output_mount_authority_sha256=request.output_mount.content_authority_sha256,
+            lease_payloads=tuple(item.owned_lease.payload for item in leases),
+        )
+
+    def _consume_result(
         self,
         request: DockerPanelRequestV5,
-        *,
-        deadline: StageDeadlineV5,
-        registrar: RuntimeLeaseRegistrarV5,
+        result: ContainerExecutionResultV5,
+        execution_leases: tuple[ExecutionLeaseV5, ...],
     ) -> DockerPanelOutcomeV5:
-        if (
-            type(request) is not DockerPanelRequestV5
-            or type(deadline) is not StageDeadlineV5
-            or not isinstance(registrar, RuntimeLeaseRegistrarV5)
-        ):
-            return self._failure("invalid_request")
-        remaining = self._remaining_timeout(request, deadline)
-        if remaining is None:
-            return self._failure("invalid_request")
-        if remaining == 0:
-            return self._failure("timed_out")
-        command = ContainerCommandV5(request, build_docker_argv_v5(request), remaining)
-        try:
-            result = self._executor.execute(command)
-        except BaseException:
-            return self._failure("driver_failed")
-        if type(result) is not ContainerExecutionResultV5:
-            return self._failure("driver_failed")
-        execution_leases = self._bound_execution(request, command, result)
-        if execution_leases is None:
-            return self._failure("foreign_lease")
-        owned_leases = tuple(item.owned_lease for item in execution_leases)
-        try:
-            registrar.register_leases(owned_leases)
-        except BaseException:
-            return self._failure("foreign_lease")
         if result.status != "succeeded":
             code = {
                 "cancelled": "cancelled",
@@ -723,6 +736,87 @@ class DockerPanelEvaluatorV5:
         ):
             return self._failure("identity_mismatch", execution_leases)
         return DockerPanelOutcomeV5(evaluation, None, execution_leases)
+
+    def evaluate(
+        self,
+        request: DockerPanelRequestV5,
+        *,
+        deadline: StageDeadlineV5,
+        registrar: RuntimeLeaseRegistrarV5,
+    ) -> DockerPanelOutcomeV5:
+        if (
+            type(request) is not DockerPanelRequestV5
+            or type(deadline) is not StageDeadlineV5
+            or not isinstance(registrar, RuntimeLeaseRegistrarV5)
+        ):
+            return self._failure("invalid_request")
+        remaining = self._remaining_timeout(request, deadline)
+        if remaining is None:
+            return self._failure("invalid_request")
+        if remaining == 0:
+            return self._failure("timed_out")
+        command = ContainerCommandV5(request, build_docker_argv_v5(request), remaining)
+        try:
+            result = self._executor.execute(command)
+        except BaseException:
+            return self._failure("driver_failed")
+        if type(result) is not ContainerExecutionResultV5:
+            return self._failure("driver_failed")
+        execution_leases = self._bound_execution(request, command.sha256, result)
+        if execution_leases is None:
+            return self._failure("foreign_lease")
+        owned_leases = tuple(item.owned_lease for item in execution_leases)
+        authority = self._execution_authority(request, command.sha256, execution_leases)
+        registrar.register_execution(authority, owned_leases)
+        return self._consume_result(request, result, execution_leases)
+
+    def recover(
+        self,
+        request: DockerPanelRequestV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
+    ) -> DockerPanelOutcomeV5:
+        if (
+            type(request) is not DockerPanelRequestV5
+            or type(deadline) is not StageDeadlineV5
+            or type(authority) is not CandidateExecutionAuthorityV5
+            or authority.campaign_id != request.owner.campaign_id
+            or authority.round_index != request.owner.round_index
+            or authority.owner_token_sha256 != request.owner.owner_token_sha256
+            or authority.key != request.execution_key
+            or authority.request_sha256 != request.sha256
+            or authority.output_mount_authority_sha256 != request.output_mount.content_authority_sha256
+        ):
+            return self._failure("invalid_request")
+        remaining = self._remaining_timeout(request, deadline)
+        if remaining is None:
+            return self._failure("invalid_request")
+        if remaining == 0:
+            return self._failure("timed_out")
+        try:
+            result = self._executor.recover(
+                request=request,
+                authority=authority,
+                remaining_timeout_seconds=remaining,
+            )
+        except BaseException:
+            return self._failure("driver_failed")
+        if result is None:
+            return self._failure("missing_output")
+        if type(result) is not ContainerExecutionResultV5:
+            return self._failure("driver_failed")
+        execution_leases = self._bound_execution(
+            request,
+            authority.command_sha256,
+            result,
+        )
+        if (
+            execution_leases is None
+            or tuple(item.owned_lease.payload for item in execution_leases) != authority.lease_payloads
+        ):
+            return self._failure("foreign_lease")
+        return self._consume_result(request, result, execution_leases)
 
     def cleanup(self, *, owner: WorkspaceOwnerV5, leases: tuple[ExecutionLeaseV5, ...]) -> CleanupResultPayloadV5:
         if type(owner) is not WorkspaceOwnerV5 or not self._cleanup_leases_match(owner, leases):
@@ -798,15 +892,36 @@ class RuntimeDockerPanelEvaluatorV5:
         assert outcome.evaluation is not None
         return outcome.evaluation
 
+    def recover(
+        self,
+        request: DockerPanelRequestV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
+    ) -> PanelEvaluationV5:
+        outcome = self._evaluator.recover(
+            request,
+            deadline=deadline,
+            authority=authority,
+        )
+        if outcome.failure is not None:
+            raise SandboxAdapterErrorV5(outcome.failure)
+        assert outcome.evaluation is not None
+        return outcome.evaluation
 
-class _CallbackLeaseRegistrarV5:
-    def __init__(self, callback: CandidateLeaseRegistrarV5) -> None:
+
+class _CallbackExecutionRegistrarV5:
+    def __init__(self, callback: CandidateExecutionRegistrarV5) -> None:
         if not callable(callback):
-            raise ValueError("candidate lease registrar is invalid")
+            raise ValueError("candidate execution registrar is invalid")
         self._callback = callback
 
-    def register_leases(self, leases: tuple[OwnedLeaseV5, ...]) -> None:
-        self._callback(leases)
+    def register_execution(
+        self,
+        authority: CandidateExecutionAuthorityV5,
+        leases: tuple[OwnedLeaseV5, ...],
+    ) -> None:
+        self._callback(authority, leases)
 
 
 class DockerCandidateRuntimeV5:
@@ -914,6 +1029,7 @@ class DockerCandidateRuntimeV5:
         materialized: MaterializedVariantV5,
         panel: EpisodePlanV5,
         scenario_ids: tuple[str, ...],
+        execution_key: CandidateExecutionKeyV5,
     ) -> DockerPanelRequestV5:
         if type(materialized) is not MaterializedVariantV5:
             raise ValueError("Docker candidate runtime materialization is invalid")
@@ -923,6 +1039,7 @@ class DockerCandidateRuntimeV5:
         return DockerPanelRequestV5(
             owner=self._owner,
             manifest=self._manifest,
+            execution_key=execution_key,
             policy_revision=materialized.variant.policy_revision,
             evaluator_contract=self._contract,
             sandbox_profile=self._profile,
@@ -935,7 +1052,12 @@ class DockerCandidateRuntimeV5:
 
     def evaluate_quick(self, materialized: MaterializedVariantV5, *, deadline: StageDeadlineV5) -> PanelEvaluationV5:
         scenarios = (self._contract.selection_scenario_id,)
-        request = self._request(materialized, self._panel_plan.quick, scenarios)
+        request = self._request(
+            materialized,
+            self._panel_plan.quick,
+            scenarios,
+            CandidateExecutionKeyV5(materialized.variant.sha256, "quick_evaluation", None),
+        )
         return self._evaluator.evaluate(request, deadline=deadline)
 
     def evaluate_quick_registered(
@@ -943,14 +1065,35 @@ class DockerCandidateRuntimeV5:
         materialized: MaterializedVariantV5,
         *,
         deadline: StageDeadlineV5,
-        register_leases: CandidateLeaseRegistrarV5,
+        execution_key: CandidateExecutionKeyV5,
+        register_execution: CandidateExecutionRegistrarV5,
     ) -> PanelEvaluationV5:
         scenarios = (self._contract.selection_scenario_id,)
-        request = self._request(materialized, self._panel_plan.quick, scenarios)
+        request = self._request(materialized, self._panel_plan.quick, scenarios, execution_key)
         return self._evaluator.evaluate(
             request,
             deadline=deadline,
-            registrar=_CallbackLeaseRegistrarV5(register_leases),
+            registrar=_CallbackExecutionRegistrarV5(register_execution),
+        )
+
+    def recover_quick_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
+    ) -> PanelEvaluationV5:
+        scenarios = (self._contract.selection_scenario_id,)
+        request = self._request(
+            materialized,
+            self._panel_plan.quick,
+            scenarios,
+            authority.key,
+        )
+        return self._evaluator.recover(
+            request,
+            deadline=deadline,
+            authority=authority,
         )
 
     def evaluate_episode(
@@ -964,7 +1107,13 @@ class DockerCandidateRuntimeV5:
             materialized,
             episode,
             deadline=deadline,
+            execution_key=CandidateExecutionKeyV5(
+                materialized.variant.sha256,
+                "discovery_evaluation",
+                episode.episode_ordinal,
+            ),
             registrar=None,
+            recovery_authority=None,
         )
 
     def evaluate_episode_registered(
@@ -973,13 +1122,33 @@ class DockerCandidateRuntimeV5:
         episode: EpisodePlanV5,
         *,
         deadline: StageDeadlineV5,
-        register_leases: CandidateLeaseRegistrarV5,
+        execution_key: CandidateExecutionKeyV5,
+        register_execution: CandidateExecutionRegistrarV5,
     ) -> EpisodeEvaluationV5:
         return self._evaluate_episode(
             materialized,
             episode,
             deadline=deadline,
-            registrar=_CallbackLeaseRegistrarV5(register_leases),
+            execution_key=execution_key,
+            registrar=_CallbackExecutionRegistrarV5(register_execution),
+            recovery_authority=None,
+        )
+
+    def recover_episode_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        episode: EpisodePlanV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
+    ) -> EpisodeEvaluationV5:
+        return self._evaluate_episode(
+            materialized,
+            episode,
+            deadline=deadline,
+            execution_key=authority.key,
+            registrar=None,
+            recovery_authority=authority,
         )
 
     def _evaluate_episode(
@@ -988,16 +1157,26 @@ class DockerCandidateRuntimeV5:
         episode: EpisodePlanV5,
         *,
         deadline: StageDeadlineV5,
+        execution_key: CandidateExecutionKeyV5,
         registrar: RuntimeLeaseRegistrarV5 | None,
+        recovery_authority: CandidateExecutionAuthorityV5 | None,
     ) -> EpisodeEvaluationV5:
         if episode not in self._panel_plan.discovery:
             raise ValueError("Docker candidate runtime episode is outside the discovery plan")
         scenarios = tuple(item.scenario_id for item in self._contract.friction_grid)
-        request = self._request(materialized, episode, scenarios)
-        evaluation = self._evaluator.evaluate(
-            request,
-            deadline=deadline,
-            registrar=registrar,
+        request = self._request(materialized, episode, scenarios, execution_key)
+        evaluation = (
+            self._evaluator.evaluate(
+                request,
+                deadline=deadline,
+                registrar=registrar,
+            )
+            if recovery_authority is None
+            else self._evaluator.recover(
+                request,
+                deadline=deadline,
+                authority=recovery_authority,
+            )
         )
         assert episode.episode_ordinal is not None
         return EpisodeEvaluationV5(

@@ -235,6 +235,67 @@ class OwnedLeaseV5:
             raise ValueError("owned lease requires an opaque handle")
 
 
+CandidateExecutionStageV5 = Literal["quick_evaluation", "discovery_evaluation"]
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateExecutionKeyV5:
+    experiment_id: str
+    stage: CandidateExecutionStageV5
+    episode_ordinal: int | None
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "candidate execution experiment")
+        if self.stage == "quick_evaluation":
+            if self.episode_ordinal is not None:
+                raise ValueError("quick execution cannot carry an episode ordinal")
+        elif self.stage == "discovery_evaluation":
+            _positive(self.episode_ordinal, "candidate execution episode ordinal")
+        else:
+            raise ValueError("candidate execution stage is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateExecutionAuthorityV5:
+    """One atomic durable ownership and recovery record for an evaluator execution."""
+
+    campaign_id: str
+    round_index: int
+    owner_token_sha256: str
+    key: CandidateExecutionKeyV5
+    request_sha256: str
+    command_sha256: str
+    output_mount_authority_sha256: str
+    lease_payloads: tuple[ResourceLeasePayloadV5, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.campaign_id) is not str or not self.campaign_id:
+            raise ValueError("candidate execution campaign is invalid")
+        _positive(self.round_index, "candidate execution round")
+        _digest(self.owner_token_sha256, "candidate execution owner token")
+        if type(self.key) is not CandidateExecutionKeyV5:
+            raise ValueError("candidate execution key is invalid")
+        _digest(self.request_sha256, "candidate execution request")
+        _digest(self.command_sha256, "candidate execution command")
+        _digest(self.output_mount_authority_sha256, "candidate execution output authority")
+        if (
+            type(self.lease_payloads) is not tuple
+            or tuple(item.resource_kind for item in self.lease_payloads) != ("evaluator_process", "container")
+            or any(
+                type(item) is not ResourceLeasePayloadV5
+                or item.owner_campaign_id != self.campaign_id
+                or item.owner_token_sha256 != self.owner_token_sha256
+                for item in self.lease_payloads
+            )
+            or len({item.lease_id for item in self.lease_payloads}) != 2
+        ):
+            raise ValueError("candidate execution leases are invalid")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
 @dataclass(frozen=True, slots=True)
 class MaterializedVariantV5:
     variant: RenderedVariantV5
@@ -487,6 +548,17 @@ class RoundPersistenceV5(Protocol):
 
 
 @runtime_checkable
+class CandidateExecutionPersistenceV5(Protocol):
+    """Atomic side journal for exact evaluator ownership and crash recovery."""
+
+    def load_candidate_executions(
+        self, *, campaign_id: str, round_index: int
+    ) -> tuple[CandidateExecutionAuthorityV5, ...]: ...
+
+    def append_candidate_execution(self, authority: CandidateExecutionAuthorityV5) -> ArtifactRefV5: ...
+
+
+@runtime_checkable
 class RuntimeClockV5(Protocol):
     def monotonic(self) -> float: ...
 
@@ -589,8 +661,12 @@ class CandidateRuntimeV5(Protocol):
     ) -> EpisodeEvaluationV5: ...
 
 
-class CandidateLeaseRegistrarV5(Protocol):
-    def __call__(self, leases: tuple[OwnedLeaseV5, ...]) -> None: ...
+class CandidateExecutionRegistrarV5(Protocol):
+    def __call__(
+        self,
+        authority: CandidateExecutionAuthorityV5,
+        leases: tuple[OwnedLeaseV5, ...],
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -602,7 +678,16 @@ class LeaseAwareCandidateRuntimeV5(Protocol):
         materialized: MaterializedVariantV5,
         *,
         deadline: StageDeadlineV5,
-        register_leases: CandidateLeaseRegistrarV5,
+        execution_key: CandidateExecutionKeyV5,
+        register_execution: CandidateExecutionRegistrarV5,
+    ) -> PanelEvaluationV5: ...
+
+    def recover_quick_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
     ) -> PanelEvaluationV5: ...
 
     def evaluate_episode_registered(
@@ -611,7 +696,17 @@ class LeaseAwareCandidateRuntimeV5(Protocol):
         episode: EpisodePlanV5,
         *,
         deadline: StageDeadlineV5,
-        register_leases: CandidateLeaseRegistrarV5,
+        execution_key: CandidateExecutionKeyV5,
+        register_execution: CandidateExecutionRegistrarV5,
+    ) -> EpisodeEvaluationV5: ...
+
+    def recover_episode_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        episode: EpisodePlanV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
     ) -> EpisodeEvaluationV5: ...
 
 
@@ -937,14 +1032,20 @@ class _Runtime:
         return True
 
     def _recover_owned_leases(self) -> tuple[OwnedLeaseV5, ...]:
-        if self._owned_leases:
-            return tuple(self._owned_leases[key] for key in sorted(self._owned_leases))
-        for payload in self.journal.lease_payloads():
+        execution_payloads = tuple(
+            payload for authority in self._execution_authorities() for payload in authority.lease_payloads
+        )
+        for payload in (*self.journal.lease_payloads(), *execution_payloads):
             if (
                 payload.owner_campaign_id != self.inputs.campaign_id
                 or payload.owner_token_sha256 != self.inputs.owner_token_sha256
             ):
                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "foreign_lease"))
+            prior = self._owned_leases.get(payload.lease_id)
+            if prior is not None:
+                if prior.payload != payload:
+                    raise _RuntimeAbort(RuntimeFailureV5("recovery", "foreign_lease"))
+                continue
             try:
                 lease = self.dependencies.cleanup.recover_lease(payload, round_index=self.inputs.round_index)
             except BaseException:
@@ -955,10 +1056,120 @@ class _Runtime:
                 or lease.round_index != self.inputs.round_index
             ):
                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "foreign_lease"))
-            if payload.lease_id in self._owned_leases:
-                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
             self._owned_leases[payload.lease_id] = lease
         return tuple(self._owned_leases[key] for key in sorted(self._owned_leases))
+
+    def _execution_authorities(self) -> tuple[CandidateExecutionAuthorityV5, ...]:
+        persistence = self.dependencies.persistence
+        if not isinstance(persistence, CandidateExecutionPersistenceV5):
+            if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
+                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+            return ()
+        try:
+            authorities = persistence.load_candidate_executions(
+                campaign_id=self.inputs.campaign_id,
+                round_index=self.inputs.round_index,
+            )
+        except _RuntimeAbort:
+            raise
+        except BaseException:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "stage_failed")) from None
+        if type(authorities) is not tuple or any(
+            type(item) is not CandidateExecutionAuthorityV5
+            or item.campaign_id != self.inputs.campaign_id
+            or item.round_index != self.inputs.round_index
+            or item.owner_token_sha256 != self.inputs.owner_token_sha256
+            for item in authorities
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        keys = tuple(item.key for item in authorities)
+        lease_ids = tuple(payload.lease_id for item in authorities for payload in item.lease_payloads)
+        if len(set(keys)) != len(keys) or len(set(lease_ids)) != len(lease_ids):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        return authorities
+
+    def _existing_execution(self, key: CandidateExecutionKeyV5) -> CandidateExecutionAuthorityV5 | None:
+        matches = tuple(item for item in self._execution_authorities() if item.key == key)
+        if len(matches) > 1:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        return None if not matches else matches[0]
+
+    def _register_execution(
+        self,
+        authority: CandidateExecutionAuthorityV5,
+        leases: tuple[OwnedLeaseV5, ...],
+    ) -> None:
+        if (
+            type(authority) is not CandidateExecutionAuthorityV5
+            or type(leases) is not tuple
+            or tuple(item.payload for item in leases) != authority.lease_payloads
+            or any(type(item) is not OwnedLeaseV5 for item in leases)
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        if (
+            authority.campaign_id != self.inputs.campaign_id
+            or authority.round_index != self.inputs.round_index
+            or authority.owner_token_sha256 != self.inputs.owner_token_sha256
+            or any(item.round_index != self.inputs.round_index for item in leases)
+        ):
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "foreign_lease",
+                    experiment_id=authority.key.experiment_id,
+                )
+            )
+        existing_authorities = self._execution_authorities()
+        if any(item.key == authority.key for item in existing_authorities):
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "invalid_dependency_result",
+                    experiment_id=authority.key.experiment_id,
+                )
+            )
+        durable_ids = {payload.lease_id for item in existing_authorities for payload in item.lease_payloads} | {
+            item.lease_id for item in self.journal.lease_payloads()
+        }
+        for lease in leases:
+            if lease.payload.lease_id in self._owned_leases or lease.payload.lease_id in durable_ids:
+                raise _RuntimeAbort(
+                    RuntimeFailureV5(
+                        authority.key.stage,
+                        "foreign_lease",
+                        experiment_id=authority.key.experiment_id,
+                    )
+                )
+        self._owned_leases.update({item.payload.lease_id: item for item in leases})
+        persistence = self.dependencies.persistence
+        if not isinstance(persistence, CandidateExecutionPersistenceV5):
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "invalid_dependency_result",
+                    experiment_id=authority.key.experiment_id,
+                )
+            )
+        try:
+            reference = persistence.append_candidate_execution(authority)
+        except _RuntimeAbort:
+            raise
+        except BaseException:
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "stage_failed",
+                    experiment_id=authority.key.experiment_id,
+                )
+            ) from None
+        if type(reference) is not ArtifactRefV5:
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "invalid_dependency_result",
+                    experiment_id=authority.key.experiment_id,
+                )
+            )
 
     def _register_leases(self, leases: tuple[OwnedLeaseV5, ...]) -> None:
         if type(leases) is not tuple or any(type(item) is not OwnedLeaseV5 for item in leases):
@@ -1598,11 +1809,25 @@ class _Runtime:
         quick_deadline = self._deadline("quick_evaluation", self.inputs.manifest.resources.quick_timeout_seconds)
         try:
             if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
-                quick = self.dependencies.candidates.evaluate_quick_registered(
-                    materialized,
-                    deadline=quick_deadline,
-                    register_leases=self._register_leases,
+                execution_key = CandidateExecutionKeyV5(
+                    identity.sha256,
+                    "quick_evaluation",
+                    None,
                 )
+                execution = self._existing_execution(execution_key)
+                if execution is None:
+                    quick = self.dependencies.candidates.evaluate_quick_registered(
+                        materialized,
+                        deadline=quick_deadline,
+                        execution_key=execution_key,
+                        register_execution=self._register_execution,
+                    )
+                else:
+                    quick = self.dependencies.candidates.recover_quick_registered(
+                        materialized,
+                        deadline=quick_deadline,
+                        authority=execution,
+                    )
             else:
                 quick = self.dependencies.candidates.evaluate_quick(materialized, deadline=quick_deadline)
             self._validate_quick(quick, identity)
@@ -1785,12 +2010,27 @@ class _Runtime:
                     )
                     try:
                         if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
-                            episode = self.dependencies.candidates.evaluate_episode_registered(
-                                candidate.materialized,
-                                plan,
-                                deadline=deadline,
-                                register_leases=self._register_leases,
+                            execution_key = CandidateExecutionKeyV5(
+                                identity.sha256,
+                                "discovery_evaluation",
+                                plan.episode_ordinal,
                             )
+                            execution = self._existing_execution(execution_key)
+                            if execution is None:
+                                episode = self.dependencies.candidates.evaluate_episode_registered(
+                                    candidate.materialized,
+                                    plan,
+                                    deadline=deadline,
+                                    execution_key=execution_key,
+                                    register_execution=self._register_execution,
+                                )
+                            else:
+                                episode = self.dependencies.candidates.recover_episode_registered(
+                                    candidate.materialized,
+                                    plan,
+                                    deadline=deadline,
+                                    authority=execution,
+                                )
                         else:
                             episode = self.dependencies.candidates.evaluate_episode(
                                 candidate.materialized,
@@ -2337,7 +2577,11 @@ def run_feedback_round_v5(
 __all__ = [
     "ArchiveReducerFactoryV5",
     "CandidateEvidenceV5",
-    "CandidateLeaseRegistrarV5",
+    "CandidateExecutionAuthorityV5",
+    "CandidateExecutionKeyV5",
+    "CandidateExecutionPersistenceV5",
+    "CandidateExecutionRegistrarV5",
+    "CandidateExecutionStageV5",
     "CandidateRuntimeV5",
     "ExperimentRecordFactoryV5",
     "FeedbackRoundDependenciesV5",
