@@ -214,14 +214,245 @@ def hash_regular_in_directory_v5(
     *,
     maximum_bytes: int | None = None,
 ) -> tuple[int, int, int, str]:
-    content, info = read_regular_in_directory_v5(
-        directory,
-        name,
-        maximum_bytes=maximum_bytes,
-    )
-    if info.st_size != len(content):
+    if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes <= 0):
+        raise ValueError("filesystem hash bound is invalid")
+    stream, info = open_regular_in_directory_v5(directory, name, writable=False)
+    if maximum_bytes is not None and info.st_size > maximum_bytes:
+        stream.close()
+        raise ValueError("filesystem child exceeds its hash bound")
+    digest = hashlib.sha256()
+    observed_bytes = 0
+    try:
+        while chunk := stream.read(1024 * 1024):
+            observed_bytes += len(chunk)
+            if maximum_bytes is not None and observed_bytes > maximum_bytes:
+                raise ValueError("filesystem child exceeds its hash bound")
+            digest.update(chunk)
+        after = os.fstat(stream.fileno())
+    finally:
+        stream.close()
+    if (
+        observed_bytes != info.st_size
+        or _identity(after) != _identity(info)
+        or after.st_size != info.st_size
+    ):
         raise ValueError("filesystem child changed during hashing")
-    return info.st_dev, info.st_ino, info.st_size, hashlib.sha256(content).hexdigest()
+    directory.assert_current()
+    return info.st_dev, info.st_ino, observed_bytes, digest.hexdigest()
+
+
+def _windows_handle_identity(handle: int) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_info = kernel32.GetFileInformationByHandle
+    get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation))
+    get_info.restype = wintypes.BOOL
+    value = _ByHandleFileInformation()
+    if not get_info(wintypes.HANDLE(handle), ctypes.byref(value)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (int(value.nFileIndexHigh) << 32) | int(value.nFileIndexLow)
+
+
+def _open_windows_delete_handle(path: Path, *, directory: bool) -> tuple[int, os.stat_result]:
+    import ctypes
+    from ctypes import wintypes
+
+    before = os.lstat(path)
+    if _is_reparse(before) or stat.S_ISDIR(before.st_mode) is not directory:
+        raise ValueError("filesystem cleanup target is not an exact expected entry")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        _windows_extended_path(path),
+        0x00010000 | 0x00000080 | (0x00000001 if directory else 0),
+        0x0001 | 0x0002 | 0x0004,
+        None,
+        3,
+        0x00200000 | (0x02000000 if directory else 0x00000080),
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle in {None, invalid}:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        after = os.lstat(path)
+        handle_inode = _windows_handle_identity(int(handle))
+        if (
+            _is_reparse(after)
+            or stat.S_ISDIR(after.st_mode) is not directory
+            or _identity(before) != _identity(after)
+            or handle_inode != after.st_ino
+        ):
+            raise ValueError("filesystem cleanup target changed while opening")
+        return int(handle), after
+    except BaseException:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
+
+
+def _mark_windows_handle_for_delete(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_info = kernel32.SetFileInformationByHandle
+    set_info.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    set_info.restype = wintypes.BOOL
+    disposition = _FileDispositionInfo(True)
+    if not set_info(
+        wintypes.HANDLE(handle),
+        4,  # FileDispositionInfo
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _close_windows_raw_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _remove_windows_tree(path: Path, *, expected_identity: tuple[int, int]) -> None:
+    handle, info = _open_windows_delete_handle(path, directory=True)
+    try:
+        if _identity(info) != expected_identity:
+            raise ValueError("filesystem cleanup root identity changed")
+        for entry in tuple(os.scandir(path)):
+            child = path / _closed_name(entry.name)
+            child_info = os.lstat(child)
+            if _is_reparse(child_info):
+                raise ValueError("filesystem cleanup encountered a reparse point")
+            if stat.S_ISDIR(child_info.st_mode):
+                _remove_windows_tree(child, expected_identity=_identity(child_info))
+            elif stat.S_ISREG(child_info.st_mode) and child_info.st_nlink == 1:
+                child_handle, opened = _open_windows_delete_handle(child, directory=False)
+                try:
+                    if _identity(opened) != _identity(child_info):
+                        raise ValueError("filesystem cleanup child identity changed")
+                    _mark_windows_handle_for_delete(child_handle)
+                finally:
+                    _close_windows_raw_handle(child_handle)
+            else:
+                raise ValueError("filesystem cleanup encountered a foreign entry")
+        current = os.lstat(path)
+        if _identity(current) != expected_identity or _windows_handle_identity(handle) != current.st_ino:
+            raise ValueError("filesystem cleanup root identity changed")
+        _mark_windows_handle_for_delete(handle)
+    finally:
+        _close_windows_raw_handle(handle)
+
+
+def _remove_posix_tree(
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or _identity(info) != expected_identity:
+            raise ValueError("filesystem cleanup root identity changed")
+        for child in tuple(os.listdir(descriptor)):
+            child = _closed_name(child)
+            child_info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            if _is_reparse(child_info):
+                raise ValueError("filesystem cleanup encountered a link")
+            if stat.S_ISDIR(child_info.st_mode):
+                _remove_posix_tree(descriptor, child, expected_identity=_identity(child_info))
+            elif stat.S_ISREG(child_info.st_mode) and child_info.st_nlink == 1:
+                child_descriptor = os.open(
+                    child,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+                try:
+                    opened = os.fstat(child_descriptor)
+                    current = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+                    if _identity(opened) != _identity(current) or _identity(current) != _identity(child_info):
+                        raise ValueError("filesystem cleanup child identity changed")
+                    os.unlink(child, dir_fd=descriptor)
+                finally:
+                    os.close(child_descriptor)
+            else:
+                raise ValueError("filesystem cleanup encountered a foreign entry")
+        if _identity(os.fstat(descriptor)) != expected_identity:
+            raise ValueError("filesystem cleanup root identity changed")
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent_descriptor)
+
+
+def remove_owned_tree_in_directory_v5(
+    parent: _DirectoryAccess,
+    name: str,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Delete one exact owned child without following or crossing filesystem links."""
+
+    child = _closed_name(name)
+    if (
+        type(expected_identity) is not tuple
+        or len(expected_identity) != 2
+        or any(type(item) is not int for item in expected_identity)
+    ):
+        raise ValueError("filesystem cleanup identity is invalid")
+    parent.assert_current()
+    if os.name == "nt":
+        _remove_windows_tree(parent.path / child, expected_identity=expected_identity)
+    else:
+        _remove_posix_tree(parent.descriptor, child, expected_identity=expected_identity)
+    parent.assert_current()
+    try:
+        if os.name == "nt":
+            os.lstat(parent.path / child)
+        else:
+            os.stat(child, dir_fd=parent.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise ValueError("filesystem cleanup target remains")
 
 
 def write_regular_in_directory_v5(
@@ -282,6 +513,7 @@ __all__ = [
     "hash_regular_in_directory_v5",
     "open_regular_in_directory_v5",
     "read_regular_in_directory_v5",
+    "remove_owned_tree_in_directory_v5",
     "write_new_regular_in_directory_v5",
     "write_regular_in_directory_v5",
 ]

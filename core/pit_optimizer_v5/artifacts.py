@@ -1222,9 +1222,23 @@ class LocalArtifactRepositoryV5:
         digest = hashlib.sha256(canonical_json_bytes_v5(primitive)).hexdigest()
         return self._create_only(f"inputs/{kind}/{digest}.json", primitive)
 
-    def _create_or_authenticate_typed(self, relative_path: str, value: object) -> ArtifactRefV5:
+    def _create_or_authenticate_typed(
+        self,
+        relative_path: str,
+        value: object,
+        *,
+        create_if_missing: bool = True,
+    ) -> ArtifactRefV5:
         raw = canonical_json_bytes_v5(value)
         reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
+        if not create_if_missing:
+            authenticated = self.authenticate(reference)
+            if authenticated.content != raw:
+                raise ArtifactDigestMismatchV5(
+                    reference,
+                    hashlib.sha256(authenticated.content).hexdigest(),
+                )
+            return reference
         try:
             return self._create_only(relative_path, canonical_primitive_v5(value))
         except ArtifactExistsV5:
@@ -1290,7 +1304,11 @@ class LocalArtifactRepositoryV5:
         # Publish immutable value bytes before their index.  A crash between the
         # two writes leaves an exact orphan which this same operation can reuse;
         # it never leaves a newly published authority pointing at absent bytes.
-        stored_reference = self._create_or_authenticate_typed(relative, value)
+        stored_reference = self._create_or_authenticate_typed(
+            relative,
+            value,
+            create_if_missing=prior is None,
+        )
         if stored_reference != reference:
             raise ArtifactDigestMismatchV5(reference, stored_reference.sha256)
         self._create_or_authenticate_typed(authority_relative, authority)

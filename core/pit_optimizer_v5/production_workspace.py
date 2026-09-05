@@ -98,7 +98,11 @@ def _hash_regular_file(path: Path) -> tuple[int, int, int, str]:
         raise ValueError("Git executable is not a canonical regular file")
     try:
         with acquire_absolute_directory_v5(resolved.parent) as parent:
-            observed = hash_regular_in_directory_v5(parent, resolved.name)
+            observed = hash_regular_in_directory_v5(
+                parent,
+                resolved.name,
+                maximum_bytes=512 * 1024 * 1024,
+            )
     except (OSError, ValueError):
         raise ValueError("Git executable could not be authenticated") from None
     if _metadata_identity(info) != observed[:2]:

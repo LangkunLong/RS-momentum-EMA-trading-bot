@@ -31,6 +31,7 @@ from core.pit_optimizer_v5.production_fs import (
     acquire_directory_v5,
     hash_regular_in_directory_v5,
     open_regular_in_directory_v5,
+    remove_owned_tree_in_directory_v5,
 )
 from core.pit_optimizer_v5.memory import (
     CandidateExecutionAuthorityV5,
@@ -56,6 +57,10 @@ from core.pit_optimizer_v5.workspace import MaterializedWorkspaceV5, WorkspaceOw
 
 
 _DATA_FILES_V5 = ("pit_bundle.sqlite3", "prices_provenance.json")
+_DATA_FILE_MAXIMUM_BYTES_V5 = (8 * 1024 * 1024 * 1024, 64 * 1024 * 1024)
+_DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5 = 512 * 1024 * 1024
+_POLICY_SOURCE_MAXIMUM_BYTES_V5 = 1024 * 1024
+_CONTAINER_SHM_SIZE_BYTES_V5 = 16 * 1024 * 1024
 
 
 def _windows_key(path: str) -> str:
@@ -119,10 +124,18 @@ def _roots_overlap(first: Path, second: Path) -> bool:
     return common in {first_key, second_key}
 
 
-def _hash_regular_no_follow(path: Path) -> tuple[int, int, int, str]:
+def _hash_regular_no_follow(
+    path: Path,
+    *,
+    maximum_bytes: int,
+) -> tuple[int, int, int, str]:
     try:
         with acquire_absolute_directory_v5(path.parent) as parent:
-            return hash_regular_in_directory_v5(parent, path.name)
+            return hash_regular_in_directory_v5(
+                parent,
+                path.name,
+                maximum_bytes=maximum_bytes,
+            )
     except (OSError, ValueError):
         raise ValueError("sandbox data file is not an exact regular file") from None
 
@@ -178,11 +191,50 @@ def _hash_docker_executable(path: Path) -> tuple[int, int, int, str]:
     ):
         stream.close()
         raise ValueError("Docker executable changed during authentication")
+    if opened.st_size > _DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5:
+        stream.close()
+        raise ValueError("Docker executable exceeds its authentication bound")
     digest = hashlib.sha256()
+    observed_bytes = 0
     with stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            observed_bytes += len(chunk)
+            if observed_bytes > _DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5:
+                raise ValueError("Docker executable exceeds its authentication bound")
             digest.update(chunk)
-    return opened.st_dev, opened.st_ino, opened.st_size, digest.hexdigest()
+    if observed_bytes != opened.st_size:
+        raise ValueError("Docker executable changed during authentication")
+    return opened.st_dev, opened.st_ino, observed_bytes, digest.hexdigest()
+
+
+def _hash_open_stream(
+    stream: object,
+    info: os.stat_result,
+    *,
+    maximum_bytes: int,
+) -> tuple[int, int, int, str]:
+    if (
+        type(maximum_bytes) is not int
+        or maximum_bytes <= 0
+        or info.st_size > maximum_bytes
+    ):
+        raise ValueError("pinned file exceeds its authentication bound")
+    stream.seek(0)  # type: ignore[attr-defined]
+    digest = hashlib.sha256()
+    observed_bytes = 0
+    while chunk := stream.read(1024 * 1024):  # type: ignore[attr-defined]
+        observed_bytes += len(chunk)
+        if observed_bytes > maximum_bytes:
+            raise ValueError("pinned file exceeds its authentication bound")
+        digest.update(chunk)
+    after = os.fstat(stream.fileno())  # type: ignore[attr-defined]
+    if (
+        observed_bytes != info.st_size
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (info.st_dev, info.st_ino, info.st_size)
+    ):
+        raise ValueError("pinned file changed during authentication")
+    return info.st_dev, info.st_ino, observed_bytes, digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +310,7 @@ class ExecutionReservationRecordV5:
     command_argv: tuple[str, ...]
     runtime_argv_sha256: str
     output_mount_authority_sha256: str
+    expected_mounts: tuple[tuple[str, str, bool], ...]
     lease_ids: tuple[str, str]
     container_name: str
     control_relative_path: str
@@ -284,6 +337,23 @@ class ExecutionReservationRecordV5:
             or re.fullmatch(r"execution-[0-9a-f]{24}", self.control_relative_path) is None
         ):
             raise ValueError("container execution reservation is invalid")
+        if (
+            type(self.expected_mounts) is not tuple
+            or len(self.expected_mounts) != 4
+            or any(
+                type(item) is not tuple
+                or len(item) != 3
+                or type(item[0]) is not str
+                or not item[0]
+                or type(item[1]) is not str
+                or not item[1].startswith("/")
+                or type(item[2]) is not bool
+                for item in self.expected_mounts
+            )
+        ):
+            raise ValueError("container execution mount authority is invalid")
+        if self.expected_mounts != tuple(sorted(set(self.expected_mounts))):
+            raise ValueError("container execution mount authority is not canonical")
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,8 +524,16 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 expected_identity=(data_info.st_dev, data_info.st_ino),
             ) as data_access:
                 entries = tuple(sorted(item.name for item in os.scandir(data_access.path)))
-                bundle_identity = hash_regular_in_directory_v5(data_access, _DATA_FILES_V5[0])
-                provenance_identity = hash_regular_in_directory_v5(data_access, _DATA_FILES_V5[1])
+                bundle_identity = hash_regular_in_directory_v5(
+                    data_access,
+                    _DATA_FILES_V5[0],
+                    maximum_bytes=_DATA_FILE_MAXIMUM_BYTES_V5[0],
+                )
+                provenance_identity = hash_regular_in_directory_v5(
+                    data_access,
+                    _DATA_FILES_V5[1],
+                    maximum_bytes=_DATA_FILE_MAXIMUM_BYTES_V5[1],
+                )
         except (OSError, ValueError):
             raise ValueError("sandbox data root is unreadable") from None
         if entries != _DATA_FILES_V5:
@@ -610,13 +688,31 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                     expected_identity=(self._data_info.st_dev, self._data_info.st_ino),
                 ) as pinned:
                     observed = tuple(
-                        hash_regular_in_directory_v5(pinned, name) for name in _DATA_FILES_V5
+                        hash_regular_in_directory_v5(
+                            pinned,
+                            name,
+                            maximum_bytes=maximum,
+                        )
+                        for name, maximum in zip(
+                            _DATA_FILES_V5,
+                            _DATA_FILE_MAXIMUM_BYTES_V5,
+                            strict=True,
+                        )
                     )
             except (OSError, ValueError):
                 raise ValueError("sandbox data files changed") from None
         else:
             observed = tuple(
-                hash_regular_in_directory_v5(access, name) for name in _DATA_FILES_V5  # type: ignore[arg-type]
+                hash_regular_in_directory_v5(  # type: ignore[arg-type]
+                    access,
+                    name,
+                    maximum_bytes=maximum,
+                )
+                for name, maximum in zip(
+                    _DATA_FILES_V5,
+                    _DATA_FILE_MAXIMUM_BYTES_V5,
+                    strict=True,
+                )
             )
         if observed != self._data_file_identities:
             raise ValueError("sandbox data files changed")
@@ -771,22 +867,22 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                     raise ValueError("sandbox mount root changed")
                 if handle.kind == "data":
                     observed = []
-                    for name in _DATA_FILES_V5:
+                    for name, maximum in zip(
+                        _DATA_FILES_V5,
+                        _DATA_FILE_MAXIMUM_BYTES_V5,
+                        strict=True,
+                    ):
                         stream, file_info = open_regular_in_directory_v5(
                             access,
                             name,
                             writable=False,
                         )
                         stack.enter_context(stream)
-                        digest = hashlib.sha256()
-                        while chunk := stream.read(1024 * 1024):
-                            digest.update(chunk)
                         observed.append(
-                            (
-                                file_info.st_dev,
-                                file_info.st_ino,
-                                file_info.st_size,
-                                digest.hexdigest(),
+                            _hash_open_stream(
+                                stream,
+                                file_info,
+                                maximum_bytes=maximum,
                             )
                         )
                     if tuple(observed) != self._data_file_identities:
@@ -851,12 +947,12 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                         writable=False,
                     )
                     stack.enter_context(stream)
-                    digest = hashlib.sha256()
-                    while chunk := stream.read(1024 * 1024):
-                        digest.update(chunk)
-                    if info.st_size != stream.tell():
-                        raise ValueError("sandbox source changed while hashing")
-                    observed_sources.append((relative, digest.hexdigest()))
+                    observed = _hash_open_stream(
+                        stream,
+                        info,
+                        maximum_bytes=_POLICY_SOURCE_MAXIMUM_BYTES_V5,
+                    )
+                    observed_sources.append((relative, observed[3]))
                 except (OSError, ValueError):
                     raise ValueError("sandbox source path changed") from None
             if tuple(observed_sources) != expected_sources:
@@ -1019,6 +1115,18 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             f"pit-v5.owner={self._owner.sha256}",
             "--pull",
             "never",
+            "--privileged=false",
+            "--ipc",
+            "private",
+            "--cgroupns",
+            "private",
+            "--oom-kill-disable=false",
+            "--init=false",
+            "--publish-all=false",
+            "--log-driver",
+            "none",
+            "--shm-size",
+            "16m",
             "--user",
             "65532:65532",
             "--entrypoint",
@@ -1027,6 +1135,28 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "/pit/source",
         ]
         generic[2:2] = injected
+        data_mount = command.request.data_mount
+        data_root_argument = (
+            f"type=bind,src={data_mount.host_path},dst={data_mount.container_path},readonly"
+        )
+        try:
+            data_argument_index = generic.index(data_root_argument)
+        except ValueError:
+            raise ValueError("container data mount differs from the closed V5 grammar") from None
+        data_file_arguments = []
+        for name in _DATA_FILES_V5:
+            data_file_arguments.extend(
+                (
+                    "--mount",
+                    (
+                        f"type=bind,src={Path(data_mount.host_path) / name},"
+                        f"dst={data_mount.container_path}/{name},readonly"
+                    ),
+                )
+            )
+        if data_argument_index == 0 or generic[data_argument_index - 1] != "--mount":
+            raise ValueError("container data mount grammar is malformed")
+        generic[data_argument_index - 1 : data_argument_index + 1] = data_file_arguments
         separator = generic.index("--")
         if generic[separator + 1] != self._profile.image_reference or generic[separator + 2] != "python":
             raise ValueError("container image command differs from the closed V5 grammar")
@@ -1039,6 +1169,30 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             for role in ("evaluator_process", "container")
         )
         runtime_argv = self._runtime_argv(command)
+        expected_mounts = tuple(
+            sorted(
+                (
+                    (
+                        _windows_key(command.request.source_mount.host_path),
+                        command.request.source_mount.container_path,
+                        False,
+                    ),
+                    *(
+                        (
+                            _windows_key(str(Path(command.request.data_mount.host_path) / name)),
+                            f"{command.request.data_mount.container_path}/{name}",
+                            False,
+                        )
+                        for name in _DATA_FILES_V5
+                    ),
+                    (
+                        _windows_key(command.request.output_mount.host_path),
+                        command.request.output_mount.container_path,
+                        True,
+                    ),
+                )
+            )
+        )
         return ExecutionReservationRecordV5(
             5,
             self.executor_identity_sha256,
@@ -1048,6 +1202,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             command.argv,
             canonical_sha256_v5(runtime_argv),
             command.request.output_mount.content_authority_sha256,
+            expected_mounts,
             lease_ids,
             self._container_name(command.sha256),
             f"execution-{command.sha256[:24]}",
@@ -1160,7 +1315,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         )
         return record
 
-    def _ensure_control(self, reservation: ExecutionReservationRecordV5) -> tuple[Path, dict[str, str]]:
+    def _ensure_control(self, reservation: ExecutionReservationRecordV5) -> Path:
         target = self._control_root / reservation.control_relative_path
         ready = self._repository.load_typed_state(
             namespace="container-control-ready",
@@ -1210,23 +1365,114 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             )
         elif ready != expected:
             raise ValueError("container control directory is foreign")
-        environment = dict(self._base_environment)
-        environment.update(
-            {
-                "HOME": str(path / "home"),
-                "USERPROFILE": str(path / "home"),
-                "DOCKER_CONFIG": str(path / "config"),
-                "TEMP": str(path / "tmp"),
-                "TMP": str(path / "tmp"),
-            }
+        return path
+
+    @contextmanager
+    def _pinned_control_environment(
+        self,
+        reservation: ExecutionReservationRecordV5,
+    ) -> Iterator[dict[str, str]]:
+        ready = self._repository.load_typed_state(
+            namespace="container-control-ready",
+            key=reservation.command_sha256,
+            value_type=ExecutionControlRecordV5,
         )
-        return path, environment
+        if ready is None:
+            raise ValueError("container control directory is not durably ready")
+        with ExitStack() as stack:
+            root = stack.enter_context(
+                acquire_absolute_directory_v5(
+                    self._control_root,
+                    expected_identity=(
+                        self._control_root_info.st_dev,
+                        self._control_root_info.st_ino,
+                    ),
+                )
+            )
+            target = stack.enter_context(
+                acquire_directory_v5(
+                    root.path,
+                    (reservation.control_relative_path,),
+                    create=False,
+                    expected_root_identity=root.identity,
+                )
+            )
+            target_info = target.path.lstat()
+            if (
+                ready
+                != ExecutionControlRecordV5(
+                    5,
+                    self.executor_identity_sha256,
+                    reservation.command_sha256,
+                    _directory_identity(target.path, target_info),
+                )
+                or target.identity != (target_info.st_dev, target_info.st_ino)
+            ):
+                raise ValueError("container control directory authority changed")
+            children = {}
+            for name in ("home", "config", "tmp"):
+                child = stack.enter_context(
+                    acquire_directory_v5(
+                        target.path,
+                        (name,),
+                        create=False,
+                        expected_root_identity=target.identity,
+                    )
+                )
+                children[name] = child
+            environment = dict(self._base_environment)
+            environment.update(
+                {
+                    "HOME": str(children["home"].path),
+                    "USERPROFILE": str(children["home"].path),
+                    "DOCKER_CONFIG": str(children["config"].path),
+                    "TEMP": str(children["tmp"].path),
+                    "TMP": str(children["tmp"].path),
+                }
+            )
+            try:
+                yield environment
+            finally:
+                for access in (*children.values(), target, root):
+                    access.assert_current()
+
+    @contextmanager
+    def _pinned_docker_executable(self) -> Iterator[None]:
+        with acquire_absolute_directory_v5(self._docker_executable.parent) as parent:
+            stream, info = open_regular_in_directory_v5(
+                parent,
+                self._docker_executable.name,
+                writable=False,
+            )
+            with stream:
+                observed = _hash_open_stream(
+                    stream,
+                    info,
+                    maximum_bytes=_DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5,
+                )
+                if observed != self._docker_identity:
+                    raise ValueError("Docker executable identity changed")
+                try:
+                    yield
+                finally:
+                    after = _hash_open_stream(
+                        stream,
+                        info,
+                        maximum_bytes=_DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5,
+                    )
+                    if (
+                        after != self._docker_identity
+                        or _hash_docker_executable(self._docker_executable)
+                        != self._docker_identity
+                    ):
+                        raise ValueError("Docker executable identity changed")
+                    parent.assert_current()
 
     def _control(
         self,
+        reservation: ExecutionReservationRecordV5,
         arguments: tuple[str, ...],
         *,
-        environment: dict[str, str],
         timeout: float,
         output_limit: int = 1024 * 1024,
     ) -> object:
@@ -1239,15 +1485,16 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or timeout <= 0
         ):
             raise ValueError("Docker control invocation is invalid")
-        self._authenticate_executable()
         from agent_loop import _bounded_process
-
-        return _bounded_process(
-            (str(self._docker_executable), *arguments),
-            env=environment,
-            timeout=timeout,
-            output_limit=output_limit,
-        )
+        with self._pinned_control_environment(reservation) as environment:
+            with self._pinned_docker_executable():
+                result = _bounded_process(
+                    (str(self._docker_executable), *arguments),
+                    env=environment,
+                    timeout=timeout,
+                    output_limit=output_limit,
+                )
+        return result
 
     @staticmethod
     def _successful(result: object) -> bool:
@@ -1258,10 +1505,13 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             and type(getattr(result, "stdout", None)) is str
         )
 
-    def _inspect_image(self, environment: dict[str, str]) -> str:
+    def _inspect_image(
+        self,
+        reservation: ExecutionReservationRecordV5,
+    ) -> tuple[str, tuple[str, ...]]:
         result = self._control(
+            reservation,
             ("image", "inspect", self._profile.image_reference),
-            environment=environment,
             timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
         )
         if not self._successful(result):
@@ -1271,6 +1521,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             item = values[0]
             image_id = item["Id"]
             repo_digests = item["RepoDigests"]
+            image_config = item["Config"]
+            image_environment = image_config["Env"]
         except (json.JSONDecodeError, IndexError, KeyError, TypeError):
             raise ValueError("sandbox image inspection is malformed") from None
         if (
@@ -1278,25 +1530,32 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
             or type(repo_digests) is not list
             or self._profile.image_reference not in repo_digests
+            or type(image_config) is not dict
+            or type(image_environment) is not list
+            or any(
+                type(value) is not str or "=" not in value or "\x00" in value
+                for value in image_environment
+            )
+            or len({value.split("=", 1)[0] for value in image_environment})
+            != len(image_environment)
         ):
             raise ValueError("sandbox image differs from its immutable authority")
-        return image_id
+        return image_id, tuple(image_environment)
 
     def _inspect_container(
         self,
         *,
         reservation: ExecutionReservationRecordV5,
-        command: ContainerCommandV5,
-        environment: dict[str, str],
-        image_id: str | None,
+        image_authority: tuple[str, tuple[str, ...]],
     ) -> tuple[dict[str, object], str] | None:
         result = self._control(
+            reservation,
             ("inspect", reservation.container_name),
-            environment=environment,
             timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
         )
         if not self._successful(result):
             listing = self._control(
+                reservation,
                 (
                     "container",
                     "ls",
@@ -1306,7 +1565,6 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     "--filter",
                     f"name=^{reservation.container_name}$",
                 ),
-                environment=environment,
                 timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
                 output_limit=64 * 1024,
             )
@@ -1328,19 +1586,79 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             raise ValueError("container inspection is malformed") from None
         expected_labels = {
             "pit-v5.executor": self.executor_identity_sha256,
-            "pit-v5.command": command.sha256,
+            "pit-v5.command": reservation.command_sha256,
             "pit-v5.owner": self._owner.sha256,
         }
-        separator = command.argv.index("--")
-        expected_command = list(command.argv[separator + 3 :])
+        image_id, expected_environment = image_authority
+        separator = reservation.command_argv.index("--")
+        expected_command = list(reservation.command_argv[separator + 3 :])
+        normalized_host = dict(host) if type(host) is dict else {}
+        for key in (
+            "CapAdd",
+            "Devices",
+            "DeviceRequests",
+            "PortBindings",
+            "VolumesFrom",
+            "Links",
+            "Dns",
+            "DnsOptions",
+            "DnsSearch",
+            "ExtraHosts",
+            "GroupAdd",
+        ):
+            if normalized_host.get(key) is None:
+                normalized_host[key] = {} if key == "PortBindings" else []
+        if normalized_host.get("OomKillDisable") is None:
+            normalized_host["OomKillDisable"] = False
+        if normalized_host.get("Init") is None:
+            normalized_host["Init"] = False
+        expected_host = {
+            "NetworkMode": "none",
+            "ReadonlyRootfs": True,
+            "OomKillDisable": False,
+            "PidsLimit": self._profile.pid_limit,
+            "Memory": self._profile.memory_limit_mib * 1024 * 1024,
+            "NanoCpus": int(self._profile.cpu_limit * Decimal(1_000_000_000)),
+            "Privileged": False,
+            "CapDrop": ["ALL"],
+            "CapAdd": [],
+            "Devices": [],
+            "DeviceRequests": [],
+            "SecurityOpt": ["no-new-privileges:true"],
+            "IpcMode": "private",
+            "ShmSize": _CONTAINER_SHM_SIZE_BYTES_V5,
+            "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=16m"},
+            "PidMode": "",
+            "UTSMode": "",
+            "CgroupnsMode": "private",
+            "CgroupParent": "",
+            "PortBindings": {},
+            "PublishAllPorts": False,
+            "Init": False,
+            "AutoRemove": False,
+            "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+            "VolumesFrom": [],
+            "Links": [],
+            "Dns": [],
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": [],
+            "GroupAdd": [],
+            "UsernsMode": "",
+            "LogConfig": {"Type": "none", "Config": {}},
+        }
+        network = item.get("NetworkSettings") if type(item) is dict else None
+        actual_environment = config.get("Env") if type(config) is dict else None
+        normalized_exposed_ports = config.get("ExposedPorts") if type(config) is dict else None
+        if normalized_exposed_ports is None:
+            normalized_exposed_ports = {}
+        normalized_volumes = config.get("Volumes") if type(config) is dict else None
+        if normalized_volumes is None:
+            normalized_volumes = {}
         if (
             type(item) is not dict
             or item.get("Name") != f"/{reservation.container_name}"
-            or (
-                item.get("Image") != image_id
-                if image_id is not None
-                else re.fullmatch(r"sha256:[0-9a-f]{64}", str(item.get("Image"))) is None
-            )
+            or item.get("Image") != image_id
             or type(config) is not dict
             or config.get("Image") != self._profile.image_reference
             or config.get("User") != "65532:65532"
@@ -1349,35 +1667,66 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or config.get("Cmd") != expected_command
             or type(labels) is not dict
             or labels != expected_labels
+            or actual_environment != list(expected_environment)
+            or normalized_exposed_ports != {}
+            or normalized_volumes != {}
+            or config.get("AttachStdin") is not False
+            or config.get("AttachStdout") is not True
+            or config.get("AttachStderr") is not True
+            or config.get("Tty") is not False
+            or config.get("OpenStdin") is not False
+            or config.get("StdinOnce") is not False
             or type(host) is not dict
-            or host.get("NetworkMode") != "none"
-            or host.get("ReadonlyRootfs") is not True
-            or host.get("PidsLimit") != self._profile.pid_limit
-            or host.get("Memory") != self._profile.memory_limit_mib * 1024 * 1024
-            or host.get("NanoCpus") != int(self._profile.cpu_limit * Decimal(1_000_000_000))
-            or host.get("CapDrop") != ["ALL"]
-            or host.get("SecurityOpt") != ["no-new-privileges:true"]
-            or host.get("Tmpfs") != {"/tmp": "rw,noexec,nosuid,nodev,size=16m"}
+            or any(
+                key not in normalized_host
+                or type(normalized_host[key]) is not type(expected)
+                or normalized_host[key] != expected
+                for key, expected in expected_host.items()
+            )
+            or type(network) is not dict
+            or network.get("Ports") != {}
+            or type(network.get("Networks")) is not dict
+            or set(network["Networks"]) != {"none"}
             or type(state) is not dict
         ):
             raise ValueError("container isolation differs from executor authority")
-        expected_mounts = {
-            (
-                _windows_key(handle.host_path),
-                handle.container_path,
-                handle.mode == "bounded_write_only",
+        none_network = network["Networks"]["none"]
+        if (
+            type(none_network) is not dict
+            or any(
+                not (
+                    none_network.get(key) is None
+                    or none_network.get(key) == ""
+                    or none_network.get(key) == 0
+                )
+                for key in (
+                    "IPAMConfig",
+                    "Links",
+                    "Aliases",
+                    "MacAddress",
+                    "DriverOpts",
+                    "Gateway",
+                    "IPAddress",
+                    "IPPrefixLen",
+                    "IPv6Gateway",
+                    "GlobalIPv6Address",
+                    "GlobalIPv6PrefixLen",
+                )
             )
-            for handle in (
-                command.request.source_mount,
-                command.request.data_mount,
-                command.request.output_mount,
-            )
-        }
+        ):
+            raise ValueError("container network namespace differs from executor authority")
+        expected_mounts = set(reservation.expected_mounts)
         if type(mounts) is not list or len(mounts) != len(expected_mounts):
             raise ValueError("container mount count differs from executor authority")
         actual_mounts = set()
         for mount in mounts:
-            if type(mount) is not dict or mount.get("Type") != "bind":
+            if (
+                type(mount) is not dict
+                or mount.get("Type") != "bind"
+                or mount.get("Propagation") != "rprivate"
+                or mount.get("Mode") not in {"ro", "rw"}
+                or (mount.get("Mode") == "rw") is not (mount.get("RW") is True)
+            ):
                 raise ValueError("container mount is malformed")
             actual_mounts.add(
                 (
@@ -1397,14 +1746,9 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 "entrypoint": config.get("Entrypoint"),
                 "command": config.get("Cmd"),
                 "working_dir": config.get("WorkingDir"),
-                "network_mode": host.get("NetworkMode"),
-                "read_only": host.get("ReadonlyRootfs"),
-                "cap_drop": host.get("CapDrop"),
-                "security_opt": host.get("SecurityOpt"),
-                "tmpfs": host.get("Tmpfs"),
-                "pids": host.get("PidsLimit"),
-                "memory": host.get("Memory"),
-                "nano_cpus": host.get("NanoCpus"),
+                "environment": actual_environment,
+                "host": {key: normalized_host[key] for key in sorted(expected_host)},
+                "network": network,
                 "mounts": sorted(expected_mounts),
             }
         )
@@ -1420,75 +1764,72 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             launch_is_new = launch_claim is None
             if launch_is_new:
                 self._append_phase(command.sha256, "launch_claim")
-            _, environment = self._ensure_control(record)
+            self._ensure_control(record)
             try:
-                image_id = self._inspect_image(environment)
-                created = self._phase(command.sha256, "created")
-                inspection = self._inspect_container(
-                    reservation=record,
-                    command=command,
-                    environment=environment,
-                    image_id=image_id,
-                )
-                if created is None and inspection is None and launch_is_new:
-                    runtime = self._runtime_argv(command)
-                    with self._mount_factory.pinned_request(command.request):
+                image_authority = self._inspect_image(record)
+                with self._mount_factory.pinned_request(command.request):
+                    created = self._phase(command.sha256, "created")
+                    inspection = self._inspect_container(
+                        reservation=record,
+                        image_authority=image_authority,
+                    )
+                    if created is None and inspection is None and launch_is_new:
+                        runtime = self._runtime_argv(command)
                         result = self._control(
+                            record,
                             runtime[1:],
-                            environment=environment,
                             timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
                             output_limit=64 * 1024,
                         )
                         inspection = self._inspect_container(
                             reservation=record,
-                            command=command,
-                            environment=environment,
-                            image_id=image_id,
+                            image_authority=image_authority,
                         )
-                    if not self._successful(result) and inspection is None:
+                        if not self._successful(result) and inspection is None:
+                            self._persist_failure(command)
+                            return
+                    if created is None:
+                        if inspection is None:
+                            self._persist_failure(command)
+                            return
+                        created = self._append_phase(
+                            command.sha256,
+                            "created",
+                            inspection[1],
+                        )
+                    elif inspection is None or created.attestation_sha256 != inspection[1]:
                         self._persist_failure(command)
                         return
-                if created is None:
+                    start_claim = self._phase(command.sha256, "start_claim")
+                    start_is_new = start_claim is None
+                    if start_is_new:
+                        self._append_phase(command.sha256, "start_claim")
+                    state = inspection[0]["State"]
+                    assert type(state) is dict
+                    status = state.get("Status")
+                    if status == "created" and start_is_new:
+                        result = self._control(
+                            record,
+                            ("start", record.container_name),
+                            timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
+                            output_limit=64 * 1024,
+                        )
+                        inspection = self._inspect_container(
+                            reservation=record,
+                            image_authority=image_authority,
+                        )
+                        if not self._successful(result) and inspection is None:
+                            self._persist_failure(command)
+                            return
                     if inspection is None:
                         self._persist_failure(command)
                         return
-                    created = self._append_phase(command.sha256, "created", inspection[1])
-                elif inspection is None or created.attestation_sha256 != inspection[1]:
-                    self._persist_failure(command)
-                    return
-                start_claim = self._phase(command.sha256, "start_claim")
-                start_is_new = start_claim is None
-                if start_is_new:
-                    self._append_phase(command.sha256, "start_claim")
-                state = inspection[0]["State"]
-                assert type(state) is dict
-                status = state.get("Status")
-                if status == "created" and start_is_new:
-                    with self._mount_factory.pinned_request(command.request):
-                        result = self._control(
-                            ("start", record.container_name),
-                            environment=environment,
-                            timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
-                            output_limit=64 * 1024,
-                        )
-                        inspection = self._inspect_container(
-                            reservation=record,
-                            command=command,
-                            environment=environment,
-                            image_id=image_id,
-                        )
-                    if not self._successful(result) and inspection is None:
+                    state = inspection[0]["State"]
+                    assert type(state) is dict
+                    if state.get("Status") not in {"running", "exited"}:
                         self._persist_failure(command)
                         return
-                if inspection is None:
-                    self._persist_failure(command)
-                    return
-                state = inspection[0]["State"]
-                assert type(state) is dict
-                if state.get("Status") not in {"running", "exited"}:
-                    self._persist_failure(command)
-                    return
-                self._append_phase(command.sha256, "started", inspection[1])
+                    self._append_phase(command.sha256, "started", inspection[1])
             except Exception:
                 self._persist_failure(command)
 
@@ -1619,14 +1960,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 return self._result_from_terminal(command, terminal)
             if self._phase(command.sha256, "started") is None:
                 return self._result_from_terminal(command, self._persist_failure(command))
-            _, environment = self._ensure_control(record)
+            self._ensure_control(record)
             try:
-                image_id = self._inspect_image(environment)
+                image_authority = self._inspect_image(record)
                 inspection = self._inspect_container(
                     reservation=record,
-                    command=command,
-                    environment=environment,
-                    image_id=image_id,
+                    image_authority=image_authority,
                 )
                 if inspection is None:
                     return self._result_from_terminal(command, self._persist_failure(command))
@@ -1634,15 +1973,15 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 assert type(state) is dict
                 if state.get("Running") is True:
                     waited = self._control(
+                        record,
                         ("wait", record.container_name),
-                        environment=environment,
                         timeout=remaining_timeout_seconds,
                         output_limit=64 * 1024,
                     )
                     if getattr(waited, "timed_out", None) is True:
                         self._control(
+                            record,
                             ("stop", "--time", "0", record.container_name),
-                            environment=environment,
                             timeout=float(self._manifest.resources.cleanup_timeout_seconds),
                             output_limit=64 * 1024,
                         )
@@ -1657,9 +1996,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         return self._result_from_terminal(command, self._persist_failure(command))
                     inspection = self._inspect_container(
                         reservation=record,
-                        command=command,
-                        environment=environment,
-                        image_id=image_id,
+                        image_authority=image_authority,
                     )
                     if inspection is None:
                         return self._result_from_terminal(command, self._persist_failure(command))
@@ -1728,6 +2065,11 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             record = self._load_reservation(command_sha256)
             if record is None:
                 raise ValueError("container cleanup reservation is absent")
+            if (
+                record.owner != owner
+                or record.lease_ids != tuple(item.payload.lease_id for item in leases)
+            ):
+                raise ValueError("container cleanup reservation is foreign")
             complete = self._repository.load_typed_state(
                 namespace="container-cleanup",
                 key=command_sha256,
@@ -1743,7 +2085,6 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 if complete != expected:
                     raise ValueError("container cleanup record is foreign")
                 return CleanupResultPayloadV5(0, 0, 1, 1, True)
-            command = self._command_from_cleanup_record(record, leases)
             container_absent = self._repository.load_typed_state(
                 namespace="container-cleanup-container-absent",
                 key=command_sha256,
@@ -1753,17 +2094,16 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             if container_absent is not None and container_absent != expected:
                 raise ValueError("container cleanup absence record is foreign")
             if container_absent is None:
-                _, environment = self._ensure_control(record)
+                self._ensure_control(record)
+                image_authority = self._inspect_image(record)
                 inspection = self._inspect_container(
                     reservation=record,
-                    command=command,
-                    environment=environment,
-                    image_id=None,
+                    image_authority=image_authority,
                 )
                 if inspection is not None:
                     removed = self._control(
+                        record,
                         ("rm", "--force", record.container_name),
-                        environment=environment,
                         timeout=float(self._manifest.resources.cleanup_timeout_seconds),
                         output_limit=64 * 1024,
                     )
@@ -1771,9 +2111,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         raise ValueError("owned container cleanup failed")
                     if self._inspect_container(
                         reservation=record,
-                        command=command,
-                        environment=environment,
-                        image_id=None,
+                        image_authority=image_authority,
                     ) is not None:
                         raise ValueError("owned container remains after cleanup")
                 self._repository.append_typed_state(
@@ -1783,16 +2121,33 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 )
             if _lstat_optional(control_path) is not None:
                 try:
-                    from agent_loop import _remove_private_tree
-
+                    ready = self._repository.load_typed_state(
+                        namespace="container-control-ready",
+                        key=command_sha256,
+                        value_type=ExecutionControlRecordV5,
+                    )
+                    if ready is None:
+                        raise ValueError("container control readiness is absent")
                     with acquire_absolute_directory_v5(
                         self._control_root,
                         expected_identity=(
                             self._control_root_info.st_dev,
                             self._control_root_info.st_ino,
                         ),
-                    ):
-                        _remove_private_tree(control_path)
+                    ) as parent:
+                        target_info = control_path.lstat()
+                        if ready != ExecutionControlRecordV5(
+                            5,
+                            self.executor_identity_sha256,
+                            command_sha256,
+                            _directory_identity(control_path, target_info),
+                        ):
+                            raise ValueError("container control cleanup authority changed")
+                        remove_owned_tree_in_directory_v5(
+                            parent,
+                            record.control_relative_path,
+                            expected_identity=(target_info.st_dev, target_info.st_ino),
+                        )
                 except BaseException:
                     raise ValueError("container control cleanup failed") from None
                 if _lstat_optional(control_path) is not None:
@@ -1833,29 +2188,6 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         if len(command_digests) != 1:
             raise ValueError("container cleanup leases span multiple executions")
         return command_digests.pop()
-
-    def _command_from_cleanup_record(
-        self,
-        record: ExecutionReservationRecordV5,
-        leases: tuple[OwnedLeaseV5, ...],
-    ) -> ContainerCommandV5:
-        capabilities = tuple(item.opaque_handle for item in leases)
-        if any(type(item) is not _ExecutionLeaseCapabilityV5 for item in capabilities):
-            raise ValueError("container cleanup command capability is absent")
-        commands = tuple(item.command for item in capabilities)  # type: ignore[union-attr]
-        if len(commands) != 2 or commands[0] != commands[1]:
-            raise ValueError("container cleanup commands disagree")
-        command = commands[0]
-        if (
-            command.sha256 != record.command_sha256
-            or command.request.sha256 != record.request_sha256
-            or command.argv != record.command_argv
-            or self._reservation_record(command) != record
-        ):
-            raise ValueError("container cleanup command is foreign")
-        self._authenticate_command(command)
-        return command
-
 
 __all__ = [
     "ExecutionCleanupRecordV5",
