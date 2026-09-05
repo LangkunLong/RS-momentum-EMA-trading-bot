@@ -70,6 +70,7 @@ from .runtime import (
     RuntimeFailureV5,
     run_feedback_round_v5,
 )
+from .production_provider import LocalRoleAuthorizationLedgerV5, OpenRouterOneShotJsonCompletionV5
 from .sandbox import (
     AuthenticatedCandidateBaseOperationsV5,
     AuthenticatedContainerExecutorV5,
@@ -169,11 +170,13 @@ __all__ = [
     "HypothesisV5",
     "InvestigatorArtifactV5",
     "LeaseAwareCandidateRuntimeV5",
+    "LocalRoleAuthorizationLedgerV5",
     "MetricCountV5",
     "MetricPredictionV5",
     "MaterializedWorkspaceV5",
     "OwnedWorkspaceHandleV5",
     "OptimizerSummaryV5",
+    "OpenRouterOneShotJsonCompletionV5",
     "PanelEvaluationV5",
     "PitPanelEvaluatorV5",
     "ProviderCapabilitiesV5",

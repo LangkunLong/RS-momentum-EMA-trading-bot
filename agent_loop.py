@@ -3856,6 +3856,103 @@ class OpenRouterGateway:
             )
         return self._client
 
+    def request_pit_optimizer_v5_json_once(
+        self,
+        *,
+        request_sha256: str,
+        model: str,
+        messages: tuple[Mapping[str, object], ...],
+        response_schema_json: bytes,
+        max_output_tokens: int,
+    ) -> object:
+        """Perform one retry-free V5 JSON-schema completion without owning its ledger."""
+
+        from core.pit_optimizer_v5.provider import CompletionResultV5
+
+        if (
+            type(request_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+            or type(model) is not str
+            or not model.strip()
+            or type(messages) is not tuple
+            or not messages
+            or any(not isinstance(item, Mapping) for item in messages)
+            or type(response_schema_json) is not bytes
+            or type(max_output_tokens) is not int
+            or max_output_tokens < 1
+        ):
+            raise ConfigurationError("V5 provider request is invalid")
+        try:
+            schema = json.loads(
+                response_schema_json.decode("utf-8"),
+                object_pairs_hook=lambda pairs: (
+                    (_ for _ in ()).throw(ValueError("duplicate schema key"))
+                    if len({key for key, _value in pairs}) != len(pairs)
+                    else dict(pairs)
+                ),
+            )
+        except (UnicodeDecodeError, ValueError, TypeError):
+            raise ConfigurationError("V5 provider schema is invalid") from None
+        if not isinstance(schema, Mapping):
+            raise ConfigurationError("V5 provider schema is invalid")
+        response = self._get_client().chat.completions.create(
+            model=model,
+            messages=list(messages),
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "pit_optimizer_v5_role",
+                    "strict": True,
+                    "schema": dict(schema),
+                },
+            },
+            stream=False,
+            max_tokens=max_output_tokens,
+            timeout=self.timeout_seconds,
+            extra_headers={"X-Session-Id": f"{self.run_id}:pit-optimizer-v5:{request_sha256[:16]}"},
+            extra_body={
+                "provider": {"require_parameters": True},
+                "reasoning": {"exclude": True},
+            },
+        )
+        usage = _usage_from_response(response, require_complete=True)
+        if (
+            usage.prompt_tokens is None
+            or usage.completion_tokens is None
+            or usage.cost_usd is None
+        ):
+            raise AccountingValidationError(
+                "V5 provider accounting is incomplete",
+                code=AccountingFailureCode.INLINE_USAGE_MISSING,
+            )
+        raw_model = _read_field(response, "model")
+        returned_model = raw_model if isinstance(raw_model, str) and raw_model.strip() else "unknown"
+        choices = _read_field(response, "choices")
+        choice = choices[0] if isinstance(choices, (list, tuple)) and len(choices) == 1 else None
+        content = _read_field(choice, "message", "content")
+        response_text = content if isinstance(content, str) else ""
+        accepted = bool(
+            _read_field(response, "error") is None
+            and choice is not None
+            and _read_field(choice, "finish_reason") == "stop"
+            and _read_field(choice, "message", "refusal") is None
+            and response_text.strip()
+            and returned_model == model
+        )
+        raw_request_id = _read_field(response, "id")
+        request_id = raw_request_id if isinstance(raw_request_id, str) and raw_request_id.strip() else None
+        return CompletionResultV5(
+            response_text=response_text,
+            accepted=accepted,
+            input_tokens=usage.prompt_tokens,
+            output_tokens=usage.completion_tokens,
+            provider_request_id=request_id,
+            returned_model=returned_model,
+            cost_usd=Decimal(str(usage.cost_usd)),
+            external_attempt_count=1,
+            response_received=True,
+        )
+
     def request(
         self,
         role: str,

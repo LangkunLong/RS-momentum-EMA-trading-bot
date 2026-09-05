@@ -1776,6 +1776,7 @@ class OneShotJsonCompletionV5(Protocol):
     def invoke_json_once(
         self,
         *,
+        request_sha256: str,
         model: str,
         messages: tuple[Mapping[str, object], ...],
         response_schema_json: bytes,
@@ -1783,49 +1784,6 @@ class OneShotJsonCompletionV5(Protocol):
         automatic_retries: int,
         schema_repair_calls: int,
     ) -> CompletionResultV5: ...
-
-
-class AuthenticatedOneShotJsonCompletionV5:
-    """Identity-bound production gateway capability supplied by the local host."""
-
-    __slots__ = ("_delegate", "audit_store_identity_sha256", "gateway_identity_sha256", "ledger_identity_sha256")
-
-    def __init__(
-        self,
-        *,
-        delegate: OneShotJsonCompletionV5,
-        gateway_identity_sha256: str,
-        ledger_identity_sha256: str,
-        audit_store_identity_sha256: str,
-    ) -> None:
-        if not isinstance(delegate, OneShotJsonCompletionV5):
-            raise ValueError("production gateway delegate is invalid")
-        self.gateway_identity_sha256 = _digest(gateway_identity_sha256, "production gateway identity")
-        self.ledger_identity_sha256 = _digest(ledger_identity_sha256, "production gateway ledger identity")
-        self.audit_store_identity_sha256 = _digest(
-            audit_store_identity_sha256,
-            "production gateway audit-store identity",
-        )
-        self._delegate = delegate
-
-    def invoke_json_once(
-        self,
-        *,
-        model: str,
-        messages: tuple[Mapping[str, object], ...],
-        response_schema_json: bytes,
-        max_output_tokens: int,
-        automatic_retries: int,
-        schema_repair_calls: int,
-    ) -> CompletionResultV5:
-        return self._delegate.invoke_json_once(
-            model=model,
-            messages=messages,
-            response_schema_json=response_schema_json,
-            max_output_tokens=max_output_tokens,
-            automatic_retries=automatic_retries,
-            schema_repair_calls=schema_repair_calls,
-        )
 
 
 class GatewayCompletionProviderV5:
@@ -1846,6 +1804,7 @@ class GatewayCompletionProviderV5:
         if type(request) is not ProviderCompletionRequestV5:
             raise ValueError("V5 gateway completion request is invalid")
         result = self._gateway.invoke_json_once(
+            request_sha256=request.role_request.sha256,
             model=request.model,
             messages=request.role_request.messages,
             response_schema_json=request.role_request.schema_authority.canonical_schema_json,
@@ -2276,9 +2235,24 @@ class RoleInvocationPackageV5:
         authority = self.terminal_authority
         if type(authority) is LedgerRoleTerminalAuthorityV5:
             receipt = authority.receipt
+            expected_slot_request_sha256 = (
+                None
+                if self.attempt.usage.requested_model is None
+                else RoleSlotRequestV5(
+                    self.request.sha256,
+                    self.call.role,
+                    self.call.attempt_kind,
+                    self.call.attempt_index,
+                    self.attempt.usage.requested_model,
+                    self.request.max_output_tokens,
+                ).sha256
+            )
             if (
                 authority.call_key_sha256 != self.call.sha256
-                or receipt.slot_request_sha256 != self.request.sha256
+                or (
+                    expected_slot_request_sha256 is not None
+                    and receipt.slot_request_sha256 != expected_slot_request_sha256
+                )
                 or receipt.attempt_facts_sha256 != self.attempt.sha256
                 or self.attempt.slot_id != receipt.slot_id
             ):
@@ -2391,6 +2365,7 @@ class RoleAuthorizationLifecycleV5(Protocol):
         self,
         slot: AuthorizedRoleSlotV5,
         facts: RoleAttemptFactsV5,
+        artifact: ParsedRoleArtifactV5 | None,
     ) -> RoleTerminalReceiptV5: ...
 
     def settle_unreported_role_slot(
@@ -2423,79 +2398,83 @@ class LedgerRoleAuthorizationLifecycleV5(RoleAuthorizationLifecycleV5, Protocol)
     def ledger_identity_sha256(self) -> str: ...
 
 
-class AuthenticatedRoleLedgerV5:
-    """Exact identity-bound production authorization and reconciliation capability."""
+@dataclass(frozen=True, slots=True)
+class RoleLedgerReservationV5:
+    schema_version: Literal[5]
+    campaign_id: str
+    campaign_manifest_sha256: str
+    ledger_identity_sha256: str
+    audit_store_identity_sha256: str
+    slot: AuthorizedRoleSlotV5
 
-    __slots__ = (
-        "_lifecycle",
-        "_reconciler",
-        "audit_store_identity_sha256",
-        "campaign_manifest_sha256",
-        "ledger_identity_sha256",
-    )
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("role-ledger reservation schema is invalid")
+        _text(self.campaign_id, "role-ledger campaign")
+        _digest(self.campaign_manifest_sha256, "role-ledger manifest")
+        _digest(self.ledger_identity_sha256, "role-ledger identity")
+        _digest(self.audit_store_identity_sha256, "role-ledger audit-store identity")
+        if type(self.slot) is not AuthorizedRoleSlotV5:
+            raise ValueError("role-ledger reservation slot is invalid")
 
-    def __init__(
-        self,
-        *,
-        lifecycle: RoleAuthorizationLifecycleV5,
-        reconciler: PaidRoleReconcilerV5,
-        campaign_manifest_sha256: str,
-        ledger_identity_sha256: str,
-        audit_store_identity_sha256: str,
-    ) -> None:
-        if not isinstance(lifecycle, RoleAuthorizationLifecycleV5) or not isinstance(
-            reconciler,
-            PaidRoleReconcilerV5,
-        ):
-            raise ValueError("production role-ledger delegates are invalid")
-        self.campaign_manifest_sha256 = _digest(
-            campaign_manifest_sha256,
-            "production role-ledger manifest",
-        )
-        self.ledger_identity_sha256 = _digest(ledger_identity_sha256, "production role-ledger identity")
-        self.audit_store_identity_sha256 = _digest(
-            audit_store_identity_sha256,
-            "production role-ledger audit-store identity",
-        )
-        self._lifecycle = lifecycle
-        self._reconciler = reconciler
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
 
-    def reserve_role_slot(self, request: RoleSlotRequestV5) -> AuthorizedRoleSlotV5:
-        return self._lifecycle.reserve_role_slot(request)
 
-    def verify_role_slot(self, slot: AuthorizedRoleSlotV5) -> None:
-        self._lifecycle.verify_role_slot(slot)
+@dataclass(frozen=True, slots=True)
+class RoleLedgerTerminalV5:
+    schema_version: Literal[5]
+    reservation_sha256: str
+    facts: RoleAttemptFactsV5
+    receipt: RoleTerminalReceiptV5
+    artifact: ParsedRoleArtifactV5 | None
 
-    def settle_role_slot(
-        self,
-        slot: AuthorizedRoleSlotV5,
-        facts: RoleAttemptFactsV5,
-    ) -> RoleTerminalReceiptV5:
-        return self._lifecycle.settle_role_slot(slot, facts)
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("role-ledger terminal schema is invalid")
+        _digest(self.reservation_sha256, "role-ledger reservation")
+        if type(self.facts) is not RoleAttemptFactsV5 or type(self.receipt) is not RoleTerminalReceiptV5:
+            raise ValueError("role-ledger terminal facts are invalid")
+        if self.receipt.attempt_facts_sha256 != self.facts.sha256:
+            raise ValueError("role-ledger terminal receipt differs from facts")
+        if (self.facts.outcome == "accepted") != (self.artifact is not None):
+            raise ValueError("role-ledger terminal artifact state is invalid")
+        if self.artifact is not None:
+            if canonical_sha256_v5(self.artifact) != self.facts.artifact_sha256:
+                raise ValueError("role-ledger terminal artifact differs from facts")
 
-    def settle_unreported_role_slot(
-        self,
-        slot: AuthorizedRoleSlotV5,
-        failure_code: RoleFailureCode,
-    ) -> RecoveredRoleTerminalV5:
-        return self._lifecycle.settle_unreported_role_slot(slot, failure_code)
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
 
-    def recover_role_slot(self, slot: AuthorizedRoleSlotV5) -> RecoveredRoleTerminalV5 | None:
-        return self._lifecycle.recover_role_slot(slot)
 
-    def verify_role_slot_receipt(
-        self,
-        slot: AuthorizedRoleSlotV5,
-        facts: RoleAttemptFactsV5,
-        receipt: RoleTerminalReceiptV5,
-    ) -> None:
-        self._lifecycle.verify_role_slot_receipt(slot, facts, receipt)
+@dataclass(frozen=True, slots=True)
+class RoleProviderResponseV5:
+    """Exact paid provider response published before the caller consumes it."""
 
-    def reconcile_paid_role(
-        self,
-        persisted_request: ExistingPersistedRoleRequestV5,
-    ) -> RoleReconciliationResultV5:
-        return self._reconciler.reconcile_paid_role(persisted_request)
+    schema_version: Literal[5]
+    campaign_id: str
+    campaign_manifest_sha256: str
+    ledger_identity_sha256: str
+    audit_store_identity_sha256: str
+    request_sha256: str
+    completion: CompletionResultV5
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("provider-response schema is invalid")
+        _text(self.campaign_id, "provider-response campaign")
+        _digest(self.campaign_manifest_sha256, "provider-response manifest")
+        _digest(self.ledger_identity_sha256, "provider-response ledger")
+        _digest(self.audit_store_identity_sha256, "provider-response audit store")
+        _digest(self.request_sha256, "provider-response request")
+        if type(self.completion) is not CompletionResultV5:
+            raise ValueError("provider-response completion is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
 
 
 @runtime_checkable
@@ -2560,6 +2539,15 @@ def _canonical_response_sha256(response_text: str) -> str | None:
     except ValueError:
         return None
     return hashlib.sha256(canonical_json_bytes_v5(decoded)).hexdigest()
+
+
+def canonical_role_response_sha256_v5(response_text: str) -> str:
+    """Return the exact canonical identity used by durable role-attempt facts."""
+
+    digest = _canonical_response_sha256(response_text)
+    if digest is None:
+        raise ValueError("role response is not a JSON object")
+    return digest
 
 
 class AuthorizedRoleRunnerV5:
@@ -2782,11 +2770,12 @@ class AuthorizedRoleRunnerV5:
         attempt_index: int,
         slot: AuthorizedRoleSlotV5,
         facts: RoleAttemptFactsV5,
+        artifact: ParsedRoleArtifactV5 | None = None,
         allow_stale_slot_prior: bool = False,
     ) -> RoleTerminalReceiptV5:
         receipt: RoleTerminalReceiptV5 | None
         try:
-            receipt = self._lifecycle.settle_role_slot(slot, facts)
+            receipt = self._lifecycle.settle_role_slot(slot, facts, artifact)
             self._validate_receipt(
                 slot=slot,
                 facts=facts,
@@ -3083,6 +3072,7 @@ class AuthorizedRoleRunnerV5:
             attempt_index=attempt_index,
             slot=slot,
             facts=facts,
+            artifact=artifact,
         )
         return artifact
 
@@ -3291,8 +3281,6 @@ class FixtureRoleRunnerV5:
 
 __all__ = [
     "ArchiveFamilyAggregateV5",
-    "AuthenticatedOneShotJsonCompletionV5",
-    "AuthenticatedRoleLedgerV5",
     "AuthorPolicyContractsV5",
     "AuthorRoleInputV5",
     "AuthorizedRoleRunnerV5",
@@ -3339,6 +3327,9 @@ __all__ = [
     "RoleOutcomeV5",
     "RoleInputV5",
     "RoleInvocationPackageV5",
+    "RoleLedgerReservationV5",
+    "RoleLedgerTerminalV5",
+    "RoleProviderResponseV5",
     "RoleRequestV5",
     "RoleReconciliationFailureCodeV5",
     "RoleReconciliationFailureV5",
@@ -3354,6 +3345,7 @@ __all__ = [
     "ScenarioAggregateV5",
     "TestableExperimentStatusV5",
     "build_role_request_v5",
+    "canonical_role_response_sha256_v5",
     "decode_parsed_role_artifact_v5",
     "parse_and_bind_role_artifact",
     "parsed_role_artifact_primitive_v5",

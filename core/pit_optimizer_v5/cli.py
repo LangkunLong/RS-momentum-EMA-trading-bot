@@ -23,10 +23,12 @@ from core.pit_optimizer_v5.contracts import (
     validate_sandbox_profile_resources_v5,
 )
 from core.pit_optimizer_v5.provider import (
-    AuthenticatedOneShotJsonCompletionV5,
-    AuthenticatedRoleLedgerV5,
     GatewayCompletionProviderV5,
     LedgerBackedRoleInvokerV5,
+)
+from core.pit_optimizer_v5.production_provider import (
+    LocalRoleAuthorizationLedgerV5,
+    OpenRouterOneShotJsonCompletionV5,
 )
 from core.pit_optimizer_v5.runtime import (
     FeedbackRoundDependenciesV5,
@@ -218,8 +220,8 @@ class ProductionRoundCompositionV5:
         panel_evaluator = candidate.panel_evaluator
         executor = panel_evaluator.evaluator.executor
         if (
-            type(gateway) is not AuthenticatedOneShotJsonCompletionV5
-            or type(lifecycle) is not AuthenticatedRoleLedgerV5
+            type(gateway) is not OpenRouterOneShotJsonCompletionV5
+            or type(lifecycle) is not LocalRoleAuthorizationLedgerV5
             or self.dependencies.invoker.reconciler is not lifecycle
             or lifecycle.campaign_manifest_sha256 != authorities.manifest.sha256
             or lifecycle.ledger_identity_sha256 != adapter_config.ledger_identity_sha256

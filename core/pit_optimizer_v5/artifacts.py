@@ -88,10 +88,14 @@ from core.pit_optimizer_v5.provider import (
     RoleFailureCode,
     RoleInputV5,
     RoleInvocationPackageV5,
+    RoleLedgerReservationV5,
+    RoleLedgerTerminalV5,
     RoleNameV5,
+    RoleProviderResponseV5,
     RoleRequestV5,
     RoleSchemaAuthorityV5,
     RoleTerminalAuthorityV5,
+    RoleTerminalReceiptV5,
     decode_parsed_role_artifact_v5,
     parsed_role_artifact_primitive_v5,
     role_request_artifact_primitive_v5,
@@ -323,6 +327,30 @@ def _decode_dataclass(cls: type[T], value: object) -> T:
     hints = get_type_hints(cls)
     decoded = {item.name: _decode_value(hints[item.name], primitive[item.name]) for item in fields(cls) if item.init}
     return cls(**decoded)
+
+
+def _decode_role_ledger_terminal(value: object) -> RoleLedgerTerminalV5:
+    primitive = _exact_keys(
+        value,
+        {"schema_version", "reservation_sha256", "facts", "receipt", "artifact"},
+    )
+    facts = _decode_role_attempt(primitive["facts"])
+    artifact_value = primitive["artifact"]
+    artifact = (
+        None
+        if artifact_value is None
+        else decode_parsed_role_artifact_v5(
+            role=facts.role,
+            primitive={"role": facts.role, "artifact": artifact_value},
+        )
+    )
+    return RoleLedgerTerminalV5(
+        schema_version=_decode_value(Literal[5], primitive["schema_version"]),  # type: ignore[arg-type]
+        reservation_sha256=_decode_value(str, primitive["reservation_sha256"]),  # type: ignore[arg-type]
+        facts=facts,
+        receipt=_decode_dataclass(RoleTerminalReceiptV5, primitive["receipt"]),
+        artifact=artifact,
+    )
 
 
 def _decode_role_request(value: object) -> RoleRequestV5:
@@ -1050,6 +1078,109 @@ class LocalArtifactRepositoryV5:
         digest = hashlib.sha256(canonical_json_bytes_v5(primitive)).hexdigest()
         return self._create_only(f"inputs/{kind}/{digest}.json", primitive)
 
+    def _create_or_authenticate_typed(self, relative_path: str, value: object) -> ArtifactRefV5:
+        raw = canonical_json_bytes_v5(value)
+        reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
+        try:
+            return self._create_only(relative_path, canonical_primitive_v5(value))
+        except ArtifactExistsV5:
+            authenticated = self.authenticate(reference)
+            if authenticated.content != raw:
+                raise ArtifactDigestMismatchV5(
+                    reference,
+                    hashlib.sha256(authenticated.content).hexdigest(),
+                ) from None
+            return reference
+
+    def append_role_ledger_reservation(self, record: RoleLedgerReservationV5) -> ArtifactRefV5:
+        if type(record) is not RoleLedgerReservationV5:
+            raise ValueError("role-ledger reservation is invalid")
+        campaign = _safe_component(record.campaign_id, "role-ledger campaign")
+        slot = _safe_component(record.slot.slot_id, "role-ledger slot")
+        return self._create_or_authenticate_typed(
+            f"authorization/{campaign}/reservations/{slot}.json",
+            record,
+        )
+
+    def append_role_ledger_terminal(
+        self,
+        campaign_id: str,
+        slot_id: str,
+        terminal: RoleLedgerTerminalV5,
+    ) -> ArtifactRefV5:
+        if type(terminal) is not RoleLedgerTerminalV5:
+            raise ValueError("role-ledger terminal is invalid")
+        campaign = _safe_component(campaign_id, "role-ledger campaign")
+        slot = _safe_component(slot_id, "role-ledger slot")
+        return self._create_or_authenticate_typed(
+            f"authorization/{campaign}/terminals/{slot}.json",
+            terminal,
+        )
+
+    def append_role_provider_response(self, response: RoleProviderResponseV5) -> ArtifactRefV5:
+        if type(response) is not RoleProviderResponseV5:
+            raise ValueError("role provider response is invalid")
+        campaign = _safe_component(response.campaign_id, "role provider-response campaign")
+        request = _safe_component(response.request_sha256, "role provider-response request")
+        return self._create_or_authenticate_typed(
+            f"authorization/{campaign}/responses/{request}.json",
+            response,
+        )
+
+    def load_role_provider_response(
+        self,
+        *,
+        campaign_id: str,
+        request_sha256: str,
+    ) -> RoleProviderResponseV5 | None:
+        campaign = _safe_component(campaign_id, "role provider-response campaign")
+        request = _safe_component(request_sha256, "role provider-response request")
+        relative = f"authorization/{campaign}/responses/{request}.json"
+        try:
+            raw = self._read_relative(relative)
+        except ArtifactMissingV5:
+            return None
+        reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
+        response = self.load_typed_artifact(reference, value_type=RoleProviderResponseV5)
+        if response.campaign_id != campaign_id or response.request_sha256 != request_sha256:
+            raise ArtifactSchemaFailureV5(reference)
+        return response
+
+    def load_role_ledger_records(
+        self,
+        *,
+        campaign_id: str,
+    ) -> tuple[tuple[RoleLedgerReservationV5, ...], tuple[RoleLedgerTerminalV5, ...]]:
+        campaign = _safe_component(campaign_id, "role-ledger campaign")
+
+        def load_group(group: str, value_type: type[T]) -> tuple[T, ...]:
+            try:
+                names = self._names(("authorization", campaign, group))
+            except ArtifactMissingV5:
+                return ()
+            values: list[T] = []
+            for name in names:
+                if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                    raise ArtifactSchemaFailureV5()
+                relative = f"authorization/{campaign}/{group}/{name}"
+                raw = self._read_relative(relative)
+                reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
+                value = self.load_typed_artifact(reference, value_type=value_type)
+                expected_slot = (
+                    value.slot.slot_id
+                    if type(value) is RoleLedgerReservationV5
+                    else value.receipt.slot_id
+                )
+                if name != f"{expected_slot}.json":
+                    raise ArtifactSchemaFailureV5(reference)
+                values.append(value)
+            return tuple(values)
+
+        return (
+            load_group("reservations", RoleLedgerReservationV5),
+            load_group("terminals", RoleLedgerTerminalV5),
+        )
+
     def load_typed_artifact(self, reference: ArtifactRefV5, *, value_type: type[T]) -> T:
         """Authenticate exact canonical dataclass bytes without an extra envelope."""
 
@@ -1057,9 +1188,11 @@ class LocalArtifactRepositoryV5:
             raise ValueError("typed artifact type must be a dataclass")
         authenticated = self.authenticate(reference)
         try:
-            value = _decode_dataclass(
-                value_type,
-                _strict_json_object(authenticated.content, reference),
+            primitive = _strict_json_object(authenticated.content, reference)
+            value = (
+                _decode_role_ledger_terminal(primitive)
+                if value_type is RoleLedgerTerminalV5
+                else _decode_dataclass(value_type, primitive)
             )
         except ArtifactRepositoryFailureV5:
             raise
