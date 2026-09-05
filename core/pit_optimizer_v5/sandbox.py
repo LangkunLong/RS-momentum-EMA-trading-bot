@@ -31,6 +31,7 @@ from core.pit_optimizer_v5.contracts import (
     validate_sandbox_profile_resources_v5,
 )
 from core.pit_optimizer_v5.memory import CleanupResultPayloadV5
+from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 from core.pit_optimizer_v5.probes import (
     PROBE_SUITE_ID_V5,
     ProbeObservationV5,
@@ -136,8 +137,12 @@ class SandboxMountHandleV5:
             or any(character in self.host_path for character in {",", "\x00", "\n", "\r"})
         ):
             raise ValueError("sandbox mount host path is invalid")
-        expected_target = {"source": "/pit/source", "data": "/pit/data", "output": "/pit/output"}[self.kind]
-        if self.container_path != expected_target:
+        expected_targets = {
+            "source": {"/pit/source", "/pit/candidate"},
+            "data": {"/pit/data"},
+            "output": {"/pit/output"},
+        }[self.kind]
+        if self.container_path not in expected_targets:
             raise ValueError("sandbox mount target is not the closed V5 target")
         if self.kind == "output":
             _positive(self.maximum_bytes, "sandbox output mount bound")
@@ -158,6 +163,28 @@ class SandboxMountHandleV5:
         }
 
 
+def derive_trusted_probe_runtime_authority_v5(
+    *,
+    evaluator_contract: EvaluatorContractV5,
+    sandbox_profile: SandboxProfileV5,
+) -> str:
+    if (
+        type(evaluator_contract) is not EvaluatorContractV5
+        or type(sandbox_profile) is not SandboxProfileV5
+        or evaluator_contract.sandbox_profile_sha256 != sandbox_profile.sha256
+    ):
+        raise ValueError("trusted probe runtime authority is invalid")
+    return canonical_sha256_v5(
+        {
+            "domain": "pit-optimizer-v5-trusted-probe-runtime-v1",
+            "evaluator_contract_sha256": evaluator_contract.sha256,
+            "sandbox_profile_sha256": sandbox_profile.sha256,
+            "runtime_source_sha256": sandbox_profile.runtime_source_sha256,
+            "probe_suite_id": PROBE_SUITE_ID_V5,
+        }
+    )
+
+
 def derive_sandbox_mount_authorities_v5(
     *,
     owner: WorkspaceOwnerV5,
@@ -167,7 +194,7 @@ def derive_sandbox_mount_authorities_v5(
     panel: EpisodePlanV5,
     scenario_ids: tuple[str, ...],
     execution_key: CandidateExecutionKeyV5,
-) -> tuple[str, str, str]:
+) -> tuple[str, str | None, str]:
     """Bind every mount's contents to the complete evaluation authority."""
 
     if (
@@ -188,16 +215,28 @@ def derive_sandbox_mount_authorities_v5(
         "scenario_ids": scenario_ids,
         "execution_key": canonical_primitive_v5(execution_key),
     }
-    return (
-        canonical_sha256_v5({**common, "kind": "source"}),
-        canonical_sha256_v5(
+    if execution_key.stage == "semantic_probe":
+        common["trusted_probe_runtime_authority_sha256"] = (
+            derive_trusted_probe_runtime_authority_v5(
+                evaluator_contract=evaluator_contract,
+                sandbox_profile=sandbox_profile,
+            )
+        )
+    data_authority = (
+        None
+        if execution_key.stage == "semantic_probe"
+        else canonical_sha256_v5(
             {
                 **common,
                 "kind": "data",
                 "pit_bundle_sha256": evaluator_contract.pit_bundle_sha256,
                 "prices_provenance_sha256": evaluator_contract.prices_provenance_sha256,
             }
-        ),
+        )
+    )
+    return (
+        canonical_sha256_v5({**common, "kind": "source"}),
+        data_authority,
         canonical_sha256_v5({**common, "kind": "output", "owner_sha256": owner.sha256}),
     )
 
@@ -213,7 +252,7 @@ class DockerPanelRequestV5:
     panel: EpisodePlanV5
     scenario_ids: tuple[str, ...]
     source_mount: SandboxMountHandleV5
-    data_mount: SandboxMountHandleV5
+    data_mount: SandboxMountHandleV5 | None
     output_mount: SandboxMountHandleV5
 
     def __post_init__(self) -> None:
@@ -252,32 +291,37 @@ class DockerPanelRequestV5:
         )
         if self.scenario_ids not in permitted_scenarios:
             raise ValueError("Docker panel scenarios are outside the quick/full closed scopes")
+        semantic_probe = self.execution_key.stage == "semantic_probe"
         if (
             type(self.source_mount) is not SandboxMountHandleV5
-            or type(self.data_mount) is not SandboxMountHandleV5
             or type(self.output_mount) is not SandboxMountHandleV5
-            or (self.source_mount.kind, self.data_mount.kind, self.output_mount.kind) != ("source", "data", "output")
+            or self.source_mount.kind != "source"
+            or self.output_mount.kind != "output"
+            or self.source_mount.container_path
+            != ("/pit/candidate" if semantic_probe else "/pit/source")
+            or (
+                semantic_probe
+                and self.data_mount is not None
+            )
+            or (
+                not semantic_probe
+                and (
+                    type(self.data_mount) is not SandboxMountHandleV5
+                    or self.data_mount.kind != "data"
+                )
+            )
         ):
             raise ValueError("Docker panel mount capabilities are invalid")
         if self.output_mount.maximum_bytes != self.manifest.resources.evaluation_output_limit_bytes:
             raise ValueError("Docker panel output mount differs from manifest authority")
+        mounts = (
+            (self.source_mount, self.output_mount)
+            if self.data_mount is None
+            else (self.source_mount, self.data_mount, self.output_mount)
+        )
         if (
-            len(
-                {
-                    self.source_mount.root_identity_sha256,
-                    self.data_mount.root_identity_sha256,
-                    self.output_mount.root_identity_sha256,
-                }
-            )
-            != 3
-            or len(
-                {
-                    _windows_key(self.source_mount.host_path),
-                    _windows_key(self.data_mount.host_path),
-                    _windows_key(self.output_mount.host_path),
-                }
-            )
-            != 3
+            len({item.root_identity_sha256 for item in mounts}) != len(mounts)
+            or len({_windows_key(item.host_path) for item in mounts}) != len(mounts)
         ):
             raise ValueError("Docker panel mount roots must be distinct")
         expected = derive_sandbox_mount_authorities_v5(
@@ -291,7 +335,7 @@ class DockerPanelRequestV5:
         )
         if (
             self.source_mount.content_authority_sha256,
-            self.data_mount.content_authority_sha256,
+            None if self.data_mount is None else self.data_mount.content_authority_sha256,
             self.output_mount.content_authority_sha256,
         ) != expected:
             raise ValueError("Docker panel mount contents differ from request authority")
@@ -306,10 +350,13 @@ class DockerPanelRequestV5:
             "sandbox_profile_sha256": self.sandbox_profile.sha256,
             "panel": canonical_primitive_v5(self.panel),
             "scenario_ids": self.scenario_ids,
-            "mounts": (
-                self.source_mount.authority_primitive(),
-                self.data_mount.authority_primitive(),
-                self.output_mount.authority_primitive(),
+            "mounts": tuple(
+                item.authority_primitive()
+                for item in (
+                    (self.source_mount, self.output_mount)
+                    if self.data_mount is None
+                    else (self.source_mount, self.data_mount, self.output_mount)
+                )
             ),
         }
 
@@ -669,7 +716,7 @@ class SandboxMountFactoryV5(Protocol):
         panel: EpisodePlanV5,
         scenario_ids: tuple[str, ...],
         execution_key: CandidateExecutionKeyV5,
-    ) -> tuple[SandboxMountHandleV5, SandboxMountHandleV5, SandboxMountHandleV5]: ...
+    ) -> tuple[SandboxMountHandleV5, ...]: ...
 
 
 class AuthenticatedSandboxMountFactoryV5:
@@ -688,7 +735,7 @@ class AuthenticatedSandboxMountFactoryV5:
         panel: EpisodePlanV5,
         scenario_ids: tuple[str, ...],
         execution_key: CandidateExecutionKeyV5,
-    ) -> tuple[SandboxMountHandleV5, SandboxMountHandleV5, SandboxMountHandleV5]:
+    ) -> tuple[SandboxMountHandleV5, ...]:
         return self._delegate.mounts_for(
             materialized=materialized,
             panel=panel,
@@ -700,6 +747,26 @@ class AuthenticatedSandboxMountFactoryV5:
 def _mount_arg(mount: SandboxMountHandleV5) -> str:
     options = f"type=bind,src={mount.host_path},dst={mount.container_path}"
     return f"{options},readonly" if mount.mode == "read_only" else options
+
+
+def _semantic_policy_mount_args_v5(
+    source_mount: SandboxMountHandleV5,
+) -> tuple[str, ...]:
+    if source_mount.kind != "source" or source_mount.container_path != "/pit/candidate":
+        raise ValueError("semantic source mount is invalid")
+    arguments: list[str] = []
+    for relative in EDITABLE_POLICY_PATHS_V5:
+        name = relative.rsplit("/", 1)[-1]
+        arguments.extend(
+            (
+                "--mount",
+                (
+                    f"type=bind,src={ntpath.join(source_mount.host_path, *relative.split('/'))},"
+                    f"dst={source_mount.container_path}/{name},readonly"
+                ),
+            )
+        )
+    return tuple(arguments)
 
 
 def execution_output_name_v5(request: DockerPanelRequestV5) -> str:
@@ -734,10 +801,24 @@ def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
         cpu,
         "--memory",
         f"{request.manifest.resources.evaluation_memory_mib}m",
-        "--mount",
-        _mount_arg(request.source_mount),
-        "--mount",
-        _mount_arg(request.data_mount),
+    ]
+    if request.execution_key.stage == "semantic_probe":
+        if request.data_mount is not None:
+            raise ValueError("semantic probe cannot mount PIT data")
+        argv.extend(_semantic_policy_mount_args_v5(request.source_mount))
+    else:
+        if type(request.data_mount) is not SandboxMountHandleV5:
+            raise ValueError("panel evaluation requires the PIT data mount")
+        argv.extend(
+            (
+                "--mount",
+                _mount_arg(request.source_mount),
+                "--mount",
+                _mount_arg(request.data_mount),
+            )
+        )
+    argv.extend(
+        (
         "--mount",
         _mount_arg(request.output_mount),
         "--tmpfs",
@@ -747,7 +828,8 @@ def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
         "python",
         "-B",
         "-m",
-    ]
+        )
+    )
     if request.execution_key.stage == "semantic_probe":
         argv.extend(
             (
@@ -762,6 +844,17 @@ def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
                 request.policy_revision.immutable_constraints_sha256,
                 "--suite-id",
                 PROBE_SUITE_ID_V5,
+                "--evaluator-contract-sha256",
+                request.evaluator_contract.sha256,
+                "--sandbox-profile-sha256",
+                request.sandbox_profile.sha256,
+                "--probe-runtime-sha256",
+                request.sandbox_profile.runtime_source_sha256,
+                "--probe-runtime-authority-sha256",
+                derive_trusted_probe_runtime_authority_v5(
+                    evaluator_contract=request.evaluator_contract,
+                    sandbox_profile=request.sandbox_profile,
+                ),
                 "--call-timeout-seconds",
                 str(request.manifest.resources.policy_method_timeout_seconds),
                 "--output-limit-bytes",
@@ -1565,7 +1658,8 @@ class DockerCandidateRuntimeV5:
             scenario_ids=scenario_ids,
             execution_key=execution_key,
         )
-        if type(supplied) is not tuple or len(supplied) != 3:
+        semantic_probe = execution_key.stage == "semantic_probe"
+        if type(supplied) is not tuple or len(supplied) != (2 if semantic_probe else 3):
             raise ValueError("Docker candidate runtime mounts are invalid")
         return DockerPanelRequestV5(
             owner=self._owner,
@@ -1577,8 +1671,8 @@ class DockerCandidateRuntimeV5:
             panel=panel,
             scenario_ids=scenario_ids,
             source_mount=supplied[0],
-            data_mount=supplied[1],
-            output_mount=supplied[2],
+            data_mount=None if semantic_probe else supplied[1],
+            output_mount=supplied[1] if semantic_probe else supplied[2],
         )
 
     def evaluate_quick(self, materialized: MaterializedVariantV5, *, deadline: StageDeadlineV5) -> PanelEvaluationV5:
@@ -1748,6 +1842,7 @@ __all__ = [
     "build_docker_argv_v5",
     "decode_panel_evaluation_v5",
     "decode_semantic_fingerprint_output_v5",
+    "derive_trusted_probe_runtime_authority_v5",
     "derive_sandbox_mount_authorities_v5",
     "derive_execution_lease_id_v5",
     "execution_output_name_v5",

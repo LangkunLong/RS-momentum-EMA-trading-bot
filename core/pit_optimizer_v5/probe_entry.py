@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import select
+import stat
 import subprocess
 import sys
 
@@ -15,7 +16,7 @@ from core.pit_optimizer_v5.candidate_ir import (
     SourceFileV5,
     derive_policy_revision_identity_v5,
 )
-from core.pit_optimizer_v5.contracts import canonical_json_bytes_v5
+from core.pit_optimizer_v5.contracts import canonical_json_bytes_v5, canonical_sha256_v5
 from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 from core.pit_optimizer_v5.probes import (
     PROBE_SUITE_ID_V5,
@@ -34,10 +35,13 @@ from core.strategy_policy.worker import (
 )
 
 
-_SOURCE_ROOT = Path("/pit/source")
+_POLICY_OVERLAY_ROOT = Path("/pit/candidate")
 _OUTPUT_ROOT = Path("/pit/output")
 _OUTPUT_NAME = "semantic-fingerprint.json"
 _MAX_POLICY_SOURCE_BYTES = 131_072
+_OVERLAY_FILE_BY_POLICY_PATH = {
+    relative: relative.rsplit("/", 1)[-1] for relative in EDITABLE_POLICY_PATHS_V5
+}
 
 
 def _digest(value: str, label: str) -> str:
@@ -53,6 +57,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--trusted-runtime-sha256", required=True)
     parser.add_argument("--immutable-constraints-sha256", required=True)
     parser.add_argument("--suite-id", required=True)
+    parser.add_argument("--evaluator-contract-sha256", required=True)
+    parser.add_argument("--sandbox-profile-sha256", required=True)
+    parser.add_argument("--probe-runtime-sha256", required=True)
+    parser.add_argument("--probe-runtime-authority-sha256", required=True)
     parser.add_argument("--call-timeout-seconds", required=True, type=float)
     parser.add_argument("--output-limit-bytes", required=True, type=int)
     return parser
@@ -60,28 +68,69 @@ def _parser() -> argparse.ArgumentParser:
 
 def _read_policy_source() -> SourceBundleV5:
     files: list[SourceFileV5] = []
-    root = _SOURCE_ROOT.resolve(strict=True)
-    if root != _SOURCE_ROOT or root.is_symlink() or not root.is_dir():
-        raise ValueError("probe source root is invalid")
-    for relative in EDITABLE_POLICY_PATHS_V5:
-        path = root.joinpath(*relative.split("/"))
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("probe policy source is invalid")
-        raw = path.read_bytes()
-        if not raw or len(raw) > _MAX_POLICY_SOURCE_BYTES:
-            raise ValueError("probe policy source is invalid")
-        files.append(SourceFileV5(relative, raw.decode("utf-8", errors="strict")))
+    directory_fd = os.open(
+        _POLICY_OVERLAY_ROOT,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            raise ValueError("probe policy overlay is invalid")
+        for relative in EDITABLE_POLICY_PATHS_V5:
+            descriptor = os.open(
+                _OVERLAY_FILE_BY_POLICY_PATH[relative],
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                before = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or not 0 < before.st_size <= _MAX_POLICY_SOURCE_BYTES
+                ):
+                    raise ValueError("probe policy source is invalid")
+                chunks: list[bytes] = []
+                observed = 0
+                while True:
+                    chunk = os.read(
+                        descriptor,
+                        min(65_536, _MAX_POLICY_SOURCE_BYTES + 1 - observed),
+                    )
+                    if not chunk:
+                        break
+                    observed += len(chunk)
+                    if observed > _MAX_POLICY_SOURCE_BYTES:
+                        raise ValueError("probe policy source is invalid")
+                    chunks.append(chunk)
+                after = os.fstat(descriptor)
+                if (
+                    (before.st_dev, before.st_ino, before.st_size)
+                    != (after.st_dev, after.st_ino, after.st_size)
+                    or observed != before.st_size
+                ):
+                    raise ValueError("probe policy source changed")
+                raw = b"".join(chunks)
+            finally:
+                os.close(descriptor)
+            files.append(SourceFileV5(relative, raw.decode("utf-8", errors="strict")))
+    finally:
+        os.close(directory_fd)
     return SourceBundleV5(tuple(files))
 
 
 class _PolicyWorkerSessionV5:
     """One local V3 worker process contained by the already-owned outer sandbox."""
 
-    def __init__(self, *, call_timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        call_timeout_seconds: float,
+        source: SourceBundleV5,
+    ) -> None:
         if (
             type(call_timeout_seconds) is not float
             or not math.isfinite(call_timeout_seconds)
             or call_timeout_seconds <= 0
+            or type(source) is not SourceBundleV5
         ):
             raise ValueError("probe worker timeout is invalid")
         self._timeout = call_timeout_seconds
@@ -94,11 +143,24 @@ class _PolicyWorkerSessionV5:
             "PYTHONHASHSEED": "0",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": str(_SOURCE_ROOT),
         }
+        source_by_name = {
+            item.path.rsplit("/", 1)[-1].removesuffix(".py"): item.sha256
+            for item in source.files
+        }
+        worker_argv = [
+            sys.executable,
+            "-B",
+            "-m",
+            "core.strategy_policy.worker",
+            "--policy-overlay-root",
+            str(_POLICY_OVERLAY_ROOT),
+        ]
+        for name in ("entry", "risk", "position", "exit"):
+            worker_argv.extend((f"--policy-{name}-sha256", source_by_name[name]))
         self._process = subprocess.Popen(
-            (sys.executable, "-B", "-m", "core.strategy_policy.worker"),
-            cwd=_SOURCE_ROOT,
+            tuple(worker_argv),
+            cwd=Path("/"),
             env=environment,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -220,6 +282,33 @@ def main(argv: tuple[str, ...] | None = None) -> int:
             arguments.immutable_constraints_sha256,
             "immutable constraints",
         )
+        evaluator_contract_sha256 = _digest(
+            arguments.evaluator_contract_sha256,
+            "evaluator contract",
+        )
+        sandbox_profile_sha256 = _digest(
+            arguments.sandbox_profile_sha256,
+            "sandbox profile",
+        )
+        probe_runtime_sha256 = _digest(
+            arguments.probe_runtime_sha256,
+            "trusted probe runtime",
+        )
+        probe_runtime_authority_sha256 = _digest(
+            arguments.probe_runtime_authority_sha256,
+            "trusted probe authority",
+        )
+        expected_probe_authority = canonical_sha256_v5(
+            {
+                "domain": "pit-optimizer-v5-trusted-probe-runtime-v1",
+                "evaluator_contract_sha256": evaluator_contract_sha256,
+                "sandbox_profile_sha256": sandbox_profile_sha256,
+                "runtime_source_sha256": probe_runtime_sha256,
+                "probe_suite_id": PROBE_SUITE_ID_V5,
+            }
+        )
+        if probe_runtime_authority_sha256 != expected_probe_authority:
+            raise ValueError("trusted probe runtime authority differs")
         if arguments.suite_id != PROBE_SUITE_ID_V5:
             raise ValueError("probe suite is invalid")
         source = _read_policy_source()
@@ -232,6 +321,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
             raise ValueError("probe policy identity differs")
         session = _PolicyWorkerSessionV5(
             call_timeout_seconds=float(arguments.call_timeout_seconds),
+            source=source,
         )
         client = JsonLinePolicyClient(
             session=session,

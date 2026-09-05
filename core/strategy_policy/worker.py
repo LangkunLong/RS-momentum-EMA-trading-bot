@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 from collections import OrderedDict
 from dataclasses import dataclass, fields
@@ -9,7 +10,9 @@ import hashlib
 import hmac
 from importlib import import_module
 import json
+import os
 import secrets
+import stat
 import sys
 from types import ModuleType
 from typing import Callable, Mapping
@@ -52,6 +55,121 @@ _METHOD_TYPES = {
     "evaluate_exit": (ExitSnapshot, ExitDecision),
 }
 _SUPPORTED_INTERFACE_VERSIONS = frozenset({2, 3})
+_POLICY_OVERLAY_ROOT_V3 = "/pit/candidate"
+_POLICY_OVERLAY_FILES_V3 = (
+    ("entry", "entry.py"),
+    ("risk", "risk.py"),
+    ("position", "position.py"),
+    ("exit", "exit.py"),
+)
+_MAX_POLICY_SOURCE_BYTES_V3 = 131_072
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicyOverlayV3:
+    root: str
+    source_sha256: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if self.root != _POLICY_OVERLAY_ROOT_V3 or tuple(
+            name for name, _digest_value in self.source_sha256
+        ) != tuple(name for name, _file_name in _POLICY_OVERLAY_FILES_V3):
+            raise ValueError("V3 policy overlay authority is invalid")
+        tuple(_sha256(value, "overlay source") for _name, value in self.source_sha256)
+
+
+def _policy_overlay_v3(argv: tuple[str, ...]) -> _PolicyOverlayV3 | None:
+    if not argv:
+        return None
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--policy-overlay-root", required=True)
+    for module_name, _file_name in _POLICY_OVERLAY_FILES_V3:
+        parser.add_argument(f"--policy-{module_name}-sha256", required=True)
+    arguments = parser.parse_args(argv)
+    return _PolicyOverlayV3(
+        arguments.policy_overlay_root,
+        tuple(
+            (module_name, getattr(arguments, f"policy_{module_name}_sha256"))
+            for module_name, _file_name in _POLICY_OVERLAY_FILES_V3
+        ),
+    )
+
+
+def _read_policy_overlay_file_v3(
+    directory_fd: int,
+    *,
+    file_name: str,
+    expected_sha256: str,
+) -> bytes:
+    descriptor = os.open(
+        file_name,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= _MAX_POLICY_SOURCE_BYTES_V3:
+            raise ValueError("V3 policy overlay file is invalid")
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(65_536, _MAX_POLICY_SOURCE_BYTES_V3 + 1 - observed))
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > _MAX_POLICY_SOURCE_BYTES_V3:
+                raise ValueError("V3 policy overlay file exceeds its bound")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_size)
+            or observed != before.st_size
+        ):
+            raise ValueError("V3 policy overlay file changed during read")
+        content = b"".join(chunks)
+        if not content or hashlib.sha256(content).hexdigest() != expected_sha256:
+            raise ValueError("V3 policy overlay file differs from its authority")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _overlay_policy_modules_v3(
+    authority: _PolicyOverlayV3,
+) -> dict[str, ModuleType]:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(authority.root, flags)
+    try:
+        directory = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory.st_mode):
+            raise ValueError("V3 policy overlay root is invalid")
+        expected = dict(authority.source_sha256)
+        modules: dict[str, ModuleType] = {}
+        for module_name, file_name in _POLICY_OVERLAY_FILES_V3:
+            source = _read_policy_overlay_file_v3(
+                directory_fd,
+                file_name=file_name,
+                expected_sha256=expected[module_name],
+            )
+            qualified_name = f"core.strategy_policy.v3.{module_name}"
+            module = ModuleType(qualified_name)
+            module.__file__ = f"{authority.root}/{file_name}"
+            module.__package__ = "core.strategy_policy.v3"
+            code = compile(
+                source,
+                module.__file__,
+                "exec",
+                dont_inherit=True,
+                optimize=0,
+            )
+            exec(code, module.__dict__)
+            modules[module_name] = module
+        return modules
+    finally:
+        os.close(directory_fd)
 
 
 def _method_types(interface_version: int) -> Mapping[str, tuple[type[object], type[object]]]:
@@ -556,8 +674,14 @@ class DecisionDeterminismGuard:
             raise ValueError("candidate_nondeterminism")
 
 
-def _policy_dispatch(interface_version: int) -> dict[str, Callable[[object], object]]:
+def _policy_dispatch(
+    interface_version: int,
+    *,
+    overlay: _PolicyOverlayV3 | None = None,
+) -> dict[str, Callable[[object], object]]:
     if interface_version == 2:
+        if overlay is not None:
+            raise ValueError("V2 policy worker cannot accept a V3 overlay")
         from . import entry, exit, risk
 
         return {
@@ -574,12 +698,15 @@ def _policy_dispatch(interface_version: int) -> dict[str, Callable[[object], obj
         "position": ("evaluate_add_on",),
         "exit": ("evaluate_exit",),
     }
-    modules: dict[str, ModuleType] = {}
-    for module_name in module_exports:
-        module = import_module(f".v3.{module_name}", __package__)
-        if not isinstance(module, ModuleType):
-            raise TypeError("V3 policy module is invalid")
-        modules[module_name] = module
+    if overlay is None:
+        modules: dict[str, ModuleType] = {}
+        for module_name in module_exports:
+            module = import_module(f".v3.{module_name}", __package__)
+            if not isinstance(module, ModuleType):
+                raise TypeError("V3 policy module is invalid")
+            modules[module_name] = module
+    else:
+        modules = _overlay_policy_modules_v3(overlay)
     dispatch: dict[str, Callable[[object], object]] = {}
     for module_name, exports in module_exports.items():
         for export in exports:
@@ -592,9 +719,13 @@ def _policy_dispatch(interface_version: int) -> dict[str, Callable[[object], obj
     return dispatch
 
 
-def worker_main() -> int:
+def worker_main(argv: tuple[str, ...] = ()) -> int:
     """Run one trusted wrapper around version-selected candidate policy modules."""
 
+    try:
+        overlay = _policy_overlay_v3(argv)
+    except (SystemExit, TypeError, ValueError):
+        return 2
     bootstrap_raw = sys.stdin.buffer.readline(MAX_POLICY_LINE_BYTES + 2)
     if not bootstrap_raw or len(bootstrap_raw) > MAX_POLICY_LINE_BYTES + 1:
         return 2
@@ -603,7 +734,10 @@ def worker_main() -> int:
     except (UnicodeDecodeError, ValueError):
         return 2
     try:
-        dispatch = _policy_dispatch(bootstrap.interface_version)
+        dispatch = _policy_dispatch(
+            bootstrap.interface_version,
+            overlay=overlay,
+        )
         ready = encode_worker_ready(bootstrap=bootstrap)
         sys.stdout.buffer.write(ready.encode("utf-8") + b"\n")
         sys.stdout.buffer.flush()
@@ -645,7 +779,7 @@ def worker_main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(worker_main())
+    raise SystemExit(worker_main(tuple(sys.argv[1:])))
 
 
 __all__ = [

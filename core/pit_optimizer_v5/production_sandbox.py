@@ -44,6 +44,7 @@ from core.pit_optimizer_v5.memory import (
     CleanupResultPayloadV5,
     ResourceLeasePayloadV5,
 )
+from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 from core.pit_optimizer_v5.runtime import CandidateExecutionKeyV5, MaterializedVariantV5, OwnedLeaseV5
 from core.pit_optimizer_v5.sandbox import (
     BoundedOutputBytesV5,
@@ -375,9 +376,16 @@ class ExecutionReservationRecordV5:
             or re.fullmatch(r"execution-[0-9a-f]{24}", self.control_relative_path) is None
         ):
             raise ValueError("container execution reservation is invalid")
+        separator = self.command_argv.index("--")
+        semantic_probe = self.command_argv[separator + 2 : separator + 6] == (
+            "python",
+            "-B",
+            "-m",
+            "core.pit_optimizer_v5.probe_entry",
+        )
         if (
             type(self.expected_mounts) is not tuple
-            or len(self.expected_mounts) != 4
+            or len(self.expected_mounts) != (5 if semantic_probe else 4)
             or any(
                 type(item) is not tuple
                 or len(item) != 3
@@ -775,7 +783,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         panel: EpisodePlanV5,
         scenario_ids: tuple[str, ...],
         execution_key: CandidateExecutionKeyV5,
-    ) -> tuple[SandboxMountHandleV5, SandboxMountHandleV5, SandboxMountHandleV5]:
+    ) -> tuple[SandboxMountHandleV5, ...]:
         if (
             type(materialized) is not MaterializedVariantV5
             or type(materialized.opaque_candidate) is not MaterializedWorkspaceV5
@@ -812,16 +820,19 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             scenario_ids=scenario_ids,
             execution_key=execution_key,
         )
+        semantic_probe = execution_key.stage == "semantic_probe"
+        if semantic_probe != (scenario_ids == ()):
+            raise ValueError("sandbox probe data authority is invalid")
+        absent_data_identity = canonical_sha256_v5(
+            {
+                "domain": "pit-optimizer-v5-absent-data-mount-v1",
+                "execution_key": canonical_sha256_v5(execution_key),
+            }
+        )
         try:
             with ExitStack() as stack:
                 source_access = stack.enter_context(
                     acquire_absolute_directory_v5(source_path, expected_identity=source_identity)
-                )
-                data_access = stack.enter_context(
-                    acquire_absolute_directory_v5(
-                        self._data_root,
-                        expected_identity=(self._data_info.st_dev, self._data_info.st_ino),
-                    )
                 )
                 output_access = stack.enter_context(
                     acquire_absolute_directory_v5(
@@ -829,34 +840,73 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                         expected_identity=(self._output_info.st_dev, self._output_info.st_ino),
                     )
                 )
-                self._authenticate_data_files(data_access)
+                data_access = None
+                if not semantic_probe:
+                    data_access = stack.enter_context(
+                        acquire_absolute_directory_v5(
+                            self._data_root,
+                            expected_identity=(
+                                self._data_info.st_dev,
+                                self._data_info.st_ino,
+                            ),
+                        )
+                    )
+                    self._authenticate_data_files(data_access)
                 # This is the last pre-mutation authority check.  All involved
                 # ancestors remain pinned while the output child is reserved.
+                issuance_paths = (
+                    (source_access.path, output_access.path)
+                    if data_access is None
+                    else (source_access.path, data_access.path, output_access.path)
+                )
                 if any(
                     _roots_overlap(first, second)
-                    for first, second in (
-                        (source_access.path, data_access.path),
-                        (source_access.path, output_access.path),
-                        (data_access.path, output_access.path),
-                    )
+                    for index, first in enumerate(issuance_paths)
+                    for second in issuance_paths[index + 1 :]
                 ):
                     raise ValueError("sandbox mount roots are not fully disjoint")
+                data_identity = (
+                    absent_data_identity
+                    if data_access is None
+                    else _directory_identity(data_access.path, data_access.path.lstat())
+                )
                 output_path, output_info = self._create_or_load_output(
                     output_parent=output_access,
                     source_path=source_access.path,
                     source_identity=source_binding,
-                    data_identity=_directory_identity(data_access.path, data_access.path.lstat()),
+                    data_identity=data_identity,
                     execution_key=execution_key,
                     output_authority=authorities[2],
                 )
                 source_info = source_access.path.lstat()
-                data_path = data_access.path
-                data_info = data_path.lstat()
+                data_path = None if data_access is None else data_access.path
+                data_info = None if data_path is None else data_path.lstat()
                 source_path = source_access.path
         except (OSError, ValueError):
             raise ValueError("sandbox mount authority changed during issuance") from None
+        source_handle = self._mount_handle(
+            "source",
+            source_path,
+            source_info,
+            authorities[0],
+            source_binding,
+            container_path="/pit/candidate" if semantic_probe else "/pit/source",
+        )
+        output_handle = self._mount_handle(
+            "output",
+            output_path,
+            output_info,
+            authorities[2],
+            _directory_identity(output_path, output_info),
+        )
+        if semantic_probe:
+            if authorities[1] is not None or data_path is not None or data_info is not None:
+                raise ValueError("sandbox semantic probe received a data authority")
+            return (source_handle, output_handle)
+        if authorities[1] is None or data_path is None or data_info is None:
+            raise ValueError("sandbox panel data authority is unavailable")
         return (
-            self._mount_handle("source", source_path, source_info, authorities[0], source_binding),
+            source_handle,
             self._mount_handle(
                 "data",
                 data_path,
@@ -864,13 +914,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 authorities[1],
                 canonical_sha256_v5(self._data_file_identities),
             ),
-            self._mount_handle(
-                "output",
-                output_path,
-                output_info,
-                authorities[2],
-                _directory_identity(output_path, output_info),
-            ),
+            output_handle,
         )
 
     def _authenticate_data_files(self, access: object | None = None) -> None:
@@ -1089,6 +1133,8 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         info: os.stat_result,
         content_authority: str,
         binding: str,
+        *,
+        container_path: str | None = None,
     ) -> SandboxMountHandleV5:
         capability = _MountCapabilityV5(
             self.mount_identity_sha256,
@@ -1105,7 +1151,8 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             _directory_identity(path, info),
             content_authority,
             str(path),
-            {"source": "/pit/source", "data": "/pit/data", "output": "/pit/output"}[kind],
+            container_path
+            or {"source": "/pit/source", "data": "/pit/data", "output": "/pit/output"}[kind],
             self._manifest.resources.evaluation_output_limit_bytes if kind == "output" else None,
             capability,
         )
@@ -1186,25 +1233,29 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
     def pinned_request(
         self,
         request: DockerPanelRequestV5,
-    ) -> Iterator[tuple[Path, Path, Path]]:
+    ) -> Iterator[tuple[Path, ...]]:
         """Hold every mount ancestry stable across one Docker engine boundary."""
 
         self._authorize_request(request)
         with ExitStack() as stack:
+            handles = (
+                (request.source_mount, request.output_mount)
+                if request.data_mount is None
+                else (request.source_mount, request.data_mount, request.output_mount)
+            )
             accesses = tuple(
                 stack.enter_context(self._pin_handle(handle))
-                for handle in (request.source_mount, request.data_mount, request.output_mount)
+                for handle in handles
             )
             paths = tuple(access.path for access in accesses)
             if any(
                 _roots_overlap(first, second)
-                for first, second in (
-                    (paths[0], paths[1]),
-                    (paths[0], paths[2]),
-                    (paths[1], paths[2]),
-                )
+                for index, first in enumerate(paths)
+                for second in paths[index + 1 :]
             ):
                 raise ValueError("sandbox request mount roots overlap")
+            access_by_kind = dict(zip((item.kind for item in handles), accesses, strict=True))
+            path_by_kind = {kind: access.path for kind, access in access_by_kind.items()}
             expected_sources = request.policy_revision.editable_source_sha256
             observed_sources = []
             for relative, _expected in expected_sources:
@@ -1215,7 +1266,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                             paths[0],
                             parts[:-1],
                             create=False,
-                            expected_root_identity=accesses[0].identity,
+                            expected_root_identity=access_by_kind["source"].identity,
                         )
                     )
                     stream, info = open_regular_in_directory_v5(
@@ -1256,17 +1307,17 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 or output_ready.output_root_identity_sha256
                 != request.output_mount.root_identity_sha256
                 or (output_created.output_device, output_created.output_inode)
-                != accesses[2].identity
+                != access_by_kind["output"].identity
                 or (output_ready.output_device, output_ready.output_inode)
-                != accesses[2].identity
+                != access_by_kind["output"].identity
             ):
                 raise ValueError("sandbox output mount is not durably ready")
-            yield paths
+            yield tuple(path_by_kind[item.kind] for item in handles)
 
     def authenticate_request(
         self,
         request: DockerPanelRequestV5,
-    ) -> tuple[Path, Path, Path]:
+    ) -> tuple[Path, ...]:
         """Reauthenticate every mount and its request-bound source/data authority."""
 
         with self.pinned_request(request) as paths:
@@ -1341,7 +1392,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     "pull": "never",
                     "user": "65532:65532",
                     "entrypoint": "python",
-                    "workdir": "/pit/source",
+                    "workdirs": (
+                        ("semantic_probe", "/"),
+                        ("panel_evaluation", "/pit/source"),
+                    ),
+                    "mount_layout": (
+                        ("semantic_probe", "four_policy_files_and_output"),
+                        ("panel_evaluation", "source_two_data_files_and_output"),
+                    ),
                     "output_names": (
                         ("semantic_probe", "semantic-fingerprint.json"),
                         ("panel_evaluation", "panel-evaluation.json"),
@@ -1379,7 +1437,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 raise ValueError("container execution reservation is foreign")
         return self._runtime_reservation(command, "created" if created else "existing")
 
-    def _authenticate_command(self, command: ContainerCommandV5) -> tuple[Path, Path, Path]:
+    def _authenticate_command(self, command: ContainerCommandV5) -> tuple[Path, ...]:
         if (
             type(command) is not ContainerCommandV5
             or command.request.owner != self._owner
@@ -1449,31 +1507,37 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "--entrypoint",
             "python",
             "--workdir",
-            "/pit/source",
+            "/" if command.request.execution_key.stage == "semantic_probe" else "/pit/source",
         ]
         generic[2:2] = injected
         data_mount = command.request.data_mount
-        data_root_argument = (
-            f"type=bind,src={data_mount.host_path},dst={data_mount.container_path},readonly"
-        )
-        try:
-            data_argument_index = generic.index(data_root_argument)
-        except ValueError:
-            raise ValueError("container data mount differs from the closed V5 grammar") from None
-        data_file_arguments = []
-        for name in _DATA_FILES_V5:
-            data_file_arguments.extend(
-                (
-                    "--mount",
-                    (
-                        f"type=bind,src={Path(data_mount.host_path) / name},"
-                        f"dst={data_mount.container_path}/{name},readonly"
-                    ),
-                )
+        if command.request.execution_key.stage == "semantic_probe":
+            if data_mount is not None or any("/pit/data" in item for item in generic):
+                raise ValueError("semantic probe Docker grammar exposes PIT data")
+        else:
+            if type(data_mount) is not SandboxMountHandleV5:
+                raise ValueError("panel Docker grammar lacks its data authority")
+            data_root_argument = (
+                f"type=bind,src={data_mount.host_path},dst={data_mount.container_path},readonly"
             )
-        if data_argument_index == 0 or generic[data_argument_index - 1] != "--mount":
-            raise ValueError("container data mount grammar is malformed")
-        generic[data_argument_index - 1 : data_argument_index + 1] = data_file_arguments
+            try:
+                data_argument_index = generic.index(data_root_argument)
+            except ValueError:
+                raise ValueError("container data mount differs from the closed V5 grammar") from None
+            data_file_arguments = []
+            for name in _DATA_FILES_V5:
+                data_file_arguments.extend(
+                    (
+                        "--mount",
+                        (
+                            f"type=bind,src={Path(data_mount.host_path) / name},"
+                            f"dst={data_mount.container_path}/{name},readonly"
+                        ),
+                    )
+                )
+            if data_argument_index == 0 or generic[data_argument_index - 1] != "--mount":
+                raise ValueError("container data mount grammar is malformed")
+            generic[data_argument_index - 1 : data_argument_index + 1] = data_file_arguments
         separator = generic.index("--")
         if generic[separator + 1] != self._profile.image_reference or generic[separator + 2] != "python":
             raise ValueError("container image command differs from the closed V5 grammar")
@@ -1486,22 +1550,48 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             for role in ("evaluator_process", "container")
         )
         runtime_argv = self._runtime_argv(command)
+        if command.request.execution_key.stage == "semantic_probe":
+            if command.request.data_mount is not None:
+                raise ValueError("semantic probe reservation exposes PIT data")
+            source_mounts = tuple(
+                (
+                    _windows_key(
+                        str(
+                            Path(command.request.source_mount.host_path).joinpath(
+                                *relative.split("/")
+                            )
+                        )
+                    ),
+                    f"{command.request.source_mount.container_path}/{relative.rsplit('/', 1)[-1]}",
+                    False,
+                )
+                for relative in EDITABLE_POLICY_PATHS_V5
+            )
+            data_mounts: tuple[tuple[str, str, bool], ...] = ()
+        else:
+            data_mount = command.request.data_mount
+            if type(data_mount) is not SandboxMountHandleV5:
+                raise ValueError("panel reservation lacks its data mount")
+            source_mounts = (
+                (
+                    _windows_key(command.request.source_mount.host_path),
+                    command.request.source_mount.container_path,
+                    False,
+                ),
+            )
+            data_mounts = tuple(
+                (
+                    _windows_key(str(Path(data_mount.host_path) / name)),
+                    f"{data_mount.container_path}/{name}",
+                    False,
+                )
+                for name in _DATA_FILES_V5
+            )
         expected_mounts = tuple(
             sorted(
                 (
-                    (
-                        _windows_key(command.request.source_mount.host_path),
-                        command.request.source_mount.container_path,
-                        False,
-                    ),
-                    *(
-                        (
-                            _windows_key(str(Path(command.request.data_mount.host_path) / name)),
-                            f"{command.request.data_mount.container_path}/{name}",
-                            False,
-                        )
-                        for name in _DATA_FILES_V5
-                    ),
+                    *source_mounts,
+                    *data_mounts,
                     (
                         _windows_key(command.request.output_mount.host_path),
                         command.request.output_mount.container_path,
@@ -2180,6 +2270,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         expected_environment: tuple[str, ...],
         expected_command: list[str],
         expected_labels: dict[str, str],
+        expected_working_directory: str,
     ) -> dict[str, object]:
         if type(config) is not dict:
             raise ValueError("container config is malformed")
@@ -2200,7 +2291,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "ArgsEscaped": False,
             "Image": image_reference,
             "Volumes": None,
-            "WorkingDir": "/pit/source",
+            "WorkingDir": expected_working_directory,
             "Entrypoint": ["python"],
             "NetworkDisabled": False,
             "MacAddress": "",
@@ -2897,6 +2988,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         expected_labels.update(pit_labels)
         separator = reservation.command_argv.index("--")
         expected_command = list(reservation.command_argv[separator + 3 :])
+        expected_working_directory = (
+            "/"
+            if expected_command[:3]
+            == ["-B", "-m", "core.pit_optimizer_v5.probe_entry"]
+            else "/pit/source"
+        )
         network = item.get("NetworkSettings") if type(item) is dict else None
         observed_id = item.get("Id") if type(item) is dict else None
         if (
@@ -2921,6 +3018,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             expected_environment=expected_environment,
             expected_command=expected_command,
             expected_labels=expected_labels,
+            expected_working_directory=expected_working_directory,
         )
         host_authority = self._closed_host_authority(
             host,
