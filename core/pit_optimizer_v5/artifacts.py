@@ -34,6 +34,7 @@ from core.pit_optimizer_v5.candidate_ir import (
     VariantAssignmentV5,
 )
 from core.pit_optimizer_v5.contracts import (
+    AnnualizedReturnTargetV5,
     ArtifactGraphFailureV5,
     ArtifactGraphVerificationV5,
     ArtifactRefV5,
@@ -261,6 +262,19 @@ def _decode_value(annotation: object, value: object) -> object:
         if type(value) is not str:
             raise ValueError
         return value.encode("utf-8")
+    if annotation is AnnualizedReturnTargetV5:
+        primitive = _exact_keys(value, {"target_pct", "metric_id", "basis"})
+        raw_target = primitive["target_pct"]
+        if type(raw_target) is not str:
+            raise ValueError
+        parsed = Decimal(raw_target)
+        if not parsed.is_finite() or canonical_primitive_v5(parsed) != raw_target:
+            raise ValueError
+        return AnnualizedReturnTargetV5(
+            target_pct=parsed.quantize(Decimal("0.01")),
+            metric_id=primitive["metric_id"],  # type: ignore[arg-type]
+            basis=primitive["basis"],  # type: ignore[arg-type]
+        )
     if origin is Literal:
         if not any(type(value) is type(item) and value == item for item in arguments):
             raise ValueError
@@ -1032,6 +1046,25 @@ class LocalArtifactRepositoryV5:
         digest = hashlib.sha256(canonical_json_bytes_v5(primitive)).hexdigest()
         return self._create_only(f"inputs/{kind}/{digest}.json", primitive)
 
+    def load_typed_artifact(self, reference: ArtifactRefV5, *, value_type: type[T]) -> T:
+        """Authenticate exact canonical dataclass bytes without an extra envelope."""
+
+        if not isinstance(value_type, type) or not is_dataclass(value_type):
+            raise ValueError("typed artifact type must be a dataclass")
+        authenticated = self.authenticate(reference)
+        try:
+            value = _decode_dataclass(
+                value_type,
+                _strict_json_object(authenticated.content, reference),
+            )
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (TypeError, ValueError, ArithmeticError):
+            raise ArtifactSchemaFailureV5(reference) from None
+        if canonical_json_bytes_v5(value) != authenticated.content:
+            raise ArtifactNonCanonicalV5(reference)
+        return value
+
     def append_role_request(
         self,
         *,
@@ -1555,6 +1588,49 @@ class LocalArtifactRepositoryV5:
             raise ArtifactSchemaFailureV5()
         return None if not matches else matches[0]
 
+    def verify_candidate_execution_index(
+        self,
+        *,
+        campaign_id: str,
+        round_index: int,
+    ) -> tuple[CandidateExecutionAuthorityV5, ...]:
+        """Read-only verification that every matching reservation is indexed."""
+
+        events = self.load_round_events(campaign_id=campaign_id, round_index=round_index)
+        indexed: dict[ArtifactRefV5, CandidateExecutionAuthorityV5] = {}
+        for event in events:
+            if event.event_kind != "candidate_execution":
+                continue
+            payload = self.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
+            if (
+                type(payload) is not CandidateExecutionAuthorityV5
+                or payload.campaign_id != campaign_id
+                or payload.round_index != round_index
+                or event.payload_ref in indexed
+            ):
+                raise ArtifactSchemaFailureV5(event.payload_ref)
+            indexed[event.payload_ref] = payload
+        try:
+            names = self._names(("payloads", "candidate_execution"))
+        except ArtifactMissingV5:
+            names = ()
+        for name in names:
+            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                raise ArtifactSchemaFailureV5()
+            reference = ArtifactRefV5(
+                f"payloads/candidate_execution/{name}",
+                name.removesuffix(".json"),
+            )
+            payload = self.load_round_payload(reference, expected_kind="candidate_execution")
+            if (
+                type(payload) is CandidateExecutionAuthorityV5
+                and payload.campaign_id == campaign_id
+                and payload.round_index == round_index
+                and reference not in indexed
+            ):
+                raise ArtifactSchemaFailureV5(reference)
+        return tuple(indexed[event.payload_ref] for event in events if event.payload_ref in indexed)
+
     def append_candidate_execution(self, authority: CandidateExecutionAuthorityV5) -> ArtifactRefV5:
         if type(authority) is not CandidateExecutionAuthorityV5:
             raise ValueError("candidate execution authority is invalid")
@@ -1792,6 +1868,11 @@ class LocalArtifactRepositoryV5:
         if canonical_json_bytes_v5(checkpoint.to_primitive()) != raw:
             raise ArtifactNonCanonicalV5(reference)
         return checkpoint
+
+    def load_checkpoint(self) -> RepositoryCheckpointV5 | None:
+        """Authenticate the current checkpoint without repairing or mutating it."""
+
+        return self._load_checkpoint()
 
     def recover_projection(self, reducer: ArchiveReducerV5[T]) -> tuple[RepositoryCheckpointV5 | None, T]:
         checkpoint = self._load_checkpoint()

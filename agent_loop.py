@@ -24132,6 +24132,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _dispatch_hidden_watchdog(arguments)
     if arguments and arguments[0] == "--_hidden-backtest":
         return _dispatch_hidden_backtest(arguments)
+    if arguments and arguments[0] == "pit-optimizer-v5":
+        from core.pit_optimizer_v5.cli import dispatch_v5_cli
+
+        return dispatch_v5_cli(arguments[1:])
     parser = build_parser()
     namespace = parser.parse_args(arguments)
     try:

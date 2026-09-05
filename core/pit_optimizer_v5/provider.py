@@ -2323,6 +2323,16 @@ class RecoverableRoleInvokerV5(Protocol):
 
 
 @runtime_checkable
+class PaidRoleReconcilerV5(Protocol):
+    """Read an already-started role terminal without making another call."""
+
+    def reconcile_paid_role(
+        self,
+        persisted_request: ExistingPersistedRoleRequestV5,
+    ) -> RoleReconciliationResultV5: ...
+
+
+@runtime_checkable
 class RoleAuthorizationLifecycleV5(Protocol):
     """Opaque controller-owned reserve/settle lifecycle for authorized provider slots."""
 
@@ -2353,6 +2363,17 @@ class RoleAuthorizationLifecycleV5(Protocol):
         facts: RoleAttemptFactsV5,
         receipt: RoleTerminalReceiptV5,
     ) -> None: ...
+
+
+@runtime_checkable
+class LedgerRoleAuthorizationLifecycleV5(RoleAuthorizationLifecycleV5, Protocol):
+    """Production lifecycle whose authority is a durable campaign ledger."""
+
+    @property
+    def campaign_manifest_sha256(self) -> str: ...
+
+    @property
+    def ledger_identity_sha256(self) -> str: ...
 
 
 @runtime_checkable
@@ -2466,6 +2487,14 @@ class AuthorizedRoleRunnerV5:
     @property
     def receipts(self) -> tuple[RoleTerminalReceiptV5, ...]:
         return tuple(self._receipts)
+
+    @property
+    def completion_provider(self) -> CompletionProvider:
+        return self._provider
+
+    @property
+    def authorization_lifecycle(self) -> RoleAuthorizationLifecycleV5:
+        return self._lifecycle
 
     def _attempt_facts(
         self,
@@ -2936,6 +2965,86 @@ class AuthorizedRoleRunnerV5:
         return artifact
 
 
+class LedgerBackedRoleInvokerV5:
+    """Production recoverable invoker backed by authorization receipts.
+
+    Only a freshness capability may enter the one-shot runner. Existing request
+    capabilities are routed exclusively to the paid-response reconciler.
+    """
+
+    __slots__ = ("_reconciler", "_runner")
+
+    def __init__(
+        self,
+        *,
+        runner: AuthorizedRoleRunnerV5,
+        reconciler: PaidRoleReconcilerV5,
+    ) -> None:
+        if type(runner) is not AuthorizedRoleRunnerV5 or not isinstance(reconciler, PaidRoleReconcilerV5):
+            raise ValueError("ledger-backed role invoker dependencies are invalid")
+        self._runner = runner
+        self._reconciler = reconciler
+
+    @property
+    def runner(self) -> AuthorizedRoleRunnerV5:
+        return self._runner
+
+    def invoke_once(self, persisted_request: FreshPersistedRoleRequestV5) -> RoleInvocationPackageV5:
+        if type(persisted_request) is not FreshPersistedRoleRequestV5:
+            raise ValueError("fresh role invocation capability is invalid")
+        before_attempts = len(self._runner.attempts)
+        before_receipts = len(self._runner.receipts)
+        artifact: ParsedRoleArtifactV5 | None = None
+        failure: RoleFailureV5 | None = None
+        try:
+            artifact = self._runner.invoke_once(
+                persisted_request.request,
+                attempt_kind=persisted_request.call.attempt_kind,
+            )
+        except RoleFailureV5 as exc:
+            failure = exc
+        attempts = self._runner.attempts
+        receipts = self._runner.receipts
+        if len(attempts) != before_attempts + 1 or len(receipts) != before_receipts + 1:
+            if failure is not None:
+                raise failure
+            raise ValueError("authorized role runner did not produce one terminal receipt")
+        attempt = attempts[-1]
+        receipt = receipts[-1]
+        package = RoleInvocationPackageV5(
+            call=persisted_request.call,
+            request=persisted_request.request,
+            attempt=attempt,
+            terminal_authority=LedgerRoleTerminalAuthorityV5(
+                call_key_sha256=persisted_request.call.sha256,
+                receipt=receipt,
+            ),
+            artifact=artifact,
+        )
+        if failure is not None and package.accepted:
+            raise ValueError("failed role invocation produced an accepted terminal")
+        return package
+
+    def reconcile_once(
+        self,
+        persisted_request: ExistingPersistedRoleRequestV5,
+    ) -> RoleReconciliationResultV5:
+        if type(persisted_request) is not ExistingPersistedRoleRequestV5:
+            raise ValueError("existing role reconciliation capability is invalid")
+        result = self._reconciler.reconcile_paid_role(persisted_request)
+        if type(result) is RoleInvocationPackageV5:
+            if result.call != persisted_request.call or result.request != persisted_request.request:
+                raise ValueError("paid role reconciliation differs from its durable request")
+            if type(result.terminal_authority) is not LedgerRoleTerminalAuthorityV5:
+                raise ValueError("paid role reconciliation lacks ledger authority")
+        elif type(result) is RoleReconciliationFailureV5:
+            if result.call != persisted_request.call:
+                raise ValueError("paid role reconciliation failure differs from its call")
+        else:
+            raise ValueError("paid role reconciliation result is invalid")
+        return result
+
+
 class FixtureRoleRunnerV5:
     """Provider-free role runner using explicitly declared canonical fixture slots."""
 
@@ -3078,7 +3187,10 @@ __all__ = [
     "IssuedEvidenceV5",
     "InvestigatorRoleInputV5",
     "LedgerRoleTerminalAuthorityV5",
+    "LedgerBackedRoleInvokerV5",
+    "LedgerRoleAuthorizationLifecycleV5",
     "OneShotJsonCompletionV5",
+    "PaidRoleReconcilerV5",
     "ParsedRoleArtifactV5",
     "PersistedRoleRequestV5",
     "ProviderCompletionRequestV5",

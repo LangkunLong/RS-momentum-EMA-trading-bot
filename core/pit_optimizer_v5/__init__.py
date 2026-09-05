@@ -93,6 +93,7 @@ from .sandbox import (
     derive_execution_lease_id_v5,
     derive_sandbox_mount_authorities_v5,
 )
+from .summary import OptimizerSummaryV5, summarize_repository_v5, unavailable_summary_v5
 from .workspace import (
     GitCandidateMaterializerV5,
     GitWorkspaceDriverV5,
@@ -164,6 +165,7 @@ __all__ = [
     "MetricPredictionV5",
     "MaterializedWorkspaceV5",
     "OwnedWorkspaceHandleV5",
+    "OptimizerSummaryV5",
     "PanelEvaluationV5",
     "PitPanelEvaluatorV5",
     "ProviderCapabilitiesV5",
@@ -204,10 +206,12 @@ __all__ = [
     "initial_friction_grid_v5",
     "investigator_hypothesis_schema_bounds_v5",
     "sandbox_profile_from_manifest_v5",
+    "summarize_repository_v5",
     "selected_scenario",
     "run_feedback_round_v5",
     "validate_campaign_evidence_v5",
     "validate_campaign_manifest_bindings_v5",
     "validate_episode_plan_panel_v5",
     "validate_sandbox_profile_resources_v5",
+    "unavailable_summary_v5",
 ]
