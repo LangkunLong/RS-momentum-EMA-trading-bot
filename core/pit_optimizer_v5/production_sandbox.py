@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 import hashlib
@@ -12,7 +13,7 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import BinaryIO, Literal
+from typing import Iterator, Literal
 
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
 from core.pit_optimizer_v5.contracts import (
@@ -25,6 +26,12 @@ from core.pit_optimizer_v5.contracts import (
     validate_sandbox_profile_resources_v5,
 )
 from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
+from core.pit_optimizer_v5.production_fs import (
+    acquire_absolute_directory_v5,
+    acquire_directory_v5,
+    hash_regular_in_directory_v5,
+    open_regular_in_directory_v5,
+)
 from core.pit_optimizer_v5.memory import (
     CandidateExecutionAuthorityV5,
     CleanupResultPayloadV5,
@@ -68,8 +75,11 @@ def _canonical_directory(path: Path) -> tuple[Path, os.stat_result]:
         raise ValueError("sandbox root path is not canonical")
     try:
         resolved = path.resolve(strict=True)
-        info = resolved.lstat()
-    except OSError:
+        with acquire_absolute_directory_v5(resolved) as access:
+            info = access.path.lstat()
+            if (info.st_dev, info.st_ino) != access.identity:
+                raise ValueError("sandbox root identity changed")
+    except (OSError, ValueError):
         raise ValueError("sandbox root is unavailable") from None
     if (
         _windows_key(str(resolved)) != _windows_key(text)
@@ -109,64 +119,19 @@ def _roots_overlap(first: Path, second: Path) -> bool:
     return common in {first_key, second_key}
 
 
-def _open_regular_no_follow(path: Path) -> tuple[BinaryIO, os.stat_result]:
+def _hash_regular_no_follow(path: Path) -> tuple[int, int, int, str]:
     try:
-        before = path.lstat()
-        if _is_reparse(before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise OSError
-        descriptor = os.open(
-            path,
-            os.O_RDONLY
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        stream = os.fdopen(descriptor, "rb", buffering=0)
-        opened = os.fstat(stream.fileno())
-        after = path.lstat()
-        identity = lambda item: (item.st_dev, item.st_ino)
-        if (
-            identity(before) != identity(opened)
-            or identity(opened) != identity(after)
-            or _is_reparse(after)
-            or not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or after.st_nlink != 1
-        ):
-            stream.close()
-            raise OSError
-        return stream, opened
-    except OSError:
+        with acquire_absolute_directory_v5(path.parent) as parent:
+            return hash_regular_in_directory_v5(parent, path.name)
+    except (OSError, ValueError):
         raise ValueError("sandbox data file is not an exact regular file") from None
 
 
-def _hash_regular_no_follow(path: Path) -> tuple[int, int, int, str]:
-    stream, info = _open_regular_no_follow(path)
-    digest = hashlib.sha256()
-    try:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    except OSError:
-        raise ValueError("sandbox data file is unreadable") from None
-    finally:
-        stream.close()
-    return info.st_dev, info.st_ino, info.st_size, digest.hexdigest()
-
-
-def _closed_child_file(root: Path, relative_path: str) -> Path:
+def _closed_child_parts(relative_path: str) -> tuple[str, ...]:
     parts = relative_path.split("/")
     if not parts or any(not item or item in {".", ".."} or "\\" in item for item in parts):
         raise ValueError("sandbox source path is invalid")
-    parent = root
-    for component in parts[:-1]:
-        parent /= component
-        try:
-            info = parent.lstat()
-        except OSError:
-            raise ValueError("sandbox source parent is unavailable") from None
-        if not stat.S_ISDIR(info.st_mode) or _is_reparse(info):
-            raise ValueError("sandbox source parent is not link-free")
-    return parent / parts[-1]
+    return tuple(parts)
 
 
 def _directory_identity(path: Path, info: os.stat_result) -> str:
@@ -467,16 +432,34 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         validate_sandbox_profile_resources_v5(sandbox_profile, manifest.resources)
         data_path, data_info = _canonical_directory(data_root)
         output_path, output_info = _canonical_directory(output_root)
-        if _roots_overlap(data_path, output_path):
-            raise ValueError("sandbox data and output roots must be fully disjoint")
+        workspace_roots = tuple(
+            (Path(path), identity) for path, identity in workspace_driver.root_identities
+        )
         try:
-            entries = tuple(sorted(item.name for item in os.scandir(data_path)))
-        except OSError:
+            for path, identity in workspace_roots:
+                with acquire_absolute_directory_v5(path, expected_identity=identity):
+                    pass
+        except (OSError, ValueError):
+            raise ValueError("workspace root authority changed") from None
+        fixed_roots = (workspace_roots[0][0], workspace_roots[1][0], data_path, output_path)
+        if any(
+            _roots_overlap(first, second)
+            for index, first in enumerate(fixed_roots)
+            for second in fixed_roots[index + 1 :]
+        ):
+            raise ValueError("sandbox source, workspace, data, and output roots must be fully disjoint")
+        try:
+            with acquire_absolute_directory_v5(
+                data_path,
+                expected_identity=(data_info.st_dev, data_info.st_ino),
+            ) as data_access:
+                entries = tuple(sorted(item.name for item in os.scandir(data_access.path)))
+                bundle_identity = hash_regular_in_directory_v5(data_access, _DATA_FILES_V5[0])
+                provenance_identity = hash_regular_in_directory_v5(data_access, _DATA_FILES_V5[1])
+        except (OSError, ValueError):
             raise ValueError("sandbox data root is unreadable") from None
         if entries != _DATA_FILES_V5:
             raise ValueError("sandbox data root differs from the closed V5 layout")
-        bundle_identity = _hash_regular_no_follow(data_path / _DATA_FILES_V5[0])
-        provenance_identity = _hash_regular_no_follow(data_path / _DATA_FILES_V5[1])
         if (
             bundle_identity[3] != evaluator_contract.pit_bundle_sha256
             or provenance_identity[3] != evaluator_contract.prices_provenance_sha256
@@ -492,6 +475,8 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         self._output_root = output_path
         self._output_info = output_info
         self._repository = repository
+        self._fixed_roots = fixed_roots
+        self._workspace_root_identities = workspace_roots
         self._data_file_identities = (bundle_identity, provenance_identity)
         self.mount_identity_sha256 = canonical_sha256_v5(
             {
@@ -507,6 +492,10 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 "repository_root_identity_sha256": repository.root_identity_sha256,
             }
         )
+
+    @property
+    def fixed_roots(self) -> tuple[Path, Path, Path, Path]:
+        return self._fixed_roots
 
     def mounts_for(
         self,
@@ -531,12 +520,18 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             or candidate.lease.owner != self._owner
         ):
             raise ValueError("sandbox source authority is foreign")
-        source_path, source_binding = self._workspace.authorize_materialized_source(candidate)
-        source_path, source_info = _canonical_directory(source_path)
-        data_path, data_info = _canonical_directory(self._data_root)
-        if (data_info.st_dev, data_info.st_ino) != (self._data_info.st_dev, self._data_info.st_ino):
-            raise ValueError("sandbox data root changed")
-        self._authenticate_data_files()
+        source_path, source_binding, source_identity = self._workspace.authorize_materialized_source(
+            candidate
+        )
+        workspace_root = self._fixed_roots[1]
+        if (
+            _windows_key(str(source_path.parent)) != _windows_key(str(workspace_root))
+            or any(
+                _roots_overlap(source_path, fixed)
+                for fixed in (self._fixed_roots[0], self._data_root, self._output_root)
+            )
+        ):
+            raise ValueError("sandbox candidate subtree is outside its workspace authority")
         authorities = derive_sandbox_mount_authorities_v5(
             owner=self._owner,
             policy_revision=materialized.variant.policy_revision,
@@ -546,22 +541,49 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             scenario_ids=scenario_ids,
             execution_key=execution_key,
         )
-        output_path, output_info = self._create_or_load_output(
-            source_path=source_path,
-            source_identity=source_binding,
-            data_identity=_directory_identity(data_path, data_info),
-            execution_key=execution_key,
-            output_authority=authorities[2],
-        )
-        if any(
-            _roots_overlap(first, second)
-            for first, second in (
-                (source_path, data_path),
-                (source_path, output_path),
-                (data_path, output_path),
-            )
-        ):
-            raise ValueError("sandbox mount roots are not fully disjoint")
+        try:
+            with ExitStack() as stack:
+                source_access = stack.enter_context(
+                    acquire_absolute_directory_v5(source_path, expected_identity=source_identity)
+                )
+                data_access = stack.enter_context(
+                    acquire_absolute_directory_v5(
+                        self._data_root,
+                        expected_identity=(self._data_info.st_dev, self._data_info.st_ino),
+                    )
+                )
+                output_access = stack.enter_context(
+                    acquire_absolute_directory_v5(
+                        self._output_root,
+                        expected_identity=(self._output_info.st_dev, self._output_info.st_ino),
+                    )
+                )
+                self._authenticate_data_files(data_access)
+                # This is the last pre-mutation authority check.  All involved
+                # ancestors remain pinned while the output child is reserved.
+                if any(
+                    _roots_overlap(first, second)
+                    for first, second in (
+                        (source_access.path, data_access.path),
+                        (source_access.path, output_access.path),
+                        (data_access.path, output_access.path),
+                    )
+                ):
+                    raise ValueError("sandbox mount roots are not fully disjoint")
+                output_path, output_info = self._create_or_load_output(
+                    output_parent=output_access,
+                    source_path=source_access.path,
+                    source_identity=source_binding,
+                    data_identity=_directory_identity(data_access.path, data_access.path.lstat()),
+                    execution_key=execution_key,
+                    output_authority=authorities[2],
+                )
+                source_info = source_access.path.lstat()
+                data_path = data_access.path
+                data_info = data_path.lstat()
+                source_path = source_access.path
+        except (OSError, ValueError):
+            raise ValueError("sandbox mount authority changed during issuance") from None
         return (
             self._mount_handle("source", source_path, source_info, authorities[0], source_binding),
             self._mount_handle(
@@ -580,14 +602,29 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             ),
         )
 
-    def _authenticate_data_files(self) -> None:
-        observed = tuple(_hash_regular_no_follow(self._data_root / name) for name in _DATA_FILES_V5)
+    def _authenticate_data_files(self, access: object | None = None) -> None:
+        if access is None:
+            try:
+                with acquire_absolute_directory_v5(
+                    self._data_root,
+                    expected_identity=(self._data_info.st_dev, self._data_info.st_ino),
+                ) as pinned:
+                    observed = tuple(
+                        hash_regular_in_directory_v5(pinned, name) for name in _DATA_FILES_V5
+                    )
+            except (OSError, ValueError):
+                raise ValueError("sandbox data files changed") from None
+        else:
+            observed = tuple(
+                hash_regular_in_directory_v5(access, name) for name in _DATA_FILES_V5  # type: ignore[arg-type]
+            )
         if observed != self._data_file_identities:
             raise ValueError("sandbox data files changed")
 
     def _create_or_load_output(
         self,
         *,
+        output_parent: object,
         source_path: Path,
         source_identity: str,
         data_identity: str,
@@ -595,6 +632,10 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         output_authority: str,
     ) -> tuple[Path, os.stat_result]:
         relative = f"pit-v5-output-{output_authority[:24]}"
+        if getattr(output_parent, "path", None) != self._output_root or getattr(
+            output_parent, "identity", None
+        ) != (self._output_info.st_dev, self._output_info.st_ino):
+            raise ValueError("sandbox output parent authority is foreign")
         target = self._output_root / relative
         record = MountReservationRecordV5(
             5,
@@ -629,40 +670,44 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 value_type=MountReadyRecordV5,
             )
             existing = _lstat_optional(target)
-            if existing is None:
-                if ready is not None:
-                    raise ValueError("sandbox output disappeared after readiness")
-                try:
-                    target.mkdir()
-                except OSError:
-                    raise ValueError("sandbox output could not be created") from None
-            target_path, target_info = _canonical_directory(target)
-            identity = _directory_identity(target_path, target_info)
-            if ready is None:
-                try:
-                    if any(os.scandir(target_path)):
-                        raise ValueError("unready sandbox output is not empty")
-                except OSError:
-                    raise ValueError("sandbox output is unreadable") from None
-                self._repository.append_typed_state(
-                    namespace="sandbox-mount-ready",
-                    key=output_authority,
-                    value=MountReadyRecordV5(
-                        5,
-                        self.mount_identity_sha256,
-                        output_authority,
-                        identity,
-                    ),
-                )
-            elif (
-                ready.factory_identity_sha256 != self.mount_identity_sha256
-                or ready.output_authority_sha256 != output_authority
-                or ready.output_root_identity_sha256 != identity
-            ):
-                raise ValueError("sandbox output readiness is foreign")
-            if _roots_overlap(source_path, target_path):
-                raise ValueError("sandbox source and output roots overlap")
-            return target_path, target_info
+            if existing is None and ready is not None:
+                raise ValueError("sandbox output disappeared after readiness")
+            try:
+                with acquire_directory_v5(
+                    self._output_root,
+                    (relative,),
+                    create=existing is None,
+                    expected_root_identity=(self._output_info.st_dev, self._output_info.st_ino),
+                ) as target_access:
+                    target_path = target_access.path
+                    target_info = target_path.lstat()
+                    if (target_info.st_dev, target_info.st_ino) != target_access.identity:
+                        raise ValueError("sandbox output identity changed")
+                    identity = _directory_identity(target_path, target_info)
+                    if ready is None:
+                        if any(os.scandir(target_access.path)):
+                            raise ValueError("unready sandbox output is not empty")
+                        self._repository.append_typed_state(
+                            namespace="sandbox-mount-ready",
+                            key=output_authority,
+                            value=MountReadyRecordV5(
+                                5,
+                                self.mount_identity_sha256,
+                                output_authority,
+                                identity,
+                            ),
+                        )
+                    elif (
+                        ready.factory_identity_sha256 != self.mount_identity_sha256
+                        or ready.output_authority_sha256 != output_authority
+                        or ready.output_root_identity_sha256 != identity
+                    ):
+                        raise ValueError("sandbox output readiness is foreign")
+                    if _roots_overlap(source_path, target_path):
+                        raise ValueError("sandbox source and output roots overlap")
+                    return target_path, target_info
+            except (OSError, ValueError):
+                raise ValueError("sandbox output could not be safely created or opened") from None
 
     def _mount_handle(
         self,
@@ -695,6 +740,11 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
     def authenticate_handle(self, handle: SandboxMountHandleV5) -> Path:
         """Reauthenticate one issued handle immediately before Docker argv construction."""
 
+        with self._pin_handle(handle) as access:
+            return access.path
+
+    @contextmanager
+    def _pin_handle(self, handle: SandboxMountHandleV5) -> Iterator[object]:
         capability = handle.opaque_handle
         if (
             type(handle) is not SandboxMountHandleV5
@@ -705,24 +755,51 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             or _windows_key(capability.path) != _windows_key(handle.host_path)
         ):
             raise ValueError("sandbox mount handle is foreign")
-        path, info = _canonical_directory(Path(capability.path))
-        if (
-            (info.st_dev, info.st_ino) != (capability.device, capability.inode)
-            or handle.root_identity_sha256 != _directory_identity(path, info)
-        ):
-            raise ValueError("sandbox mount root changed")
-        if handle.kind == "data":
-            self._authenticate_data_files()
-            if capability.binding_sha256 != canonical_sha256_v5(self._data_file_identities):
-                raise ValueError("sandbox data binding is foreign")
-        return path
+        try:
+            with ExitStack() as stack:
+                access = stack.enter_context(
+                    acquire_absolute_directory_v5(
+                        Path(capability.path),
+                        expected_identity=(capability.device, capability.inode),
+                    )
+                )
+                info = access.path.lstat()
+                if (
+                    (info.st_dev, info.st_ino) != access.identity
+                    or handle.root_identity_sha256 != _directory_identity(access.path, info)
+                ):
+                    raise ValueError("sandbox mount root changed")
+                if handle.kind == "data":
+                    observed = []
+                    for name in _DATA_FILES_V5:
+                        stream, file_info = open_regular_in_directory_v5(
+                            access,
+                            name,
+                            writable=False,
+                        )
+                        stack.enter_context(stream)
+                        digest = hashlib.sha256()
+                        while chunk := stream.read(1024 * 1024):
+                            digest.update(chunk)
+                        observed.append(
+                            (
+                                file_info.st_dev,
+                                file_info.st_ino,
+                                file_info.st_size,
+                                digest.hexdigest(),
+                            )
+                        )
+                    if tuple(observed) != self._data_file_identities:
+                        raise ValueError("sandbox data files changed")
+                    if capability.binding_sha256 != canonical_sha256_v5(
+                        self._data_file_identities
+                    ):
+                        raise ValueError("sandbox data binding is foreign")
+                yield access
+        except (OSError, ValueError):
+            raise ValueError("sandbox mount root changed") from None
 
-    def authenticate_request(
-        self,
-        request: DockerPanelRequestV5,
-    ) -> tuple[Path, Path, Path]:
-        """Reauthenticate every mount and its request-bound source/data authority."""
-
+    def _authorize_request(self, request: DockerPanelRequestV5) -> None:
         if (
             type(request) is not DockerPanelRequestV5
             or request.manifest != self._manifest
@@ -731,35 +808,83 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             or request.owner != self._owner
         ):
             raise ValueError("sandbox request differs from mount factory authority")
-        paths = tuple(
-            self.authenticate_handle(handle)
-            for handle in (request.source_mount, request.data_mount, request.output_mount)
-        )
-        if any(
-            _roots_overlap(first, second)
-            for first, second in ((paths[0], paths[1]), (paths[0], paths[2]), (paths[1], paths[2]))
-        ):
-            raise ValueError("sandbox request mount roots overlap")
-        expected_sources = request.policy_revision.editable_source_sha256
-        observed_sources = tuple(
-            (relative, _hash_regular_no_follow(_closed_child_file(paths[0], relative))[3])
-            for relative, _ in expected_sources
-        )
-        if observed_sources != expected_sources:
-            raise ValueError("sandbox source bytes changed after mount issuance")
-        output_ready = self._repository.load_typed_state(
-            namespace="sandbox-mount-ready",
-            key=request.output_mount.content_authority_sha256,
-            value_type=MountReadyRecordV5,
-        )
-        if (
-            output_ready is None
-            or output_ready.factory_identity_sha256 != self.mount_identity_sha256
-            or output_ready.output_authority_sha256 != request.output_mount.content_authority_sha256
-            or output_ready.output_root_identity_sha256 != request.output_mount.root_identity_sha256
-        ):
-            raise ValueError("sandbox output mount is not durably ready")
-        return paths
+
+    @contextmanager
+    def pinned_request(
+        self,
+        request: DockerPanelRequestV5,
+    ) -> Iterator[tuple[Path, Path, Path]]:
+        """Hold every mount ancestry stable across one Docker engine boundary."""
+
+        self._authorize_request(request)
+        with ExitStack() as stack:
+            accesses = tuple(
+                stack.enter_context(self._pin_handle(handle))
+                for handle in (request.source_mount, request.data_mount, request.output_mount)
+            )
+            paths = tuple(access.path for access in accesses)
+            if any(
+                _roots_overlap(first, second)
+                for first, second in (
+                    (paths[0], paths[1]),
+                    (paths[0], paths[2]),
+                    (paths[1], paths[2]),
+                )
+            ):
+                raise ValueError("sandbox request mount roots overlap")
+            expected_sources = request.policy_revision.editable_source_sha256
+            observed_sources = []
+            for relative, _expected in expected_sources:
+                parts = _closed_child_parts(relative)
+                try:
+                    parent = stack.enter_context(
+                        acquire_directory_v5(
+                            paths[0],
+                            parts[:-1],
+                            create=False,
+                            expected_root_identity=accesses[0].identity,
+                        )
+                    )
+                    stream, info = open_regular_in_directory_v5(
+                        parent,
+                        parts[-1],
+                        writable=False,
+                    )
+                    stack.enter_context(stream)
+                    digest = hashlib.sha256()
+                    while chunk := stream.read(1024 * 1024):
+                        digest.update(chunk)
+                    if info.st_size != stream.tell():
+                        raise ValueError("sandbox source changed while hashing")
+                    observed_sources.append((relative, digest.hexdigest()))
+                except (OSError, ValueError):
+                    raise ValueError("sandbox source path changed") from None
+            if tuple(observed_sources) != expected_sources:
+                raise ValueError("sandbox source bytes changed after mount issuance")
+            output_ready = self._repository.load_typed_state(
+                namespace="sandbox-mount-ready",
+                key=request.output_mount.content_authority_sha256,
+                value_type=MountReadyRecordV5,
+            )
+            if (
+                output_ready is None
+                or output_ready.factory_identity_sha256 != self.mount_identity_sha256
+                or output_ready.output_authority_sha256
+                != request.output_mount.content_authority_sha256
+                or output_ready.output_root_identity_sha256
+                != request.output_mount.root_identity_sha256
+            ):
+                raise ValueError("sandbox output mount is not durably ready")
+            yield paths
+
+    def authenticate_request(
+        self,
+        request: DockerPanelRequestV5,
+    ) -> tuple[Path, Path, Path]:
+        """Reauthenticate every mount and its request-bound source/data authority."""
+
+        with self.pinned_request(request) as paths:
+            return paths
 
 
 class LocalContainerExecutorV5(ContainerExecutorV5):
@@ -793,6 +918,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         validate_sandbox_profile_resources_v5(sandbox_profile, manifest.resources)
         executable_identity = _hash_docker_executable(docker_executable)
         control_path, control_info = _canonical_directory(control_root)
+        if any(_roots_overlap(control_path, root) for root in mount_factory.fixed_roots):
+            raise ValueError("container control root overlaps a fixed sandbox root")
         base_environment = tuple(
             sorted(
                 (key, os.environ[key])
@@ -1040,21 +1167,35 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             key=reservation.command_sha256,
             value_type=ExecutionControlRecordV5,
         )
-        if _lstat_optional(target) is None:
-            if ready is not None:
-                raise ValueError("container control directory disappeared")
-            try:
-                target.mkdir()
+        existing = _lstat_optional(target)
+        if existing is None and ready is not None:
+            raise ValueError("container control directory disappeared")
+        try:
+            with acquire_directory_v5(
+                self._control_root,
+                (reservation.control_relative_path,),
+                create=existing is None,
+                expected_root_identity=(
+                    self._control_root_info.st_dev,
+                    self._control_root_info.st_ino,
+                ),
+            ) as target_access:
+                path = target_access.path
+                info = path.lstat()
+                if (info.st_dev, info.st_ino) != target_access.identity:
+                    raise ValueError("container control identity changed")
                 for name in ("home", "config", "tmp"):
-                    (target / name).mkdir()
-            except OSError:
-                raise ValueError("container control directory could not be created") from None
-        path, info = _canonical_directory(target)
-        for name in ("home", "config", "tmp"):
-            child, _ = _canonical_directory(path / name)
-            if child.parent != path:
-                raise ValueError("container control child escaped its root")
-        identity = _directory_identity(path, info)
+                    with acquire_directory_v5(
+                        path,
+                        (name,),
+                        create=ready is None,
+                        expected_root_identity=target_access.identity,
+                    ) as child:
+                        if child.path.parent != path:
+                            raise ValueError("container control child escaped its root")
+                identity = _directory_identity(path, info)
+        except (OSError, ValueError):
+            raise ValueError("container control directory could not be safely opened") from None
         expected = ExecutionControlRecordV5(
             5,
             self.executor_identity_sha256,
@@ -1215,8 +1356,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or host.get("Memory") != self._profile.memory_limit_mib * 1024 * 1024
             or host.get("NanoCpus") != int(self._profile.cpu_limit * Decimal(1_000_000_000))
             or host.get("CapDrop") != ["ALL"]
-            or not isinstance(host.get("SecurityOpt"), list)
-            or not any(str(value).startswith("no-new-privileges") for value in host["SecurityOpt"])
+            or host.get("SecurityOpt") != ["no-new-privileges:true"]
+            or host.get("Tmpfs") != {"/tmp": "rw,noexec,nosuid,nodev,size=16m"}
             or type(state) is not dict
         ):
             raise ValueError("container isolation differs from executor authority")
@@ -1260,6 +1401,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 "read_only": host.get("ReadonlyRootfs"),
                 "cap_drop": host.get("CapDrop"),
                 "security_opt": host.get("SecurityOpt"),
+                "tmpfs": host.get("Tmpfs"),
                 "pids": host.get("PidsLimit"),
                 "memory": host.get("Memory"),
                 "nano_cpus": host.get("NanoCpus"),
@@ -1290,18 +1432,19 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 )
                 if created is None and inspection is None and launch_is_new:
                     runtime = self._runtime_argv(command)
-                    result = self._control(
-                        runtime[1:],
-                        environment=environment,
-                        timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
-                        output_limit=64 * 1024,
-                    )
-                    inspection = self._inspect_container(
-                        reservation=record,
-                        command=command,
-                        environment=environment,
-                        image_id=image_id,
-                    )
+                    with self._mount_factory.pinned_request(command.request):
+                        result = self._control(
+                            runtime[1:],
+                            environment=environment,
+                            timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
+                            output_limit=64 * 1024,
+                        )
+                        inspection = self._inspect_container(
+                            reservation=record,
+                            command=command,
+                            environment=environment,
+                            image_id=image_id,
+                        )
                     if not self._successful(result) and inspection is None:
                         self._persist_failure(command)
                         return
@@ -1321,18 +1464,19 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 assert type(state) is dict
                 status = state.get("Status")
                 if status == "created" and start_is_new:
-                    result = self._control(
-                        ("start", record.container_name),
-                        environment=environment,
-                        timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
-                        output_limit=64 * 1024,
-                    )
-                    inspection = self._inspect_container(
-                        reservation=record,
-                        command=command,
-                        environment=environment,
-                        image_id=image_id,
-                    )
+                    with self._mount_factory.pinned_request(command.request):
+                        result = self._control(
+                            ("start", record.container_name),
+                            environment=environment,
+                            timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
+                            output_limit=64 * 1024,
+                        )
+                        inspection = self._inspect_container(
+                            reservation=record,
+                            command=command,
+                            environment=environment,
+                            image_id=image_id,
+                        )
                     if not self._successful(result) and inspection is None:
                         self._persist_failure(command)
                         return
@@ -1432,20 +1576,28 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         )
 
     def _read_output(self, command: ContainerCommandV5) -> bytes | None:
-        output_root = self._mount_factory.authenticate_handle(command.request.output_mount)
-        path = output_root / self._OUTPUT_NAME
-        if _lstat_optional(path) is None:
-            return None
-        stream, info = _open_regular_no_follow(path)
-        try:
-            content = stream.read(self._manifest.resources.evaluation_output_limit_bytes + 1)
-        except OSError:
-            raise ValueError("container output could not be read") from None
-        finally:
-            stream.close()
-        if len(content) <= self._manifest.resources.evaluation_output_limit_bytes and info.st_size != len(content):
-            raise ValueError("container output changed during bounded read")
-        return content
+        with self._mount_factory._pin_handle(command.request.output_mount) as output_root:
+            path = output_root.path / self._OUTPUT_NAME
+            if _lstat_optional(path) is None:
+                return None
+            try:
+                stream, info = open_regular_in_directory_v5(
+                    output_root,  # type: ignore[arg-type]
+                    self._OUTPUT_NAME,
+                    writable=False,
+                )
+                try:
+                    content = stream.read(self._manifest.resources.evaluation_output_limit_bytes + 1)
+                finally:
+                    stream.close()
+            except (OSError, ValueError):
+                raise ValueError("container output could not be read") from None
+            if (
+                len(content) <= self._manifest.resources.evaluation_output_limit_bytes
+                and info.st_size != len(content)
+            ):
+                raise ValueError("container output changed during bounded read")
+            return content
 
     def collect(
         self,
@@ -1633,7 +1785,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 try:
                     from agent_loop import _remove_private_tree
 
-                    _remove_private_tree(control_path)
+                    with acquire_absolute_directory_v5(
+                        self._control_root,
+                        expected_identity=(
+                            self._control_root_info.st_dev,
+                            self._control_root_info.st_ino,
+                        ),
+                    ):
+                        _remove_private_tree(control_path)
                 except BaseException:
                     raise ValueError("container control cleanup failed") from None
                 if _lstat_optional(control_path) is not None:

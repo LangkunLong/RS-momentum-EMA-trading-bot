@@ -1236,6 +1236,33 @@ class LocalArtifactRepositoryV5:
                 ) from None
             return reference
 
+    def _load_adapter_state_authority(
+        self,
+        *,
+        namespace: str,
+        key: str,
+    ) -> tuple[AdapterStateAuthorityV5, ArtifactRefV5] | None:
+        authority_relative = f"adapter-state-authority/{namespace}/{key}.json"
+        try:
+            authority_raw = self._read_relative(authority_relative)
+        except ArtifactMissingV5:
+            return None
+        authority_reference = ArtifactRefV5(
+            authority_relative,
+            hashlib.sha256(authority_raw).hexdigest(),
+        )
+        authority = self.load_typed_artifact(
+            authority_reference,
+            value_type=AdapterStateAuthorityV5,
+        )
+        if (
+            authority.namespace != namespace
+            or authority.key != key
+            or authority.value_ref.relative_path != f"adapter-state/{namespace}/{key}.json"
+        ):
+            raise ArtifactSchemaFailureV5(authority_reference)
+        return authority, authority_reference
+
     def append_typed_state(self, *, namespace: str, key: str, value: object) -> ArtifactRefV5:
         """Create or authenticate one deterministic adapter state record."""
 
@@ -1252,11 +1279,22 @@ class LocalArtifactRepositoryV5:
             safe_key,
             reference,
         )
-        self._create_or_authenticate_typed(
-            f"adapter-state-authority/{safe_namespace}/{safe_key}.json",
-            authority,
+        authority_relative = f"adapter-state-authority/{safe_namespace}/{safe_key}.json"
+        prior = self._load_adapter_state_authority(
+            namespace=safe_namespace,
+            key=safe_key,
         )
-        return self._create_or_authenticate_typed(relative, value)
+        if prior is not None and prior[0] != authority:
+            raise ArtifactExistsV5(prior[1])
+
+        # Publish immutable value bytes before their index.  A crash between the
+        # two writes leaves an exact orphan which this same operation can reuse;
+        # it never leaves a newly published authority pointing at absent bytes.
+        stored_reference = self._create_or_authenticate_typed(relative, value)
+        if stored_reference != reference:
+            raise ArtifactDigestMismatchV5(reference, stored_reference.sha256)
+        self._create_or_authenticate_typed(authority_relative, authority)
+        return stored_reference
 
     def load_typed_state(
         self,
@@ -1264,37 +1302,60 @@ class LocalArtifactRepositoryV5:
         namespace: str,
         key: str,
         value_type: type[T],
+        repair: bool = True,
     ) -> T | None:
-        """Load one exact deterministic adapter state record if it exists."""
+        """Load exact state; operational mode repairs only an authenticated orphan index."""
 
         safe_namespace = _safe_component(namespace, "typed state namespace")
         safe_key = _safe_component(key, "typed state key")
+        if type(repair) is not bool:
+            raise ValueError("typed state repair mode is invalid")
         relative = f"adapter-state/{safe_namespace}/{safe_key}.json"
         authority_relative = f"adapter-state-authority/{safe_namespace}/{safe_key}.json"
-        try:
-            authority_raw = self._read_relative(authority_relative)
-        except ArtifactMissingV5:
+        loaded_authority = self._load_adapter_state_authority(
+            namespace=safe_namespace,
+            key=safe_key,
+        )
+        if loaded_authority is None:
             try:
-                self._read_relative(relative)
+                value_raw = self._read_relative(relative)
             except ArtifactMissingV5:
                 return None
-            raise ArtifactMissingV5(
-                ArtifactRefV5(authority_relative, "0" * 64)
-            ) from None
-        authority_reference = ArtifactRefV5(
-            authority_relative,
-            hashlib.sha256(authority_raw).hexdigest(),
-        )
-        authority = self.load_typed_artifact(
-            authority_reference,
-            value_type=AdapterStateAuthorityV5,
-        )
-        if (
-            authority.namespace != safe_namespace
-            or authority.key != safe_key
-            or authority.value_ref.relative_path != relative
-        ):
-            raise ArtifactSchemaFailureV5(authority_reference)
+            value_reference = ArtifactRefV5(
+                relative,
+                hashlib.sha256(value_raw).hexdigest(),
+            )
+            # Authenticate the orphan exactly before reporting the missing
+            # index.  A later identical append can now repair this crash window.
+            orphan_value = self.load_typed_artifact(value_reference, value_type=value_type)
+            expected_authority = AdapterStateAuthorityV5(
+                5,
+                safe_namespace,
+                safe_key,
+                value_reference,
+            )
+            expected_authority_ref = ArtifactRefV5(
+                authority_relative,
+                hashlib.sha256(canonical_json_bytes_v5(expected_authority)).hexdigest(),
+            )
+            if not repair:
+                raise ArtifactMissingV5(expected_authority_ref) from None
+            repaired_ref = self._create_or_authenticate_typed(
+                authority_relative,
+                expected_authority,
+            )
+            if repaired_ref != expected_authority_ref:
+                raise ArtifactDigestMismatchV5(expected_authority_ref, repaired_ref.sha256)
+            repaired = self._load_adapter_state_authority(
+                namespace=safe_namespace,
+                key=safe_key,
+            )
+            if repaired is None or repaired[0] != expected_authority or repaired[1] != expected_authority_ref:
+                raise ArtifactSchemaFailureV5(expected_authority_ref)
+            if self.load_typed_artifact(value_reference, value_type=value_type) != orphan_value:
+                raise ArtifactSchemaFailureV5(value_reference)
+            return orphan_value
+        authority, _authority_reference = loaded_authority
         return self.load_typed_artifact(authority.value_ref, value_type=value_type)
 
     def append_binary_state(self, *, namespace: str, key: str, content: bytes) -> ArtifactRefV5:
@@ -1344,7 +1405,10 @@ class LocalArtifactRepositoryV5:
             or maximum_bytes <= 0
         ):
             raise ValueError("binary state authority is invalid")
-        content = self._read_relative(reference.relative_path)
+        try:
+            content = self._read_relative(reference.relative_path)
+        except ArtifactMissingV5:
+            raise ArtifactMissingV5(reference) from None
         actual = hashlib.sha256(content).hexdigest()
         if actual != reference.sha256:
             raise ArtifactDigestMismatchV5(reference, actual)

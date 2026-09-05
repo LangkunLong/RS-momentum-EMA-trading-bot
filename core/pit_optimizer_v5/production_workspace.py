@@ -9,11 +9,21 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-from typing import BinaryIO, Literal
+import subprocess
+from typing import Literal
 
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
 from core.pit_optimizer_v5.contracts import canonical_sha256_v5
 from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+from core.pit_optimizer_v5.production_fs import (
+    acquire_absolute_directory_v5,
+    acquire_directory_v5,
+    hash_regular_in_directory_v5,
+    open_regular_in_directory_v5,
+    read_regular_in_directory_v5,
+    write_new_regular_in_directory_v5,
+    write_regular_in_directory_v5,
+)
 from core.pit_optimizer_v5.workspace import (
     GitWorkspaceDriverV5,
     MaterializedWorkspaceV5,
@@ -86,32 +96,14 @@ def _hash_regular_file(path: Path) -> tuple[int, int, int, str]:
         or _is_reparse(info)
     ):
         raise ValueError("Git executable is not a canonical regular file")
-    digest = hashlib.sha256()
     try:
-        descriptor = os.open(
-            resolved,
-            os.O_RDONLY
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        stream = os.fdopen(descriptor, "rb", buffering=0)
-        opened = os.fstat(stream.fileno())
-        after = resolved.lstat()
-    except OSError:
+        with acquire_absolute_directory_v5(resolved.parent) as parent:
+            observed = hash_regular_in_directory_v5(parent, resolved.name)
+    except (OSError, ValueError):
         raise ValueError("Git executable could not be authenticated") from None
-    if (
-        _metadata_identity(info) != _metadata_identity(opened)
-        or _metadata_identity(opened) != _metadata_identity(after)
-        or not stat.S_ISREG(opened.st_mode)
-        or _is_reparse(after)
-    ):
-        stream.close()
+    if _metadata_identity(info) != observed[:2]:
         raise ValueError("Git executable changed during authentication")
-    with stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return opened.st_dev, opened.st_ino, opened.st_size, digest.hexdigest()
+    return observed
 
 
 def _metadata_identity(info: os.stat_result) -> tuple[int, int]:
@@ -127,61 +119,6 @@ def _directory_identity(path: Path, info: os.stat_result, *, lease_sha256: str) 
             "lease_sha256": lease_sha256,
         }
     )
-
-
-def _open_regular_no_follow(path: Path, *, writable: bool) -> tuple[BinaryIO, os.stat_result]:
-    try:
-        before = os.lstat(path)
-        if _is_reparse(before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise OSError
-        flags = os.O_WRONLY if writable else os.O_RDONLY
-        descriptor = os.open(
-            path,
-            flags
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        stream = os.fdopen(descriptor, "r+b" if writable else "rb", buffering=0)
-        opened = os.fstat(stream.fileno())
-        after = os.lstat(path)
-        if (
-            _metadata_identity(before) != _metadata_identity(opened)
-            or _metadata_identity(opened) != _metadata_identity(after)
-            or _is_reparse(after)
-            or not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or after.st_nlink != 1
-        ):
-            stream.close()
-            raise OSError
-        return stream, opened
-    except OSError:
-        raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
-
-
-def _read_regular_no_follow(path: Path) -> bytes:
-    stream, _ = _open_regular_no_follow(path, writable=False)
-    try:
-        return stream.read()
-    except OSError:
-        raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
-    finally:
-        stream.close()
-
-
-def _write_regular_no_follow(path: Path, content: bytes) -> None:
-    stream, _ = _open_regular_no_follow(path, writable=True)
-    try:
-        stream.seek(0)
-        stream.truncate(0)
-        stream.write(content)
-        stream.flush()
-        os.fsync(stream.fileno())
-    except OSError:
-        raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
-    finally:
-        stream.close()
 
 
 def _lstat_optional(path: Path) -> os.stat_result | None:
@@ -201,6 +138,88 @@ def _roots_overlap(first: str, second: str) -> bool:
     except ValueError:
         return False
     return common in {first_key, second_key}
+
+
+_GIT_ENV_KEYS = frozenset({"SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"})
+_NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
+_GIT_FIXED_ARGS = (
+    "--no-lazy-fetch",
+    "--no-replace-objects",
+    "-c",
+    f"core.hooksPath={_NULL_DEVICE}",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "pager.status=false",
+)
+_CREDENTIAL_COMPONENT = re.compile(
+    r"(?:^|[._-])(?:secret|secrets|token|tokens|credential|credentials|private[_-]?key|api[_-]?key)(?:$|[._-])"
+)
+
+
+def _git_environment() -> dict[str, str]:
+    allowed = {key.casefold(): key for key in _GIT_ENV_KEYS}
+    environment: dict[str, str] = {}
+    for key, value in os.environ.items():
+        canonical = allowed.get(key.casefold())
+        if canonical is None:
+            continue
+        if canonical in environment and environment[canonical] != value:
+            raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+        environment[canonical] = value
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": _NULL_DEVICE,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "LC_ALL": "C",
+            "LANG": "C",
+        }
+    )
+    return environment
+
+
+def _closed_tracked_path(raw: bytes) -> tuple[str, ...]:
+    try:
+        relative = raw.decode("utf-8", errors="strict")
+    except UnicodeError:
+        raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
+    pure = PurePosixPath(relative)
+    if (
+        not relative
+        or pure.is_absolute()
+        or pure.as_posix() != relative
+        or "\\" in relative
+        or any(
+            part in {"", ".", ".."}
+            or part.endswith((".", " "))
+            or ":" in part
+            for part in pure.parts
+        )
+    ):
+        raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+    for index, component in enumerate(part.casefold() for part in pure.parts):
+        public_example = index == len(pure.parts) - 1 and component in {
+            ".env.example",
+            ".env.template",
+        }
+        if (
+            (not public_example and (component == ".env" or component.startswith(".env.")))
+            or component in {"id_rsa", "id_ed25519", "credentials.json"}
+            or component.endswith((".pem", ".key", ".p12", ".pfx", ".jks"))
+            or _CREDENTIAL_COMPONENT.search(component) is not None
+        ):
+            raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+    return pure.parts
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +319,8 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         self._source_commit = source_commit
         self._git_executable = git_executable
         self._git_identity = executable_identity
+        self._source_identity = _metadata_identity(source_info)
+        self._workspace_identity = _metadata_identity(workspace_info)
         self._repository = repository
         self._owner = owner
         self.driver_identity_sha256 = canonical_sha256_v5(
@@ -323,6 +344,13 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
     def roots(self) -> WorkspaceRootsV5:
         return self._roots
 
+    @property
+    def root_identities(self) -> tuple[tuple[str, tuple[int, int]], tuple[str, tuple[int, int]]]:
+        return (
+            (self._roots.source_root, self._source_identity),
+            (self._roots.workspace_root, self._workspace_identity),
+        )
+
     def acquire_root(self, *, configured_path: str, purpose: WorkspacePurposeV5) -> WorkspaceRootHandleV5:
         expected = self._roots.source_root if purpose == "source" else self._roots.workspace_root
         if purpose not in {"source", "workspace"} or _windows_key(configured_path) != _windows_key(expected):
@@ -340,7 +368,11 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             capability,
         )
 
-    def _root(self, handle: WorkspaceRootHandleV5, purpose: WorkspacePurposeV5) -> Path:
+    def _root_capability(
+        self,
+        handle: WorkspaceRootHandleV5,
+        purpose: WorkspacePurposeV5,
+    ) -> _RootCapabilityV5:
         capability = handle.opaque_handle
         if type(handle) is not WorkspaceRootHandleV5 or type(capability) is not _RootCapabilityV5:
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
@@ -352,37 +384,137 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             or _windows_key(handle.canonical_path) != _windows_key(capability.path)
         ):
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-        path, info = _canonical_link_free_directory(capability.path)
-        identity = canonical_sha256_v5({"device": info.st_dev, "inode": info.st_ino})
+        identity = canonical_sha256_v5({"device": capability.device, "inode": capability.inode})
         if (
-            (info.st_dev, info.st_ino) != (capability.device, capability.inode)
-            or handle.root_identity_sha256 != identity
+            handle.root_identity_sha256 != identity
             or handle.canonical_path_sha256
-            != hashlib.sha256(_windows_key(str(path)).encode("utf-8")).hexdigest()
+            != hashlib.sha256(_windows_key(capability.path).encode("utf-8")).hexdigest()
         ):
-            raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
-        return path
+            raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
+        return capability
 
-    @staticmethod
-    def _policy_file(root: Path, relative_path: str) -> Path:
-        parts = _closed_policy_path(relative_path)
-        parent = root
-        for component in parts[:-1]:
-            parent = parent / component
-            try:
-                info = parent.lstat()
-            except OSError:
-                raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
-            if not stat.S_ISDIR(info.st_mode) or _is_reparse(info):
-                raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
-        target = parent / parts[-1]
-        info = _lstat_optional(target)
-        if info is None or not stat.S_ISREG(info.st_mode) or _is_reparse(info) or info.st_nlink != 1:
-            raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
-        return target
+    def _root(self, handle: WorkspaceRootHandleV5, purpose: WorkspacePurposeV5) -> Path:
+        capability = self._root_capability(handle, purpose)
+        try:
+            with acquire_absolute_directory_v5(
+                Path(capability.path),
+                expected_identity=(capability.device, capability.inode),
+            ):
+                return Path(capability.path)
+        except (OSError, ValueError):
+            raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
 
     def read_root_policy_file(self, *, root: WorkspaceRootHandleV5, relative_path: str) -> bytes:
-        return _read_regular_no_follow(self._policy_file(self._root(root, "source"), relative_path))
+        capability = self._root_capability(root, "source")
+        parts = _closed_policy_path(relative_path)
+        try:
+            with acquire_directory_v5(
+                Path(capability.path),
+                parts[:-1],
+                create=False,
+                expected_root_identity=(capability.device, capability.inode),
+            ) as parent:
+                return read_regular_in_directory_v5(parent, parts[-1])[0]
+        except (OSError, ValueError):
+            raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
+
+    def _run_git(self, source: Path, *arguments: str, output_limit: int = 128 * 1024 * 1024) -> bytes:
+        if (
+            type(arguments) is not tuple
+            or not arguments
+            or any(type(item) is not str or not item or "\x00" in item for item in arguments)
+            or type(output_limit) is not int
+            or output_limit <= 0
+        ):
+            raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+        try:
+            with acquire_absolute_directory_v5(
+                source,
+                expected_identity=self._source_identity,
+            ), acquire_absolute_directory_v5(self._git_executable.parent) as executable_parent:
+                executable_stream, executable_info = open_regular_in_directory_v5(
+                    executable_parent,
+                    self._git_executable.name,
+                    writable=False,
+                )
+                with executable_stream:
+                    digest = hashlib.sha256()
+                    while chunk := executable_stream.read(1024 * 1024):
+                        digest.update(chunk)
+                    observed = (
+                        executable_info.st_dev,
+                        executable_info.st_ino,
+                        executable_info.st_size,
+                        digest.hexdigest(),
+                    )
+                    if observed != self._git_identity:
+                        raise ValueError("Git executable identity changed")
+                    result = subprocess.run(
+                        [str(self._git_executable), *_GIT_FIXED_ARGS, *arguments],
+                        cwd=source,
+                        env=_git_environment(),
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        check=False,
+                        timeout=60.0,
+                        shell=False,
+                    )
+                    if result.returncode != 0 or len(result.stdout) > output_limit:
+                        raise ValueError("Git operation failed")
+                    executable_stream.seek(0)
+                    after_digest = hashlib.sha256()
+                    while chunk := executable_stream.read(1024 * 1024):
+                        after_digest.update(chunk)
+                    if after_digest.hexdigest() != self._git_identity[3]:
+                        raise ValueError("Git executable identity changed")
+                    return result.stdout
+        except (OSError, subprocess.SubprocessError, ValueError):
+            raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
+
+    def _export_commit(self, source: Path, target_root: Path, target_identity: tuple[int, int]) -> None:
+        raw_tree = self._run_git(
+            source,
+            "ls-tree",
+            "-rz",
+            "-r",
+            "--full-tree",
+            self._source_commit,
+            output_limit=32 * 1024 * 1024,
+        )
+        entries: list[tuple[tuple[str, ...], str]] = []
+        for raw_entry in raw_tree.split(b"\0"):
+            if not raw_entry:
+                continue
+            try:
+                metadata, raw_path = raw_entry.split(b"\t", 1)
+                mode, kind, _object_id = metadata.decode("ascii", errors="strict").split(" ")
+            except (UnicodeError, ValueError):
+                raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
+            parts = _closed_tracked_path(raw_path)
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+            entries.append((parts, mode))
+        paths = tuple("/".join(parts) for parts, _mode in entries)
+        if len(set(paths)) != len(paths):
+            raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+        entries.sort(key=lambda item: "/".join(item[0]))
+        for parts, _mode in entries:
+            relative = "/".join(parts)
+            content = self._run_git(
+                source,
+                "show",
+                f"{self._source_commit}:{relative}",
+            )
+            try:
+                with acquire_directory_v5(
+                    target_root,
+                    parts[:-1],
+                    create=True,
+                    expected_root_identity=target_identity,
+                ) as parent:
+                    write_new_regular_in_directory_v5(parent, parts[-1], content)
+            except (OSError, ValueError):
+                raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
 
     def _record(self, lease: WorkspaceLeaseV5) -> WorkspaceLeaseRecordV5:
         return WorkspaceLeaseRecordV5(5, self.driver_identity_sha256, lease)
@@ -394,8 +526,10 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         workspace_root: WorkspaceRootHandleV5,
         lease: WorkspaceLeaseV5,
     ) -> OwnedWorkspaceHandleV5:
-        source = self._root(source_root, "source")
-        destination_root = self._root(workspace_root, "workspace")
+        source_capability = self._root_capability(source_root, "source")
+        destination_capability = self._root_capability(workspace_root, "workspace")
+        source = Path(source_capability.path)
+        destination_root = Path(destination_capability.path)
         if lease.workspace_root_identity_sha256 != workspace_root.root_identity_sha256:
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
         target = destination_root / lease.workspace_relative_path
@@ -426,20 +560,44 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             if existing is not None:
                 if not stat.S_ISDIR(existing.st_mode) or _is_reparse(existing) or target.parent != destination_root:
                     raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
-                self._remove_exact_tree(target)
+                try:
+                    with acquire_absolute_directory_v5(
+                        destination_root,
+                        expected_identity=(destination_capability.device, destination_capability.inode),
+                    ):
+                        self._remove_exact_tree(target)
+                except (OSError, ValueError):
+                    raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
             try:
-                target.mkdir()
-                from agent_loop import _write_commit_export, configure_git_executable
-
-                configure_git_executable(self._git_executable)
-                _write_commit_export(source, self._source_commit, target)
+                with acquire_directory_v5(
+                    destination_root,
+                    (lease.workspace_relative_path,),
+                    create=True,
+                    expected_root_identity=(
+                        destination_capability.device,
+                        destination_capability.inode,
+                    ),
+                ) as target_access:
+                    if any(os.scandir(target_access.path)):
+                        raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+                    self._export_commit(source, target_access.path, target_access.identity)
+                    target_path = target_access.path
+                    target_info = target_path.lstat()
+                    if _metadata_identity(target_info) != target_access.identity:
+                        raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
             except BaseException:
                 try:
-                    self._remove_exact_tree(target)
-                except WorkspaceDriverBoundaryErrorV5:
+                    with acquire_absolute_directory_v5(
+                        destination_root,
+                        expected_identity=(
+                            destination_capability.device,
+                            destination_capability.inode,
+                        ),
+                    ):
+                        self._remove_exact_tree(target)
+                except (OSError, ValueError, WorkspaceDriverBoundaryErrorV5):
                     pass
                 raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
-            target_path, target_info = _canonical_link_free_directory(str(target))
             identity = _directory_identity(target_path, target_info, lease_sha256=lease.sha256)
             self._repository.append_typed_state(
                 namespace="workspace-ready",
@@ -535,17 +693,28 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         lease: WorkspaceLeaseV5,
         require_ready: bool,
     ) -> OwnedWorkspaceHandleV5 | None:
-        root = self._root(workspace_root, "workspace")
+        root_capability = self._root_capability(workspace_root, "workspace")
+        root = Path(root_capability.path)
         registered = self._active_record_unlocked(lease.payload.lease_id)
         if registered is None or registered.lease != lease:
             return None
         target = root / lease.workspace_relative_path
         if _lstat_optional(target) is None:
             return None
-        target, info = _canonical_link_free_directory(str(target))
-        if target.parent != root:
-            raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
-        identity = _directory_identity(target, info, lease_sha256=lease.sha256)
+        try:
+            with acquire_directory_v5(
+                root,
+                (lease.workspace_relative_path,),
+                create=False,
+                expected_root_identity=(root_capability.device, root_capability.inode),
+            ) as target_access:
+                target = target_access.path
+                info = target.lstat()
+                if _metadata_identity(info) != target_access.identity or target.parent != root:
+                    raise ValueError("workspace target identity changed")
+                identity = _directory_identity(target, info, lease_sha256=lease.sha256)
+        except (OSError, ValueError):
+            raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
         ready = self._ready(lease.lease_token_sha256)
         if require_ready and ready is None:
             raise WorkspaceDriverBoundaryErrorV5("driver_failed")
@@ -591,14 +760,42 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             or workspace.lease_token_sha256 != lease.lease_token_sha256
         ):
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-        target, info = _canonical_link_free_directory(capability.path)
-        if (
-            (info.st_dev, info.st_ino) != (capability.device, capability.inode)
-            or _directory_identity(target, info, lease_sha256=lease.sha256)
-            != workspace.handle_identity_sha256
-        ):
-            raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-        return target
+        try:
+            with acquire_absolute_directory_v5(
+                Path(capability.path),
+                expected_identity=(capability.device, capability.inode),
+            ) as target_access:
+                info = target_access.path.lstat()
+                if (
+                    _metadata_identity(info) != target_access.identity
+                    or _directory_identity(target_access.path, info, lease_sha256=lease.sha256)
+                    != workspace.handle_identity_sha256
+                ):
+                    raise ValueError("workspace identity changed")
+                return target_access.path
+        except (OSError, ValueError):
+            try:
+                absent = _lstat_optional(Path(capability.path)) is None
+            except WorkspaceDriverBoundaryErrorV5:
+                absent = False
+            raise WorkspaceDriverBoundaryErrorV5("unsafe_path" if absent else "foreign_lease") from None
+
+    def _acquire_owned_directory(
+        self,
+        workspace: OwnedWorkspaceHandleV5,
+        lease: WorkspaceLeaseV5,
+    ):
+        capability = workspace.opaque_handle
+        target = self._owned_capability(workspace, lease)
+        assert type(capability) is _OwnedWorkspaceCapabilityV5
+        try:
+            access = acquire_absolute_directory_v5(
+                target,
+                expected_identity=(capability.device, capability.inode),
+            )
+        except (OSError, ValueError):
+            raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
+        return access
 
     def workspace_presence(self, *, workspace: OwnedWorkspaceHandleV5, lease: WorkspaceLeaseV5) -> WorkspacePresenceV5:
         try:
@@ -618,7 +815,17 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         record = self.load_lease(workspace.lease_id)
         if record is None:
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-        return _read_regular_no_follow(self._policy_file(self._owned(workspace, record), relative_path))
+        parts = _closed_policy_path(relative_path)
+        try:
+            with self._acquire_owned_directory(workspace, record) as root, acquire_directory_v5(
+                root.path,
+                parts[:-1],
+                create=False,
+                expected_root_identity=root.identity,
+            ) as parent:
+                return read_regular_in_directory_v5(parent, parts[-1])[0]
+        except (OSError, ValueError):
+            raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
 
     def write_workspace_policy_file(
         self,
@@ -632,14 +839,27 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         record = self.load_lease(workspace.lease_id)
         if record is None:
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-        _write_regular_no_follow(self._policy_file(self._owned(workspace, record), relative_path), content)
+        parts = _closed_policy_path(relative_path)
+        try:
+            with self._acquire_owned_directory(workspace, record) as root, acquire_directory_v5(
+                root.path,
+                parts[:-1],
+                create=False,
+                expected_root_identity=root.identity,
+            ) as parent:
+                write_regular_in_directory_v5(parent, parts[-1], content)
+        except (OSError, ValueError):
+            raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
 
     def controller_lease_is_live(self, owner: WorkspaceOwnerV5) -> bool:
         if type(owner) is not WorkspaceOwnerV5:
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
         return owner == self._owner
 
-    def authorize_materialized_source(self, materialized: MaterializedWorkspaceV5) -> tuple[Path, str]:
+    def authorize_materialized_source(
+        self,
+        materialized: MaterializedWorkspaceV5,
+    ) -> tuple[Path, str, tuple[int, int]]:
         """Return the exact root only to the concrete mount factory after reauthentication."""
 
         if (
@@ -648,12 +868,29 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             or materialized.lease.child_revision_sha256 != materialized.variant.policy_revision.sha256
         ):
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-        root = self._owned(materialized.workspace_handle, materialized.lease)
-        for source_file in materialized.variant.source_bundle.files:
-            observed = _read_regular_no_follow(self._policy_file(root, source_file.path))
-            if hashlib.sha256(observed).hexdigest() != source_file.sha256:
-                raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-        return root, materialized.workspace_handle.handle_identity_sha256
+        try:
+            with self._acquire_owned_directory(
+                materialized.workspace_handle,
+                materialized.lease,
+            ) as root:
+                for source_file in materialized.variant.source_bundle.files:
+                    parts = _closed_policy_path(source_file.path)
+                    with acquire_directory_v5(
+                        root.path,
+                        parts[:-1],
+                        create=False,
+                        expected_root_identity=root.identity,
+                    ) as parent:
+                        observed = read_regular_in_directory_v5(parent, parts[-1])[0]
+                    if hashlib.sha256(observed).hexdigest() != source_file.sha256:
+                        raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
+                return (
+                    root.path,
+                    materialized.workspace_handle.handle_identity_sha256,
+                    root.identity,
+                )
+        except (OSError, ValueError):
+            raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
 
     def remove_workspace_no_follow(
         self,
@@ -662,7 +899,8 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         workspace: OwnedWorkspaceHandleV5,
         lease: WorkspaceLeaseV5,
     ) -> WorkspaceRemovalStateV5:
-        root = self._root(workspace_root, "workspace")
+        root_capability = self._root_capability(workspace_root, "workspace")
+        root = Path(root_capability.path)
         key = lease.lease_token_sha256
         with self._repository.adapter_state_transition(namespace="workspace", key=key):
             registered = self._active_record_unlocked(lease.payload.lease_id)
@@ -673,7 +911,14 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             target = self._owned_capability(workspace, lease)
             if target.parent != root:
                 raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
-            self._remove_exact_tree(target)
+            try:
+                with acquire_absolute_directory_v5(
+                    root,
+                    expected_identity=(root_capability.device, root_capability.inode),
+                ):
+                    self._remove_exact_tree(target)
+            except (OSError, ValueError):
+                raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
             return "removed"
 
     @staticmethod
@@ -695,9 +940,15 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             record = self._active_record_unlocked(lease_id)
             if record is None:
                 return
-            root, _ = _canonical_link_free_directory(self._roots.workspace_root)
-            if _lstat_optional(root / record.lease.workspace_relative_path) is not None:
-                raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+            try:
+                with acquire_absolute_directory_v5(
+                    Path(self._roots.workspace_root),
+                    expected_identity=self._workspace_identity,
+                ) as root:
+                    if _lstat_optional(root.path / record.lease.workspace_relative_path) is not None:
+                        raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+            except (OSError, ValueError):
+                raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
             self._repository.append_typed_state(
                 namespace="workspace-retirement",
                 key=key,
