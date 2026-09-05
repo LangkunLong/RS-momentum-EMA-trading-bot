@@ -220,6 +220,33 @@ def _policy_assignment_name_and_value_v5(
     return statement.target.id, statement.value
 
 
+def _policy_literal_is_deeply_immutable_v5(value: object) -> bool:
+    if type(value) in {type(None), bool, int, float, str}:
+        return not (type(value) is float and not math.isfinite(value))
+    return (
+        type(value) is tuple
+        and len(value) <= 256
+        and all(_policy_literal_is_deeply_immutable_v5(item) for item in value)
+    )
+
+
+def _policy_local_target_names_v5(target: ast.expr) -> tuple[str, ...]:
+    if isinstance(target, ast.Name):
+        if target.id.startswith("__"):
+            raise ValueError("V5 policy assignment target is invalid")
+        return (target.id,)
+    if isinstance(target, ast.Tuple) and 1 <= len(target.elts) <= 8:
+        names = tuple(
+            name
+            for item in target.elts
+            for name in _policy_local_target_names_v5(item)
+        )
+        if len(names) != len(set(names)):
+            raise ValueError("V5 policy assignment targets are duplicated")
+        return names
+    raise ValueError("V5 policy writes require bounded local name targets")
+
+
 def _policy_call_graph_is_acyclic_v5(
     functions: Mapping[str, ast.FunctionDef],
 ) -> bool:
@@ -352,7 +379,7 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
             except (TypeError, ValueError):
                 raise ValueError("V5 policy module constants must be literal") from None
             if name == "__all__":
-                if all_exports_seen or type(literal) not in {list, tuple}:
+                if all_exports_seen or type(literal) is not tuple:
                     raise ValueError("V5 policy export declaration is invalid")
                 exports = tuple(literal)
                 if (
@@ -362,7 +389,11 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
                 ):
                     raise ValueError("V5 policy export declaration differs from the interface")
                 all_exports_seen = True
-            elif not name.isupper() or name.startswith("_"):
+            elif (
+                not name.isupper()
+                or name.startswith("_")
+                or not _policy_literal_is_deeply_immutable_v5(literal)
+            ):
                 raise ValueError("V5 policy module assignment is outside the constant scope")
             continue
         raise ValueError("V5 policy module statement is outside the closed language")
@@ -400,6 +431,20 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
         ):
             continue
         raise ValueError("V5 policy attribute and dynamic calls are forbidden")
+    for function in functions.values():
+        for node in ast.walk(function):
+            if isinstance(node, ast.Assign):
+                names = tuple(
+                    name
+                    for target in node.targets
+                    for name in _policy_local_target_names_v5(target)
+                )
+                if len(names) > 8 or len(names) != len(set(names)):
+                    raise ValueError("V5 policy assignment targets are invalid")
+            elif isinstance(node, ast.AnnAssign):
+                _policy_local_target_names_v5(node.target)
+            elif isinstance(node, ast.AugAssign):
+                _policy_local_target_names_v5(node.target)
     if not _policy_call_graph_is_acyclic_v5(functions):
         raise ValueError("V5 policy helper recursion is forbidden")
     return tree

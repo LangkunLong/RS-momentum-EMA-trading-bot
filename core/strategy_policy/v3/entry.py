@@ -13,4 +13,4 @@ def evaluate_entry(snapshot: EntrySnapshotV3) -> EntryDecision:
     return _evaluate_entry_v2(snapshot.base)
 
 
-__all__ = ["evaluate_entry"]
+__all__ = ("evaluate_entry",)

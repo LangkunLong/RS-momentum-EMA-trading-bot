@@ -16,4 +16,4 @@ def evaluate_add_on(snapshot: AddOnSnapshotV3) -> AddOnDecisionV3:
     )
 
 
-__all__ = ["evaluate_add_on"]
+__all__ = ("evaluate_add_on",)

@@ -37,4 +37,4 @@ def select_eviction(snapshot: EvictionSnapshotV3) -> EvictionDecision:
     return _select_eviction_v2(snapshot.base)
 
 
-__all__ = ["recommend_allocation", "recommend_capacity", "select_eviction"]
+__all__ = ("recommend_allocation", "recommend_capacity", "select_eviction")

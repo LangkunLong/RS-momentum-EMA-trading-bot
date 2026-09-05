@@ -13,4 +13,4 @@ def evaluate_exit(snapshot: ExitSnapshotV3) -> ExitDecision:
     return _evaluate_exit_v2(snapshot.base)
 
 
-__all__ = ["evaluate_exit"]
+__all__ = ("evaluate_exit",)
