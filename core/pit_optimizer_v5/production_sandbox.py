@@ -29,9 +29,12 @@ from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
 from core.pit_optimizer_v5.production_fs import (
     acquire_absolute_directory_v5,
     acquire_directory_v5,
+    directory_child_absent_v5,
+    directory_entry_names_v5,
     hash_regular_in_directory_v5,
     open_regular_in_directory_v5,
     remove_owned_tree_in_directory_v5,
+    write_new_regular_in_directory_v5,
 )
 from core.pit_optimizer_v5.memory import (
     CandidateExecutionAuthorityV5,
@@ -61,6 +64,10 @@ _DATA_FILE_MAXIMUM_BYTES_V5 = (8 * 1024 * 1024 * 1024, 64 * 1024 * 1024)
 _DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5 = 512 * 1024 * 1024
 _POLICY_SOURCE_MAXIMUM_BYTES_V5 = 1024 * 1024
 _CONTAINER_SHM_SIZE_BYTES_V5 = 16 * 1024 * 1024
+_CONTROL_CHILDREN_V5 = ("config", "home", "tmp")
+_DOCKER_CONFIG_NAME_V5 = "config.json"
+_DOCKER_CONFIG_CONTENT_V5 = b"{}\n"
+_DOCKER_CONFIG_TEXT_V5 = _DOCKER_CONFIG_CONTENT_V5.decode("ascii")
 
 
 def _windows_key(path: str) -> str:
@@ -389,6 +396,11 @@ class ExecutionControlRecordV5:
     executor_identity_sha256: str
     command_sha256: str
     control_root_identity_sha256: str
+    transaction_root_identity_sha256: str
+    child_identity_sha256s: tuple[tuple[str, str], ...]
+    docker_config_file_identity_sha256: str
+    docker_config_content: str
+    docker_executable_identity_sha256: str
 
     def __post_init__(self) -> None:
         if self.schema_version != 5 or any(
@@ -397,7 +409,20 @@ class ExecutionControlRecordV5:
                 self.executor_identity_sha256,
                 self.command_sha256,
                 self.control_root_identity_sha256,
+                self.transaction_root_identity_sha256,
+                self.docker_config_file_identity_sha256,
+                self.docker_executable_identity_sha256,
             )
+        ) or (
+            type(self.child_identity_sha256s) is not tuple
+            or tuple(item[0] for item in self.child_identity_sha256s) != _CONTROL_CHILDREN_V5
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or re.fullmatch(r"[0-9a-f]{64}", item[1]) is None
+                for item in self.child_identity_sha256s
+            )
+            or self.docker_config_content != _DOCKER_CONFIG_TEXT_V5
         ):
             raise ValueError("container execution control record is invalid")
 
@@ -457,6 +482,15 @@ class ExecutionCleanupRecordV5:
 class _ExecutionReservationCapabilityV5:
     executor_identity_sha256: str
     command_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PinnedControlTransactionV5:
+    executor_identity_sha256: str
+    command_sha256: str
+    transaction_root_identity: tuple[int, int]
+    environment: tuple[tuple[str, str], ...]
+    opaque_capability: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -1033,6 +1067,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         self._control_root_info = control_info
         self._repository = repository
         self._base_environment = base_environment
+        self._control_capability = object()
         self.executor_identity_sha256 = canonical_sha256_v5(
             {
                 "domain": "pit-optimizer-v5-local-container-executor-v1",
@@ -1115,6 +1150,15 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             f"pit-v5.owner={self._owner.sha256}",
             "--pull",
             "never",
+            "--hostname",
+            self._container_name(command.sha256),
+            "--runtime",
+            "runc",
+            "--restart",
+            "no",
+            "--memory-swap",
+            f"{self._profile.memory_limit_mib}m",
+            "--no-healthcheck",
             "--privileged=false",
             "--ipc",
             "private",
@@ -1315,6 +1359,57 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         )
         return record
 
+    def _control_record(
+        self,
+        reservation: ExecutionReservationRecordV5,
+        *,
+        root: object,
+        target: object,
+        children: dict[str, object],
+        config_identity: tuple[int, int, int, str],
+    ) -> ExecutionControlRecordV5:
+        root_access = root
+        target_access = target
+        return ExecutionControlRecordV5(
+            5,
+            self.executor_identity_sha256,
+            reservation.command_sha256,
+            canonical_sha256_v5(
+                {
+                    "path": _windows_key(str(root_access.path)),  # type: ignore[attr-defined]
+                    "identity": root_access.identity,  # type: ignore[attr-defined]
+                }
+            ),
+            canonical_sha256_v5(
+                {
+                    "path": _windows_key(str(target_access.path)),  # type: ignore[attr-defined]
+                    "identity": target_access.identity,  # type: ignore[attr-defined]
+                }
+            ),
+            tuple(
+                (
+                    name,
+                    canonical_sha256_v5(
+                        {
+                            "path": _windows_key(str(children[name].path)),  # type: ignore[attr-defined]
+                            "identity": children[name].identity,  # type: ignore[attr-defined]
+                        }
+                    ),
+                )
+                for name in _CONTROL_CHILDREN_V5
+            ),
+            canonical_sha256_v5(
+                {
+                    "device": config_identity[0],
+                    "inode": config_identity[1],
+                    "byte_count": config_identity[2],
+                    "sha256": config_identity[3],
+                }
+            ),
+            _DOCKER_CONFIG_TEXT_V5,
+            canonical_sha256_v5(self._docker_identity),
+        )
+
     def _ensure_control(self, reservation: ExecutionReservationRecordV5) -> Path:
         target = self._control_root / reservation.control_relative_path
         ready = self._repository.load_typed_state(
@@ -1325,53 +1420,115 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         existing = _lstat_optional(target)
         if existing is None and ready is not None:
             raise ValueError("container control directory disappeared")
+        if existing is not None and ready is None:
+            raise ValueError("container control directory predates durable authority")
+        created_identity: tuple[int, int] | None = None
         try:
-            with acquire_directory_v5(
-                self._control_root,
-                (reservation.control_relative_path,),
-                create=existing is None,
-                expected_root_identity=(
-                    self._control_root_info.st_dev,
-                    self._control_root_info.st_ino,
-                ),
-            ) as target_access:
-                path = target_access.path
-                info = path.lstat()
-                if (info.st_dev, info.st_ino) != target_access.identity:
-                    raise ValueError("container control identity changed")
-                for name in ("home", "config", "tmp"):
-                    with acquire_directory_v5(
-                        path,
-                        (name,),
-                        create=ready is None,
-                        expected_root_identity=target_access.identity,
-                    ) as child:
-                        if child.path.parent != path:
-                            raise ValueError("container control child escaped its root")
-                identity = _directory_identity(path, info)
+            with ExitStack() as stack:
+                root = stack.enter_context(
+                    acquire_absolute_directory_v5(
+                        self._control_root,
+                        expected_identity=(
+                            self._control_root_info.st_dev,
+                            self._control_root_info.st_ino,
+                        ),
+                    )
+                )
+                target_access = stack.enter_context(
+                    acquire_directory_v5(
+                        root.path,
+                        (reservation.control_relative_path,),
+                        create=existing is None,
+                        expected_root_identity=root.identity,
+                    )
+                )
+                if existing is None:
+                    created_identity = target_access.identity
+                children = {
+                    name: stack.enter_context(
+                        acquire_directory_v5(
+                            target_access.path,
+                            (name,),
+                            create=ready is None,
+                            expected_root_identity=target_access.identity,
+                        )
+                    )
+                    for name in _CONTROL_CHILDREN_V5
+                }
+                config = children["config"]
+                try:
+                    config_stream, config_info = open_regular_in_directory_v5(
+                        config,  # type: ignore[arg-type]
+                        _DOCKER_CONFIG_NAME_V5,
+                        writable=False,
+                    )
+                except FileNotFoundError:
+                    if ready is not None or directory_entry_names_v5(config):  # type: ignore[arg-type]
+                        raise ValueError("container Docker config is absent or foreign") from None
+                    write_new_regular_in_directory_v5(
+                        config,  # type: ignore[arg-type]
+                        _DOCKER_CONFIG_NAME_V5,
+                        _DOCKER_CONFIG_CONTENT_V5,
+                    )
+                    config_stream, config_info = open_regular_in_directory_v5(
+                        config,  # type: ignore[arg-type]
+                        _DOCKER_CONFIG_NAME_V5,
+                        writable=False,
+                    )
+                with config_stream:
+                    config_identity = _hash_open_stream(
+                        config_stream,
+                        config_info,
+                        maximum_bytes=len(_DOCKER_CONFIG_CONTENT_V5),
+                    )
+                if (
+                    config_identity[2:] != (
+                        len(_DOCKER_CONFIG_CONTENT_V5),
+                        hashlib.sha256(_DOCKER_CONFIG_CONTENT_V5).hexdigest(),
+                    )
+                    or directory_entry_names_v5(config) != (_DOCKER_CONFIG_NAME_V5,)  # type: ignore[arg-type]
+                ):
+                    raise ValueError("container Docker config differs from closed authority")
+                expected = self._control_record(
+                    reservation,
+                    root=root,
+                    target=target_access,
+                    children=children,
+                    config_identity=config_identity,
+                )
+                if ready is None:
+                    self._repository.append_typed_state(
+                        namespace="container-control-ready",
+                        key=reservation.command_sha256,
+                        value=expected,
+                    )
+                elif ready != expected:
+                    raise ValueError("container control directory is foreign")
         except (OSError, ValueError):
+            if created_identity is not None:
+                try:
+                    with acquire_absolute_directory_v5(
+                        self._control_root,
+                        expected_identity=(
+                            self._control_root_info.st_dev,
+                            self._control_root_info.st_ino,
+                        ),
+                    ) as parent:
+                        remove_owned_tree_in_directory_v5(
+                            parent,
+                            reservation.control_relative_path,
+                            expected_identity=created_identity,
+                        )
+                except (OSError, ValueError):
+                    pass
             raise ValueError("container control directory could not be safely opened") from None
-        expected = ExecutionControlRecordV5(
-            5,
-            self.executor_identity_sha256,
-            reservation.command_sha256,
-            identity,
-        )
-        if ready is None:
-            self._repository.append_typed_state(
-                namespace="container-control-ready",
-                key=reservation.command_sha256,
-                value=expected,
-            )
-        elif ready != expected:
-            raise ValueError("container control directory is foreign")
-        return path
+        return target
 
     @contextmanager
     def _pinned_control_environment(
         self,
         reservation: ExecutionReservationRecordV5,
-    ) -> Iterator[dict[str, str]]:
+    ) -> Iterator[tuple[tuple[tuple[str, str], ...], tuple[int, int]]]:
         ready = self._repository.load_typed_state(
             namespace="container-control-ready",
             key=reservation.command_sha256,
@@ -1397,20 +1554,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     expected_root_identity=root.identity,
                 )
             )
-            target_info = target.path.lstat()
-            if (
-                ready
-                != ExecutionControlRecordV5(
-                    5,
-                    self.executor_identity_sha256,
-                    reservation.command_sha256,
-                    _directory_identity(target.path, target_info),
-                )
-                or target.identity != (target_info.st_dev, target_info.st_ino)
-            ):
-                raise ValueError("container control directory authority changed")
             children = {}
-            for name in ("home", "config", "tmp"):
+            for name in _CONTROL_CHILDREN_V5:
                 child = stack.enter_context(
                     acquire_directory_v5(
                         target.path,
@@ -1420,6 +1565,25 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     )
                 )
                 children[name] = child
+            config = children["config"]
+            config_stream, config_info = open_regular_in_directory_v5(
+                config,
+                _DOCKER_CONFIG_NAME_V5,
+                writable=False,
+            )
+            stack.enter_context(config_stream)
+            config_identity = _hash_open_stream(
+                config_stream,
+                config_info,
+                maximum_bytes=len(_DOCKER_CONFIG_CONTENT_V5),
+            )
+            expected = self._control_record(
+                reservation,
+                root=root,
+                target=target,
+                children=children,
+                config_identity=config_identity,
+            )
             environment = dict(self._base_environment)
             environment.update(
                 {
@@ -1430,9 +1594,37 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     "TMP": str(children["tmp"].path),
                 }
             )
+            environment_tuple = tuple(sorted(environment.items()))
             try:
-                yield environment
+                if (
+                    ready != expected
+                    or config_identity[2:] != (
+                        len(_DOCKER_CONFIG_CONTENT_V5),
+                        hashlib.sha256(_DOCKER_CONFIG_CONTENT_V5).hexdigest(),
+                    )
+                    or directory_entry_names_v5(config) != (_DOCKER_CONFIG_NAME_V5,)
+                ):
+                    raise ValueError("container control environment differs from durable authority")
+                yield environment_tuple, target.identity
             finally:
+                after_config = _hash_open_stream(
+                    config_stream,
+                    config_info,
+                    maximum_bytes=len(_DOCKER_CONFIG_CONTENT_V5),
+                )
+                if (
+                    after_config != config_identity
+                    or directory_entry_names_v5(config) != (_DOCKER_CONFIG_NAME_V5,)
+                    or self._control_record(
+                        reservation,
+                        root=root,
+                        target=target,
+                        children=children,
+                        config_identity=after_config,
+                    )
+                    != ready
+                ):
+                    raise ValueError("container control environment changed during transaction")
                 for access in (*children.values(), target, root):
                     access.assert_current()
 
@@ -1468,16 +1660,37 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         raise ValueError("Docker executable identity changed")
                     parent.assert_current()
 
-    def _control(
+    @contextmanager
+    def _pinned_control_transaction(
         self,
         reservation: ExecutionReservationRecordV5,
+    ) -> Iterator[_PinnedControlTransactionV5]:
+        """Hold every Docker control capability across a multi-command operation."""
+
+        with self._pinned_control_environment(reservation) as pinned:
+            environment, target_identity = pinned
+            with self._pinned_docker_executable():
+                yield _PinnedControlTransactionV5(
+                    self.executor_identity_sha256,
+                    reservation.command_sha256,
+                    target_identity,
+                    environment,
+                    self._control_capability,
+                )
+
+    def _control(
+        self,
+        transaction: _PinnedControlTransactionV5,
         arguments: tuple[str, ...],
         *,
         timeout: float,
         output_limit: int = 1024 * 1024,
     ) -> object:
         if (
-            type(arguments) is not tuple
+            type(transaction) is not _PinnedControlTransactionV5
+            or transaction.executor_identity_sha256 != self.executor_identity_sha256
+            or transaction.opaque_capability is not self._control_capability
+            or type(arguments) is not tuple
             or not arguments
             or any(type(item) is not str or not item or "\x00" in item for item in arguments)
             or type(timeout) is not float
@@ -1486,14 +1699,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         ):
             raise ValueError("Docker control invocation is invalid")
         from agent_loop import _bounded_process
-        with self._pinned_control_environment(reservation) as environment:
-            with self._pinned_docker_executable():
-                result = _bounded_process(
-                    (str(self._docker_executable), *arguments),
-                    env=environment,
-                    timeout=timeout,
-                    output_limit=output_limit,
-                )
+        result = _bounded_process(
+            (str(self._docker_executable), *arguments),
+            env=dict(transaction.environment),
+            timeout=timeout,
+            output_limit=output_limit,
+        )
         return result
 
     @staticmethod
@@ -1507,10 +1718,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
 
     def _inspect_image(
         self,
-        reservation: ExecutionReservationRecordV5,
+        transaction: _PinnedControlTransactionV5,
     ) -> tuple[str, tuple[str, ...]]:
         result = self._control(
-            reservation,
+            transaction,
             ("image", "inspect", self._profile.image_reference),
             timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
         )
@@ -1542,20 +1753,490 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             raise ValueError("sandbox image differs from its immutable authority")
         return image_id, tuple(image_environment)
 
+    @staticmethod
+    def _closed_config_authority(
+        config: object,
+        *,
+        container_name: str,
+        image_reference: str,
+        expected_environment: tuple[str, ...],
+        expected_command: list[str],
+        expected_labels: dict[str, str],
+    ) -> dict[str, object]:
+        if type(config) is not dict:
+            raise ValueError("container config is malformed")
+        expected: dict[str, object] = {
+            "Hostname": container_name,
+            "Domainname": "",
+            "User": "65532:65532",
+            "AttachStdin": False,
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "ExposedPorts": None,
+            "Tty": False,
+            "OpenStdin": False,
+            "StdinOnce": False,
+            "Env": list(expected_environment),
+            "Cmd": expected_command,
+            "Healthcheck": {"Test": ["NONE"]},
+            "ArgsEscaped": False,
+            "Image": image_reference,
+            "Volumes": None,
+            "WorkingDir": "/pit/source",
+            "Entrypoint": ["python"],
+            "OnBuild": None,
+            "Labels": expected_labels,
+            "StopSignal": "",
+            "StopTimeout": None,
+            "Shell": None,
+        }
+        optional_defaults = {
+            "ExposedPorts",
+            "ArgsEscaped",
+            "Volumes",
+            "OnBuild",
+            "StopSignal",
+            "StopTimeout",
+            "Shell",
+        }
+        if set(config) - set(expected) or any(
+            key not in config and key not in optional_defaults for key in expected
+        ):
+            raise ValueError("container config contains an open execution field")
+        normalized = {
+            key: config[key] if key in config else value
+            for key, value in expected.items()
+        }
+        if normalized != expected:
+            raise ValueError("container config differs from executor authority")
+        return normalized
+
+    @staticmethod
+    def _closed_host_mount_authority(
+        mounts: object,
+        expected_mounts: tuple[tuple[str, str, bool], ...],
+    ) -> tuple[tuple[str, str, bool], ...]:
+        if type(mounts) is not list or len(mounts) != len(expected_mounts):
+            raise ValueError("container HostConfig mount count differs")
+        actual: set[tuple[str, str, bool]] = set()
+        allowed = {
+            "Type",
+            "Source",
+            "Target",
+            "ReadOnly",
+            "Consistency",
+            "BindOptions",
+            "VolumeOptions",
+            "TmpfsOptions",
+            "ImageOptions",
+        }
+        for mount in mounts:
+            if type(mount) is not dict or set(mount) - allowed:
+                raise ValueError("container HostConfig mount is open or malformed")
+            bind_options = mount.get("BindOptions")
+            if bind_options is None:
+                bind_options = {}
+            if type(bind_options) is not dict or set(bind_options) - {
+                "Propagation",
+                "NonRecursive",
+                "CreateMountpoint",
+                "ReadOnlyNonRecursive",
+                "ReadOnlyForceRecursive",
+            }:
+                raise ValueError("container bind options are open or malformed")
+            normalized_bind = {
+                "Propagation": bind_options.get("Propagation", "rprivate"),
+                "NonRecursive": bind_options.get("NonRecursive", False),
+                "CreateMountpoint": bind_options.get("CreateMountpoint", False),
+                "ReadOnlyNonRecursive": bind_options.get("ReadOnlyNonRecursive", False),
+                "ReadOnlyForceRecursive": bind_options.get("ReadOnlyForceRecursive", False),
+            }
+            if (
+                normalized_bind
+                != {
+                    "Propagation": "rprivate",
+                    "NonRecursive": False,
+                    "CreateMountpoint": False,
+                    "ReadOnlyNonRecursive": False,
+                    "ReadOnlyForceRecursive": False,
+                }
+                or mount.get("Type") != "bind"
+                or type(mount.get("Source")) is not str
+                or type(mount.get("Target")) is not str
+                or type(mount.get("ReadOnly")) is not bool
+                or mount.get("Consistency", "") not in {"", "default"}
+                or mount.get("VolumeOptions") is not None
+                or mount.get("TmpfsOptions") is not None
+                or mount.get("ImageOptions") is not None
+            ):
+                raise ValueError("container HostConfig mount differs from executor authority")
+            actual.add(
+                (
+                    _windows_key(mount["Source"]),
+                    mount["Target"],
+                    not mount["ReadOnly"],
+                )
+            )
+        if actual != set(expected_mounts) or len(actual) != len(expected_mounts):
+            raise ValueError("container HostConfig mounts differ from executor authority")
+        return tuple(sorted(actual))
+
+    def _closed_host_authority(
+        self,
+        host: object,
+        *,
+        expected_mounts: tuple[tuple[str, str, bool], ...],
+    ) -> dict[str, object]:
+        if type(host) is not dict:
+            raise ValueError("container HostConfig is malformed")
+        mount_authority = self._closed_host_mount_authority(host.get("Mounts"), expected_mounts)
+        masked_paths = [
+            "/proc/asound",
+            "/proc/acpi",
+            "/proc/kcore",
+            "/proc/keys",
+            "/proc/latency_stats",
+            "/proc/timer_list",
+            "/proc/timer_stats",
+            "/proc/sched_debug",
+            "/proc/scsi",
+            "/sys/firmware",
+            "/sys/devices/virtual/powercap",
+        ]
+        readonly_paths = [
+            "/proc/bus",
+            "/proc/fs",
+            "/proc/irq",
+            "/proc/sys",
+            "/proc/sysrq-trigger",
+        ]
+        expected: dict[str, object] = {
+            "Binds": [],
+            "ContainerIDFile": "",
+            "LogConfig": {"Type": "none", "Config": {}},
+            "NetworkMode": "none",
+            "PortBindings": {},
+            "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+            "AutoRemove": False,
+            "VolumeDriver": "",
+            "VolumesFrom": [],
+            "ConsoleSize": [0, 0],
+            "CapAdd": [],
+            "CapDrop": ["ALL"],
+            "CgroupnsMode": "private",
+            "Dns": [],
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": [],
+            "GroupAdd": [],
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": [],
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": False,
+            "PublishAllPorts": False,
+            "ReadonlyRootfs": True,
+            "SecurityOpt": ["no-new-privileges:true"],
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": _CONTAINER_SHM_SIZE_BYTES_V5,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": self._profile.memory_limit_mib * 1024 * 1024,
+            "NanoCpus": int(self._profile.cpu_limit * Decimal(1_000_000_000)),
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": [],
+            "BlkioDeviceReadBps": [],
+            "BlkioDeviceWriteBps": [],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [],
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": [],
+            "DeviceCgroupRules": [],
+            "DeviceRequests": [],
+            "MemoryReservation": 0,
+            "MemorySwap": self._profile.memory_limit_mib * 1024 * 1024,
+            "MemorySwappiness": None,
+            "OomKillDisable": False,
+            "PidsLimit": self._profile.pid_limit,
+            "Ulimits": [],
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": masked_paths,
+            "ReadonlyPaths": readonly_paths,
+            "Init": False,
+            "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=16m"},
+            "Sysctls": {},
+            "StorageOpt": {},
+            "Annotations": {},
+            "KernelMemory": 0,
+            "KernelMemoryTCP": 0,
+            "Mounts": mount_authority,
+        }
+        nullable_lists = {
+            "Binds",
+            "VolumesFrom",
+            "CapAdd",
+            "Dns",
+            "DnsOptions",
+            "DnsSearch",
+            "ExtraHosts",
+            "GroupAdd",
+            "Links",
+            "BlkioWeightDevice",
+            "BlkioDeviceReadBps",
+            "BlkioDeviceWriteBps",
+            "BlkioDeviceReadIOps",
+            "BlkioDeviceWriteIOps",
+            "Devices",
+            "DeviceCgroupRules",
+            "DeviceRequests",
+            "Ulimits",
+        }
+        nullable_maps = {"PortBindings", "Sysctls", "StorageOpt", "Annotations"}
+        optional_defaults = {
+            "CgroupnsMode",
+            "ConsoleSize",
+            "DeviceCgroupRules",
+            "Init",
+            "KernelMemory",
+            "KernelMemoryTCP",
+            "Annotations",
+        }
+        if set(host) - set(expected) or any(
+            key not in host and key not in optional_defaults for key in expected
+        ):
+            raise ValueError("container HostConfig contains an open execution field")
+        normalized: dict[str, object] = {}
+        for key, expected_value in expected.items():
+            value = host.get(key, expected_value)
+            if key == "Mounts":
+                value = mount_authority
+            if key in nullable_lists and value is None:
+                value = []
+            if key in nullable_maps and value is None:
+                value = {}
+            if key == "SecurityOpt" and value == ["no-new-privileges"]:
+                value = ["no-new-privileges:true"]
+            normalized[key] = value
+        if normalized != expected:
+            raise ValueError("container HostConfig differs from executor authority")
+        return normalized
+
+    @staticmethod
+    def _closed_network_authority(network: object) -> dict[str, object]:
+        if type(network) is not dict:
+            raise ValueError("container NetworkSettings is malformed")
+        allowed = {
+            "Bridge",
+            "SandboxID",
+            "SandboxKey",
+            "Ports",
+            "HairpinMode",
+            "LinkLocalIPv6Address",
+            "LinkLocalIPv6PrefixLen",
+            "SecondaryIPAddresses",
+            "SecondaryIPv6Addresses",
+            "EndpointID",
+            "Gateway",
+            "GlobalIPv6Address",
+            "GlobalIPv6PrefixLen",
+            "IPAddress",
+            "IPPrefixLen",
+            "IPv6Gateway",
+            "MacAddress",
+            "Networks",
+        }
+        required = allowed - {"Bridge", "HairpinMode", "LinkLocalIPv6Address", "LinkLocalIPv6PrefixLen"}
+        if set(network) - allowed or not required.issubset(network):
+            raise ValueError("container NetworkSettings contains an open execution field")
+        dynamic_id = network.get("SandboxID")
+        sandbox_key = network.get("SandboxKey")
+        if (
+            type(dynamic_id) is not str
+            or (dynamic_id and re.fullmatch(r"[0-9a-f]{64}", dynamic_id) is None)
+            or type(sandbox_key) is not str
+            or "\x00" in sandbox_key
+            or type(network.get("Networks")) is not dict
+            or set(network["Networks"]) != {"none"}
+        ):
+            raise ValueError("container network namespace identity is malformed")
+        none_network = network["Networks"]["none"]
+        none_allowed = {
+            "IPAMConfig",
+            "Links",
+            "Aliases",
+            "MacAddress",
+            "DriverOpts",
+            "GwPriority",
+            "NetworkID",
+            "EndpointID",
+            "Gateway",
+            "IPAddress",
+            "IPPrefixLen",
+            "IPv6Gateway",
+            "GlobalIPv6Address",
+            "GlobalIPv6PrefixLen",
+            "DNSNames",
+        }
+        if type(none_network) is not dict or set(none_network) - none_allowed:
+            raise ValueError("container none-network fields are open or malformed")
+        for key in ("NetworkID", "EndpointID"):
+            value = none_network.get(key, "")
+            if type(value) is not str or (value and re.fullmatch(r"[0-9a-f]{64}", value) is None):
+                raise ValueError("container none-network identity is malformed")
+        empty_values = {
+            "IPAMConfig": {},
+            "Links": [],
+            "Aliases": [],
+            "MacAddress": "",
+            "DriverOpts": {},
+            "GwPriority": 0,
+            "Gateway": "",
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "DNSNames": [],
+        }
+        for key, expected in empty_values.items():
+            value = none_network.get(key, expected)
+            if expected in ({}, []) and value is None:
+                value = type(expected)()
+            if value != expected:
+                raise ValueError("container none-network has address or routing authority")
+        top_empty = {
+            "Bridge": "",
+            "Ports": {},
+            "HairpinMode": False,
+            "LinkLocalIPv6Address": "",
+            "LinkLocalIPv6PrefixLen": 0,
+            "SecondaryIPAddresses": [],
+            "SecondaryIPv6Addresses": [],
+            "EndpointID": "",
+            "Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "MacAddress": "",
+        }
+        for key, expected in top_empty.items():
+            value = network.get(key, expected)
+            if expected in ({}, []) and value is None:
+                value = type(expected)()
+            if value != expected:
+                raise ValueError("container NetworkSettings exposes connectivity")
+        return {
+            "mode": "none",
+            "ports": {},
+            "addresses": (),
+            "aliases": (),
+        }
+
+    @staticmethod
+    def _closed_state(state: object) -> None:
+        expected_keys = {
+            "Status",
+            "Running",
+            "Paused",
+            "Restarting",
+            "OOMKilled",
+            "Dead",
+            "Pid",
+            "ExitCode",
+            "Error",
+            "StartedAt",
+            "FinishedAt",
+        }
+        if type(state) is not dict or set(state) != expected_keys:
+            raise ValueError("container State contains an open execution field")
+        status = state["Status"]
+        if (
+            status not in {"created", "running", "exited", "dead", "removing"}
+            or type(state["Running"]) is not bool
+            or state["Running"] is not (status == "running")
+            or state["Paused"] is not False
+            or state["Restarting"] is not False
+            or type(state["OOMKilled"]) is not bool
+            or type(state["Dead"]) is not bool
+            or state["Dead"] is not (status == "dead")
+            or type(state["Pid"]) is not int
+            or state["Pid"] < 0
+            or type(state["ExitCode"]) is not int
+            or any(
+                type(state[key]) is not str
+                or "\x00" in state[key]
+                or len(state[key]) > 4096
+                for key in ("Error", "StartedAt", "FinishedAt")
+            )
+        ):
+            raise ValueError("container State differs from the closed lifecycle")
+
+    @staticmethod
+    def _closed_resolved_mount_authority(
+        mounts: object,
+        expected_mounts: tuple[tuple[str, str, bool], ...],
+    ) -> tuple[tuple[str, str, bool], ...]:
+        if type(mounts) is not list or len(mounts) != len(expected_mounts):
+            raise ValueError("container mount count differs from executor authority")
+        allowed = {"Type", "Name", "Source", "Destination", "Driver", "Mode", "RW", "Propagation"}
+        actual: set[tuple[str, str, bool]] = set()
+        for mount in mounts:
+            if (
+                type(mount) is not dict
+                or set(mount) - allowed
+                or mount.get("Type") != "bind"
+                or mount.get("Name", "") != ""
+                or mount.get("Driver", "") != ""
+                or mount.get("Propagation") != "rprivate"
+                or mount.get("Mode") not in {"ro", "rw"}
+                or type(mount.get("RW")) is not bool
+                or (mount.get("Mode") == "rw") is not mount.get("RW")
+                or type(mount.get("Source")) is not str
+                or type(mount.get("Destination")) is not str
+            ):
+                raise ValueError("container resolved mount is open or malformed")
+            actual.add(
+                (
+                    _windows_key(mount["Source"]),
+                    mount["Destination"],
+                    mount["RW"],
+                )
+            )
+        if actual != set(expected_mounts) or len(actual) != len(expected_mounts):
+            raise ValueError("container resolved mounts differ from executor authority")
+        return tuple(sorted(actual))
+
     def _inspect_container(
         self,
         *,
+        transaction: _PinnedControlTransactionV5,
         reservation: ExecutionReservationRecordV5,
         image_authority: tuple[str, tuple[str, ...]],
     ) -> tuple[dict[str, object], str] | None:
+        if transaction.command_sha256 != reservation.command_sha256:
+            raise ValueError("container inspection transaction is foreign")
         result = self._control(
-            reservation,
+            transaction,
             ("inspect", reservation.container_name),
             timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
         )
         if not self._successful(result):
             listing = self._control(
-                reservation,
+                transaction,
                 (
                     "container",
                     "ls",
@@ -1581,7 +2262,6 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             host = item["HostConfig"]
             mounts = item["Mounts"]
             state = item["State"]
-            labels = config["Labels"]
         except (json.JSONDecodeError, IndexError, KeyError, TypeError):
             raise ValueError("container inspection is malformed") from None
         expected_labels = {
@@ -1592,164 +2272,43 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         image_id, expected_environment = image_authority
         separator = reservation.command_argv.index("--")
         expected_command = list(reservation.command_argv[separator + 3 :])
-        normalized_host = dict(host) if type(host) is dict else {}
-        for key in (
-            "CapAdd",
-            "Devices",
-            "DeviceRequests",
-            "PortBindings",
-            "VolumesFrom",
-            "Links",
-            "Dns",
-            "DnsOptions",
-            "DnsSearch",
-            "ExtraHosts",
-            "GroupAdd",
-        ):
-            if normalized_host.get(key) is None:
-                normalized_host[key] = {} if key == "PortBindings" else []
-        if normalized_host.get("OomKillDisable") is None:
-            normalized_host["OomKillDisable"] = False
-        if normalized_host.get("Init") is None:
-            normalized_host["Init"] = False
-        expected_host = {
-            "NetworkMode": "none",
-            "ReadonlyRootfs": True,
-            "OomKillDisable": False,
-            "PidsLimit": self._profile.pid_limit,
-            "Memory": self._profile.memory_limit_mib * 1024 * 1024,
-            "NanoCpus": int(self._profile.cpu_limit * Decimal(1_000_000_000)),
-            "Privileged": False,
-            "CapDrop": ["ALL"],
-            "CapAdd": [],
-            "Devices": [],
-            "DeviceRequests": [],
-            "SecurityOpt": ["no-new-privileges:true"],
-            "IpcMode": "private",
-            "ShmSize": _CONTAINER_SHM_SIZE_BYTES_V5,
-            "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=16m"},
-            "PidMode": "",
-            "UTSMode": "",
-            "CgroupnsMode": "private",
-            "CgroupParent": "",
-            "PortBindings": {},
-            "PublishAllPorts": False,
-            "Init": False,
-            "AutoRemove": False,
-            "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
-            "VolumesFrom": [],
-            "Links": [],
-            "Dns": [],
-            "DnsOptions": [],
-            "DnsSearch": [],
-            "ExtraHosts": [],
-            "GroupAdd": [],
-            "UsernsMode": "",
-            "LogConfig": {"Type": "none", "Config": {}},
-        }
         network = item.get("NetworkSettings") if type(item) is dict else None
-        actual_environment = config.get("Env") if type(config) is dict else None
-        normalized_exposed_ports = config.get("ExposedPorts") if type(config) is dict else None
-        if normalized_exposed_ports is None:
-            normalized_exposed_ports = {}
-        normalized_volumes = config.get("Volumes") if type(config) is dict else None
-        if normalized_volumes is None:
-            normalized_volumes = {}
         if (
             type(item) is not dict
             or item.get("Name") != f"/{reservation.container_name}"
             or item.get("Image") != image_id
-            or type(config) is not dict
-            or config.get("Image") != self._profile.image_reference
-            or config.get("User") != "65532:65532"
-            or config.get("WorkingDir") != "/pit/source"
-            or config.get("Entrypoint") != ["python"]
-            or config.get("Cmd") != expected_command
-            or type(labels) is not dict
-            or labels != expected_labels
-            or actual_environment != list(expected_environment)
-            or normalized_exposed_ports != {}
-            or normalized_volumes != {}
-            or config.get("AttachStdin") is not False
-            or config.get("AttachStdout") is not True
-            or config.get("AttachStderr") is not True
-            or config.get("Tty") is not False
-            or config.get("OpenStdin") is not False
-            or config.get("StdinOnce") is not False
-            or type(host) is not dict
-            or any(
-                key not in normalized_host
-                or type(normalized_host[key]) is not type(expected)
-                or normalized_host[key] != expected
-                for key, expected in expected_host.items()
-            )
-            or type(network) is not dict
-            or network.get("Ports") != {}
-            or type(network.get("Networks")) is not dict
-            or set(network["Networks"]) != {"none"}
-            or type(state) is not dict
+            or item.get("Path") != "python"
+            or item.get("Args") != expected_command
         ):
             raise ValueError("container isolation differs from executor authority")
-        none_network = network["Networks"]["none"]
-        if (
-            type(none_network) is not dict
-            or any(
-                not (
-                    none_network.get(key) is None
-                    or none_network.get(key) == ""
-                    or none_network.get(key) == 0
-                )
-                for key in (
-                    "IPAMConfig",
-                    "Links",
-                    "Aliases",
-                    "MacAddress",
-                    "DriverOpts",
-                    "Gateway",
-                    "IPAddress",
-                    "IPPrefixLen",
-                    "IPv6Gateway",
-                    "GlobalIPv6Address",
-                    "GlobalIPv6PrefixLen",
-                )
-            )
-        ):
-            raise ValueError("container network namespace differs from executor authority")
-        expected_mounts = set(reservation.expected_mounts)
-        if type(mounts) is not list or len(mounts) != len(expected_mounts):
-            raise ValueError("container mount count differs from executor authority")
-        actual_mounts = set()
-        for mount in mounts:
-            if (
-                type(mount) is not dict
-                or mount.get("Type") != "bind"
-                or mount.get("Propagation") != "rprivate"
-                or mount.get("Mode") not in {"ro", "rw"}
-                or (mount.get("Mode") == "rw") is not (mount.get("RW") is True)
-            ):
-                raise ValueError("container mount is malformed")
-            actual_mounts.add(
-                (
-                    _windows_key(str(mount.get("Source"))),
-                    mount.get("Destination"),
-                    mount.get("RW"),
-                )
-            )
-        if actual_mounts != expected_mounts:
-            raise ValueError("container mounts differ from executor authority")
+        config_authority = self._closed_config_authority(
+            config,
+            container_name=reservation.container_name,
+            image_reference=self._profile.image_reference,
+            expected_environment=expected_environment,
+            expected_command=expected_command,
+            expected_labels=expected_labels,
+        )
+        host_authority = self._closed_host_authority(
+            host,
+            expected_mounts=reservation.expected_mounts,
+        )
+        network_authority = self._closed_network_authority(network)
+        self._closed_state(state)
+        mount_authority = self._closed_resolved_mount_authority(
+            mounts,
+            reservation.expected_mounts,
+        )
         attestation = canonical_sha256_v5(
             {
                 "name": item.get("Name"),
                 "image": item.get("Image"),
-                "labels": labels,
-                "user": config.get("User"),
-                "entrypoint": config.get("Entrypoint"),
-                "command": config.get("Cmd"),
-                "working_dir": config.get("WorkingDir"),
-                "environment": actual_environment,
-                "host": {key: normalized_host[key] for key in sorted(expected_host)},
-                "network": network,
-                "mounts": sorted(expected_mounts),
+                "path": item.get("Path"),
+                "arguments": item.get("Args"),
+                "config": config_authority,
+                "host": host_authority,
+                "network": network_authority,
+                "mounts": mount_authority,
             }
         )
         return item, attestation
@@ -1766,70 +2325,74 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 self._append_phase(command.sha256, "launch_claim")
             self._ensure_control(record)
             try:
-                image_authority = self._inspect_image(record)
-                with self._mount_factory.pinned_request(command.request):
-                    created = self._phase(command.sha256, "created")
-                    inspection = self._inspect_container(
-                        reservation=record,
-                        image_authority=image_authority,
-                    )
-                    if created is None and inspection is None and launch_is_new:
-                        runtime = self._runtime_argv(command)
-                        result = self._control(
-                            record,
-                            runtime[1:],
-                            timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
-                            output_limit=64 * 1024,
-                        )
+                with self._pinned_control_transaction(record) as transaction:
+                    image_authority = self._inspect_image(transaction)
+                    with self._mount_factory.pinned_request(command.request):
+                        created = self._phase(command.sha256, "created")
                         inspection = self._inspect_container(
+                            transaction=transaction,
                             reservation=record,
                             image_authority=image_authority,
                         )
-                        if not self._successful(result) and inspection is None:
+                        if created is None and inspection is None and launch_is_new:
+                            runtime = self._runtime_argv(command)
+                            result = self._control(
+                                transaction,
+                                runtime[1:],
+                                timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
+                                output_limit=64 * 1024,
+                            )
+                            inspection = self._inspect_container(
+                                transaction=transaction,
+                                reservation=record,
+                                image_authority=image_authority,
+                            )
+                            if not self._successful(result) and inspection is None:
+                                self._persist_failure(command)
+                                return
+                        if created is None:
+                            if inspection is None:
+                                self._persist_failure(command)
+                                return
+                            created = self._append_phase(
+                                command.sha256,
+                                "created",
+                                inspection[1],
+                            )
+                        elif inspection is None or created.attestation_sha256 != inspection[1]:
                             self._persist_failure(command)
                             return
-                    if created is None:
+                        start_claim = self._phase(command.sha256, "start_claim")
+                        start_is_new = start_claim is None
+                        if start_is_new:
+                            self._append_phase(command.sha256, "start_claim")
+                        state = inspection[0]["State"]
+                        assert type(state) is dict
+                        status = state.get("Status")
+                        if status == "created" and start_is_new:
+                            result = self._control(
+                                transaction,
+                                ("start", record.container_name),
+                                timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
+                                output_limit=64 * 1024,
+                            )
+                            inspection = self._inspect_container(
+                                transaction=transaction,
+                                reservation=record,
+                                image_authority=image_authority,
+                            )
+                            if not self._successful(result) and inspection is None:
+                                self._persist_failure(command)
+                                return
                         if inspection is None:
                             self._persist_failure(command)
                             return
-                        created = self._append_phase(
-                            command.sha256,
-                            "created",
-                            inspection[1],
-                        )
-                    elif inspection is None or created.attestation_sha256 != inspection[1]:
-                        self._persist_failure(command)
-                        return
-                    start_claim = self._phase(command.sha256, "start_claim")
-                    start_is_new = start_claim is None
-                    if start_is_new:
-                        self._append_phase(command.sha256, "start_claim")
-                    state = inspection[0]["State"]
-                    assert type(state) is dict
-                    status = state.get("Status")
-                    if status == "created" and start_is_new:
-                        result = self._control(
-                            record,
-                            ("start", record.container_name),
-                            timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
-                            output_limit=64 * 1024,
-                        )
-                        inspection = self._inspect_container(
-                            reservation=record,
-                            image_authority=image_authority,
-                        )
-                        if not self._successful(result) and inspection is None:
+                        state = inspection[0]["State"]
+                        assert type(state) is dict
+                        if state.get("Status") not in {"running", "exited"}:
                             self._persist_failure(command)
                             return
-                    if inspection is None:
-                        self._persist_failure(command)
-                        return
-                    state = inspection[0]["State"]
-                    assert type(state) is dict
-                    if state.get("Status") not in {"running", "exited"}:
-                        self._persist_failure(command)
-                        return
-                    self._append_phase(command.sha256, "started", inspection[1])
+                        self._append_phase(command.sha256, "started", inspection[1])
             except Exception:
                 self._persist_failure(command)
 
@@ -1962,39 +2525,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 return self._result_from_terminal(command, self._persist_failure(command))
             self._ensure_control(record)
             try:
-                image_authority = self._inspect_image(record)
-                inspection = self._inspect_container(
-                    reservation=record,
-                    image_authority=image_authority,
-                )
-                if inspection is None:
-                    return self._result_from_terminal(command, self._persist_failure(command))
-                state = inspection[0]["State"]
-                assert type(state) is dict
-                if state.get("Running") is True:
-                    waited = self._control(
-                        record,
-                        ("wait", record.container_name),
-                        timeout=remaining_timeout_seconds,
-                        output_limit=64 * 1024,
-                    )
-                    if getattr(waited, "timed_out", None) is True:
-                        self._control(
-                            record,
-                            ("stop", "--time", "0", record.container_name),
-                            timeout=float(self._manifest.resources.cleanup_timeout_seconds),
-                            output_limit=64 * 1024,
-                        )
-                        terminal = self._persist_terminal(
-                            command,
-                            status="timed_out",
-                            exit_code=None,
-                            output=None,
-                        )
-                        return self._result_from_terminal(command, terminal)
-                    if not self._successful(waited):
-                        return self._result_from_terminal(command, self._persist_failure(command))
+                with self._pinned_control_transaction(record) as transaction:
+                    image_authority = self._inspect_image(transaction)
                     inspection = self._inspect_container(
+                        transaction=transaction,
                         reservation=record,
                         image_authority=image_authority,
                     )
@@ -2002,19 +2536,51 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         return self._result_from_terminal(command, self._persist_failure(command))
                     state = inspection[0]["State"]
                     assert type(state) is dict
-                if state.get("Running") is True or state.get("Status") != "exited":
-                    return self._result_from_terminal(command, self._persist_failure(command))
-                exit_code = state.get("ExitCode")
-                if type(exit_code) is not int:
-                    return self._result_from_terminal(command, self._persist_failure(command))
-                output = self._read_output(command) if exit_code == 0 else None
-                terminal = self._persist_terminal(
-                    command,
-                    status="succeeded" if exit_code == 0 else "nonzero_exit",
-                    exit_code=exit_code,
-                    output=output,
-                )
-                return self._result_from_terminal(command, terminal)
+                    if state.get("Running") is True:
+                        waited = self._control(
+                            transaction,
+                            ("wait", record.container_name),
+                            timeout=remaining_timeout_seconds,
+                            output_limit=64 * 1024,
+                        )
+                        if getattr(waited, "timed_out", None) is True:
+                            self._control(
+                                transaction,
+                                ("stop", "--time", "0", record.container_name),
+                                timeout=float(self._manifest.resources.cleanup_timeout_seconds),
+                                output_limit=64 * 1024,
+                            )
+                            terminal = self._persist_terminal(
+                                command,
+                                status="timed_out",
+                                exit_code=None,
+                                output=None,
+                            )
+                            return self._result_from_terminal(command, terminal)
+                        if not self._successful(waited):
+                            return self._result_from_terminal(command, self._persist_failure(command))
+                        inspection = self._inspect_container(
+                            transaction=transaction,
+                            reservation=record,
+                            image_authority=image_authority,
+                        )
+                        if inspection is None:
+                            return self._result_from_terminal(command, self._persist_failure(command))
+                        state = inspection[0]["State"]
+                        assert type(state) is dict
+                    if state.get("Running") is True or state.get("Status") != "exited":
+                        return self._result_from_terminal(command, self._persist_failure(command))
+                    exit_code = state.get("ExitCode")
+                    if type(exit_code) is not int:
+                        return self._result_from_terminal(command, self._persist_failure(command))
+                    output = self._read_output(command) if exit_code == 0 else None
+                    terminal = self._persist_terminal(
+                        command,
+                        status="succeeded" if exit_code == 0 else "nonzero_exit",
+                        exit_code=exit_code,
+                        output=output,
+                    )
+                    return self._result_from_terminal(command, terminal)
             except Exception:
                 return self._result_from_terminal(command, self._persist_failure(command))
 
@@ -2090,68 +2656,65 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 key=command_sha256,
                 value_type=ExecutionCleanupRecordV5,
             )
-            control_path = self._control_root / record.control_relative_path
             if container_absent is not None and container_absent != expected:
                 raise ValueError("container cleanup absence record is foreign")
             if container_absent is None:
                 self._ensure_control(record)
-                image_authority = self._inspect_image(record)
-                inspection = self._inspect_container(
-                    reservation=record,
-                    image_authority=image_authority,
-                )
-                if inspection is not None:
-                    removed = self._control(
-                        record,
-                        ("rm", "--force", record.container_name),
-                        timeout=float(self._manifest.resources.cleanup_timeout_seconds),
-                        output_limit=64 * 1024,
-                    )
-                    if not self._successful(removed):
-                        raise ValueError("owned container cleanup failed")
-                    if self._inspect_container(
+                with self._pinned_control_transaction(record) as transaction:
+                    image_authority = self._inspect_image(transaction)
+                    inspection = self._inspect_container(
+                        transaction=transaction,
                         reservation=record,
                         image_authority=image_authority,
-                    ) is not None:
-                        raise ValueError("owned container remains after cleanup")
+                    )
+                    if inspection is not None:
+                        removed = self._control(
+                            transaction,
+                            ("rm", "--force", record.container_name),
+                            timeout=float(self._manifest.resources.cleanup_timeout_seconds),
+                            output_limit=64 * 1024,
+                        )
+                        if not self._successful(removed):
+                            raise ValueError("owned container cleanup failed")
+                        if self._inspect_container(
+                            transaction=transaction,
+                            reservation=record,
+                            image_authority=image_authority,
+                        ) is not None:
+                            raise ValueError("owned container remains after cleanup")
                 self._repository.append_typed_state(
                     namespace="container-cleanup-container-absent",
                     key=command_sha256,
                     value=expected,
                 )
-            if _lstat_optional(control_path) is not None:
-                try:
-                    ready = self._repository.load_typed_state(
-                        namespace="container-control-ready",
-                        key=command_sha256,
-                        value_type=ExecutionControlRecordV5,
-                    )
-                    if ready is None:
-                        raise ValueError("container control readiness is absent")
-                    with acquire_absolute_directory_v5(
-                        self._control_root,
-                        expected_identity=(
-                            self._control_root_info.st_dev,
-                            self._control_root_info.st_ino,
-                        ),
-                    ) as parent:
-                        target_info = control_path.lstat()
-                        if ready != ExecutionControlRecordV5(
-                            5,
-                            self.executor_identity_sha256,
-                            command_sha256,
-                            _directory_identity(control_path, target_info),
-                        ):
-                            raise ValueError("container control cleanup authority changed")
+            try:
+                ready = self._repository.load_typed_state(
+                    namespace="container-control-ready",
+                    key=command_sha256,
+                    value_type=ExecutionControlRecordV5,
+                )
+                if ready is None:
+                    raise ValueError("container control readiness is absent")
+                with acquire_absolute_directory_v5(
+                    self._control_root,
+                    expected_identity=(
+                        self._control_root_info.st_dev,
+                        self._control_root_info.st_ino,
+                    ),
+                ) as parent:
+                    if not directory_child_absent_v5(parent, record.control_relative_path):
+                        self._ensure_control(record)
+                        with self._pinned_control_transaction(record) as transaction:
+                            target_identity = transaction.transaction_root_identity
                         remove_owned_tree_in_directory_v5(
                             parent,
                             record.control_relative_path,
-                            expected_identity=(target_info.st_dev, target_info.st_ino),
+                            expected_identity=target_identity,
                         )
-                except BaseException:
-                    raise ValueError("container control cleanup failed") from None
-                if _lstat_optional(control_path) is not None:
-                    raise ValueError("container control cleanup is incomplete")
+                    if not directory_child_absent_v5(parent, record.control_relative_path):
+                        raise ValueError("container control cleanup is incomplete")
+            except BaseException:
+                raise ValueError("container control cleanup failed") from None
             self._repository.append_typed_state(
                 namespace="container-cleanup",
                 key=command_sha256,

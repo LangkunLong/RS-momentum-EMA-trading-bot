@@ -18,9 +18,12 @@ from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 from core.pit_optimizer_v5.production_fs import (
     acquire_absolute_directory_v5,
     acquire_directory_v5,
+    directory_child_absent_v5,
+    directory_is_empty_v5,
     hash_regular_in_directory_v5,
     open_regular_in_directory_v5,
     read_regular_in_directory_v5,
+    remove_owned_tree_in_directory_v5,
     write_new_regular_in_directory_v5,
     write_regular_in_directory_v5,
 )
@@ -562,16 +565,11 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
                 return opened
             existing = _lstat_optional(target)
             if existing is not None:
-                if not stat.S_ISDIR(existing.st_mode) or _is_reparse(existing) or target.parent != destination_root:
-                    raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
-                try:
-                    with acquire_absolute_directory_v5(
-                        destination_root,
-                        expected_identity=(destination_capability.device, destination_capability.inode),
-                    ):
-                        self._remove_exact_tree(target)
-                except (OSError, ValueError):
-                    raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
+                # A reservation without a ready/identity record cannot prove an
+                # existing name belongs to it.  Never infer ownership from a
+                # predictable path and delete a potentially foreign tree.
+                raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
+            created_identity: tuple[int, int] | None = None
             try:
                 with acquire_directory_v5(
                     destination_root,
@@ -582,7 +580,8 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
                         destination_capability.inode,
                     ),
                 ) as target_access:
-                    if any(os.scandir(target_access.path)):
+                    created_identity = target_access.identity
+                    if not directory_is_empty_v5(target_access):
                         raise WorkspaceDriverBoundaryErrorV5("driver_failed")
                     self._export_commit(source, target_access.path, target_access.identity)
                     target_path = target_access.path
@@ -597,8 +596,13 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
                             destination_capability.device,
                             destination_capability.inode,
                         ),
-                    ):
-                        self._remove_exact_tree(target)
+                    ) as destination_access:
+                        if created_identity is not None:
+                            self._remove_exact_tree(
+                                destination_access,
+                                lease.workspace_relative_path,
+                                created_identity,
+                            )
                 except (OSError, ValueError, WorkspaceDriverBoundaryErrorV5):
                     pass
                 raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
@@ -910,31 +914,48 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             registered = self._active_record_unlocked(lease.payload.lease_id)
             if registered is None or registered.lease != lease:
                 raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
-            if _lstat_optional(root / lease.workspace_relative_path) is None:
-                return "absent"
-            target = self._owned_capability(workspace, lease)
-            if target.parent != root:
+            capability = workspace.opaque_handle
+            if (
+                type(capability) is not _OwnedWorkspaceCapabilityV5
+                or capability.driver_identity_sha256 != self.driver_identity_sha256
+                or capability.lease_sha256 != lease.sha256
+                or workspace.workspace_root_identity_sha256 != capability.root_identity_sha256
+                or workspace.workspace_relative_path != capability.relative_path
+                or workspace.lease_id != lease.payload.lease_id
+                or workspace.lease_token_sha256 != lease.lease_token_sha256
+            ):
+                raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
+            target = Path(capability.path)
+            if target.parent != root or target.name != lease.workspace_relative_path:
                 raise WorkspaceDriverBoundaryErrorV5("unsafe_path")
             try:
                 with acquire_absolute_directory_v5(
                     root,
                     expected_identity=(root_capability.device, root_capability.inode),
-                ):
-                    self._remove_exact_tree(target)
+                ) as root_access:
+                    removed = self._remove_exact_tree(
+                        root_access,
+                        lease.workspace_relative_path,
+                        (capability.device, capability.inode),
+                    )
             except (OSError, ValueError):
                 raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None
-            return "removed"
+            return "removed" if removed else "absent"
 
     @staticmethod
-    def _remove_exact_tree(target: Path) -> None:
+    def _remove_exact_tree(
+        parent: object,
+        relative_path: str,
+        expected_identity: tuple[int, int],
+    ) -> bool:
         try:
-            from agent_loop import _remove_private_tree
-
-            _remove_private_tree(target)
-        except BaseException:
+            return remove_owned_tree_in_directory_v5(
+                parent,  # type: ignore[arg-type]
+                relative_path,
+                expected_identity=expected_identity,
+            )
+        except (OSError, ValueError):
             raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
-        if _lstat_optional(target) is not None:
-            raise WorkspaceDriverBoundaryErrorV5("driver_failed")
 
     def retire_lease(self, lease_id: str) -> None:
         if not lease_id.startswith("workspace."):
@@ -949,7 +970,10 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
                     Path(self._roots.workspace_root),
                     expected_identity=self._workspace_identity,
                 ) as root:
-                    if _lstat_optional(root.path / record.lease.workspace_relative_path) is not None:
+                    if not directory_child_absent_v5(
+                        root,
+                        record.lease.workspace_relative_path,
+                    ):
                         raise WorkspaceDriverBoundaryErrorV5("driver_failed")
             except (OSError, ValueError):
                 raise WorkspaceDriverBoundaryErrorV5("unsafe_path") from None

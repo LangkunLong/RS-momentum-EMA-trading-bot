@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ntpath
 import os
 from pathlib import Path
 import stat
@@ -241,7 +242,9 @@ def hash_regular_in_directory_v5(
     return info.st_dev, info.st_ino, observed_bytes, digest.hexdigest()
 
 
-def _windows_handle_identity(handle: int) -> int:
+def _windows_handle_information(handle: int) -> tuple[int, int, int, int]:
+    """Return attributes, volume serial, file id, and link count for one handle."""
+
     import ctypes
     from ctypes import wintypes
 
@@ -266,16 +269,56 @@ def _windows_handle_identity(handle: int) -> int:
     value = _ByHandleFileInformation()
     if not get_info(wintypes.HANDLE(handle), ctypes.byref(value)):
         raise ctypes.WinError(ctypes.get_last_error())
-    return (int(value.nFileIndexHigh) << 32) | int(value.nFileIndexLow)
+    return (
+        int(value.dwFileAttributes),
+        int(value.dwVolumeSerialNumber),
+        (int(value.nFileIndexHigh) << 32) | int(value.nFileIndexLow),
+        int(value.nNumberOfLinks),
+    )
 
 
-def _open_windows_delete_handle(path: Path, *, directory: bool) -> tuple[int, os.stat_result]:
+def _windows_handle_identity(handle: int) -> int:
+    return _windows_handle_information(handle)[2]
+
+
+def _windows_final_path(handle: int) -> str:
     import ctypes
     from ctypes import wintypes
 
-    before = os.lstat(path)
-    if _is_reparse(before) or stat.S_ISDIR(before.st_mode) is not directory:
-        raise ValueError("filesystem cleanup target is not an exact expected entry")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_name = kernel32.GetFinalPathNameByHandleW
+    get_name.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    get_name.restype = wintypes.DWORD
+    required = int(get_name(wintypes.HANDLE(handle), None, 0, 0))
+    if required <= 0 or required > 32768:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_unicode_buffer(required + 1)
+    written = int(get_name(wintypes.HANDLE(handle), buffer, len(buffer), 0))
+    if written <= 0 or written >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buffer.value
+
+
+def _windows_directory_handle(directory: _DirectoryAccess) -> int:
+    """Return the held leaf handle without accepting an unpinned path."""
+
+    directory.assert_current()
+    handles = getattr(directory, "_windows_handles", None)
+    if os.name != "nt" or type(handles) is not list or not handles:
+        raise RuntimeError("component-relative Windows directory handle is unavailable")
+    handle = handles[-1]
+    if type(handle) is not int or handle <= 0:
+        raise RuntimeError("component-relative Windows directory handle is invalid")
+    return handle
+
+
+def _open_windows_enumeration_handle(directory: _DirectoryAccess) -> int:
+    """Open list authority for the exact directory already pinned by ``directory``."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    directory.assert_current()
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
     create_file.argtypes = (
@@ -289,31 +332,204 @@ def _open_windows_delete_handle(path: Path, *, directory: bool) -> tuple[int, os
     )
     create_file.restype = wintypes.HANDLE
     handle = create_file(
-        _windows_extended_path(path),
-        0x00010000 | 0x00000080 | (0x00000001 if directory else 0),
-        0x0001 | 0x0002 | 0x0004,
+        _windows_extended_path(directory.path),
+        0x00000001 | 0x00000080,  # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+        0x0001 | 0x0002,  # READ | WRITE sharing; held chain denies delete/rename
         None,
         3,
-        0x00200000 | (0x02000000 if directory else 0x00000080),
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
         None,
     )
     invalid = ctypes.c_void_p(-1).value
     if handle in {None, invalid}:
         raise ctypes.WinError(ctypes.get_last_error())
+    raw = int(handle)
     try:
-        after = os.lstat(path)
-        handle_inode = _windows_handle_identity(int(handle))
+        attributes, _volume_serial, file_id, _links = _windows_handle_information(raw)
         if (
-            _is_reparse(after)
-            or stat.S_ISDIR(after.st_mode) is not directory
-            or _identity(before) != _identity(after)
-            or handle_inode != after.st_ino
+            attributes & 0x00000400
+            or not attributes & 0x00000010
+            or file_id != directory.identity[1]
         ):
-            raise ValueError("filesystem cleanup target changed while opening")
-        return int(handle), after
+            raise ValueError("filesystem directory identity changed before enumeration")
+        directory.assert_current()
+        return raw
     except BaseException:
-        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        _close_windows_raw_handle(raw)
         raise
+
+
+def _raise_windows_ntstatus(status: int, name: str) -> None:
+    import ctypes
+
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    convert = ntdll.RtlNtStatusToDosError
+    convert.argtypes = (ctypes.c_ulong,)
+    convert.restype = ctypes.c_ulong
+    error = int(convert(ctypes.c_ulong(status & 0xFFFFFFFF)))
+    if error in {2, 3}:  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+        raise FileNotFoundError(name)
+    if error in {5, 32}:  # ACCESS_DENIED / SHARING_VIOLATION
+        raise PermissionError(error, "Windows relative entry could not be pinned", name)
+    if error == 267:  # ERROR_DIRECTORY
+        raise NotADirectoryError(name)
+    raise OSError(error, "Windows relative entry open failed", name)
+
+
+def _open_windows_delete_handle_at(
+    parent_handle: int,
+    name: str,
+    *,
+    directory: bool,
+) -> tuple[int, tuple[int, int, int, int]]:
+    """Open one child relative to an already pinned directory handle."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    child = _closed_name(name)
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", ctypes.POINTER(ctypes.c_ushort)),
+        ]
+
+    class _ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(_UnicodeString)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", wintypes.LPVOID),
+            ("SecurityQualityOfService", wintypes.LPVOID),
+        ]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+    encoded = child.encode("utf-16-le")
+    name_buffer = (ctypes.c_ushort * (len(encoded) // 2 + 1))()
+    ctypes.memmove(name_buffer, encoded, len(encoded))
+    unicode_name = _UnicodeString(
+        len(encoded),
+        len(encoded),
+        ctypes.cast(name_buffer, ctypes.POINTER(ctypes.c_ushort)),
+    )
+    attributes = _ObjectAttributes(
+        ctypes.sizeof(_ObjectAttributes),
+        wintypes.HANDLE(parent_handle),
+        ctypes.pointer(unicode_name),
+        0x00000040,  # OBJ_CASE_INSENSITIVE
+        None,
+        None,
+    )
+    io_status = _IoStatusBlock()
+    handle = wintypes.HANDLE()
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    nt_create = ntdll.NtCreateFile
+    nt_create.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.ULONG,
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.LPVOID,
+        wintypes.ULONG,
+    )
+    nt_create.restype = ctypes.c_long
+    options = 0x00200000 | 0x00000020  # OPEN_REPARSE_POINT | SYNCHRONOUS_IO_NONALERT
+    options |= 0x00000001 if directory else 0x00000040  # DIRECTORY / NON_DIRECTORY
+    status = int(
+        nt_create(
+            ctypes.byref(handle),
+            0x00010000 | 0x00100000 | 0x00000080 | 0x00000001,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            0,
+            0x00000001,  # FILE_SHARE_READ: deny mutation/rename while pinned
+            1,  # FILE_OPEN
+            options,
+            None,
+            0,
+        )
+    )
+    if status < 0:
+        _raise_windows_ntstatus(status, child)
+    raw_handle = int(handle.value)
+    try:
+        information = _windows_handle_information(raw_handle)
+        file_attributes, _volume_serial, _file_id, link_count = information
+        if (
+            bool(file_attributes & 0x00000400)  # FILE_ATTRIBUTE_REPARSE_POINT
+            or bool(file_attributes & 0x00000010) is not directory
+            or (not directory and link_count != 1)
+        ):
+            raise ValueError("filesystem cleanup target is not an exact expected entry")
+        return raw_handle, information
+    except BaseException:
+        _close_windows_raw_handle(raw_handle)
+        raise
+
+
+def _try_open_windows_delete_handle_at(
+    parent_handle: int,
+    name: str,
+    *,
+    directory: bool,
+) -> tuple[int, tuple[int, int, int, int]] | None:
+    try:
+        return _open_windows_delete_handle_at(parent_handle, name, directory=directory)
+    except FileNotFoundError:
+        return None
+
+
+def _rename_windows_handle_at(handle: int, parent: _DirectoryAccess, name: str) -> None:
+    """Atomically move an exact open handle beneath its pinned parent."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", ctypes.c_ubyte),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", ctypes.c_ushort * 1),
+        ]
+
+    target = parent.path / _closed_name(name)
+    encoded = str(target).encode("utf-16-le")
+    # Include the structure's trailing WCHAR storage and a zeroed terminator;
+    # FileNameLength remains the exact non-NUL byte count.
+    size = ctypes.sizeof(_FileRenameInfo) + len(encoded)
+    buffer = ctypes.create_string_buffer(size)
+    value = ctypes.cast(buffer, ctypes.POINTER(_FileRenameInfo)).contents
+    value.ReplaceIfExists = 0
+    # SetFileInformationByHandle requires an absolute name and a null root.
+    # ``parent`` remains pinned without delete sharing for this whole call, so
+    # the absolute namespace cannot be exchanged while the exact target handle
+    # is quarantined.
+    value.RootDirectory = None
+    value.FileNameLength = len(encoded)
+    ctypes.memmove(ctypes.addressof(buffer) + _FileRenameInfo.FileName.offset, encoded, len(encoded))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_info = kernel32.SetFileInformationByHandle
+    set_info.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    set_info.restype = wintypes.BOOL
+    if not set_info(wintypes.HANDLE(handle), 3, buffer, size):  # FileRenameInfo
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _mark_windows_handle_for_delete(handle: int) -> None:
@@ -351,34 +567,174 @@ def _close_windows_raw_handle(handle: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def _remove_windows_tree(path: Path, *, expected_identity: tuple[int, int]) -> None:
-    handle, info = _open_windows_delete_handle(path, directory=True)
-    try:
-        if _identity(info) != expected_identity:
-            raise ValueError("filesystem cleanup root identity changed")
-        for entry in tuple(os.scandir(path)):
-            child = path / _closed_name(entry.name)
-            child_info = os.lstat(child)
-            if _is_reparse(child_info):
-                raise ValueError("filesystem cleanup encountered a reparse point")
-            if stat.S_ISDIR(child_info.st_mode):
-                _remove_windows_tree(child, expected_identity=_identity(child_info))
-            elif stat.S_ISREG(child_info.st_mode) and child_info.st_nlink == 1:
-                child_handle, opened = _open_windows_delete_handle(child, directory=False)
-                try:
-                    if _identity(opened) != _identity(child_info):
-                        raise ValueError("filesystem cleanup child identity changed")
-                    _mark_windows_handle_for_delete(child_handle)
-                finally:
-                    _close_windows_raw_handle(child_handle)
+def _enumerate_windows_directory(handle: int) -> tuple[tuple[str, int, int], ...]:
+    """Enumerate names, attributes, and file ids from the held directory handle."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileIdBothDirectoryInfo(ctypes.Structure):
+        _fields_ = [
+            ("NextEntryOffset", wintypes.DWORD),
+            ("FileIndex", wintypes.DWORD),
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("EndOfFile", ctypes.c_longlong),
+            ("AllocationSize", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+            ("FileNameLength", wintypes.DWORD),
+            ("EaSize", wintypes.DWORD),
+            ("ShortNameLength", ctypes.c_ubyte),
+            ("ShortName", ctypes.c_ushort * 12),
+            ("FileId", ctypes.c_longlong),
+            ("FileName", ctypes.c_ushort * 1),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel32.GetFileInformationByHandleEx
+    query.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    query.restype = wintypes.BOOL
+    buffer_size = 1024 * 1024
+    buffer = ctypes.create_string_buffer(buffer_size)
+    result: list[tuple[str, int, int]] = []
+    seen: set[str] = set()
+    info_class = 11  # FileIdBothDirectoryRestartInfo for the first page
+    while True:
+        ctypes.memset(buffer, 0, buffer_size)
+        if not query(wintypes.HANDLE(handle), info_class, buffer, buffer_size):
+            error = ctypes.get_last_error()
+            if error == 18:  # ERROR_NO_MORE_FILES
+                break
+            raise ctypes.WinError(error)
+        info_class = 10  # FileIdBothDirectoryInfo continues enumeration
+        offset = 0
+        while True:
+            if offset + _FileIdBothDirectoryInfo.FileName.offset > buffer_size:
+                raise ValueError("filesystem cleanup directory enumeration is malformed")
+            entry = _FileIdBothDirectoryInfo.from_buffer_copy(buffer, offset)
+            length = int(entry.FileNameLength)
+            name_offset = offset + _FileIdBothDirectoryInfo.FileName.offset
+            if length % 2 or length <= 0 or name_offset + length > buffer_size:
+                raise ValueError("filesystem cleanup directory name is malformed")
+            raw_name = ctypes.string_at(ctypes.addressof(buffer) + name_offset, length)
+            try:
+                name = raw_name.decode("utf-16-le", errors="strict")
+            except UnicodeDecodeError:
+                raise ValueError("filesystem cleanup directory name is malformed") from None
+            if name not in {".", ".."}:
+                child = _closed_name(name)
+                key = child.casefold()
+                if key in seen or len(result) >= 1_000_000:
+                    raise ValueError("filesystem cleanup directory enumeration is ambiguous")
+                seen.add(key)
+                result.append((child, int(entry.FileAttributes), int(entry.FileId) & ((1 << 64) - 1)))
+            next_offset = int(entry.NextEntryOffset)
+            if next_offset == 0:
+                break
+            if next_offset < _FileIdBothDirectoryInfo.FileName.offset or offset + next_offset <= offset:
+                raise ValueError("filesystem cleanup directory enumeration is malformed")
+            offset += next_offset
+    return tuple(result)
+
+
+def _remove_open_windows_tree(
+    handle: int,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Delete only descendants opened and pinned beneath ``handle``."""
+
+    attributes, _volume_serial, file_id, _link_count = _windows_handle_information(handle)
+    if attributes & 0x00000400 or not attributes & 0x00000010 or file_id != expected_identity[1]:
+        raise ValueError("filesystem cleanup root identity changed")
+    for child, enumerated_attributes, enumerated_file_id in _enumerate_windows_directory(handle):
+        if enumerated_attributes & 0x00000400:
+            raise ValueError("filesystem cleanup encountered a reparse point")
+        is_directory = bool(enumerated_attributes & 0x00000010)
+        child_handle, opened = _open_windows_delete_handle_at(
+            handle,
+            child,
+            directory=is_directory,
+        )
+        try:
+            opened_attributes, _opened_volume, opened_file_id, _opened_links = opened
+            if (
+                opened_file_id != enumerated_file_id
+                or bool(opened_attributes & 0x00000010) is not is_directory
+                or bool(opened_attributes & 0x00000400)
+            ):
+                raise ValueError("filesystem cleanup child identity changed")
+            if is_directory:
+                _remove_open_windows_tree(
+                    child_handle,
+                    expected_identity=(expected_identity[0], opened_file_id),
+                )
             else:
-                raise ValueError("filesystem cleanup encountered a foreign entry")
-        current = os.lstat(path)
-        if _identity(current) != expected_identity or _windows_handle_identity(handle) != current.st_ino:
+                _mark_windows_handle_for_delete(child_handle)
+        finally:
+            _close_windows_raw_handle(child_handle)
+    if _enumerate_windows_directory(handle):
+        raise ValueError("filesystem cleanup directory changed during deletion")
+    if _windows_handle_identity(handle) != expected_identity[1]:
+        raise ValueError("filesystem cleanup root identity changed")
+    _mark_windows_handle_for_delete(handle)
+
+
+def _remove_windows_tree(
+    parent: _DirectoryAccess,
+    name: str,
+    *,
+    expected_identity: tuple[int, int],
+) -> bool:
+    """Quarantine an exact owned root by handle, then recursively disposition it."""
+
+    quarantine_name = ".pit-v5-quarantine-" + hashlib.sha256(
+        f"{name}:{expected_identity[0]}:{expected_identity[1]}".encode("utf-8")
+    ).hexdigest()[:32]
+    parent_handle = _windows_directory_handle(parent)
+    original = _try_open_windows_delete_handle_at(parent_handle, name, directory=True)
+    quarantine = _try_open_windows_delete_handle_at(parent_handle, quarantine_name, directory=True)
+    if original is not None and quarantine is not None:
+        _close_windows_raw_handle(original[0])
+        _close_windows_raw_handle(quarantine[0])
+        raise ValueError("filesystem cleanup has conflicting namespace entries")
+    selected = original if original is not None else quarantine
+    if selected is None:
+        return False
+    handle, opened = selected
+    try:
+        if opened[2] != expected_identity[1]:
             raise ValueError("filesystem cleanup root identity changed")
-        _mark_windows_handle_for_delete(handle)
+        if original is not None:
+            _rename_windows_handle_at(handle, parent, quarantine_name)
+            expected_final = _windows_extended_path(parent.path / quarantine_name)
+            if ntpath.normcase(ntpath.normpath(_windows_final_path(handle))) != ntpath.normcase(
+                ntpath.normpath(expected_final)
+            ):
+                raise ValueError("filesystem cleanup quarantine identity changed")
+            unexpected_original = _try_open_windows_delete_handle_at(
+                parent_handle,
+                name,
+                directory=True,
+            )
+            if unexpected_original is not None:
+                _close_windows_raw_handle(unexpected_original[0])
+                raise ValueError("filesystem cleanup quarantine identity changed")
+        _remove_open_windows_tree(handle, expected_identity=expected_identity)
     finally:
         _close_windows_raw_handle(handle)
+    for candidate in (name, quarantine_name):
+        remaining = _try_open_windows_delete_handle_at(
+            parent_handle,
+            candidate,
+            directory=True,
+        )
+        if remaining is not None:
+            _close_windows_raw_handle(remaining[0])
+            raise ValueError("filesystem cleanup target remains")
+    return True
 
 
 def _remove_posix_tree(
@@ -429,7 +785,7 @@ def remove_owned_tree_in_directory_v5(
     name: str,
     *,
     expected_identity: tuple[int, int],
-) -> None:
+) -> bool:
     """Delete one exact owned child without following or crossing filesystem links."""
 
     child = _closed_name(name)
@@ -441,18 +797,70 @@ def remove_owned_tree_in_directory_v5(
         raise ValueError("filesystem cleanup identity is invalid")
     parent.assert_current()
     if os.name == "nt":
-        _remove_windows_tree(parent.path / child, expected_identity=expected_identity)
-    else:
+        removed = _remove_windows_tree(parent, child, expected_identity=expected_identity)
+        parent.assert_current()
+        return removed
+    try:
         _remove_posix_tree(parent.descriptor, child, expected_identity=expected_identity)
+    except FileNotFoundError:
+        parent.assert_current()
+        return False
     parent.assert_current()
     try:
-        if os.name == "nt":
-            os.lstat(parent.path / child)
-        else:
-            os.stat(child, dir_fd=parent.descriptor, follow_symlinks=False)
+        os.stat(child, dir_fd=parent.descriptor, follow_symlinks=False)
     except FileNotFoundError:
-        return
+        return True
     raise ValueError("filesystem cleanup target remains")
+
+
+def directory_entry_names_v5(directory: _DirectoryAccess) -> tuple[str, ...]:
+    """List closed names from a held directory, never from a reopened path."""
+
+    directory.assert_current()
+    if os.name == "nt":
+        handle = _open_windows_enumeration_handle(directory)
+        try:
+            names = tuple(item[0] for item in _enumerate_windows_directory(handle))
+        finally:
+            _close_windows_raw_handle(handle)
+    else:
+        names = tuple(_closed_name(item) for item in os.listdir(directory.descriptor))
+    directory.assert_current()
+    return tuple(sorted(names, key=str.casefold))
+
+
+def directory_is_empty_v5(directory: _DirectoryAccess) -> bool:
+    """Inspect a held directory by descriptor/handle, never by a reopened path."""
+
+    return not directory_entry_names_v5(directory)
+
+
+def directory_child_absent_v5(directory: _DirectoryAccess, name: str) -> bool:
+    """Prove a closed child name absent relative to one pinned directory."""
+
+    child = _closed_name(name)
+    directory.assert_current()
+    if os.name == "nt":
+        opened = _try_open_windows_delete_handle_at(
+            _windows_directory_handle(directory),
+            child,
+            directory=True,
+        )
+        if opened is None:
+            directory.assert_current()
+            return True
+        _close_windows_raw_handle(opened[0])
+        directory.assert_current()
+        return False
+    try:
+        metadata = os.stat(child, dir_fd=directory.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        directory.assert_current()
+        return True
+    if _is_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("filesystem child is not an exact directory")
+    directory.assert_current()
+    return False
 
 
 def write_regular_in_directory_v5(
@@ -510,6 +918,9 @@ def write_new_regular_in_directory_v5(
 __all__ = [
     "acquire_absolute_directory_v5",
     "acquire_directory_v5",
+    "directory_child_absent_v5",
+    "directory_entry_names_v5",
+    "directory_is_empty_v5",
     "hash_regular_in_directory_v5",
     "open_regular_in_directory_v5",
     "read_regular_in_directory_v5",
