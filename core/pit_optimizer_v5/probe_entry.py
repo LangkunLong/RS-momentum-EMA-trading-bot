@@ -66,7 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _read_policy_source() -> SourceBundleV5:
+def read_policy_source_v5() -> SourceBundleV5:
     files: list[SourceFileV5] = []
     directory_fd = os.open(
         _POLICY_OVERLAY_ROOT,
@@ -117,7 +117,7 @@ def _read_policy_source() -> SourceBundleV5:
     return SourceBundleV5(tuple(files))
 
 
-class _PolicyWorkerSessionV5:
+class PolicyWorkerSessionV5:
     """One local V3 worker process contained by the already-owned outer sandbox."""
 
     def __init__(
@@ -125,15 +125,25 @@ class _PolicyWorkerSessionV5:
         *,
         call_timeout_seconds: float,
         source: SourceBundleV5,
+        startup_timeout_seconds: float | None = None,
     ) -> None:
+        startup_timeout = (
+            call_timeout_seconds
+            if startup_timeout_seconds is None
+            else startup_timeout_seconds
+        )
         if (
             type(call_timeout_seconds) is not float
             or not math.isfinite(call_timeout_seconds)
             or call_timeout_seconds <= 0
+            or type(startup_timeout) is not float
+            or not math.isfinite(startup_timeout)
+            or startup_timeout <= 0
             or type(source) is not SourceBundleV5
         ):
             raise ValueError("probe worker timeout is invalid")
         self._timeout = call_timeout_seconds
+        self._startup_timeout = startup_timeout
         self._bootstrap = WorkerBootstrap.create(interface_version=POLICY_INTERFACE_VERSION_V3)
         self._sequence = 1
         self._previous_hmac_sha256 = initial_chain_sha256(self._bootstrap)
@@ -171,7 +181,10 @@ class _PolicyWorkerSessionV5:
         )
         try:
             self._write_line(self._bootstrap.to_json())
-            decode_worker_ready(self._read_line(), bootstrap=self._bootstrap)
+            decode_worker_ready(
+                self._read_line(timeout_seconds=self._startup_timeout),
+                bootstrap=self._bootstrap,
+            )
         except BaseException:
             self.close()
             raise
@@ -185,7 +198,7 @@ class _PolicyWorkerSessionV5:
         self._process.stdin.write(encoded + b"\n")
         self._process.stdin.flush()
 
-    def _read_line(self) -> str:
+    def _read_line(self, *, timeout_seconds: float | None = None) -> str:
         stream = self._process.stdout
         if stream is None:
             raise RuntimeError("probe worker output is closed")
@@ -193,7 +206,7 @@ class _PolicyWorkerSessionV5:
             (stream,),
             (),
             (),
-            self._timeout,
+            self._timeout if timeout_seconds is None else timeout_seconds,
         )
         if not ready:
             raise TimeoutError("probe worker timed out")
@@ -311,7 +324,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
             raise ValueError("trusted probe runtime authority differs")
         if arguments.suite_id != PROBE_SUITE_ID_V5:
             raise ValueError("probe suite is invalid")
-        source = _read_policy_source()
+        source = read_policy_source_v5()
         revision = derive_policy_revision_identity_v5(
             source_bundle=source,
             trusted_policy_runtime_sha256=trusted_runtime_sha256,
@@ -319,7 +332,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         )
         if revision.sha256 != expected_policy_sha256:
             raise ValueError("probe policy identity differs")
-        session = _PolicyWorkerSessionV5(
+        session = PolicyWorkerSessionV5(
             call_timeout_seconds=float(arguments.call_timeout_seconds),
             source=source,
         )
@@ -349,4 +362,4 @@ if __name__ == "__main__":
     raise SystemExit(main(tuple(sys.argv[1:])))
 
 
-__all__ = ["main"]
+__all__ = ["PolicyWorkerSessionV5", "main", "read_policy_source_v5"]

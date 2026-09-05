@@ -10,11 +10,12 @@ import json
 import math
 import ntpath
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 from typing import Iterator, Literal
 
+from core.pit_optimizer_evaluation import EvaluationPanelSpec
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
 from core.pit_optimizer_v5.contracts import (
     ArtifactRefV5,
@@ -23,7 +24,12 @@ from core.pit_optimizer_v5.contracts import (
     EvaluatorContractV5,
     SandboxProfileV5,
     canonical_sha256_v5,
+    validate_episode_plan_panel_v5,
     validate_sandbox_profile_resources_v5,
+)
+from core.pit_optimizer_v5.container_protocol import (
+    PanelExecutionRequestV5,
+    panel_execution_request_bytes_v5,
 )
 from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
 from core.pit_optimizer_v5.production_fs import (
@@ -63,6 +69,7 @@ from core.pit_optimizer_v5.sandbox import (
     derive_execution_lease_id_v5,
     derive_sandbox_mount_authorities_v5,
     execution_output_name_v5,
+    panel_execution_request_for_v5,
 )
 from core.pit_optimizer_v5.workspace import MaterializedWorkspaceV5, WorkspaceOwnerV5
 
@@ -71,15 +78,43 @@ _DATA_FILES_V5 = ("pit_bundle.sqlite3", "prices_provenance.json")
 _DATA_FILE_MAXIMUM_BYTES_V5 = (8 * 1024 * 1024 * 1024, 64 * 1024 * 1024)
 _DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5 = 512 * 1024 * 1024
 _POLICY_SOURCE_MAXIMUM_BYTES_V5 = 1024 * 1024
+_PANEL_INPUT_MAXIMUM_BYTES_V5 = 8 * 1024 * 1024
 _CONTAINER_SHM_SIZE_BYTES_V5 = 16 * 1024 * 1024
 _CONTROL_CHILDREN_V5 = ("config", "home", "tmp")
 _DOCKER_CONFIG_NAME_V5 = "config.json"
 _DOCKER_CONFIG_CONTENT_V5 = b"{}\n"
 _DOCKER_CONFIG_TEXT_V5 = _DOCKER_CONFIG_CONTENT_V5.decode("ascii")
+_PANEL_INPUT_NAMESPACE_V5 = "container-panel-input"
+_PANEL_INPUT_TARGET_V5 = "/pit/request/panel-request.json"
 
 
 def _windows_key(path: str) -> str:
     return ntpath.normcase(ntpath.normpath(path))
+
+
+def _docker_host_path_v5(path: Path) -> str:
+    value = str(path)
+    if (
+        not ntpath.isabs(value)
+        or ntpath.normpath(value) != value
+        or any(character in value for character in {",", "\x00", "\n", "\r"})
+    ):
+        raise ValueError("Docker host mount path is invalid")
+    return value
+
+
+def _panel_input_reference_v5(
+    request: DockerPanelRequestV5,
+) -> tuple[PanelExecutionRequestV5, ArtifactRefV5]:
+    panel_input = panel_execution_request_for_v5(request)
+    raw = panel_execution_request_bytes_v5(panel_input)
+    reference = ArtifactRefV5(
+        f"adapter-state/{_PANEL_INPUT_NAMESPACE_V5}/{request.sha256}.json",
+        hashlib.sha256(raw).hexdigest(),
+    )
+    if reference.sha256 != panel_input.sha256:
+        raise ValueError("panel input canonical identity is inconsistent")
+    return panel_input, reference
 
 
 def _is_reparse(info: os.stat_result) -> bool:
@@ -389,7 +424,7 @@ class ExecutionReservationRecordV5:
         )
         if (
             type(self.expected_mounts) is not tuple
-            or len(self.expected_mounts) != (5 if semantic_probe else 4)
+            or len(self.expected_mounts) != (5 if semantic_probe else 8)
             or any(
                 type(item) is not tuple
                 or len(item) != 3
@@ -780,6 +815,20 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
     def fixed_roots(self) -> tuple[Path, Path, Path, Path]:
         return self._fixed_roots
 
+    def panel_for(self, panel: EpisodePlanV5) -> EvaluationPanelSpec:
+        """Load and authenticate the complete panel referenced by one episode."""
+
+        if type(panel) is not EpisodePlanV5:
+            raise ValueError("sandbox panel request is invalid")
+        authenticated = self._repository.load_typed_artifact(
+            panel.panel_ref,
+            value_type=EvaluationPanelSpec,
+        )
+        validate_episode_plan_panel_v5(panel, authenticated)
+        if authenticated.purpose != panel.purpose:
+            raise ValueError("sandbox panel purpose differs from its episode")
+        return authenticated
+
     def mounts_for(
         self,
         *,
@@ -894,7 +943,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             source_info,
             authorities[0],
             source_binding,
-            container_path="/pit/candidate" if semantic_probe else "/pit/source",
+            container_path="/pit/candidate",
         )
         output_handle = self._mount_handle(
             "output",
@@ -1156,7 +1205,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             content_authority,
             str(path),
             container_path
-            or {"source": "/pit/source", "data": "/pit/data", "output": "/pit/output"}[kind],
+            or {"source": "/pit/candidate", "data": "/pit/data", "output": "/pit/output"}[kind],
             self._manifest.resources.evaluation_output_limit_bytes if kind == "output" else None,
             capability,
         )
@@ -1316,7 +1365,57 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 != access_by_kind["output"].identity
             ):
                 raise ValueError("sandbox output mount is not durably ready")
-            yield tuple(path_by_kind[item.kind] for item in handles)
+            pinned_paths = tuple(path_by_kind[item.kind] for item in handles)
+            if request.execution_key.stage != "semantic_probe":
+                panel_input, reference = _panel_input_reference_v5(request)
+                recorded = self._repository.load_typed_state(
+                    namespace=_PANEL_INPUT_NAMESPACE_V5,
+                    key=request.sha256,
+                    value_type=PanelExecutionRequestV5,
+                    repair=False,
+                )
+                if recorded != panel_input:
+                    raise ValueError("sandbox panel input is not durably authenticated")
+                parts = PurePosixPath(reference.relative_path).parts
+                try:
+                    repository_root = stack.enter_context(
+                        acquire_absolute_directory_v5(self._repository.root)
+                    )
+                    if self._repository.root_identity_sha256 != canonical_sha256_v5(
+                        {
+                            "device": repository_root.identity[0],
+                            "inode": repository_root.identity[1],
+                        }
+                    ):
+                        raise ValueError("artifact repository root changed")
+                    parent = stack.enter_context(
+                        acquire_directory_v5(
+                            self._repository.root,
+                            tuple(parts[:-1]),
+                            create=False,
+                            expected_root_identity=repository_root.identity,
+                        )
+                    )
+                    stream, info = open_regular_in_directory_v5(
+                        parent,
+                        parts[-1],
+                        writable=False,
+                    )
+                    stack.enter_context(stream)
+                    observed = _hash_open_stream(
+                        stream,
+                        info,
+                        maximum_bytes=_PANEL_INPUT_MAXIMUM_BYTES_V5,
+                    )
+                except (OSError, ValueError):
+                    raise ValueError("sandbox panel input changed") from None
+                if observed[3] != reference.sha256:
+                    raise ValueError("sandbox panel input bytes changed")
+                input_path = parent.path / parts[-1]
+                if any(_roots_overlap(input_path, path) for path in pinned_paths):
+                    raise ValueError("sandbox panel input overlaps another mount")
+                pinned_paths = (*pinned_paths, input_path)
+            yield pinned_paths
 
     def authenticate_request(
         self,
@@ -1399,11 +1498,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     "python_flags": ("-P", "-B"),
                     "workdirs": (
                         ("semantic_probe", "/"),
-                        ("panel_evaluation", "/pit/source"),
+                        ("panel_evaluation", "/"),
                     ),
                     "mount_layout": (
                         ("semantic_probe", "four_policy_files_and_output"),
-                        ("panel_evaluation", "source_two_data_files_and_output"),
+                        (
+                            "panel_evaluation",
+                            "four_policy_files_two_data_files_request_and_output",
+                        ),
                     ),
                     "output_names": (
                         ("semantic_probe", "semantic-fingerprint.json"),
@@ -1424,7 +1526,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         return self._mount_factory
 
     def reserve(self, command: ContainerCommandV5) -> ExecutionReservationV5:
-        self._authenticate_command(command)
+        self._authenticate_command(command, persist_panel_input=True)
         record = self._reservation_record(command)
         with self._repository.adapter_state_transition(namespace="container-execution", key=command.sha256):
             prior = self._load_reservation(command.sha256)
@@ -1442,15 +1544,38 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 raise ValueError("container execution reservation is foreign")
         return self._runtime_reservation(command, "created" if created else "existing")
 
-    def _authenticate_command(self, command: ContainerCommandV5) -> tuple[Path, ...]:
+    def _ensure_panel_input(self, request: DockerPanelRequestV5) -> ArtifactRefV5 | None:
+        if request.execution_key.stage == "semantic_probe":
+            if request.panel_spec is not None:
+                raise ValueError("semantic probe unexpectedly carries a panel input")
+            return None
+        panel_input, expected = _panel_input_reference_v5(request)
+        stored = self._repository.append_typed_state(
+            namespace=_PANEL_INPUT_NAMESPACE_V5,
+            key=request.sha256,
+            value=panel_input,
+        )
+        if stored != expected:
+            raise ValueError("container panel input persistence differs from authority")
+        return stored
+
+    def _authenticate_command(
+        self,
+        command: ContainerCommandV5,
+        *,
+        persist_panel_input: bool = False,
+    ) -> tuple[Path, ...]:
         if (
             type(command) is not ContainerCommandV5
+            or type(persist_panel_input) is not bool
             or command.request.owner != self._owner
             or command.request.manifest != self._manifest
             or command.request.sandbox_profile != self._profile
             or command.argv != build_docker_argv_v5(command.request)
         ):
             raise ValueError("container command differs from executor authority")
+        if persist_panel_input:
+            self._ensure_panel_input(command.request)
         paths = self._mount_factory.authenticate_request(command.request)
         if any(_roots_overlap(self._control_root, path) for path in paths):
             raise ValueError("container control root overlaps a sandbox mount")
@@ -1512,7 +1637,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "--entrypoint",
             "python",
             "--workdir",
-            "/" if command.request.execution_key.stage == "semantic_probe" else "/pit/source",
+            "/",
         ]
         generic[2:2] = injected
         data_mount = command.request.data_mount
@@ -1543,6 +1668,19 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             if data_argument_index == 0 or generic[data_argument_index - 1] != "--mount":
                 raise ValueError("container data mount grammar is malformed")
             generic[data_argument_index - 1 : data_argument_index + 1] = data_file_arguments
+            _panel_input, input_reference = _panel_input_reference_v5(command.request)
+            input_path = self._repository.root.joinpath(
+                *PurePosixPath(input_reference.relative_path).parts
+            )
+            input_host_path = _docker_host_path_v5(input_path)
+            separator = generic.index("--")
+            generic[separator:separator] = [
+                "--mount",
+                (
+                    f"type=bind,src={input_host_path},"
+                    f"dst={_PANEL_INPUT_TARGET_V5},readonly"
+                ),
+            ]
         separator = generic.index("--")
         if generic[separator + 1] != self._profile.image_reference or generic[separator + 2] != "python":
             raise ValueError("container image command differs from the closed V5 grammar")
@@ -1555,35 +1693,29 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             for role in ("evaluator_process", "container")
         )
         runtime_argv = self._runtime_argv(command)
+        source_mounts = tuple(
+            (
+                _windows_key(
+                    str(
+                        Path(command.request.source_mount.host_path).joinpath(
+                            *relative.split("/")
+                        )
+                    )
+                ),
+                f"{command.request.source_mount.container_path}/{relative.rsplit('/', 1)[-1]}",
+                False,
+            )
+            for relative in EDITABLE_POLICY_PATHS_V5
+        )
         if command.request.execution_key.stage == "semantic_probe":
             if command.request.data_mount is not None:
                 raise ValueError("semantic probe reservation exposes PIT data")
-            source_mounts = tuple(
-                (
-                    _windows_key(
-                        str(
-                            Path(command.request.source_mount.host_path).joinpath(
-                                *relative.split("/")
-                            )
-                        )
-                    ),
-                    f"{command.request.source_mount.container_path}/{relative.rsplit('/', 1)[-1]}",
-                    False,
-                )
-                for relative in EDITABLE_POLICY_PATHS_V5
-            )
             data_mounts: tuple[tuple[str, str, bool], ...] = ()
+            input_mounts: tuple[tuple[str, str, bool], ...] = ()
         else:
             data_mount = command.request.data_mount
             if type(data_mount) is not SandboxMountHandleV5:
                 raise ValueError("panel reservation lacks its data mount")
-            source_mounts = (
-                (
-                    _windows_key(command.request.source_mount.host_path),
-                    command.request.source_mount.container_path,
-                    False,
-                ),
-            )
             data_mounts = tuple(
                 (
                     _windows_key(str(Path(data_mount.host_path) / name)),
@@ -1592,11 +1724,23 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 )
                 for name in _DATA_FILES_V5
             )
+            _panel_input, input_reference = _panel_input_reference_v5(command.request)
+            input_path = self._repository.root.joinpath(
+                *PurePosixPath(input_reference.relative_path).parts
+            )
+            input_mounts = (
+                (
+                    _windows_key(_docker_host_path_v5(input_path)),
+                    _PANEL_INPUT_TARGET_V5,
+                    False,
+                ),
+            )
         expected_mounts = tuple(
             sorted(
                 (
                     *source_mounts,
                     *data_mounts,
+                    *input_mounts,
                     (
                         _windows_key(command.request.output_mount.host_path),
                         command.request.output_mount.container_path,
@@ -2986,12 +3130,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         expected_labels.update(pit_labels)
         separator = reservation.command_argv.index("--")
         expected_command = list(reservation.command_argv[separator + 3 :])
-        expected_working_directory = (
-            "/"
-            if expected_command[:4]
-            == ["-P", "-B", "-m", "core.pit_optimizer_v5.probe_entry"]
-            else "/pit/source"
-        )
+        expected_working_directory = "/"
         network = item.get("NetworkSettings") if type(item) is dict else None
         observed_id = item.get("Id") if type(item) is dict else None
         if (

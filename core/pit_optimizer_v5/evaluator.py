@@ -317,7 +317,8 @@ class PitPanelEvaluatorV5:
         pit_bundle: AuthenticatedPitBundleV5,
         prices_provenance: Path,
         report_builder: EvaluationReportBuilderV5,
-        baseline_policy_revision: PolicyRevisionIdentityV5,
+        baseline_policy_revision: PolicyRevisionIdentityV5 | None = None,
+        candidate_policy_authority: PolicyRevisionIdentityV5 | None = None,
         baseline_worker_factory: BaselineWorkerFactoryV5 | None = None,
         simulator_factory: SimulatorFactoryV5 = PortfolioSimulator,
     ) -> None:
@@ -327,10 +328,15 @@ class PitPanelEvaluatorV5:
             raise ValueError("sandbox profile must use schema V5")
         if type(execution_profile) is not ExecutionProfileV5:
             raise ValueError("execution profile must use schema V5")
-        if type(baseline_policy_revision) is not PolicyRevisionIdentityV5:
-            raise ValueError("baseline policy revision must use the V5 identity schema")
-        if baseline_policy_revision.sha256 != contract.baseline_policy_revision_sha256:
-            raise ValueError("baseline policy revision differs from evaluator contract")
+        if (baseline_policy_revision is None) == (candidate_policy_authority is None):
+            raise ValueError("evaluator requires exactly one policy authority mode")
+        if baseline_policy_revision is not None:
+            if type(baseline_policy_revision) is not PolicyRevisionIdentityV5:
+                raise ValueError("baseline policy revision must use the V5 identity schema")
+            if baseline_policy_revision.sha256 != contract.baseline_policy_revision_sha256:
+                raise ValueError("baseline policy revision differs from evaluator contract")
+        elif type(candidate_policy_authority) is not PolicyRevisionIdentityV5:
+            raise ValueError("candidate policy authority must use the V5 identity schema")
         validate_sandbox_profile_resources_v5(sandbox_profile, resource_manifest)
         if sandbox_profile.sha256 != contract.sandbox_profile_sha256:
             raise ValueError("sandbox profile identity differs from evaluator contract")
@@ -342,13 +348,17 @@ class PitPanelEvaluatorV5:
             raise TypeError("V5 evaluation report builder is invalid")
         if not callable(simulator_factory):
             raise TypeError("V5 simulator factory is invalid")
-        baseline_factory = (
-            _InProcessBaselineWorkerFactoryV5(baseline_policy_revision)
-            if baseline_worker_factory is None
-            else baseline_worker_factory
-        )
-        if not callable(baseline_factory):
-            raise TypeError("baseline worker factory is invalid")
+        if candidate_policy_authority is not None and baseline_worker_factory is not None:
+            raise ValueError("candidate-only evaluation cannot receive a baseline worker")
+        baseline_factory = None
+        if baseline_policy_revision is not None:
+            baseline_factory = (
+                _InProcessBaselineWorkerFactoryV5(baseline_policy_revision)
+                if baseline_worker_factory is None
+                else baseline_worker_factory
+            )
+            if not callable(baseline_factory):
+                raise TypeError("baseline worker factory is invalid")
 
         provenance = Path(prices_provenance)
         if not provenance.is_absolute() or not provenance.is_file() or provenance.is_symlink():
@@ -390,6 +400,19 @@ class PitPanelEvaluatorV5:
         self._warmup_start = warmup_start
         self._report_builder = report_builder
         self._baseline_policy_revision = baseline_policy_revision
+        self._candidate_policy_authority = candidate_policy_authority
+        policy_authority = (
+            baseline_policy_revision
+            if baseline_policy_revision is not None
+            else candidate_policy_authority
+        )
+        assert policy_authority is not None
+        self._trusted_policy_runtime_sha256 = (
+            policy_authority.trusted_policy_runtime_sha256
+        )
+        self._immutable_constraints_sha256 = (
+            policy_authority.immutable_constraints_sha256
+        )
         self._baseline_worker_factory = baseline_factory
         self._simulator_factory = simulator_factory
 
@@ -403,6 +426,8 @@ class PitPanelEvaluatorV5:
         *,
         scenario_ids: tuple[str, ...],
     ) -> PanelEvaluationV5:
+        if self._baseline_policy_revision is None or self._baseline_worker_factory is None:
+            raise ValueError("candidate-only evaluator cannot evaluate a baseline")
         return self._evaluate(
             panel=panel,
             policy_revision=self._baseline_policy_revision,
@@ -422,6 +447,11 @@ class PitPanelEvaluatorV5:
         root = _canonical_candidate_root(candidate_root)
         if Path(candidate_root) != root:
             raise ValueError("candidate root must be supplied in canonical form")
+        if (
+            self._candidate_policy_authority is not None
+            and policy_revision != self._candidate_policy_authority
+        ):
+            raise ValueError("candidate policy differs from evaluator authority")
         return self._evaluate(
             panel=panel,
             policy_revision=policy_revision,
@@ -447,9 +477,9 @@ class PitPanelEvaluatorV5:
             raise ValueError("evaluation policy revision must use the V5 identity schema")
         if (
             policy_revision.trusted_policy_runtime_sha256
-            != self._baseline_policy_revision.trusted_policy_runtime_sha256
+            != self._trusted_policy_runtime_sha256
             or policy_revision.immutable_constraints_sha256
-            != self._baseline_policy_revision.immutable_constraints_sha256
+            != self._immutable_constraints_sha256
         ):
             raise ValueError("evaluation policy revision changes trusted policy authority")
         policy_identity_sha256 = policy_revision.sha256

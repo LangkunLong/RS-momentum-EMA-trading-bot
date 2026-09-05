@@ -19,12 +19,29 @@ COPY config/ /usr/local/lib/python3.13/site-packages/config/
 COPY core/ /usr/local/lib/python3.13/site-packages/core/
 
 RUN test -f /usr/local/lib/python3.13/site-packages/core/pit_optimizer_v5/probe_entry.py \
+    && test -f /usr/local/lib/python3.13/site-packages/core/pit_optimizer_v5/container_entry.py \
+    && test -f /usr/local/lib/python3.13/site-packages/core/pit_optimizer_v5/container_protocol.py \
+    && test -f /usr/local/lib/python3.13/site-packages/core/pit_optimizer_v5/image_manifest.py \
     && test -f /usr/local/lib/python3.13/site-packages/core/pit_optimizer_v5/probes.py \
     && test -f /usr/local/lib/python3.13/site-packages/core/strategy_policy/worker.py \
     && test ! -e /usr/local/lib/python3.13/site-packages/core/strategy_policy/v3/entry.py \
     && test ! -e /usr/local/lib/python3.13/site-packages/core/strategy_policy/v3/risk.py \
     && test ! -e /usr/local/lib/python3.13/site-packages/core/strategy_policy/v3/position.py \
     && test ! -e /usr/local/lib/python3.13/site-packages/core/strategy_policy/v3/exit.py
+
+RUN mkdir -p /pit/candidate /pit/data /pit/request /pit/output \
+    && touch /pit/candidate/entry.py /pit/candidate/risk.py \
+        /pit/candidate/position.py /pit/candidate/exit.py \
+        /pit/data/pit_bundle.sqlite3 /pit/data/prices_provenance.json \
+        /pit/request/panel-request.json \
+    && chmod 0444 /pit/candidate/*.py /pit/data/* /pit/request/panel-request.json \
+    && chmod 0555 /pit /pit/candidate /pit/data /pit/request /pit/output
+
+# The label is accepted only after the installed allowlisted bytes independently
+# reproduce the host-authenticated source-map digest.
+RUN python -P -B -m core.pit_optimizer_v5.image_manifest \
+    --source-root /usr/local/lib/python3.13/site-packages \
+    --expected-sha256 "$PIT_V5_RUNTIME_SOURCE_SHA256"
 
 LABEL io.trading-bot.pit-v5.runtime-kind="evaluator-probe-v5" \
     io.trading-bot.pit-v5.runtime-source-sha256="$PIT_V5_RUNTIME_SOURCE_SHA256"

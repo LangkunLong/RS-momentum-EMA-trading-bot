@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
-from decimal import Decimal
+from dataclasses import dataclass
 import json
 import math
 import ntpath
-import types
-from typing import Literal, Protocol, TypeVar, get_args, get_origin, get_type_hints, runtime_checkable
+from typing import Literal, Protocol, get_args, runtime_checkable
 
+from core.backtest_fills import ExecutionProfileV5
+from core.pit_optimizer_evaluation import EvaluationPanelSpec
 from core.pit_optimizer_v5.candidate_ir import (
     ExperimentIdentityV5,
     PolicyRevisionIdentityV5,
@@ -28,7 +28,12 @@ from core.pit_optimizer_v5.contracts import (
     canonical_json_bytes_v5,
     canonical_primitive_v5,
     canonical_sha256_v5,
+    validate_episode_plan_panel_v5,
     validate_sandbox_profile_resources_v5,
+)
+from core.pit_optimizer_v5.container_protocol import (
+    PanelExecutionRequestV5,
+    decode_panel_execution_output_v5,
 )
 from core.pit_optimizer_v5.memory import CleanupResultPayloadV5
 from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
@@ -141,7 +146,7 @@ class SandboxMountHandleV5:
         ):
             raise ValueError("sandbox mount host path is invalid")
         expected_targets = {
-            "source": {"/pit/source", "/pit/candidate"},
+            "source": {"/pit/candidate"},
             "data": {"/pit/data"},
             "output": {"/pit/output"},
         }[self.kind]
@@ -259,6 +264,7 @@ class DockerPanelRequestV5:
     source_mount: SandboxMountHandleV5
     data_mount: SandboxMountHandleV5 | None
     output_mount: SandboxMountHandleV5
+    panel_spec: EvaluationPanelSpec | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -304,8 +310,7 @@ class DockerPanelRequestV5:
             or type(self.output_mount) is not SandboxMountHandleV5
             or self.source_mount.kind != "source"
             or self.output_mount.kind != "output"
-            or self.source_mount.container_path
-            != ("/pit/candidate" if semantic_probe else "/pit/source")
+            or self.source_mount.container_path != "/pit/candidate"
             or (
                 semantic_probe
                 and self.data_mount is not None
@@ -319,6 +324,15 @@ class DockerPanelRequestV5:
             )
         ):
             raise ValueError("Docker panel mount capabilities are invalid")
+        if semantic_probe:
+            if self.panel_spec is not None:
+                raise ValueError("semantic probe cannot carry authenticated PIT panel data")
+        else:
+            if type(self.panel_spec) is not EvaluationPanelSpec:
+                raise ValueError("panel evaluation requires its authenticated panel")
+            validate_episode_plan_panel_v5(self.panel, self.panel_spec)
+            if self.panel.purpose != self.panel_spec.purpose:
+                raise ValueError("Docker panel purpose differs from its authenticated panel")
         if self.output_mount.maximum_bytes != self.manifest.resources.evaluation_output_limit_bytes:
             raise ValueError("Docker panel output mount differs from manifest authority")
         mounts = (
@@ -356,6 +370,7 @@ class DockerPanelRequestV5:
             "evaluator_contract_sha256": self.evaluator_contract.sha256,
             "sandbox_profile_sha256": self.sandbox_profile.sha256,
             "panel": canonical_primitive_v5(self.panel),
+            "panel_spec": canonical_primitive_v5(self.panel_spec),
             "scenario_ids": self.scenario_ids,
             "mounts": tuple(
                 item.authority_primitive()
@@ -716,6 +731,8 @@ class AuthenticatedCandidateBaseOperationsV5:
 
 @runtime_checkable
 class SandboxMountFactoryV5(Protocol):
+    def panel_for(self, panel: EpisodePlanV5) -> EvaluationPanelSpec: ...
+
     def mounts_for(
         self,
         *,
@@ -734,6 +751,9 @@ class AuthenticatedSandboxMountFactoryV5:
             raise ValueError("production mount-factory delegate is invalid")
         self.mount_identity_sha256 = _digest(mount_identity_sha256, "sandbox mount-factory identity")
         self._delegate = delegate
+
+    def panel_for(self, panel: EpisodePlanV5) -> EvaluationPanelSpec:
+        return self._delegate.panel_for(panel)
 
     def mounts_for(
         self,
@@ -786,6 +806,43 @@ def execution_output_name_v5(request: DockerPanelRequestV5) -> str:
     )
 
 
+def panel_execution_request_for_v5(
+    request: DockerPanelRequestV5,
+) -> PanelExecutionRequestV5:
+    """Derive the sole canonical image input for a non-probe panel request."""
+
+    if (
+        type(request) is not DockerPanelRequestV5
+        or request.execution_key.stage == "semantic_probe"
+        or type(request.panel_spec) is not EvaluationPanelSpec
+    ):
+        raise ValueError("panel execution input requires an authenticated panel request")
+    return PanelExecutionRequestV5(
+        schema_version=5,
+        request_sha256=request.sha256,
+        evaluator_contract=request.evaluator_contract,
+        sandbox_profile=request.sandbox_profile,
+        execution_profile=ExecutionProfileV5(
+            5,
+            "next_open",
+            "open_then_stop",
+            "last_session_close",
+            "half_spread_plus_market_impact_plus_commission_bps",
+        ),
+        policy_revision=request.policy_revision,
+        episode=request.panel,
+        panel=request.panel_spec,
+        scenario_ids=request.scenario_ids,
+        policy_method_timeout_seconds=(
+            request.manifest.resources.policy_method_timeout_seconds
+        ),
+        worker_startup_timeout_seconds=(
+            request.manifest.resources.worker_startup_timeout_seconds
+        ),
+        output_limit_bytes=request.manifest.resources.evaluation_output_limit_bytes,
+    )
+
+
 def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
     if type(request) is not DockerPanelRequestV5:
         raise ValueError("Docker argv requires a V5 panel request")
@@ -809,17 +866,15 @@ def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
         "--memory",
         f"{request.manifest.resources.evaluation_memory_mib}m",
     ]
+    argv.extend(_semantic_policy_mount_args_v5(request.source_mount))
     if request.execution_key.stage == "semantic_probe":
         if request.data_mount is not None:
             raise ValueError("semantic probe cannot mount PIT data")
-        argv.extend(_semantic_policy_mount_args_v5(request.source_mount))
     else:
         if type(request.data_mount) is not SandboxMountHandleV5:
             raise ValueError("panel evaluation requires the PIT data mount")
         argv.extend(
             (
-                "--mount",
-                _mount_arg(request.source_mount),
                 "--mount",
                 _mount_arg(request.data_mount),
             )
@@ -870,9 +925,14 @@ def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
             )
         )
         return tuple(argv)
+    panel_input = panel_execution_request_for_v5(request)
     argv.extend(
         (
             "core.pit_optimizer_v5.container_entry",
+            "--request-sha256",
+            request.sha256,
+            "--input-sha256",
+            panel_input.sha256,
             "--evaluator-sha256",
             request.evaluator_contract.sha256,
             "--sandbox-sha256",
@@ -892,9 +952,6 @@ def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
     for scenario_id in request.scenario_ids:
         argv.extend(("--scenario", scenario_id))
     return tuple(argv)
-
-
-T = TypeVar("T")
 
 
 def _strict_json(raw: bytes) -> object:
@@ -919,58 +976,20 @@ def _strict_json(raw: bytes) -> object:
     return decoded
 
 
-def _decode_value(annotation: object, value: object) -> object:
-    origin = get_origin(annotation)
-    arguments = get_args(annotation)
-    if annotation is Decimal:
-        if type(value) is not str:
-            raise ValueError
-        parsed = Decimal(value)
-        if not parsed.is_finite() or canonical_primitive_v5(parsed) != value:
-            raise ValueError
-        return parsed
-    if origin is Literal:
-        if not any(type(value) is type(item) and value == item for item in arguments):
-            raise ValueError
-        return value
-    if origin in {types.UnionType, __import__("typing").Union}:
-        if value is None and type(None) in arguments:
-            return None
-        successes = []
-        for argument in arguments:
-            if argument is type(None):
-                continue
-            try:
-                successes.append(_decode_value(argument, value))
-            except (TypeError, ValueError, ArithmeticError):
-                pass
-        if len(successes) != 1:
-            raise ValueError
-        return successes[0]
-    if origin is tuple:
-        if type(value) is not list or len(arguments) != 2 or arguments[1] is not Ellipsis:
-            raise ValueError
-        return tuple(_decode_value(arguments[0], item) for item in value)
-    if isinstance(annotation, type) and is_dataclass(annotation):
-        return _decode_dataclass(annotation, value)
-    if annotation in {str, int, bool}:
-        if type(value) is not annotation:
-            raise ValueError
-        return value
-    raise TypeError
-
-
-def _decode_dataclass(cls: type[T], value: object) -> T:
-    expected = {item.name for item in fields(cls) if item.init}
-    if type(value) is not dict or set(value) != expected:
-        raise ValueError
-    hints = get_type_hints(cls)
-    return cls(**{item.name: _decode_value(hints[item.name], value[item.name]) for item in fields(cls) if item.init})
-
-
-def decode_panel_evaluation_v5(raw: bytes) -> PanelEvaluationV5:
+def decode_panel_evaluation_v5(
+    raw: bytes,
+    *,
+    request: DockerPanelRequestV5,
+) -> PanelEvaluationV5:
     try:
-        return _decode_dataclass(PanelEvaluationV5, _strict_json(raw))
+        output = decode_panel_execution_output_v5(raw)
+        panel_input = panel_execution_request_for_v5(request)
+        if (
+            output.request_sha256 != request.sha256
+            or output.input_sha256 != panel_input.sha256
+        ):
+            raise SandboxAdapterErrorV5(SandboxFailureV5("identity_mismatch"))
+        return output.evaluation
     except SandboxAdapterErrorV5:
         raise
     except (TypeError, ValueError, ArithmeticError, RecursionError):
@@ -1188,7 +1207,7 @@ class DockerPanelEvaluatorV5:
             evaluation = (
                 decode_semantic_fingerprint_output_v5(output.content, request=request)
                 if request.execution_key.stage == "semantic_probe"
-                else decode_panel_evaluation_v5(output.content)
+                else decode_panel_evaluation_v5(output.content, request=request)
             )
         except SandboxAdapterErrorV5 as exc:
             return DockerPanelOutcomeV5(None, exc.failure, execution_leases)
@@ -1662,13 +1681,14 @@ class DockerCandidateRuntimeV5:
     ) -> DockerPanelRequestV5:
         if type(materialized) is not MaterializedVariantV5:
             raise ValueError("Docker candidate runtime materialization is invalid")
+        semantic_probe = execution_key.stage == "semantic_probe"
+        panel_spec = None if semantic_probe else self._mounts.panel_for(panel)
         supplied = self._mounts.mounts_for(
             materialized=materialized,
             panel=panel,
             scenario_ids=scenario_ids,
             execution_key=execution_key,
         )
-        semantic_probe = execution_key.stage == "semantic_probe"
         if type(supplied) is not tuple or len(supplied) != (2 if semantic_probe else 3):
             raise ValueError("Docker candidate runtime mounts are invalid")
         return DockerPanelRequestV5(
@@ -1683,6 +1703,7 @@ class DockerCandidateRuntimeV5:
             source_mount=supplied[0],
             data_mount=None if semantic_probe else supplied[1],
             output_mount=supplied[1] if semantic_probe else supplied[2],
+            panel_spec=panel_spec,
         )
 
     def evaluate_quick(self, materialized: MaterializedVariantV5, *, deadline: StageDeadlineV5) -> PanelEvaluationV5:
@@ -1859,4 +1880,5 @@ __all__ = [
     "derive_sandbox_mount_authorities_v5",
     "derive_execution_lease_id_v5",
     "execution_output_name_v5",
+    "panel_execution_request_for_v5",
 ]
