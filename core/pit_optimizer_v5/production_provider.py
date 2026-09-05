@@ -8,7 +8,7 @@ import secrets
 import time
 from typing import Callable, Mapping
 
-from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5, RoleLedgerMigrationAuthorityV5
 from core.pit_optimizer_v5.contracts import CampaignManifestV5, canonical_json_bytes_v5, canonical_sha256_v5
 from core.pit_optimizer_v5.provider import (
     AuthorizedRoleSlotV5,
@@ -343,15 +343,25 @@ class LocalRoleAuthorizationLedgerV5:
         tuple[RoleLedgerReservationV5, ...],
         tuple[RoleLedgerTerminalV5, ...],
     ]:
-        reservations, terminals = self._repository.load_role_ledger_records(campaign_id=self._manifest.campaign_id)
+        provider = self._manifest.provider
+        assert provider is not None
+        reservations, terminals = self._repository.load_role_ledger_records(
+            campaign_id=self._manifest.campaign_id,
+            migration_authority=RoleLedgerMigrationAuthorityV5(
+                campaign_id=self._manifest.campaign_id,
+                campaign_manifest_sha256=self.campaign_manifest_sha256,
+                ledger_identity_sha256=self.ledger_identity_sha256,
+                audit_store_identity_sha256=self.audit_store_identity_sha256,
+                model=provider.model,
+                maximum_output_tokens_per_role=provider.maximum_output_tokens_per_role,
+            ),
+        )
         by_reservation = {item.sha256: item for item in reservations}
         if len(by_reservation) != len(reservations):
             raise ValueError("local V5 role ledger has duplicate reservations")
         by_slot = {item.slot.slot_id: item for item in reservations}
         if len(by_slot) != len(reservations):
             raise ValueError("local V5 role ledger has duplicate slots")
-        provider = self._manifest.provider
-        assert provider is not None
         requests_by_slot: dict[str, RoleRequestV5] = {}
         terminal_slots: set[str] = set()
         for reservation in reservations:
@@ -546,6 +556,14 @@ class LocalRoleAuthorizationLedgerV5:
                     response=existing_response,
                 )
                 return existing_response
+            authoritative_now_ms = self._now_ms()
+            if authoritative_now_ms > reservation.invocation_claim.lease_deadline_epoch_ms:
+                self._settle_unreported_role_slot_locked(
+                    slot=reservation.slot,
+                    failure_code=RoleFailureCode.ACCOUNTING,
+                    authoritative_now_ms=authoritative_now_ms,
+                )
+                return None
             request = self._repository.load_unique_role_request_by_sha256(response.request_sha256)
             self._derive_reported_terminal(slot=reservation.slot, request=request, response=response)
             reference = self._repository.append_role_provider_response(response)
@@ -643,6 +661,7 @@ class LocalRoleAuthorizationLedgerV5:
         *,
         slot: AuthorizedRoleSlotV5,
         failure_code: RoleFailureCode,
+        authoritative_now_ms: int | None = None,
     ) -> RecoveredRoleTerminalV5:
         outcomes = {
             RoleFailureCode.TRANSPORT: "transport_failure",
@@ -658,7 +677,10 @@ class LocalRoleAuthorizationLedgerV5:
                 raise ValueError("local V5 role-ledger terminal is ambiguous")
             return RecoveredRoleTerminalV5(existing[0].facts, existing[0].receipt)
         owner = reservation.invocation_claim.owner_sha256 == self._invocation_owner_sha256
-        expired = reservation.invocation_claim.lease_deadline_epoch_ms <= self._now_ms()
+        observed_now_ms = self._now_ms() if authoritative_now_ms is None else authoritative_now_ms
+        if type(observed_now_ms) is not int or observed_now_ms < 0:
+            raise ValueError("local V5 role invocation settlement time is invalid")
+        expired = reservation.invocation_claim.lease_deadline_epoch_ms < observed_now_ms
         if not owner and not expired:
             raise ValueError("local V5 role invocation is still live")
         # Crossing the transport boundary without a complete result accounts
@@ -746,12 +768,14 @@ class LocalRoleAuthorizationLedgerV5:
                                 request=persisted_request.request,
                                 response=response,
                             )
-                        elif reservation.invocation_claim.lease_deadline_epoch_ms > self._now_ms():
-                            return RoleReconciliationFailureV5(persisted_request.call, "pending")
                         else:
+                            authoritative_now_ms = self._now_ms()
+                            if reservation.invocation_claim.lease_deadline_epoch_ms >= authoritative_now_ms:
+                                return RoleReconciliationFailureV5(persisted_request.call, "pending")
                             self._settle_unreported_role_slot_locked(
                                 slot=slot,
                                 failure_code=RoleFailureCode.ACCOUNTING,
+                                authoritative_now_ms=authoritative_now_ms,
                             )
             except BaseException:
                 return RoleReconciliationFailureV5(

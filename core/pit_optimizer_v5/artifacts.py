@@ -190,6 +190,32 @@ class RoleLedgerMigrationRequiredV5(ArtifactRepositoryFailureV5):
         super().__init__("migration_required", reference)
 
 
+@dataclass(frozen=True, slots=True)
+class RoleLedgerMigrationAuthorityV5:
+    """Exact current authority used only to authenticate superseded ledger records."""
+
+    campaign_id: str
+    campaign_manifest_sha256: str
+    ledger_identity_sha256: str
+    audit_store_identity_sha256: str
+    model: str
+    maximum_output_tokens_per_role: int
+
+    def __post_init__(self) -> None:
+        _safe_component(self.campaign_id, "role-ledger migration campaign")
+        for value, label in (
+            (self.campaign_manifest_sha256, "role-ledger migration manifest"),
+            (self.ledger_identity_sha256, "role-ledger migration identity"),
+            (self.audit_store_identity_sha256, "role-ledger migration audit store"),
+        ):
+            if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"{label} is invalid")
+        if type(self.model) is not str or not self.model or self.model.strip() != self.model:
+            raise ValueError("role-ledger migration model is invalid")
+        if type(self.maximum_output_tokens_per_role) is not int or self.maximum_output_tokens_per_role <= 0:
+            raise ValueError("role-ledger migration output bound is invalid")
+
+
 def _safe_component(value: object, label: str) -> str:
     if type(value) is not str or _COMPONENT_RE.fullmatch(value) is None:
         raise ValueError(f"{label} is not a canonical artifact component")
@@ -370,34 +396,27 @@ def _decode_role_ledger_reservation(
     *,
     request: RoleRequestV5,
 ) -> RoleLedgerReservationV5:
-    """Decode V3 or return a stable migration requirement for exact V1/V2."""
+    """Decode only the current V3 reservation shape."""
 
     if type(value) is not dict:
         raise ArtifactSchemaFailureV5()
-    shared = {
+    current_keys = {
         "schema_version",
+        "record_schema_revision",
+        "ledger_ordinal",
         "campaign_id",
         "campaign_manifest_sha256",
         "ledger_identity_sha256",
         "audit_store_identity_sha256",
         "slot",
+        "invocation_claim",
     }
-    keys = frozenset(value)
-    legacy_v1 = frozenset(shared)
-    legacy_v2 = frozenset((*shared, "ledger_ordinal"))
-    current_v3 = frozenset((*shared, "record_schema_revision", "ledger_ordinal", "invocation_claim"))
-    if keys == legacy_v1:
-        revision: Literal[1, 2, 3] = 1
-    elif keys == legacy_v2:
-        revision = 2
-    elif keys == current_v3:
-        revision = 3
-    else:
-        raise ArtifactSchemaFailureV5()
-    primitive = _exact_keys(value, set(keys))
+    primitive = _exact_keys(value, current_keys)
     _decode_value(Literal[5], primitive["schema_version"])
+    if primitive["record_schema_revision"] != 3:
+        raise ArtifactSchemaFailureV5()
     campaign_id = _decode_value(str, primitive["campaign_id"])
-    _safe_component(campaign_id, "legacy role-ledger campaign")
+    _safe_component(campaign_id, "role-ledger campaign")
     for field_name in (
         "campaign_manifest_sha256",
         "ledger_identity_sha256",
@@ -406,10 +425,9 @@ def _decode_role_ledger_reservation(
         digest = _decode_value(str, primitive[field_name])
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise ArtifactSchemaFailureV5()
-    if revision == 2:
-        ordinal = _decode_value(int, primitive["ledger_ordinal"])
-        if ordinal < 1:
-            raise ArtifactSchemaFailureV5()
+    ordinal = _decode_value(int, primitive["ledger_ordinal"])
+    if ordinal < 1:
+        raise ArtifactSchemaFailureV5()
     authorized_slot_value = primitive["slot"]
     if type(authorized_slot_value) is not dict:
         raise ArtifactSchemaFailureV5()
@@ -426,7 +444,7 @@ def _decode_role_ledger_reservation(
     slot_value = authorized_slot_primitive["request"]
     if type(slot_value) is not dict:
         raise ArtifactSchemaFailureV5()
-    current_slot_keys = {
+    slot_keys = {
         "request_sha256",
         "role",
         "attempt_kind",
@@ -435,13 +453,9 @@ def _decode_role_ledger_reservation(
         "max_output_tokens",
         "response_schema_sha256",
     }
-    expected_slot_keys = current_slot_keys - ({"response_schema_sha256"} if revision == 1 else set())
-    slot_primitive = _exact_keys(slot_value, expected_slot_keys)
-    decoded_slot_primitive = dict(slot_primitive)
-    if revision == 1:
-        decoded_slot_primitive["response_schema_sha256"] = request.response_schema_sha256
+    slot_primitive = _exact_keys(slot_value, slot_keys)
     decoded_authorized_slot = dict(authorized_slot_primitive)
-    decoded_authorized_slot["request"] = decoded_slot_primitive
+    decoded_authorized_slot["request"] = slot_primitive
     slot = _decode_dataclass(AuthorizedRoleSlotV5, decoded_authorized_slot)
     if (
         slot.request.request_sha256 != request.sha256
@@ -449,17 +463,6 @@ def _decode_role_ledger_reservation(
         or slot.request.max_output_tokens != request.max_output_tokens
         or slot.request.response_schema_sha256 != request.response_schema_sha256
     ):
-        raise ArtifactSchemaFailureV5()
-    if revision == 1:
-        # The exact legacy slot omitted this binding.  Resolve it only to prove
-        # the record belongs to the authenticated request, then fail closed: its
-        # slot/authorization digests cannot be silently rewritten.
-        if request.response_schema_sha256 != request.schema_authority.sha256:
-            raise ArtifactSchemaFailureV5()
-        raise RoleLedgerMigrationRequiredV5(1)
-    if revision == 2:
-        raise RoleLedgerMigrationRequiredV5(2)
-    if primitive["record_schema_revision"] != 3:
         raise ArtifactSchemaFailureV5()
     return RoleLedgerReservationV5(
         schema_version=_decode_value(Literal[5], primitive["schema_version"]),  # type: ignore[arg-type]
@@ -1347,8 +1350,14 @@ class LocalArtifactRepositoryV5:
         self,
         *,
         campaign_id: str,
+        migration_authority: RoleLedgerMigrationAuthorityV5,
     ) -> tuple[tuple[RoleLedgerReservationV5, ...], tuple[RoleLedgerTerminalV5, ...]]:
         campaign = _safe_component(campaign_id, "role-ledger campaign")
+        if (
+            type(migration_authority) is not RoleLedgerMigrationAuthorityV5
+            or migration_authority.campaign_id != campaign_id
+        ):
+            raise ArtifactSchemaFailureV5()
 
         def load_group(group: str, value_type: type[T]) -> tuple[T, ...]:
             try:
@@ -1363,20 +1372,225 @@ class LocalArtifactRepositoryV5:
                 raw = self._read_relative(relative)
                 reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
                 value = self.load_typed_artifact(reference, value_type=value_type)
-                expected_slot = (
-                    value.slot.slot_id
-                    if type(value) is RoleLedgerReservationV5
-                    else value.receipt.slot_id
-                )
+                expected_slot = value.slot.slot_id if type(value) is RoleLedgerReservationV5 else value.receipt.slot_id
                 if name != f"{expected_slot}.json":
                     raise ArtifactSchemaFailureV5(reference)
                 values.append(value)
             return tuple(values)
 
-        return (
-            load_group("reservations", RoleLedgerReservationV5),
-            load_group("terminals", RoleLedgerTerminalV5),
-        )
+        terminals = load_group("terminals", RoleLedgerTerminalV5)
+        try:
+            reservation_names = self._names(("authorization", campaign, "reservations"))
+        except ArtifactMissingV5:
+            reservation_names = ()
+        legacy_entries: list[tuple[ArtifactRefV5, dict[str, object], Literal[1, 2]]] = []
+        current_seen = False
+        shared_keys = {
+            "schema_version",
+            "campaign_id",
+            "campaign_manifest_sha256",
+            "ledger_identity_sha256",
+            "audit_store_identity_sha256",
+            "slot",
+        }
+        for name in reservation_names:
+            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                raise ArtifactSchemaFailureV5()
+            relative = f"authorization/{campaign}/reservations/{name}"
+            raw = self._read_relative(relative)
+            reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
+            authenticated = self.authenticate(reference)
+            primitive = _strict_json_object(authenticated.content, reference)
+            if canonical_json_bytes_v5(primitive) != authenticated.content:
+                raise ArtifactNonCanonicalV5(reference)
+            keys = set(primitive)
+            if keys == shared_keys:
+                legacy_entries.append((reference, primitive, 1))
+            elif keys == {*shared_keys, "ledger_ordinal"}:
+                legacy_entries.append((reference, primitive, 2))
+            else:
+                current_seen = True
+        if legacy_entries:
+            if current_seen or len(legacy_entries) != len(reservation_names):
+                raise ArtifactSchemaFailureV5(legacy_entries[0][0])
+            self._require_exact_legacy_role_ledger(
+                entries=tuple(legacy_entries),
+                terminals=terminals,
+                authority=migration_authority,
+            )
+            revisions = {item[2] for item in legacy_entries}
+            if len(revisions) != 1:
+                raise ArtifactSchemaFailureV5(legacy_entries[0][0])
+            revision = next(iter(revisions))
+            raise RoleLedgerMigrationRequiredV5(revision, legacy_entries[0][0])
+        return load_group("reservations", RoleLedgerReservationV5), terminals
+
+    def _require_exact_legacy_role_ledger(
+        self,
+        *,
+        entries: tuple[tuple[ArtifactRefV5, dict[str, object], Literal[1, 2]], ...],
+        terminals: tuple[RoleLedgerTerminalV5, ...],
+        authority: RoleLedgerMigrationAuthorityV5,
+    ) -> None:
+        """Authenticate every relation in the two exact superseded reservation shapes."""
+
+        decoded: list[dict[str, object]] = []
+        slot_keys = {
+            "slot_id",
+            "request",
+            "authorization_sha256",
+            "prior_external_attempts",
+            "prior_total_tokens",
+            "prior_cost_usd",
+            "prior_terminal_sequence",
+        }
+        request_keys_v1 = {
+            "request_sha256",
+            "role",
+            "attempt_kind",
+            "attempt_index",
+            "model",
+            "max_output_tokens",
+        }
+        for reference, primitive, revision in entries:
+            if (
+                primitive["schema_version"] != 5
+                or primitive["campaign_id"] != authority.campaign_id
+                or primitive["campaign_manifest_sha256"] != authority.campaign_manifest_sha256
+                or primitive["ledger_identity_sha256"] != authority.ledger_identity_sha256
+                or primitive["audit_store_identity_sha256"] != authority.audit_store_identity_sha256
+            ):
+                raise ArtifactSchemaFailureV5(reference)
+            slot = _exact_keys(primitive["slot"], slot_keys, reference)
+            request_value = slot["request"]
+            expected_request_keys = request_keys_v1 | ({"response_schema_sha256"} if revision == 2 else set())
+            request_primitive = _exact_keys(request_value, expected_request_keys, reference)
+            request_sha256 = _decode_value(str, request_primitive["request_sha256"])
+            if re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None:
+                raise ArtifactSchemaFailureV5(reference)
+            call, request = self.load_unique_role_request_entry_by_sha256(request_sha256)
+            role = _decode_value(RoleNameV5, request_primitive["role"])
+            attempt_kind = _decode_value(Literal["primary", "retry", "repair"], request_primitive["attempt_kind"])
+            attempt_index = _decode_value(int, request_primitive["attempt_index"])
+            model = _decode_value(str, request_primitive["model"])
+            maximum_output_tokens = _decode_value(int, request_primitive["max_output_tokens"])
+            if (
+                attempt_index < 1
+                or maximum_output_tokens < 1
+                or model != authority.model
+                or maximum_output_tokens != authority.maximum_output_tokens_per_role
+                or request_sha256 != request.sha256
+                or role != request.role
+                or maximum_output_tokens != request.max_output_tokens
+                or call.campaign_id != authority.campaign_id
+                or call.role != role
+                or call.attempt_kind != attempt_kind
+                or call.attempt_index != attempt_index
+                or call.request_sha256 != request.sha256
+                or request.response_schema_sha256 != request.schema_authority.sha256
+            ):
+                raise ArtifactSchemaFailureV5(reference)
+            if revision == 2:
+                response_schema_sha256 = _decode_value(str, request_primitive["response_schema_sha256"])
+                if response_schema_sha256 != request.response_schema_sha256:
+                    raise ArtifactSchemaFailureV5(reference)
+            slot_request_sha256 = canonical_sha256_v5(request_primitive)
+            slot_id = _decode_value(str, slot["slot_id"])
+            authorization_sha256 = _decode_value(str, slot["authorization_sha256"])
+            prior_attempts = _decode_value(int, slot["prior_external_attempts"])
+            prior_tokens = _decode_value(int, slot["prior_total_tokens"])
+            prior_cost = _decode_value(Decimal, slot["prior_cost_usd"])
+            prior_sequence = _decode_value(int, slot["prior_terminal_sequence"])
+            if (
+                prior_attempts < 0
+                or prior_tokens < 0
+                or prior_sequence < 0
+                or slot_id
+                != canonical_sha256_v5(
+                    {
+                        "domain": "pit-optimizer-v5-role-slot-id-v1",
+                        "campaign_manifest_sha256": authority.campaign_manifest_sha256,
+                        "request_sha256": slot_request_sha256,
+                    }
+                )
+                or authorization_sha256
+                != canonical_sha256_v5(
+                    {
+                        "domain": "pit-optimizer-v5-role-slot-v1",
+                        "ledger_identity_sha256": authority.ledger_identity_sha256,
+                        "request_sha256": slot_request_sha256,
+                        "terminal_sequence": prior_sequence + 1,
+                    }
+                )
+                or reference.relative_path != f"authorization/{authority.campaign_id}/reservations/{slot_id}.json"
+            ):
+                raise ArtifactSchemaFailureV5(reference)
+            ordinal = _decode_value(int, primitive["ledger_ordinal"]) if revision == 2 else prior_sequence + 1
+            if ordinal < 1 or ordinal != prior_sequence + 1:
+                raise ArtifactSchemaFailureV5(reference)
+            decoded.append(
+                {
+                    "reference": reference,
+                    "reservation_sha256": reference.sha256,
+                    "ordinal": ordinal,
+                    "slot_id": slot_id,
+                    "slot_request_sha256": slot_request_sha256,
+                    "request_sha256": request.sha256,
+                    "role": role,
+                    "attempt_kind": attempt_kind,
+                    "attempt_index": attempt_index,
+                    "authorization_sha256": authorization_sha256,
+                    "prior_attempts": prior_attempts,
+                    "prior_tokens": prior_tokens,
+                    "prior_cost": prior_cost,
+                    "prior_sequence": prior_sequence,
+                }
+            )
+        ordered = tuple(sorted(decoded, key=lambda item: int(item["ordinal"])))
+        if tuple(item["ordinal"] for item in ordered) != tuple(range(1, len(ordered) + 1)):
+            raise ArtifactSchemaFailureV5(entries[0][0])
+        ordered_terminals = tuple(sorted(terminals, key=lambda item: item.receipt.terminal_sequence))
+        if len(ordered_terminals) not in {len(ordered) - 1, len(ordered)} or tuple(
+            item.receipt.terminal_sequence for item in ordered_terminals
+        ) != tuple(range(1, len(ordered_terminals) + 1)):
+            raise ArtifactSchemaFailureV5(entries[0][0])
+        for index, item in enumerate(ordered):
+            previous = ordered_terminals[index - 1].receipt if index else None
+            expected_prior = (
+                0 if previous is None else previous.cumulative_external_attempts,
+                0 if previous is None else previous.cumulative_total_tokens,
+                Decimal("0") if previous is None else previous.cumulative_cost_usd,
+                index,
+            )
+            if (
+                item["prior_attempts"],
+                item["prior_tokens"],
+                item["prior_cost"],
+                item["prior_sequence"],
+            ) != expected_prior:
+                raise ArtifactSchemaFailureV5(item["reference"])  # type: ignore[arg-type]
+            if index >= len(ordered_terminals):
+                continue
+            terminal = ordered_terminals[index]
+            expected_cumulative_attempts = int(item["prior_attempts"]) + terminal.facts.usage.external_attempt_count
+            expected_cumulative_tokens = int(item["prior_tokens"]) + terminal.facts.usage.total_tokens
+            expected_cumulative_cost = item["prior_cost"] + terminal.facts.usage.cost_usd  # type: ignore[operator]
+            if (
+                terminal.reservation_sha256 != item["reservation_sha256"]
+                or terminal.facts.slot_id != item["slot_id"]
+                or terminal.facts.request_sha256 != item["request_sha256"]
+                or terminal.facts.role != item["role"]
+                or terminal.facts.attempt_kind != item["attempt_kind"]
+                or terminal.facts.attempt_index != item["attempt_index"]
+                or terminal.receipt.slot_id != item["slot_id"]
+                or terminal.receipt.slot_request_sha256 != item["slot_request_sha256"]
+                or terminal.receipt.authorization_sha256 != item["authorization_sha256"]
+                or terminal.receipt.cumulative_external_attempts != expected_cumulative_attempts
+                or terminal.receipt.cumulative_total_tokens != expected_cumulative_tokens
+                or terminal.receipt.cumulative_cost_usd != expected_cumulative_cost
+                or terminal.receipt.terminal_sequence != item["ordinal"]
+            ):
+                raise ArtifactSchemaFailureV5(item["reference"])  # type: ignore[arg-type]
 
     def load_typed_artifact(self, reference: ArtifactRefV5, *, value_type: type[T]) -> T:
         """Authenticate exact canonical dataclass bytes without an extra envelope."""
@@ -1386,6 +1600,8 @@ class LocalArtifactRepositoryV5:
         authenticated = self.authenticate(reference)
         try:
             primitive = _strict_json_object(authenticated.content, reference)
+            if canonical_json_bytes_v5(primitive) != authenticated.content:
+                raise ArtifactNonCanonicalV5(reference)
             if value_type is RoleLedgerTerminalV5:
                 value = _decode_role_ledger_terminal(primitive)
             elif value_type is RoleLedgerReservationV5:
@@ -1397,8 +1613,6 @@ class LocalArtifactRepositoryV5:
                 value = _decode_role_ledger_reservation(primitive, request=request)
             else:
                 value = _decode_dataclass(value_type, primitive)
-        except RoleLedgerMigrationRequiredV5 as failure:
-            raise RoleLedgerMigrationRequiredV5(failure.record_revision, reference) from None
         except ArtifactRepositoryFailureV5:
             raise
         except (TypeError, ValueError, ArithmeticError):
@@ -1458,25 +1672,47 @@ class LocalArtifactRepositoryV5:
     def load_unique_role_request_by_sha256(self, request_sha256: str) -> RoleRequestV5:
         """Resolve exactly one authenticated durable request by semantic identity."""
 
+        matches = self._role_request_entries_by_sha256(request_sha256)
+        if any(item[1] != matches[0][1] for item in matches[1:]):
+            raise ArtifactSchemaFailureV5()
+        return matches[0][1]
+
+    def load_unique_role_request_entry_by_sha256(
+        self,
+        request_sha256: str,
+    ) -> tuple[RoleCallKeyV5, RoleRequestV5]:
+        """Resolve one exact authenticated call/request pair by request identity."""
+
+        matches = self._role_request_entries_by_sha256(request_sha256)
+        if len(matches) != 1:
+            raise ArtifactSchemaFailureV5()
+        return matches[0]
+
+    def _role_request_entries_by_sha256(
+        self,
+        request_sha256: str,
+    ) -> tuple[tuple[RoleCallKeyV5, RoleRequestV5], ...]:
+        """Load every authenticated durable call carrying one request identity."""
+
         if type(request_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None:
             raise ArtifactSchemaFailureV5()
         try:
             names = self._names(("roles", "requests"))
         except ArtifactMissingV5:
             raise ArtifactSchemaFailureV5() from None
-        matches: list[RoleRequestV5] = []
+        matches: list[tuple[RoleCallKeyV5, RoleRequestV5]] = []
         for name in names:
             if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
                 raise ArtifactSchemaFailureV5()
             relative = f"roles/requests/{name}"
             raw = self._read_relative(relative)
             reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
-            _, request = self._load_role_request_entry(reference)
+            call, request = self._load_role_request_entry(reference)
             if request.sha256 == request_sha256:
-                matches.append(request)
-        if not matches or any(item != matches[0] for item in matches[1:]):
+                matches.append((call, request))
+        if not matches:
             raise ArtifactSchemaFailureV5()
-        return matches[0]
+        return tuple(matches)
 
     def append_role_attempt(self, attempt: RoleAttemptFactsV5) -> ArtifactRefV5:
         if type(attempt) is not RoleAttemptFactsV5:
@@ -2332,5 +2568,6 @@ __all__ = [
     "PersistedRoleInvocationV5",
     "PersistedRoleRequestV5",
     "RepositoryCheckpointV5",
+    "RoleLedgerMigrationAuthorityV5",
     "RoleLedgerMigrationRequiredV5",
 ]
