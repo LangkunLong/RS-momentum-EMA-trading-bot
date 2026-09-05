@@ -967,56 +967,66 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             created_identity: tuple[int, int] | None = None
             created_durable: bool | None = created is not None
             try:
-                if created is None:
-                    try:
-                        target_access = create_directory_in_directory_v5(
-                            output_parent,  # type: ignore[arg-type]
-                            relative,
-                        )
-                    except FileExistsError:
-                        raise ValueError("sandbox output target predates durable creation") from None
-                    created_identity = target_access.identity
-                    expected_created = MountCreatedRecordV5(
-                        5,
-                        self.mount_identity_sha256,
-                        output_authority,
-                        target_access.identity[0],
-                        target_access.identity[1],
-                    )
-                    try:
-                        self._repository.append_typed_state(
-                            namespace="sandbox-mount-created",
-                            key=output_authority,
-                            value=expected_created,
-                        )
-                    except BaseException:
+                with ExitStack() as stack:
+                    if created is None:
                         try:
-                            observed_created = self._repository.load_typed_state(
+                            target_access = stack.enter_context(
+                                create_directory_in_directory_v5(
+                                    output_parent,  # type: ignore[arg-type]
+                                    relative,
+                                )
+                            )
+                        except FileExistsError:
+                            raise ValueError(
+                                "sandbox output target predates durable creation"
+                            ) from None
+                        created_identity = target_access.identity
+                        expected_created = MountCreatedRecordV5(
+                            5,
+                            self.mount_identity_sha256,
+                            output_authority,
+                            target_access.identity[0],
+                            target_access.identity[1],
+                        )
+                        try:
+                            self._repository.append_typed_state(
                                 namespace="sandbox-mount-created",
                                 key=output_authority,
-                                value_type=MountCreatedRecordV5,
+                                value=expected_created,
                             )
                         except BaseException:
-                            created_durable = None
-                        else:
-                            created_durable = observed_created == expected_created
-                        raise
-                    created = expected_created
-                    created_durable = True
-                else:
-                    target_access = acquire_directory_v5(
-                        self._output_root,
-                        (relative,),
-                        create=False,
-                        expected_root_identity=(self._output_info.st_dev, self._output_info.st_ino),
-                    )
-                    if target_access.identity != (
-                        created.output_device,
-                        created.output_inode,
-                    ):
-                        target_access.close()
-                        raise ValueError("sandbox output identity differs from durable creation")
-                with target_access:
+                            try:
+                                observed_created = self._repository.load_typed_state(
+                                    namespace="sandbox-mount-created",
+                                    key=output_authority,
+                                    value_type=MountCreatedRecordV5,
+                                )
+                            except BaseException:
+                                created_durable = None
+                            else:
+                                created_durable = observed_created == expected_created
+                            raise
+                        created = expected_created
+                        created_durable = True
+                    else:
+                        target_access = stack.enter_context(
+                            acquire_directory_v5(
+                                self._output_root,
+                                (relative,),
+                                create=False,
+                                expected_root_identity=(
+                                    self._output_info.st_dev,
+                                    self._output_info.st_ino,
+                                ),
+                            )
+                        )
+                        if target_access.identity != (
+                            created.output_device,
+                            created.output_inode,
+                        ):
+                            raise ValueError(
+                                "sandbox output identity differs from durable creation"
+                            )
                     target_path = target_access.path
                     target_info = target_path.lstat()
                     if (target_info.st_dev, target_info.st_ino) != target_access.identity:
@@ -1049,6 +1059,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                         raise ValueError("sandbox source and output roots overlap")
                     return target_path, target_info
             except BaseException:
+                rollback_failed = False
                 if created_identity is not None and created_durable is False:
                     try:
                         remove_owned_tree_in_directory_v5(
@@ -1057,7 +1068,9 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                             expected_identity=created_identity,
                         )
                     except (OSError, ValueError):
-                        pass
+                        rollback_failed = True
+                if rollback_failed:
+                    raise ValueError("sandbox output creation rollback failed") from None
                 raise ValueError("sandbox output could not be safely created or opened") from None
 
     def _mount_handle(
