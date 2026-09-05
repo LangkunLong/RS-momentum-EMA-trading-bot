@@ -58,6 +58,7 @@ from core.pit_optimizer_v5.sandbox import (
     build_docker_argv_v5,
     derive_execution_lease_id_v5,
     derive_sandbox_mount_authorities_v5,
+    execution_output_name_v5,
 )
 from core.pit_optimizer_v5.workspace import MaterializedWorkspaceV5, WorkspaceOwnerV5
 
@@ -638,6 +639,14 @@ class _ExecutionLeaseCapabilityV5:
     role_kind: Literal["evaluator_process", "container"]
     owner_sha256: str
     command: ContainerCommandV5
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveredExecutionLeaseCapabilityV5:
+    executor_identity_sha256: str
+    command_sha256: str
+    role_kind: Literal["evaluator_process", "container"]
+    owner_sha256: str
 
 
 class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
@@ -1267,8 +1276,6 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
 class LocalContainerExecutorV5(ContainerExecutorV5):
     """Durable create/start/collect Docker executor with deterministic ownership."""
 
-    _OUTPUT_NAME = "panel-evaluation.json"
-
     def __init__(
         self,
         *,
@@ -1335,7 +1342,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     "user": "65532:65532",
                     "entrypoint": "python",
                     "workdir": "/pit/source",
-                    "output_name": self._OUTPUT_NAME,
+                    "output_names": (
+                        ("semantic_probe", "semantic-fingerprint.json"),
+                        ("panel_evaluation", "panel-evaluation.json"),
+                    ),
                     "shell": False,
                 },
                 "repository_root_identity_sha256": repository.root_identity_sha256,
@@ -3275,14 +3285,15 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         )
 
     def _read_output(self, command: ContainerCommandV5) -> bytes | None:
+        output_name = execution_output_name_v5(command.request)
         with self._mount_factory._pin_handle(command.request.output_mount) as output_root:
-            path = output_root.path / self._OUTPUT_NAME
+            path = output_root.path / output_name
             if _lstat_optional(path) is None:
                 return None
             try:
                 stream, info = open_regular_in_directory_v5(
                     output_root,  # type: ignore[arg-type]
-                    self._OUTPUT_NAME,
+                    output_name,
                     writable=False,
                 )
                 try:
@@ -3501,6 +3512,57 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 raise ValueError("container recovery lease authority is foreign")
             return reservation
 
+    def recover_lease(
+        self,
+        payload: ResourceLeasePayloadV5,
+        *,
+        round_index: int,
+    ) -> OwnedLeaseV5:
+        """Recover one cleanup-only lease from authenticated execution authority."""
+
+        if (
+            type(payload) is not ResourceLeasePayloadV5
+            or payload.resource_kind not in {"evaluator_process", "container"}
+            or type(round_index) is not int
+            or round_index != self._owner.round_index
+            or payload.owner_campaign_id != self._owner.campaign_id
+            or payload.owner_token_sha256 != self._owner.owner_token_sha256
+        ):
+            raise ValueError("container recovery lease authority is invalid")
+        authorities = self._repository.load_candidate_executions(
+            campaign_id=self._owner.campaign_id,
+            round_index=round_index,
+        )
+        matches = tuple(
+            authority for authority in authorities if payload in authority.lease_payloads
+        )
+        if len(matches) != 1:
+            raise ValueError("container recovery lease is absent or ambiguous")
+        authority = matches[0]
+        record = self._load_reservation(authority.command_sha256)
+        roles = ("evaluator_process", "container")
+        role_index = roles.index(payload.resource_kind)
+        if (
+            record is None
+            or record.owner != self._owner
+            or record.request_sha256 != authority.request_sha256
+            or record.command_sha256 != authority.command_sha256
+            or record.output_mount_authority_sha256
+            != authority.output_mount_authority_sha256
+            or record.lease_ids != tuple(item.lease_id for item in authority.lease_payloads)
+            or authority.lease_payloads[role_index] != payload
+            or payload.lease_id
+            != derive_execution_lease_id_v5(authority.command_sha256, payload.resource_kind)
+        ):
+            raise ValueError("container recovery lease differs from durable authority")
+        capability = _RecoveredExecutionLeaseCapabilityV5(
+            self.executor_identity_sha256,
+            authority.command_sha256,
+            payload.resource_kind,
+            self._owner.sha256,
+        )
+        return OwnedLeaseV5(payload, round_index, capability)
+
     def cleanup(
         self,
         *,
@@ -3671,6 +3733,61 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             )
             return CleanupResultPayloadV5(0, 0, 1, 1, True)
 
+    def cleanup_many(
+        self,
+        *,
+        owner: WorkspaceOwnerV5,
+        leases: tuple[OwnedLeaseV5, ...],
+    ) -> CleanupResultPayloadV5:
+        """Clean exact complete evaluator/container lease pairs by execution."""
+
+        if type(leases) is not tuple or any(
+            type(item) is not OwnedLeaseV5
+            or item.payload.resource_kind not in {"evaluator_process", "container"}
+            for item in leases
+        ):
+            raise ValueError("container cleanup lease collection is invalid")
+        grouped: dict[str, dict[str, OwnedLeaseV5]] = {}
+        for lease in leases:
+            capability = lease.opaque_handle
+            if type(capability) not in {
+                _ExecutionLeaseCapabilityV5,
+                _RecoveredExecutionLeaseCapabilityV5,
+            }:
+                raise ValueError("container cleanup lease capability is foreign")
+            roles = grouped.setdefault(capability.command_sha256, {})
+            if lease.payload.resource_kind in roles:
+                raise ValueError("container cleanup lease collection contains a duplicate")
+            roles[lease.payload.resource_kind] = lease
+        evaluator_count = 0
+        container_count = 0
+        for command_sha256 in sorted(grouped):
+            roles = grouped[command_sha256]
+            if set(roles) != {"evaluator_process", "container"}:
+                raise ValueError("container cleanup requires each complete execution lease pair")
+            result = self.cleanup(
+                owner=owner,
+                leases=(roles["evaluator_process"], roles["container"]),
+            )
+            if not result.cleanup_complete:
+                return CleanupResultPayloadV5(
+                    0,
+                    0,
+                    evaluator_count + result.owned_evaluators,
+                    container_count + result.owned_containers,
+                    False,
+                    result.failure_code,
+                )
+            evaluator_count += result.owned_evaluators
+            container_count += result.owned_containers
+        return CleanupResultPayloadV5(
+            0,
+            0,
+            evaluator_count,
+            container_count,
+            True,
+        )
+
     def _authorize_cleanup(self, owner: WorkspaceOwnerV5, leases: tuple[OwnedLeaseV5, ...]) -> str:
         if (
             type(owner) is not WorkspaceOwnerV5
@@ -3684,16 +3801,21 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             capability = lease.opaque_handle
             if (
                 type(lease) is not OwnedLeaseV5
-                or type(capability) is not _ExecutionLeaseCapabilityV5
+                or type(capability)
+                not in {_ExecutionLeaseCapabilityV5, _RecoveredExecutionLeaseCapabilityV5}
                 or capability.executor_identity_sha256 != self.executor_identity_sha256
                 or capability.role_kind != role
                 or capability.owner_sha256 != owner.sha256
-                or capability.command.sha256 != capability.command_sha256
                 or lease.round_index != owner.round_index
                 or lease.payload.owner_campaign_id != owner.campaign_id
                 or lease.payload.owner_token_sha256 != owner.owner_token_sha256
             ):
                 raise ValueError("container cleanup lease is foreign")
+            if (
+                type(capability) is _ExecutionLeaseCapabilityV5
+                and capability.command.sha256 != capability.command_sha256
+            ):
+                raise ValueError("container cleanup live command is foreign")
             command_digests.add(capability.command_sha256)
             if lease.payload.lease_id != derive_execution_lease_id_v5(capability.command_sha256, role):
                 raise ValueError("container cleanup lease identity is invalid")

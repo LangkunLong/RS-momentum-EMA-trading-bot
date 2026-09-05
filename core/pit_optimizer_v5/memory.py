@@ -816,7 +816,11 @@ class ResourceLeasePayloadV5:
         _digest(self.owner_token_sha256, "resource lease owner token")
 
 
-CandidateExecutionStageV5 = Literal["quick_evaluation", "discovery_evaluation"]
+CandidateExecutionStageV5 = Literal[
+    "semantic_probe",
+    "quick_evaluation",
+    "discovery_evaluation",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -827,9 +831,9 @@ class CandidateExecutionKeyV5:
 
     def __post_init__(self) -> None:
         _digest(self.experiment_id, "candidate execution experiment")
-        if self.stage == "quick_evaluation":
+        if self.stage in {"semantic_probe", "quick_evaluation"}:
             if self.episode_ordinal is not None:
-                raise ValueError("quick execution cannot carry an episode ordinal")
+                raise ValueError("non-episode execution cannot carry an episode ordinal")
         elif self.stage == "discovery_evaluation":
             _count(self.episode_ordinal, "candidate execution episode ordinal", positive=True)
         else:
@@ -1428,7 +1432,10 @@ def _validate_candidate_stage_chain_v5(
             if payload.key in execution_keys:
                 raise ValueError("candidate execution authority is duplicated")
             state = states.get(experiment_id)
-            if payload.key.stage == "quick_evaluation":
+            if payload.key.stage == "semantic_probe":
+                if state != "validated":
+                    raise ValueError("candidate semantic-probe execution is out of order")
+            elif payload.key.stage == "quick_evaluation":
                 if state != "distinct":
                     raise ValueError("candidate quick execution is out of order")
             elif state not in {"quick", "episodes"}:

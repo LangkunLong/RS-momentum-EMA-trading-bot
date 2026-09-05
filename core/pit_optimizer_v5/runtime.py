@@ -623,6 +623,23 @@ class CandidateExecutionRegistrarV5(Protocol):
 class LeaseAwareCandidateRuntimeV5(Protocol):
     """Candidate evaluator that durably registers owned leases before evidence use."""
 
+    def fingerprint_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        *,
+        deadline: StageDeadlineV5,
+        execution_key: CandidateExecutionKeyV5,
+        register_execution: CandidateExecutionRegistrarV5,
+    ) -> SemanticFingerprintV5: ...
+
+    def recover_fingerprint_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
+    ) -> SemanticFingerprintV5: ...
+
     def evaluate_quick_registered(
         self,
         materialized: MaterializedVariantV5,
@@ -1716,7 +1733,12 @@ class _Runtime:
                 failure_code=validation.failure_code,
                 artifact_refs=references,
             )
-        if validation.changed_symbols != template.changed_symbols:
+        expected_changed_symbols = (
+            ()
+            if identity.policy_revision_sha256 == parent.policy_identity_sha256
+            else template.changed_symbols
+        )
+        if validation.changed_symbols != expected_changed_symbols:
             raise _RuntimeAbort(
                 RuntimeFailureV5("validation", "invalid_dependency_result", experiment_id=identity.sha256)
             )
@@ -1780,7 +1802,31 @@ class _Runtime:
         else:
             probe_deadline = self._deadline("semantic_probe", self.inputs.manifest.resources.mechanics_timeout_seconds)
             try:
-                fingerprint = self.dependencies.candidates.fingerprint(materialized, deadline=probe_deadline)
+                if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
+                    execution_key = CandidateExecutionKeyV5(
+                        identity.sha256,
+                        "semantic_probe",
+                        None,
+                    )
+                    execution = self._existing_execution(execution_key)
+                    if execution is None:
+                        fingerprint = self.dependencies.candidates.fingerprint_registered(
+                            materialized,
+                            deadline=probe_deadline,
+                            execution_key=execution_key,
+                            register_execution=self._register_execution,
+                        )
+                    else:
+                        fingerprint = self.dependencies.candidates.recover_fingerprint_registered(
+                            materialized,
+                            deadline=probe_deadline,
+                            authority=execution,
+                        )
+                else:
+                    fingerprint = self.dependencies.candidates.fingerprint(
+                        materialized,
+                        deadline=probe_deadline,
+                    )
                 if type(fingerprint) is not SemanticFingerprintV5:
                     raise TypeError
                 comparison = classify_semantic_fingerprints_v5(

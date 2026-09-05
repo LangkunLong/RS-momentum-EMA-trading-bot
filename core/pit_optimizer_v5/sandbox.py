@@ -31,7 +31,11 @@ from core.pit_optimizer_v5.contracts import (
     validate_sandbox_profile_resources_v5,
 )
 from core.pit_optimizer_v5.memory import CleanupResultPayloadV5
-from core.pit_optimizer_v5.probes import SemanticFingerprintV5
+from core.pit_optimizer_v5.probes import (
+    PROBE_SUITE_ID_V5,
+    ProbeObservationV5,
+    SemanticFingerprintV5,
+)
 from core.pit_optimizer_v5.runtime import (
     CandidateExecutionAuthorityV5,
     CandidateExecutionKeyV5,
@@ -231,14 +235,22 @@ class DockerPanelRequestV5:
             or self.evaluator_contract.sandbox_profile_sha256 != self.sandbox_profile.sha256
         ):
             raise ValueError("Docker panel request differs from campaign authority")
-        if (self.execution_key.stage == "quick_evaluation" and self.panel.episode_ordinal is not None) or (
+        if (
+            self.execution_key.stage in {"semantic_probe", "quick_evaluation"}
+            and self.panel.episode_ordinal is not None
+        ) or (
             self.execution_key.stage == "discovery_evaluation"
             and self.execution_key.episode_ordinal != self.panel.episode_ordinal
         ):
             raise ValueError("Docker panel execution key differs from its panel")
         validate_sandbox_profile_resources_v5(self.sandbox_profile, self.manifest.resources)
         declared = tuple(item.scenario_id for item in self.evaluator_contract.friction_grid)
-        if self.scenario_ids not in {(self.evaluator_contract.selection_scenario_id,), declared}:
+        permitted_scenarios = (
+            {()}
+            if self.execution_key.stage == "semantic_probe"
+            else {(self.evaluator_contract.selection_scenario_id,), declared}
+        )
+        if self.scenario_ids not in permitted_scenarios:
             raise ValueError("Docker panel scenarios are outside the quick/full closed scopes")
         if (
             type(self.source_mount) is not SandboxMountHandleV5
@@ -448,7 +460,7 @@ class ContainerExecutionResultV5:
 
 @dataclass(frozen=True, slots=True)
 class DockerPanelOutcomeV5:
-    evaluation: PanelEvaluationV5 | None
+    evaluation: PanelEvaluationV5 | SemanticFingerprintV5 | None
     failure: SandboxFailureV5 | None
     leases: tuple[ExecutionLeaseV5, ...]
 
@@ -457,7 +469,10 @@ class DockerPanelOutcomeV5:
             raise ValueError("Docker panel outcome leases are invalid")
         if (self.evaluation is None) == (self.failure is None):
             raise ValueError("Docker panel outcome must contain exactly one result")
-        if self.evaluation is not None and type(self.evaluation) is not PanelEvaluationV5:
+        if self.evaluation is not None and type(self.evaluation) not in {
+            PanelEvaluationV5,
+            SemanticFingerprintV5,
+        }:
             raise ValueError("Docker panel outcome evaluation is invalid")
         if self.failure is not None and type(self.failure) is not SandboxFailureV5:
             raise ValueError("Docker panel outcome failure is invalid")
@@ -687,6 +702,16 @@ def _mount_arg(mount: SandboxMountHandleV5) -> str:
     return f"{options},readonly" if mount.mode == "read_only" else options
 
 
+def execution_output_name_v5(request: DockerPanelRequestV5) -> str:
+    if type(request) is not DockerPanelRequestV5:
+        raise ValueError("execution output request is invalid")
+    return (
+        "semantic-fingerprint.json"
+        if request.execution_key.stage == "semantic_probe"
+        else "panel-evaluation.json"
+    )
+
+
 def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
     if type(request) is not DockerPanelRequestV5:
         raise ValueError("Docker argv requires a V5 panel request")
@@ -722,22 +747,47 @@ def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
         "python",
         "-B",
         "-m",
-        "core.pit_optimizer_v5.container_entry",
-        "--evaluator-sha256",
-        request.evaluator_contract.sha256,
-        "--sandbox-sha256",
-        request.sandbox_profile.sha256,
-        "--policy-sha256",
-        request.policy_revision.sha256,
-        "--panel-sha256",
-        request.panel.panel_ref.sha256,
-        "--start-date",
-        request.panel.start_date,
-        "--end-date",
-        request.panel.end_date,
-        "--output-limit-bytes",
-        str(request.manifest.resources.evaluation_output_limit_bytes),
     ]
+    if request.execution_key.stage == "semantic_probe":
+        argv.extend(
+            (
+                "core.pit_optimizer_v5.probe_entry",
+                "--request-sha256",
+                request.sha256,
+                "--policy-sha256",
+                request.policy_revision.sha256,
+                "--trusted-runtime-sha256",
+                request.policy_revision.trusted_policy_runtime_sha256,
+                "--immutable-constraints-sha256",
+                request.policy_revision.immutable_constraints_sha256,
+                "--suite-id",
+                PROBE_SUITE_ID_V5,
+                "--call-timeout-seconds",
+                str(request.manifest.resources.policy_method_timeout_seconds),
+                "--output-limit-bytes",
+                str(request.manifest.resources.evaluation_output_limit_bytes),
+            )
+        )
+        return tuple(argv)
+    argv.extend(
+        (
+            "core.pit_optimizer_v5.container_entry",
+            "--evaluator-sha256",
+            request.evaluator_contract.sha256,
+            "--sandbox-sha256",
+            request.sandbox_profile.sha256,
+            "--policy-sha256",
+            request.policy_revision.sha256,
+            "--panel-sha256",
+            request.panel.panel_ref.sha256,
+            "--start-date",
+            request.panel.start_date,
+            "--end-date",
+            request.panel.end_date,
+            "--output-limit-bytes",
+            str(request.manifest.resources.evaluation_output_limit_bytes),
+        )
+    )
     for scenario_id in request.scenario_ids:
         argv.extend(("--scenario", scenario_id))
     return tuple(argv)
@@ -826,6 +876,72 @@ def decode_panel_evaluation_v5(raw: bytes) -> PanelEvaluationV5:
         raise SandboxAdapterErrorV5(SandboxFailureV5("output_schema")) from None
 
 
+def decode_semantic_fingerprint_output_v5(
+    raw: bytes,
+    *,
+    request: DockerPanelRequestV5,
+) -> SemanticFingerprintV5:
+    """Decode one exact request-bound semantic-probe output envelope."""
+
+    try:
+        value = _strict_json(raw)
+        if type(value) is not dict or set(value) != {
+            "request_sha256",
+            "policy_revision_sha256",
+            "suite_id",
+            "fingerprint",
+        }:
+            raise ValueError
+        if (
+            value["request_sha256"] != request.sha256
+            or value["policy_revision_sha256"] != request.policy_revision.sha256
+            or value["suite_id"] != PROBE_SUITE_ID_V5
+        ):
+            raise SandboxAdapterErrorV5(SandboxFailureV5("identity_mismatch"))
+        primitive = value["fingerprint"]
+        if type(primitive) is not dict or set(primitive) != {
+            "suite_id",
+            "observations",
+            "fingerprint_sha256",
+        }:
+            raise ValueError
+        raw_observations = primitive["observations"]
+        if type(raw_observations) is not list:
+            raise ValueError
+        observations: list[ProbeObservationV5] = []
+        for item in raw_observations:
+            if type(item) is not dict or set(item) != {
+                "probe_id",
+                "method",
+                "input_sha256",
+                "decision_json_utf8",
+            }:
+                raise ValueError
+            decision = item["decision_json_utf8"]
+            if type(decision) is not str:
+                raise ValueError
+            observations.append(
+                ProbeObservationV5(
+                    item["probe_id"],  # type: ignore[arg-type]
+                    item["method"],  # type: ignore[arg-type]
+                    item["input_sha256"],  # type: ignore[arg-type]
+                    decision.encode("utf-8"),
+                )
+            )
+        fingerprint = SemanticFingerprintV5(
+            primitive["suite_id"],  # type: ignore[arg-type]
+            tuple(observations),
+            primitive["fingerprint_sha256"],  # type: ignore[arg-type]
+        )
+        if canonical_json_bytes_v5(fingerprint.to_primitive()) != canonical_json_bytes_v5(primitive):
+            raise ValueError
+        return fingerprint
+    except SandboxAdapterErrorV5:
+        raise
+    except (TypeError, ValueError, ArithmeticError, UnicodeError, RecursionError):
+        raise SandboxAdapterErrorV5(SandboxFailureV5("output_schema")) from None
+
+
 class DockerPanelEvaluatorV5:
     def __init__(self, *, executor: ContainerExecutorV5, clock: RuntimeClockV5) -> None:
         if not isinstance(executor, ContainerExecutorV5) or not isinstance(clock, RuntimeClockV5):
@@ -842,15 +958,23 @@ class DockerPanelEvaluatorV5:
         return DockerPanelOutcomeV5(None, SandboxFailureV5(code), leases)
 
     def _remaining_timeout(self, request: DockerPanelRequestV5, deadline: StageDeadlineV5) -> float | None:
-        if deadline.stage == "quick_evaluation":
+        if deadline.stage == "semantic_probe":
+            cap = request.manifest.resources.mechanics_timeout_seconds
+            if (
+                request.execution_key.stage != "semantic_probe"
+                or request.panel.episode_ordinal is not None
+                or request.scenario_ids
+            ):
+                return None
+        elif deadline.stage == "quick_evaluation":
             cap = request.manifest.resources.quick_timeout_seconds
-            if request.panel.episode_ordinal is not None or request.scenario_ids != (
+            if request.execution_key.stage != "quick_evaluation" or request.panel.episode_ordinal is not None or request.scenario_ids != (
                 request.evaluator_contract.selection_scenario_id,
             ):
                 return None
         elif deadline.stage == "discovery_evaluation":
             cap = request.manifest.resources.discovery_episode_timeout_seconds
-            if request.panel.episode_ordinal not in {1, 2, 3, 4} or request.scenario_ids != tuple(
+            if request.execution_key.stage != "discovery_evaluation" or request.panel.episode_ordinal not in {1, 2, 3, 4} or request.scenario_ids != tuple(
                 item.scenario_id for item in request.evaluator_contract.friction_grid
             ):
                 return None
@@ -960,9 +1084,15 @@ class DockerPanelEvaluatorV5:
         if output.observed_byte_count > request.manifest.resources.evaluation_output_limit_bytes:
             return self._failure("output_too_large", execution_leases)
         try:
-            evaluation = decode_panel_evaluation_v5(output.content)
+            evaluation = (
+                decode_semantic_fingerprint_output_v5(output.content, request=request)
+                if request.execution_key.stage == "semantic_probe"
+                else decode_panel_evaluation_v5(output.content)
+            )
         except SandboxAdapterErrorV5 as exc:
             return DockerPanelOutcomeV5(None, exc.failure, execution_leases)
+        if type(evaluation) is SemanticFingerprintV5:
+            return DockerPanelOutcomeV5(evaluation, None, execution_leases)
         if (
             evaluation.evaluator_contract_sha256 != request.evaluator_contract.sha256
             or evaluation.sandbox_profile_sha256 != request.sandbox_profile.sha256
@@ -1129,9 +1259,11 @@ class RuntimeDockerPanelEvaluatorV5:
     def __init__(
         self,
         evaluator: DockerPanelEvaluatorV5,
-        registrar: RuntimeLeaseRegistrarV5,
+        registrar: RuntimeLeaseRegistrarV5 | None = None,
     ) -> None:
-        if type(evaluator) is not DockerPanelEvaluatorV5 or not isinstance(registrar, RuntimeLeaseRegistrarV5):
+        if type(evaluator) is not DockerPanelEvaluatorV5 or (
+            registrar is not None and not isinstance(registrar, RuntimeLeaseRegistrarV5)
+        ):
             raise ValueError("runtime Docker evaluator dependencies are invalid")
         self._evaluator = evaluator
         self._registrar = registrar
@@ -1141,7 +1273,7 @@ class RuntimeDockerPanelEvaluatorV5:
         return self._evaluator
 
     @property
-    def registrar(self) -> RuntimeLeaseRegistrarV5:
+    def registrar(self) -> RuntimeLeaseRegistrarV5 | None:
         return self._registrar
 
     def evaluate(
@@ -1152,6 +1284,8 @@ class RuntimeDockerPanelEvaluatorV5:
         registrar: RuntimeLeaseRegistrarV5 | None = None,
     ) -> PanelEvaluationV5:
         selected_registrar = self._registrar if registrar is None else registrar
+        if selected_registrar is None:
+            raise ValueError("runtime Docker evaluation requires durable registration")
         if not isinstance(selected_registrar, RuntimeLeaseRegistrarV5):
             raise ValueError("runtime Docker evaluator registrar is invalid")
         outcome = self._evaluator.evaluate(
@@ -1161,7 +1295,8 @@ class RuntimeDockerPanelEvaluatorV5:
         )
         if outcome.failure is not None:
             raise SandboxAdapterErrorV5(outcome.failure)
-        assert outcome.evaluation is not None
+        if type(outcome.evaluation) is not PanelEvaluationV5:
+            raise SandboxAdapterErrorV5(SandboxFailureV5("output_schema"))
         return outcome.evaluation
 
     def recover(
@@ -1178,7 +1313,49 @@ class RuntimeDockerPanelEvaluatorV5:
         )
         if outcome.failure is not None:
             raise SandboxAdapterErrorV5(outcome.failure)
-        assert outcome.evaluation is not None
+        if type(outcome.evaluation) is not PanelEvaluationV5:
+            raise SandboxAdapterErrorV5(SandboxFailureV5("output_schema"))
+        return outcome.evaluation
+
+    def fingerprint(
+        self,
+        request: DockerPanelRequestV5,
+        *,
+        deadline: StageDeadlineV5,
+        registrar: RuntimeLeaseRegistrarV5 | None = None,
+    ) -> SemanticFingerprintV5:
+        selected_registrar = self._registrar if registrar is None else registrar
+        if selected_registrar is None:
+            raise ValueError("runtime Docker evaluation requires durable registration")
+        if not isinstance(selected_registrar, RuntimeLeaseRegistrarV5):
+            raise ValueError("runtime Docker evaluator registrar is invalid")
+        outcome = self._evaluator.evaluate(
+            request,
+            deadline=deadline,
+            registrar=selected_registrar,
+        )
+        if outcome.failure is not None:
+            raise SandboxAdapterErrorV5(outcome.failure)
+        if type(outcome.evaluation) is not SemanticFingerprintV5:
+            raise SandboxAdapterErrorV5(SandboxFailureV5("output_schema"))
+        return outcome.evaluation
+
+    def recover_fingerprint(
+        self,
+        request: DockerPanelRequestV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
+    ) -> SemanticFingerprintV5:
+        outcome = self._evaluator.recover(
+            request,
+            deadline=deadline,
+            authority=authority,
+        )
+        if outcome.failure is not None:
+            raise SandboxAdapterErrorV5(outcome.failure)
+        if type(outcome.evaluation) is not SemanticFingerprintV5:
+            raise SandboxAdapterErrorV5(SandboxFailureV5("output_schema"))
         return outcome.evaluation
 
 
@@ -1315,7 +1492,52 @@ class DockerCandidateRuntimeV5:
         return self._base.validate(materialized, deadline=deadline)
 
     def fingerprint(self, materialized: MaterializedVariantV5, *, deadline: StageDeadlineV5) -> SemanticFingerprintV5:
-        return self._base.fingerprint(materialized, deadline=deadline)
+        request = self._request(
+            materialized,
+            self._panel_plan.mechanics,
+            (),
+            CandidateExecutionKeyV5(materialized.variant.sha256, "semantic_probe", None),
+        )
+        return self._evaluator.fingerprint(request, deadline=deadline)
+
+    def fingerprint_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        *,
+        deadline: StageDeadlineV5,
+        execution_key: CandidateExecutionKeyV5,
+        register_execution: CandidateExecutionRegistrarV5,
+    ) -> SemanticFingerprintV5:
+        request = self._request(
+            materialized,
+            self._panel_plan.mechanics,
+            (),
+            execution_key,
+        )
+        return self._evaluator.fingerprint(
+            request,
+            deadline=deadline,
+            registrar=_CallbackExecutionRegistrarV5(register_execution),
+        )
+
+    def recover_fingerprint_registered(
+        self,
+        materialized: MaterializedVariantV5,
+        *,
+        deadline: StageDeadlineV5,
+        authority: CandidateExecutionAuthorityV5,
+    ) -> SemanticFingerprintV5:
+        request = self._request(
+            materialized,
+            self._panel_plan.mechanics,
+            (),
+            authority.key,
+        )
+        return self._evaluator.recover_fingerprint(
+            request,
+            deadline=deadline,
+            authority=authority,
+        )
 
     def _require_inputs(self, inputs: FeedbackRoundInputV5) -> None:
         if (
@@ -1525,6 +1747,8 @@ __all__ = [
     "SandboxMountHandleV5",
     "build_docker_argv_v5",
     "decode_panel_evaluation_v5",
+    "decode_semantic_fingerprint_output_v5",
     "derive_sandbox_mount_authorities_v5",
     "derive_execution_lease_id_v5",
+    "execution_output_name_v5",
 ]
