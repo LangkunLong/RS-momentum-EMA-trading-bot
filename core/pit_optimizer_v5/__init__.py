@@ -71,6 +71,8 @@ from .runtime import (
     run_feedback_round_v5,
 )
 from .production_provider import LocalRoleAuthorizationLedgerV5, OpenRouterOneShotJsonCompletionV5
+from .production_sandbox import LocalContainerExecutorV5, LocalSandboxMountFactoryV5
+from .production_workspace import LocalGitWorkspaceDriverV5
 from .sandbox import (
     AuthenticatedCandidateBaseOperationsV5,
     AuthenticatedContainerExecutorV5,
@@ -171,6 +173,9 @@ __all__ = [
     "InvestigatorArtifactV5",
     "LeaseAwareCandidateRuntimeV5",
     "LocalRoleAuthorizationLedgerV5",
+    "LocalContainerExecutorV5",
+    "LocalGitWorkspaceDriverV5",
+    "LocalSandboxMountFactoryV5",
     "MetricCountV5",
     "MetricPredictionV5",
     "MaterializedWorkspaceV5",

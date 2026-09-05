@@ -994,6 +994,26 @@ class PersistedRoleInvocationV5:
             raise ValueError("role completion call key differs from its package")
 
 
+@dataclass(frozen=True, slots=True)
+class AdapterStateAuthorityV5:
+    """Create-only authority binding an adapter state slot to its exact bytes."""
+
+    schema_version: Literal[5]
+    namespace: str
+    key: str
+    value_ref: ArtifactRefV5
+
+    def __post_init__(self) -> None:
+        namespace = _safe_component(self.namespace, "adapter state authority namespace")
+        key = _safe_component(self.key, "adapter state authority key")
+        if (
+            self.schema_version != 5
+            or type(self.value_ref) is not ArtifactRefV5
+            or self.value_ref.relative_path != f"adapter-state/{namespace}/{key}.json"
+        ):
+            raise ValueError("adapter state authority is invalid")
+
+
 class LocalArtifactRepositoryV5:
     """Closed-layout repository with immutable evidence and atomic projections."""
 
@@ -1215,6 +1235,199 @@ class LocalArtifactRepositoryV5:
                     hashlib.sha256(authenticated.content).hexdigest(),
                 ) from None
             return reference
+
+    def append_typed_state(self, *, namespace: str, key: str, value: object) -> ArtifactRefV5:
+        """Create or authenticate one deterministic adapter state record."""
+
+        safe_namespace = _safe_component(namespace, "typed state namespace")
+        safe_key = _safe_component(key, "typed state key")
+        if not is_dataclass(value) or isinstance(value, type):
+            raise ValueError("typed state value must be a dataclass instance")
+        relative = f"adapter-state/{safe_namespace}/{safe_key}.json"
+        raw = canonical_json_bytes_v5(value)
+        reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
+        authority = AdapterStateAuthorityV5(
+            5,
+            safe_namespace,
+            safe_key,
+            reference,
+        )
+        self._create_or_authenticate_typed(
+            f"adapter-state-authority/{safe_namespace}/{safe_key}.json",
+            authority,
+        )
+        return self._create_or_authenticate_typed(relative, value)
+
+    def load_typed_state(
+        self,
+        *,
+        namespace: str,
+        key: str,
+        value_type: type[T],
+    ) -> T | None:
+        """Load one exact deterministic adapter state record if it exists."""
+
+        safe_namespace = _safe_component(namespace, "typed state namespace")
+        safe_key = _safe_component(key, "typed state key")
+        relative = f"adapter-state/{safe_namespace}/{safe_key}.json"
+        authority_relative = f"adapter-state-authority/{safe_namespace}/{safe_key}.json"
+        try:
+            authority_raw = self._read_relative(authority_relative)
+        except ArtifactMissingV5:
+            try:
+                self._read_relative(relative)
+            except ArtifactMissingV5:
+                return None
+            raise ArtifactMissingV5(
+                ArtifactRefV5(authority_relative, "0" * 64)
+            ) from None
+        authority_reference = ArtifactRefV5(
+            authority_relative,
+            hashlib.sha256(authority_raw).hexdigest(),
+        )
+        authority = self.load_typed_artifact(
+            authority_reference,
+            value_type=AdapterStateAuthorityV5,
+        )
+        if (
+            authority.namespace != safe_namespace
+            or authority.key != safe_key
+            or authority.value_ref.relative_path != relative
+        ):
+            raise ArtifactSchemaFailureV5(authority_reference)
+        return self.load_typed_artifact(authority.value_ref, value_type=value_type)
+
+    def append_binary_state(self, *, namespace: str, key: str, content: bytes) -> ArtifactRefV5:
+        """Create or authenticate one exact bounded adapter-owned byte payload."""
+
+        safe_namespace = _safe_component(namespace, "binary state namespace")
+        safe_key = _safe_component(key, "binary state key")
+        if type(content) is not bytes:
+            raise ValueError("binary state content must be immutable bytes")
+        relative = f"adapter-blobs/{safe_namespace}/{safe_key}.bin"
+        reference = ArtifactRefV5(relative, hashlib.sha256(content).hexdigest())
+        parts = _safe_relative_path(relative)
+        try:
+            with self._directory(tuple(parts[:-1]), create=True) as directory:
+                _write_create_only_in_directory(directory, parts[-1], content)
+        except FileExistsError:
+            existing = self._read_relative(relative)
+            actual = hashlib.sha256(existing).hexdigest()
+            if actual != reference.sha256 or existing != content:
+                raise ArtifactDigestMismatchV5(
+                    reference,
+                    actual,
+                ) from None
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (OSError, ValueError):
+            raise ArtifactRelocatedV5(reference, relative) from None
+        return reference
+
+    def load_binary_state(
+        self,
+        *,
+        namespace: str,
+        key: str,
+        reference: ArtifactRefV5,
+        maximum_bytes: int,
+    ) -> bytes:
+        """Authenticate one exact adapter byte payload and enforce its read bound."""
+
+        safe_namespace = _safe_component(namespace, "binary state namespace")
+        safe_key = _safe_component(key, "binary state key")
+        expected = f"adapter-blobs/{safe_namespace}/{safe_key}.bin"
+        if (
+            type(reference) is not ArtifactRefV5
+            or reference.relative_path != expected
+            or type(maximum_bytes) is not int
+            or maximum_bytes <= 0
+        ):
+            raise ValueError("binary state authority is invalid")
+        content = self._read_relative(reference.relative_path)
+        actual = hashlib.sha256(content).hexdigest()
+        if actual != reference.sha256:
+            raise ArtifactDigestMismatchV5(reference, actual)
+        if len(content) > maximum_bytes:
+            raise ArtifactSchemaFailureV5(reference)
+        return content
+
+    @contextmanager
+    def adapter_state_transition(self, *, namespace: str, key: str) -> Iterator[None]:
+        """Serialize one exact durable adapter-state transition across processes."""
+
+        safe_namespace = _safe_component(namespace, "adapter transition namespace")
+        safe_key = _safe_component(key, "adapter transition key")
+        lock_name = f"{safe_key}.lock"
+        lock_relative = f"adapter-state-locks/{safe_namespace}/{lock_name}"
+        lock_reference = ArtifactRefV5(lock_relative, "0" * 64)
+        try:
+            directory_context = self._directory(("adapter-state-locks", safe_namespace), create=True)
+            directory = directory_context.__enter__()
+            try:
+                try:
+                    _write_create_only_in_directory(directory, lock_name, b"\0")
+                except FileExistsError:
+                    pass
+                if not directory.entry_exists(lock_name):
+                    raise ValueError("adapter transition lock is absent")
+                lock_path = directory.path / lock_name
+                before = os.lstat(lock_path)
+                if _is_link_or_reparse(lock_path) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                    raise ValueError("adapter transition lock is invalid")
+                descriptor = os.open(
+                    lock_path,
+                    os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                )
+                handle = os.fdopen(descriptor, "r+b", buffering=0)
+                opened = os.fstat(handle.fileno())
+                if _metadata_identity(before) != _metadata_identity(opened):
+                    handle.close()
+                    raise ValueError("adapter transition lock changed before open")
+            except BaseException:
+                directory_context.__exit__(None, None, None)
+                raise
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (OSError, ValueError):
+            raise ArtifactRelocatedV5(lock_reference, lock_relative) from None
+        locked = False
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+            after = os.lstat(lock_path)
+            if (
+                _is_link_or_reparse(lock_path)
+                or _metadata_identity(opened) != _metadata_identity(after)
+                or not stat.S_ISREG(after.st_mode)
+                or after.st_nlink != 1
+            ):
+                raise ArtifactRelocatedV5(lock_reference, lock_relative)
+            directory.assert_current()
+            yield
+        finally:
+            try:
+                if locked:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+                directory_context.__exit__(None, None, None)
 
     @contextmanager
     def role_provider_transition(self, *, campaign_id: str) -> Iterator[None]:
