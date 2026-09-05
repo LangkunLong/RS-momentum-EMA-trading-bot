@@ -1825,6 +1825,7 @@ class RoleSlotRequestV5:
     attempt_index: int
     model: str
     max_output_tokens: int
+    response_schema_sha256: str
 
     def __post_init__(self) -> None:
         _digest(self.request_sha256, "role slot request")
@@ -1833,6 +1834,7 @@ class RoleSlotRequestV5:
         _count(self.attempt_index, "role attempt index", positive=True)
         _text(self.model, "role slot model")
         _count(self.max_output_tokens, "role slot output tokens", positive=True)
+        _digest(self.response_schema_sha256, "role slot response schema")
 
     @property
     def sha256(self) -> str:
@@ -2239,12 +2241,13 @@ class RoleInvocationPackageV5:
                 None
                 if self.attempt.usage.requested_model is None
                 else RoleSlotRequestV5(
-                    self.request.sha256,
-                    self.call.role,
-                    self.call.attempt_kind,
-                    self.call.attempt_index,
-                    self.attempt.usage.requested_model,
-                    self.request.max_output_tokens,
+                    request_sha256=self.request.sha256,
+                    role=self.call.role,
+                    attempt_kind=self.call.attempt_kind,
+                    attempt_index=self.call.attempt_index,
+                    model=self.attempt.usage.requested_model,
+                    max_output_tokens=self.request.max_output_tokens,
+                    response_schema_sha256=self.request.response_schema_sha256,
                 ).sha256
             )
             if (
@@ -2401,6 +2404,7 @@ class LedgerRoleAuthorizationLifecycleV5(RoleAuthorizationLifecycleV5, Protocol)
 @dataclass(frozen=True, slots=True)
 class RoleLedgerReservationV5:
     schema_version: Literal[5]
+    ledger_ordinal: int
     campaign_id: str
     campaign_manifest_sha256: str
     ledger_identity_sha256: str
@@ -2410,6 +2414,7 @@ class RoleLedgerReservationV5:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
             raise ValueError("role-ledger reservation schema is invalid")
+        _count(self.ledger_ordinal, "role-ledger ordinal", positive=True)
         _text(self.campaign_id, "role-ledger campaign")
         _digest(self.campaign_manifest_sha256, "role-ledger manifest")
         _digest(self.ledger_identity_sha256, "role-ledger identity")
@@ -2850,12 +2855,17 @@ class AuthorizedRoleRunnerV5:
         self,
         request: RoleRequestV5,
         *,
-        attempt_kind: RoleAttemptKindV5 = "primary",
+        call_key: RoleCallKeyV5,
     ) -> ParsedRoleArtifactV5:
-        if type(request) is not RoleRequestV5:
-            raise ValueError("authorized runner requires a V5 role request")
-        canonical_kind = _attempt_kind(attempt_kind)
-        attempt_index = len(self._attempts) + 1
+        if (
+            type(request) is not RoleRequestV5
+            or type(call_key) is not RoleCallKeyV5
+            or call_key.role != request.role
+            or call_key.request_sha256 != request.sha256
+        ):
+            raise ValueError("authorized runner requires the exact V5 role call and request")
+        canonical_kind = _attempt_kind(call_key.attempt_kind)
+        attempt_index = call_key.attempt_index
         capabilities = self._capabilities
         kind_limit = {
             "primary": capabilities.maximum_role_calls,
@@ -2879,6 +2889,7 @@ class AuthorizedRoleRunnerV5:
             attempt_index=attempt_index,
             model=capabilities.model,
             max_output_tokens=capabilities.maximum_output_tokens_per_role,
+            response_schema_sha256=request.response_schema_sha256,
         )
         try:
             slot = self._lifecycle.reserve_role_slot(slot_request)
@@ -3115,7 +3126,7 @@ class LedgerBackedRoleInvokerV5:
         try:
             artifact = self._runner.invoke_once(
                 persisted_request.request,
-                attempt_kind=persisted_request.call.attempt_kind,
+                call_key=persisted_request.call,
             )
         except RoleFailureV5 as exc:
             failure = exc
@@ -3164,7 +3175,7 @@ class LedgerBackedRoleInvokerV5:
 class FixtureRoleRunnerV5:
     """Provider-free role runner using explicitly declared canonical fixture slots."""
 
-    __slots__ = ("_attempts", "_positions", "_responses")
+    __slots__ = ("_attempt_indexes", "_attempts", "_positions", "_responses")
 
     def __init__(
         self,
@@ -3190,6 +3201,7 @@ class FixtureRoleRunnerV5:
         self._responses = MappingProxyType(normalized)
         self._positions = {identity: 0 for identity in normalized}
         self._attempts: list[RoleAttemptFactsV5] = []
+        self._attempt_indexes: dict[RoleNameV5, int] = {}
 
     @property
     def attempts(self) -> tuple[RoleAttemptFactsV5, ...]:
@@ -3204,8 +3216,9 @@ class FixtureRoleRunnerV5:
         if type(request) is not RoleRequestV5:
             raise ValueError("fixture runner requires a V5 role request")
         canonical_kind = _attempt_kind(attempt_kind)
-        attempt_index = len(self._attempts) + 1
         identity = (request.role, canonical_kind)
+        attempt_index = self._attempt_indexes.get(request.role, 0) + 1
+        self._attempt_indexes[request.role] = attempt_index
         position = self._positions.get(identity, 0)
         declared = self._responses.get(identity, ())
         usage = _zero_usage_facts()
