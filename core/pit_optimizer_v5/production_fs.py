@@ -732,7 +732,7 @@ def _enumerate_windows_directory(handle: int) -> tuple[tuple[str, int, int], ...
     return tuple(result)
 
 
-def _remove_open_windows_tree(
+def _clear_open_windows_directory(
     handle: int,
     *,
     expected_identity: tuple[int, int],
@@ -772,6 +772,16 @@ def _remove_open_windows_tree(
         raise ValueError("filesystem cleanup directory changed during deletion")
     if _windows_handle_identity(handle) != expected_identity[1]:
         raise ValueError("filesystem cleanup root identity changed")
+
+
+def _remove_open_windows_tree(
+    handle: int,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Delete one exact open directory after clearing its descendants."""
+
+    _clear_open_windows_directory(handle, expected_identity=expected_identity)
     _mark_windows_handle_for_delete(handle)
 
 
@@ -946,6 +956,20 @@ def create_directory_in_directory_v5(
     return access
 
 
+def clear_owned_directory_v5(directory: _DirectoryAccess) -> None:
+    """Clear one exact owned directory without reopening or removing its root."""
+
+    directory.assert_current()
+    if os.name != "nt":
+        raise RuntimeError("owned directory clearing requires the Windows production adapter")
+    handle = _open_windows_enumeration_handle(directory)
+    try:
+        _clear_open_windows_directory(handle, expected_identity=directory.identity)
+    finally:
+        _close_windows_raw_handle(handle)
+    directory.assert_current()
+
+
 def directory_entry_names_v5(directory: _DirectoryAccess) -> tuple[str, ...]:
     """List closed names from a held directory, never from a reopened path."""
 
@@ -1051,6 +1075,7 @@ def write_new_regular_in_directory_v5(
 __all__ = [
     "acquire_absolute_directory_v5",
     "acquire_directory_v5",
+    "clear_owned_directory_v5",
     "create_directory_in_directory_v5",
     "directory_child_absent_v5",
     "directory_entry_names_v5",

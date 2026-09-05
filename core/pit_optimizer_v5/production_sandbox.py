@@ -29,9 +29,11 @@ from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
 from core.pit_optimizer_v5.production_fs import (
     acquire_absolute_directory_v5,
     acquire_directory_v5,
+    clear_owned_directory_v5,
     create_directory_in_directory_v5,
     directory_child_absent_v5,
     directory_entry_names_v5,
+    directory_is_empty_v5,
     hash_regular_in_directory_v5,
     open_regular_in_directory_v5,
     remove_owned_tree_in_directory_v5,
@@ -287,11 +289,34 @@ class MountReservationRecordV5:
 
 
 @dataclass(frozen=True, slots=True)
+class MountCreatedRecordV5:
+    schema_version: Literal[5]
+    factory_identity_sha256: str
+    output_authority_sha256: str
+    output_device: int
+    output_inode: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 5
+            or re.fullmatch(r"[0-9a-f]{64}", self.factory_identity_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.output_authority_sha256) is None
+            or type(self.output_device) is not int
+            or type(self.output_inode) is not int
+            or self.output_device < 0
+            or self.output_inode <= 0
+        ):
+            raise ValueError("sandbox mount created record is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class MountReadyRecordV5:
     schema_version: Literal[5]
     factory_identity_sha256: str
     output_authority_sha256: str
     output_root_identity_sha256: str
+    output_device: int
+    output_inode: int
 
     def __post_init__(self) -> None:
         if (
@@ -304,6 +329,10 @@ class MountReadyRecordV5:
                     self.output_root_identity_sha256,
                 )
             )
+            or type(self.output_device) is not int
+            or type(self.output_inode) is not int
+            or self.output_device < 0
+            or self.output_inode <= 0
         ):
             raise ValueError("sandbox mount ready record is invalid")
 
@@ -375,6 +404,7 @@ class ExecutionPhaseRecordV5:
     lifecycle_status: Literal["created", "running", "exited"] | None = None
     network_attestation_sha256: str | None = None
     state_attestation_sha256: str | None = None
+    network_namespace_status: Literal["empty", "private"] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -400,6 +430,7 @@ class ExecutionPhaseRecordV5:
                         self.lifecycle_status,
                         self.network_attestation_sha256,
                         self.state_attestation_sha256,
+                        self.network_namespace_status,
                     )
                 )
             )
@@ -412,6 +443,7 @@ class ExecutionPhaseRecordV5:
                     is None
                     or re.fullmatch(r"[0-9a-f]{64}", self.state_attestation_sha256 or "")
                     is None
+                    or self.network_namespace_status not in {"empty", "private"}
                     or self.lifecycle_status
                     not in (
                         {"created"}
@@ -420,6 +452,10 @@ class ExecutionPhaseRecordV5:
                         if self.phase == "collected"
                         else {"running", "exited"}
                     )
+                    or self.lifecycle_status == "created"
+                    and self.network_namespace_status != "empty"
+                    or self.lifecycle_status == "running"
+                    and self.network_namespace_status != "private"
                 )
             )
         ):
@@ -455,6 +491,29 @@ class ExecutionContainerIdentityRecordV5:
     @property
     def sha256(self) -> str:
         return canonical_sha256_v5(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionControlCreatedRecordV5:
+    schema_version: Literal[5]
+    executor_identity_sha256: str
+    command_sha256: str
+    control_root_identity_sha256: str
+    transaction_device: int
+    transaction_inode: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 5
+            or re.fullmatch(r"[0-9a-f]{64}", self.executor_identity_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.command_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.control_root_identity_sha256) is None
+            or type(self.transaction_device) is not int
+            or type(self.transaction_inode) is not int
+            or self.transaction_device < 0
+            or self.transaction_inode <= 0
+        ):
+            raise ValueError("container execution control creation record is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,7 +732,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         self._fixed_roots = fixed_roots
         self._workspace_root_identities = workspace_roots
         self._data_file_identities = (bundle_identity, provenance_identity)
-        self.mount_identity_sha256 = canonical_sha256_v5(
+        self._mount_identity_sha256 = canonical_sha256_v5(
             {
                 "domain": "pit-optimizer-v5-local-sandbox-mount-v1",
                 "manifest_sha256": manifest.sha256,
@@ -687,6 +746,14 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 "repository_root_identity_sha256": repository.root_identity_sha256,
             }
         )
+
+    @property
+    def mount_identity_sha256(self) -> str:
+        return self._mount_identity_sha256
+
+    @property
+    def workspace_driver(self) -> LocalGitWorkspaceDriverV5:
+        return self._workspace
 
     @property
     def fixed_roots(self) -> tuple[Path, Path, Path, Path]:
@@ -849,7 +916,6 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             output_parent, "identity", None
         ) != (self._output_info.st_dev, self._output_info.st_ino):
             raise ValueError("sandbox output parent authority is foreign")
-        target = self._output_root / relative
         record = MountReservationRecordV5(
             5,
             self.mount_identity_sha256,
@@ -868,8 +934,6 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 value_type=MountReservationRecordV5,
             )
             if prior is None:
-                if _lstat_optional(target) is not None:
-                    raise ValueError("sandbox output target predates its reservation")
                 self._repository.append_typed_state(
                     namespace="sandbox-mount-reservation",
                     key=output_authority,
@@ -877,28 +941,89 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 )
             elif prior != record:
                 raise ValueError("sandbox output reservation is foreign")
+            created = self._repository.load_typed_state(
+                namespace="sandbox-mount-created",
+                key=output_authority,
+                value_type=MountCreatedRecordV5,
+            )
             ready = self._repository.load_typed_state(
                 namespace="sandbox-mount-ready",
                 key=output_authority,
                 value_type=MountReadyRecordV5,
             )
-            existing = _lstat_optional(target)
-            if existing is None and ready is not None:
-                raise ValueError("sandbox output disappeared after readiness")
+            if created is not None and (
+                created.factory_identity_sha256 != self.mount_identity_sha256
+                or created.output_authority_sha256 != output_authority
+            ):
+                raise ValueError("sandbox output creation authority is foreign")
+            if ready is not None and (
+                created is None
+                or ready.factory_identity_sha256 != self.mount_identity_sha256
+                or ready.output_authority_sha256 != output_authority
+                or (ready.output_device, ready.output_inode)
+                != (created.output_device, created.output_inode)
+            ):
+                raise ValueError("sandbox output readiness is foreign")
+            created_identity: tuple[int, int] | None = None
+            created_durable: bool | None = created is not None
             try:
-                with acquire_directory_v5(
-                    self._output_root,
-                    (relative,),
-                    create=existing is None,
-                    expected_root_identity=(self._output_info.st_dev, self._output_info.st_ino),
-                ) as target_access:
+                if created is None:
+                    try:
+                        target_access = create_directory_in_directory_v5(
+                            output_parent,  # type: ignore[arg-type]
+                            relative,
+                        )
+                    except FileExistsError:
+                        raise ValueError("sandbox output target predates durable creation") from None
+                    created_identity = target_access.identity
+                    expected_created = MountCreatedRecordV5(
+                        5,
+                        self.mount_identity_sha256,
+                        output_authority,
+                        target_access.identity[0],
+                        target_access.identity[1],
+                    )
+                    try:
+                        self._repository.append_typed_state(
+                            namespace="sandbox-mount-created",
+                            key=output_authority,
+                            value=expected_created,
+                        )
+                    except BaseException:
+                        try:
+                            observed_created = self._repository.load_typed_state(
+                                namespace="sandbox-mount-created",
+                                key=output_authority,
+                                value_type=MountCreatedRecordV5,
+                            )
+                        except BaseException:
+                            created_durable = None
+                        else:
+                            created_durable = observed_created == expected_created
+                        raise
+                    created = expected_created
+                    created_durable = True
+                else:
+                    target_access = acquire_directory_v5(
+                        self._output_root,
+                        (relative,),
+                        create=False,
+                        expected_root_identity=(self._output_info.st_dev, self._output_info.st_ino),
+                    )
+                    if target_access.identity != (
+                        created.output_device,
+                        created.output_inode,
+                    ):
+                        target_access.close()
+                        raise ValueError("sandbox output identity differs from durable creation")
+                with target_access:
                     target_path = target_access.path
                     target_info = target_path.lstat()
                     if (target_info.st_dev, target_info.st_ino) != target_access.identity:
                         raise ValueError("sandbox output identity changed")
                     identity = _directory_identity(target_path, target_info)
                     if ready is None:
-                        if any(os.scandir(target_access.path)):
+                        if not directory_is_empty_v5(target_access):
                             raise ValueError("unready sandbox output is not empty")
                         self._repository.append_typed_state(
                             namespace="sandbox-mount-ready",
@@ -908,18 +1033,31 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                                 self.mount_identity_sha256,
                                 output_authority,
                                 identity,
+                                target_access.identity[0],
+                                target_access.identity[1],
                             ),
                         )
                     elif (
                         ready.factory_identity_sha256 != self.mount_identity_sha256
                         or ready.output_authority_sha256 != output_authority
                         or ready.output_root_identity_sha256 != identity
+                        or (ready.output_device, ready.output_inode)
+                        != target_access.identity
                     ):
                         raise ValueError("sandbox output readiness is foreign")
                     if _roots_overlap(source_path, target_path):
                         raise ValueError("sandbox source and output roots overlap")
                     return target_path, target_info
-            except (OSError, ValueError):
+            except BaseException:
+                if created_identity is not None and created_durable is False:
+                    try:
+                        remove_owned_tree_in_directory_v5(
+                            output_parent,  # type: ignore[arg-type]
+                            relative,
+                            expected_identity=created_identity,
+                        )
+                    except (OSError, ValueError):
+                        pass
                 raise ValueError("sandbox output could not be safely created or opened") from None
 
     def _mount_handle(
@@ -1074,18 +1212,31 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                     raise ValueError("sandbox source path changed") from None
             if tuple(observed_sources) != expected_sources:
                 raise ValueError("sandbox source bytes changed after mount issuance")
+            output_created = self._repository.load_typed_state(
+                namespace="sandbox-mount-created",
+                key=request.output_mount.content_authority_sha256,
+                value_type=MountCreatedRecordV5,
+            )
             output_ready = self._repository.load_typed_state(
                 namespace="sandbox-mount-ready",
                 key=request.output_mount.content_authority_sha256,
                 value_type=MountReadyRecordV5,
             )
             if (
-                output_ready is None
+                output_created is None
+                or output_ready is None
+                or output_created.factory_identity_sha256 != self.mount_identity_sha256
+                or output_created.output_authority_sha256
+                != request.output_mount.content_authority_sha256
                 or output_ready.factory_identity_sha256 != self.mount_identity_sha256
                 or output_ready.output_authority_sha256
                 != request.output_mount.content_authority_sha256
                 or output_ready.output_root_identity_sha256
                 != request.output_mount.root_identity_sha256
+                or (output_created.output_device, output_created.output_inode)
+                != accesses[2].identity
+                or (output_ready.output_device, output_ready.output_inode)
+                != accesses[2].identity
             ):
                 raise ValueError("sandbox output mount is not durably ready")
             yield paths
@@ -1155,7 +1306,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         self._repository = repository
         self._base_environment = base_environment
         self._control_capability = object()
-        self.executor_identity_sha256 = canonical_sha256_v5(
+        self._executor_identity_sha256 = canonical_sha256_v5(
             {
                 "domain": "pit-optimizer-v5-local-container-executor-v1",
                 "manifest_sha256": manifest.sha256,
@@ -1177,6 +1328,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 "repository_root_identity_sha256": repository.root_identity_sha256,
             }
         )
+
+    @property
+    def executor_identity_sha256(self) -> str:
+        return self._executor_identity_sha256
+
+    @property
+    def mount_factory(self) -> LocalSandboxMountFactoryV5:
+        return self._mount_factory
 
     def reserve(self, command: ContainerCommandV5) -> ExecutionReservationV5:
         self._authenticate_command(command)
@@ -1440,6 +1599,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         lifecycle_status: Literal["created", "running", "exited"] | None = None,
         network_attestation_sha256: str | None = None,
         state_attestation_sha256: str | None = None,
+        network_namespace_status: Literal["empty", "private"] | None = None,
     ) -> ExecutionPhaseRecordV5:
         record = ExecutionPhaseRecordV5(
             5,
@@ -1451,6 +1611,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             lifecycle_status,
             network_attestation_sha256,
             state_attestation_sha256,
+            network_namespace_status,
         )
         self._repository.append_typed_state(
             namespace=f"container-{phase.replace('_', '-')}",
@@ -1499,6 +1660,31 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             raise ValueError("container identity changed")
         return expected
 
+    def _control_created(
+        self,
+        command_sha256: str,
+    ) -> ExecutionControlCreatedRecordV5 | None:
+        created = self._repository.load_typed_state(
+            namespace="container-control-created",
+            key=command_sha256,
+            value_type=ExecutionControlCreatedRecordV5,
+        )
+        if created is not None and (
+            created.executor_identity_sha256 != self.executor_identity_sha256
+            or created.command_sha256 != command_sha256
+        ):
+            raise ValueError("container control creation record is foreign")
+        return created
+
+    @staticmethod
+    def _control_root_identity(root: object) -> str:
+        return canonical_sha256_v5(
+            {
+                "path": _windows_key(str(root.path)),  # type: ignore[attr-defined]
+                "identity": root.identity,  # type: ignore[attr-defined]
+            }
+        )
+
     def _control_record(
         self,
         reservation: ExecutionReservationRecordV5,
@@ -1514,12 +1700,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             5,
             self.executor_identity_sha256,
             reservation.command_sha256,
-            canonical_sha256_v5(
-                {
-                    "path": _windows_key(str(root_access.path)),  # type: ignore[attr-defined]
-                    "identity": root_access.identity,  # type: ignore[attr-defined]
-                }
-            ),
+            self._control_root_identity(root_access),
             canonical_sha256_v5(
                 {
                     "path": _windows_key(str(target_access.path)),  # type: ignore[attr-defined]
@@ -1552,13 +1733,16 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
 
     def _ensure_control(self, reservation: ExecutionReservationRecordV5) -> Path:
         target = self._control_root / reservation.control_relative_path
+        created = self._control_created(reservation.command_sha256)
         ready = self._repository.load_typed_state(
             namespace="container-control-ready",
             key=reservation.command_sha256,
             value_type=ExecutionControlRecordV5,
         )
+        if ready is not None and created is None:
+            raise ValueError("container control readiness lacks durable creation authority")
         created_identity: tuple[int, int] | None = None
-        ready_persisted = ready is not None
+        created_durable: bool | None = created is not None
         try:
             with ExitStack() as stack:
                 root = stack.enter_context(
@@ -1570,7 +1754,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         ),
                     )
                 )
-                if ready is None:
+                root_identity_sha256 = self._control_root_identity(root)
+                if created is not None and (
+                    created.control_root_identity_sha256 != root_identity_sha256
+                ):
+                    raise ValueError("container control creation root is foreign")
+                if created is None:
                     try:
                         target_access = stack.enter_context(
                             create_directory_in_directory_v5(
@@ -1583,6 +1772,32 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             "container control directory predates durable authority"
                         ) from None
                     created_identity = target_access.identity
+                    expected_created = ExecutionControlCreatedRecordV5(
+                        5,
+                        self.executor_identity_sha256,
+                        reservation.command_sha256,
+                        root_identity_sha256,
+                        target_access.identity[0],
+                        target_access.identity[1],
+                    )
+                    try:
+                        self._repository.append_typed_state(
+                            namespace="container-control-created",
+                            key=reservation.command_sha256,
+                            value=expected_created,
+                        )
+                    except BaseException:
+                        try:
+                            observed_created = self._control_created(
+                                reservation.command_sha256
+                            )
+                        except BaseException:
+                            created_durable = None
+                        else:
+                            created_durable = observed_created == expected_created
+                        raise
+                    created = expected_created
+                    created_durable = True
                 else:
                     target_access = stack.enter_context(
                         acquire_directory_v5(
@@ -1592,6 +1807,13 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             expected_root_identity=root.identity,
                         )
                     )
+                    if target_access.identity != (
+                        created.transaction_device,
+                        created.transaction_inode,
+                    ):
+                        raise ValueError("container control identity differs from durable creation")
+                    if ready is None:
+                        clear_owned_directory_v5(target_access)
                 children = {}
                 for name in _CONTROL_CHILDREN_V5:
                     if ready is None:
@@ -1651,11 +1873,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         key=reservation.command_sha256,
                         value=expected,
                     )
-                    ready_persisted = True
                 elif ready != expected:
                     raise ValueError("container control directory is foreign")
-        except (OSError, ValueError):
-            if created_identity is not None and not ready_persisted:
+        except BaseException:
+            if created_identity is not None and created_durable is False:
                 try:
                     with acquire_absolute_directory_v5(
                         self._control_root,
@@ -1679,12 +1900,13 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         self,
         reservation: ExecutionReservationRecordV5,
     ) -> Iterator[tuple[tuple[tuple[str, str], ...], tuple[int, int]]]:
+        created = self._control_created(reservation.command_sha256)
         ready = self._repository.load_typed_state(
             namespace="container-control-ready",
             key=reservation.command_sha256,
             value_type=ExecutionControlRecordV5,
         )
-        if ready is None:
+        if ready is None or created is None:
             raise ValueError("container control directory is not durably ready")
         with ExitStack() as stack:
             root = stack.enter_context(
@@ -1704,6 +1926,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     expected_root_identity=root.identity,
                 )
             )
+            if (
+                created.control_root_identity_sha256 != self._control_root_identity(root)
+                or target.identity
+                != (created.transaction_device, created.transaction_inode)
+            ):
+                raise ValueError("container control creation authority changed")
             children = {}
             for name in _CONTROL_CHILDREN_V5:
                 child = stack.enter_context(
@@ -2551,6 +2779,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             security_labels[key] = value
         if security_labels["AppArmorProfile"] not in {"", "docker-default"}:
             raise ValueError("container AppArmor profile is outside closed authority")
+        if security_labels["MountLabel"] != "" or security_labels["ProcessLabel"] != "":
+            raise ValueError("container process labels are outside Windows host authority")
         size_authority = {}
         for key in ("SizeRw", "SizeRootFs"):
             value = item.get(key)
@@ -2725,6 +2955,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     ) -> ExecutionPhaseRecordV5:
         status = inspection.state_authority["Status"]
         assert status in {"created", "running", "exited"}
+        network_namespace_status = self._network_lifecycle(
+            inspection.network_authority,
+            status,  # type: ignore[arg-type]
+        )
         return self._append_phase(
             command_sha256,
             phase,
@@ -2733,6 +2967,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             lifecycle_status=status,  # type: ignore[arg-type]
             network_attestation_sha256=inspection.network_attestation_sha256,
             state_attestation_sha256=inspection.state_attestation_sha256,
+            network_namespace_status=network_namespace_status,
         )
 
     @staticmethod
@@ -2764,18 +2999,27 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         if (
             phase.container_identity_sha256 != identity.sha256
             or phase.lifecycle_status is None
+            or phase.network_namespace_status is None
             or phase.network_attestation_sha256 is None
             or phase.state_attestation_sha256 is None
         ):
             raise ValueError("container phase identity is incomplete")
         if current_status == phase.lifecycle_status:
-            if (
+            exact = (
                 inspection.network_attestation_sha256 != phase.network_attestation_sha256
                 or inspection.state_attestation_sha256 != phase.state_attestation_sha256
                 or self._phase_attestation(identity, inspection) != phase.attestation_sha256
+            )
+            if not exact:
+                return
+            if (
+                current_status == "exited"
+                and phase.network_namespace_status == "private"
+                and current_network == "empty"
+                and inspection.state_attestation_sha256 == phase.state_attestation_sha256
             ):
-                raise ValueError("container phase authority changed")
-            return
+                return
+            raise ValueError("container phase authority changed")
         if not (
             permit_running_to_exited
             and phase.lifecycle_status == "running"
@@ -3371,12 +3615,13 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     value=expected,
                 )
             try:
+                control_created = self._control_created(command_sha256)
                 ready = self._repository.load_typed_state(
                     namespace="container-control-ready",
                     key=command_sha256,
                     value_type=ExecutionControlRecordV5,
                 )
-                if ready is None:
+                if control_created is None or ready is None:
                     raise ValueError("container control readiness is absent")
                 with acquire_absolute_directory_v5(
                     self._control_root,
@@ -3389,10 +3634,18 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         self._ensure_control(record)
                         with self._pinned_control_transaction(record) as transaction:
                             target_identity = transaction.transaction_root_identity
+                        if target_identity != (
+                            control_created.transaction_device,
+                            control_created.transaction_inode,
+                        ):
+                            raise ValueError("container control cleanup identity changed")
                         remove_owned_tree_in_directory_v5(
                             parent,
                             record.control_relative_path,
-                            expected_identity=target_identity,
+                            expected_identity=(
+                                control_created.transaction_device,
+                                control_created.transaction_inode,
+                            ),
                         )
                     if not directory_child_absent_v5(parent, record.control_relative_path):
                         raise ValueError("container control cleanup is incomplete")
@@ -3438,12 +3691,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
 __all__ = [
     "ExecutionCleanupRecordV5",
     "ExecutionContainerIdentityRecordV5",
+    "ExecutionControlCreatedRecordV5",
     "ExecutionControlRecordV5",
     "ExecutionPhaseRecordV5",
     "ExecutionReservationRecordV5",
     "ExecutionTerminalRecordV5",
     "LocalContainerExecutorV5",
     "LocalSandboxMountFactoryV5",
+    "MountCreatedRecordV5",
     "MountReadyRecordV5",
     "MountReservationRecordV5",
 ]

@@ -38,13 +38,15 @@ from core.pit_optimizer_v5.runtime import (
 )
 from core.pit_optimizer_v5.sandbox import (
     AuthenticatedCandidateBaseOperationsV5,
-    AuthenticatedContainerExecutorV5,
-    AuthenticatedSandboxMountFactoryV5,
     DockerCandidateRuntimeV5,
 )
+from core.pit_optimizer_v5.production_sandbox import (
+    LocalContainerExecutorV5,
+    LocalSandboxMountFactoryV5,
+)
+from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
 from core.pit_optimizer_v5.search import BaselineParentAuthorityV5
 from core.pit_optimizer_v5.summary import OptimizerSummaryV5, summarize_repository_v5, unavailable_summary_v5
-from core.pit_optimizer_v5.workspace import AuthenticatedGitWorkspaceDriverV5
 
 
 V5CommandName = Literal["run", "resume", "verify-run", "summarize", "import-v4-candidate"]
@@ -59,6 +61,7 @@ _FAILURE_REASONS = frozenset(
         "internal_failure",
         "invalid_request",
         "production_authority_mismatch",
+        "production_candidate_base_unavailable",
         "production_composition_unavailable",
         "production_config_invalid",
         "production_config_missing",
@@ -182,6 +185,34 @@ class CampaignAuthoritiesV5:
             raise ValueError("V5 campaign authority identity differs from the manifest")
 
 
+def _exact_production_host_adapter_graph_v5(
+    candidate: object,
+    adapter_config: ProductionAdapterConfigV5,
+) -> bool:
+    """Accept only the concrete, internally identified local host adapter graph."""
+
+    if type(candidate) is not DockerCandidateRuntimeV5:
+        return False
+    base = candidate.base_operations
+    mount_factory = candidate.mount_factory
+    executor = candidate.panel_evaluator.evaluator.executor
+    if (
+        type(base) is not AuthenticatedCandidateBaseOperationsV5
+        or type(base.materializer.driver) is not LocalGitWorkspaceDriverV5
+        or type(mount_factory) is not LocalSandboxMountFactoryV5
+        or type(executor) is not LocalContainerExecutorV5
+    ):
+        return False
+    driver = base.materializer.driver
+    return (
+        mount_factory.workspace_driver is driver
+        and executor.mount_factory is mount_factory
+        and driver.driver_identity_sha256 == adapter_config.workspace_driver_identity_sha256
+        and mount_factory.mount_identity_sha256 == adapter_config.mount_factory_identity_sha256
+        and executor.executor_identity_sha256 == adapter_config.container_executor_identity_sha256
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProductionRoundCompositionV5:
     inputs: FeedbackRoundInputV5
@@ -214,11 +245,9 @@ class ProductionRoundCompositionV5:
         lifecycle = runner.authorization_lifecycle
         provider = runner.completion_provider
         candidate = self.dependencies.candidates
-        if type(provider) is not GatewayCompletionProviderV5 or type(candidate) is not DockerCandidateRuntimeV5:
+        if type(provider) is not GatewayCompletionProviderV5:
             raise V5CliFailure("production_dependency_invalid")
         gateway = provider.gateway
-        panel_evaluator = candidate.panel_evaluator
-        executor = panel_evaluator.evaluator.executor
         if (
             type(gateway) is not OpenRouterOneShotJsonCompletionV5
             or type(lifecycle) is not LocalRoleAuthorizationLedgerV5
@@ -229,6 +258,7 @@ class ProductionRoundCompositionV5:
             or gateway.gateway_identity_sha256 != adapter_config.gateway_identity_sha256
             or gateway.ledger_identity_sha256 != lifecycle.ledger_identity_sha256
             or gateway.audit_store_identity_sha256 != lifecycle.audit_store_identity_sha256
+            or type(candidate) is not DockerCandidateRuntimeV5
             or candidate.manifest != authorities.manifest
             or candidate.panel_plan != authorities.panel_plan
             or candidate.evaluator_contract != authorities.evaluator_contract
@@ -236,17 +266,10 @@ class ProductionRoundCompositionV5:
             or candidate.owner.campaign_id != authorities.manifest.campaign_id
             or candidate.owner.round_index != round_index
             or candidate.owner.owner_token_sha256 != owner_token_sha256
-            or type(candidate.base_operations) is not AuthenticatedCandidateBaseOperationsV5
-            or candidate.base_operations.base_identity_sha256 != adapter_config.candidate_base_identity_sha256
-            or type(candidate.base_operations.materializer.driver) is not AuthenticatedGitWorkspaceDriverV5
-            or candidate.base_operations.materializer.driver.driver_identity_sha256
-            != adapter_config.workspace_driver_identity_sha256
-            or type(candidate.mount_factory) is not AuthenticatedSandboxMountFactoryV5
-            or candidate.mount_factory.mount_identity_sha256 != adapter_config.mount_factory_identity_sha256
-            or type(executor) is not AuthenticatedContainerExecutorV5
-            or executor.executor_identity_sha256 != adapter_config.container_executor_identity_sha256
+            or not _exact_production_host_adapter_graph_v5(candidate, adapter_config)
         ):
             raise V5CliFailure("production_dependency_invalid")
+        raise V5CliFailure("production_candidate_base_unavailable")
 
 
 class ProductionRoundFactoryV5:
@@ -271,7 +294,10 @@ class ProductionRoundFactoryV5:
         for round_index, dependencies in dependencies_by_round.items():
             if type(round_index) is not int or round_index < 1 or type(dependencies) is not FeedbackRoundDependenciesV5:
                 raise ValueError("production round factory dependency map is invalid")
-            closed[round_index] = dependencies
+            candidate = dependencies.candidates
+            if not _exact_production_host_adapter_graph_v5(candidate, adapter_config):
+                raise ValueError("production round factory dependency map is invalid")
+            raise ValueError("production candidate base unavailable")
         self.adapter_config_ref = adapter_config_ref
         self.adapter_config = adapter_config
         self._dependencies_by_round = MappingProxyType(closed)
