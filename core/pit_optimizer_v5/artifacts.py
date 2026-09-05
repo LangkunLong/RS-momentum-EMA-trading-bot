@@ -861,6 +861,10 @@ class LocalArtifactRepositoryV5:
     def root(self) -> Path:
         return self._root
 
+    @property
+    def root_identity_sha256(self) -> str:
+        return canonical_sha256_v5({"device": self._root_identity[0], "inode": self._root_identity[1]})
+
     def _directory(self, parts: tuple[str, ...], *, create: bool):
         try:
             return _acquire_directory(

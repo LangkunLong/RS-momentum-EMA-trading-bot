@@ -369,6 +369,89 @@ class GitWorkspaceDriverV5(Protocol):
     def retire_lease(self, lease_id: str) -> None: ...
 
 
+class AuthenticatedGitWorkspaceDriverV5:
+    """Identity-bound production no-follow Git workspace capability."""
+
+    def __init__(self, *, delegate: GitWorkspaceDriverV5, driver_identity_sha256: str) -> None:
+        if not isinstance(delegate, GitWorkspaceDriverV5):
+            raise ValueError("production workspace driver delegate is invalid")
+        self.driver_identity_sha256 = _digest(driver_identity_sha256, "workspace driver identity")
+        self._delegate = delegate
+
+    def acquire_root(self, *, configured_path: str, purpose: WorkspacePurposeV5) -> WorkspaceRootHandleV5:
+        return self._delegate.acquire_root(configured_path=configured_path, purpose=purpose)
+
+    def read_root_policy_file(self, *, root: WorkspaceRootHandleV5, relative_path: str) -> bytes:
+        return self._delegate.read_root_policy_file(root=root, relative_path=relative_path)
+
+    def create_disposable_workspace(
+        self,
+        *,
+        source_root: WorkspaceRootHandleV5,
+        workspace_root: WorkspaceRootHandleV5,
+        lease: WorkspaceLeaseV5,
+    ) -> OwnedWorkspaceHandleV5:
+        return self._delegate.create_disposable_workspace(
+            source_root=source_root,
+            workspace_root=workspace_root,
+            lease=lease,
+        )
+
+    def open_owned_workspace(
+        self,
+        *,
+        workspace_root: WorkspaceRootHandleV5,
+        lease: WorkspaceLeaseV5,
+    ) -> OwnedWorkspaceHandleV5 | None:
+        return self._delegate.open_owned_workspace(workspace_root=workspace_root, lease=lease)
+
+    def workspace_presence(
+        self,
+        *,
+        workspace: OwnedWorkspaceHandleV5,
+        lease: WorkspaceLeaseV5,
+    ) -> WorkspacePresenceV5:
+        return self._delegate.workspace_presence(workspace=workspace, lease=lease)
+
+    def read_workspace_policy_file(self, *, workspace: OwnedWorkspaceHandleV5, relative_path: str) -> bytes:
+        return self._delegate.read_workspace_policy_file(workspace=workspace, relative_path=relative_path)
+
+    def write_workspace_policy_file(
+        self,
+        *,
+        workspace: OwnedWorkspaceHandleV5,
+        relative_path: str,
+        content: bytes,
+    ) -> None:
+        self._delegate.write_workspace_policy_file(
+            workspace=workspace,
+            relative_path=relative_path,
+            content=content,
+        )
+
+    def load_lease(self, lease_id: str) -> WorkspaceLeaseV5 | None:
+        return self._delegate.load_lease(lease_id)
+
+    def controller_lease_is_live(self, owner: WorkspaceOwnerV5) -> bool:
+        return self._delegate.controller_lease_is_live(owner)
+
+    def remove_workspace_no_follow(
+        self,
+        *,
+        workspace_root: WorkspaceRootHandleV5,
+        workspace: OwnedWorkspaceHandleV5,
+        lease: WorkspaceLeaseV5,
+    ) -> WorkspaceRemovalStateV5:
+        return self._delegate.remove_workspace_no_follow(
+            workspace_root=workspace_root,
+            workspace=workspace,
+            lease=lease,
+        )
+
+    def retire_lease(self, lease_id: str) -> None:
+        self._delegate.retire_lease(lease_id)
+
+
 class GitCandidateMaterializerV5:
     def __init__(
         self,
@@ -391,6 +474,10 @@ class GitCandidateMaterializerV5:
             raise ValueError("acquired source and workspace roots are not fully disjoint")
         if self._source_root.root_identity_sha256 == self._workspace_root.root_identity_sha256:
             raise ValueError("source and workspace root handles must be distinct")
+
+    @property
+    def driver(self) -> GitWorkspaceDriverV5:
+        return self._driver
 
     def _fail(self, code: WorkspaceFailureCodeV5) -> None:
         raise WorkspaceAdapterErrorV5(WorkspaceFailureV5(code))
@@ -660,6 +747,7 @@ class GitCandidateMaterializerV5:
 
 
 __all__ = [
+    "AuthenticatedGitWorkspaceDriverV5",
     "GitCandidateMaterializerV5",
     "GitWorkspaceDriverV5",
     "MaterializedWorkspaceV5",

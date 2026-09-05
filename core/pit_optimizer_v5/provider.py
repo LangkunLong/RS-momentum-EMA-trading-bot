@@ -1785,6 +1785,49 @@ class OneShotJsonCompletionV5(Protocol):
     ) -> CompletionResultV5: ...
 
 
+class AuthenticatedOneShotJsonCompletionV5:
+    """Identity-bound production gateway capability supplied by the local host."""
+
+    __slots__ = ("_delegate", "audit_store_identity_sha256", "gateway_identity_sha256", "ledger_identity_sha256")
+
+    def __init__(
+        self,
+        *,
+        delegate: OneShotJsonCompletionV5,
+        gateway_identity_sha256: str,
+        ledger_identity_sha256: str,
+        audit_store_identity_sha256: str,
+    ) -> None:
+        if not isinstance(delegate, OneShotJsonCompletionV5):
+            raise ValueError("production gateway delegate is invalid")
+        self.gateway_identity_sha256 = _digest(gateway_identity_sha256, "production gateway identity")
+        self.ledger_identity_sha256 = _digest(ledger_identity_sha256, "production gateway ledger identity")
+        self.audit_store_identity_sha256 = _digest(
+            audit_store_identity_sha256,
+            "production gateway audit-store identity",
+        )
+        self._delegate = delegate
+
+    def invoke_json_once(
+        self,
+        *,
+        model: str,
+        messages: tuple[Mapping[str, object], ...],
+        response_schema_json: bytes,
+        max_output_tokens: int,
+        automatic_retries: int,
+        schema_repair_calls: int,
+    ) -> CompletionResultV5:
+        return self._delegate.invoke_json_once(
+            model=model,
+            messages=messages,
+            response_schema_json=response_schema_json,
+            max_output_tokens=max_output_tokens,
+            automatic_retries=automatic_retries,
+            schema_repair_calls=schema_repair_calls,
+        )
+
+
 class GatewayCompletionProviderV5:
     """Adapt a truthful one-shot callable without claiming a current gateway implementation."""
 
@@ -1794,6 +1837,10 @@ class GatewayCompletionProviderV5:
         if not isinstance(gateway, OneShotJsonCompletionV5):
             raise ValueError("V5 completion gateway lacks the one-shot JSON boundary")
         self._gateway = gateway
+
+    @property
+    def gateway(self) -> OneShotJsonCompletionV5:
+        return self._gateway
 
     def complete_once(self, request: ProviderCompletionRequestV5) -> CompletionResultV5:
         if type(request) is not ProviderCompletionRequestV5:
@@ -2374,6 +2421,81 @@ class LedgerRoleAuthorizationLifecycleV5(RoleAuthorizationLifecycleV5, Protocol)
 
     @property
     def ledger_identity_sha256(self) -> str: ...
+
+
+class AuthenticatedRoleLedgerV5:
+    """Exact identity-bound production authorization and reconciliation capability."""
+
+    __slots__ = (
+        "_lifecycle",
+        "_reconciler",
+        "audit_store_identity_sha256",
+        "campaign_manifest_sha256",
+        "ledger_identity_sha256",
+    )
+
+    def __init__(
+        self,
+        *,
+        lifecycle: RoleAuthorizationLifecycleV5,
+        reconciler: PaidRoleReconcilerV5,
+        campaign_manifest_sha256: str,
+        ledger_identity_sha256: str,
+        audit_store_identity_sha256: str,
+    ) -> None:
+        if not isinstance(lifecycle, RoleAuthorizationLifecycleV5) or not isinstance(
+            reconciler,
+            PaidRoleReconcilerV5,
+        ):
+            raise ValueError("production role-ledger delegates are invalid")
+        self.campaign_manifest_sha256 = _digest(
+            campaign_manifest_sha256,
+            "production role-ledger manifest",
+        )
+        self.ledger_identity_sha256 = _digest(ledger_identity_sha256, "production role-ledger identity")
+        self.audit_store_identity_sha256 = _digest(
+            audit_store_identity_sha256,
+            "production role-ledger audit-store identity",
+        )
+        self._lifecycle = lifecycle
+        self._reconciler = reconciler
+
+    def reserve_role_slot(self, request: RoleSlotRequestV5) -> AuthorizedRoleSlotV5:
+        return self._lifecycle.reserve_role_slot(request)
+
+    def verify_role_slot(self, slot: AuthorizedRoleSlotV5) -> None:
+        self._lifecycle.verify_role_slot(slot)
+
+    def settle_role_slot(
+        self,
+        slot: AuthorizedRoleSlotV5,
+        facts: RoleAttemptFactsV5,
+    ) -> RoleTerminalReceiptV5:
+        return self._lifecycle.settle_role_slot(slot, facts)
+
+    def settle_unreported_role_slot(
+        self,
+        slot: AuthorizedRoleSlotV5,
+        failure_code: RoleFailureCode,
+    ) -> RecoveredRoleTerminalV5:
+        return self._lifecycle.settle_unreported_role_slot(slot, failure_code)
+
+    def recover_role_slot(self, slot: AuthorizedRoleSlotV5) -> RecoveredRoleTerminalV5 | None:
+        return self._lifecycle.recover_role_slot(slot)
+
+    def verify_role_slot_receipt(
+        self,
+        slot: AuthorizedRoleSlotV5,
+        facts: RoleAttemptFactsV5,
+        receipt: RoleTerminalReceiptV5,
+    ) -> None:
+        self._lifecycle.verify_role_slot_receipt(slot, facts, receipt)
+
+    def reconcile_paid_role(
+        self,
+        persisted_request: ExistingPersistedRoleRequestV5,
+    ) -> RoleReconciliationResultV5:
+        return self._reconciler.reconcile_paid_role(persisted_request)
 
 
 @runtime_checkable
@@ -2989,6 +3111,10 @@ class LedgerBackedRoleInvokerV5:
     def runner(self) -> AuthorizedRoleRunnerV5:
         return self._runner
 
+    @property
+    def reconciler(self) -> PaidRoleReconcilerV5:
+        return self._reconciler
+
     def invoke_once(self, persisted_request: FreshPersistedRoleRequestV5) -> RoleInvocationPackageV5:
         if type(persisted_request) is not FreshPersistedRoleRequestV5:
             raise ValueError("fresh role invocation capability is invalid")
@@ -3165,6 +3291,8 @@ class FixtureRoleRunnerV5:
 
 __all__ = [
     "ArchiveFamilyAggregateV5",
+    "AuthenticatedOneShotJsonCompletionV5",
+    "AuthenticatedRoleLedgerV5",
     "AuthorPolicyContractsV5",
     "AuthorRoleInputV5",
     "AuthorizedRoleRunnerV5",

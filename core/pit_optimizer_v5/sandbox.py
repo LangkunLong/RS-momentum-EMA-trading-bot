@@ -45,7 +45,7 @@ from core.pit_optimizer_v5.runtime import (
     StageDeadlineV5,
 )
 from core.pit_optimizer_v5.search import ParentCandidateV5
-from core.pit_optimizer_v5.workspace import WorkspaceOwnerV5
+from core.pit_optimizer_v5.workspace import GitCandidateMaterializerV5, WorkspaceOwnerV5
 
 
 SandboxFailureCodeV5 = Literal[
@@ -495,6 +495,54 @@ class ContainerExecutorV5(Protocol):
     def cleanup(self, *, owner: WorkspaceOwnerV5, leases: tuple[OwnedLeaseV5, ...]) -> CleanupResultPayloadV5: ...
 
 
+class AuthenticatedContainerExecutorV5:
+    """Identity-bound production container capability supplied by the local host."""
+
+    def __init__(self, *, delegate: ContainerExecutorV5, executor_identity_sha256: str) -> None:
+        if not isinstance(delegate, ContainerExecutorV5):
+            raise ValueError("production container executor delegate is invalid")
+        self.executor_identity_sha256 = _digest(executor_identity_sha256, "container executor identity")
+        self._delegate = delegate
+
+    def reserve(self, command: ContainerCommandV5) -> ExecutionReservationV5:
+        return self._delegate.reserve(command)
+
+    def start(self, reservation: ExecutionReservationV5) -> None:
+        self._delegate.start(reservation)
+
+    def collect(
+        self,
+        reservation: ExecutionReservationV5,
+        *,
+        remaining_timeout_seconds: float,
+    ) -> ContainerExecutionResultV5:
+        return self._delegate.collect(
+            reservation,
+            remaining_timeout_seconds=remaining_timeout_seconds,
+        )
+
+    def reconcile(
+        self,
+        *,
+        request: DockerPanelRequestV5,
+        authority: CandidateExecutionAuthorityV5,
+        remaining_timeout_seconds: float,
+    ) -> ExecutionReservationV5 | None:
+        return self._delegate.reconcile(
+            request=request,
+            authority=authority,
+            remaining_timeout_seconds=remaining_timeout_seconds,
+        )
+
+    def cleanup(
+        self,
+        *,
+        owner: WorkspaceOwnerV5,
+        leases: tuple[OwnedLeaseV5, ...],
+    ) -> CleanupResultPayloadV5:
+        return self._delegate.cleanup(owner=owner, leases=leases)
+
+
 @runtime_checkable
 class RuntimeLeaseRegistrarV5(Protocol):
     def register_execution(
@@ -534,6 +582,69 @@ class CandidateBaseOperationsV5(Protocol):
     ) -> SemanticFingerprintV5: ...
 
 
+class AuthenticatedCandidateBaseOperationsV5:
+    """Identity-bound source/workspace/probe capability for production composition."""
+
+    def __init__(
+        self,
+        *,
+        delegate: CandidateBaseOperationsV5,
+        materializer: GitCandidateMaterializerV5,
+        base_identity_sha256: str,
+    ) -> None:
+        if not isinstance(delegate, CandidateBaseOperationsV5) or type(materializer) is not GitCandidateMaterializerV5:
+            raise ValueError("production candidate-base delegate is invalid")
+        self.base_identity_sha256 = _digest(base_identity_sha256, "candidate-base identity")
+        self._delegate = delegate
+        self.materializer = materializer
+
+    def load_parent_source(self, parent: ParentCandidateV5) -> SourceBundleV5:
+        return self._delegate.load_parent_source(parent)
+
+    def materialize(
+        self,
+        *,
+        inputs: FeedbackRoundInputV5,
+        experiment_identity: ExperimentIdentityV5,
+        variant: RenderedVariantV5,
+        deadline: StageDeadlineV5,
+    ) -> MaterializedVariantV5:
+        return self._delegate.materialize(
+            inputs=inputs,
+            experiment_identity=experiment_identity,
+            variant=variant,
+            deadline=deadline,
+        )
+
+    def recover_materialized(
+        self,
+        *,
+        inputs: FeedbackRoundInputV5,
+        experiment_identity: ExperimentIdentityV5,
+        variant: RenderedVariantV5,
+        leases: tuple[OwnedLeaseV5, ...],
+        deadline: StageDeadlineV5,
+    ) -> MaterializedVariantV5:
+        return self._delegate.recover_materialized(
+            inputs=inputs,
+            experiment_identity=experiment_identity,
+            variant=variant,
+            leases=leases,
+            deadline=deadline,
+        )
+
+    def validate(self, materialized: MaterializedVariantV5, *, deadline: StageDeadlineV5) -> ValidationResultV5:
+        return self._delegate.validate(materialized, deadline=deadline)
+
+    def fingerprint(
+        self,
+        materialized: MaterializedVariantV5,
+        *,
+        deadline: StageDeadlineV5,
+    ) -> SemanticFingerprintV5:
+        return self._delegate.fingerprint(materialized, deadline=deadline)
+
+
 @runtime_checkable
 class SandboxMountFactoryV5(Protocol):
     def mounts_for(
@@ -544,6 +655,31 @@ class SandboxMountFactoryV5(Protocol):
         scenario_ids: tuple[str, ...],
         execution_key: CandidateExecutionKeyV5,
     ) -> tuple[SandboxMountHandleV5, SandboxMountHandleV5, SandboxMountHandleV5]: ...
+
+
+class AuthenticatedSandboxMountFactoryV5:
+    """Identity-bound root-handle mount capability for production composition."""
+
+    def __init__(self, *, delegate: SandboxMountFactoryV5, mount_identity_sha256: str) -> None:
+        if not isinstance(delegate, SandboxMountFactoryV5):
+            raise ValueError("production mount-factory delegate is invalid")
+        self.mount_identity_sha256 = _digest(mount_identity_sha256, "sandbox mount-factory identity")
+        self._delegate = delegate
+
+    def mounts_for(
+        self,
+        *,
+        materialized: MaterializedVariantV5,
+        panel: EpisodePlanV5,
+        scenario_ids: tuple[str, ...],
+        execution_key: CandidateExecutionKeyV5,
+    ) -> tuple[SandboxMountHandleV5, SandboxMountHandleV5, SandboxMountHandleV5]:
+        return self._delegate.mounts_for(
+            materialized=materialized,
+            panel=panel,
+            scenario_ids=scenario_ids,
+            execution_key=execution_key,
+        )
 
 
 def _mount_arg(mount: SandboxMountHandleV5) -> str:
@@ -696,6 +832,10 @@ class DockerPanelEvaluatorV5:
             raise ValueError("Docker panel evaluator dependencies are invalid")
         self._executor = executor
         self._clock = clock
+
+    @property
+    def executor(self) -> ContainerExecutorV5:
+        return self._executor
 
     @staticmethod
     def _failure(code: SandboxFailureCodeV5, leases: tuple[ExecutionLeaseV5, ...] = ()) -> DockerPanelOutcomeV5:
@@ -996,6 +1136,14 @@ class RuntimeDockerPanelEvaluatorV5:
         self._evaluator = evaluator
         self._registrar = registrar
 
+    @property
+    def evaluator(self) -> DockerPanelEvaluatorV5:
+        return self._evaluator
+
+    @property
+    def registrar(self) -> RuntimeLeaseRegistrarV5:
+        return self._registrar
+
     def evaluate(
         self,
         request: DockerPanelRequestV5,
@@ -1093,6 +1241,38 @@ class DockerCandidateRuntimeV5:
         self._evaluator = evaluator
         if not isinstance(self, CandidateRuntimeV5) or not isinstance(self, LeaseAwareCandidateRuntimeV5):
             raise ValueError("Docker candidate runtime does not satisfy CandidateRuntimeV5")
+
+    @property
+    def base_operations(self) -> CandidateBaseOperationsV5:
+        return self._base
+
+    @property
+    def manifest(self) -> CampaignManifestV5:
+        return self._manifest
+
+    @property
+    def panel_plan(self) -> CampaignPanelPlanV5:
+        return self._panel_plan
+
+    @property
+    def evaluator_contract(self) -> EvaluatorContractV5:
+        return self._contract
+
+    @property
+    def sandbox_profile(self) -> SandboxProfileV5:
+        return self._profile
+
+    @property
+    def owner(self) -> WorkspaceOwnerV5:
+        return self._owner
+
+    @property
+    def mount_factory(self) -> SandboxMountFactoryV5:
+        return self._mounts
+
+    @property
+    def panel_evaluator(self) -> RuntimeDockerPanelEvaluatorV5:
+        return self._evaluator
 
     def load_parent_source(self, parent: ParentCandidateV5) -> SourceBundleV5:
         return self._base.load_parent_source(parent)
@@ -1318,6 +1498,9 @@ class DockerCandidateRuntimeV5:
 
 
 __all__ = [
+    "AuthenticatedCandidateBaseOperationsV5",
+    "AuthenticatedContainerExecutorV5",
+    "AuthenticatedSandboxMountFactoryV5",
     "BoundedOutputBytesV5",
     "CandidateBaseOperationsV5",
     "ContainerExecutionResultV5",

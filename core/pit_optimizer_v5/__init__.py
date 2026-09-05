@@ -71,6 +71,9 @@ from .runtime import (
     run_feedback_round_v5,
 )
 from .sandbox import (
+    AuthenticatedCandidateBaseOperationsV5,
+    AuthenticatedContainerExecutorV5,
+    AuthenticatedSandboxMountFactoryV5,
     BoundedOutputBytesV5,
     CandidateBaseOperationsV5,
     ContainerExecutionResultV5,
@@ -95,6 +98,7 @@ from .sandbox import (
 )
 from .summary import OptimizerSummaryV5, summarize_repository_v5, unavailable_summary_v5
 from .workspace import (
+    AuthenticatedGitWorkspaceDriverV5,
     GitCandidateMaterializerV5,
     GitWorkspaceDriverV5,
     MaterializedWorkspaceV5,
@@ -120,7 +124,11 @@ __all__ = [
     "ArtifactGraphVerifierV5",
     "ArtifactIndexV5",
     "ArtifactRefV5",
+    "AuthenticatedGitWorkspaceDriverV5",
+    "AuthenticatedCandidateBaseOperationsV5",
+    "AuthenticatedContainerExecutorV5",
     "AuthenticatedPitBundleV5",
+    "AuthenticatedSandboxMountFactoryV5",
     "AuthenticatedArtifactV5",
     "BaselineWorkerBindingV5",
     "BaselineWorkerFactoryV5",
