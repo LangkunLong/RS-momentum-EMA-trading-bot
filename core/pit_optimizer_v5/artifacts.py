@@ -47,6 +47,7 @@ from core.pit_optimizer_v5.contracts import (
     ValidationResultV5,
     canonical_json_bytes_v5,
     canonical_primitive_v5,
+    canonical_sha256_v5,
 )
 from core.pit_optimizer_v5.memory import (
     ArchiveReducerV5,
@@ -57,6 +58,7 @@ from core.pit_optimizer_v5.memory import (
     RecoveryStepV5,
     RenderedVariantPayloadV5,
     ResourceLeasePayloadV5,
+    RoleCompletionPayloadV5,
     RoundEventPayloadV5,
     RoundEventV5,
     RoundIntentPayloadV5,
@@ -70,6 +72,22 @@ from core.pit_optimizer_v5.memory import (
     round_event_payload_primitive_v5,
 )
 from core.pit_optimizer_v5.probes import ProbeObservationV5, SemanticFingerprintV5
+from core.pit_optimizer_v5.provider import (
+    FixtureRoleTerminalAuthorityV5,
+    LedgerRoleTerminalAuthorityV5,
+    ParsedRoleArtifactV5,
+    RoleAttemptFactsV5,
+    RoleCallKeyV5,
+    RoleFailureCode,
+    RoleInputV5,
+    RoleInvocationPackageV5,
+    RoleNameV5,
+    RoleRequestV5,
+    RoleSchemaAuthorityV5,
+    RoleTerminalAuthorityV5,
+    decode_parsed_role_artifact_v5,
+    parsed_role_artifact_primitive_v5,
+)
 
 
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -199,6 +217,29 @@ def _exact_keys(
 T = TypeVar("T")
 
 
+def _constructor_primitive(value: object) -> object:
+    """Encode exactly the public constructor surface of immutable contracts."""
+
+    if isinstance(value, Decimal):
+        return canonical_primitive_v5(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {item.name: _constructor_primitive(getattr(value, item.name)) for item in fields(value) if item.init}
+    if isinstance(value, tuple):
+        return [_constructor_primitive(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _constructor_primitive(item) for key, item in sorted(value.items())}
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeError:
+            raise ValueError("durable contract bytes must be UTF-8") from None
+    if isinstance(value, str):
+        return str(value)
+    if value is None or type(value) in {bool, int, float}:
+        return value
+    raise ValueError("durable contract contains an unsupported value")
+
+
 def _decode_value(annotation: object, value: object) -> object:
     origin = get_origin(annotation)
     arguments = get_args(annotation)
@@ -261,6 +302,72 @@ def _decode_dataclass(cls: type[T], value: object) -> T:
     hints = get_type_hints(cls)
     decoded = {item.name: _decode_value(hints[item.name], primitive[item.name]) for item in fields(cls) if item.init}
     return cls(**decoded)
+
+
+def _role_request_primitive(request: RoleRequestV5) -> dict[str, object]:
+    if type(request) is not RoleRequestV5:
+        raise ValueError("durable role request must use the V5 schema")
+    result = _constructor_primitive(request)
+    if type(result) is not dict:
+        raise ValueError("durable role request primitive is invalid")
+    return result
+
+
+def _decode_role_request(value: object) -> RoleRequestV5:
+    primitive = _exact_keys(
+        value,
+        {
+            "role",
+            "role_input",
+            "role_evidence",
+            "expected_binding",
+            "max_output_tokens",
+            "schema_authority",
+        },
+    )
+    hints = get_type_hints(RoleRequestV5)
+    return RoleRequestV5(
+        role=_decode_value(hints["role"], primitive["role"]),  # type: ignore[arg-type]
+        role_input=_decode_value(RoleInputV5, primitive["role_input"]),  # type: ignore[arg-type]
+        role_evidence=_decode_value(hints["role_evidence"], primitive["role_evidence"]),  # type: ignore[arg-type]
+        expected_binding=_decode_value(hints["expected_binding"], primitive["expected_binding"]),  # type: ignore[arg-type]
+        max_output_tokens=_decode_value(int, primitive["max_output_tokens"]),  # type: ignore[arg-type]
+        schema_authority=_decode_value(RoleSchemaAuthorityV5, primitive["schema_authority"]),  # type: ignore[arg-type]
+    )
+
+
+def _decode_role_attempt(value: object) -> RoleAttemptFactsV5:
+    primitive = _exact_keys(
+        value,
+        {
+            "role",
+            "attempt_kind",
+            "attempt_index",
+            "request_sha256",
+            "slot_id",
+            "outcome",
+            "failure_code",
+            "usage",
+            "response_sha256",
+            "artifact_sha256",
+        },
+    )
+    hints = get_type_hints(RoleAttemptFactsV5)
+    failure_value = primitive["failure_code"]
+    if failure_value is not None and type(failure_value) is not str:
+        raise ValueError
+    return RoleAttemptFactsV5(
+        role=_decode_value(hints["role"], primitive["role"]),  # type: ignore[arg-type]
+        attempt_kind=_decode_value(hints["attempt_kind"], primitive["attempt_kind"]),  # type: ignore[arg-type]
+        attempt_index=_decode_value(int, primitive["attempt_index"]),  # type: ignore[arg-type]
+        request_sha256=_decode_value(str, primitive["request_sha256"]),  # type: ignore[arg-type]
+        slot_id=_decode_value(str | None, primitive["slot_id"]),  # type: ignore[arg-type]
+        outcome=_decode_value(hints["outcome"], primitive["outcome"]),  # type: ignore[arg-type]
+        failure_code=None if failure_value is None else RoleFailureCode(failure_value),
+        usage=_decode_value(hints["usage"], primitive["usage"]),  # type: ignore[arg-type]
+        response_sha256=_decode_value(str | None, primitive["response_sha256"]),  # type: ignore[arg-type]
+        artifact_sha256=_decode_value(str | None, primitive["artifact_sha256"]),  # type: ignore[arg-type]
+    )
 
 
 def _decode_literal(value: object) -> object:
@@ -535,6 +642,8 @@ def _decode_round_payload(expected_kind: str, value: object) -> RoundEventPayloa
     body = envelope["payload"]
     if expected_kind == "round_intent":
         return _decode_dataclass(RoundIntentPayloadV5, body)
+    if expected_kind == "role_completion":
+        return _decode_dataclass(RoleCompletionPayloadV5, body)
     if expected_kind == "rendered_variant":
         item = _exact_keys(body, {"variant"})
         return RenderedVariantPayloadV5(variant=_decode_rendered_variant(item["variant"]))
@@ -632,6 +741,81 @@ class RepositoryCheckpointV5:
             "archive_sha256": self.archive_sha256,
             "record_refs": [item.to_primitive() for item in self.record_refs],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedRoleRequestV5:
+    reference: ArtifactRefV5
+    call: RoleCallKeyV5
+    request: RoleRequestV5
+    newly_created: bool
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.reference) is not ArtifactRefV5
+            or type(self.call) is not RoleCallKeyV5
+            or type(self.request) is not RoleRequestV5
+        ):
+            raise ValueError("persisted role request is invalid")
+        if type(self.newly_created) is not bool:
+            raise ValueError("persisted role request creation state is invalid")
+        if (
+            self.call.role != self.request.role
+            or self.call.request_sha256 != self.request.sha256
+            or self.reference.relative_path != f"roles/requests/{self.call.sha256}.json"
+        ):
+            raise ValueError("persisted role request path differs from its identity")
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedRoleInvocationV5:
+    payload: RoleCompletionPayloadV5
+    call: RoleCallKeyV5
+    package: RoleInvocationPackageV5
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.payload) is not RoleCompletionPayloadV5
+            or type(self.call) is not RoleCallKeyV5
+            or type(self.package) is not RoleInvocationPackageV5
+        ):
+            raise ValueError("persisted role invocation is invalid")
+        artifact_sha256 = None if self.package.artifact is None else canonical_sha256_v5(self.package.artifact)
+        expected = (
+            self.call.sha256,
+            self.package.request.role,
+            self.package.attempt.outcome,
+            self.package.request.sha256,
+            self.package.binding_sha256,
+            self.package.attempt.sha256,
+            self.package.terminal_authority_sha256,
+            artifact_sha256,
+            self.package.sha256,
+        )
+        actual = (
+            self.payload.call_key_sha256,
+            self.payload.role,
+            self.payload.outcome,
+            self.payload.request_sha256,
+            self.payload.binding_sha256,
+            self.payload.attempt_sha256,
+            self.payload.terminal_authority_sha256,
+            self.payload.artifact_sha256,
+            self.payload.package_sha256,
+        )
+        if actual != expected:
+            raise ValueError("role completion differs from its durable package")
+        if (
+            self.package.call != self.call
+            or self.call.campaign_id != self.payload.campaign_id
+            or self.call.round_index != self.payload.round_index
+            or self.call.role_position != self.payload.role_position
+            or self.call.role != self.package.request.role
+            or self.call.attempt_kind != self.package.attempt.attempt_kind
+            or self.call.attempt_index != self.package.attempt.attempt_index
+            or self.call.request_sha256 != self.package.request.sha256
+        ):
+            raise ValueError("role completion call key differs from its package")
 
 
 class LocalArtifactRepositoryV5:
@@ -787,14 +971,20 @@ class LocalArtifactRepositoryV5:
             child_references=_extract_artifact_refs(primitive),
         )
 
-    def _create_only(self, relative_path: str, primitive: object) -> ArtifactRefV5:
+    def _create_only_with_status(
+        self,
+        relative_path: str,
+        primitive: object,
+    ) -> tuple[ArtifactRefV5, bool]:
         parts = _safe_relative_path(relative_path)
         raw = canonical_json_bytes_v5(primitive)
         reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
+        created = True
         try:
             with self._directory(tuple(parts[:-1]), create=True) as directory:
                 _write_create_only_in_directory(directory, parts[-1], raw)
         except FileExistsError:
+            created = False
             try:
                 existing = self.authenticate(reference)
             except ArtifactRepositoryFailureV5:
@@ -805,7 +995,10 @@ class LocalArtifactRepositoryV5:
             raise
         except (OSError, ValueError):
             raise ArtifactRelocatedV5(reference, relative_path) from None
-        return reference
+        return reference, created
+
+    def _create_only(self, relative_path: str, primitive: object) -> ArtifactRefV5:
+        return self._create_only_with_status(relative_path, primitive)[0]
 
     def _replace(self, relative_path: str, primitive: object) -> ArtifactRefV5:
         if relative_path not in {"archive.json", "checkpoint.json"}:
@@ -829,7 +1022,293 @@ class LocalArtifactRepositoryV5:
         digest = hashlib.sha256(canonical_json_bytes_v5(primitive)).hexdigest()
         return self._create_only(f"inputs/{kind}/{digest}.json", primitive)
 
+    def append_role_request(
+        self,
+        *,
+        call: RoleCallKeyV5,
+        request: RoleRequestV5,
+    ) -> PersistedRoleRequestV5:
+        """Persist the full reconstructible request before any role invocation."""
+
+        if type(call) is not RoleCallKeyV5 or type(request) is not RoleRequestV5:
+            raise ValueError("role call and request must use the V5 schema")
+        if call.role != request.role or call.request_sha256 != request.sha256:
+            raise ValueError("role call differs from its exact request")
+        primitive = {
+            "schema_version": 5,
+            "artifact_type": "role_request",
+            "call": _constructor_primitive(call),
+            "request": _role_request_primitive(request),
+        }
+        path = f"roles/requests/{call.sha256}.json"
+        reference, created = self._create_only_with_status(path, primitive)
+        return PersistedRoleRequestV5(
+            reference=reference,
+            call=call,
+            request=request,
+            newly_created=created,
+        )
+
+    def _load_role_request_entry(
+        self,
+        reference: ArtifactRefV5,
+    ) -> tuple[RoleCallKeyV5, RoleRequestV5]:
+        authenticated = self.authenticate(reference)
+        try:
+            envelope = _exact_keys(
+                _strict_json_object(authenticated.content, reference),
+                {"schema_version", "artifact_type", "call", "request"},
+                reference,
+            )
+            if envelope["schema_version"] != 5 or envelope["artifact_type"] != "role_request":
+                raise ArtifactSchemaFailureV5(reference)
+            call = _decode_dataclass(RoleCallKeyV5, envelope["call"])
+            request = _decode_role_request(envelope["request"])
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (TypeError, ValueError, ArithmeticError):
+            raise ArtifactSchemaFailureV5(reference) from None
+        if (
+            call.role != request.role
+            or call.request_sha256 != request.sha256
+            or reference.relative_path != f"roles/requests/{call.sha256}.json"
+        ):
+            raise ArtifactSchemaFailureV5(reference)
+        if (
+            canonical_json_bytes_v5(
+                {
+                    "schema_version": 5,
+                    "artifact_type": "role_request",
+                    "call": _constructor_primitive(call),
+                    "request": _role_request_primitive(request),
+                }
+            )
+            != authenticated.content
+        ):
+            raise ArtifactNonCanonicalV5(reference)
+        return call, request
+
+    def load_role_request(self, reference: ArtifactRefV5) -> RoleRequestV5:
+        return self._load_role_request_entry(reference)[1]
+
+    def append_role_attempt(self, attempt: RoleAttemptFactsV5) -> ArtifactRefV5:
+        if type(attempt) is not RoleAttemptFactsV5:
+            raise ValueError("role attempt must use the V5 schema")
+        primitive = {
+            "schema_version": 5,
+            "artifact_type": "role_attempt",
+            "attempt": _constructor_primitive(attempt),
+        }
+        return self._create_only(f"roles/attempts/{attempt.role}/{attempt.sha256}.json", primitive)
+
+    def load_role_attempt(self, reference: ArtifactRefV5) -> RoleAttemptFactsV5:
+        authenticated = self.authenticate(reference)
+        try:
+            envelope = _exact_keys(
+                _strict_json_object(authenticated.content, reference),
+                {"schema_version", "artifact_type", "attempt"},
+                reference,
+            )
+            if envelope["schema_version"] != 5 or envelope["artifact_type"] != "role_attempt":
+                raise ArtifactSchemaFailureV5(reference)
+            attempt = _decode_role_attempt(envelope["attempt"])
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (TypeError, ValueError, ArithmeticError):
+            raise ArtifactSchemaFailureV5(reference) from None
+        if reference.relative_path != f"roles/attempts/{attempt.role}/{attempt.sha256}.json":
+            raise ArtifactSchemaFailureV5(reference)
+        expected = {
+            "schema_version": 5,
+            "artifact_type": "role_attempt",
+            "attempt": _constructor_primitive(attempt),
+        }
+        if canonical_json_bytes_v5(expected) != authenticated.content:
+            raise ArtifactNonCanonicalV5(reference)
+        return attempt
+
+    def append_role_terminal_authority(
+        self,
+        *,
+        role: RoleNameV5,
+        authority: RoleTerminalAuthorityV5,
+    ) -> ArtifactRefV5:
+        if role not in {"investigator", "author", "critic"}:
+            raise ValueError("role terminal authority role is invalid")
+        if type(authority) is LedgerRoleTerminalAuthorityV5:
+            kind = "ledger_receipt"
+            identity = authority.sha256
+        elif type(authority) is FixtureRoleTerminalAuthorityV5:
+            kind = "fixture_authority"
+            identity = authority.sha256
+        else:
+            raise ValueError("role terminal authority is outside the closed V5 union")
+        primitive = {
+            "schema_version": 5,
+            "artifact_type": "role_terminal_authority",
+            "authority_kind": kind,
+            "authority": _constructor_primitive(authority),
+        }
+        return self._create_only(f"roles/terminals/{role}/{identity}.json", primitive)
+
+    def load_role_terminal_authority(
+        self,
+        reference: ArtifactRefV5,
+        *,
+        role: RoleNameV5,
+    ) -> RoleTerminalAuthorityV5:
+        authenticated = self.authenticate(reference)
+        try:
+            envelope = _exact_keys(
+                _strict_json_object(authenticated.content, reference),
+                {"schema_version", "artifact_type", "authority_kind", "authority"},
+                reference,
+            )
+            if envelope["schema_version"] != 5 or envelope["artifact_type"] != "role_terminal_authority":
+                raise ArtifactSchemaFailureV5(reference)
+            kind = envelope["authority_kind"]
+            if kind == "ledger_receipt":
+                authority: RoleTerminalAuthorityV5 = _decode_dataclass(
+                    LedgerRoleTerminalAuthorityV5,
+                    envelope["authority"],
+                )
+                identity = authority.sha256
+            elif kind == "fixture_authority":
+                authority = _decode_dataclass(FixtureRoleTerminalAuthorityV5, envelope["authority"])
+                identity = authority.sha256
+            else:
+                raise ArtifactSchemaFailureV5(reference)
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (TypeError, ValueError, ArithmeticError):
+            raise ArtifactSchemaFailureV5(reference) from None
+        if reference.relative_path != f"roles/terminals/{role}/{identity}.json":
+            raise ArtifactSchemaFailureV5(reference)
+        expected = {
+            "schema_version": 5,
+            "artifact_type": "role_terminal_authority",
+            "authority_kind": kind,
+            "authority": _constructor_primitive(authority),
+        }
+        if canonical_json_bytes_v5(expected) != authenticated.content:
+            raise ArtifactNonCanonicalV5(reference)
+        return authority
+
+    def append_role_artifact(
+        self,
+        *,
+        role: RoleNameV5,
+        artifact: ParsedRoleArtifactV5,
+    ) -> ArtifactRefV5:
+        primitive = {
+            "schema_version": 5,
+            "artifact_type": "role_artifact",
+            "payload": parsed_role_artifact_primitive_v5(artifact),
+        }
+        identity = canonical_sha256_v5(artifact)
+        return self._create_only(f"roles/artifacts/{role}/{identity}.json", primitive)
+
+    def load_role_artifact(
+        self,
+        reference: ArtifactRefV5,
+        *,
+        role: RoleNameV5,
+    ) -> ParsedRoleArtifactV5:
+        authenticated = self.authenticate(reference)
+        try:
+            envelope = _exact_keys(
+                _strict_json_object(authenticated.content, reference),
+                {"schema_version", "artifact_type", "payload"},
+                reference,
+            )
+            if envelope["schema_version"] != 5 or envelope["artifact_type"] != "role_artifact":
+                raise ArtifactSchemaFailureV5(reference)
+            artifact = decode_parsed_role_artifact_v5(role=role, primitive=envelope["payload"])
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (TypeError, ValueError, ArithmeticError):
+            raise ArtifactSchemaFailureV5(reference) from None
+        identity = canonical_sha256_v5(artifact)
+        if reference.relative_path != f"roles/artifacts/{role}/{identity}.json":
+            raise ArtifactSchemaFailureV5(reference)
+        expected = {
+            "schema_version": 5,
+            "artifact_type": "role_artifact",
+            "payload": parsed_role_artifact_primitive_v5(artifact),
+        }
+        if canonical_json_bytes_v5(expected) != authenticated.content:
+            raise ArtifactNonCanonicalV5(reference)
+        return artifact
+
+    def persist_role_invocation(
+        self,
+        *,
+        call: RoleCallKeyV5,
+        request_ref: ArtifactRefV5,
+        package: RoleInvocationPackageV5,
+    ) -> PersistedRoleInvocationV5:
+        """Durably store one terminal package after its request already exists."""
+
+        if type(call) is not RoleCallKeyV5 or type(package) is not RoleInvocationPackageV5:
+            raise ValueError("role call and invocation package must use the V5 schema")
+        persisted_call, persisted_request = self._load_role_request_entry(request_ref)
+        if persisted_call != call or persisted_request != package.request:
+            raise ValueError("role invocation request differs from its durable request")
+        attempt_ref = self.append_role_attempt(package.attempt)
+        terminal_ref = self.append_role_terminal_authority(
+            role=package.request.role,
+            authority=package.terminal_authority,
+        )
+        artifact_ref = (
+            None
+            if package.artifact is None
+            else self.append_role_artifact(role=package.request.role, artifact=package.artifact)
+        )
+        payload = RoleCompletionPayloadV5(
+            campaign_id=call.campaign_id,
+            round_index=call.round_index,
+            role=package.request.role,
+            role_position=call.role_position,
+            outcome=package.attempt.outcome,
+            call_key_sha256=call.sha256,
+            request_sha256=package.request.sha256,
+            binding_sha256=package.binding_sha256,
+            attempt_sha256=package.attempt.sha256,
+            terminal_authority_sha256=package.terminal_authority_sha256,
+            artifact_sha256=(None if package.artifact is None else canonical_sha256_v5(package.artifact)),
+            package_sha256=package.sha256,
+            request_ref=request_ref,
+            attempt_ref=attempt_ref,
+            terminal_authority_ref=terminal_ref,
+            artifact_ref=artifact_ref,
+        )
+        return PersistedRoleInvocationV5(payload=payload, call=call, package=package)
+
+    def load_role_invocation(self, payload: RoleCompletionPayloadV5) -> RoleInvocationPackageV5:
+        if type(payload) is not RoleCompletionPayloadV5:
+            raise ValueError("role completion must use the V5 schema")
+        call, request = self._load_role_request_entry(payload.request_ref)
+        attempt = self.load_role_attempt(payload.attempt_ref)
+        authority = self.load_role_terminal_authority(
+            payload.terminal_authority_ref,
+            role=payload.role,
+        )
+        artifact = (
+            None if payload.artifact_ref is None else self.load_role_artifact(payload.artifact_ref, role=payload.role)
+        )
+        package = RoleInvocationPackageV5(
+            call=call,
+            request=request,
+            attempt=attempt,
+            terminal_authority=authority,
+            artifact=artifact,
+        )
+        PersistedRoleInvocationV5(payload=payload, call=call, package=package)
+        return package
+
     def append_round_payload(self, payload: RoundEventPayloadV5) -> ArtifactRefV5:
+        if isinstance(payload, RoleCompletionPayloadV5):
+            self.load_role_invocation(payload)
         kind = event_kind_for_payload_v5(payload)
         primitive = round_event_payload_primitive_v5(payload)
         digest = hashlib.sha256(canonical_json_bytes_v5(primitive)).hexdigest()
@@ -847,6 +1326,8 @@ class LocalArtifactRepositoryV5:
             raise ArtifactSchemaFailureV5(reference) from None
         if canonical_json_bytes_v5(round_event_payload_primitive_v5(payload)) != authenticated.content:
             raise ArtifactNonCanonicalV5(reference)
+        if isinstance(payload, RoleCompletionPayloadV5):
+            self.load_role_invocation(payload)
         return payload
 
     def append_round_event(self, event: RoundEventV5) -> ArtifactRefV5:
@@ -1206,5 +1687,7 @@ __all__ = [
     "ArtifactRepositoryFailureV5",
     "ArtifactSchemaFailureV5",
     "LocalArtifactRepositoryV5",
+    "PersistedRoleInvocationV5",
+    "PersistedRoleRequestV5",
     "RepositoryCheckpointV5",
 ]

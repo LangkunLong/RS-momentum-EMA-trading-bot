@@ -30,6 +30,7 @@ from core.pit_optimizer_v5.contracts import (
     canonical_sha256_v5,
 )
 from core.pit_optimizer_v5.probes import SemanticFingerprintV5
+from core.pit_optimizer_v5.provider import RoleNameV5, RoleOutcomeV5
 
 
 ExperimentStatusV5 = Literal[
@@ -46,6 +47,7 @@ ExperimentStatusV5 = Literal[
 ExperimentIdentityLikeV5 = ExperimentIdentityV5 | PreValidationInvalidExperimentIdentityV5
 RoundEventKindV5 = Literal[
     "round_intent",
+    "role_completion",
     "rendered_variant",
     "quick_evidence",
     "episode_evidence",
@@ -85,6 +87,7 @@ _TESTABLE_STATUSES = frozenset(
 _EVENT_KINDS = frozenset(
     {
         "round_intent",
+        "role_completion",
         "rendered_variant",
         "quick_evidence",
         "episode_evidence",
@@ -505,6 +508,73 @@ class RoundIntentPayloadV5:
 
 
 @dataclass(frozen=True, slots=True)
+class RoleCompletionPayloadV5:
+    """Authenticated durable terminal package for one fixed round role."""
+
+    campaign_id: str
+    round_index: int
+    role: RoleNameV5
+    role_position: int
+    outcome: RoleOutcomeV5
+    call_key_sha256: str
+    request_sha256: str
+    binding_sha256: str
+    attempt_sha256: str
+    terminal_authority_sha256: str
+    artifact_sha256: str | None
+    package_sha256: str
+    request_ref: ArtifactRefV5
+    attempt_ref: ArtifactRefV5
+    terminal_authority_ref: ArtifactRefV5
+    artifact_ref: ArtifactRefV5 | None
+
+    def __post_init__(self) -> None:
+        _text(self.campaign_id, "role-completion campaign ID")
+        _count(self.round_index, "role-completion round", positive=True)
+        expected_position = {"investigator": 1, "author": 2, "critic": 3}.get(self.role)
+        if type(self.role_position) is not int or self.role_position != expected_position:
+            raise ValueError("role completion differs from its fixed round position")
+        if self.outcome not in {
+            "accepted",
+            "transport_failure",
+            "response_schema_failure",
+            "evidence_binding_failure",
+            "authorization_failure",
+            "accounting_failure",
+        }:
+            raise ValueError("role completion outcome is invalid")
+        for value, label in (
+            (self.call_key_sha256, "role-completion call key"),
+            (self.request_sha256, "role-completion request"),
+            (self.binding_sha256, "role-completion binding"),
+            (self.attempt_sha256, "role-completion attempt"),
+            (self.terminal_authority_sha256, "role-completion terminal authority"),
+            (self.package_sha256, "role-completion package"),
+        ):
+            _digest(value, label)
+        if self.artifact_sha256 is not None:
+            _digest(self.artifact_sha256, "role-completion artifact")
+        refs = (
+            (self.request_ref, f"roles/requests/{self.call_key_sha256}.json"),
+            (self.attempt_ref, f"roles/attempts/{self.role}/{self.attempt_sha256}.json"),
+            (
+                self.terminal_authority_ref,
+                f"roles/terminals/{self.role}/{self.terminal_authority_sha256}.json",
+            ),
+        )
+        for reference, expected_path in refs:
+            if type(reference) is not ArtifactRefV5 or reference.relative_path != expected_path:
+                raise ValueError("role completion reference differs from its authority")
+        if self.outcome == "accepted":
+            if self.artifact_sha256 is None or type(self.artifact_ref) is not ArtifactRefV5:
+                raise ValueError("accepted role completion requires its exact artifact")
+            if self.artifact_ref.relative_path != f"roles/artifacts/{self.role}/{self.artifact_sha256}.json":
+                raise ValueError("role completion artifact path differs from its authority")
+        elif self.artifact_sha256 is not None or self.artifact_ref is not None:
+            raise ValueError("failed role completion cannot carry an artifact")
+
+
+@dataclass(frozen=True, slots=True)
 class RenderedVariantPayloadV5:
     variant: RenderedVariantV5
 
@@ -794,6 +864,7 @@ class RoundOutcomePayloadV5:
 
 RoundEventPayloadV5 = (
     RoundIntentPayloadV5
+    | RoleCompletionPayloadV5
     | RenderedVariantPayloadV5
     | QuickEvidencePayloadV5
     | EpisodeEvidencePayloadV5
@@ -804,6 +875,7 @@ RoundEventPayloadV5 = (
 
 _PAYLOAD_TYPES: dict[str, type[object]] = {
     "round_intent": RoundIntentPayloadV5,
+    "role_completion": RoleCompletionPayloadV5,
     "rendered_variant": RenderedVariantPayloadV5,
     "quick_evidence": QuickEvidencePayloadV5,
     "episode_evidence": EpisodeEvidencePayloadV5,
@@ -890,6 +962,7 @@ class RoundEventV5:
                 raise ValueError("experiment-local event requires an experiment ID")
         elif self.event_kind in {
             "round_intent",
+            "role_completion",
             "resource_lease",
             "cleanup_result",
             "round_outcome",
@@ -911,6 +984,9 @@ class RoundEventV5:
         if isinstance(payload, ResourceLeasePayloadV5):
             if payload.owner_campaign_id != self.campaign_id:
                 raise ValueError("resource lease differs from its campaign")
+        if isinstance(payload, RoleCompletionPayloadV5):
+            if payload.campaign_id != self.campaign_id or payload.round_index != self.round_index:
+                raise ValueError("role completion differs from its event authority")
         if isinstance(payload, RoundOutcomePayloadV5):
             if payload.campaign_id != self.campaign_id or payload.round_index != self.round_index:
                 raise ValueError("round outcome differs from its event authority")
@@ -939,6 +1015,8 @@ class RecoveryStepV5:
     episode_ordinal: int | None = None
     resource_kind: str | None = None
     resource_lease_id: str | None = None
+    role: RoleNameV5 | None = None
+    role_position: int | None = None
 
     def __post_init__(self) -> None:
         if self.event_kind not in _EVENT_KINDS:
@@ -960,6 +1038,12 @@ class RecoveryStepV5:
             _text(self.resource_lease_id, "resource recovery lease ID")
         elif self.resource_kind is not None or self.resource_lease_id is not None:
             raise ValueError("only resource recovery steps carry lease bindings")
+        if self.event_kind == "role_completion":
+            expected_position = {"investigator": 1, "author": 2, "critic": 3}.get(self.role)
+            if type(self.role_position) is not int or self.role_position != expected_position:
+                raise ValueError("role recovery step differs from its fixed round position")
+        elif self.role is not None or self.role_position is not None:
+            raise ValueError("only role recovery steps carry role bindings")
         if self.event_kind in {
             "rendered_variant",
             "quick_evidence",
@@ -1041,6 +1125,10 @@ def fold_round_events_v5(
     if terminal is not None and not isinstance(payloads[-1], RoundOutcomePayloadV5):
         raise ValueError("round outcome must be the final durable event")
 
+    role_completions = tuple(payload for payload in payloads if isinstance(payload, RoleCompletionPayloadV5))
+    if tuple(item.role_position for item in role_completions) != tuple(range(1, len(role_completions) + 1)):
+        raise ValueError("durable role completions are not the canonical round prefix")
+
     completed: set[RecoveryStepV5] = set()
     for event, payload in zip(events, payloads, strict=True):
         episode_ordinal = payload.episode.episode_ordinal if isinstance(payload, EpisodeEvidencePayloadV5) else None
@@ -1051,6 +1139,8 @@ def fold_round_events_v5(
                 episode_ordinal=episode_ordinal,
                 resource_kind=(payload.resource_kind if isinstance(payload, ResourceLeasePayloadV5) else None),
                 resource_lease_id=(payload.lease_id if isinstance(payload, ResourceLeasePayloadV5) else None),
+                role=(payload.role if isinstance(payload, RoleCompletionPayloadV5) else None),
+                role_position=(payload.role_position if isinstance(payload, RoleCompletionPayloadV5) else None),
             )
         )
     return RoundRecoveryV5(
@@ -1465,6 +1555,7 @@ __all__ = [
     "RecoveryStepV5",
     "RenderedVariantPayloadV5",
     "ResourceLeasePayloadV5",
+    "RoleCompletionPayloadV5",
     "RoundEventKindV5",
     "RoundEventPayloadV5",
     "RoundEventV5",

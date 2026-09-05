@@ -46,6 +46,11 @@ RoleOutcomeV5 = Literal[
     "authorization_failure",
     "accounting_failure",
 ]
+RoleReconciliationFailureCodeV5 = Literal[
+    "terminal_unavailable",
+    "terminal_incomplete",
+    "authority_unavailable",
+]
 ParsedRoleArtifactV5 = InvestigatorArtifactV5 | StructuralTemplateV5 | CriticArtifactV5
 PrimaryMechanismV5 = Literal[
     "entry",
@@ -1618,6 +1623,103 @@ def parse_and_bind_role_artifact(
     return artifact
 
 
+def _role_literal_primitive(value: bool | int | float | str) -> dict[str, object]:
+    if type(value) is bool:
+        return {"kind": "bool", "value": value}
+    if type(value) is int:
+        return {"kind": "int", "value": value}
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("role artifact float literal must be finite")
+        return {"kind": "float", "value": value.hex()}
+    if type(value) is str:
+        return {"kind": "str", "value": value}
+    raise ValueError("role artifact literal has an unsupported type")
+
+
+def parsed_role_artifact_primitive_v5(
+    artifact: ParsedRoleArtifactV5,
+) -> dict[str, object]:
+    """Encode the closed role-artifact union without losing literal types."""
+
+    if type(artifact) is InvestigatorArtifactV5:
+        body = canonical_primitive_v5(artifact)
+        role: RoleNameV5 = "investigator"
+    elif type(artifact) is StructuralTemplateV5:
+        body = {
+            "hypothesis_id": artifact.hypothesis_id,
+            "parent_revision_sha256": artifact.parent_revision_sha256,
+            "changed_symbols": artifact.changed_symbols,
+            "source_operations": canonical_primitive_v5(artifact.source_operations),
+            "axes": tuple(
+                {
+                    "name": axis.name,
+                    "default": _role_literal_primitive(axis.default),
+                    "values": tuple(_role_literal_primitive(value) for value in axis.values),
+                }
+                for axis in artifact.axes
+            ),
+            "full_source_escape": (
+                None if artifact.full_source_escape is None else canonical_primitive_v5(artifact.full_source_escape)
+            ),
+        }
+        role = "author"
+    elif type(artifact) is CriticArtifactV5:
+        body = canonical_primitive_v5(artifact)
+        role = "critic"
+    else:
+        raise ValueError("role artifact is outside the closed V5 union")
+    body = canonical_primitive_v5(body)
+    if type(body) is not dict:
+        raise ValueError("role artifact primitive is invalid")
+    return {"role": role, "artifact": body}
+
+
+def decode_parsed_role_artifact_v5(
+    *,
+    role: RoleNameV5,
+    primitive: object,
+) -> ParsedRoleArtifactV5:
+    """Decode a canonical persisted artifact through the production role parser."""
+
+    canonical_role = _role(role)
+    envelope = _exact_mapping(primitive, frozenset(("role", "artifact")))
+    if envelope["role"] != canonical_role:
+        raise ValueError("persisted role artifact differs from its role")
+    if canonical_role == "investigator":
+        return _investigator_from_json(envelope["artifact"])
+    if canonical_role == "author":
+        return _author_from_json(envelope["artifact"])
+    return _critic_from_json(envelope["artifact"])
+
+
+def validate_parsed_role_artifact_v5(
+    *,
+    request: RoleRequestV5,
+    artifact: ParsedRoleArtifactV5,
+) -> None:
+    """Reapply the exact request binding to a decoded durable role artifact."""
+
+    if type(request) is not RoleRequestV5:
+        raise ValueError("role artifact validation requires an authenticated request")
+    expected_type = {
+        "investigator": InvestigatorArtifactV5,
+        "author": StructuralTemplateV5,
+        "critic": CriticArtifactV5,
+    }[request.role]
+    if type(artifact) is not expected_type:
+        raise ValueError("role artifact type differs from its request")
+    try:
+        if request.role == "investigator":
+            _bind_investigator_artifact(request=request, artifact=artifact)  # type: ignore[arg-type]
+        elif request.role == "author":
+            _bind_author_artifact(request=request, artifact=artifact)  # type: ignore[arg-type]
+        else:
+            _bind_critic_artifact(request=request, artifact=artifact)  # type: ignore[arg-type]
+    except RoleFailureV5:
+        raise ValueError("durable role artifact differs from its request authority") from None
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderCompletionRequestV5:
     role_request: RoleRequestV5
@@ -1913,6 +2015,208 @@ class RecoveredRoleTerminalV5:
             raise ValueError("recovered role terminal package is invalid")
         if self.receipt.attempt_facts_sha256 != self.facts.sha256:
             raise ValueError("recovered role terminal facts differ from their receipt")
+
+
+@dataclass(frozen=True, slots=True)
+class RoleCallKeyV5:
+    """Controller-owned idempotency key for one authorized round-role attempt."""
+
+    campaign_id: str
+    round_index: int
+    role: RoleNameV5
+    role_position: int
+    attempt_kind: RoleAttemptKindV5
+    attempt_index: int
+    request_sha256: str
+
+    def __post_init__(self) -> None:
+        _text(self.campaign_id, "role call campaign ID")
+        _count(self.round_index, "role call round", positive=True)
+        role = _role(self.role)
+        expected_position = {"investigator": 1, "author": 2, "critic": 3}[role]
+        if type(self.role_position) is not int or self.role_position != expected_position:
+            raise ValueError("role call differs from its fixed round position")
+        _attempt_kind(self.attempt_kind)
+        _count(self.attempt_index, "role call attempt index", positive=True)
+        _digest(self.request_sha256, "role call request")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerRoleTerminalAuthorityV5:
+    """Ledger receipt wrapped with the controller's exact round-role key."""
+
+    call_key_sha256: str
+    receipt: RoleTerminalReceiptV5
+
+    def __post_init__(self) -> None:
+        _digest(self.call_key_sha256, "ledger role terminal call key")
+        if type(self.receipt) is not RoleTerminalReceiptV5:
+            raise ValueError("ledger role terminal receipt is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+@dataclass(frozen=True, slots=True)
+class FixtureRoleTerminalAuthorityV5:
+    """Provider-free terminal authority used only by deterministic fixture runs."""
+
+    fixture_id: str
+    call_key_sha256: str
+    request_sha256: str
+    attempt_facts_sha256: str
+    artifact_sha256: str | None
+
+    def __post_init__(self) -> None:
+        _text(self.fixture_id, "fixture role terminal ID")
+        _digest(self.call_key_sha256, "fixture role terminal call key")
+        _digest(self.request_sha256, "fixture role terminal request")
+        _digest(self.attempt_facts_sha256, "fixture role terminal facts")
+        if self.artifact_sha256 is not None:
+            _digest(self.artifact_sha256, "fixture role terminal artifact")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+RoleTerminalAuthorityV5 = LedgerRoleTerminalAuthorityV5 | FixtureRoleTerminalAuthorityV5
+
+
+@dataclass(frozen=True, slots=True)
+class RoleInvocationPackageV5:
+    """One fully bound terminal role result suitable for create-only persistence."""
+
+    call: RoleCallKeyV5
+    request: RoleRequestV5
+    attempt: RoleAttemptFactsV5
+    terminal_authority: RoleTerminalAuthorityV5
+    artifact: ParsedRoleArtifactV5 | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.call) is not RoleCallKeyV5
+            or type(self.request) is not RoleRequestV5
+            or type(self.attempt) is not RoleAttemptFactsV5
+        ):
+            raise ValueError("role invocation package request or attempt is invalid")
+        if (
+            self.call.role != self.request.role
+            or self.call.request_sha256 != self.request.sha256
+            or self.call.attempt_kind != self.attempt.attempt_kind
+            or self.call.attempt_index != self.attempt.attempt_index
+            or self.attempt.role != self.request.role
+            or self.attempt.request_sha256 != self.request.sha256
+        ):
+            raise ValueError("role invocation attempt differs from its request")
+        artifact_sha256 = None if self.artifact is None else canonical_sha256_v5(self.artifact)
+        if self.attempt.outcome == "accepted":
+            if self.artifact is None or self.attempt.artifact_sha256 != artifact_sha256:
+                raise ValueError("accepted role invocation lacks its exact artifact")
+            validate_parsed_role_artifact_v5(request=self.request, artifact=self.artifact)
+        elif self.artifact is not None or self.attempt.artifact_sha256 is not None:
+            raise ValueError("failed role invocation cannot carry an artifact")
+        authority = self.terminal_authority
+        if type(authority) is LedgerRoleTerminalAuthorityV5:
+            receipt = authority.receipt
+            if (
+                authority.call_key_sha256 != self.call.sha256
+                or receipt.slot_request_sha256 != self.request.sha256
+                or receipt.attempt_facts_sha256 != self.attempt.sha256
+                or self.attempt.slot_id != receipt.slot_id
+            ):
+                raise ValueError("role terminal receipt differs from its invocation")
+        elif type(authority) is FixtureRoleTerminalAuthorityV5:
+            if (
+                authority.call_key_sha256 != self.call.sha256
+                or authority.request_sha256 != self.request.sha256
+                or authority.attempt_facts_sha256 != self.attempt.sha256
+                or authority.artifact_sha256 != artifact_sha256
+                or self.attempt.usage.external_attempt_count != 0
+            ):
+                raise ValueError("fixture terminal authority differs from its invocation")
+        else:
+            raise ValueError("role invocation terminal authority is invalid")
+
+    @property
+    def accepted(self) -> bool:
+        return self.attempt.outcome == "accepted"
+
+    @property
+    def binding_sha256(self) -> str:
+        return canonical_sha256_v5(self.request.expected_binding.to_primitive())
+
+    @property
+    def terminal_authority_sha256(self) -> str:
+        return self.terminal_authority.sha256
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "call_key_sha256": self.call.sha256,
+            "request_sha256": self.request.sha256,
+            "role": self.request.role,
+            "binding_sha256": self.binding_sha256,
+            "attempt_sha256": self.attempt.sha256,
+            "terminal_authority_sha256": self.terminal_authority_sha256,
+            "artifact_sha256": None if self.artifact is None else canonical_sha256_v5(self.artifact),
+            "accepted": self.accepted,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self.to_primitive())
+
+
+@dataclass(frozen=True, slots=True)
+class RoleReconciliationFailureV5:
+    """Sanitized terminal recovery failure; it never authorizes a new call."""
+
+    call: RoleCallKeyV5
+    failure_code: RoleReconciliationFailureCodeV5
+
+    def __post_init__(self) -> None:
+        if type(self.call) is not RoleCallKeyV5:
+            raise ValueError("role reconciliation call key is invalid")
+        if self.failure_code not in {
+            "terminal_unavailable",
+            "terminal_incomplete",
+            "authority_unavailable",
+        }:
+            raise ValueError("role reconciliation failure code is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+RoleReconciliationResultV5 = RoleInvocationPackageV5 | RoleReconciliationFailureV5
+
+
+@runtime_checkable
+class RecoverableRoleInvokerV5(Protocol):
+    """Crash-safe role boundary supplied by Task-9 production composition.
+
+    ``invoke_once`` is permitted only for a request proven newly persisted by the
+    caller. ``reconcile_once`` performs no new provider call and either returns
+    the same authenticated terminal package or reports that it cannot recover it.
+    """
+
+    def invoke_once(
+        self,
+        call: RoleCallKeyV5,
+        request: RoleRequestV5,
+    ) -> RoleInvocationPackageV5: ...
+
+    def reconcile_once(
+        self,
+        call: RoleCallKeyV5,
+        request: RoleRequestV5,
+    ) -> RoleReconciliationResultV5: ...
 
 
 @runtime_checkable
@@ -2663,14 +2967,17 @@ __all__ = [
     "ExperimentPredictionAggregateV5",
     "ExperimentSemanticDifferenceAggregateV5",
     "FailureStageV5",
+    "FixtureRoleTerminalAuthorityV5",
     "FixtureRoleRunnerV5",
     "GatewayCompletionProviderV5",
     "IssuedEvidenceV5",
     "InvestigatorRoleInputV5",
+    "LedgerRoleTerminalAuthorityV5",
     "OneShotJsonCompletionV5",
     "ParsedRoleArtifactV5",
     "ProviderCompletionRequestV5",
     "PrimaryMechanismV5",
+    "RecoverableRoleInvokerV5",
     "RecoveredRoleTerminalV5",
     "RoleAccountingFailureV5",
     "RoleAttemptFactsV5",
@@ -2678,23 +2985,32 @@ __all__ = [
     "RoleAuthorizationFailureV5",
     "RoleAuthorizationLifecycleV5",
     "RoleBindingV5",
+    "RoleCallKeyV5",
     "RoleEvidenceBindingFailureV5",
     "RoleFailureCode",
     "RoleFailureV5",
     "RoleNameV5",
     "RoleOutcomeV5",
     "RoleInputV5",
+    "RoleInvocationPackageV5",
     "RoleRequestV5",
+    "RoleReconciliationFailureCodeV5",
+    "RoleReconciliationFailureV5",
+    "RoleReconciliationResultV5",
     "RoleResponseSchemaFailureV5",
     "RoleRunnerV5",
     "RoleSchemaAuthorityV5",
     "RoleSlotRequestV5",
     "RoleTerminalReceiptV5",
+    "RoleTerminalAuthorityV5",
     "RoleTransportFailureV5",
     "RoleUsageFactsV5",
     "ScenarioAggregateV5",
     "TestableExperimentStatusV5",
     "build_role_request_v5",
+    "decode_parsed_role_artifact_v5",
     "parse_and_bind_role_artifact",
+    "parsed_role_artifact_primitive_v5",
     "role_schema_authority_from_manifest_v5",
+    "validate_parsed_role_artifact_v5",
 ]
