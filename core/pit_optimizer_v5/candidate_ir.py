@@ -33,6 +33,9 @@ _MAX_POLICY_TUPLE_ITEMS_V5 = 256
 _MAX_POLICY_CALL_ARGUMENTS_V5 = 16
 _MAX_POLICY_INTEGER_MAGNITUDE_V5 = 10**12
 _MAX_POLICY_FLOAT_MAGNITUDE_V5 = 10**12
+_MAX_POLICY_CALL_DEPTH_V5 = 16
+_MAX_POLICY_STATIC_WORK_V5 = 65_536
+_MAX_AUTHENTICATED_COLLECTION_ITEMS_V5 = 256
 _PURE_POLICY_BUILTINS_V5 = frozenset(
     {
         "abs",
@@ -94,6 +97,22 @@ _SAFE_POLICY_IMPORTS_V5: Mapping[str, frozenset[str]] = {
         {"recommend_allocation", "recommend_capacity", "select_eviction"}
     ),
 }
+_SELECTOR_BUILTINS_V5 = frozenset({"max", "min"})
+_AUTHENTICATED_COLLECTION_CHAINS_V5 = frozenset(
+    {
+        ("positions",),
+        ("base", "positions"),
+        ("portfolio", "sector_exposures"),
+        ("portfolio", "industry_exposures"),
+        ("market", "benchmarks"),
+        ("base", "market", "benchmarks"),
+        ("features", "affiliations"),
+        ("candidate", "affiliations"),
+        ("base", "technical_blocking_reasons"),
+        ("base", "protective_stop_candidates"),
+        ("base", "scale_out_tiers"),
+    }
+)
 _FORBIDDEN_POLICY_NODES_V5 = (
     ast.AsyncFor,
     ast.AsyncFunctionDef,
@@ -105,11 +124,13 @@ _FORBIDDEN_POLICY_NODES_V5 = (
     ast.Dict,
     ast.DictComp,
     ast.For,
+    ast.FormattedValue,
     ast.GeneratorExp,
     ast.Global,
     ast.Lambda,
     ast.List,
     ast.ListComp,
+    ast.JoinedStr,
     ast.Match,
     ast.NamedExpr,
     ast.Nonlocal,
@@ -265,35 +286,53 @@ def _policy_local_target_names_v5(target: ast.expr) -> tuple[str, ...]:
     raise ValueError("V5 policy writes require bounded local name targets")
 
 
-def _policy_call_graph_is_acyclic_v5(
+def _policy_call_graph_is_bounded_v5(
+    *,
     functions: Mapping[str, ast.FunctionDef],
+    edges: Mapping[str, tuple[tuple[str, int], ...]],
+    local_work: Mapping[str, int],
 ) -> bool:
-    calls = {
-        name: frozenset(
-            node.func.id
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in functions
+    """Prove that direct and selector-callback execution is finite and bounded."""
+
+    if (
+        set(edges) != set(functions)
+        or set(local_work) != set(functions)
+        or any(
+            child not in functions or type(multiplier) is not int or multiplier <= 0
+            for function_edges in edges.values()
+            for child, multiplier in function_edges
         )
-        for name, function in functions.items()
-    }
-    visiting: set[str] = set()
-    visited: set[str] = set()
+    ):
+        return False
+    incoming = dict.fromkeys(functions, 0)
+    for function_edges in edges.values():
+        for child, _multiplier in function_edges:
+            incoming[child] += 1
+    ready = [name for name, count in incoming.items() if count == 0]
+    topological: list[str] = []
+    while ready:
+        name = ready.pop()
+        topological.append(name)
+        for child, _multiplier in edges[name]:
+            incoming[child] -= 1
+            if incoming[child] == 0:
+                ready.append(child)
+    if len(topological) != len(functions):
+        return False
 
-    def visit(name: str) -> bool:
-        if name in visiting:
-            return False
-        if name in visited:
-            return True
-        visiting.add(name)
-        if any(not visit(child) for child in calls[name]):
-            return False
-        visiting.remove(name)
-        visited.add(name)
-        return True
-
-    return all(visit(name) for name in functions)
+    cost_by_name: dict[str, int] = {}
+    depth_by_name: dict[str, int] = {}
+    for name in reversed(topological):
+        cost = local_work[name]
+        depth = 1
+        for child, multiplier in edges[name]:
+            cost += multiplier * cost_by_name[child]
+            depth = max(depth, depth_by_name[child] + 1)
+            if cost > _MAX_POLICY_STATIC_WORK_V5 or depth > _MAX_POLICY_CALL_DEPTH_V5:
+                return False
+        cost_by_name[name] = cost
+        depth_by_name[name] = depth
+    return True
 
 
 def _policy_ast_depth_is_bounded_v5(tree: ast.Module) -> bool:
@@ -307,51 +346,148 @@ def _policy_ast_depth_is_bounded_v5(tree: ast.Module) -> bool:
     return True
 
 
-def _policy_expression_is_non_index_numeric_v5(expression: ast.expr) -> bool:
-    """Return whether a successful expression cannot be a sequence index.
+_NumericKindV5 = Literal["integer", "float", "number"]
 
-    Multiplication is the one permitted binary operator that can allocate an
-    input-sized sequence.  Requiring one operand to be a guaranteed float
-    keeps numeric scaling useful while making Python sequence repetition
-    unreachable through the closed language.
-    """
 
-    if isinstance(expression, ast.Constant):
-        return type(expression.value) is float
-    if isinstance(expression, ast.UnaryOp) and isinstance(
-        expression.op,
-        (ast.UAdd, ast.USub),
+def _policy_attribute_chain_v5(
+    expression: ast.expr,
+) -> tuple[str, tuple[str, ...]] | None:
+    attributes: list[str] = []
+    current: ast.expr = expression
+    while isinstance(current, ast.Attribute):
+        attributes.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    return current.id, tuple(reversed(attributes))
+
+
+def _policy_selector_collection_bound_v5(
+    expression: ast.expr,
+    *,
+    argument_names: frozenset[str],
+) -> int | None:
+    if isinstance(expression, ast.Tuple):
+        return len(expression.elts) if 1 <= len(expression.elts) <= _MAX_POLICY_TUPLE_ITEMS_V5 else None
+    resolved = _policy_attribute_chain_v5(expression)
+    if resolved is not None and resolved[0] in argument_names and resolved[1] in _AUTHENTICATED_COLLECTION_CHAINS_V5:
+        return _MAX_AUTHENTICATED_COLLECTION_ITEMS_V5
+    return None
+
+
+def _policy_tuple_literal_v5(expression: ast.expr) -> tuple[object, ...] | None:
+    if not isinstance(expression, ast.Tuple):
+        return None
+    try:
+        literal = ast.literal_eval(expression)
+    except (TypeError, ValueError):
+        return None
+    if (
+        type(literal) is not tuple
+        or len(literal) > _MAX_POLICY_TUPLE_ITEMS_V5
+        or not _policy_literal_is_deeply_immutable_v5(literal)
     ):
-        return _policy_expression_is_non_index_numeric_v5(expression.operand)
-    if isinstance(expression, ast.BinOp):
-        if isinstance(expression.op, ast.Div):
-            return True
-        if isinstance(expression.op, ast.Mult):
-            return _policy_expression_is_non_index_numeric_v5(
-                expression.left
-            ) or _policy_expression_is_non_index_numeric_v5(expression.right)
-        return _policy_expression_is_non_index_numeric_v5(
-            expression.left
-        ) and _policy_expression_is_non_index_numeric_v5(expression.right)
-    if isinstance(expression, ast.Call):
-        if isinstance(expression.func, ast.Name) and expression.func.id == "float":
-            return True
-        return (
-            isinstance(expression.func, ast.Attribute)
-            and isinstance(expression.func.value, ast.Name)
-            and expression.func.value.id == "math"
-            and expression.func.attr
-            in {
-                "copysign",
-                "exp",
-                "fabs",
-                "log",
-                "log1p",
-                "sqrt",
-                "tanh",
-            }
+        return None
+    return literal
+
+
+def _policy_numeric_kind_v5(
+    expression: ast.expr,
+    *,
+    numeric_names: Mapping[str, _NumericKindV5],
+) -> _NumericKindV5 | None:
+    if isinstance(expression, ast.Constant):
+        if type(expression.value) in {bool, int}:
+            return "integer"
+        return "float" if type(expression.value) is float else None
+    if isinstance(expression, ast.Name):
+        return numeric_names.get(expression.id)
+    if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, (ast.UAdd, ast.USub)):
+        return _policy_numeric_kind_v5(
+            expression.operand,
+            numeric_names=numeric_names,
         )
-    return False
+    if isinstance(expression, (ast.Compare, ast.UnaryOp)):
+        return "integer"
+    if isinstance(expression, ast.BoolOp):
+        kinds = tuple(_policy_numeric_kind_v5(item, numeric_names=numeric_names) for item in expression.values)
+        return (
+            (kinds[0] if kinds and len(set(kinds)) == 1 else "number")
+            if kinds and all(kind is not None for kind in kinds)
+            else None
+        )
+    if isinstance(expression, ast.IfExp):
+        kinds = tuple(
+            _policy_numeric_kind_v5(item, numeric_names=numeric_names) for item in (expression.body, expression.orelse)
+        )
+        return (kinds[0] if len(set(kinds)) == 1 else "number") if all(kind is not None for kind in kinds) else None
+    if isinstance(expression, ast.BinOp):
+        left = _policy_numeric_kind_v5(expression.left, numeric_names=numeric_names)
+        right = _policy_numeric_kind_v5(expression.right, numeric_names=numeric_names)
+        if left is None or right is None:
+            return None
+        if isinstance(expression.op, ast.Div):
+            return "float"
+        return left if left == right else "number"
+    if not isinstance(expression, ast.Call):
+        return None
+    if isinstance(expression.func, ast.Name):
+        name = expression.func.id
+        if name in {"bool", "int", "len"}:
+            return "integer"
+        if name == "float":
+            return "float"
+        if name in {"abs", "round"} and expression.args:
+            return _policy_numeric_kind_v5(
+                expression.args[0],
+                numeric_names=numeric_names,
+            )
+        if name in _SELECTOR_BUILTINS_V5 and not expression.keywords:
+            kinds = tuple(_policy_numeric_kind_v5(item, numeric_names=numeric_names) for item in expression.args)
+            if kinds and all(kind is not None for kind in kinds):
+                return kinds[0] if len(set(kinds)) == 1 else "number"  # type: ignore[return-value]
+        return None
+    if (
+        isinstance(expression.func, ast.Attribute)
+        and isinstance(expression.func.value, ast.Name)
+        and expression.func.value.id == "math"
+        and expression.func.attr in _SAFE_MATH_CALLS_V5
+    ):
+        return "integer" if expression.func.attr in {"ceil", "floor", "isfinite", "isnan"} else "float"
+    return None
+
+
+def _policy_numeric_local_names_v5(
+    function: ast.FunctionDef,
+) -> dict[str, _NumericKindV5]:
+    assignments: dict[str, list[ast.expr | None]] = {}
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                assignments.setdefault(node.targets[0].id, []).append(node.value)
+            else:
+                for target in node.targets:
+                    for name in _policy_local_target_names_v5(target):
+                        assignments.setdefault(name, []).append(None)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assignments.setdefault(node.target.id, []).append(node.value)
+    numeric: dict[str, _NumericKindV5] = {}
+    while True:
+        changed = False
+        for name, values in assignments.items():
+            kinds = tuple(
+                None if value is None else _policy_numeric_kind_v5(value, numeric_names=numeric) for value in values
+            )
+            if not kinds or any(kind is None for kind in kinds):
+                continue
+            inferred: _NumericKindV5 = (
+                kinds[0] if len(set(kinds)) == 1 else "number"  # type: ignore[assignment]
+            )
+            if numeric.get(name) != inferred:
+                numeric[name] = inferred
+                changed = True
+        if not changed:
+            return numeric
 
 
 def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
@@ -388,9 +524,11 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
     direct_import_nodes: set[int] = set()
     all_exports_seen = False
     for statement in tree.body:
-        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and type(
-            statement.value.value
-        ) is str:
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and type(statement.value.value) is str
+        ):
             continue
         if isinstance(statement, ast.Import):
             if (
@@ -407,9 +545,7 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
             if statement.level != 0 or statement.module is None:
                 raise ValueError("V5 policy import is outside the closed allowlist")
             if statement.module == "__future__":
-                if tuple((item.name, item.asname) for item in statement.names) != (
-                    ("annotations", None),
-                ):
+                if tuple((item.name, item.asname) for item in statement.names) != (("annotations", None),):
                     raise ValueError("V5 policy future import is invalid")
                 direct_import_nodes.add(id(statement))
                 continue
@@ -466,7 +602,9 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
             functions[statement.name] = statement
             bound_module_names.add(statement.name)
             continue
-        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        if isinstance(statement, ast.AnnAssign):
+            raise ValueError("V5 policy module annotations are outside the closed language")
+        if isinstance(statement, ast.Assign):
             name, value = _policy_assignment_name_and_value_v5(statement)
             try:
                 literal = ast.literal_eval(value)
@@ -483,11 +621,7 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
                 ):
                     raise ValueError("V5 policy export declaration differs from the interface")
                 all_exports_seen = True
-            elif (
-                not name.isupper()
-                or name.startswith("_")
-                or not _policy_literal_is_deeply_immutable_v5(literal)
-            ):
+            elif not name.isupper() or name.startswith("_") or not _policy_literal_is_deeply_immutable_v5(literal):
                 raise ValueError("V5 policy module assignment is outside the constant scope")
             if name in bound_module_names:
                 raise ValueError("V5 policy module binding is duplicated")
@@ -511,8 +645,7 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
             if type(node.value) is int and abs(node.value) > _MAX_POLICY_INTEGER_MAGNITUDE_V5:
                 raise ValueError("V5 policy integer literal is too large")
             if type(node.value) is float and (
-                not math.isfinite(node.value)
-                or abs(node.value) > _MAX_POLICY_FLOAT_MAGNITUDE_V5
+                not math.isfinite(node.value) or abs(node.value) > _MAX_POLICY_FLOAT_MAGNITUDE_V5
             ):
                 raise ValueError("V5 policy float literal is invalid")
             if type(node.value) is str and len(node.value.encode("utf-8")) > 4_096:
@@ -527,23 +660,6 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
                 (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod),
             ):
                 raise ValueError("V5 policy binary operator is outside the bounded set")
-            if isinstance(node.op, ast.Mult):
-                try:
-                    literal_left = ast.literal_eval(node.left)
-                    literal_right = ast.literal_eval(node.right)
-                except (TypeError, ValueError):
-                    literal_left = literal_right = None
-                constant_numeric_product = (
-                    type(literal_left) in {int, float}
-                    and type(literal_right) in {int, float}
-                    and abs(literal_left * literal_right)
-                    <= _MAX_POLICY_FLOAT_MAGNITUDE_V5
-                )
-                if not constant_numeric_product and not (
-                    _policy_expression_is_non_index_numeric_v5(node.left)
-                    or _policy_expression_is_non_index_numeric_v5(node.right)
-                ):
-                    raise ValueError("V5 policy sequence repetition is forbidden")
         if not isinstance(node, ast.Call):
             continue
         if len(node.args) + len(node.keywords) > _MAX_POLICY_CALL_ARGUMENTS_V5:
@@ -564,19 +680,21 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
         ):
             continue
         raise ValueError("V5 policy attribute and dynamic calls are forbidden")
-    for function in functions.values():
+    call_edges: dict[str, list[tuple[str, int]]] = {name: [] for name in functions}
+    callback_names: set[str] = set()
+    direct_callees: set[str] = set()
+    local_work: dict[str, int] = {}
+    for function_name, function in functions.items():
         protected_names = allowed_calls | {"math"}
         arguments = (*function.args.posonlyargs, *function.args.args)
+        argument_names = frozenset(argument.arg for argument in arguments)
         if any(argument.arg in protected_names or argument.arg.startswith("__") for argument in arguments):
             raise ValueError("V5 policy argument shadows a callable authority")
         local_names: set[str] = set()
-        for node in ast.walk(function):
+        function_nodes = tuple(ast.walk(function))
+        for node in function_nodes:
             if isinstance(node, ast.Assign):
-                names = tuple(
-                    name
-                    for target in node.targets
-                    for name in _policy_local_target_names_v5(target)
-                )
+                names = tuple(name for target in node.targets for name in _policy_local_target_names_v5(target))
                 if len(names) > 8 or len(names) != len(set(names)):
                     raise ValueError("V5 policy assignment targets are invalid")
                 local_names.update(names)
@@ -589,18 +707,166 @@ def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
                 raise ValueError("V5 policy mutation target is forbidden")
         if local_names & protected_names:
             raise ValueError("V5 policy local shadows a callable authority")
-        available_names = bound_module_names | _PURE_POLICY_BUILTINS_V5 | {
-            argument.arg for argument in arguments
-        } | local_names
-        for node in ast.walk(function):
-            if (
-                isinstance(node, ast.Name)
-                and isinstance(node.ctx, ast.Load)
-                and node.id not in available_names
-            ):
+        if local_names & argument_names:
+            raise ValueError("V5 policy arguments cannot be rebound")
+        available_names = bound_module_names | _PURE_POLICY_BUILTINS_V5 | argument_names | local_names
+        for node in function_nodes:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in available_names:
                 raise ValueError("V5 policy name resolves outside the closed lexical scope")
-    if not _policy_call_graph_is_acyclic_v5(functions):
-        raise ValueError("V5 policy helper recursion is forbidden")
+
+        parents = {id(child): parent for parent in function_nodes for child in ast.iter_child_nodes(parent)}
+        annotation_node_ids: set[int] = set()
+        annotation_roots = [argument.annotation for argument in arguments if argument.annotation is not None]
+        if function.returns is not None:
+            annotation_roots.append(function.returns)
+        annotation_roots.extend(node.annotation for node in function_nodes if isinstance(node, ast.AnnAssign))
+        for annotation in annotation_roots:
+            annotation_node_ids.update(id(node) for node in ast.walk(annotation))
+
+        callable_node_ids: set[int] = set()
+        selector_callback_node_ids: set[int] = set()
+        work = len(function_nodes)
+        for call in (node for node in function_nodes if isinstance(node, ast.Call)):
+            callable_node_ids.add(id(call.func))
+            if not isinstance(call.func, ast.Name):
+                continue
+            called_name = call.func.id
+            if called_name in functions:
+                call_edges[function_name].append((called_name, 1))
+                direct_callees.add(called_name)
+            if called_name in _SELECTOR_BUILTINS_V5 and call.keywords:
+                if (
+                    len(call.args) != 1
+                    or len(call.keywords) != 1
+                    or call.keywords[0].arg != "key"
+                    or not isinstance(call.keywords[0].value, ast.Name)
+                ):
+                    raise ValueError("V5 policy selector callback is outside the closed form")
+                callback_name = call.keywords[0].value.id
+                callback = functions.get(callback_name)
+                callback_arguments = () if callback is None else (*callback.args.posonlyargs, *callback.args.args)
+                collection_bound = _policy_selector_collection_bound_v5(
+                    call.args[0],
+                    argument_names=argument_names,
+                )
+                if (
+                    callback is None
+                    or not callback_name.startswith("_")
+                    or len(callback_arguments) != 1
+                    or collection_bound is None
+                ):
+                    raise ValueError("V5 policy selector callback is outside the closed form")
+                call_edges[function_name].append((callback_name, collection_bound))
+                callback_names.add(callback_name)
+                selector_callback_node_ids.add(id(call.keywords[0].value))
+                work += collection_bound
+            elif called_name in _SELECTOR_BUILTINS_V5 and len(call.args) == 1:
+                collection_bound = _policy_selector_collection_bound_v5(
+                    call.args[0],
+                    argument_names=argument_names,
+                )
+                if collection_bound is None:
+                    raise ValueError("V5 policy selector input is not bounded")
+                work += collection_bound
+            elif called_name in {"all", "any", "sum", "tuple"}:
+                collection_bound = (
+                    _policy_selector_collection_bound_v5(
+                        call.args[0],
+                        argument_names=argument_names,
+                    )
+                    if len(call.args) == 1
+                    else None
+                )
+                if call.keywords or collection_bound is None:
+                    raise ValueError("V5 policy traversal input is not bounded")
+                work += collection_bound
+
+        for node in function_nodes:
+            if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+                continue
+            parent = parents.get(id(node))
+            if node.id in frozenset(functions) | _PURE_POLICY_BUILTINS_V5:
+                if (
+                    id(node) not in callable_node_ids
+                    and id(node) not in selector_callback_node_ids
+                    and id(node) not in annotation_node_ids
+                ):
+                    raise ValueError("V5 policy callable value escape is forbidden")
+            elif node.id in imported_call_names:
+                if (
+                    id(node) not in callable_node_ids
+                    and id(node) not in annotation_node_ids
+                    and not (isinstance(parent, ast.Attribute) and parent.value is node)
+                ):
+                    raise ValueError("V5 policy imported callable escape is forbidden")
+            elif node.id == "math" and not (
+                id(node) in annotation_node_ids or isinstance(parent, ast.Attribute) and parent.value is node
+            ):
+                raise ValueError("V5 policy module authority escape is forbidden")
+        for node in function_nodes:
+            if not (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "math"
+                and node.attr in _SAFE_MATH_CALLS_V5
+            ):
+                continue
+            if id(node) not in callable_node_ids and id(node) not in annotation_node_ids:
+                raise ValueError("V5 policy math callable escape is forbidden")
+        if work > _MAX_POLICY_STATIC_WORK_V5:
+            raise ValueError("V5 policy local work exceeds the static bound")
+        local_work[function_name] = work
+
+    if callback_names & direct_callees:
+        raise ValueError("V5 policy selector callbacks must be callback-only helpers")
+
+    for function in functions.values():
+        numeric_names = _policy_numeric_local_names_v5(function)
+        for node in ast.walk(function):
+            if not isinstance(node, ast.BinOp):
+                continue
+            left_kind = _policy_numeric_kind_v5(
+                node.left,
+                numeric_names=numeric_names,
+            )
+            right_kind = _policy_numeric_kind_v5(
+                node.right,
+                numeric_names=numeric_names,
+            )
+            if isinstance(node.op, ast.Add):
+                left_tuple = _policy_tuple_literal_v5(node.left)
+                right_tuple = _policy_tuple_literal_v5(node.right)
+                if left_kind is not None and right_kind is not None:
+                    continue
+                if (
+                    left_tuple is not None
+                    and right_tuple is not None
+                    and len(left_tuple) + len(right_tuple) <= _MAX_POLICY_TUPLE_ITEMS_V5
+                ):
+                    continue
+                raise ValueError("V5 policy dynamic sequence concatenation is forbidden")
+            if isinstance(node.op, ast.Mod) and (left_kind is None or right_kind is None):
+                raise ValueError("V5 policy percent formatting is forbidden")
+            if isinstance(node.op, ast.Mult):
+                try:
+                    literal_left = ast.literal_eval(node.left)
+                    literal_right = ast.literal_eval(node.right)
+                except (TypeError, ValueError):
+                    literal_left = literal_right = None
+                constant_numeric_product = (
+                    type(literal_left) in {int, float}
+                    and type(literal_right) in {int, float}
+                    and abs(literal_left * literal_right) <= _MAX_POLICY_FLOAT_MAGNITUDE_V5
+                )
+                if not constant_numeric_product and (left_kind != "float" and right_kind != "float"):
+                    raise ValueError("V5 policy sequence repetition is forbidden")
+
+    if not _policy_call_graph_is_bounded_v5(
+        functions=functions,
+        edges={name: tuple(items) for name, items in call_edges.items()},
+        local_work=local_work,
+    ):
+        raise ValueError("V5 policy helper graph exceeds recursion or work bounds")
     return tree
 
 
