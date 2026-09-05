@@ -281,9 +281,11 @@ class ProductionRoundFactoryV5:
         authorities: CampaignAuthoritiesV5,
         round_index: int,
         owner_token_sha256: str,
+        adapter_config: ProductionAdapterConfigV5,
     ) -> ProductionRoundCompositionV5:
         if (
-            authorities.manifest.sha256 != self.adapter_config.campaign_manifest_sha256
+            adapter_config != self.adapter_config
+            or authorities.manifest.sha256 != self.adapter_config.campaign_manifest_sha256
             or repository.root_identity_sha256 != self.adapter_config.repository_root_identity_sha256
         ):
             raise V5CliFailure("production_authority_mismatch")
@@ -529,6 +531,7 @@ class ProductionV5CommandServices:
             authorities=authorities,
             round_index=request.round_index,
             owner_token_sha256=request.owner_token_sha256,
+            adapter_config=adapter_config,
         )
         result = run_feedback_round_v5(composition.inputs, composition.dependencies)
         if type(result) is not FeedbackRoundResultV5:
