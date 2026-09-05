@@ -432,11 +432,11 @@ def _policy_numeric_kind_v5(
         return None
     if isinstance(expression.func, ast.Name):
         name = expression.func.id
-        if name in {"bool", "int", "len"}:
+        if name in {"bool", "int", "len", "round"}:
             return "integer"
         if name == "float":
             return "float"
-        if name in {"abs", "round"} and expression.args:
+        if name == "abs" and expression.args:
             return _policy_numeric_kind_v5(
                 expression.args[0],
                 numeric_names=numeric_names,
