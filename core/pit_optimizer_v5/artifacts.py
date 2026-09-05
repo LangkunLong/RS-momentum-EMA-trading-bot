@@ -73,9 +73,12 @@ from core.pit_optimizer_v5.memory import (
 )
 from core.pit_optimizer_v5.probes import ProbeObservationV5, SemanticFingerprintV5
 from core.pit_optimizer_v5.provider import (
+    ExistingPersistedRoleRequestV5,
     FixtureRoleTerminalAuthorityV5,
+    FreshPersistedRoleRequestV5,
     LedgerRoleTerminalAuthorityV5,
     ParsedRoleArtifactV5,
+    PersistedRoleRequestV5,
     RoleAttemptFactsV5,
     RoleCallKeyV5,
     RoleFailureCode,
@@ -87,6 +90,7 @@ from core.pit_optimizer_v5.provider import (
     RoleTerminalAuthorityV5,
     decode_parsed_role_artifact_v5,
     parsed_role_artifact_primitive_v5,
+    role_request_artifact_primitive_v5,
 )
 
 
@@ -302,15 +306,6 @@ def _decode_dataclass(cls: type[T], value: object) -> T:
     hints = get_type_hints(cls)
     decoded = {item.name: _decode_value(hints[item.name], primitive[item.name]) for item in fields(cls) if item.init}
     return cls(**decoded)
-
-
-def _role_request_primitive(request: RoleRequestV5) -> dict[str, object]:
-    if type(request) is not RoleRequestV5:
-        raise ValueError("durable role request must use the V5 schema")
-    result = _constructor_primitive(request)
-    if type(result) is not dict:
-        raise ValueError("durable role request primitive is invalid")
-    return result
 
 
 def _decode_role_request(value: object) -> RoleRequestV5:
@@ -744,30 +739,6 @@ class RepositoryCheckpointV5:
 
 
 @dataclass(frozen=True, slots=True)
-class PersistedRoleRequestV5:
-    reference: ArtifactRefV5
-    call: RoleCallKeyV5
-    request: RoleRequestV5
-    newly_created: bool
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.reference) is not ArtifactRefV5
-            or type(self.call) is not RoleCallKeyV5
-            or type(self.request) is not RoleRequestV5
-        ):
-            raise ValueError("persisted role request is invalid")
-        if type(self.newly_created) is not bool:
-            raise ValueError("persisted role request creation state is invalid")
-        if (
-            self.call.role != self.request.role
-            or self.call.request_sha256 != self.request.sha256
-            or self.reference.relative_path != f"roles/requests/{self.call.sha256}.json"
-        ):
-            raise ValueError("persisted role request path differs from its identity")
-
-
-@dataclass(frozen=True, slots=True)
 class PersistedRoleInvocationV5:
     payload: RoleCompletionPayloadV5
     call: RoleCallKeyV5
@@ -1034,20 +1005,11 @@ class LocalArtifactRepositoryV5:
             raise ValueError("role call and request must use the V5 schema")
         if call.role != request.role or call.request_sha256 != request.sha256:
             raise ValueError("role call differs from its exact request")
-        primitive = {
-            "schema_version": 5,
-            "artifact_type": "role_request",
-            "call": _constructor_primitive(call),
-            "request": _role_request_primitive(request),
-        }
+        primitive = role_request_artifact_primitive_v5(call=call, request=request)
         path = f"roles/requests/{call.sha256}.json"
         reference, created = self._create_only_with_status(path, primitive)
-        return PersistedRoleRequestV5(
-            reference=reference,
-            call=call,
-            request=request,
-            newly_created=created,
-        )
+        capability_type = FreshPersistedRoleRequestV5 if created else ExistingPersistedRoleRequestV5
+        return capability_type(reference=reference, call=call, request=request)
 
     def _load_role_request_entry(
         self,
@@ -1068,23 +1030,10 @@ class LocalArtifactRepositoryV5:
             raise
         except (TypeError, ValueError, ArithmeticError):
             raise ArtifactSchemaFailureV5(reference) from None
-        if (
-            call.role != request.role
-            or call.request_sha256 != request.sha256
-            or reference.relative_path != f"roles/requests/{call.sha256}.json"
-        ):
+        expected = role_request_artifact_primitive_v5(call=call, request=request)
+        if reference.relative_path != f"roles/requests/{call.sha256}.json":
             raise ArtifactSchemaFailureV5(reference)
-        if (
-            canonical_json_bytes_v5(
-                {
-                    "schema_version": 5,
-                    "artifact_type": "role_request",
-                    "call": _constructor_primitive(call),
-                    "request": _role_request_primitive(request),
-                }
-            )
-            != authenticated.content
-        ):
+        if canonical_json_bytes_v5(expected) != authenticated.content:
             raise ArtifactNonCanonicalV5(reference)
         return call, request
 
@@ -1343,6 +1292,13 @@ class LocalArtifactRepositoryV5:
         expected_prior = None if not prior else prior[-1].sha256
         if event.prior_event_sha256 != expected_prior:
             raise ValueError("round event predecessor is not the durable head")
+        prior_payloads = tuple(
+            self.load_round_payload(item.payload_ref, expected_kind=item.event_kind) for item in prior
+        )
+        fold_round_events_v5(
+            events=(*prior, event),
+            payloads=(*prior_payloads, payload),
+        )
         campaign = _safe_component(event.campaign_id, "round event campaign")
         path = f"events/{campaign}/{event.round_index:04d}/{event.sequence:06d}.json"
         reference = self._create_only(path, event.to_primitive())

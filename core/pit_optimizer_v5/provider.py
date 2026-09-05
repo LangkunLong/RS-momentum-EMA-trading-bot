@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from decimal import Decimal
 from enum import StrEnum
 import hashlib
@@ -21,6 +21,7 @@ from core.pit_optimizer_v5.candidate_ir import (
     StructuralTemplateV5,
 )
 from core.pit_optimizer_v5.contracts import (
+    ArtifactRefV5,
     CampaignManifestV5,
     CriticArtifactV5,
     CriticReviewV5,
@@ -2045,6 +2046,110 @@ class RoleCallKeyV5:
         return canonical_sha256_v5(self)
 
 
+def _role_contract_constructor_primitive(value: object) -> object:
+    """Encode only immutable public constructor fields for durable role data."""
+
+    if isinstance(value, Decimal):
+        return canonical_primitive_v5(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _role_contract_constructor_primitive(getattr(value, item.name))
+            for item in fields(value)
+            if item.init
+        }
+    if isinstance(value, tuple):
+        return [_role_contract_constructor_primitive(item) for item in value]
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise ValueError("durable role contract mapping keys must be strings")
+        return {key: _role_contract_constructor_primitive(value[key]) for key in sorted(value)}
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeError:
+            raise ValueError("durable role contract bytes must be UTF-8") from None
+    if isinstance(value, str):
+        return str(value)
+    if value is None or type(value) in {bool, int, float}:
+        return value
+    raise ValueError("durable role contract contains an unsupported value")
+
+
+def role_request_artifact_primitive_v5(
+    *,
+    call: RoleCallKeyV5,
+    request: RoleRequestV5,
+) -> dict[str, object]:
+    """Return the exact create-only request artifact authenticated by a capability."""
+
+    if type(call) is not RoleCallKeyV5 or type(request) is not RoleRequestV5:
+        raise ValueError("role call and request must use the V5 schema")
+    if call.role != request.role or call.request_sha256 != request.sha256:
+        raise ValueError("role call differs from its exact request")
+    call_primitive = _role_contract_constructor_primitive(call)
+    request_primitive = _role_contract_constructor_primitive(request)
+    if type(call_primitive) is not dict or type(request_primitive) is not dict:
+        raise ValueError("durable role request primitive is invalid")
+    return {
+        "schema_version": 5,
+        "artifact_type": "role_request",
+        "call": call_primitive,
+        "request": request_primitive,
+    }
+
+
+def _validate_persisted_role_request_capability(
+    *,
+    reference: ArtifactRefV5,
+    call: RoleCallKeyV5,
+    request: RoleRequestV5,
+) -> None:
+    if type(reference) is not ArtifactRefV5 or type(call) is not RoleCallKeyV5 or type(request) is not RoleRequestV5:
+        raise ValueError("persisted role request capability is invalid")
+    primitive = role_request_artifact_primitive_v5(call=call, request=request)
+    expected = ArtifactRefV5(
+        relative_path=f"roles/requests/{call.sha256}.json",
+        sha256=canonical_sha256_v5(primitive),
+    )
+    if reference != expected:
+        raise ValueError("persisted role request reference differs from its exact request")
+
+
+@dataclass(frozen=True, slots=True)
+class FreshPersistedRoleRequestV5:
+    """Proof that this exact request record was created by the current append."""
+
+    reference: ArtifactRefV5
+    call: RoleCallKeyV5
+    request: RoleRequestV5
+
+    def __post_init__(self) -> None:
+        _validate_persisted_role_request_capability(
+            reference=self.reference,
+            call=self.call,
+            request=self.request,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExistingPersistedRoleRequestV5:
+    """Proof that the exact request record predated the current append."""
+
+    reference: ArtifactRefV5
+    call: RoleCallKeyV5
+    request: RoleRequestV5
+
+    def __post_init__(self) -> None:
+        _validate_persisted_role_request_capability(
+            reference=self.reference,
+            call=self.call,
+            request=self.request,
+        )
+
+
+PersistedRoleRequestV5 = FreshPersistedRoleRequestV5 | ExistingPersistedRoleRequestV5
+
+
 @dataclass(frozen=True, slots=True)
 class LedgerRoleTerminalAuthorityV5:
     """Ledger receipt wrapped with the controller's exact round-role key."""
@@ -2208,14 +2313,12 @@ class RecoverableRoleInvokerV5(Protocol):
 
     def invoke_once(
         self,
-        call: RoleCallKeyV5,
-        request: RoleRequestV5,
+        persisted_request: FreshPersistedRoleRequestV5,
     ) -> RoleInvocationPackageV5: ...
 
     def reconcile_once(
         self,
-        call: RoleCallKeyV5,
-        request: RoleRequestV5,
+        persisted_request: ExistingPersistedRoleRequestV5,
     ) -> RoleReconciliationResultV5: ...
 
 
@@ -2966,15 +3069,18 @@ __all__ = [
     "ExperimentFailureAggregateV5",
     "ExperimentPredictionAggregateV5",
     "ExperimentSemanticDifferenceAggregateV5",
+    "ExistingPersistedRoleRequestV5",
     "FailureStageV5",
     "FixtureRoleTerminalAuthorityV5",
     "FixtureRoleRunnerV5",
+    "FreshPersistedRoleRequestV5",
     "GatewayCompletionProviderV5",
     "IssuedEvidenceV5",
     "InvestigatorRoleInputV5",
     "LedgerRoleTerminalAuthorityV5",
     "OneShotJsonCompletionV5",
     "ParsedRoleArtifactV5",
+    "PersistedRoleRequestV5",
     "ProviderCompletionRequestV5",
     "PrimaryMechanismV5",
     "RecoverableRoleInvokerV5",
@@ -3012,5 +3118,6 @@ __all__ = [
     "parse_and_bind_role_artifact",
     "parsed_role_artifact_primitive_v5",
     "role_schema_authority_from_manifest_v5",
+    "role_request_artifact_primitive_v5",
     "validate_parsed_role_artifact_v5",
 ]
