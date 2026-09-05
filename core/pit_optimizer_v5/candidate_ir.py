@@ -26,6 +26,94 @@ LiteralValueV5 = bool | int | float | str
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _PATH_ORDER_V5 = {path: index for index, path in enumerate(EDITABLE_POLICY_PATHS_V5)}
 
+_MAX_POLICY_SOURCE_BYTES_V5 = 131_072
+_MAX_POLICY_AST_NODES_V5 = 8_192
+_PURE_POLICY_BUILTINS_V5 = frozenset(
+    {
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "float",
+        "int",
+        "len",
+        "max",
+        "min",
+        "round",
+        "sum",
+        "tuple",
+    }
+)
+_SAFE_MATH_CALLS_V5 = frozenset(
+    {
+        "ceil",
+        "copysign",
+        "exp",
+        "fabs",
+        "floor",
+        "isfinite",
+        "isnan",
+        "log",
+        "log1p",
+        "sqrt",
+        "tanh",
+    }
+)
+_SAFE_POLICY_IMPORTS_V5: Mapping[str, frozenset[str]] = {
+    "core.strategy_policy.contracts": frozenset(
+        {
+            "AllocationDecision",
+            "CapacityDecision",
+            "EntryDecision",
+            "EvictionDecision",
+            "ExitAction",
+            "ExitDecision",
+        }
+    ),
+    "core.strategy_policy.contracts_v3": frozenset(
+        {
+            "AddOnDecisionV3",
+            "AddOnSnapshotV3",
+            "AllocationSnapshotV3",
+            "CapacitySnapshotV3",
+            "EntrySnapshotV3",
+            "EvictionPositionV3",
+            "EvictionSnapshotV3",
+            "ExitSnapshotV3",
+            "PortfolioFeaturesV3",
+        }
+    ),
+    "core.strategy_policy.entry": frozenset({"evaluate_entry"}),
+    "core.strategy_policy.exit": frozenset({"evaluate_exit"}),
+    "core.strategy_policy.risk": frozenset(
+        {"recommend_allocation", "recommend_capacity", "select_eviction"}
+    ),
+}
+_FORBIDDEN_POLICY_NODES_V5 = (
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.AsyncWith,
+    ast.Await,
+    ast.ClassDef,
+    ast.Delete,
+    ast.DictComp,
+    ast.For,
+    ast.GeneratorExp,
+    ast.Global,
+    ast.Lambda,
+    ast.ListComp,
+    ast.Match,
+    ast.NamedExpr,
+    ast.Nonlocal,
+    ast.Raise,
+    ast.SetComp,
+    ast.Try,
+    ast.While,
+    ast.With,
+    ast.Yield,
+    ast.YieldFrom,
+)
+
 
 def _digest(value: object, label: str) -> str:
     if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
@@ -118,6 +206,242 @@ def _source_hashes(bundle: SourceBundleV5) -> tuple[tuple[str, str], ...]:
         (item.path, hashlib.sha256(item.source.encode("utf-8")).hexdigest())
         for item in bundle.files
     )
+
+
+def _policy_assignment_name_and_value_v5(
+    statement: ast.Assign | ast.AnnAssign,
+) -> tuple[str, ast.expr]:
+    if isinstance(statement, ast.Assign):
+        if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+            raise ValueError("policy module assignment must target one name")
+        return statement.targets[0].id, statement.value
+    if not isinstance(statement.target, ast.Name) or statement.value is None:
+        raise ValueError("policy module assignment must target one initialized name")
+    return statement.target.id, statement.value
+
+
+def _policy_call_graph_is_acyclic_v5(
+    functions: Mapping[str, ast.FunctionDef],
+) -> bool:
+    calls = {
+        name: frozenset(
+            node.func.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in functions
+        )
+        for name, function in functions.items()
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> bool:
+        if name in visiting:
+            return False
+        if name in visited:
+            return True
+        visiting.add(name)
+        if any(not visit(child) for child in calls[name]):
+            return False
+        visiting.remove(name)
+        visited.add(name)
+        return True
+
+    return all(visit(name) for name in functions)
+
+
+def validate_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
+    """Validate one bounded, capability-closed V3 policy module.
+
+    The evaluator still runs candidates inside its Docker sandbox.  This
+    stricter controller-side language is used for deterministic semantic
+    probes, so it deliberately excludes loops, recursion, dynamic calls,
+    reflection, mutation helpers, and ambient imports.
+    """
+
+    if path not in EDITABLE_POLICY_PATHS_V5 or type(source) is not str:
+        raise ValueError("V5 policy source authority is invalid")
+    if len(source.encode("utf-8")) > _MAX_POLICY_SOURCE_BYTES_V5:
+        raise ValueError("V5 policy source exceeds the bounded AST envelope")
+    tree = validate_policy_source_ast(
+        path=path,
+        source=source,
+        required_public_symbols=REQUIRED_POLICY_EXPORTS_V5[path],
+    )
+    nodes = tuple(ast.walk(tree))
+    if len(nodes) > _MAX_POLICY_AST_NODES_V5:
+        raise ValueError("V5 policy AST exceeds the bounded node envelope")
+    if any(isinstance(node, _FORBIDDEN_POLICY_NODES_V5) for node in nodes):
+        raise ValueError("V5 policy AST contains an unbounded or stateful construct")
+    if any(isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Pow, ast.MatMult)) for node in nodes):
+        raise ValueError("V5 policy AST contains an unbounded arithmetic construct")
+
+    functions: dict[str, ast.FunctionDef] = {}
+    imported_call_names: set[str] = set()
+    all_exports_seen = False
+    for statement in tree.body:
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and type(
+            statement.value.value
+        ) is str:
+            continue
+        if isinstance(statement, ast.Import):
+            if (
+                len(statement.names) != 1
+                or statement.names[0].name != "math"
+                or statement.names[0].asname is not None
+            ):
+                raise ValueError("V5 policy import is outside the closed allowlist")
+            continue
+        if isinstance(statement, ast.ImportFrom):
+            if statement.level != 0 or statement.module is None:
+                raise ValueError("V5 policy import is outside the closed allowlist")
+            if statement.module == "__future__":
+                if tuple((item.name, item.asname) for item in statement.names) != (
+                    ("annotations", None),
+                ):
+                    raise ValueError("V5 policy future import is invalid")
+                continue
+            permitted = _SAFE_POLICY_IMPORTS_V5.get(statement.module)
+            if permitted is None or not statement.names:
+                raise ValueError("V5 policy import is outside the closed allowlist")
+            trusted_helper = statement.module in {
+                "core.strategy_policy.entry",
+                "core.strategy_policy.exit",
+                "core.strategy_policy.risk",
+            }
+            for item in statement.names:
+                if item.name not in permitted:
+                    raise ValueError("V5 policy import name is outside the closed allowlist")
+                if trusted_helper:
+                    if item.asname is None or not item.asname.startswith("_") or item.asname.startswith("__"):
+                        raise ValueError("trusted baseline helpers require a private local alias")
+                elif item.asname is not None:
+                    raise ValueError("V5 policy contract imports cannot be aliased")
+                imported_call_names.add(item.asname or item.name)
+            continue
+        if isinstance(statement, ast.FunctionDef):
+            if statement.name in functions or statement.name.startswith("__"):
+                raise ValueError("V5 policy function names must be unique and non-dunder")
+            if (
+                statement.decorator_list
+                or statement.args.defaults
+                or statement.args.kw_defaults
+                or statement.args.vararg is not None
+                or statement.args.kwarg is not None
+                or statement.args.kwonlyargs
+            ):
+                raise ValueError("V5 policy function signature is outside the closed contract")
+            arguments = (*statement.args.posonlyargs, *statement.args.args)
+            if statement.name in REQUIRED_POLICY_EXPORTS_V5[path]:
+                if len(arguments) != 1:
+                    raise ValueError("V5 public policy functions require one snapshot argument")
+            elif not statement.name.startswith("_") or not 1 <= len(arguments) <= 8:
+                raise ValueError("V5 private helper signature is outside the bounded contract")
+            if any(
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node is not statement
+                for node in ast.walk(statement)
+            ):
+                raise ValueError("nested V5 policy functions are forbidden")
+            functions[statement.name] = statement
+            continue
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            name, value = _policy_assignment_name_and_value_v5(statement)
+            try:
+                literal = ast.literal_eval(value)
+            except (TypeError, ValueError):
+                raise ValueError("V5 policy module constants must be literal") from None
+            if name == "__all__":
+                if all_exports_seen or type(literal) not in {list, tuple}:
+                    raise ValueError("V5 policy export declaration is invalid")
+                exports = tuple(literal)
+                if (
+                    any(type(item) is not str for item in exports)
+                    or len(set(exports)) != len(exports)
+                    or set(exports) != set(REQUIRED_POLICY_EXPORTS_V5[path])
+                ):
+                    raise ValueError("V5 policy export declaration differs from the interface")
+                all_exports_seen = True
+            elif not name.isupper() or name.startswith("_"):
+                raise ValueError("V5 policy module assignment is outside the constant scope")
+            continue
+        raise ValueError("V5 policy module statement is outside the closed language")
+    if not all_exports_seen:
+        raise ValueError("V5 policy module must declare its exact public exports")
+
+    allowed_calls = _PURE_POLICY_BUILTINS_V5 | frozenset(imported_call_names) | frozenset(functions)
+    for node in nodes:
+        if isinstance(node, ast.Name) and node.id.startswith("__") and node.id != "__all__":
+            raise ValueError("V5 policy dunder access is forbidden")
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            raise ValueError("V5 policy private attribute access is forbidden")
+        if isinstance(node, ast.Constant):
+            if type(node.value) not in {type(None), bool, int, float, str}:
+                raise ValueError("V5 policy constants must be bounded JSON literals")
+            if type(node.value) is float and not math.isfinite(node.value):
+                raise ValueError("V5 policy floats must be finite")
+            if type(node.value) is str and len(node.value.encode("utf-8")) > 4_096:
+                raise ValueError("V5 policy string literal is too large")
+        if not isinstance(node, ast.Call):
+            continue
+        if any(keyword.arg is None for keyword in node.keywords) or any(
+            isinstance(argument, ast.Starred) for argument in node.args
+        ):
+            raise ValueError("V5 policy variadic calls are forbidden")
+        if isinstance(node.func, ast.Name):
+            if node.func.id not in allowed_calls:
+                raise ValueError("V5 policy call is outside the pure allowlist")
+            continue
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "math"
+            and node.func.attr in _SAFE_MATH_CALLS_V5
+        ):
+            continue
+        raise ValueError("V5 policy attribute and dynamic calls are forbidden")
+    if not _policy_call_graph_is_acyclic_v5(functions):
+        raise ValueError("V5 policy helper recursion is forbidden")
+    return tree
+
+
+def _policy_symbol_nodes_v5(source_file: SourceFileV5) -> dict[str, str]:
+    tree = validate_policy_source_ast_v5(path=source_file.path, source=source_file.source)
+    result: dict[str, str] = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.FunctionDef):
+            result[statement.name] = ast.dump(statement, include_attributes=False)
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            name, _value = _policy_assignment_name_and_value_v5(statement)
+            if name.isupper() and not name.startswith("_"):
+                result[name] = ast.dump(statement, include_attributes=False)
+    return result
+
+
+def derive_changed_symbols_v5(
+    *,
+    before: SourceBundleV5,
+    after: SourceBundleV5,
+) -> tuple[str, ...]:
+    """Return exact qualified top-level symbols changed across two V5 bundles."""
+
+    if type(before) is not SourceBundleV5 or type(after) is not SourceBundleV5:
+        raise ValueError("V5 changed-symbol inputs must be source bundles")
+    before_files = {item.path: item for item in before.files}
+    after_files = {item.path: item for item in after.files}
+    if tuple(before_files) != EDITABLE_POLICY_PATHS_V5 or tuple(after_files) != EDITABLE_POLICY_PATHS_V5:
+        raise ValueError("V5 changed-symbol source paths differ")
+    changed: list[str] = []
+    for path in EDITABLE_POLICY_PATHS_V5:
+        left = _policy_symbol_nodes_v5(before_files[path])
+        right = _policy_symbol_nodes_v5(after_files[path])
+        module = path.removesuffix(".py").replace("/", ".")
+        changed.extend(
+            f"{module}.{name}"
+            for name in left.keys() | right.keys()
+            if left.get(name) != right.get(name)
+        )
+    return tuple(sorted(changed))
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,11 +537,7 @@ class SourceFileV5:
         if type(self.path) is not str or self.path not in EDITABLE_POLICY_PATHS_V5:
             raise ValueError("policy source path is outside the V5 editable scope")
         source = _source_text(self.source, f"policy source {self.path}")
-        tree = validate_policy_source_ast(
-            path=self.path,
-            source=source,
-            required_public_symbols=REQUIRED_POLICY_EXPORTS_V5[self.path],
-        )
+        tree = validate_policy_source_ast_v5(path=self.path, source=source)
         public_definitions = tuple(
             node.name
             for node in tree.body
@@ -754,7 +1074,9 @@ __all__ = [
     "StructuralTemplateV5",
     "VariantAssignmentV5",
     "derive_experiment_identity_v5",
+    "derive_changed_symbols_v5",
     "derive_policy_revision_identity_v5",
     "derive_pre_validation_invalid_experiment_identity_v5",
+    "validate_policy_source_ast_v5",
     "validate_post_validation_experiment_identity_v5",
 ]

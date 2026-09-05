@@ -543,6 +543,22 @@ class GitCandidateMaterializerV5:
             files.append(self._source_file(relative_path, raw, "workspace_identity_mismatch"))
         return SourceBundleV5(tuple(files))
 
+    def _write_workspace_bundle(
+        self,
+        workspace: OwnedWorkspaceHandleV5,
+        bundle: SourceBundleV5,
+    ) -> None:
+        if type(bundle) is not SourceBundleV5:
+            self._fail("invalid_authority")
+        for source_file in bundle.files:
+            self._driver_call(
+                lambda source_file=source_file: self._driver.write_workspace_policy_file(
+                    workspace=workspace,
+                    relative_path=self._validate_policy_path(source_file.path),
+                    content=source_file.source.encode("utf-8"),
+                )
+            )
+
     @staticmethod
     def _bundle_matches_revision(bundle: SourceBundleV5, revision: PolicyRevisionIdentityV5) -> bool:
         return tuple((item.path, item.sha256) for item in bundle.files) == revision.editable_source_sha256
@@ -605,19 +621,72 @@ class GitCandidateMaterializerV5:
         parent_revision: PolicyRevisionIdentityV5,
         variant: RenderedVariantV5,
     ) -> MaterializedWorkspaceV5:
+        return self._materialize_from_source(
+            owner=owner,
+            source_revision=parent_revision,
+            parent_revision=parent_revision,
+            parent_source=None,
+            variant=variant,
+        )
+
+    def materialize_from_parent_source(
+        self,
+        *,
+        owner: WorkspaceOwnerV5,
+        source_revision: PolicyRevisionIdentityV5,
+        parent_revision: PolicyRevisionIdentityV5,
+        parent_source: SourceBundleV5,
+        variant: RenderedVariantV5,
+    ) -> MaterializedWorkspaceV5:
+        """Export authenticated source, overlay an archive parent, then its child.
+
+        ``source_revision`` identifies the exact checked-out repository bytes used
+        to create the disposable Git export.  ``parent_source`` may identify an
+        archived policy revision, but it cannot change the trusted runtime or
+        immutable-constraint identities inherited by the child.
+        """
+
+        if type(parent_source) is not SourceBundleV5:
+            self._fail("invalid_authority")
+        return self._materialize_from_source(
+            owner=owner,
+            source_revision=source_revision,
+            parent_revision=parent_revision,
+            parent_source=parent_source,
+            variant=variant,
+        )
+
+    def _materialize_from_source(
+        self,
+        *,
+        owner: WorkspaceOwnerV5,
+        source_revision: PolicyRevisionIdentityV5,
+        parent_revision: PolicyRevisionIdentityV5,
+        parent_source: SourceBundleV5 | None,
+        variant: RenderedVariantV5,
+    ) -> MaterializedWorkspaceV5:
         if (
             type(owner) is not WorkspaceOwnerV5
+            or type(source_revision) is not PolicyRevisionIdentityV5
             or type(parent_revision) is not PolicyRevisionIdentityV5
             or type(variant) is not RenderedVariantV5
         ):
             self._fail("invalid_authority")
         if (
-            variant.policy_revision.trusted_policy_runtime_sha256 != parent_revision.trusted_policy_runtime_sha256
+            source_revision.trusted_policy_runtime_sha256
+            != parent_revision.trusted_policy_runtime_sha256
+            or source_revision.immutable_constraints_sha256
+            != parent_revision.immutable_constraints_sha256
+            or variant.policy_revision.trusted_policy_runtime_sha256
+            != parent_revision.trusted_policy_runtime_sha256
             or variant.policy_revision.immutable_constraints_sha256 != parent_revision.immutable_constraints_sha256
         ):
             self._fail("source_identity_mismatch")
         source_bundle = self._read_source_bundle()
-        if not self._bundle_matches_revision(source_bundle, parent_revision):
+        if not self._bundle_matches_revision(source_bundle, source_revision):
+            self._fail("source_identity_mismatch")
+        selected_parent = source_bundle if parent_source is None else parent_source
+        if not self._bundle_matches_revision(selected_parent, parent_revision):
             self._fail("source_identity_mismatch")
 
         lease = self._new_lease(owner, parent_revision, variant)
@@ -633,17 +702,21 @@ class GitCandidateMaterializerV5:
             handle = self._authorize_handle(created, lease)
             if self._load_lease(lease.payload.lease_id) != lease:
                 self._fail("foreign_lease")
-            workspace_parent = self._read_workspace_bundle(handle)
-            if not self._bundle_matches_revision(workspace_parent, parent_revision):
+            workspace_source = self._read_workspace_bundle(handle)
+            if workspace_source != source_bundle or not self._bundle_matches_revision(
+                workspace_source,
+                source_revision,
+            ):
                 self._fail("source_identity_mismatch")
-            for source_file in variant.source_bundle.files:
-                self._driver_call(
-                    lambda source_file=source_file: self._driver.write_workspace_policy_file(
-                        workspace=handle,
-                        relative_path=self._validate_policy_path(source_file.path),
-                        content=source_file.source.encode("utf-8"),
-                    )
-                )
+            if selected_parent != workspace_source:
+                self._write_workspace_bundle(handle, selected_parent)
+            workspace_parent = self._read_workspace_bundle(handle)
+            if workspace_parent != selected_parent or not self._bundle_matches_revision(
+                workspace_parent,
+                parent_revision,
+            ):
+                self._fail("source_identity_mismatch")
+            self._write_workspace_bundle(handle, variant.source_bundle)
             child_bundle = self._read_workspace_bundle(handle)
             child_revision = derive_policy_revision_identity_v5(
                 source_bundle=child_bundle,
@@ -658,6 +731,65 @@ class GitCandidateMaterializerV5:
         except BaseException:
             self._cleanup_failed_materialization(owner, lease)
             raise
+        return MaterializedWorkspaceV5(parent_revision, variant, lease, handle)
+
+    def recover_materialized(
+        self,
+        *,
+        owner: WorkspaceOwnerV5,
+        source_revision: PolicyRevisionIdentityV5,
+        parent_revision: PolicyRevisionIdentityV5,
+        variant: RenderedVariantV5,
+        lease: WorkspaceLeaseV5,
+    ) -> MaterializedWorkspaceV5:
+        """Reopen one exact durable workspace without creating a replacement."""
+
+        if (
+            type(owner) is not WorkspaceOwnerV5
+            or type(source_revision) is not PolicyRevisionIdentityV5
+            or type(parent_revision) is not PolicyRevisionIdentityV5
+            or type(variant) is not RenderedVariantV5
+            or type(lease) is not WorkspaceLeaseV5
+        ):
+            self._fail("invalid_authority")
+        if (
+            source_revision.trusted_policy_runtime_sha256
+            != parent_revision.trusted_policy_runtime_sha256
+            or source_revision.immutable_constraints_sha256
+            != parent_revision.immutable_constraints_sha256
+            or variant.policy_revision.trusted_policy_runtime_sha256
+            != parent_revision.trusted_policy_runtime_sha256
+            or variant.policy_revision.immutable_constraints_sha256
+            != parent_revision.immutable_constraints_sha256
+            or lease.parent_revision_sha256 != parent_revision.sha256
+            or lease.child_revision_sha256 != variant.policy_revision.sha256
+        ):
+            self._fail("source_identity_mismatch")
+        self._authorize_lease(owner, lease)
+        source_bundle = self._read_source_bundle()
+        if not self._bundle_matches_revision(source_bundle, source_revision):
+            self._fail("source_identity_mismatch")
+        if self._load_lease(lease.payload.lease_id) != lease:
+            self._fail("foreign_lease")
+        opened = self._driver_call(
+            lambda: self._driver.open_owned_workspace(
+                workspace_root=self._workspace_root,
+                lease=lease,
+            )
+        )
+        if opened is None:
+            self._fail("unsafe_path")
+        handle = self._authorize_handle(opened, lease)
+        child_bundle = self._read_workspace_bundle(handle)
+        child_revision = derive_policy_revision_identity_v5(
+            source_bundle=child_bundle,
+            trusted_policy_runtime_sha256=parent_revision.trusted_policy_runtime_sha256,
+            immutable_constraints_sha256=parent_revision.immutable_constraints_sha256,
+        )
+        if child_bundle != variant.source_bundle or child_revision != variant.policy_revision:
+            self._fail("workspace_identity_mismatch")
+        if self._load_lease(lease.payload.lease_id) != lease:
+            self._fail("foreign_lease")
         return MaterializedWorkspaceV5(parent_revision, variant, lease, handle)
 
     def _cleanup_failed_materialization(self, owner: WorkspaceOwnerV5, lease: WorkspaceLeaseV5) -> None:
