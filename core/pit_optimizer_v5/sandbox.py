@@ -161,6 +161,7 @@ def derive_sandbox_mount_authorities_v5(
     sandbox_profile: SandboxProfileV5,
     panel: EpisodePlanV5,
     scenario_ids: tuple[str, ...],
+    execution_key: CandidateExecutionKeyV5,
 ) -> tuple[str, str, str]:
     """Bind every mount's contents to the complete evaluation authority."""
 
@@ -171,6 +172,7 @@ def derive_sandbox_mount_authorities_v5(
         or type(sandbox_profile) is not SandboxProfileV5
         or type(panel) is not EpisodePlanV5
         or type(scenario_ids) is not tuple
+        or type(execution_key) is not CandidateExecutionKeyV5
     ):
         raise ValueError("sandbox mount authority inputs are invalid")
     common = {
@@ -179,6 +181,7 @@ def derive_sandbox_mount_authorities_v5(
         "panel_sha256": panel.panel_ref.sha256,
         "policy_revision_sha256": policy_revision.sha256,
         "scenario_ids": scenario_ids,
+        "execution_key": canonical_primitive_v5(execution_key),
     }
     return (
         canonical_sha256_v5({**common, "kind": "source"}),
@@ -271,6 +274,7 @@ class DockerPanelRequestV5:
             sandbox_profile=self.sandbox_profile,
             panel=self.panel,
             scenario_ids=self.scenario_ids,
+            execution_key=self.execution_key,
         )
         if (
             self.source_mount.content_authority_sha256,
@@ -283,6 +287,7 @@ class DockerPanelRequestV5:
         return {
             "owner_sha256": self.owner.sha256,
             "manifest_sha256": self.manifest.sha256,
+            "execution_key": canonical_primitive_v5(self.execution_key),
             "policy_revision": self.policy_revision.to_primitive(),
             "evaluator_contract_sha256": self.evaluator_contract.sha256,
             "sandbox_profile_sha256": self.sandbox_profile.sha256,
@@ -474,6 +479,7 @@ class SandboxMountFactoryV5(Protocol):
         materialized: MaterializedVariantV5,
         panel: EpisodePlanV5,
         scenario_ids: tuple[str, ...],
+        execution_key: CandidateExecutionKeyV5,
     ) -> tuple[SandboxMountHandleV5, SandboxMountHandleV5, SandboxMountHandleV5]: ...
 
 
@@ -1033,7 +1039,12 @@ class DockerCandidateRuntimeV5:
     ) -> DockerPanelRequestV5:
         if type(materialized) is not MaterializedVariantV5:
             raise ValueError("Docker candidate runtime materialization is invalid")
-        supplied = self._mounts.mounts_for(materialized=materialized, panel=panel, scenario_ids=scenario_ids)
+        supplied = self._mounts.mounts_for(
+            materialized=materialized,
+            panel=panel,
+            scenario_ids=scenario_ids,
+            execution_key=execution_key,
+        )
         if type(supplied) is not tuple or len(supplied) != 3:
             raise ValueError("Docker candidate runtime mounts are invalid")
         return DockerPanelRequestV5(

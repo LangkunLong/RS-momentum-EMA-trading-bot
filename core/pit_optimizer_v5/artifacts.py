@@ -51,6 +51,8 @@ from core.pit_optimizer_v5.contracts import (
 )
 from core.pit_optimizer_v5.memory import (
     ArchiveReducerV5,
+    CandidateExecutionAuthorityV5,
+    CandidateExecutionKeyV5,
     CandidateStageResultPayloadV5,
     CleanupResultPayloadV5,
     EpisodeEvidencePayloadV5,
@@ -690,6 +692,8 @@ def _decode_round_payload(expected_kind: str, value: object) -> RoundEventPayloa
             experiment_id=item["experiment_id"],  # type: ignore[arg-type]
             episode=_decode_dataclass(EpisodeEvaluationV5, item["episode"]),
         )
+    if expected_kind == "candidate_execution":
+        return _decode_dataclass(CandidateExecutionAuthorityV5, body)
     if expected_kind == "resource_lease":
         return _decode_dataclass(ResourceLeasePayloadV5, body)
     if expected_kind == "cleanup_result":
@@ -1434,6 +1438,96 @@ class LocalArtifactRepositoryV5:
             payloads.append(payload)
         fold_round_events_v5(events=tuple(events), payloads=tuple(payloads))
         return tuple(events)
+
+    def load_candidate_executions(
+        self, *, campaign_id: str, round_index: int
+    ) -> tuple[CandidateExecutionAuthorityV5, ...]:
+        events = self.load_round_events(campaign_id=campaign_id, round_index=round_index)
+        return tuple(
+            payload
+            for event in events
+            if isinstance(
+                payload := self.load_round_payload(
+                    event.payload_ref,
+                    expected_kind=event.event_kind,
+                ),
+                CandidateExecutionAuthorityV5,
+            )
+        )
+
+    def load_candidate_execution(
+        self,
+        *,
+        campaign_id: str,
+        round_index: int,
+        key: CandidateExecutionKeyV5,
+    ) -> tuple[CandidateExecutionAuthorityV5, ArtifactRefV5] | None:
+        if type(key) is not CandidateExecutionKeyV5:
+            raise ValueError("candidate execution lookup key is invalid")
+        events = self.load_round_events(campaign_id=campaign_id, round_index=round_index)
+        matches: list[tuple[CandidateExecutionAuthorityV5, ArtifactRefV5]] = []
+        for event in events:
+            if event.event_kind != "candidate_execution":
+                continue
+            payload = self.load_round_payload(
+                event.payload_ref,
+                expected_kind=event.event_kind,
+            )
+            if not isinstance(payload, CandidateExecutionAuthorityV5):
+                raise ArtifactSchemaFailureV5(event.payload_ref)
+            if payload.key == key:
+                matches.append((payload, event.payload_ref))
+        if len(matches) > 1:
+            raise ArtifactSchemaFailureV5()
+        return None if not matches else matches[0]
+
+    def append_candidate_execution(self, authority: CandidateExecutionAuthorityV5) -> ArtifactRefV5:
+        if type(authority) is not CandidateExecutionAuthorityV5:
+            raise ValueError("candidate execution authority is invalid")
+        existing = self.load_candidate_executions(
+            campaign_id=authority.campaign_id,
+            round_index=authority.round_index,
+        )
+        if (
+            self.load_candidate_execution(
+                campaign_id=authority.campaign_id,
+                round_index=authority.round_index,
+                key=authority.key,
+            )
+            is not None
+        ):
+            raise ArtifactExistsV5()
+        existing_lease_ids = {payload.lease_id for item in existing for payload in item.lease_payloads}
+        if any(payload.lease_id in existing_lease_ids for payload in authority.lease_payloads):
+            raise ArtifactExistsV5()
+        prior = self.load_round_events(
+            campaign_id=authority.campaign_id,
+            round_index=authority.round_index,
+        )
+        payload_ref = self.append_round_payload(authority)
+        event = RoundEventV5(
+            campaign_id=authority.campaign_id,
+            round_index=authority.round_index,
+            sequence=len(prior),
+            prior_event_sha256=None if not prior else prior[-1].sha256,
+            event_kind="candidate_execution",
+            experiment_id=authority.key.experiment_id,
+            payload_ref=payload_ref,
+        )
+        self.append_round_event(event)
+        reloaded = self.load_candidate_execution(
+            campaign_id=authority.campaign_id,
+            round_index=authority.round_index,
+            key=authority.key,
+        )
+        if (
+            reloaded is None
+            or reloaded[0] != authority
+            or reloaded[1] != payload_ref
+            or type(reloaded[1]) is not ArtifactRefV5
+        ):
+            raise ArtifactNonCanonicalV5(payload_ref)
+        return payload_ref
 
     def recover_round(
         self,

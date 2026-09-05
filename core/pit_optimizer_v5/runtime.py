@@ -38,6 +38,9 @@ from core.pit_optimizer_v5.contracts import (
 )
 from core.pit_optimizer_v5.memory import (
     ArchiveReducerV5,
+    CandidateExecutionAuthorityV5,
+    CandidateExecutionKeyV5,
+    CandidateExecutionStageV5,
     CandidateStageFailureCodeV5,
     CandidateStageOutcomeV5,
     CandidateStageResultPayloadV5,
@@ -233,67 +236,6 @@ class OwnedLeaseV5:
         _positive(self.round_index, "owned lease round")
         if self.opaque_handle is None:
             raise ValueError("owned lease requires an opaque handle")
-
-
-CandidateExecutionStageV5 = Literal["quick_evaluation", "discovery_evaluation"]
-
-
-@dataclass(frozen=True, slots=True)
-class CandidateExecutionKeyV5:
-    experiment_id: str
-    stage: CandidateExecutionStageV5
-    episode_ordinal: int | None
-
-    def __post_init__(self) -> None:
-        _digest(self.experiment_id, "candidate execution experiment")
-        if self.stage == "quick_evaluation":
-            if self.episode_ordinal is not None:
-                raise ValueError("quick execution cannot carry an episode ordinal")
-        elif self.stage == "discovery_evaluation":
-            _positive(self.episode_ordinal, "candidate execution episode ordinal")
-        else:
-            raise ValueError("candidate execution stage is invalid")
-
-
-@dataclass(frozen=True, slots=True)
-class CandidateExecutionAuthorityV5:
-    """One atomic durable ownership and recovery record for an evaluator execution."""
-
-    campaign_id: str
-    round_index: int
-    owner_token_sha256: str
-    key: CandidateExecutionKeyV5
-    request_sha256: str
-    command_sha256: str
-    output_mount_authority_sha256: str
-    lease_payloads: tuple[ResourceLeasePayloadV5, ...]
-
-    def __post_init__(self) -> None:
-        if type(self.campaign_id) is not str or not self.campaign_id:
-            raise ValueError("candidate execution campaign is invalid")
-        _positive(self.round_index, "candidate execution round")
-        _digest(self.owner_token_sha256, "candidate execution owner token")
-        if type(self.key) is not CandidateExecutionKeyV5:
-            raise ValueError("candidate execution key is invalid")
-        _digest(self.request_sha256, "candidate execution request")
-        _digest(self.command_sha256, "candidate execution command")
-        _digest(self.output_mount_authority_sha256, "candidate execution output authority")
-        if (
-            type(self.lease_payloads) is not tuple
-            or tuple(item.resource_kind for item in self.lease_payloads) != ("evaluator_process", "container")
-            or any(
-                type(item) is not ResourceLeasePayloadV5
-                or item.owner_campaign_id != self.campaign_id
-                or item.owner_token_sha256 != self.owner_token_sha256
-                for item in self.lease_payloads
-            )
-            or len({item.lease_id for item in self.lease_payloads}) != 2
-        ):
-            raise ValueError("candidate execution leases are invalid")
-
-    @property
-    def sha256(self) -> str:
-        return canonical_sha256_v5(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,6 +496,14 @@ class CandidateExecutionPersistenceV5(Protocol):
     def load_candidate_executions(
         self, *, campaign_id: str, round_index: int
     ) -> tuple[CandidateExecutionAuthorityV5, ...]: ...
+
+    def load_candidate_execution(
+        self,
+        *,
+        campaign_id: str,
+        round_index: int,
+        key: CandidateExecutionKeyV5,
+    ) -> tuple[CandidateExecutionAuthorityV5, ArtifactRefV5] | None: ...
 
     def append_candidate_execution(self, authority: CandidateExecutionAuthorityV5) -> ArtifactRefV5: ...
 
@@ -861,6 +811,7 @@ class _Journal:
                 CandidateStageResultPayloadV5: "candidate_stage_result",
                 QuickEvidencePayloadV5: "quick_evidence",
                 EpisodeEvidencePayloadV5: "episode_evidence",
+                CandidateExecutionAuthorityV5: "candidate_execution",
                 ResourceLeasePayloadV5: "resource_lease",
                 CleanupResultPayloadV5: "cleanup_result",
                 RoundOutcomePayloadV5: "round_outcome",
@@ -1089,10 +1040,35 @@ class _Runtime:
         return authorities
 
     def _existing_execution(self, key: CandidateExecutionKeyV5) -> CandidateExecutionAuthorityV5 | None:
-        matches = tuple(item for item in self._execution_authorities() if item.key == key)
-        if len(matches) > 1:
+        if type(key) is not CandidateExecutionKeyV5:
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
-        return None if not matches else matches[0]
+        persistence = self.dependencies.persistence
+        if not isinstance(persistence, CandidateExecutionPersistenceV5):
+            if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
+                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+            return None
+        try:
+            match = persistence.load_candidate_execution(
+                campaign_id=self.inputs.campaign_id,
+                round_index=self.inputs.round_index,
+                key=key,
+            )
+        except BaseException:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "stage_failed")) from None
+        if match is None:
+            return None
+        if (
+            type(match) is not tuple
+            or len(match) != 2
+            or type(match[0]) is not CandidateExecutionAuthorityV5
+            or type(match[1]) is not ArtifactRefV5
+            or match[0].key != key
+            or match[0].campaign_id != self.inputs.campaign_id
+            or match[0].round_index != self.inputs.round_index
+            or match[0].owner_token_sha256 != self.inputs.owner_token_sha256
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        return match[0]
 
     def _register_execution(
         self,
@@ -1162,7 +1138,65 @@ class _Runtime:
                     experiment_id=authority.key.experiment_id,
                 )
             ) from None
+        try:
+            refreshed = _Journal(self.inputs, self.dependencies.persistence)
+        except _RuntimeAbort:
+            raise
+        except BaseException:
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "stage_failed",
+                    experiment_id=authority.key.experiment_id,
+                )
+            ) from None
+        self.journal = refreshed
         if type(reference) is not ArtifactRefV5:
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "invalid_dependency_result",
+                    experiment_id=authority.key.experiment_id,
+                )
+            )
+        try:
+            reloaded = persistence.load_candidate_execution(
+                campaign_id=self.inputs.campaign_id,
+                round_index=self.inputs.round_index,
+                key=authority.key,
+            )
+        except BaseException:
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "stage_failed",
+                    experiment_id=authority.key.experiment_id,
+                )
+            ) from None
+        if (
+            type(reloaded) is not tuple
+            or len(reloaded) != 2
+            or type(reloaded[0]) is not CandidateExecutionAuthorityV5
+            or type(reloaded[1]) is not ArtifactRefV5
+            or reloaded != (authority, reference)
+        ):
+            raise _RuntimeAbort(
+                RuntimeFailureV5(
+                    authority.key.stage,
+                    "invalid_dependency_result",
+                    experiment_id=authority.key.experiment_id,
+                )
+            )
+        durable = tuple(
+            payload
+            for event, payload in zip(
+                refreshed.events,
+                refreshed.payloads,
+                strict=True,
+            )
+            if payload == authority and event.payload_ref == reference
+        )
+        if durable != (authority,):
             raise _RuntimeAbort(
                 RuntimeFailureV5(
                     authority.key.stage,

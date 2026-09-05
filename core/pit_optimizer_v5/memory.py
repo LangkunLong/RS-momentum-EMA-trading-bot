@@ -52,6 +52,7 @@ RoundEventKindV5 = Literal[
     "candidate_stage_result",
     "quick_evidence",
     "episode_evidence",
+    "candidate_execution",
     "resource_lease",
     "cleanup_result",
     "round_outcome",
@@ -141,6 +142,7 @@ _EVENT_KINDS = frozenset(
         "candidate_stage_result",
         "quick_evidence",
         "episode_evidence",
+        "candidate_execution",
         "resource_lease",
         "cleanup_result",
         "round_outcome",
@@ -814,6 +816,66 @@ class ResourceLeasePayloadV5:
         _digest(self.owner_token_sha256, "resource lease owner token")
 
 
+CandidateExecutionStageV5 = Literal["quick_evaluation", "discovery_evaluation"]
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateExecutionKeyV5:
+    experiment_id: str
+    stage: CandidateExecutionStageV5
+    episode_ordinal: int | None
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "candidate execution experiment")
+        if self.stage == "quick_evaluation":
+            if self.episode_ordinal is not None:
+                raise ValueError("quick execution cannot carry an episode ordinal")
+        elif self.stage == "discovery_evaluation":
+            _count(self.episode_ordinal, "candidate execution episode ordinal", positive=True)
+        else:
+            raise ValueError("candidate execution stage is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateExecutionAuthorityV5:
+    """One atomic durable ownership and recovery record for an evaluator execution."""
+
+    campaign_id: str
+    round_index: int
+    owner_token_sha256: str
+    key: CandidateExecutionKeyV5
+    request_sha256: str
+    command_sha256: str
+    output_mount_authority_sha256: str
+    lease_payloads: tuple[ResourceLeasePayloadV5, ...]
+
+    def __post_init__(self) -> None:
+        _text(self.campaign_id, "candidate execution campaign")
+        _count(self.round_index, "candidate execution round", positive=True)
+        _digest(self.owner_token_sha256, "candidate execution owner token")
+        if type(self.key) is not CandidateExecutionKeyV5:
+            raise ValueError("candidate execution key is invalid")
+        _digest(self.request_sha256, "candidate execution request")
+        _digest(self.command_sha256, "candidate execution command")
+        _digest(self.output_mount_authority_sha256, "candidate execution output authority")
+        if (
+            type(self.lease_payloads) is not tuple
+            or tuple(item.resource_kind for item in self.lease_payloads) != ("evaluator_process", "container")
+            or any(
+                type(item) is not ResourceLeasePayloadV5
+                or item.owner_campaign_id != self.campaign_id
+                or item.owner_token_sha256 != self.owner_token_sha256
+                for item in self.lease_payloads
+            )
+            or len({item.lease_id for item in self.lease_payloads}) != 2
+        ):
+            raise ValueError("candidate execution leases are invalid")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
 @dataclass(frozen=True, slots=True)
 class CleanupResultPayloadV5:
     owned_workspaces: int
@@ -1086,6 +1148,7 @@ RoundEventPayloadV5 = (
     | CandidateStageResultPayloadV5
     | QuickEvidencePayloadV5
     | EpisodeEvidencePayloadV5
+    | CandidateExecutionAuthorityV5
     | ResourceLeasePayloadV5
     | CleanupResultPayloadV5
     | RoundOutcomePayloadV5
@@ -1098,6 +1161,7 @@ _PAYLOAD_TYPES: dict[str, type[object]] = {
     "candidate_stage_result": CandidateStageResultPayloadV5,
     "quick_evidence": QuickEvidencePayloadV5,
     "episode_evidence": EpisodeEvidencePayloadV5,
+    "candidate_execution": CandidateExecutionAuthorityV5,
     "resource_lease": ResourceLeasePayloadV5,
     "cleanup_result": CleanupResultPayloadV5,
     "round_outcome": RoundOutcomePayloadV5,
@@ -1191,6 +1255,7 @@ class RoundEventV5:
             "candidate_stage_result",
             "quick_evidence",
             "episode_evidence",
+            "candidate_execution",
         }:
             if self.experiment_id is None:
                 raise ValueError("experiment-local event requires an experiment ID")
@@ -1215,6 +1280,13 @@ class RoundEventV5:
         if isinstance(payload, (CandidateStageResultPayloadV5, QuickEvidencePayloadV5, EpisodeEvidencePayloadV5)):
             if payload.experiment_id != self.experiment_id:
                 raise ValueError("round-event experiment differs from its payload")
+        if isinstance(payload, CandidateExecutionAuthorityV5):
+            if (
+                payload.campaign_id != self.campaign_id
+                or payload.round_index != self.round_index
+                or payload.key.experiment_id != self.experiment_id
+            ):
+                raise ValueError("candidate execution differs from its event authority")
         if isinstance(payload, ResourceLeasePayloadV5):
             if payload.owner_campaign_id != self.campaign_id:
                 raise ValueError("resource lease differs from its campaign")
@@ -1283,6 +1355,7 @@ class RecoveryStepV5:
             "candidate_stage_result",
             "quick_evidence",
             "episode_evidence",
+            "candidate_execution",
         }:
             if self.experiment_id is None:
                 raise ValueError("experiment recovery step requires an experiment ID")
@@ -1329,6 +1402,7 @@ def _validate_candidate_stage_chain_v5(
     states: dict[str, str] = {}
     fingerprints: dict[str, SemanticFingerprintV5] = {}
     episode_ordinals: dict[str, set[int]] = {}
+    execution_keys: set[CandidateExecutionKeyV5] = set()
     critic_complete = False
     for event, payload in zip(events, payloads, strict=True):
         if isinstance(payload, RoleCompletionPayloadV5) and payload.role == "critic":
@@ -1342,12 +1416,25 @@ def _validate_candidate_stage_chain_v5(
                     CandidateStageResultPayloadV5,
                     QuickEvidencePayloadV5,
                     EpisodeEvidencePayloadV5,
+                    CandidateExecutionAuthorityV5,
                 ),
             )
             and critic_complete
         ):
             raise ValueError("candidate work cannot follow critic completion")
         experiment_id = event.experiment_id
+        if isinstance(payload, CandidateExecutionAuthorityV5):
+            assert experiment_id is not None
+            if payload.key in execution_keys:
+                raise ValueError("candidate execution authority is duplicated")
+            state = states.get(experiment_id)
+            if payload.key.stage == "quick_evaluation":
+                if state != "distinct":
+                    raise ValueError("candidate quick execution is out of order")
+            elif state not in {"quick", "episodes"}:
+                raise ValueError("candidate discovery execution is out of order")
+            execution_keys.add(payload.key)
+            continue
         if isinstance(payload, RenderedVariantPayloadV5):
             assert experiment_id is not None
             if experiment_id in states:
@@ -1869,6 +1956,9 @@ def project_investigator_memory_v5(
 
 __all__ = [
     "ArchiveReducerV5",
+    "CandidateExecutionAuthorityV5",
+    "CandidateExecutionKeyV5",
+    "CandidateExecutionStageV5",
     "CandidateStageFailureCodeV5",
     "CandidateStageOutcomeV5",
     "CandidateStageResultPayloadV5",
