@@ -48,6 +48,7 @@ RoleOutcomeV5 = Literal[
     "accounting_failure",
 ]
 RoleReconciliationFailureCodeV5 = Literal[
+    "pending",
     "terminal_unavailable",
     "terminal_incomplete",
     "authority_unavailable",
@@ -2312,6 +2313,7 @@ class RoleReconciliationFailureV5:
         if type(self.call) is not RoleCallKeyV5:
             raise ValueError("role reconciliation call key is invalid")
         if self.failure_code not in {
+            "pending",
             "terminal_unavailable",
             "terminal_incomplete",
             "authority_unavailable",
@@ -2402,18 +2404,38 @@ class LedgerRoleAuthorizationLifecycleV5(RoleAuthorizationLifecycleV5, Protocol)
 
 
 @dataclass(frozen=True, slots=True)
+class RoleInvocationClaimV5:
+    """Durable ownership window for one possibly in-flight provider request."""
+
+    owner_sha256: str
+    lease_started_epoch_ms: int
+    lease_deadline_epoch_ms: int
+
+    def __post_init__(self) -> None:
+        _digest(self.owner_sha256, "role invocation owner")
+        _count(self.lease_started_epoch_ms, "role invocation lease start")
+        _count(self.lease_deadline_epoch_ms, "role invocation lease deadline")
+        if self.lease_deadline_epoch_ms <= self.lease_started_epoch_ms:
+            raise ValueError("role invocation lease deadline must follow its start")
+
+
+@dataclass(frozen=True, slots=True)
 class RoleLedgerReservationV5:
     schema_version: Literal[5]
+    record_schema_revision: int
     ledger_ordinal: int
     campaign_id: str
     campaign_manifest_sha256: str
     ledger_identity_sha256: str
     audit_store_identity_sha256: str
     slot: AuthorizedRoleSlotV5
+    invocation_claim: RoleInvocationClaimV5
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
             raise ValueError("role-ledger reservation schema is invalid")
+        if type(self.record_schema_revision) is not int or self.record_schema_revision != 3:
+            raise ValueError("role-ledger reservation revision is invalid")
         _count(self.ledger_ordinal, "role-ledger ordinal", positive=True)
         _text(self.campaign_id, "role-ledger campaign")
         _digest(self.campaign_manifest_sha256, "role-ledger manifest")
@@ -2421,10 +2443,20 @@ class RoleLedgerReservationV5:
         _digest(self.audit_store_identity_sha256, "role-ledger audit-store identity")
         if type(self.slot) is not AuthorizedRoleSlotV5:
             raise ValueError("role-ledger reservation slot is invalid")
+        if type(self.invocation_claim) is not RoleInvocationClaimV5:
+            raise ValueError("role-ledger reservation invocation claim is invalid")
+
+    def persisted_primitive(self) -> dict[str, object]:
+        """Return the exact current on-disk reservation shape."""
+
+        primitive = canonical_primitive_v5(self)
+        if type(primitive) is not dict:
+            raise ValueError("role-ledger reservation primitive is invalid")
+        return primitive
 
     @property
     def sha256(self) -> str:
-        return canonical_sha256_v5(self)
+        return canonical_sha256_v5(self.persisted_primitive())
 
 
 @dataclass(frozen=True, slots=True)
@@ -3339,6 +3371,7 @@ __all__ = [
     "RoleNameV5",
     "RoleOutcomeV5",
     "RoleInputV5",
+    "RoleInvocationClaimV5",
     "RoleInvocationPackageV5",
     "RoleLedgerReservationV5",
     "RoleLedgerTerminalV5",

@@ -8,10 +8,11 @@ import os
 import re
 import stat
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import Literal, TypeVar, get_args, get_origin, get_type_hints
+from typing import Iterator, Literal, TypeVar, get_args, get_origin, get_type_hints
 
 from core.pit_optimizer_artifacts import (
     _acquire_absolute_directory,
@@ -77,6 +78,7 @@ from core.pit_optimizer_v5.memory import (
 )
 from core.pit_optimizer_v5.probes import ProbeObservationV5, SemanticFingerprintV5
 from core.pit_optimizer_v5.provider import (
+    AuthorizedRoleSlotV5,
     ExistingPersistedRoleRequestV5,
     FixtureRoleTerminalAuthorityV5,
     FreshPersistedRoleRequestV5,
@@ -88,6 +90,7 @@ from core.pit_optimizer_v5.provider import (
     RoleFailureCode,
     RoleInputV5,
     RoleInvocationPackageV5,
+    RoleInvocationClaimV5,
     RoleLedgerReservationV5,
     RoleLedgerTerminalV5,
     RoleNameV5,
@@ -123,6 +126,7 @@ ArtifactFailureCodeV5 = Literal[
     "noncanonical",
     "schema",
     "exists",
+    "migration_required",
 ]
 
 
@@ -176,6 +180,14 @@ class ArtifactSchemaFailureV5(ArtifactRepositoryFailureV5):
 class ArtifactExistsV5(ArtifactRepositoryFailureV5):
     def __init__(self, reference: ArtifactRefV5 | None = None) -> None:
         super().__init__("exists", reference)
+
+
+class RoleLedgerMigrationRequiredV5(ArtifactRepositoryFailureV5):
+    """Stable fail-closed result for the two superseded pre-release ledger shapes."""
+
+    def __init__(self, record_revision: Literal[1, 2], reference: ArtifactRefV5 | None = None) -> None:
+        self.record_revision = record_revision
+        super().__init__("migration_required", reference)
 
 
 def _safe_component(value: object, label: str) -> str:
@@ -350,6 +362,115 @@ def _decode_role_ledger_terminal(value: object) -> RoleLedgerTerminalV5:
         facts=facts,
         receipt=_decode_dataclass(RoleTerminalReceiptV5, primitive["receipt"]),
         artifact=artifact,
+    )
+
+
+def _decode_role_ledger_reservation(
+    value: object,
+    *,
+    request: RoleRequestV5,
+) -> RoleLedgerReservationV5:
+    """Decode V3 or return a stable migration requirement for exact V1/V2."""
+
+    if type(value) is not dict:
+        raise ArtifactSchemaFailureV5()
+    shared = {
+        "schema_version",
+        "campaign_id",
+        "campaign_manifest_sha256",
+        "ledger_identity_sha256",
+        "audit_store_identity_sha256",
+        "slot",
+    }
+    keys = frozenset(value)
+    legacy_v1 = frozenset(shared)
+    legacy_v2 = frozenset((*shared, "ledger_ordinal"))
+    current_v3 = frozenset((*shared, "record_schema_revision", "ledger_ordinal", "invocation_claim"))
+    if keys == legacy_v1:
+        revision: Literal[1, 2, 3] = 1
+    elif keys == legacy_v2:
+        revision = 2
+    elif keys == current_v3:
+        revision = 3
+    else:
+        raise ArtifactSchemaFailureV5()
+    primitive = _exact_keys(value, set(keys))
+    _decode_value(Literal[5], primitive["schema_version"])
+    campaign_id = _decode_value(str, primitive["campaign_id"])
+    _safe_component(campaign_id, "legacy role-ledger campaign")
+    for field_name in (
+        "campaign_manifest_sha256",
+        "ledger_identity_sha256",
+        "audit_store_identity_sha256",
+    ):
+        digest = _decode_value(str, primitive[field_name])
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ArtifactSchemaFailureV5()
+    if revision == 2:
+        ordinal = _decode_value(int, primitive["ledger_ordinal"])
+        if ordinal < 1:
+            raise ArtifactSchemaFailureV5()
+    authorized_slot_value = primitive["slot"]
+    if type(authorized_slot_value) is not dict:
+        raise ArtifactSchemaFailureV5()
+    authorized_slot_keys = {
+        "slot_id",
+        "request",
+        "authorization_sha256",
+        "prior_external_attempts",
+        "prior_total_tokens",
+        "prior_cost_usd",
+        "prior_terminal_sequence",
+    }
+    authorized_slot_primitive = _exact_keys(authorized_slot_value, authorized_slot_keys)
+    slot_value = authorized_slot_primitive["request"]
+    if type(slot_value) is not dict:
+        raise ArtifactSchemaFailureV5()
+    current_slot_keys = {
+        "request_sha256",
+        "role",
+        "attempt_kind",
+        "attempt_index",
+        "model",
+        "max_output_tokens",
+        "response_schema_sha256",
+    }
+    expected_slot_keys = current_slot_keys - ({"response_schema_sha256"} if revision == 1 else set())
+    slot_primitive = _exact_keys(slot_value, expected_slot_keys)
+    decoded_slot_primitive = dict(slot_primitive)
+    if revision == 1:
+        decoded_slot_primitive["response_schema_sha256"] = request.response_schema_sha256
+    decoded_authorized_slot = dict(authorized_slot_primitive)
+    decoded_authorized_slot["request"] = decoded_slot_primitive
+    slot = _decode_dataclass(AuthorizedRoleSlotV5, decoded_authorized_slot)
+    if (
+        slot.request.request_sha256 != request.sha256
+        or slot.request.role != request.role
+        or slot.request.max_output_tokens != request.max_output_tokens
+        or slot.request.response_schema_sha256 != request.response_schema_sha256
+    ):
+        raise ArtifactSchemaFailureV5()
+    if revision == 1:
+        # The exact legacy slot omitted this binding.  Resolve it only to prove
+        # the record belongs to the authenticated request, then fail closed: its
+        # slot/authorization digests cannot be silently rewritten.
+        if request.response_schema_sha256 != request.schema_authority.sha256:
+            raise ArtifactSchemaFailureV5()
+        raise RoleLedgerMigrationRequiredV5(1)
+    if revision == 2:
+        raise RoleLedgerMigrationRequiredV5(2)
+    if primitive["record_schema_revision"] != 3:
+        raise ArtifactSchemaFailureV5()
+    return RoleLedgerReservationV5(
+        schema_version=_decode_value(Literal[5], primitive["schema_version"]),  # type: ignore[arg-type]
+        record_schema_revision=3,
+        ledger_ordinal=_decode_value(int, primitive["ledger_ordinal"]),  # type: ignore[arg-type]
+        campaign_id=_decode_value(str, primitive["campaign_id"]),  # type: ignore[arg-type]
+        campaign_manifest_sha256=_decode_value(str, primitive["campaign_manifest_sha256"]),  # type: ignore[arg-type]
+        ledger_identity_sha256=_decode_value(str, primitive["ledger_identity_sha256"]),  # type: ignore[arg-type]
+        audit_store_identity_sha256=_decode_value(str, primitive["audit_store_identity_sha256"]),  # type: ignore[arg-type]
+        slot=slot,
+        invocation_claim=_decode_dataclass(RoleInvocationClaimV5, primitive["invocation_claim"]),
     )
 
 
@@ -1092,14 +1213,90 @@ class LocalArtifactRepositoryV5:
                 ) from None
             return reference
 
+    @contextmanager
+    def role_provider_transition(self, *, campaign_id: str) -> Iterator[None]:
+        """Serialize one response-or-terminal transition inside the held repository root."""
+
+        campaign = _safe_component(campaign_id, "role-provider transition campaign")
+        lock_name = "role-provider-transition.lock"
+        lock_relative = f"authorization/{campaign}/{lock_name}"
+        lock_reference = ArtifactRefV5(lock_relative, "0" * 64)
+        try:
+            directory_context = self._directory(("authorization", campaign), create=True)
+            directory = directory_context.__enter__()
+            try:
+                try:
+                    _write_create_only_in_directory(directory, lock_name, b"\0")
+                except FileExistsError:
+                    pass
+                if not directory.entry_exists(lock_name):
+                    raise ValueError("role-provider transition lock is absent")
+                lock_path = directory.path / lock_name
+                before = os.lstat(lock_path)
+                if _is_link_or_reparse(lock_path) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                    raise ValueError("role-provider transition lock is invalid")
+                descriptor = os.open(
+                    lock_path,
+                    os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                )
+                handle = os.fdopen(descriptor, "r+b", buffering=0)
+                opened = os.fstat(handle.fileno())
+                if _metadata_identity(before) != _metadata_identity(opened):
+                    handle.close()
+                    raise ValueError("role-provider transition lock changed before open")
+            except BaseException:
+                directory_context.__exit__(None, None, None)
+                raise
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (OSError, ValueError):
+            raise ArtifactRelocatedV5(lock_reference, lock_relative) from None
+        locked = False
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+            after = os.lstat(lock_path)
+            if (
+                _is_link_or_reparse(lock_path)
+                or _metadata_identity(opened) != _metadata_identity(after)
+                or not stat.S_ISREG(after.st_mode)
+                or after.st_nlink != 1
+            ):
+                raise ArtifactRelocatedV5(lock_reference, lock_relative)
+            directory.assert_current()
+            yield
+        finally:
+            try:
+                if locked:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+                directory_context.__exit__(None, None, None)
+
     def append_role_ledger_reservation(self, record: RoleLedgerReservationV5) -> ArtifactRefV5:
         if type(record) is not RoleLedgerReservationV5:
             raise ValueError("role-ledger reservation is invalid")
         campaign = _safe_component(record.campaign_id, "role-ledger campaign")
         slot = _safe_component(record.slot.slot_id, "role-ledger slot")
-        return self._create_or_authenticate_typed(
+        return self._create_only(
             f"authorization/{campaign}/reservations/{slot}.json",
-            record,
+            record.persisted_primitive(),
         )
 
     def append_role_ledger_terminal(
@@ -1189,16 +1386,25 @@ class LocalArtifactRepositoryV5:
         authenticated = self.authenticate(reference)
         try:
             primitive = _strict_json_object(authenticated.content, reference)
-            value = (
-                _decode_role_ledger_terminal(primitive)
-                if value_type is RoleLedgerTerminalV5
-                else _decode_dataclass(value_type, primitive)
-            )
+            if value_type is RoleLedgerTerminalV5:
+                value = _decode_role_ledger_terminal(primitive)
+            elif value_type is RoleLedgerReservationV5:
+                slot_value = primitive.get("slot")
+                request_value = None if type(slot_value) is not dict else slot_value.get("request")
+                if type(request_value) is not dict or type(request_value.get("request_sha256")) is not str:
+                    raise ArtifactSchemaFailureV5(reference)
+                request = self.load_unique_role_request_by_sha256(request_value["request_sha256"])
+                value = _decode_role_ledger_reservation(primitive, request=request)
+            else:
+                value = _decode_dataclass(value_type, primitive)
+        except RoleLedgerMigrationRequiredV5 as failure:
+            raise RoleLedgerMigrationRequiredV5(failure.record_revision, reference) from None
         except ArtifactRepositoryFailureV5:
             raise
         except (TypeError, ValueError, ArithmeticError):
             raise ArtifactSchemaFailureV5(reference) from None
-        if canonical_json_bytes_v5(value) != authenticated.content:
+        expected = value.persisted_primitive() if type(value) is RoleLedgerReservationV5 else value
+        if canonical_json_bytes_v5(expected) != authenticated.content:
             raise ArtifactNonCanonicalV5(reference)
         return value
 
@@ -1248,6 +1454,29 @@ class LocalArtifactRepositoryV5:
 
     def load_role_request(self, reference: ArtifactRefV5) -> RoleRequestV5:
         return self._load_role_request_entry(reference)[1]
+
+    def load_unique_role_request_by_sha256(self, request_sha256: str) -> RoleRequestV5:
+        """Resolve exactly one authenticated durable request by semantic identity."""
+
+        if type(request_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None:
+            raise ArtifactSchemaFailureV5()
+        try:
+            names = self._names(("roles", "requests"))
+        except ArtifactMissingV5:
+            raise ArtifactSchemaFailureV5() from None
+        matches: list[RoleRequestV5] = []
+        for name in names:
+            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                raise ArtifactSchemaFailureV5()
+            relative = f"roles/requests/{name}"
+            raw = self._read_relative(relative)
+            reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
+            _, request = self._load_role_request_entry(reference)
+            if request.sha256 == request_sha256:
+                matches.append(request)
+        if not matches or any(item != matches[0] for item in matches[1:]):
+            raise ArtifactSchemaFailureV5()
+        return matches[0]
 
     def append_role_attempt(self, attempt: RoleAttemptFactsV5) -> ArtifactRefV5:
         if type(attempt) is not RoleAttemptFactsV5:
@@ -2103,4 +2332,5 @@ __all__ = [
     "PersistedRoleInvocationV5",
     "PersistedRoleRequestV5",
     "RepositoryCheckpointV5",
+    "RoleLedgerMigrationRequiredV5",
 ]
