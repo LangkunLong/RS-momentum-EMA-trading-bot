@@ -2487,7 +2487,7 @@ class RoleInvocationPackageV5:
                 or authority.request_sha256 != self.request.sha256
                 or authority.attempt_facts_sha256 != self.attempt.sha256
                 or authority.artifact_sha256 != artifact_sha256
-                or self.attempt.usage.external_attempt_count != 0
+                or self.attempt.usage != _zero_usage_facts()
             ):
                 raise ValueError("fixture terminal authority differs from its invocation")
         else:
@@ -3457,7 +3457,7 @@ class LedgerBackedRoleInvokerV5:
 class FixtureRoleRunnerV5:
     """Provider-free role runner using explicitly declared canonical fixture slots."""
 
-    __slots__ = ("_attempt_indexes", "_attempts", "_positions", "_responses")
+    __slots__ = ("_attempt_indexes", "_attempts", "_positions", "_responses", "_campaign_fixture")
 
     def __init__(
         self,
@@ -3466,6 +3466,7 @@ class FixtureRoleRunnerV5:
             RoleNameV5 | tuple[RoleNameV5, RoleAttemptKindV5],
             tuple[str, ...],
         ],
+        campaign_fixture: bool = False,
     ) -> None:
         if not isinstance(responses, Mapping):
             raise ValueError("fixture role responses are invalid")
@@ -3481,6 +3482,9 @@ class FixtureRoleRunnerV5:
                 raise ValueError("fixture role response slots are invalid")
             normalized[identity] = values
         self._responses = MappingProxyType(normalized)
+        if type(campaign_fixture) is not bool or (campaign_fixture and normalized):
+            raise ValueError("campaign fixture must be exclusive of static response slots")
+        self._campaign_fixture = campaign_fixture
         self._positions = {identity: 0 for identity in normalized}
         self._attempts: list[RoleAttemptFactsV5] = []
         self._attempt_indexes: dict[RoleNameV5, int] = {}
@@ -3503,6 +3507,10 @@ class FixtureRoleRunnerV5:
         self._attempt_indexes[request.role] = attempt_index
         position = self._positions.get(identity, 0)
         declared = self._responses.get(identity, ())
+        if self._campaign_fixture and canonical_kind == "primary" and position == 0:
+            from core.pit_optimizer_v5.fixture_runtime import _response
+
+            declared = (_response(request),)
         usage = _zero_usage_facts()
         if position >= len(declared):
             facts = RoleAttemptFactsV5(

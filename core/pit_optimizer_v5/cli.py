@@ -96,8 +96,8 @@ from core.pit_optimizer_v5.workspace import (
 )
 
 
-V5CommandName = Literal["run", "resume", "verify-run", "summarize", "import-v4-candidate"]
-_COMMANDS = frozenset({"run", "resume", "verify-run", "summarize", "import-v4-candidate"})
+V5CommandName = Literal["run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"]
+_COMMANDS = frozenset({"run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"})
 _PANEL_COMMANDS = frozenset({"init-stage-ledgers", "build-panels", "verify-panels"})
 _MANIFEST_COMMANDS = frozenset({"build-manifest", "verify-manifest", "render-command"})
 _DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -890,8 +890,53 @@ class ProductionV5CommandServices:
         if request.command in {"run", "resume"} and request.adapter_config_ref is None:
             raise V5CliFailure("production_config_missing")
         repository = self._repository(request)
+        if request.command == "run-fixture":
+            from core.pit_optimizer_v5.fixture_runtime import run_fixture_campaign_v5
+
+            try:
+                authenticated = authenticate_campaign_manifest_v5(
+                    repository=repository, manifest_ref=request.manifest_ref
+                )
+                if authenticated.manifest.provider is not None:
+                    raise ValueError("fixture manifest cannot authorize a provider")
+                if repository.load_checkpoint() is not None or any(
+                    repository.load_round_events(campaign_id=authenticated.manifest.campaign_id, round_index=index)
+                    for index in range(1, authenticated.manifest.search.max_feedback_rounds + 1)
+                ):
+                    raise V5CliFailure("run_not_fresh")
+                results = run_fixture_campaign_v5(repository=repository, authorities=authenticated)
+            except V5CliFailure:
+                raise
+            except (TypeError, ValueError, ArtifactRepositoryFailureV5):
+                raise V5CliFailure("campaign_authority_invalid") from None
+            completed = len(results) == 2 and all(
+                result.status == "completed" and result.cleanup is not None and result.cleanup.cleanup_complete
+                for result in results
+            )
+            summary = summarize_repository_v5(
+                repository=repository,
+                manifest=authenticated.manifest,
+                command=request.command,
+                readiness_code="completed" if completed else "runtime_failed",
+            )
+            if not completed:
+                raise V5CliFailure("runtime_failed", exit_code=1, summary=summary)
+            return summary
         authorities = self._authorities(repository, request.manifest_ref)
         if request.command in {"verify-run", "summarize"}:
+            if authorities.manifest.provider is None:
+                from core.pit_optimizer_v5.fixture_runtime import verify_fixture_run_v5
+
+                if request.adapter_config_ref is not None:
+                    raise V5CliFailure("production_config_invalid")
+                authenticate_campaign_manifest_v5(repository=repository, manifest_ref=request.manifest_ref)
+                verify_fixture_run_v5(repository=repository, manifest=authorities.manifest)
+                return summarize_repository_v5(
+                    repository=repository,
+                    manifest=authorities.manifest,
+                    command=request.command,
+                    readiness_code="verified" if request.command == "verify-run" else "ready",
+                )
             config = (
                 None
                 if request.adapter_config_ref is None
@@ -974,7 +1019,7 @@ def build_parser_v5() -> argparse.ArgumentParser:
         required=True,
         parser_class=_ClosedArgumentParserV5,
     )
-    for name in ("run", "resume", "verify-run", "summarize", "import-v4-candidate"):
+    for name in ("run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"):
         command = commands.add_parser(name, allow_abbrev=False)
         command.add_argument("--artifact-root", required=True)
         command.add_argument("--manifest-path", required=True)

@@ -163,7 +163,21 @@ from .manifest import (
     render_discovery_command_v5,
 )
 
+from .fixture_runtime import (
+    FixtureRoleInvokerV5,
+    compose_fixture_round_v5,
+    run_fixture_campaign_v5,
+    verify_fixture_run_v5,
+)
+from .provider import FixtureRoleRunnerV5, RoleRunnerV5
+
 __all__ = [
+    "FixtureRoleInvokerV5",
+    "FixtureRoleRunnerV5",
+    "RoleRunnerV5",
+    "compose_fixture_round_v5",
+    "run_fixture_campaign_v5",
+    "verify_fixture_run_v5",
     "ARTIFACT_ROOT_V5",
     "AnnualizedReturnTargetV5",
     "ArtifactGraphFailureCodeV5",

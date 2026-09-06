@@ -542,14 +542,15 @@ class LocalRoleRequestFactoryV5:
     """Build exact bounded role requests from authenticated runtime projections."""
 
     def __init__(self, *, repository: LocalArtifactRepositoryV5, manifest: CampaignManifestV5) -> None:
-        if (
-            type(repository) is not LocalArtifactRepositoryV5
-            or type(manifest) is not CampaignManifestV5
-            or manifest.provider is None
-        ):
+        if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
             raise ValueError("local role-request factory authority is invalid")
         self._repository = repository
         self._manifest = manifest
+
+    @property
+    def maximum_output_tokens(self) -> int:
+        """Fixture requests retain a bounded schema budget without provider authority."""
+        return 4096 if self._manifest.provider is None else self._manifest.provider.maximum_output_tokens_per_role
 
     @property
     def repository(self) -> LocalArtifactRepositoryV5:
@@ -769,7 +770,7 @@ class LocalRoleRequestFactoryV5:
                 role="investigator",
                 manifest=inputs.manifest,
             ),
-            max_output_tokens=inputs.manifest.provider.maximum_output_tokens_per_role,  # type: ignore[union-attr]
+            max_output_tokens=self.maximum_output_tokens,
         )
 
     def author_request(
@@ -837,7 +838,7 @@ class LocalRoleRequestFactoryV5:
                 author_policy_paths=paths,
                 full_source_escape=full_source_allowed,
             ),
-            max_output_tokens=inputs.manifest.provider.maximum_output_tokens_per_role,  # type: ignore[union-attr]
+            max_output_tokens=self.maximum_output_tokens,
         )
 
     @staticmethod
@@ -1086,7 +1087,7 @@ class LocalRoleRequestFactoryV5:
                 role="critic",
                 manifest=inputs.manifest,
             ),
-            max_output_tokens=inputs.manifest.provider.maximum_output_tokens_per_role,  # type: ignore[union-attr]
+            max_output_tokens=self.maximum_output_tokens,
         )
 
 

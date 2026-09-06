@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, get_args
 
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
 from core.pit_optimizer_v5.contracts import (
@@ -23,6 +23,7 @@ from core.pit_optimizer_v5.memory import (
 from core.pit_optimizer_v5.production_runtime import LocalArchiveReducerFactoryV5
 from core.pit_optimizer_v5.provider import sum_cost_usd_v5
 from core.pit_optimizer_v5.search import BaselineParentAuthorityV5
+from core.pit_optimizer_v5.runtime import RuntimeFailureCodeV5, RuntimeStageV5
 from core.pit_optimizer_v5.selection import reported_champion_v5
 
 
@@ -54,7 +55,7 @@ _READINESS_CODES = frozenset(
 @dataclass(frozen=True, slots=True)
 class OptimizerSummaryV5:
     schema_version: Literal[5]
-    command: Literal["run", "resume", "verify-run", "summarize", "import-v4-candidate"]
+    command: Literal["run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"]
     status: V5SummaryStatus
     readiness_code: str
     rounds_seen: int
@@ -68,11 +69,20 @@ class OptimizerSummaryV5:
     best_campaign_cagr_pct: Decimal | None
     target_gap_pct: Decimal | None
     cleanup_complete: bool | None
+    execution_profile_sha256: str | None = None
+    target_pct: Decimal | None = None
+    behaviorally_distinct_variants: int = 0
+    archive_families: int = 0
+    typed_failures: tuple[str, ...] = ()
+    source_unchanged: bool | None = None
+    qualification_started: bool = False
+    replay_started: bool = False
+    evaluation_mode: Literal["synthetic_fixture", "production"] = "production"
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
             raise ValueError("optimizer summary schema is invalid")
-        if self.command not in {"run", "resume", "verify-run", "summarize", "import-v4-candidate"}:
+        if self.command not in {"run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"}:
             raise ValueError("optimizer summary command is invalid")
         if self.status not in {"ready", "running", "completed", "failed", "unavailable"}:
             raise ValueError("optimizer summary status is invalid")
@@ -86,23 +96,44 @@ class OptimizerSummaryV5:
             self.checkpoint_generation,
             self.experiments,
             self.evaluated_experiments,
+            self.behaviorally_distinct_variants,
+            self.archive_families,
         ):
             if type(value) is not int or value < 0:
                 raise ValueError("optimizer summary count is invalid")
         if type(self.cost_usd) is not Decimal or not self.cost_usd.is_finite() or self.cost_usd < 0:
             raise ValueError("optimizer summary cost is invalid")
-        for value in (self.best_campaign_cagr_pct, self.target_gap_pct):
+        for value in (self.best_campaign_cagr_pct, self.target_gap_pct, self.target_pct):
             if value is not None and (type(value) is not Decimal or not value.is_finite()):
                 raise ValueError("optimizer summary metric is invalid")
         if self.cleanup_complete is not None and type(self.cleanup_complete) is not bool:
             raise ValueError("optimizer summary cleanup state is invalid")
+        if self.source_unchanged is not None and type(self.source_unchanged) is not bool:
+            raise ValueError("optimizer summary source state is invalid")
+        if type(self.qualification_started) is not bool or type(self.replay_started) is not bool:
+            raise ValueError("optimizer summary stage state is invalid")
+        if self.evaluation_mode not in {"synthetic_fixture", "production"}:
+            raise ValueError("optimizer summary evaluation mode is invalid")
+        if self.execution_profile_sha256 is not None and (
+            type(self.execution_profile_sha256) is not str
+            or len(self.execution_profile_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.execution_profile_sha256)
+        ):
+            raise ValueError("optimizer summary execution profile identity is invalid")
+        permitted_failures = {
+            f"{stage}:{code}" for stage in get_args(RuntimeStageV5) for code in get_args(RuntimeFailureCodeV5)
+        }
+        if type(self.typed_failures) is not tuple or any(
+            item not in permitted_failures for item in self.typed_failures
+        ):
+            raise ValueError("optimizer summary failure is outside the closed taxonomy")
 
     def to_primitive(self) -> dict[str, object]:
         return canonical_primitive_v5(self)  # type: ignore[return-value]
 
 
 def unavailable_summary_v5(
-    command: Literal["run", "resume", "verify-run", "summarize", "import-v4-candidate"],
+    command: Literal["run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"],
     readiness_code: str,
 ) -> OptimizerSummaryV5:
     return OptimizerSummaryV5(
@@ -128,7 +159,7 @@ def summarize_repository_v5(
     *,
     repository: LocalArtifactRepositoryV5,
     manifest: CampaignManifestV5,
-    command: Literal["run", "resume", "verify-run", "summarize", "import-v4-candidate"],
+    command: Literal["run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"],
     readiness_code: str = "ready",
 ) -> OptimizerSummaryV5:
     """Project only non-sensitive counts and aggregate performance metrics."""
@@ -142,6 +173,7 @@ def summarize_repository_v5(
     cost_usd = Decimal("0")
     cleanups: dict[int, CleanupResultPayloadV5] = {}
     runtime_failed = False
+    failures = set()
     for round_index in range(1, manifest.search.max_feedback_rounds + 1):
         events = repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index)
         if not events:
@@ -157,6 +189,8 @@ def summarize_repository_v5(
             elif type(payload) is RoundOutcomePayloadV5:
                 terminal_rounds += 1
                 runtime_failed |= type(payload.authority) is RuntimeFailureAuthorityV5
+                if type(payload.authority) is RuntimeFailureAuthorityV5:
+                    failures.add(f"{payload.authority.stage}:{payload.authority.failure_code}")
             elif type(payload) is CleanupResultPayloadV5:
                 cleanups[round_index] = payload
     checkpoint = repository.load_checkpoint()
@@ -185,7 +219,21 @@ def summarize_repository_v5(
         stored_records=stored,
     ).campaign_cagr_pct
     gap = None if best is None else manifest.target.target_pct - best
-    cleanup_complete = None if not cleanups else all(item.cleanup_complete for item in cleanups.values())
+    cleanup_complete = (
+        None
+        if not cleanups
+        else len(cleanups) == rounds_seen and all(item.cleanup_complete for item in cleanups.values())
+    )
+    source_unchanged = None
+    if manifest.provider is None and rounds_seen:
+        from core.pit_optimizer_v5.fixture_runtime import verify_fixture_run_v5
+        from core.pit_optimizer_v5.candidate_ir import SourceBundleV5
+
+        verify_fixture_run_v5(repository=repository, manifest=manifest)
+        source_unchanged = (
+            repository.load_typed_artifact(baseline.source_bundle_ref, value_type=SourceBundleV5)
+            == baseline.source_bundle
+        )
     status: V5SummaryStatus = (
         "failed"
         if runtime_failed
@@ -213,6 +261,22 @@ def summarize_repository_v5(
         best,
         gap,
         cleanup_complete,
+        manifest.execution_profile_ref.sha256,
+        manifest.target.target_pct,
+        len(
+            {
+                record.semantic_fingerprint.fingerprint_sha256
+                for record in records
+                if record.semantic_fingerprint is not None
+                and record.status not in {"invalid", "exact_duplicate", "behavioral_equivalent", "sibling_equivalent"}
+            }
+        ),
+        len({entry.primary_mechanism for entry in state.archive.entries}),
+        tuple(sorted(failures)),
+        source_unchanged,
+        False,
+        False,
+        "synthetic_fixture" if manifest.provider is None else "production",
     )
 
 

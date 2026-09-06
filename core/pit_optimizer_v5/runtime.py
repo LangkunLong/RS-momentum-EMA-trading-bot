@@ -73,6 +73,7 @@ from core.pit_optimizer_v5.probes import (
 from core.pit_optimizer_v5.provider import (
     ExistingPersistedRoleRequestV5,
     FreshPersistedRoleRequestV5,
+    FixtureRoleTerminalAuthorityV5,
     PersistedRoleRequestV5,
     RecoverableRoleInvokerV5,
     RoleCallKeyV5,
@@ -950,6 +951,10 @@ class _Runtime:
             package = self.dependencies.persistence.load_role_invocation(completed)
             if package.call != call or package.request != request:
                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role=role))
+            if (type(package.terminal_authority) is FixtureRoleTerminalAuthorityV5) != (
+                self.inputs.manifest.provider is None
+            ):
+                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role=role))
             return package
 
         persisted = self.dependencies.persistence.append_role_request(call=call, request=request)
@@ -971,6 +976,10 @@ class _Runtime:
         except BaseException:
             raise _RuntimeAbort(RuntimeFailureV5(role, "role_unrecoverable", role=role)) from None  # type: ignore[arg-type]
         if type(package) is not RoleInvocationPackageV5 or package.call != call or package.request != request:
+            raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
+        if (type(package.terminal_authority) is FixtureRoleTerminalAuthorityV5) != (
+            self.inputs.manifest.provider is None
+        ):
             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
         persisted_invocation = self.dependencies.persistence.persist_role_invocation(
             call=call,
