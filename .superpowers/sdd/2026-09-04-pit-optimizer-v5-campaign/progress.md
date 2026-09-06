@@ -50,6 +50,17 @@
   confirmation panel, inspect held-out content, or run confirmation until a valid discovery archive,
   bundle, and explicit confirmation decision exist. Cost if wrong: source readiness may precede
   real-artifact compatibility, which must be reauthenticated before the one-use domain is opened.
+- Ruling: the absent discovery archive and confirmation outcome block Task 7 attempt creation and
+  execution, but not source-only detached-qualification composition. Implement against closed
+  synthetic confirmation/retirement authorities; do not construct an actual attempt, deserialize
+  the 2025 panel, inspect held-out content, or request an opening decision. Cost if wrong: source
+  readiness can precede real-confirmation compatibility, which must be reauthenticated before the
+  separate qualification decision.
+- Ruling: the absent retired qualification outcome blocks Task 8 readiness emission, but not
+  source-only read-only readiness composition. Implement against closed synthetic outcome graphs;
+  do not create a real readiness record, inspect qualification content, render a runnable replay
+  command, start Docker, or request replay approval. Cost if wrong: source readiness may precede
+  real-outcome compatibility, which must be reauthenticated before any later full-replay decision.
 
 ## Pre-flight dependency and conflict scan
 
@@ -130,3 +141,13 @@
   no tests, actual artifacts, providers, Docker, market data, or confirmation run occurred. A real
   confirmation remains blocked on an authenticated discovery archive and bundle plus a separate
   operator decision. Early-budget discovery closure has no authority contract and fails closed.
+- Task 7: fix round 1/5 (1 addressed, 0 open; commit fbb60b9 after initial 90c6cc5 review).
+- Task 7: complete (commits 90c6cc5..fbb60b9, re-review clean). The detached qualification source
+  adapter recomputes closed confirmation eligibility, freezes its candidate/target/shared identities,
+  opens the qualification ledger before held-out deserialization, and gates success on active,
+  causal-clean, target-reaching net annualized portfolio return that strictly beats the same-panel
+  baseline. Cleanup-only recovery reconciles qualification-owned resources even with dirty source,
+  without reopening/evaluation or changing the original outcome. Direct synthetic checks covered
+  lifecycle and recovery cases; no tests, actual artifacts, providers, Docker, market data, or
+  qualification run occurred. Real qualification remains blocked on valid confirmation evidence,
+  the V5 bundle, and a separate operator decision.
