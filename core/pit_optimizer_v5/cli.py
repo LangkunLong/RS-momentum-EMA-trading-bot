@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
+from decimal import Decimal
 import ntpath
 from pathlib import Path, PureWindowsPath
 import re
@@ -17,11 +18,23 @@ from core.pit_optimizer_v5.contracts import (
     CampaignManifestV5,
     CampaignPanelPlanV5,
     EvaluatorContractV5,
+    ModelPriceUpperBoundV5,
+    ProviderCapabilitiesV5,
+    ResourceCapabilitiesV5,
     SandboxProfileV5,
+    SearchCapabilitiesV5,
     canonical_json_bytes_v5,
     canonical_sha256_v5,
     validate_campaign_manifest_bindings_v5,
     validate_sandbox_profile_resources_v5,
+)
+from core.pit_optimizer_v5.manifest import (
+    AuthenticatedCampaignManifestV5,
+    authenticate_campaign_manifest_v5,
+    build_campaign_manifest_v5,
+    capture_clean_policy_snapshot_v5,
+    provider_capabilities_from_values_v5,
+    render_discovery_command_v5,
 )
 from core.pit_optimizer_v5.panels import (
     build_panels_v5,
@@ -86,6 +99,7 @@ from core.pit_optimizer_v5.workspace import (
 V5CommandName = Literal["run", "resume", "verify-run", "summarize", "import-v4-candidate"]
 _COMMANDS = frozenset({"run", "resume", "verify-run", "summarize", "import-v4-candidate"})
 _PANEL_COMMANDS = frozenset({"init-stage-ledgers", "build-panels", "verify-panels"})
+_MANIFEST_COMMANDS = frozenset({"build-manifest", "verify-manifest", "render-command"})
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _FAILURE_REASONS = frozenset(
     {
@@ -992,6 +1006,61 @@ def build_parser_v5() -> argparse.ArgumentParser:
         verify.add_argument(f"--{prefix}-plan-path", required=True)
         verify.add_argument(f"--{prefix}-plan-sha256", required=True)
     verify.add_argument("--keep-held-out-sealed", action="store_true")
+    build_manifest = commands.add_parser("build-manifest", allow_abbrev=False)
+    build_manifest.add_argument("--artifact-root", required=True)
+    build_manifest.add_argument("--campaign-id", required=True)
+    build_manifest.add_argument("--target-pct", required=True)
+    build_manifest.add_argument("--source-root", required=True)
+    build_manifest.add_argument("--git-executable", required=True)
+    build_manifest.add_argument("--source-commit", required=True)
+    for prefix in (
+        "execution-profile",
+        "evaluator-contract",
+        "baseline-authority",
+        "panel-plan",
+        "sandbox-profile",
+    ):
+        build_manifest.add_argument(f"--{prefix}-path", required=True)
+        build_manifest.add_argument(f"--{prefix}-sha256", required=True)
+    build_manifest.add_argument("--policy-scope-output-path", required=True)
+    build_manifest.add_argument("--output-path", required=True)
+    build_manifest.add_argument("--hypotheses-per-investigator", type=int, default=3)
+    build_manifest.add_argument("--max-tunable-axes", type=int, default=4)
+    build_manifest.add_argument("--max-variants-per-template", type=int, default=12)
+    build_manifest.add_argument("--max-discovery-survivors-per-template", type=int, default=6)
+    build_manifest.add_argument("--archive-capacity", type=int, default=8)
+    build_manifest.add_argument("--max-feedback-rounds", type=int, default=10)
+    build_manifest.add_argument("--deny-full-source-escape", action="store_true")
+    build_manifest.add_argument("--investigator-memory-max-bytes", type=int, default=96 * 1024)
+    build_manifest.add_argument("--max-parallel-evaluations", type=int, default=2)
+    build_manifest.add_argument("--evaluation-cpu-limit", type=Decimal, default=Decimal("1"))
+    build_manifest.add_argument("--evaluation-memory-mib", type=int, default=1024)
+    build_manifest.add_argument("--evaluation-pid-limit", type=int, default=32)
+    build_manifest.add_argument("--evaluation-output-limit-bytes", type=int, default=64 * 1024 * 1024)
+    build_manifest.add_argument("--policy-method-timeout-seconds", type=int, default=1)
+    build_manifest.add_argument("--worker-startup-timeout-seconds", type=int, default=30)
+    build_manifest.add_argument("--role-call-timeout-seconds", type=int, default=180)
+    build_manifest.add_argument("--mechanics-timeout-seconds", type=int, default=60)
+    build_manifest.add_argument("--quick-timeout-seconds", type=int, default=180)
+    build_manifest.add_argument("--discovery-episode-timeout-seconds", type=int, default=600)
+    build_manifest.add_argument("--round-wall-timeout-seconds", type=int, default=1800)
+    build_manifest.add_argument("--campaign-wall-timeout-seconds", type=int, default=18000)
+    build_manifest.add_argument("--cleanup-timeout-seconds", type=int, default=60)
+    build_manifest.add_argument("--provider-model")
+    build_manifest.add_argument("--maximum-role-calls", type=int)
+    build_manifest.add_argument("--maximum-total-tokens", type=int)
+    build_manifest.add_argument("--maximum-output-tokens-per-role", type=int)
+    build_manifest.add_argument("--maximum-usd", type=Decimal)
+    build_manifest.add_argument("--automatic-retries", type=int, default=0)
+    build_manifest.add_argument("--schema-repair-calls", type=int, default=0)
+    build_manifest.add_argument("--input-token-overhead-upper-bound", type=int, default=4096)
+    build_manifest.add_argument("--input-usd-per-million-tokens", type=Decimal)
+    build_manifest.add_argument("--output-usd-per-million-tokens", type=Decimal)
+    for name in ("verify-manifest", "render-command"):
+        command = commands.add_parser(name, allow_abbrev=False)
+        command.add_argument("--artifact-root", required=True)
+        command.add_argument("--manifest-path", required=True)
+        command.add_argument("--manifest-sha256", required=True)
     return parser
 
 
@@ -1105,6 +1174,174 @@ def dispatch_panel_cli_v5(
         return 2
 
 
+def _manifest_ref_argument_v5(namespace: argparse.Namespace, prefix: str) -> ArtifactRefV5:
+    attribute = prefix.replace("-", "_")
+    return ArtifactRefV5(
+        getattr(namespace, f"{attribute}_path"),
+        getattr(namespace, f"{attribute}_sha256"),
+    )
+
+
+def _manifest_search_capabilities_v5(namespace: argparse.Namespace) -> SearchCapabilitiesV5:
+    return SearchCapabilitiesV5(
+        hypotheses_per_investigator=namespace.hypotheses_per_investigator,
+        max_tunable_axes=namespace.max_tunable_axes,
+        max_variants_per_template=namespace.max_variants_per_template,
+        max_discovery_survivors_per_template=(namespace.max_discovery_survivors_per_template),
+        archive_capacity=namespace.archive_capacity,
+        max_feedback_rounds=namespace.max_feedback_rounds,
+        allow_full_source_escape=not namespace.deny_full_source_escape,
+        investigator_memory_max_bytes=namespace.investigator_memory_max_bytes,
+    )
+
+
+def _manifest_resource_capabilities_v5(namespace: argparse.Namespace) -> ResourceCapabilitiesV5:
+    return ResourceCapabilitiesV5(
+        max_parallel_evaluations=namespace.max_parallel_evaluations,
+        evaluation_cpu_limit=namespace.evaluation_cpu_limit,
+        evaluation_memory_mib=namespace.evaluation_memory_mib,
+        evaluation_pid_limit=namespace.evaluation_pid_limit,
+        evaluation_output_limit_bytes=namespace.evaluation_output_limit_bytes,
+        policy_method_timeout_seconds=namespace.policy_method_timeout_seconds,
+        worker_startup_timeout_seconds=namespace.worker_startup_timeout_seconds,
+        role_call_timeout_seconds=namespace.role_call_timeout_seconds,
+        mechanics_timeout_seconds=namespace.mechanics_timeout_seconds,
+        quick_timeout_seconds=namespace.quick_timeout_seconds,
+        discovery_episode_timeout_seconds=namespace.discovery_episode_timeout_seconds,
+        round_wall_timeout_seconds=namespace.round_wall_timeout_seconds,
+        campaign_wall_timeout_seconds=namespace.campaign_wall_timeout_seconds,
+        cleanup_timeout_seconds=namespace.cleanup_timeout_seconds,
+    )
+
+
+def _manifest_provider_capabilities_v5(namespace: argparse.Namespace) -> ProviderCapabilitiesV5 | None:
+    prices = (
+        namespace.input_usd_per_million_tokens,
+        namespace.output_usd_per_million_tokens,
+    )
+    if (prices[0] is None) != (prices[1] is None):
+        raise ValueError("provider price authority must supply both token prices")
+    price_upper_bound = None
+    if prices[0] is not None and prices[1] is not None:
+        if namespace.provider_model is None:
+            raise ValueError("provider prices require an authorized model")
+        price_upper_bound = ModelPriceUpperBoundV5(
+            model=namespace.provider_model,
+            input_usd_per_million_tokens=prices[0],
+            output_usd_per_million_tokens=prices[1],
+        )
+    return provider_capabilities_from_values_v5(
+        model=namespace.provider_model,
+        maximum_role_calls=namespace.maximum_role_calls,
+        maximum_total_tokens=namespace.maximum_total_tokens,
+        maximum_output_tokens_per_role=namespace.maximum_output_tokens_per_role,
+        maximum_usd=namespace.maximum_usd,
+        automatic_retries=namespace.automatic_retries,
+        schema_repair_calls=namespace.schema_repair_calls,
+        input_token_overhead_upper_bound=(namespace.input_token_overhead_upper_bound),
+        price_upper_bound=price_upper_bound,
+    )
+
+
+def _manifest_projection_v5(
+    authenticated: AuthenticatedCampaignManifestV5,
+    *,
+    status: str,
+) -> dict[str, object]:
+    manifest = authenticated.manifest
+    provider = manifest.provider
+    return {
+        "schema_version": 5,
+        "status": status,
+        "manifest_ref": authenticated.manifest_ref.to_primitive(),
+        "campaign_id": manifest.campaign_id,
+        "target_pct": manifest.target.to_text(),
+        "source_commit": manifest.source_commit,
+        "provider": (
+            None
+            if provider is None
+            else {
+                "model": provider.model,
+                "maximum_role_calls": provider.maximum_role_calls,
+                "maximum_total_tokens": provider.maximum_total_tokens,
+                "maximum_output_tokens_per_role": provider.maximum_output_tokens_per_role,
+                "maximum_usd": provider.maximum_usd,
+                "automatic_retries": provider.automatic_retries,
+                "schema_repair_calls": provider.schema_repair_calls,
+            }
+        ),
+        "policy_scope_ref": manifest.policy_scope_ref.to_primitive(),
+        "apply": manifest.apply,
+        "qualification_allowed": manifest.qualification_allowed,
+        "full_replay_allowed": manifest.full_replay_allowed,
+        "authenticated_artifact_count": len(authenticated.graph.authenticated),
+    }
+
+
+def dispatch_manifest_cli_v5(
+    argv: Sequence[str],
+    *,
+    emit: Callable[[str], None] = print,
+) -> int:
+    """Build, verify, or render an authenticated discovery manifest."""
+
+    try:
+        namespace = build_parser_v5().parse_args(tuple(argv))
+        if namespace.command not in _MANIFEST_COMMANDS:
+            raise V5CliFailure("invalid_request")
+        artifact_root = Path(namespace.artifact_root)
+        repository = LocalArtifactRepositoryV5(artifact_root)
+        if namespace.command == "build-manifest":
+            source_snapshot = capture_clean_policy_snapshot_v5(
+                source_root=Path(namespace.source_root),
+                git_executable=Path(namespace.git_executable),
+                expected_source_commit=namespace.source_commit,
+            )
+            authenticated = build_campaign_manifest_v5(
+                repository=repository,
+                campaign_id=namespace.campaign_id,
+                target=AnnualizedReturnTargetV5.from_text(namespace.target_pct),
+                source_snapshot=source_snapshot,
+                execution_profile_ref=_manifest_ref_argument_v5(namespace, "execution-profile"),
+                evaluator_contract_ref=_manifest_ref_argument_v5(namespace, "evaluator-contract"),
+                baseline_authority_ref=_manifest_ref_argument_v5(namespace, "baseline-authority"),
+                panel_plan_ref=_manifest_ref_argument_v5(namespace, "panel-plan"),
+                sandbox_profile_ref=_manifest_ref_argument_v5(namespace, "sandbox-profile"),
+                policy_scope_path=namespace.policy_scope_output_path,
+                manifest_path=namespace.output_path,
+                search=_manifest_search_capabilities_v5(namespace),
+                provider=_manifest_provider_capabilities_v5(namespace),
+                resources=_manifest_resource_capabilities_v5(namespace),
+            )
+            projection = _manifest_projection_v5(authenticated, status="created")
+        else:
+            authenticated = authenticate_campaign_manifest_v5(
+                repository=repository,
+                manifest_ref=ArtifactRefV5(
+                    namespace.manifest_path,
+                    namespace.manifest_sha256,
+                ),
+            )
+            projection = _manifest_projection_v5(authenticated, status="verified")
+            if namespace.command == "render-command":
+                rendered = render_discovery_command_v5(
+                    authenticated=authenticated,
+                )
+                projection["authorization"] = rendered
+        emit("PIT_OPTIMIZER_V5_MANIFEST=" + canonical_json_bytes_v5(projection).decode("utf-8"))
+        return 0
+    except SystemExit:
+        raise
+    except BaseException:
+        emit(
+            "PIT_OPTIMIZER_V5_MANIFEST="
+            + canonical_json_bytes_v5(
+                {"schema_version": 5, "status": "failed", "reason": "manifest_command_failed"}
+            ).decode("utf-8")
+        )
+        return 2
+
+
 def dispatch_v5_cli(
     argv: Sequence[str],
     *,
@@ -1114,6 +1351,8 @@ def dispatch_v5_cli(
     """Parse and dispatch one command; dependency construction stays outside parsing."""
     if argv and argv[0] in _PANEL_COMMANDS:
         return dispatch_panel_cli_v5(argv, emit=emit)
+    if argv and argv[0] in _MANIFEST_COMMANDS:
+        return dispatch_manifest_cli_v5(argv, emit=emit)
     command: V5CommandName = (
         argv[0]  # type: ignore[assignment]
         if argv and argv[0] in _COMMANDS
@@ -1166,6 +1405,7 @@ __all__ = [
     "V5CommandServices",
     "build_parser_v5",
     "dispatch_v5_cli",
+    "dispatch_manifest_cli_v5",
     "dispatch_panel_cli_v5",
     "parse_v5_args",
 ]
