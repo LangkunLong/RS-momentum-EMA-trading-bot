@@ -8,7 +8,7 @@ qualification owns distinct locks, ledger events, workspaces and recovery record
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import hashlib
 import json
 from pathlib import Path
@@ -18,19 +18,23 @@ from core.pit_optimizer_v5 import confirmation as confirmed
 from core.pit_optimizer_v5.candidate_ir import RenderedVariantV5, VariantAssignmentV5
 from core.pit_optimizer_v5.contracts import (
     ArtifactRefV5,
+    CampaignManifestV5,
     ConfirmationAttemptCommitmentV5,
     ConfirmationOutcomeV5,
     ConfirmationPanelPlanV5,
+    EvaluatorContractV5,
     PanelEvaluationV5,
     QualificationAttemptCommitmentV5,
     QualificationOutcomeV5,
     QualificationPanelPlanV5,
     RetirementLedgerLocatorV5,
+    SandboxProfileV5,
     StageOutcomeStatusV5,
     canonical_json_bytes_v5,
     canonical_sha256_v5,
     selected_scenario,
     validate_episode_plan_panel_v5,
+    validate_sandbox_profile_resources_v5,
 )
 from typing import Literal
 
@@ -449,7 +453,123 @@ def _failed_outcome(attempt_ref, attempt, terminal_ref, terminal):
     )
 
 
-def run_qualification(*, repository, attempt_ref: ArtifactRefV5, worker_factory=None) -> ArtifactRefV5:
+@dataclass(frozen=True, slots=True)
+class QualificationRecoveryInputsV5:
+    """Only immutable ownership/configuration; no panel or eligibility evidence."""
+
+    attempt_ref: ArtifactRefV5
+    attempt: QualificationAttemptCommitmentV5
+    manifest: CampaignManifestV5
+    evaluator: EvaluatorContractV5
+    sandbox: SandboxProfileV5
+    adapter: confirmed.ConfirmationAdapterConfigV5
+
+
+def _recovery_inputs(repository, attempt_ref, attempt):
+    # This ancestry supplies host ownership, not permission to evaluate. Never
+    # parse panels, candidate source, discovery memory or terminal metric evidence.
+    outcome = _load(repository, attempt.confirmation_outcome_ref, ConfirmationOutcomeV5)
+    prior = _load(repository, outcome.attempt_ref, ConfirmationAttemptCommitmentV5)
+    manifest = _load(repository, prior.discovery_manifest_ref, CampaignManifestV5)
+    adapter = _load(repository, prior.execution_adapter_ref, confirmed.ConfirmationAdapterConfigV5)
+    evaluator = _load(repository, attempt.evaluator_contract_ref, EvaluatorContractV5)
+    sandbox = _load(repository, attempt.sandbox_profile_ref, SandboxProfileV5)
+    for name in (
+        "pit_bundle_ref",
+        "prices_provenance_ref",
+        "execution_profile_ref",
+        "evaluator_contract_ref",
+        "scenario_grid_ref",
+        "baseline_authority_ref",
+        "sandbox_profile_ref",
+    ):
+        if getattr(attempt, name) != getattr(prior, name):
+            raise ValueError("qualification recovery has foreign shared ownership")
+    if (
+        outcome.confirmed_policy_ref != attempt.confirmed_policy_ref
+        or prior.discovery_champion_policy_ref != attempt.confirmed_policy_ref
+        or manifest.evaluator_contract_ref != attempt.evaluator_contract_ref
+        or manifest.sandbox_profile_ref != attempt.sandbox_profile_ref
+        or manifest.execution_profile_ref != attempt.execution_profile_ref
+        or manifest.baseline_authority_ref != attempt.baseline_authority_ref
+        or manifest.target != attempt.target
+        or evaluator.sandbox_profile_sha256 != sandbox.sha256
+        or evaluator.execution_profile_sha256 != attempt.execution_profile_ref.sha256
+        or evaluator.pit_bundle_sha256 != attempt.pit_bundle_ref.sha256
+        or evaluator.prices_provenance_sha256 != attempt.prices_provenance_ref.sha256
+        or adapter.discovery_manifest_ref != prior.discovery_manifest_ref
+        or adapter.repository_root_identity_sha256 != repository.root_identity_sha256
+        or _domain(attempt) != attempt.retirement_domain_id
+    ):
+        raise ValueError("qualification recovery ownership is inconsistent")
+    validate_sandbox_profile_resources_v5(sandbox, manifest.resources)
+    return QualificationRecoveryInputsV5(attempt_ref, attempt, manifest, evaluator, sandbox, adapter)
+
+
+def _recover_cleanup(repository, attempt_ref, attempt, recovery_factory):
+    try:
+        inputs = _recovery_inputs(repository, attempt_ref, attempt)
+        factory = LocalQualificationRecoveryV5 if recovery_factory is None else recovery_factory
+        cleanup = factory(repository, inputs).close(inputs, recovered=True)
+        if type(cleanup) is not QualificationCleanupV5 or cleanup.attempt_ref != attempt_ref or not cleanup.recovered:
+            raise ValueError("qualification recovery cleanup has foreign authority")
+        return cleanup
+    except BaseException:
+        return QualificationCleanupV5(5, attempt_ref, False, False, True)
+
+
+def _retry_retired_cleanup(repository, attempt_ref, attempt, cleanup, recovery_factory):
+    """Preserve terminal evidence and publish successful cleanup separately."""
+    if cleanup.attempt_ref != attempt_ref:
+        raise ValueError("qualification cleanup belongs to another attempt")
+    if cleanup.cleanup_complete:
+        return cleanup
+    path = f"qualification/{attempt.sha256}/recovery-cleanup.json"
+    previous = repository.load_qualification_record(path, value_type=QualificationCleanupV5)
+    if previous is not None:
+        recovered = previous[1]
+        if (
+            recovered.attempt_ref != attempt_ref
+            or not recovered.cleanup_complete
+            or not recovered.recovered
+            or (recovered.source_unchanged and not cleanup.source_unchanged)
+        ):
+            raise ValueError("qualification supplemental cleanup is invalid")
+        return recovered
+    recovered = _recover_cleanup(repository, attempt_ref, attempt, recovery_factory)
+    recovered = replace(recovered, source_unchanged=cleanup.source_unchanged and recovered.source_unchanged)
+    if recovered.cleanup_complete:
+        repository.create_typed_artifact(path, recovered)
+    return recovered
+
+
+def qualification_cleanup_evidence_v5(repository, outcome):
+    """Read current cleanup proof without rewriting the immutable outcome."""
+    cleanup = _load(repository, outcome.cleanup_evidence_ref, QualificationCleanupV5)
+    if cleanup.attempt_ref != outcome.attempt_ref:
+        raise ValueError("qualification outcome has foreign cleanup")
+    if cleanup.cleanup_complete:
+        return cleanup
+    attempt = _load(repository, outcome.attempt_ref, QualificationAttemptCommitmentV5)
+    previous = repository.load_qualification_record(
+        f"qualification/{attempt.sha256}/recovery-cleanup.json", value_type=QualificationCleanupV5
+    )
+    if previous is None:
+        return cleanup
+    recovered = previous[1]
+    if (
+        recovered.attempt_ref != outcome.attempt_ref
+        or not recovered.cleanup_complete
+        or not recovered.recovered
+        or (recovered.source_unchanged and not cleanup.source_unchanged)
+    ):
+        raise ValueError("qualification supplemental cleanup is invalid")
+    return recovered
+
+
+def run_qualification(
+    *, repository, attempt_ref: ArtifactRefV5, worker_factory=None, recovery_factory=None
+) -> ArtifactRefV5:
     """Open once, retire every terminal path, and recover crashes without reevaluation."""
     from core.pit_optimizer_v5.panels import StageRetirementSnapshotV5
 
@@ -475,7 +595,8 @@ def run_qualification(*, repository, attempt_ref: ArtifactRefV5, worker_factory=
                 plan = _panel(repository, inputs, snapshot)
                 outcome = _result(repository, inputs, terminal_ref, terminal, plan)
             else:
-                _load(repository, terminal.cleanup_evidence_ref, QualificationCleanupV5)
+                cleanup = _load(repository, terminal.cleanup_evidence_ref, QualificationCleanupV5)
+                _retry_retired_cleanup(repository, attempt_ref, attempt, cleanup, recovery_factory)
                 outcome = _failed_outcome(attempt_ref, attempt, terminal_ref, terminal)
             return repository.create_typed_artifact(prefix + "/outcome.json", outcome)
         recovered = state == "opened"
@@ -496,16 +617,18 @@ def run_qualification(*, repository, attempt_ref: ArtifactRefV5, worker_factory=
                     plan = _panel(repository, inputs, snapshot)
                     outcome = _result(repository, inputs, terminal_ref, terminal, plan)
                 else:
+                    cleanup = _load(repository, terminal.cleanup_evidence_ref, QualificationCleanupV5)
+                    _retry_retired_cleanup(repository, attempt_ref, attempt, cleanup, recovery_factory)
                     outcome = _failed_outcome(attempt_ref, attempt, terminal_ref, terminal)
                 return repository.create_typed_artifact(prefix + "/outcome.json", outcome)
         worker, plan = None, None
         status, baseline_ref, candidate_ref = "failed", None, None
         cleanup = QualificationCleanupV5(5, attempt_ref, False, False, recovered)
         try:
-            if inputs is None:
-                inputs = _inputs(repository, attempt_ref, attempt)
-            worker = (LocalQualificationWorkerV5 if worker_factory is None else worker_factory)(repository, inputs)
-            if not recovered:
+            if recovered:
+                cleanup = _recover_cleanup(repository, attempt_ref, attempt, recovery_factory)
+            else:
+                worker = (LocalQualificationWorkerV5 if worker_factory is None else worker_factory)(repository, inputs)
                 plan = _panel(repository, inputs, snapshot)
                 baseline = worker.evaluate(inputs, plan, baseline=True)
                 _evidence(inputs, plan, baseline, inputs.baseline_policy)
@@ -530,6 +653,10 @@ def run_qualification(*, repository, attempt_ref: ArtifactRefV5, worker_factory=
                         raise ValueError("qualification cleanup has foreign authority")
                 except BaseException:
                     cleanup = QualificationCleanupV5(5, attempt_ref, False, False, recovered)
+            elif not recovered:
+                # Constructor failures must not disable cleanup of a previously
+                # reserved deterministic slot.
+                cleanup = _recover_cleanup(repository, attempt_ref, attempt, recovery_factory)
             if not cleanup.source_unchanged or not cleanup.cleanup_complete:
                 status = "failed"
             if status != "completed":
@@ -568,21 +695,31 @@ class LocalQualificationWorkerV5:
 
     def __init__(self, repository, inputs):
         from core.pit_optimizer_v5.manifest import capture_clean_policy_snapshot_v5
-        from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
-        from core.pit_optimizer_v5.production_sandbox import LocalSandboxMountFactoryV5, LocalContainerExecutorV5
         from core.pit_optimizer_v5.sandbox import DockerPanelEvaluatorV5
-        from core.pit_optimizer_v5.workspace import WorkspaceOwnerV5, WorkspaceRootsV5, GitCandidateMaterializerV5
 
-        self.repository, self.inputs = repository, inputs
         config = inputs.adapter
         self.source_snapshot = capture_clean_policy_snapshot_v5(
             source_root=Path(config.source_root),
             git_executable=Path(config.git_executable),
             expected_source_commit=inputs.manifest.source_commit,
         )
+        self._initialize_resources(repository, inputs)
+        self.evaluator = DockerPanelEvaluatorV5(executor=self.executor, clock=self)
+        self.before = self.materializer._read_source_bundle()
+        if self.before != inputs.baseline_source:
+            raise ValueError("qualification source checkout differs from unchanged baseline")
+
+    def _initialize_resources(self, repository, inputs):
+        """Reconstruct authenticated resource handles without inspecting source cleanliness."""
+        from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
+        from core.pit_optimizer_v5.production_sandbox import LocalSandboxMountFactoryV5, LocalContainerExecutorV5
+        from core.pit_optimizer_v5.workspace import WorkspaceOwnerV5, WorkspaceRootsV5, GitCandidateMaterializerV5
+
+        self.repository, self.inputs = repository, inputs
+        config = inputs.adapter
         self.owner = WorkspaceOwnerV5(
             inputs.manifest.campaign_id,
-            inputs.selection.final_round,
+            inputs.manifest.search.max_feedback_rounds,
             config.owner_token_sha256,
             "pit-v5-qualify-" + inputs.attempt.sha256,
         )
@@ -614,12 +751,8 @@ class LocalQualificationWorkerV5:
             control_root=Path(config.control_root),
             repository=repository,
         )
-        self.evaluator = DockerPanelEvaluatorV5(executor=self.executor, clock=self)
         self.leases, self.workspace_leases = [], []
         self.role = None
-        self.before = self.materializer._read_source_bundle()
-        if self.before != inputs.baseline_source:
-            raise ValueError("qualification source checkout differs from unchanged baseline")
 
     @staticmethod
     def monotonic():
@@ -742,20 +875,31 @@ class LocalQualificationWorkerV5:
             except BaseException:
                 complete = False
         try:
-            unchanged = (
-                self.materializer._read_source_bundle() == inputs.baseline_source
-                and capture_clean_policy_snapshot_v5(
-                    source_root=Path(inputs.adapter.source_root),
-                    git_executable=Path(inputs.adapter.git_executable),
-                    expected_source_commit=inputs.manifest.source_commit,
-                )
-                == self.source_snapshot
+            source = self.materializer._read_source_bundle()
+            snapshot = capture_clean_policy_snapshot_v5(
+                source_root=Path(inputs.adapter.source_root),
+                git_executable=Path(inputs.adapter.git_executable),
+                expected_source_commit=inputs.manifest.source_commit,
+            )
+            unchanged = source.sha256 == inputs.evaluator.baseline_source_bundle_sha256 and (
+                self.source_snapshot is None or snapshot == self.source_snapshot
             )
         except BaseException:
             unchanged = False
         return QualificationCleanupV5(
             5, inputs.attempt_ref, unchanged, complete and time.monotonic() < cleanup_deadline, recovered
         )
+
+
+class LocalQualificationRecoveryV5(LocalQualificationWorkerV5):
+    """Cleanup-only handles: no evaluator, materialization or clean-source prerequisite."""
+
+    def __init__(self, repository, inputs):
+        self.source_snapshot = None
+        self._initialize_resources(repository, inputs)
+
+    def evaluate(self, inputs, plan, *, baseline):
+        raise RuntimeError("qualification recovery cannot evaluate")
 
 
 def qualification_evidence_summary_v5(repository, outcome):

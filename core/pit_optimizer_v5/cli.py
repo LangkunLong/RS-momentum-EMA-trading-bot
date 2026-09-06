@@ -1482,9 +1482,9 @@ def dispatch_confirmation_cli_v5(argv: Sequence[str], *, emit: Callable[[str], N
 def dispatch_qualification_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None] = print) -> int:
     """Only explicit authenticated references can select or open qualification."""
     from core.pit_optimizer_v5.qualification import (
-        QualificationCleanupV5,
         build_qualification_attempt,
         run_qualification,
+        qualification_cleanup_evidence_v5,
         qualification_evidence_summary_v5,
     )
     from core.pit_optimizer_v5.contracts import QualificationOutcomeV5, RetirementLedgerLocatorV5
@@ -1513,7 +1513,7 @@ def dispatch_qualification_cli_v5(argv: Sequence[str], *, emit: Callable[[str], 
                 repository=repository, attempt_ref=_manifest_ref_argument_v5(namespace, "attempt")
             )
             outcome = repository.load_typed_artifact(reference, value_type=QualificationOutcomeV5)
-            cleanup = repository.load_typed_artifact(outcome.cleanup_evidence_ref, value_type=QualificationCleanupV5)
+            cleanup = qualification_cleanup_evidence_v5(repository, outcome)
             payload = {
                 "schema_version": 5,
                 "status": outcome.status,
