@@ -44,6 +44,12 @@
   the proof may not invent one or mutate production policy source. Cost if wrong: the fixture proves
   orchestration and variant mechanics rather than a production strategy threshold; real discovery
   still requires an authenticated policy-authoring path with a valid declared edit.
+- Ruling: the missing authenticated bundle blocks Task 4 artifact preparation and Task 5 discovery
+  execution, but not source-only Task 6 composition. Implement the confirmation adapter against
+  closed synthetic authorities and direct fakes now; do not create an attempt, deserialize an actual
+  confirmation panel, inspect held-out content, or run confirmation until a valid discovery archive,
+  bundle, and explicit confirmation decision exist. Cost if wrong: source readiness may precede
+  real-artifact compatibility, which must be reauthenticated before the one-use domain is opened.
 
 ## Pre-flight dependency and conflict scan
 
@@ -115,3 +121,12 @@
   provider, Docker, market-data, or replay action occurred. This proves V5 orchestration and
   variant mechanics, not production strategy performance; real discovery remains blocked on the
   authenticated V5 three-universe bundle and the Task 4 exact-manifest approval gate.
+- Task 6: fix round 1/5 (2 addressed, 0 open; commit 0e339c4 after initial 8bb788f review).
+- Task 6: complete (commits 8bb788f..0e339c4, re-review clean). The source-only confirmation
+  adapter freezes an exactly-one authentic final discovery champion, requires reducer-verified
+  complete campaign closure, opens its one-use ledger before any held-out deserialization, retires
+  every terminal/recovery path, and recovers confirmation-owned resources without discovery lookup.
+  Direct synthetic authorities cover selection, identity binding, retirement, and cleanup truthfulness;
+  no tests, actual artifacts, providers, Docker, market data, or confirmation run occurred. A real
+  confirmation remains blocked on an authenticated discovery archive and bundle plus a separate
+  operator decision. Early-budget discovery closure has no authority contract and fails closed.
