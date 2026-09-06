@@ -383,6 +383,22 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         return self._roots
 
     @property
+    def source_commit(self) -> str:
+        return self._source_commit
+
+    @property
+    def repository(self) -> LocalArtifactRepositoryV5:
+        return self._repository
+
+    @property
+    def owner(self) -> WorkspaceOwnerV5:
+        return self._owner
+
+    @property
+    def git_executable(self) -> Path:
+        return self._git_executable
+
+    @property
     def root_identities(self) -> tuple[tuple[str, tuple[int, int]], tuple[str, tuple[int, int]]]:
         return (
             (self._roots.source_root, self._source_identity),

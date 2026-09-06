@@ -1073,6 +1073,10 @@ class DockerPanelEvaluatorV5:
     def executor(self) -> ContainerExecutorV5:
         return self._executor
 
+    @property
+    def clock(self) -> RuntimeClockV5:
+        return self._clock
+
     @staticmethod
     def _failure(code: SandboxFailureCodeV5, leases: tuple[ExecutionLeaseV5, ...] = ()) -> DockerPanelOutcomeV5:
         return DockerPanelOutcomeV5(None, SandboxFailureV5(code), leases)

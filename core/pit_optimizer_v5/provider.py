@@ -1566,7 +1566,7 @@ def _bind_author_artifact(*, request: RoleRequestV5, artifact: StructuralTemplat
     ):
         raise RoleResponseSchemaFailureV5(role=request.role)
     if artifact.full_source_escape is None:
-        if authority.allow_full_source_escape or not artifact.source_operations:
+        if not artifact.source_operations:
             raise RoleResponseSchemaFailureV5(role=request.role)
         if any(operation.path not in authority.author_policy_paths for operation in artifact.source_operations):
             raise RoleResponseSchemaFailureV5(role=request.role)
@@ -2638,6 +2638,10 @@ class AuthorizedRoleRunnerV5:
     @property
     def completion_provider(self) -> CompletionProvider:
         return self._provider
+
+    @property
+    def capabilities(self) -> ProviderCapabilitiesV5:
+        return self._capabilities
 
     @property
     def authorization_lifecycle(self) -> RoleAuthorizationLifecycleV5:

@@ -750,31 +750,6 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             for second in fixed_roots[index + 1 :]
         ):
             raise ValueError("sandbox source, workspace, data, and output roots must be fully disjoint")
-        try:
-            with acquire_absolute_directory_v5(
-                data_path,
-                expected_identity=(data_info.st_dev, data_info.st_ino),
-            ) as data_access:
-                entries = tuple(sorted(item.name for item in os.scandir(data_access.path)))
-                bundle_identity = hash_regular_in_directory_v5(
-                    data_access,
-                    _DATA_FILES_V5[0],
-                    maximum_bytes=_DATA_FILE_MAXIMUM_BYTES_V5[0],
-                )
-                provenance_identity = hash_regular_in_directory_v5(
-                    data_access,
-                    _DATA_FILES_V5[1],
-                    maximum_bytes=_DATA_FILE_MAXIMUM_BYTES_V5[1],
-                )
-        except (OSError, ValueError):
-            raise ValueError("sandbox data root is unreadable") from None
-        if entries != _DATA_FILES_V5:
-            raise ValueError("sandbox data root differs from the closed V5 layout")
-        if (
-            bundle_identity[3] != evaluator_contract.pit_bundle_sha256
-            or provenance_identity[3] != evaluator_contract.prices_provenance_sha256
-        ):
-            raise ValueError("sandbox data bytes differ from evaluator authority")
         self._manifest = manifest
         self._contract = evaluator_contract
         self._profile = sandbox_profile
@@ -787,7 +762,10 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         self._repository = repository
         self._fixed_roots = fixed_roots
         self._workspace_root_identities = workspace_roots
-        self._data_file_identities = (bundle_identity, provenance_identity)
+        self._data_file_authorities = (
+            (_DATA_FILES_V5[0], evaluator_contract.pit_bundle_sha256),
+            (_DATA_FILES_V5[1], evaluator_contract.prices_provenance_sha256),
+        )
         self._mount_identity_sha256 = canonical_sha256_v5(
             {
                 "domain": "pit-optimizer-v5-local-sandbox-mount-v1",
@@ -797,7 +775,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 "owner_sha256": owner.sha256,
                 "workspace_driver_sha256": workspace_driver.driver_identity_sha256,
                 "data_root_identity": _directory_identity(data_path, data_info),
-                "data_file_identities": self._data_file_identities,
+                "data_file_authorities": self._data_file_authorities,
                 "output_root_identity": _directory_identity(output_path, output_info),
                 "repository_root_identity_sha256": repository.root_identity_sha256,
             }
@@ -810,6 +788,34 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
     @property
     def workspace_driver(self) -> LocalGitWorkspaceDriverV5:
         return self._workspace
+
+    @property
+    def manifest(self) -> CampaignManifestV5:
+        return self._manifest
+
+    @property
+    def evaluator_contract(self) -> EvaluatorContractV5:
+        return self._contract
+
+    @property
+    def sandbox_profile(self) -> SandboxProfileV5:
+        return self._profile
+
+    @property
+    def owner(self) -> WorkspaceOwnerV5:
+        return self._owner
+
+    @property
+    def repository(self) -> LocalArtifactRepositoryV5:
+        return self._repository
+
+    @property
+    def data_root(self) -> Path:
+        return self._data_root
+
+    @property
+    def output_root(self) -> Path:
+        return self._output_root
 
     @property
     def fixed_roots(self) -> tuple[Path, Path, Path, Path]:
@@ -901,7 +907,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                             ),
                         )
                     )
-                    self._authenticate_data_files(data_access)
+                    data_file_identities = self._authenticate_data_files(data_access)
                 # This is the last pre-mutation authority check.  All involved
                 # ancestors remain pinned while the output child is reserved.
                 issuance_paths = (
@@ -962,47 +968,43 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 data_path,
                 data_info,
                 authorities[1],
-                canonical_sha256_v5(self._data_file_identities),
+                canonical_sha256_v5(data_file_identities),
             ),
             output_handle,
         )
 
-    def _authenticate_data_files(self, access: object | None = None) -> None:
+    def _authenticate_data_files(
+        self,
+        access: object | None = None,
+    ) -> tuple[tuple[int, int, int, str], ...]:
         if access is None:
             try:
                 with acquire_absolute_directory_v5(
                     self._data_root,
                     expected_identity=(self._data_info.st_dev, self._data_info.st_ino),
                 ) as pinned:
-                    observed = tuple(
-                        hash_regular_in_directory_v5(
-                            pinned,
-                            name,
-                            maximum_bytes=maximum,
-                        )
-                        for name, maximum in zip(
-                            _DATA_FILES_V5,
-                            _DATA_FILE_MAXIMUM_BYTES_V5,
-                            strict=True,
-                        )
-                    )
+                    return self._authenticate_data_files(pinned)
             except (OSError, ValueError):
                 raise ValueError("sandbox data files changed") from None
-        else:
-            observed = tuple(
-                hash_regular_in_directory_v5(  # type: ignore[arg-type]
-                    access,
-                    name,
-                    maximum_bytes=maximum,
-                )
-                for name, maximum in zip(
-                    _DATA_FILES_V5,
-                    _DATA_FILE_MAXIMUM_BYTES_V5,
-                    strict=True,
-                )
+        if directory_entry_names_v5(access) != _DATA_FILES_V5:  # type: ignore[arg-type]
+            raise ValueError("sandbox data root differs from the closed V5 layout")
+        observed = tuple(
+            hash_regular_in_directory_v5(  # type: ignore[arg-type]
+                access,
+                name,
+                maximum_bytes=maximum,
             )
-        if observed != self._data_file_identities:
+            for name, maximum in zip(
+                _DATA_FILES_V5,
+                _DATA_FILE_MAXIMUM_BYTES_V5,
+                strict=True,
+            )
+        )
+        if tuple((name, identity[3]) for name, identity in zip(_DATA_FILES_V5, observed, strict=True)) != (
+            self._data_file_authorities
+        ):
             raise ValueError("sandbox data files changed")
+        return observed
 
     def _create_or_load_output(
         self,
@@ -1241,6 +1243,8 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                     raise ValueError("sandbox mount root changed")
                 if handle.kind == "data":
                     observed = []
+                    if directory_entry_names_v5(access) != _DATA_FILES_V5:
+                        raise ValueError("sandbox data root differs from the closed V5 layout")
                     for name, maximum in zip(
                         _DATA_FILES_V5,
                         _DATA_FILE_MAXIMUM_BYTES_V5,
@@ -1259,10 +1263,13 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                                 maximum_bytes=maximum,
                             )
                         )
-                    if tuple(observed) != self._data_file_identities:
+                    if tuple(
+                        (name, identity[3])
+                        for name, identity in zip(_DATA_FILES_V5, observed, strict=True)
+                    ) != self._data_file_authorities:
                         raise ValueError("sandbox data files changed")
                     if capability.binding_sha256 != canonical_sha256_v5(
-                        self._data_file_identities
+                        tuple(observed)
                     ):
                         raise ValueError("sandbox data binding is foreign")
                 yield access
@@ -1521,6 +1528,30 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     @property
     def mount_factory(self) -> LocalSandboxMountFactoryV5:
         return self._mount_factory
+
+    @property
+    def manifest(self) -> CampaignManifestV5:
+        return self._manifest
+
+    @property
+    def sandbox_profile(self) -> SandboxProfileV5:
+        return self._profile
+
+    @property
+    def owner(self) -> WorkspaceOwnerV5:
+        return self._owner
+
+    @property
+    def repository(self) -> LocalArtifactRepositoryV5:
+        return self._repository
+
+    @property
+    def docker_executable(self) -> Path:
+        return self._docker_executable
+
+    @property
+    def control_root(self) -> Path:
+        return self._control_root
 
     def reserve(self, command: ContainerCommandV5) -> ExecutionReservationV5:
         self._authenticate_command(command, persist_panel_input=True)

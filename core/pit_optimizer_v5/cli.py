@@ -5,10 +5,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 import ntpath
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
-from types import MappingProxyType
-from typing import Callable, Literal, Mapping, Protocol, Sequence, runtime_checkable
+import secrets
+from typing import Callable, Literal, Protocol, Sequence, runtime_checkable
 
 from core.pit_optimizer_v5.artifacts import ArtifactRepositoryFailureV5, LocalArtifactRepositoryV5
 from core.pit_optimizer_v5.contracts import (
@@ -23,6 +23,7 @@ from core.pit_optimizer_v5.contracts import (
     validate_sandbox_profile_resources_v5,
 )
 from core.pit_optimizer_v5.provider import (
+    AuthorizedRoleRunnerV5,
     GatewayCompletionProviderV5,
     LedgerBackedRoleInvokerV5,
 )
@@ -37,16 +38,32 @@ from core.pit_optimizer_v5.runtime import (
     run_feedback_round_v5,
 )
 from core.pit_optimizer_v5.sandbox import (
-    AuthenticatedCandidateBaseOperationsV5,
     DockerCandidateRuntimeV5,
+    DockerPanelEvaluatorV5,
+    RuntimeDockerPanelEvaluatorV5,
 )
 from core.pit_optimizer_v5.production_sandbox import (
     LocalContainerExecutorV5,
     LocalSandboxMountFactoryV5,
 )
 from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
+from core.pit_optimizer_v5.production_runtime import (
+    CanonicalExperimentRecordFactoryV5,
+    CompositeOwnedCleanupV5,
+    ControllerCancellationV5,
+    LocalArchiveReducerFactoryV5,
+    LocalCandidateBaseOperationsV5,
+    LocalRoleRequestFactoryV5,
+    SelectionNoveltyResolverV5,
+    SystemMonotonicClockV5,
+)
 from core.pit_optimizer_v5.search import BaselineParentAuthorityV5
 from core.pit_optimizer_v5.summary import OptimizerSummaryV5, summarize_repository_v5, unavailable_summary_v5
+from core.pit_optimizer_v5.workspace import (
+    GitCandidateMaterializerV5,
+    WorkspaceOwnerV5,
+    WorkspaceRootsV5,
+)
 
 
 V5CommandName = Literal["run", "resume", "verify-run", "summarize", "import-v4-candidate"]
@@ -61,19 +78,49 @@ _FAILURE_REASONS = frozenset(
         "internal_failure",
         "invalid_request",
         "production_authority_mismatch",
-        "production_candidate_base_unavailable",
-        "production_composition_unavailable",
         "production_config_invalid",
         "production_config_missing",
         "production_dependency_invalid",
         "production_provider_invalid",
-        "production_verifier_unavailable",
         "resume_state_missing",
         "run_not_fresh",
         "runtime_failed",
         "runtime_result_invalid",
     }
 )
+
+
+def _canonical_windows_path_v5(value: object, label: str) -> str:
+    if type(value) is not str or not value or "/" in value:
+        raise ValueError(f"{label} must be an absolute canonical Windows path")
+    pure = PureWindowsPath(value)
+    if (
+        not ntpath.isabs(value)
+        or ntpath.normpath(value) != value
+        or any(part in {"", ".", ".."} or part.endswith((".", " ")) for part in pure.parts[1:])
+    ):
+        raise ValueError(f"{label} must be an absolute canonical Windows path")
+    return value
+
+
+def _windows_paths_equal_v5(first: str | Path, second: str | Path) -> bool:
+    return ntpath.normcase(ntpath.normpath(str(first))) == ntpath.normcase(ntpath.normpath(str(second)))
+
+
+def _controller_lease_id_v5(
+    *,
+    manifest_sha256: str,
+    round_index: int,
+    owner_token_sha256: str,
+) -> str:
+    return "pit-v5-controller-" + canonical_sha256_v5(
+        {
+            "domain": "pit-optimizer-v5-controller-lease-v1",
+            "manifest_sha256": manifest_sha256,
+            "round_index": round_index,
+            "owner_token_sha256": owner_token_sha256,
+        }
+    )
 
 
 class V5CliFailure(RuntimeError):
@@ -136,6 +183,14 @@ class ProductionAdapterConfigV5:
     workspace_driver_identity_sha256: str
     mount_factory_identity_sha256: str
     container_executor_identity_sha256: str
+    source_root: str
+    workspace_root: str
+    data_root: str
+    output_root: str
+    control_root: str
+    git_executable: str
+    docker_executable: str
+    api_key_environment_variable: Literal["OPENROUTER_API_KEY"] = "OPENROUTER_API_KEY"
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
@@ -153,6 +208,18 @@ class ProductionAdapterConfigV5:
         ):
             if type(value) is not str or _DIGEST.fullmatch(value) is None:
                 raise ValueError("production adapter config identity is invalid")
+        for value, label in (
+            (self.source_root, "production source root"),
+            (self.workspace_root, "production workspace root"),
+            (self.data_root, "production data root"),
+            (self.output_root, "production output root"),
+            (self.control_root, "production control root"),
+            (self.git_executable, "production Git executable"),
+            (self.docker_executable, "production Docker executable"),
+        ):
+            _canonical_windows_path_v5(value, label)
+        if self.api_key_environment_variable != "OPENROUTER_API_KEY":
+            raise ValueError("production provider secret handle is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +255,9 @@ class CampaignAuthoritiesV5:
 def _exact_production_host_adapter_graph_v5(
     candidate: object,
     adapter_config: ProductionAdapterConfigV5,
+    *,
+    repository: LocalArtifactRepositoryV5,
+    authorities: CampaignAuthoritiesV5,
 ) -> bool:
     """Accept only the concrete, internally identified local host adapter graph."""
 
@@ -195,9 +265,16 @@ def _exact_production_host_adapter_graph_v5(
         return False
     base = candidate.base_operations
     mount_factory = candidate.mount_factory
-    executor = candidate.panel_evaluator.evaluator.executor
+    runtime_evaluator = candidate.panel_evaluator
+    if type(runtime_evaluator) is not RuntimeDockerPanelEvaluatorV5:
+        return False
+    panel_evaluator = runtime_evaluator.evaluator
+    if type(panel_evaluator) is not DockerPanelEvaluatorV5:
+        return False
+    executor = panel_evaluator.executor
     if (
-        type(base) is not AuthenticatedCandidateBaseOperationsV5
+        type(base) is not LocalCandidateBaseOperationsV5
+        or type(base.materializer) is not GitCandidateMaterializerV5
         or type(base.materializer.driver) is not LocalGitWorkspaceDriverV5
         or type(mount_factory) is not LocalSandboxMountFactoryV5
         or type(executor) is not LocalContainerExecutorV5
@@ -205,8 +282,42 @@ def _exact_production_host_adapter_graph_v5(
         return False
     driver = base.materializer.driver
     return (
-        mount_factory.workspace_driver is driver
+        candidate.manifest is authorities.manifest
+        and candidate.panel_plan is authorities.panel_plan
+        and candidate.evaluator_contract is authorities.evaluator_contract
+        and candidate.sandbox_profile is authorities.sandbox_profile
+        and base.manifest is authorities.manifest
+        and base.panel_plan is authorities.panel_plan
+        and base.evaluator_contract is authorities.evaluator_contract
+        and base.sandbox_profile is authorities.sandbox_profile
+        and base.baseline is authorities.baseline
+        and base.repository is repository
+        and base.mount_factory is mount_factory
+        and base.probe_evaluator is runtime_evaluator
+        and runtime_evaluator.registrar is None
+        and panel_evaluator.executor is executor
+        and panel_evaluator.clock is base.clock
+        and mount_factory.workspace_driver is driver
+        and mount_factory.manifest is authorities.manifest
+        and mount_factory.evaluator_contract is authorities.evaluator_contract
+        and mount_factory.sandbox_profile is authorities.sandbox_profile
+        and mount_factory.owner is candidate.owner
+        and mount_factory.repository is repository
+        and _windows_paths_equal_v5(mount_factory.data_root, adapter_config.data_root)
+        and _windows_paths_equal_v5(mount_factory.output_root, adapter_config.output_root)
         and executor.mount_factory is mount_factory
+        and executor.manifest is authorities.manifest
+        and executor.sandbox_profile is authorities.sandbox_profile
+        and executor.owner is candidate.owner
+        and executor.repository is repository
+        and _windows_paths_equal_v5(executor.docker_executable, adapter_config.docker_executable)
+        and _windows_paths_equal_v5(executor.control_root, adapter_config.control_root)
+        and driver.repository is repository
+        and driver.owner is candidate.owner
+        and driver.source_commit == authorities.manifest.source_commit
+        and driver.roots == WorkspaceRootsV5(adapter_config.source_root, adapter_config.workspace_root)
+        and _windows_paths_equal_v5(driver.git_executable, adapter_config.git_executable)
+        and base.base_identity_sha256 == adapter_config.candidate_base_identity_sha256
         and driver.driver_identity_sha256 == adapter_config.workspace_driver_identity_sha256
         and mount_factory.mount_identity_sha256 == adapter_config.mount_factory_identity_sha256
         and executor.executor_identity_sha256 == adapter_config.container_executor_identity_sha256
@@ -248,10 +359,19 @@ class ProductionRoundCompositionV5:
         if type(provider) is not GatewayCompletionProviderV5:
             raise V5CliFailure("production_dependency_invalid")
         gateway = provider.gateway
+        base = candidate.base_operations if type(candidate) is DockerCandidateRuntimeV5 else None
+        clock = self.dependencies.clock
+        cleanup = self.dependencies.cleanup
         if (
-            type(gateway) is not OpenRouterOneShotJsonCompletionV5
+            type(runner) is not AuthorizedRoleRunnerV5
+            or type(gateway) is not OpenRouterOneShotJsonCompletionV5
             or type(lifecycle) is not LocalRoleAuthorizationLedgerV5
             or self.dependencies.invoker.reconciler is not lifecycle
+            or lifecycle.repository is not repository
+            or lifecycle.manifest is not authorities.manifest
+            or gateway.ledger is not lifecycle
+            or gateway.api_key_environment_variable != adapter_config.api_key_environment_variable
+            or runner.capabilities is not authorities.manifest.provider
             or lifecycle.campaign_manifest_sha256 != authorities.manifest.sha256
             or lifecycle.ledger_identity_sha256 != adapter_config.ledger_identity_sha256
             or lifecycle.audit_store_identity_sha256 != adapter_config.audit_store_identity_sha256
@@ -266,41 +386,49 @@ class ProductionRoundCompositionV5:
             or candidate.owner.campaign_id != authorities.manifest.campaign_id
             or candidate.owner.round_index != round_index
             or candidate.owner.owner_token_sha256 != owner_token_sha256
-            or not _exact_production_host_adapter_graph_v5(candidate, adapter_config)
+            or not _exact_production_host_adapter_graph_v5(
+                candidate,
+                adapter_config,
+                repository=repository,
+                authorities=authorities,
+            )
+            or type(self.dependencies.requests) is not LocalRoleRequestFactoryV5
+            or self.dependencies.requests.repository is not repository
+            or self.dependencies.requests.manifest is not authorities.manifest
+            or type(self.dependencies.novelty) is not SelectionNoveltyResolverV5
+            or type(self.dependencies.records) is not CanonicalExperimentRecordFactoryV5
+            or type(self.dependencies.archive_reducers) is not LocalArchiveReducerFactoryV5
+            or self.dependencies.archive_reducers.repository is not repository
+            or type(clock) is not SystemMonotonicClockV5
+            or base is None
+            or base.clock is not clock
+            or type(self.dependencies.cancellation) is not ControllerCancellationV5
+            or type(cleanup) is not CompositeOwnedCleanupV5
+            or cleanup.owner is not candidate.owner
+            or cleanup.materializer is not base.materializer
+            or cleanup.executor is not candidate.panel_evaluator.evaluator.executor
+            or cleanup.clock is not clock
         ):
             raise V5CliFailure("production_dependency_invalid")
-        raise V5CliFailure("production_candidate_base_unavailable")
 
 
 class ProductionRoundFactoryV5:
-    """Concrete campaign factory holding authenticated, non-CLI adapter capabilities."""
+    """Construct one exact local production graph from authenticated config data."""
 
     def __init__(
         self,
         *,
         adapter_config_ref: ArtifactRefV5,
         adapter_config: ProductionAdapterConfigV5,
-        dependencies_by_round: Mapping[int, FeedbackRoundDependenciesV5],
     ) -> None:
         if (
             type(adapter_config_ref) is not ArtifactRefV5
             or type(adapter_config) is not ProductionAdapterConfigV5
             or adapter_config_ref.sha256 != canonical_sha256_v5(adapter_config)
-            or not isinstance(dependencies_by_round, Mapping)
-            or not dependencies_by_round
         ):
             raise ValueError("production round factory authority is invalid")
-        closed: dict[int, FeedbackRoundDependenciesV5] = {}
-        for round_index, dependencies in dependencies_by_round.items():
-            if type(round_index) is not int or round_index < 1 or type(dependencies) is not FeedbackRoundDependenciesV5:
-                raise ValueError("production round factory dependency map is invalid")
-            candidate = dependencies.candidates
-            if not _exact_production_host_adapter_graph_v5(candidate, adapter_config):
-                raise ValueError("production round factory dependency map is invalid")
-            raise ValueError("production candidate base unavailable")
         self.adapter_config_ref = adapter_config_ref
         self.adapter_config = adapter_config
-        self._dependencies_by_round = MappingProxyType(closed)
 
     def compose_round(
         self,
@@ -317,22 +445,132 @@ class ProductionRoundFactoryV5:
             or repository.root_identity_sha256 != self.adapter_config.repository_root_identity_sha256
         ):
             raise V5CliFailure("production_authority_mismatch")
+        provider_capabilities = authorities.manifest.provider
+        if (
+            provider_capabilities is None
+            or provider_capabilities.automatic_retries != 0
+            or provider_capabilities.schema_repair_calls != 0
+        ):
+            raise V5CliFailure("production_provider_invalid")
         try:
-            template = self._dependencies_by_round[round_index]
-        except KeyError:
-            raise V5CliFailure("production_composition_unavailable") from None
-        dependencies = FeedbackRoundDependenciesV5(
-            persistence=repository,
-            invoker=template.invoker,
-            requests=template.requests,
-            novelty=template.novelty,
-            candidates=template.candidates,
-            records=template.records,
-            archive_reducers=template.archive_reducers,
-            clock=template.clock,
-            cancellation=template.cancellation,
-            cleanup=template.cleanup,
-        )
+            owner = WorkspaceOwnerV5(
+                authorities.manifest.campaign_id,
+                round_index,
+                owner_token_sha256,
+                _controller_lease_id_v5(
+                    manifest_sha256=authorities.manifest.sha256,
+                    round_index=round_index,
+                    owner_token_sha256=owner_token_sha256,
+                ),
+            )
+            ledger = LocalRoleAuthorizationLedgerV5(
+                repository=repository,
+                manifest=authorities.manifest,
+            )
+            gateway = OpenRouterOneShotJsonCompletionV5(
+                ledger=ledger,
+                api_key_environment_variable=adapter_config.api_key_environment_variable,
+            )
+            role_runner = AuthorizedRoleRunnerV5(
+                capabilities=provider_capabilities,
+                provider=GatewayCompletionProviderV5(gateway),
+                lifecycle=ledger,
+            )
+            invoker = LedgerBackedRoleInvokerV5(
+                runner=role_runner,
+                reconciler=ledger,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise V5CliFailure("production_provider_invalid") from exc
+        if (
+            ledger.ledger_identity_sha256 != adapter_config.ledger_identity_sha256
+            or ledger.audit_store_identity_sha256 != adapter_config.audit_store_identity_sha256
+            or gateway.gateway_identity_sha256 != adapter_config.gateway_identity_sha256
+        ):
+            raise V5CliFailure("production_provider_invalid")
+        try:
+            clock = SystemMonotonicClockV5()
+            roots = WorkspaceRootsV5(
+                adapter_config.source_root,
+                adapter_config.workspace_root,
+            )
+            driver = LocalGitWorkspaceDriverV5(
+                roots=roots,
+                source_commit=authorities.manifest.source_commit,
+                git_executable=Path(adapter_config.git_executable),
+                repository=repository,
+                owner=owner,
+            )
+            materializer = GitCandidateMaterializerV5(
+                roots=roots,
+                driver=driver,
+                token_factory=lambda: secrets.token_hex(32),
+            )
+            mount_factory = LocalSandboxMountFactoryV5(
+                manifest=authorities.manifest,
+                evaluator_contract=authorities.evaluator_contract,
+                sandbox_profile=authorities.sandbox_profile,
+                owner=owner,
+                workspace_driver=driver,
+                data_root=Path(adapter_config.data_root),
+                output_root=Path(adapter_config.output_root),
+                repository=repository,
+            )
+            executor = LocalContainerExecutorV5(
+                manifest=authorities.manifest,
+                sandbox_profile=authorities.sandbox_profile,
+                owner=owner,
+                mount_factory=mount_factory,
+                docker_executable=Path(adapter_config.docker_executable),
+                control_root=Path(adapter_config.control_root),
+                repository=repository,
+            )
+            runtime_evaluator = RuntimeDockerPanelEvaluatorV5(DockerPanelEvaluatorV5(executor=executor, clock=clock))
+            base = LocalCandidateBaseOperationsV5(
+                manifest=authorities.manifest,
+                panel_plan=authorities.panel_plan,
+                evaluator_contract=authorities.evaluator_contract,
+                sandbox_profile=authorities.sandbox_profile,
+                baseline=authorities.baseline,
+                owner=owner,
+                repository=repository,
+                materializer=materializer,
+                mount_factory=mount_factory,
+                probe_evaluator=runtime_evaluator,
+                clock=clock,
+            )
+            candidate = DockerCandidateRuntimeV5(
+                manifest=authorities.manifest,
+                panel_plan=authorities.panel_plan,
+                evaluator_contract=authorities.evaluator_contract,
+                sandbox_profile=authorities.sandbox_profile,
+                owner=owner,
+                base=base,
+                mounts=mount_factory,
+                evaluator=runtime_evaluator,
+            )
+            dependencies = FeedbackRoundDependenciesV5(
+                persistence=repository,
+                invoker=invoker,
+                requests=LocalRoleRequestFactoryV5(
+                    repository=repository,
+                    manifest=authorities.manifest,
+                ),
+                novelty=SelectionNoveltyResolverV5(),
+                candidates=candidate,
+                records=CanonicalExperimentRecordFactoryV5(),
+                archive_reducers=LocalArchiveReducerFactoryV5(repository),
+                clock=clock,
+                cancellation=ControllerCancellationV5(),
+                cleanup=CompositeOwnedCleanupV5(
+                    owner,
+                    materializer,
+                    executor,
+                    clock,
+                ),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise V5CliFailure("production_dependency_invalid") from exc
         return ProductionRoundCompositionV5(
             FeedbackRoundInputV5(
                 authorities.manifest,
@@ -345,47 +583,6 @@ class ProductionRoundFactoryV5:
             dependencies,
         )
 
-    def verify_run(
-        self,
-        *,
-        repository: LocalArtifactRepositoryV5,
-        authorities: CampaignAuthoritiesV5,
-    ) -> None:
-        if (
-            authorities.manifest.sha256 != self.adapter_config.campaign_manifest_sha256
-            or repository.root_identity_sha256 != self.adapter_config.repository_root_identity_sha256
-        ):
-            raise V5CliFailure("production_authority_mismatch")
-
-
-_PRODUCTION_FACTORIES: dict[tuple[str, str, str], ProductionRoundFactoryV5] = {}
-
-
-def _factory_key(artifact_root: Path, manifest_sha256: str, config_sha256: str) -> tuple[str, str, str]:
-    return (ntpath.normcase(ntpath.normpath(str(artifact_root))), manifest_sha256, config_sha256)
-
-
-def register_production_round_factory_v5(
-    *,
-    artifact_root: Path,
-    manifest_sha256: str,
-    factory: ProductionRoundFactoryV5,
-) -> None:
-    """Register one exact local live-capability factory; CLI text cannot construct one."""
-
-    if (
-        not isinstance(artifact_root, Path)
-        or not artifact_root.is_absolute()
-        or type(factory) is not ProductionRoundFactoryV5
-        or factory.adapter_config.campaign_manifest_sha256 != manifest_sha256
-    ):
-        raise ValueError("production factory registration is invalid")
-    key = _factory_key(artifact_root, manifest_sha256, factory.adapter_config_ref.sha256)
-    existing = _PRODUCTION_FACTORIES.get(key)
-    if existing is not None and existing is not factory:
-        raise ValueError("production factory registration conflicts")
-    _PRODUCTION_FACTORIES[key] = factory
-
 
 @runtime_checkable
 class V5CommandServices(Protocol):
@@ -394,11 +591,6 @@ class V5CommandServices(Protocol):
 
 class ProductionV5CommandServices:
     """Authenticate local authorities and invoke only approved production shapes."""
-
-    def __init__(self, *, factory: ProductionRoundFactoryV5 | None = None) -> None:
-        if factory is not None and type(factory) is not ProductionRoundFactoryV5:
-            raise ValueError("V5 production factory is invalid")
-        self._factory = factory
 
     @staticmethod
     def _repository(request: V5CliRequest) -> LocalArtifactRepositoryV5:
@@ -446,7 +638,7 @@ class ProductionV5CommandServices:
     def _verify_local_run(
         repository: LocalArtifactRepositoryV5,
         authorities: CampaignAuthoritiesV5,
-    ) -> tuple[bool, bool]:
+    ) -> None:
         role_evidence_seen = False
         for round_index in range(1, authorities.manifest.search.max_feedback_rounds + 1):
             events = repository.load_round_events(
@@ -465,7 +657,25 @@ class ProductionV5CommandServices:
         checkpoint = repository.load_checkpoint()
         if checkpoint is not None:
             tuple(repository.load_experiment(reference) for reference in checkpoint.record_refs)
-        return role_evidence_seen, checkpoint is not None
+        if authorities.manifest.provider is None:
+            if role_evidence_seen:
+                raise V5CliFailure("production_provider_invalid")
+        else:
+            try:
+                LocalRoleAuthorizationLedgerV5(
+                    repository=repository,
+                    manifest=authorities.manifest,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise V5CliFailure("production_provider_invalid") from exc
+        try:
+            LocalArchiveReducerFactoryV5(repository).verify_projection(
+                manifest=authorities.manifest,
+                panel_plan=authorities.panel_plan,
+                evaluator_contract=authorities.evaluator_contract,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise V5CliFailure("artifact_graph_invalid") from exc
 
     @staticmethod
     def _adapter_config(
@@ -505,11 +715,7 @@ class ProductionV5CommandServices:
         repository = self._repository(request)
         authorities = self._authorities(repository, request.manifest_ref)
         if request.command in {"verify-run", "summarize"}:
-            role_evidence, checkpoint_seen = self._verify_local_run(repository, authorities)
-            if self._factory is not None:
-                self._factory.verify_run(repository=repository, authorities=authorities)
-            elif request.command == "verify-run" and (role_evidence or checkpoint_seen):
-                raise V5CliFailure("production_verifier_unavailable")
+            self._verify_local_run(repository, authorities)
             return summarize_repository_v5(
                 repository=repository,
                 manifest=authorities.manifest,
@@ -523,19 +729,13 @@ class ProductionV5CommandServices:
             authorities,
             request.adapter_config_ref,
         )
-        factory = self._factory
-        if factory is None:
-            factory = _PRODUCTION_FACTORIES.get(
-                _factory_key(
-                    request.artifact_root,
-                    authorities.manifest.sha256,
-                    request.adapter_config_ref.sha256,
-                )
+        try:
+            factory = ProductionRoundFactoryV5(
+                adapter_config_ref=request.adapter_config_ref,
+                adapter_config=adapter_config,
             )
-        if factory is None:
-            raise V5CliFailure("production_composition_unavailable")
-        if factory.adapter_config_ref != request.adapter_config_ref or factory.adapter_config != adapter_config:
-            raise V5CliFailure("production_config_invalid")
+        except (TypeError, ValueError) as exc:
+            raise V5CliFailure("production_config_invalid") from exc
         assert request.round_index is not None and request.owner_token_sha256 is not None
         existing_events = repository.load_round_events(
             campaign_id=authorities.manifest.campaign_id,
@@ -564,6 +764,7 @@ class ProductionV5CommandServices:
         result = run_feedback_round_v5(composition.inputs, composition.dependencies)
         if type(result) is not FeedbackRoundResultV5:
             raise V5CliFailure("runtime_result_invalid")
+        self._verify_local_run(repository, authorities)
         summary = summarize_repository_v5(
             repository=repository,
             manifest=authorities.manifest,
@@ -689,5 +890,4 @@ __all__ = [
     "build_parser_v5",
     "dispatch_v5_cli",
     "parse_v5_args",
-    "register_production_round_factory_v5",
 ]

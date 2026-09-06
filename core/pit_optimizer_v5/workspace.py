@@ -792,6 +792,28 @@ class GitCandidateMaterializerV5:
             self._fail("foreign_lease")
         return MaterializedWorkspaceV5(parent_revision, variant, lease, handle)
 
+    def read_materialized_source(
+        self,
+        materialized: MaterializedWorkspaceV5,
+    ) -> SourceBundleV5:
+        """Read exact child bytes through the authenticated workspace capability."""
+
+        if type(materialized) is not MaterializedWorkspaceV5:
+            self._fail("invalid_authority")
+        lease = materialized.lease
+        if self._load_lease(lease.payload.lease_id) != lease:
+            self._fail("foreign_lease")
+        handle = self._authorize_handle(materialized.workspace_handle, lease)
+        source = self._read_workspace_bundle(handle)
+        if source != materialized.variant.source_bundle or not self._bundle_matches_revision(
+            source,
+            materialized.variant.policy_revision,
+        ):
+            self._fail("workspace_identity_mismatch")
+        if self._load_lease(lease.payload.lease_id) != lease:
+            self._fail("foreign_lease")
+        return source
+
     def _cleanup_failed_materialization(self, owner: WorkspaceOwnerV5, lease: WorkspaceLeaseV5) -> None:
         try:
             self.cleanup(owner=owner, lease=lease)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Context, Decimal, ROUND_CEILING, localcontext
+import os
 import re
 import secrets
 import time
@@ -42,25 +43,40 @@ class OpenRouterOneShotJsonCompletionV5:
 
     __slots__ = (
         "_ledger",
+        "api_key_environment_variable",
         "audit_store_identity_sha256",
         "gateway_identity_sha256",
         "ledger_identity_sha256",
     )
 
-    def __init__(self, *, ledger: LocalRoleAuthorizationLedgerV5) -> None:
-        if type(ledger) is not LocalRoleAuthorizationLedgerV5:
+    def __init__(
+        self,
+        *,
+        ledger: LocalRoleAuthorizationLedgerV5,
+        api_key_environment_variable: str = "OPENROUTER_API_KEY",
+    ) -> None:
+        if (
+            type(ledger) is not LocalRoleAuthorizationLedgerV5
+            or api_key_environment_variable != "OPENROUTER_API_KEY"
+        ):
             raise ValueError("OpenRouter V5 gateway requires the concrete local role ledger")
         self._ledger = ledger
+        self.api_key_environment_variable = api_key_environment_variable
         self.ledger_identity_sha256 = ledger.ledger_identity_sha256
         self.audit_store_identity_sha256 = ledger.audit_store_identity_sha256
         self.gateway_identity_sha256 = canonical_sha256_v5(
             {
                 "domain": "pit-optimizer-v5-openrouter-one-shot-v1",
                 "transport": "agent_loop.OpenRouterGateway.request_pit_optimizer_v5_json_once",
+                "api_key_environment_variable": api_key_environment_variable,
                 "ledger_identity_sha256": self.ledger_identity_sha256,
                 "audit_store_identity_sha256": self.audit_store_identity_sha256,
             }
         )
+
+    @property
+    def ledger(self) -> LocalRoleAuthorizationLedgerV5:
+        return self._ledger
 
     def invoke_json_once(
         self,
@@ -90,7 +106,11 @@ class OpenRouterOneShotJsonCompletionV5:
         # Construction and readiness therefore remain provider-free and secret-free.
         from agent_loop import OpenRouterGateway
 
+        api_key = os.environ.get(self.api_key_environment_variable)
+        if type(api_key) is not str or not api_key:
+            raise ValueError("OpenRouter V5 API key environment handle is unavailable")
         gateway = OpenRouterGateway(
+            api_key=api_key,
             run_id=f"pit-optimizer-v5-{self._ledger._manifest.campaign_id}",
             max_attempts=1,
         )
@@ -160,6 +180,14 @@ class LocalRoleAuthorizationLedgerV5:
             }
         )
         self._load_verified()
+
+    @property
+    def repository(self) -> LocalArtifactRepositoryV5:
+        return self._repository
+
+    @property
+    def manifest(self) -> CampaignManifestV5:
+        return self._manifest
 
     def _now_ms(self) -> int:
         value = self._clock_ms()

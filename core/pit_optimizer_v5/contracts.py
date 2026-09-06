@@ -34,8 +34,8 @@ _WINDOWS_RESERVED_ARTIFACT_COMPONENTS = frozenset(
 )
 _TARGET_QUANTUM_V5 = Decimal("0.01")
 ARTIFACT_ROOT_V5 = ".artifacts/pit-optimizer-v5"
-MAX_ROLE_EVIDENCE_ITEMS_V5 = 96
-MAX_ROLE_EVIDENCE_BYTES_V5 = 16 * 1024
+MAX_ROLE_EVIDENCE_ITEMS_V5 = 128
+MAX_ROLE_EVIDENCE_BYTES_V5 = 64 * 1024
 
 # This is a closed semantic-runtime set, not a repository hash.  In particular,
 # documentation, orchestration, provider, and CLI files do not affect evaluator
