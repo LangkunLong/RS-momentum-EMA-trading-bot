@@ -1210,6 +1210,18 @@ class LocalArtifactRepositoryV5:
         reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
         return reference, self.load_typed_artifact(reference, value_type=value_type)
 
+    def load_qualification_record(self, relative_path: str, *, value_type: type[T]) -> tuple[ArtifactRefV5, T] | None:
+        """Recover only an exact qualification-owned immutable record."""
+        parts = _safe_relative_path(relative_path)
+        if len(parts) != 3 or parts[0] != "qualification" or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None:
+            raise ValueError("qualification record path is not attempt-owned")
+        try:
+            raw = self._read_relative(relative_path)
+        except ArtifactMissingV5:
+            return None
+        reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
+        return reference, self.load_typed_artifact(reference, value_type=value_type)
+
     def append_stage_ledger(self, relative_path: str, *, prior: bytes, event: bytes) -> None:
         """Atomically publish a byte-preserving append while the stage lock is held."""
         if not prior.endswith(b"\n") or not event.endswith(b"\n") or self.read_stage_ledger(relative_path) != prior:

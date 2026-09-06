@@ -810,6 +810,7 @@ class QualificationAttemptCommitmentV5:
     sandbox_profile_ref: ArtifactRefV5
     retirement_domain_id: str
     retirement_ledger: RetirementLedgerLocatorV5
+    target: AnnualizedReturnTargetV5
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
@@ -830,6 +831,8 @@ class QualificationAttemptCommitmentV5:
         _digest(self.retirement_domain_id, "qualification attempt retirement domain ID")
         if type(self.retirement_ledger) is not RetirementLedgerLocatorV5:
             raise ValueError("qualification attempt retirement ledger is invalid")
+        if type(self.target) is not AnnualizedReturnTargetV5:
+            raise ValueError("qualification attempt requires its immutable target")
 
     @property
     def sha256(self) -> str:

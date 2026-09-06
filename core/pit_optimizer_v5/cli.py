@@ -101,6 +101,7 @@ _COMMANDS = frozenset({"run", "run-fixture", "resume", "verify-run", "summarize"
 _PANEL_COMMANDS = frozenset({"init-stage-ledgers", "build-panels", "verify-panels"})
 _MANIFEST_COMMANDS = frozenset({"build-manifest", "verify-manifest", "render-command"})
 _CONFIRMATION_COMMANDS = frozenset({"build-confirmation-attempt", "confirm"})
+_QUALIFICATION_COMMANDS = frozenset({"build-qualification-attempt", "qualify"})
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _FAILURE_REASONS = frozenset(
     {
@@ -1128,6 +1129,19 @@ def build_parser_v5() -> argparse.ArgumentParser:
     confirm.add_argument("--artifact-root", required=True)
     confirm.add_argument("--attempt-path", required=True)
     confirm.add_argument("--attempt-sha256", required=True)
+    qualification = commands.add_parser("build-qualification-attempt", allow_abbrev=False)
+    qualification.add_argument("--artifact-root", required=True)
+    qualification.add_argument("--attempt-id", required=True)
+    qualification.add_argument("--output-path", required=True)
+    qualification.add_argument("--qualification-ledger-path", required=True)
+    qualification.add_argument("--operator-approved", action="store_true", required=True)
+    for prefix in ("confirmation-outcome", "qualification-plan", "preopen-snapshot"):
+        qualification.add_argument(f"--{prefix}-path", required=True)
+        qualification.add_argument(f"--{prefix}-sha256", required=True)
+    qualify = commands.add_parser("qualify", allow_abbrev=False)
+    qualify.add_argument("--artifact-root", required=True)
+    qualify.add_argument("--attempt-path", required=True)
+    qualify.add_argument("--attempt-sha256", required=True)
     return parser
 
 
@@ -1465,6 +1479,70 @@ def dispatch_confirmation_cli_v5(argv: Sequence[str], *, emit: Callable[[str], N
     return exit_code
 
 
+def dispatch_qualification_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None] = print) -> int:
+    """Only explicit authenticated references can select or open qualification."""
+    from core.pit_optimizer_v5.qualification import (
+        QualificationCleanupV5,
+        build_qualification_attempt,
+        run_qualification,
+        qualification_evidence_summary_v5,
+    )
+    from core.pit_optimizer_v5.contracts import QualificationOutcomeV5, RetirementLedgerLocatorV5
+
+    try:
+        namespace = build_parser_v5().parse_args(argv)
+        root = Path(namespace.artifact_root)
+        if not root.is_absolute() or not root.is_dir():
+            raise ValueError("qualification requires an existing absolute artifact root")
+        repository = LocalArtifactRepositoryV5(root)
+        if namespace.command == "build-qualification-attempt":
+            reference = build_qualification_attempt(
+                repository=repository,
+                confirmation_outcome_ref=_manifest_ref_argument_v5(namespace, "confirmation-outcome"),
+                qualification_plan_ref=_manifest_ref_argument_v5(namespace, "qualification-plan"),
+                retirement_ledger=RetirementLedgerLocatorV5(
+                    namespace.qualification_ledger_path, _manifest_ref_argument_v5(namespace, "preopen-snapshot")
+                ),
+                operator_approved=namespace.operator_approved,
+                attempt_id=namespace.attempt_id,
+                output_path=namespace.output_path,
+            )
+            payload = {"schema_version": 5, "status": "sealed", "attempt_sha256": reference.sha256, "provider_calls": 0}
+        else:
+            reference = run_qualification(
+                repository=repository, attempt_ref=_manifest_ref_argument_v5(namespace, "attempt")
+            )
+            outcome = repository.load_typed_artifact(reference, value_type=QualificationOutcomeV5)
+            cleanup = repository.load_typed_artifact(outcome.cleanup_evidence_ref, value_type=QualificationCleanupV5)
+            payload = {
+                "schema_version": 5,
+                "status": outcome.status,
+                "outcome_sha256": reference.sha256,
+                "target_pct": outcome.target_pct,
+                "baseline_cagr_pct": outcome.baseline_cagr_pct,
+                "candidate_cagr_pct": outcome.candidate_cagr_pct,
+                "candidate_excess_cagr_pct": outcome.candidate_excess_cagr_pct,
+                "target_reached": outcome.target_reached,
+                "baseline_beaten": outcome.baseline_beaten,
+                "qualified": outcome.qualified,
+                "provider_calls": 0,
+                "source_unchanged": cleanup.source_unchanged,
+                "cleanup_complete": cleanup.cleanup_complete,
+            }
+            payload["evidence"] = qualification_evidence_summary_v5(repository, outcome)
+        exit_code = 0 if payload["status"] in {"sealed", "completed"} else 1
+    except V5CliFailure as exc:
+        payload, exit_code = {"schema_version": 5, "status": "rejected", "reason": exc.reason}, exc.exit_code
+    except SystemExit as exc:
+        if exc.code == 0:
+            raise
+        payload, exit_code = {"schema_version": 5, "status": "rejected", "reason": "invalid_request"}, 2
+    except (ValueError, TypeError, OSError, RuntimeError):
+        payload, exit_code = {"schema_version": 5, "status": "rejected", "reason": "qualification_authority_invalid"}, 2
+    emit("PIT_OPTIMIZER_V5_CONFIRMATION=" + canonical_json_bytes_v5(payload).decode("utf-8"))
+    return exit_code
+
+
 def dispatch_v5_cli(
     argv: Sequence[str],
     *,
@@ -1478,6 +1556,8 @@ def dispatch_v5_cli(
         return dispatch_manifest_cli_v5(argv, emit=emit)
     if argv and argv[0] in _CONFIRMATION_COMMANDS:
         return dispatch_confirmation_cli_v5(argv, emit=emit)
+    if argv and argv[0] in _QUALIFICATION_COMMANDS:
+        return dispatch_qualification_cli_v5(argv, emit=emit)
     command: V5CommandName = (
         argv[0]  # type: ignore[assignment]
         if argv and argv[0] in _COMMANDS
