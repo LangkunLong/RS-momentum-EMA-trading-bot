@@ -8,6 +8,8 @@ or campaign schemas.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Literal, Mapping, Protocol, TypeVar
 
 from core.backtest_fills import ExecutionProfileV5
+from core.pit_optimizer_v5.artifacts import ArtifactMissingV5
 from core.pit_optimizer_v5.candidate_ir import PolicyRevisionIdentityV5, SourceBundleV5
 from core.pit_optimizer_v5.contracts import (
     ARTIFACT_ROOT_V5,
@@ -31,6 +34,7 @@ from core.pit_optimizer_v5.contracts import (
     ResourceCapabilitiesV5,
     SandboxProfileV5,
     SearchCapabilitiesV5,
+    canonical_json_bytes_v5,
     canonical_sha256_v5,
     validate_campaign_manifest_bindings_v5,
     validate_episode_plan_panel_v5,
@@ -226,6 +230,48 @@ class ManifestAuthenticationFailureV5(ValueError):
     """The complete campaign graph or its cross-artifact bindings failed."""
 
 
+@dataclass(frozen=True, slots=True)
+class _AuthenticatedBuildDependencyGraphV5:
+    baseline_policy_revision_ref: ArtifactRefV5
+    baseline_policy_revision_present: bool
+    authenticated: tuple[AuthenticatedArtifactV5 | AuthenticatedRawArtifactV5, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.baseline_policy_revision_ref) is not ArtifactRefV5:
+            raise ValueError("build graph baseline policy reference is invalid")
+        if type(self.baseline_policy_revision_present) is not bool:
+            raise ValueError("build graph baseline policy presence is invalid")
+        if type(self.authenticated) is not tuple or any(
+            type(item) not in {AuthenticatedArtifactV5, AuthenticatedRawArtifactV5} for item in self.authenticated
+        ):
+            raise ValueError("build graph authenticated nodes are invalid")
+        references = tuple(item.reference for item in self.authenticated)
+        if len(set(references)) != len(references):
+            raise ValueError("build graph authenticated nodes must be unique")
+
+
+def _sanitized_git_environment_v5() -> dict[str, str]:
+    """Remove every ambient Git override and disable external config selection."""
+
+    environment = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+    )
+    return environment
+
+
+def _same_resolved_path_v5(first: Path, second: Path) -> bool:
+    return os.path.normcase(str(first.resolve(strict=True))) == os.path.normcase(str(second.resolve(strict=True)))
+
+
 def capture_clean_policy_snapshot_v5(
     *,
     source_root: Path,
@@ -245,6 +291,10 @@ def capture_clean_policy_snapshot_v5(
         raise ValueError("source root must be an absolute non-link directory")
     if not executable.is_absolute() or not executable.is_file() or executable.is_symlink():
         raise ValueError("Git executable must be an absolute non-link file")
+    resolved_root = root.resolve(strict=True)
+    if os.path.normcase(str(root)) != os.path.normcase(str(resolved_root)):
+        raise ValueError("source root must be its canonical resolved path")
+    git_environment = _sanitized_git_environment_v5()
 
     def invoke(*arguments: str) -> subprocess.CompletedProcess[bytes]:
         try:
@@ -256,10 +306,23 @@ def capture_clean_policy_snapshot_v5(
                 stderr=subprocess.PIPE,
                 timeout=30,
                 shell=False,
+                cwd=resolved_root,
+                env=git_environment,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ValueError("clean source authority could not be authenticated") from exc
 
+    try:
+        top_level_text = (
+            invoke("rev-parse", "--path-format=absolute", "--show-toplevel").stdout.decode("utf-8", "strict").strip()
+        )
+        top_level = Path(top_level_text)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError("Git worktree root could not be authenticated") from exc
+    if not top_level_text or not top_level.is_absolute() or not _same_resolved_path_v5(top_level, resolved_root):
+        raise ValueError("Git resolved worktree differs from the supplied source root")
+    if invoke("rev-parse", "--is-inside-work-tree").stdout.strip() != b"true":
+        raise ValueError("source root is not a Git worktree")
     head = invoke("rev-parse", "--verify", "HEAD").stdout.decode("ascii", "strict").strip()
     if head != commit:
         raise ValueError("source HEAD differs from the declared immutable commit")
@@ -272,6 +335,127 @@ def capture_clean_policy_snapshot_v5(
     return PolicySourceSnapshotV5.from_tracked_bytes(
         source_commit=commit,
         source_by_path=source_by_path,
+    )
+
+
+def _authenticated_object_v5(artifact: AuthenticatedArtifactV5, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(artifact.content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not authenticated canonical JSON") from exc
+    if type(value) is not dict or canonical_json_bytes_v5(value) != artifact.content:
+        raise ValueError(f"{label} is not authenticated canonical JSON")
+    return value
+
+
+def _primitive_artifact_ref_v5(value: object, label: str) -> ArtifactRefV5:
+    if type(value) is not dict or set(value) != {"relative_path", "sha256"}:
+        raise ValueError(f"{label} reference is invalid")
+    try:
+        return ArtifactRefV5(value["relative_path"], value["sha256"])  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} reference is invalid") from exc
+
+
+def _episode_panel_ref_v5(value: object, label: str) -> ArtifactRefV5:
+    if type(value) is not dict or "panel_ref" not in value:
+        raise ValueError(f"{label} panel reference is invalid")
+    return _primitive_artifact_ref_v5(value["panel_ref"], f"{label} panel")
+
+
+def _authenticate_build_dependency_graph_v5(
+    *,
+    repository: ManifestRepositoryV5,
+    execution_profile_ref: ArtifactRefV5,
+    evaluator_contract_ref: ArtifactRefV5,
+    baseline_authority_ref: ArtifactRefV5,
+    panel_plan_ref: ArtifactRefV5,
+    sandbox_profile_ref: ArtifactRefV5,
+) -> _AuthenticatedBuildDependencyGraphV5:
+    """Authenticate every existing build edge before typed construction."""
+
+    authenticated_by_ref: dict[
+        ArtifactRefV5,
+        AuthenticatedArtifactV5 | AuthenticatedRawArtifactV5,
+    ] = {}
+
+    def authenticate_json(reference: ArtifactRefV5) -> AuthenticatedArtifactV5:
+        item = repository.authenticate(reference)
+        if type(item) is not AuthenticatedArtifactV5 or item.reference != reference:
+            raise ValueError("build dependency authentication returned an invalid JSON node")
+        authenticated_by_ref[reference] = item
+        return item
+
+    def authenticate_raw(reference: ArtifactRefV5) -> None:
+        item = repository.authenticate_raw_artifact(reference)
+        if type(item) is not AuthenticatedRawArtifactV5 or item.reference != reference:
+            raise ValueError("build dependency authentication returned an invalid raw node")
+        authenticated_by_ref[reference] = item
+
+    execution_item = authenticate_json(execution_profile_ref)
+    evaluator_item = authenticate_json(evaluator_contract_ref)
+    baseline_item = authenticate_json(baseline_authority_ref)
+    panel_plan_item = authenticate_json(panel_plan_ref)
+    sandbox_item = authenticate_json(sandbox_profile_ref)
+    if any(item.child_references for item in (execution_item, evaluator_item, sandbox_item)):
+        raise ValueError("leaf build authority contains unexpected artifact references")
+
+    panel_value = _authenticated_object_v5(panel_plan_item, "campaign panel plan")
+    try:
+        discovery = panel_value["discovery"]
+        if type(discovery) is not list:
+            raise TypeError
+        panel_edges = (
+            _primitive_artifact_ref_v5(panel_value["pit_bundle_ref"], "PIT bundle"),
+            _primitive_artifact_ref_v5(
+                panel_value["prices_provenance_ref"],
+                "prices provenance",
+            ),
+            _episode_panel_ref_v5(panel_value["mechanics"], "mechanics"),
+            _episode_panel_ref_v5(panel_value["quick"], "quick"),
+            *(
+                _episode_panel_ref_v5(item, f"discovery episode {index}")
+                for index, item in enumerate(discovery, start=1)
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("campaign panel plan dependency graph is invalid") from exc
+    if set(panel_edges) != set(panel_plan_item.child_references):
+        raise ValueError("campaign panel plan dependency graph differs from its references")
+    for reference in panel_edges:
+        authenticate_raw(reference)
+
+    baseline_value = _authenticated_object_v5(baseline_item, "baseline authority")
+    try:
+        baseline_policy_ref = _primitive_artifact_ref_v5(
+            baseline_value["policy_revision_ref"],
+            "baseline policy revision",
+        )
+        baseline_source_ref = _primitive_artifact_ref_v5(
+            baseline_value["source_bundle_ref"],
+            "baseline source bundle",
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("baseline authority dependency graph is invalid") from exc
+    if set(baseline_item.child_references) != {baseline_policy_ref, baseline_source_ref}:
+        raise ValueError("baseline authority dependency graph differs from its references")
+    if baseline_policy_ref == baseline_source_ref:
+        raise ValueError("baseline policy and source dependencies must be distinct")
+    source_item = authenticate_json(baseline_source_ref)
+    if source_item.child_references:
+        raise ValueError("baseline source bundle contains unexpected artifact references")
+    baseline_policy_present = True
+    try:
+        policy_item = authenticate_json(baseline_policy_ref)
+    except ArtifactMissingV5:
+        baseline_policy_present = False
+    else:
+        if policy_item.child_references:
+            raise ValueError("baseline policy revision contains unexpected artifact references")
+    return _AuthenticatedBuildDependencyGraphV5(
+        baseline_policy_revision_ref=baseline_policy_ref,
+        baseline_policy_revision_present=baseline_policy_present,
+        authenticated=tuple(authenticated_by_ref.values()),
     )
 
 
@@ -290,38 +474,41 @@ def _authenticate_build_dependencies_v5(
     CampaignPanelPlanV5,
     SandboxProfileV5,
 ]:
-    # Authenticate each root's bytes before asking the codec to construct its
-    # typed value.  No runtime/provider/adapter is constructed in this path.
-    for reference in (
-        execution_profile_ref,
-        evaluator_contract_ref,
-        baseline_authority_ref,
-        panel_plan_ref,
-        sandbox_profile_ref,
-    ):
-        repository.authenticate(reference)
+    graph = _authenticate_build_dependency_graph_v5(
+        repository=repository,
+        execution_profile_ref=execution_profile_ref,
+        evaluator_contract_ref=evaluator_contract_ref,
+        baseline_authority_ref=baseline_authority_ref,
+        panel_plan_ref=panel_plan_ref,
+        sandbox_profile_ref=sandbox_profile_ref,
+    )
+    # Every existing edge is authenticated before the first typed load.  The
+    # exact baseline policy edge may be absent only because this command owns
+    # its create-only descriptor write.
     execution = repository.load_typed_artifact(execution_profile_ref, value_type=ExecutionProfileV5)
     evaluator = repository.load_typed_artifact(evaluator_contract_ref, value_type=EvaluatorContractV5)
     baseline = repository.load_typed_artifact(baseline_authority_ref, value_type=BaselineParentAuthorityV5)
     panel_plan = repository.load_typed_artifact(panel_plan_ref, value_type=CampaignPanelPlanV5)
     sandbox = repository.load_typed_artifact(sandbox_profile_ref, value_type=SandboxProfileV5)
 
-    # The two typed raw edges may never be selected by the generic JSON codec.
-    repository.authenticate_raw_artifact(panel_plan.pit_bundle_ref)
-    repository.authenticate_raw_artifact(panel_plan.prices_provenance_ref)
     for episode in (panel_plan.mechanics, panel_plan.quick, *panel_plan.discovery):
         panel = repository.load_evaluation_panel_spec(episode.panel_ref)
         validate_episode_plan_panel_v5(episode, panel)
         if episode.purpose != panel.purpose:
             raise ValueError("panel purpose differs from its authenticated V5 owner")
 
-    # Baseline source bytes are an immutable dependency.  The baseline policy
-    # revision is intentionally allowed to be absent until the create-only
-    # descriptor step below because build-manifest owns that exact write.
-    repository.authenticate(baseline.source_bundle_ref)
     source_bundle = repository.load_typed_artifact(baseline.source_bundle_ref, value_type=SourceBundleV5)
     if source_bundle != baseline.source_bundle:
         raise ValueError("baseline source artifact differs from its authority")
+    if baseline.policy_revision_ref != graph.baseline_policy_revision_ref:
+        raise ValueError("baseline policy reference differs from its preauthenticated graph")
+    if graph.baseline_policy_revision_present:
+        existing_policy = repository.load_typed_artifact(
+            graph.baseline_policy_revision_ref,
+            value_type=PolicyRevisionIdentityV5,
+        )
+        if existing_policy != baseline.policy_revision:
+            raise ValueError("existing baseline policy descriptor differs from its authority")
     return execution, evaluator, baseline, panel_plan, sandbox
 
 
