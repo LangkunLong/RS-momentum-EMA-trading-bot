@@ -74,10 +74,14 @@
 
 ## Task status
 
-- Task 1: source implementation complete — deterministic V5 episode plans, typed held-out owners,
-  create-only stage-ledger initialization, attempt/outcome contracts, content-free verification, and
-  CLI ownership are implemented and directly verified with synthetic authorities. No tests were
-  created, modified, or run. Actual panel emission remains deferred because this worktree still has
-  no authenticated V5 three-universe bundle.
+- Task 1: fix round 1/5 (1 addressed, 2 open; new Important: confirmation commitment did not bind
+  every evaluator dependency; commits 9a7665c..31c063b).
+- Task 1: fix round 2/5 (1 addressed, 2 open; commits 31c063b..89664ee).
+- Task 1: fix round 3/5 (2 addressed, 0 open; commits 89664ee..f3f79b5).
+- Task 1: complete (commits 3548feb..f3f79b5, review clean). Deterministic V5 episode plans,
+  typed held-out owners, create-only stage-ledger initialization, attempt/outcome contracts,
+  content-free verification, and CLI ownership are implemented and directly verified with synthetic
+  authorities. No tests were created, modified, or run. Actual panel emission remains deferred
+  because this worktree has no authenticated V5 three-universe bundle.
 - Task 2: next — provider/search manifest contracts, subject to the same source-first and no-tests
   ruling until the optimizer goal is reached.
