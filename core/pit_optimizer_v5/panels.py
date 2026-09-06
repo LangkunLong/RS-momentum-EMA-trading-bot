@@ -32,7 +32,6 @@ from core.pit_optimizer_v5.contracts import (
     QualificationAttemptCommitmentV5,
     QualificationOutcomeV5,
     QualificationPanelPlanV5,
-    RetirementLedgerLocatorV5,
     SandboxProfileV5,
     ScenarioGridV5,
     canonical_sha256_v5,
@@ -186,6 +185,15 @@ def _absolute_artifact_path_v5(root: Path, relative_path: str) -> Path:
         current = current / part
         if current.exists() and current.is_symlink():
             raise ValueError("artifact path crosses a symbolic link")
+    return candidate
+
+
+def _existing_stage_ledger_path_v5(root: Path, relative_path: str) -> Path:
+    """Resolve a stage ledger without permitting the legacy constructor to create it."""
+
+    candidate = _absolute_artifact_path_v5(root, relative_path)
+    if not candidate.exists() or not candidate.is_file() or candidate.is_symlink():
+        raise ValueError("canonical stage ledger is absent or not a regular non-link file")
     return candidate
 
 
@@ -636,7 +644,8 @@ def _authenticate_initial_snapshot_v5(
     domain_id: str,
     ledger_path: str,
 ) -> StageRetirementSnapshotV5:
-    ledger = QualificationRetirementLedger(_absolute_artifact_path_v5(repository.root, ledger_path), domain_id)
+    ledger_path_on_disk = _existing_stage_ledger_path_v5(repository.root, ledger_path)
+    ledger = QualificationRetirementLedger(ledger_path_on_disk, domain_id)
     live = _snapshot_from_ledger_v5(
         stage=stage,
         ledger_relative_path=ledger_path,
@@ -911,57 +920,28 @@ def confirmation_attempt_commitment_v5(
         raise ValueError("confirmation attempt must use the V5 commitment schema")
     if type(preopen_snapshot) is not StageRetirementSnapshotV5:
         raise ValueError("confirmation attempt requires a V5 preopen snapshot")
-    stored_plan = _load_typed_artifact_v5(
-        repository,
-        confirmation_plan_ref,
-        ConfirmationPanelPlanV5,
+    (
+        stored_plan,
+        _manifest,
+        stored_discovery,
+        _evaluator,
+        _execution,
+        _sandbox,
+        _scenario_grid,
+        stored_snapshot,
+    ) = _authenticate_confirmation_attempt_dependencies_v5(
+        repository=repository,
+        attempt=attempt,
     )
-    manifest = _load_typed_artifact_v5(
-        repository,
-        attempt.discovery_manifest_ref,
-        CampaignManifestV5,
-    )
-    stored_discovery = _load_typed_artifact_v5(
-        repository,
-        manifest.panel_plan_ref,
-        CampaignPanelPlanV5,
-    )
-    if stored_plan != confirmation_plan or stored_discovery != discovery_plan:
-        raise ValueError("confirmation attempt owners differ from their authenticated references")
-    locator: RetirementLedgerLocatorV5 = attempt.retirement_ledger
     if (
         type(confirmation_plan) is not ConfirmationPanelPlanV5
         or type(discovery_plan) is not CampaignPanelPlanV5
-        or preopen_snapshot.stage != "confirmation"
-        or confirmation_plan_ref.sha256 != confirmation_plan.sha256
-        or attempt.confirmation_plan_ref != confirmation_plan_ref
-        or discovery_plan.confirmation_plan_sha256 != confirmation_plan.sha256
-        or attempt.pit_bundle_ref != discovery_plan.pit_bundle_ref
-        or confirmation_plan.pit_bundle_sha256 != discovery_plan.pit_bundle_ref.sha256
-        or confirmation_plan.partition_seed_sha256 != discovery_plan.partition_seed_sha256
-        or confirmation_plan.target_sha256 != discovery_plan.target_sha256
-        or locator.relative_path != CANONICAL_STAGE_LEDGER_PATHS_V5["confirmation"]
-        or attempt.retirement_domain_id != confirmation_plan.confirmation_retirement_domain_id
-        or attempt.retirement_domain_id
-        != _stage_domain_id_v5(
-            stage="confirmation",
-            pit_bundle_ref=discovery_plan.pit_bundle_ref,
-            prices_provenance_ref=discovery_plan.prices_provenance_ref,
-            ledger_relative_path=locator.relative_path,
-        )
-        or preopen_snapshot.ledger_relative_path != locator.relative_path
-        or preopen_snapshot.retirement_domain_id != attempt.retirement_domain_id
-        or preopen_snapshot.ledger_head_sha256 != confirmation_plan.confirmation_ledger_snapshot_sha256
-        or locator.preopen_snapshot_ref.sha256 != canonical_sha256_v5(preopen_snapshot)
+        or confirmation_plan_ref != attempt.confirmation_plan_ref
+        or stored_plan != confirmation_plan
+        or stored_discovery != discovery_plan
+        or stored_snapshot != preopen_snapshot
     ):
         raise ValueError("confirmation attempt differs from its typed owner commitments")
-    stored = _load_typed_artifact_v5(
-        repository,
-        locator.preopen_snapshot_ref,
-        StageRetirementSnapshotV5,
-    )
-    if stored != preopen_snapshot:
-        raise ValueError("confirmation attempt snapshot differs from its authenticated reference")
     _authenticate_live_unopened_stage_v5(repository=repository, expected=preopen_snapshot)
     return attempt
 
@@ -1041,8 +1021,12 @@ def _authenticate_live_unopened_stage_v5(
     expected: StageRetirementSnapshotV5,
 ) -> None:
     if type(repository) is LocalArtifactRepositoryV5:
+        ledger_path = _existing_stage_ledger_path_v5(
+            repository.root,
+            expected.ledger_relative_path,
+        )
         ledger = QualificationRetirementLedger(
-            _absolute_artifact_path_v5(repository.root, expected.ledger_relative_path),
+            ledger_path,
             expected.retirement_domain_id,
         )
         live = _snapshot_from_ledger_v5(
@@ -1061,6 +1045,142 @@ def _authenticate_live_unopened_stage_v5(
         )
     if live != expected or live.record_count != 1 or live.retired_security_lineage_ids:
         raise ValueError("stage ledger differs from its canonical immutable unopened snapshot")
+
+
+def _authenticate_confirmation_attempt_dependencies_v5(
+    *,
+    repository: object,
+    attempt: ConfirmationAttemptCommitmentV5,
+) -> tuple[
+    ConfirmationPanelPlanV5,
+    CampaignManifestV5,
+    CampaignPanelPlanV5,
+    EvaluatorContractV5,
+    ExecutionProfileV5,
+    SandboxProfileV5,
+    ScenarioGridV5,
+    StageRetirementSnapshotV5,
+]:
+    """Resolve and cross-bind every dependency before confirmation can open."""
+
+    confirmation_plan = _load_typed_artifact_v5(
+        repository,
+        attempt.confirmation_plan_ref,
+        ConfirmationPanelPlanV5,
+    )
+    manifest = _load_typed_artifact_v5(
+        repository,
+        attempt.discovery_manifest_ref,
+        CampaignManifestV5,
+    )
+    discovery_plan = _load_typed_artifact_v5(
+        repository,
+        manifest.panel_plan_ref,
+        CampaignPanelPlanV5,
+    )
+    evaluator = _load_typed_artifact_v5(
+        repository,
+        attempt.evaluator_contract_ref,
+        EvaluatorContractV5,
+    )
+    execution = _load_typed_artifact_v5(
+        repository,
+        attempt.execution_profile_ref,
+        ExecutionProfileV5,
+    )
+    sandbox = _load_typed_artifact_v5(
+        repository,
+        attempt.sandbox_profile_ref,
+        SandboxProfileV5,
+    )
+    scenario_grid = _load_typed_artifact_v5(
+        repository,
+        attempt.scenario_grid_ref,
+        ScenarioGridV5,
+    )
+    snapshot = _load_typed_artifact_v5(
+        repository,
+        attempt.retirement_ledger.preopen_snapshot_ref,
+        StageRetirementSnapshotV5,
+    )
+    load_experiment = getattr(repository, "load_experiment", None)
+    if not callable(load_experiment):
+        raise ValueError("confirmation attempt requires authenticated experiment resolution")
+    experiment = load_experiment(attempt.discovery_champion_experiment_ref)
+    load_panel = getattr(repository, "load_evaluation_panel_spec", None)
+    if not callable(load_panel):
+        raise ValueError("confirmation attempt requires authenticated panel resolution")
+    confirmation_panel = load_panel(confirmation_plan.episode.panel_ref)
+    validate_episode_plan_panel_v5(confirmation_plan.episode, confirmation_panel)
+    for reference in (
+        attempt.discovery_champion_policy_ref,
+        attempt.baseline_authority_ref,
+        manifest.baseline_policy_revision_ref,
+        manifest.policy_scope_ref,
+    ):
+        _authenticate_reference_v5(repository, reference)
+    _authenticate_raw_reference_v5(repository, attempt.pit_bundle_ref)
+    _authenticate_raw_reference_v5(repository, attempt.prices_provenance_ref)
+    validate_campaign_manifest_bindings_v5(
+        manifest,
+        panel_plan=discovery_plan,
+        evaluator_contract=evaluator,
+    )
+    expected_domain = _stage_domain_id_v5(
+        stage="confirmation",
+        pit_bundle_ref=discovery_plan.pit_bundle_ref,
+        prices_provenance_ref=discovery_plan.prices_provenance_ref,
+        ledger_relative_path=CANONICAL_STAGE_LEDGER_PATHS_V5["confirmation"],
+    )
+    experiment_identity = getattr(experiment, "experiment_identity", None)
+    experiment_policy = getattr(experiment, "policy_revision", None)
+    if (
+        attempt.discovery_manifest_ref.sha256 != manifest.sha256
+        or discovery_plan.confirmation_plan_sha256 != confirmation_plan.sha256
+        or attempt.pit_bundle_ref != discovery_plan.pit_bundle_ref
+        or attempt.prices_provenance_ref != discovery_plan.prices_provenance_ref
+        or attempt.execution_profile_ref != manifest.execution_profile_ref
+        or attempt.evaluator_contract_ref != manifest.evaluator_contract_ref
+        or attempt.baseline_authority_ref != manifest.baseline_authority_ref
+        or attempt.sandbox_profile_ref != manifest.sandbox_profile_ref
+        or execution.sha256 != evaluator.execution_profile_sha256
+        or sandbox.sha256 != evaluator.sandbox_profile_sha256
+        or scenario_grid.scenarios != evaluator.friction_grid
+        or attempt.scenario_grid_ref.sha256 != scenario_grid.sha256
+        or manifest.baseline_policy_revision_ref.sha256
+        != evaluator.baseline_policy_revision_sha256
+        or confirmation_plan.pit_bundle_sha256 != evaluator.pit_bundle_sha256
+        or confirmation_plan.partition_seed_sha256 != discovery_plan.partition_seed_sha256
+        or confirmation_plan.target_sha256 != discovery_plan.target_sha256
+        or confirmation_plan.confirmation_retirement_domain_id != expected_domain
+        or attempt.retirement_domain_id != expected_domain
+        or attempt.retirement_ledger.relative_path
+        != CANONICAL_STAGE_LEDGER_PATHS_V5["confirmation"]
+        or snapshot.stage != "confirmation"
+        or snapshot.ledger_relative_path != attempt.retirement_ledger.relative_path
+        or snapshot.retirement_domain_id != expected_domain
+        or snapshot.ledger_head_sha256
+        != confirmation_plan.confirmation_ledger_snapshot_sha256
+        or attempt.retirement_ledger.preopen_snapshot_ref.sha256
+        != canonical_sha256_v5(snapshot)
+        or getattr(experiment_identity, "discovery_plan_sha256", None)
+        != discovery_plan.discovery_plan_sha256
+        or getattr(experiment_identity, "policy_revision_sha256", None)
+        != attempt.discovery_champion_policy_ref.sha256
+        or getattr(experiment_policy, "sha256", None)
+        != attempt.discovery_champion_policy_ref.sha256
+    ):
+        raise ValueError("confirmation attempt dependency graph is inconsistent")
+    return (
+        confirmation_plan,
+        manifest,
+        discovery_plan,
+        evaluator,
+        execution,
+        sandbox,
+        scenario_grid,
+        snapshot,
+    )
 
 
 def _confirmation_cagr_from_evidence_v5(evaluation: PanelEvaluationV5) -> Decimal:
@@ -1199,7 +1319,7 @@ def _confirmation_graph_v5(
             raise ValueError("confirmation evaluation differs from its attempt dependencies")
     baseline_cagr = _confirmation_cagr_from_evidence_v5(baseline)
     candidate_cagr = _confirmation_cagr_from_evidence_v5(candidate)
-    behaviorally_active = baseline.scenarios != candidate.scenarios
+    behaviorally_active = selected_scenario(candidate).report.closed_trades != 0
     recomputed = confirmation_outcome_v5(
         attempt_ref=outcome.attempt_ref,
         status=outcome.status,

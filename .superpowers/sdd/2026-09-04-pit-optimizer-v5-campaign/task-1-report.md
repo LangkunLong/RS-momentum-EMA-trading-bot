@@ -224,3 +224,82 @@ built, or verified, and no parent/main-worktree artifact was accessed or substit
 Actual bundle-derived capacity and complete causal-history counts remain unobserved. The source now
 fails closed for fewer than 1,620 eligible disjoint lineages, for any active lineage lacking its full
 252-session feature window, or for any absent/inconsistent evidence edge in the confirmation graph.
+
+## Fix round 2 — non-creating reads and confirmation activity authority (2026-09-06)
+
+### Changed scope
+
+- Added a strict existing-ledger resolver for every non-initialization path. Panel build and live
+  confirmation/qualification attempt authentication now require the canonical ledger path to exist
+  as a regular, non-symlink file before calling the legacy retirement-ledger constructor. Only
+  `init-stage-ledgers` retains authority to invoke that constructor for an absent path, so deletion
+  of a retired canonical ledger cannot silently recreate a matching deterministic genesis during a
+  later build or attempt.
+- Replaced scenario-object inequality as the confirmation activity signal. Qualification gating now
+  derives `behaviorally_active` exclusively from authenticated selected/base-scenario trade evidence:
+  `selected_scenario(candidate).report.closed_trades != 0`. The same-panel baseline and candidate
+  CAGRs remain recomputed from authenticated equity endpoints and compared strictly. The rebuilt
+  outcome must still equal the stored outcome exactly, so missing or caller-mismatched trade/gate
+  evidence fails closed.
+- Expanded confirmation-attempt construction to resolve and cross-bind every carried dependency
+  before returning the commitment: confirmation owner and raw panel, discovery manifest/plan,
+  champion policy and experiment, raw PIT bundle/provenance, execution profile, evaluator contract,
+  immutable scenario grid, baseline authority/policy, policy scope, sandbox profile, pre-open
+  snapshot, retirement domain, and canonical ledger location. The live unopened ledger comparison
+  remains the final pre-opening check.
+- No tests or test files were created, modified, read, or run. No real market artifact, provider,
+  Docker, market-data evaluation, network, Git materialization, replay, push, merge, or stage opening
+  was used.
+
+### Commands and observed output
+
+1. Preflight:
+
+   `git status --short --branch`, `git rev-parse HEAD`, `git branch --show-current`
+
+   Observed: clean `codex/pit-optimizer-v5-architecture` at
+   `31c063b35db6be8b73cf791445fd2fc0c83ec8b4`.
+
+2. Bounded missing-ledger direct fake:
+
+   `synthetic-fix2-ledger: missing-canonical=rejected constructor-before-check=never-invoked`
+
+   The fake replaced the legacy constructor with an assertion bomb and proved the absent canonical
+   path was rejected before constructor invocation. The first attempt used Python's system temporary
+   directory and its cleanup hit a Windows sandbox ACL (`PermissionError: [WinError 5]`); it produced
+   no pass result. The check was rerun in an exact disposable directory inside this worktree, passed,
+   and that directory was removed. The exact inaccessible system temporary directory from the failed
+   attempt was then removed with elevated permission and verified absent.
+
+3. Bounded in-memory confirmation/qualification graph fake:
+
+   `synthetic-fix2-graph: confirmation-dependencies=authenticated substitution=rejected zero-trade-beats-losing-baseline=ineligible active-selected-trades=eligible`
+
+   The first run correctly rejected the substituted evaluator through manifest validation, but the
+   command's assertion expected a later error spelling and therefore exited nonzero. The corrected
+   assertion accepted either fail-closed consistency layer; the complete rerun then passed. It
+   authenticated a valid confirmation dependency graph, rejected a different authenticated evaluator,
+   rejected a zero-trade candidate even though it beat a losing baseline, and accepted a one-trade
+   candidate whose same-panel CAGR strictly beat baseline.
+
+4. Final source verification:
+
+   - `python -m compileall -q core/pit_optimizer_v5`
+   - `python -c "import core.pit_optimizer_v5.panels; import core.pit_optimizer_v5.cli; import core.pit_optimizer_v5"`
+   - `python -m ruff check core/pit_optimizer_v5/panels.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/__init__.py`
+   - `python -B -m core.pit_optimizer_v5.cli init-stage-ledgers --help`
+   - `python -B -m core.pit_optimizer_v5.cli build-panels --help`
+   - `python -B -m core.pit_optimizer_v5.cli verify-panels --help`
+   - `git diff --check`
+
+   Observed: compile/import and all three CLI parsers exited zero; Ruff reported
+   `All checks passed!`; diff checking exited zero with only the repository's LF-to-CRLF checkout
+   notice.
+
+### Remaining blocker and concerns
+
+The exact non-blocking runtime blocker remains the missing authenticated V5 schema-V3 three-universe
+PIT bundle and matching price-identity provenance in this isolated worktree. No real ledger or panel
+artifact was created and no parent/main-worktree artifact was inspected or reused. Actual eligible
+capacity/history counts and real filesystem ledger lifecycle remain unobserved until that bundle is
+available under the authorized V5 artifact root.
