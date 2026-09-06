@@ -151,3 +151,14 @@
   lifecycle and recovery cases; no tests, actual artifacts, providers, Docker, market data, or
   qualification run occurred. Real qualification remains blocked on valid confirmation evidence,
   the V5 bundle, and a separate operator decision.
+- Task 8: fix round 1/5 (1 addressed, 0 open; commit 4757f38 after initial c6aaf79 review).
+- Task 8: fix round 2/5 (2 addressed, 0 open; commit 2395ad5 after first re-review).
+- Task 8: complete (commits c6aaf79..2395ad5, final re-review clean). Readiness authenticates a
+  successful retired qualification graph, emits only create-only content-free non-executable
+  projections, and has no replay launch path. Its clean-source gate requires a separately pinned
+  trusted Windows Git authority, rejects repository-controlled/writable tools and unsafe checkout
+  forms, disables executable Git behavior, and holds/revalidates source and tool pins through the
+  output write. Direct synthetic checks covered graph/identity gates, malicious configuration,
+  executable and source TOCTOU, and output refusal. No tests, real artifacts, providers, Docker,
+  market data, or replay ran. A real readiness record remains blocked on a valid retired
+  qualification outcome, the V5 bundle, and the separately required replay decision.
