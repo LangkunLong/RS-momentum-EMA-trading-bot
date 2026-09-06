@@ -7,6 +7,7 @@ selected by their already-retired owners; source bundles are data, never code.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, fields
 import hashlib
 import json
@@ -51,7 +52,6 @@ from core.pit_optimizer_v5.production_fs import (
     acquire_absolute_directory_v5,
     acquire_directory_v5,
     open_regular_in_directory_v5,
-    read_regular_in_directory_v5,
 )
 from core.pit_optimizer_v5.search import BaselineParentAuthorityV5
 
@@ -84,28 +84,108 @@ class ReadinessGitAuthorityV5:
             raise ValueError("readiness requires an explicit trusted executable")
 
 
-def _open_trusted_git(authority):
-    """Authenticate before any process; keep executable and parent chain pinned."""
-    from contextlib import ExitStack
+def _file_metadata(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@dataclass(frozen=True, slots=True)
+class _PinnedReadinessFileV5:
+    parent: object
+    name: str
+    stream: object
+    metadata: tuple
+    sha256: str
+
+    def revalidate(self):
+        self.parent.assert_current()
+        path = self.parent.path / self.name
+        if (
+            _file_metadata(os.lstat(path)) != self.metadata
+            or _file_metadata(os.fstat(self.stream.fileno())) != self.metadata
+        ):
+            raise ValueError("pinned inspection file identity changed")
+        self.stream.seek(0)
+        if hashlib.file_digest(self.stream, "sha256").hexdigest() != self.sha256:
+            raise ValueError("pinned inspection file bytes changed")
+        if (
+            _file_metadata(os.fstat(self.stream.fileno())) != self.metadata
+            or _file_metadata(os.lstat(path)) != self.metadata
+        ):
+            raise ValueError("pinned inspection file metadata changed")
+        self.parent.assert_current()
+
+
+def _pin_inspection_file(stack, parent, name):
+    stream, info = open_regular_in_directory_v5(parent, name, writable=False)
+    stack.enter_context(stream)
+    raw = stream.read(32 * 1024 * 1024 + 1)
+    if len(raw) > 32 * 1024 * 1024 or len(raw) != info.st_size:
+        raise ValueError("inspection file exceeds its immutable bound")
+    pin = _PinnedReadinessFileV5(parent, name, stream, _file_metadata(info), hashlib.sha256(raw).hexdigest())
+    pin.revalidate()
+    return pin, raw
+
+
+def _require_windows_unwritable(path, *, directory):
+    """Probe the current token's mutation rights without changing any bytes/ACL."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes, close_handle.restype = (wintypes.HANDLE,), wintypes.BOOL
+    # WRITE_DATA/ADD_FILE, APPEND_DATA/ADD_SUBDIRECTORY, WRITE_EA,
+    # WRITE_ATTRIBUTES, DELETE, WRITE_DAC, WRITE_OWNER and DELETE_CHILD.
+    # Each is checked alone:
+    # denying a combined mask would not prove every mutation right absent.
+    rights = (0x2, 0x4, 0x10, 0x100, 0x10000, 0x40000, 0x80000) + ((0x40,) if directory else ())
+    for access in rights:
+        handle = create_file(str(path), access, 0x7, None, 3, 0x02000000 | 0x00200000, None)
+        if handle not in (None, ctypes.c_void_p(-1).value):
+            close_handle(handle)
+            raise ValueError("trusted Git path is writable or controlled by the current token")
+        if ctypes.get_last_error() != 5:  # Only an explicit access denial proves this boundary.
+            raise ValueError("trusted Git write protection could not be authenticated")
+
+
+@contextmanager
+def _open_trusted_git(authority, *, forbidden_roots=()):
+    """Windows-only deny-write/delete pins; no pathname execution on POSIX."""
+    if os.name != "nt":
+        raise ValueError("readiness source inspection requires Windows file pinning")
 
     if type(authority) is not ReadinessGitAuthorityV5:
         raise ValueError("trusted Git authority is required")
     executable = Path(authority.executable)
     if os.path.normcase(str(executable.resolve(strict=True))) != os.path.normcase(str(executable)):
         raise ValueError("trusted Git path must be canonical")
-    stack = ExitStack()
-    try:
+    if any(executable.is_relative_to(Path(root)) for root in forbidden_roots):
+        raise ValueError("trusted Git cannot reside inside source or artifact roots")
+    _require_windows_unwritable(executable, directory=False)
+    current = executable.parent
+    while current != current.parent:
+        _require_windows_unwritable(current, directory=True)
+        current = current.parent
+    with ExitStack() as stack:
         parent = stack.enter_context(acquire_absolute_directory_v5(executable.parent))
-        stream, _ = open_regular_in_directory_v5(parent, executable.name, writable=False)
-        stack.enter_context(stream)
-        if hashlib.file_digest(stream, "sha256").hexdigest() != authority.sha256:
+        pin, _ = _pin_inspection_file(stack, parent, executable.name)
+        if pin.sha256 != authority.sha256:
             raise ValueError("trusted Git bytes differ")
-        return stack
-    except BaseException:
-        stack.close()
-        raise
+        yield pin
 
 
+@contextmanager
 def capture_readiness_source_v5(
     *, source_root: Path, expected_source_commit: str, git_authority: ReadinessGitAuthorityV5
 ):
@@ -114,7 +194,9 @@ def capture_readiness_source_v5(
     In particular, status/diff can run repository-configured clean filters, so
     compare tree/index identities and hash working files ourselves. Transformed
     checkouts, links and submodules fail closed. Normal text CRLF conversion is
-    allowed only when the read-only EOL/attribute metadata permits it.
+    allowed only when the read-only EOL/attribute metadata permits it. The
+    yielded source snapshot and every source/tool pin remain live until the
+    caller has completed its create-only readiness write.
     """
     if re.fullmatch(r"[0-9a-f]{40}", expected_source_commit) is None:
         raise ValueError("invalid source commit")
@@ -145,6 +227,7 @@ def capture_readiness_source_v5(
     def invoke(*arguments, missing_is_empty=False):
         # All call sites below are literal builtin read operations. Neither a
         # command nor an argument list can enter through an artifact or CLI.
+        trusted_git.revalidate()
         result = subprocess.run(
             (git_authority.executable, *fixed, "-C", str(root), *arguments),
             check=False,
@@ -193,7 +276,11 @@ def capture_readiness_source_v5(
             raise ValueError("tracked source aliases collide")
         return result
 
-    with _open_trusted_git(git_authority), acquire_absolute_directory_v5(root) as source_directory:
+    with (
+        _open_trusted_git(git_authority, forbidden_roots=(root,)) as trusted_git,
+        acquire_absolute_directory_v5(root) as source_directory,
+        ExitStack() as source_pins,
+    ):
         version = invoke("--version").decode("ascii").strip()
         parsed_version = re.fullmatch(r"git version (\d+)\.(\d+)(?:\.[0-9A-Za-z]+)*", version)
         if parsed_version is None or tuple(map(int, parsed_version.groups())) < (2, 50):
@@ -234,12 +321,14 @@ def capture_readiness_source_v5(
         if set(eol) != set(tree):
             raise ValueError("source EOL metadata differs")
         sources = {}
+        pins = []
         for path, (_, oid) in tree.items():
             parts = PurePosixPath(path).parts
-            with acquire_directory_v5(
-                root, parts[:-1], create=False, expected_root_identity=source_directory.identity
-            ) as parent:
-                raw, _ = read_regular_in_directory_v5(parent, parts[-1], maximum_bytes=32 * 1024 * 1024)
+            parent = source_pins.enter_context(
+                acquire_directory_v5(root, parts[:-1], create=False, expected_root_identity=source_directory.identity)
+            )
+            pin, raw = _pin_inspection_file(source_pins, parent, parts[-1])
+            pins.append(pin)
 
             def blob_id(value):
                 return hashlib.sha1(b"blob " + str(len(value)).encode("ascii") + b"\0" + value).hexdigest()
@@ -263,16 +352,25 @@ def capture_readiness_source_v5(
                     raise ValueError("working source differs")
             if path in EDITABLE_POLICY_PATHS_V5:
                 sources[path] = raw
-        if (
-            invoke("rev-parse", "--verify", "HEAD").strip() != expected_source_commit.encode("ascii")
-            or invoke("ls-files", "--stage", "--full-name", "-z") != index_raw
-            or invoke("ls-files", "--others", "--exclude-standard", "--full-name", "-z")
-        ):
-            raise ValueError("source changed during inspection")
-        return PolicySourceSnapshotV5.from_tracked_bytes(
+
+        def revalidate():
+            if (
+                invoke("rev-parse", "--verify", "HEAD").strip() != expected_source_commit.encode("ascii")
+                or invoke("ls-files", "--stage", "--full-name", "-z") != index_raw
+                or invoke("ls-files", "--others", "--exclude-standard", "--full-name", "-z")
+            ):
+                raise ValueError("source changed during inspection")
+            for pin in pins:
+                pin.revalidate()
+            trusted_git.revalidate()
+            source_directory.assert_current()
+
+        snapshot = PolicySourceSnapshotV5.from_tracked_bytes(
             source_commit=expected_source_commit,
             source_by_path={path: sources[path] for path in EDITABLE_POLICY_PATHS_V5},
         )
+        revalidate()
+        yield SimpleNamespace(snapshot=snapshot, revalidate=revalidate)
 
 
 class ReplayReadinessFailureV5(ValueError):
@@ -535,7 +633,7 @@ def full_replay_readiness(
         blocker = "git_authority_invalid"
         # Authenticate the operator's tool before inspecting the outcome graph.
         # The source helper pins and reauthenticates it again before any launch.
-        with _open_trusted_git(git_authority):
+        with _open_trusted_git(git_authority, forbidden_roots=(repository.root,)):
             pass
         blocker = "artifact_graph_invalid"
         outcome = _load(repository, qualification_outcome_ref, QualificationOutcomeV5)
@@ -600,41 +698,44 @@ def full_replay_readiness(
         if qualification._result(repository, inputs, outcome.retirement_terminal_ref, terminal, plan) != outcome:
             raise ValueError("qualification gate differs")
         blocker = "source_not_clean_or_matching"
-        source = capture_readiness_source_v5(
+        with capture_readiness_source_v5(
             source_root=Path(inputs.adapter.source_root),
             git_authority=git_authority,
             expected_source_commit=inputs.manifest.source_commit,
-        )
-        if type(source) is not PolicySourceSnapshotV5 or source != inputs.expected_source:
-            raise ValueError("source drift")
-        blocker = "retirement_invalid"
-        if ledger.state() != ("retired", outcome.retirement_terminal_ref) or prior_ledger.state() != (
-            "retired",
-            confirmed_outcome.retirement_terminal_ref,
-        ):
-            raise ValueError("retirement changed during authentication")
-        record = FullReplayReadinessV5(
-            5,
-            git_authority.sha256,
-            qualification_outcome_ref.sha256,
-            outcome.attempt_ref.sha256,
-            outcome.retirement_terminal_ref.sha256,
-            attempt.confirmation_outcome_ref.sha256,
-            outcome.qualified_policy_ref.sha256,
-            inputs.selection.source_ref.sha256,
-            canonical_sha256_v5(source),
-            attempt.execution_profile_ref.sha256,
-            attempt.evaluator_contract_ref.sha256,
-            attempt.pit_bundle_ref.sha256,
-            attempt.prices_provenance_ref.sha256,
-            attempt.baseline_authority_ref.sha256,
-            attempt.scenario_grid_ref.sha256,
-            attempt.sandbox_profile_ref.sha256,
-            outcome.cleanup_evidence_ref.sha256,
-            graph_sha256,
-        )
-        blocker = "output_unavailable"
-        return repository.create_readiness_record(output_path, record)
+        ) as source_pin:
+            source = source_pin.snapshot
+            if type(source) is not PolicySourceSnapshotV5 or source != inputs.expected_source:
+                raise ValueError("source drift")
+            blocker = "retirement_invalid"
+            if ledger.state() != ("retired", outcome.retirement_terminal_ref) or prior_ledger.state() != (
+                "retired",
+                confirmed_outcome.retirement_terminal_ref,
+            ):
+                raise ValueError("retirement changed during authentication")
+            record = FullReplayReadinessV5(
+                5,
+                git_authority.sha256,
+                qualification_outcome_ref.sha256,
+                outcome.attempt_ref.sha256,
+                outcome.retirement_terminal_ref.sha256,
+                attempt.confirmation_outcome_ref.sha256,
+                outcome.qualified_policy_ref.sha256,
+                inputs.selection.source_ref.sha256,
+                canonical_sha256_v5(source),
+                attempt.execution_profile_ref.sha256,
+                attempt.evaluator_contract_ref.sha256,
+                attempt.pit_bundle_ref.sha256,
+                attempt.prices_provenance_ref.sha256,
+                attempt.baseline_authority_ref.sha256,
+                attempt.scenario_grid_ref.sha256,
+                attempt.sandbox_profile_ref.sha256,
+                outcome.cleanup_evidence_ref.sha256,
+                graph_sha256,
+            )
+            blocker = "source_not_clean_or_matching"
+            source_pin.revalidate()
+            blocker = "output_unavailable"
+            return repository.create_readiness_record(output_path, record)
     except ArtifactExistsV5:
         raise ReplayReadinessFailureV5("output_exists") from None
     except (
