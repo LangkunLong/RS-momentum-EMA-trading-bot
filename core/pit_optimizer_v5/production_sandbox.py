@@ -820,10 +820,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
 
         if type(panel) is not EpisodePlanV5:
             raise ValueError("sandbox panel request is invalid")
-        authenticated = self._repository.load_typed_artifact(
-            panel.panel_ref,
-            value_type=EvaluationPanelSpec,
-        )
+        authenticated = self._repository.load_evaluation_panel_spec(panel.panel_ref)
         validate_episode_plan_panel_v5(panel, authenticated)
         if authenticated.purpose != panel.purpose:
             raise ValueError("sandbox panel purpose differs from its episode")

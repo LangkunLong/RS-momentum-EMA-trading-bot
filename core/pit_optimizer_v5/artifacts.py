@@ -22,6 +22,11 @@ from core.pit_optimizer_artifacts import (
     _metadata_identity,
     _write_create_only_in_directory,
 )
+from core.pit_optimizer_evaluation import (
+    EvaluationPanelSpec,
+    _canonical_json_bytes as _canonical_panel_json_bytes,
+    _panel_json_value,
+)
 from core.pit_optimizer_v5.candidate_ir import (
     ExperimentIdentityV5,
     LiteralAxisV5,
@@ -41,6 +46,8 @@ from core.pit_optimizer_v5.contracts import (
     ArtifactRefV5,
     AuthenticatedArtifactV5,
     CampaignEvidenceV5,
+    CampaignManifestV5,
+    CampaignPanelPlanV5,
     CriticArtifactV5,
     CriticReviewV5,
     EpisodeEvaluationV5,
@@ -50,6 +57,7 @@ from core.pit_optimizer_v5.contracts import (
     canonical_json_bytes_v5,
     canonical_primitive_v5,
     canonical_sha256_v5,
+    validate_episode_plan_panel_v5,
 )
 from core.pit_optimizer_v5.memory import (
     ArchiveReducerV5,
@@ -1887,6 +1895,50 @@ class LocalArtifactRepositoryV5:
             ):
                 raise ArtifactSchemaFailureV5(item["reference"])  # type: ignore[arg-type]
 
+    def load_evaluation_panel_spec(self, reference: ArtifactRefV5) -> EvaluationPanelSpec:
+        """Authenticate the panel's authoritative newline-bearing legacy encoding."""
+
+        panel, _ = self._authenticate_evaluation_panel_spec(reference)
+        return panel
+
+    def _authenticate_evaluation_panel_spec(
+        self, reference: ArtifactRefV5
+    ) -> tuple[EvaluationPanelSpec, AuthenticatedArtifactV5]:
+        if type(reference) is not ArtifactRefV5:
+            raise ValueError("panel authentication requires a V5 reference")
+        _safe_relative_path(reference.relative_path)
+        try:
+            raw = self._read_relative(reference.relative_path)
+        except ArtifactMissingV5:
+            relocated = self._find_digest(reference.sha256, reference.relative_path)
+            if relocated is not None:
+                raise ArtifactRelocatedV5(reference, relocated) from None
+            raise ArtifactMissingV5(reference) from None
+        actual = hashlib.sha256(raw).hexdigest()
+        if actual != reference.sha256:
+            raise ArtifactDigestMismatchV5(reference, actual)
+
+        def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in items:
+                if key in result:
+                    raise ArtifactNonCanonicalV5(reference)
+                result[key] = value
+            return result
+
+        try:
+            primitive = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+            panel = _decode_dataclass(EvaluationPanelSpec, primitive)
+            if _canonical_panel_json_bytes(_panel_json_value(panel)) != raw:
+                raise ArtifactNonCanonicalV5(reference)
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (UnicodeError, TypeError, ValueError, ArithmeticError, RecursionError):
+            raise ArtifactSchemaFailureV5(reference) from None
+        if panel.sha256 != reference.sha256:
+            raise ArtifactDigestMismatchV5(reference, panel.sha256)
+        return panel, AuthenticatedArtifactV5(reference=reference, content=raw, child_references=())
+
     def load_typed_artifact(self, reference: ArtifactRefV5, *, value_type: type[T]) -> T:
         """Authenticate exact canonical dataclass bytes without an extra envelope."""
 
@@ -2799,25 +2851,61 @@ class LocalArtifactRepositoryV5:
 
     def verify_graph(self, manifest_ref: ArtifactRefV5) -> ArtifactGraphVerificationV5:
         authenticated: list[AuthenticatedArtifactV5] = []
-        complete: set[tuple[str, str]] = set()
+        authenticated_keys: set[tuple[str, str]] = set()
+        panels: dict[tuple[str, str], EvaluationPanelSpec] = {}
+        complete: set[tuple[str, str, str]] = set()
         active: set[tuple[str, str]] = set()
 
-        def visit(reference: ArtifactRefV5) -> None:
+        def visit(
+            reference: ArtifactRefV5, kind: Literal["generic", "manifest", "panel_plan", "panel"] = "generic"
+        ) -> None:
             key = (reference.relative_path, reference.sha256)
             if key in active:
                 raise ArtifactCycleV5(reference)
-            if key in complete:
+            typed_key = (*key, kind)
+            if typed_key in complete:
                 return
             active.add(key)
-            item = self.authenticate(reference)
-            authenticated.append(item)
-            for child in item.child_references:
-                visit(child)
+            if kind == "panel":
+                panels[key], item = self._authenticate_evaluation_panel_spec(reference)
+            else:
+                item = self.authenticate(reference)
+            if key not in authenticated_keys:
+                authenticated.append(item)
+                authenticated_keys.add(key)
+            if kind in {"manifest", "panel_plan"}:
+                value_type = CampaignManifestV5 if kind == "manifest" else CampaignPanelPlanV5
+                try:
+                    value = _decode_dataclass(value_type, _strict_json_object(item.content, reference))
+                    if canonical_json_bytes_v5(value) != item.content:
+                        raise ArtifactNonCanonicalV5(reference)
+                except ArtifactRepositoryFailureV5:
+                    raise
+                except (TypeError, ValueError, ArithmeticError, RecursionError):
+                    raise ArtifactSchemaFailureV5(reference) from None
+                if type(value) is CampaignManifestV5:
+                    for child in item.child_references:
+                        visit(child, "panel_plan" if child == value.panel_plan_ref else "generic")
+                else:
+                    visit(value.pit_bundle_ref)
+                    visit(value.prices_provenance_ref)
+                    for episode in (value.mechanics, value.quick, *value.discovery):
+                        visit(episode.panel_ref, "panel")
+                        panel = panels[(episode.panel_ref.relative_path, episode.panel_ref.sha256)]
+                        try:
+                            validate_episode_plan_panel_v5(episode, panel)
+                            if episode.purpose != panel.purpose:
+                                raise ValueError
+                        except ValueError:
+                            raise ArtifactSchemaFailureV5(episode.panel_ref) from None
+            else:
+                for child in item.child_references:
+                    visit(child)
             active.remove(key)
-            complete.add(key)
+            complete.add(typed_key)
 
         try:
-            visit(manifest_ref)
+            visit(manifest_ref, "manifest")
         except ArtifactRepositoryFailureV5 as exc:
             reference = exc.reference or manifest_ref
             if exc.code == "relocated":
