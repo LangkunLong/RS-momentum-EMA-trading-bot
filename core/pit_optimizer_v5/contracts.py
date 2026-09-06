@@ -700,6 +700,53 @@ def _require_artifact_refs_v5(*references: ArtifactRefV5) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class FinalizedDiscoveryRoundV5:
+    """Explicit immutable event and record closure for one completed round."""
+
+    round_index: int
+    event_refs: tuple[ArtifactRefV5, ...]
+    record_refs: tuple[ArtifactRefV5, ...]
+
+    def __post_init__(self) -> None:
+        _count(self.round_index, "finalized discovery round", positive=True)
+        for references in (self.event_refs, self.record_refs):
+            if type(references) is not tuple or not references:
+                raise ValueError("finalized discovery round requires event and record authority")
+            _require_artifact_refs_v5(*references)
+            if len(set(references)) != len(references):
+                raise ValueError("finalized discovery references are duplicated")
+        if self.record_refs != tuple(sorted(self.record_refs, key=lambda item: (item.relative_path, item.sha256))):
+            raise ValueError("finalized discovery records are not canonical")
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizedDiscoveryCampaignV5:
+    """Closure authority; a checkpoint counter alone cannot close discovery."""
+
+    schema_version: Literal[5]
+    discovery_manifest_ref: ArtifactRefV5
+    checkpoint_ref: ArtifactRefV5
+    archive_ref: ArtifactRefV5
+    rounds: tuple[FinalizedDiscoveryRoundV5, ...]
+    status: Literal["completed"]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5 or self.status != "completed":
+            raise ValueError("discovery campaign is not finalized")
+        _require_artifact_refs_v5(self.discovery_manifest_ref, self.checkpoint_ref, self.archive_ref)
+        if (
+            type(self.rounds) is not tuple
+            or not self.rounds
+            or any(type(item) is not FinalizedDiscoveryRoundV5 for item in self.rounds)
+            or tuple(item.round_index for item in self.rounds) != tuple(range(1, len(self.rounds) + 1))
+        ):
+            raise ValueError("finalized discovery rounds are incomplete or noncanonical")
+        all_records = tuple(ref for item in self.rounds for ref in item.record_refs)
+        if len(set(all_records)) != len(all_records):
+            raise ValueError("finalized discovery rounds repeat experiment records")
+
+
+@dataclass(frozen=True, slots=True)
 class ConfirmationAttemptCommitmentV5:
     schema_version: Literal[5]
     attempt_id: str
@@ -1929,6 +1976,8 @@ __all__ = [
     "EvaluationReportV5",
     "EvaluationSliceV5",
     "EvaluatorContractV5",
+    "FinalizedDiscoveryCampaignV5",
+    "FinalizedDiscoveryRoundV5",
     "HypothesisV5",
     "InvestigatorArtifactV5",
     "MetricCountV5",

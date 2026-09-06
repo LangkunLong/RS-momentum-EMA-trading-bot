@@ -1116,6 +1116,7 @@ def build_parser_v5() -> argparse.ArgumentParser:
         "discovery-manifest",
         "discovery-checkpoint",
         "discovery-archive",
+        "finalized-campaign",
         "confirmation-plan",
         "scenario-grid",
         "preopen-snapshot",
@@ -1425,6 +1426,7 @@ def dispatch_confirmation_cli_v5(argv: Sequence[str], *, emit: Callable[[str], N
                 discovery_manifest_ref=_manifest_ref_argument_v5(namespace, "discovery-manifest"),
                 discovery_checkpoint_ref=_manifest_ref_argument_v5(namespace, "discovery-checkpoint"),
                 discovery_archive_ref=_manifest_ref_argument_v5(namespace, "discovery-archive"),
+                finalized_campaign_ref=_manifest_ref_argument_v5(namespace, "finalized-campaign"),
                 confirmation_plan_ref=_manifest_ref_argument_v5(namespace, "confirmation-plan"),
                 scenario_grid_ref=_manifest_ref_argument_v5(namespace, "scenario-grid"),
                 retirement_ledger=RetirementLedgerLocatorV5(

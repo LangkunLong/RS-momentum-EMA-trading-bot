@@ -31,6 +31,7 @@ from core.pit_optimizer_v5.contracts import (
     ConfirmationOutcomeV5,
     ConfirmationPanelPlanV5,
     EvaluatorContractV5,
+    FinalizedDiscoveryCampaignV5,
     PanelEvaluationV5,
     RetirementLedgerLocatorV5,
     SandboxProfileV5,
@@ -100,6 +101,7 @@ class FrozenConfirmationSelectionV5:
     baseline_policy_ref: ArtifactRefV5
     baseline_source_ref: ArtifactRefV5
     final_round: int
+    finalized_campaign_ref: ArtifactRefV5
 
     def __post_init__(self) -> None:
         if self.schema_version != 5 or type(self.final_round) is not int or self.final_round < 1:
@@ -113,6 +115,7 @@ class FrozenConfirmationSelectionV5:
             self.source_ref,
             self.baseline_policy_ref,
             self.baseline_source_ref,
+            self.finalized_campaign_ref,
         ):
             if type(reference) is not ArtifactRefV5:
                 raise ValueError("frozen selection requires complete authenticated edges")
@@ -325,6 +328,7 @@ def build_confirmation_attempt(
     discovery_manifest_ref: ArtifactRefV5,
     discovery_checkpoint_ref: ArtifactRefV5,
     discovery_archive_ref: ArtifactRefV5,
+    finalized_campaign_ref: ArtifactRefV5,
     confirmation_plan_ref: ArtifactRefV5,
     scenario_grid_ref: ArtifactRefV5,
     retirement_ledger: RetirementLedgerLocatorV5,
@@ -334,9 +338,9 @@ def build_confirmation_attempt(
 ) -> ArtifactRefV5:
     """Freeze the authenticated final champion without parsing held-out bytes.
 
-    Until discovery supplies an explicit early-budget closure contract, only a
-    checkpoint at the manifest's final feedback round can authorize this stage.
-    An intermediate archive never implies that discovery has closed.
+    Every completed round must be covered by explicit finalized-campaign
+    authority. Source-only work cannot synthesize closure from checkpoint
+    counters; absent or unauthentic closure fails before any attempt is written.
     """
     from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
     from core.pit_optimizer_v5.panels import StageRetirementSnapshotV5
@@ -357,6 +361,7 @@ def build_confirmation_attempt(
         (
             discovery_checkpoint_ref,
             discovery_archive_ref,
+            finalized_campaign_ref,
             execution_adapter_ref,
             scenario_grid_ref,
             confirmation_plan_ref,
@@ -368,7 +373,8 @@ def build_confirmation_attempt(
     champion, experiment = repository.load_confirmation_champion(
         checkpoint_ref=discovery_checkpoint_ref,
         archive_ref=discovery_archive_ref,
-        final_round=manifest.search.max_feedback_rounds,
+        finalized_campaign_ref=finalized_campaign_ref,
+        discovery_manifest_ref=discovery_manifest_ref,
     )
     score = verified_campaign_cagr_pct(
         campaign=champion.campaign,
@@ -395,6 +401,7 @@ def build_confirmation_attempt(
         manifest.baseline_policy_revision_ref,
         authorities.baseline_authority.source_bundle_ref,
         manifest.search.max_feedback_rounds,
+        finalized_campaign_ref,
     )
     source = _load(repository, selection.source_ref, SourceBundleV5)
     policy = (
@@ -466,6 +473,7 @@ def _inputs(repository, attempt_ref, attempt):
     # Discovery archive and checkpoint are opaque byte commitments here. The
     # builder is the sole consumer of their projection and experiment records.
     selection = _load(repository, attempt.frozen_selection_ref, FrozenConfirmationSelectionV5)
+    finalization = _load(repository, selection.finalized_campaign_ref, FinalizedDiscoveryCampaignV5)
     manifest = _load(repository, attempt.discovery_manifest_ref, CampaignManifestV5)
     discovery = _load(repository, manifest.panel_plan_ref, CampaignPanelPlanV5)
     _walk(
@@ -476,6 +484,7 @@ def _inputs(repository, attempt_ref, attempt):
             selection.checkpoint_ref,
             selection.archive_ref,
             selection.experiment_ref,
+            selection.finalized_campaign_ref,
         ),
         raw=(attempt.pit_bundle_ref, attempt.prices_provenance_ref),
     )
@@ -492,6 +501,10 @@ def _inputs(repository, attempt_ref, attempt):
     validate_sandbox_profile_resources_v5(sandbox, manifest.resources)
     if (
         selection.discovery_manifest_ref != attempt.discovery_manifest_ref
+        or finalization.discovery_manifest_ref != attempt.discovery_manifest_ref
+        or finalization.checkpoint_ref != selection.checkpoint_ref
+        or finalization.archive_ref != selection.archive_ref
+        or len(finalization.rounds) != selection.final_round
         or selection.policy_ref != attempt.discovery_champion_policy_ref
         or selection.experiment_ref != attempt.discovery_champion_experiment_ref
         or selection.final_round != manifest.search.max_feedback_rounds
@@ -900,6 +913,7 @@ class LocalConfirmationWorkerV5:
         # No resource enumeration, discovery journal, or replay is permitted.
         for role in ("baseline", "candidate"):
             self.role = role
+            record = None
             try:
                 record = self.repository.load_confirmation_record(
                     f"confirmation/{inputs.attempt.sha256}/{role}-execution.json",
@@ -907,10 +921,23 @@ class LocalConfirmationWorkerV5:
                 )
                 if recovered and record is not None:
                     authority = record[1]
+                    if (
+                        authority.key.stage != "confirmation_evaluation"
+                        or authority.key.episode_ordinal is not None
+                        or authority.key.experiment_id != canonical_sha256_v5((inputs.attempt.sha256, role))
+                    ):
+                        raise ValueError("confirmation cleanup execution belongs to another policy slot")
                     self.leases.extend(
-                        self.executor.recover_lease(payload, round_index=self.owner.round_index)
+                        self.executor.recover_lease_from_authority(
+                            payload, authority=authority, round_index=self.owner.round_index
+                        )
                         for payload in authority.lease_payloads
                     )
+            except BaseException:
+                complete = False
+            # Workspace cleanup must still run if container authority recovery
+            # failed. These are separately owned deterministic resources.
+            try:
                 lease = self.driver.load_lease("workspace." + hashlib.sha256(self._token().encode()).hexdigest())
                 if lease is not None:
                     if lease not in self.workspace_leases:

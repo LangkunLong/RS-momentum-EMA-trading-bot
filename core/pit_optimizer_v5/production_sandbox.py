@@ -3809,11 +3809,39 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         if len(matches) != 1:
             raise ValueError("container recovery lease is absent or ambiguous")
         authority = matches[0]
+        return self.recover_lease_from_authority(payload, authority=authority, round_index=round_index)
+
+    def recover_lease_from_authority(
+        self,
+        payload: ResourceLeasePayloadV5,
+        *,
+        authority: CandidateExecutionAuthorityV5,
+        round_index: int,
+    ) -> OwnedLeaseV5:
+        """Recover from an authenticated execution edge without consulting discovery.
+
+        The stage owner authenticates the immutable authority artifact. This
+        boundary independently binds it to the executor's durable reservation.
+        It can issue only a cleanup capability; it never resumes evaluation.
+        """
+        if (
+            type(payload) is not ResourceLeasePayloadV5
+            or type(authority) is not CandidateExecutionAuthorityV5
+            or payload.resource_kind not in {"evaluator_process", "container"}
+            or type(round_index) is not int
+            or round_index != self._owner.round_index
+            or authority.campaign_id != self._owner.campaign_id
+            or authority.round_index != round_index
+            or authority.owner_token_sha256 != self._owner.owner_token_sha256
+            or payload not in authority.lease_payloads
+        ):
+            raise ValueError("container recovery execution authority is invalid")
         record = self._load_reservation(authority.command_sha256)
         roles = ("evaluator_process", "container")
         role_index = roles.index(payload.resource_kind)
         if (
             record is None
+            or record.executor_identity_sha256 != self.executor_identity_sha256
             or record.owner != self._owner
             or record.request_sha256 != authority.request_sha256
             or record.command_sha256 != authority.command_sha256

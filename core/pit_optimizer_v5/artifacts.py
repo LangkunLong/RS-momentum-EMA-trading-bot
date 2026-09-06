@@ -52,6 +52,8 @@ from core.pit_optimizer_v5.contracts import (
     CriticArtifactV5,
     CriticReviewV5,
     EpisodeEvaluationV5,
+    EvaluatorContractV5,
+    FinalizedDiscoveryCampaignV5,
     HypothesisV5,
     PanelEvaluationV5,
     ValidationResultV5,
@@ -1221,9 +1223,22 @@ class LocalArtifactRepositoryV5:
         *,
         checkpoint_ref: ArtifactRefV5,
         archive_ref: ArtifactRefV5,
-        final_round: int,
+        finalized_campaign_ref: ArtifactRefV5,
+        discovery_manifest_ref: ArtifactRefV5,
     ):
-        """Select from explicitly authenticated final discovery edges, without repair."""
+        """Reconstruct the whole explicitly finalized discovery projection, read-only."""
+        from core.pit_optimizer_v5.search import ArchiveRecordAuthorityV5, CandidateArchiveReducerV5
+
+        finalization = self.load_typed_artifact(finalized_campaign_ref, value_type=FinalizedDiscoveryCampaignV5)
+        manifest = self.load_typed_artifact(discovery_manifest_ref, value_type=CampaignManifestV5)
+        if (
+            finalization.discovery_manifest_ref != discovery_manifest_ref
+            or finalization.checkpoint_ref != checkpoint_ref
+            or finalization.archive_ref != archive_ref
+            or len(finalization.rounds) != manifest.search.max_feedback_rounds
+        ):
+            raise ArtifactSchemaFailureV5(finalized_campaign_ref)
+        final_round = len(finalization.rounds)
         checkpoint = _strict_json_object(self.authenticate(checkpoint_ref).content, checkpoint_ref)
         archive = _strict_json_object(self.authenticate(archive_ref).content, archive_ref)
         _exact_keys(
@@ -1250,7 +1265,46 @@ class LocalArtifactRepositoryV5:
         if canonical_json_bytes_v5(closed_checkpoint.to_primitive()) != self.authenticate(checkpoint_ref).content:
             raise ArtifactSchemaFailureV5(checkpoint_ref)
         records = self._verify_record_refs(references)
-        state = _decode_dataclass(SearchStateV5, archive["projection"])
+        closed_refs = tuple(
+            sorted(
+                (ref for item in finalization.rounds for ref in item.record_refs),
+                key=lambda item: (item.relative_path, item.sha256),
+            )
+        )
+        if references != closed_refs:
+            raise ArtifactSchemaFailureV5(finalized_campaign_ref)
+        self._verify_finalized_discovery_rounds(finalization, manifest, records)
+        source_authorities = []
+        for item in records:
+            if item.record.status not in {"evaluated", "zero_trade"}:
+                continue
+            policy = item.record.policy_revision
+            if policy is None:
+                raise ArtifactSchemaFailureV5(item.reference)
+            # Resolve the exact source edge already present in the immutable
+            # experiment. Never repair or consult mutable search-source indexes.
+            source_refs = tuple(
+                ref
+                for ref in item.record.artifact_refs
+                if ref.relative_path == f"adapter-state/policy-source/{policy.sha256}.json"
+            )
+            if len(source_refs) != 1:
+                raise ArtifactSchemaFailureV5(item.reference)
+            source = self.load_typed_artifact(source_refs[0], value_type=SourceBundleV5)
+            source_authorities.append(
+                ArchiveRecordAuthorityV5(item.record.experiment_id, item.reference, source, source_refs[0])
+            )
+        reducer = CandidateArchiveReducerV5(
+            self.load_typed_artifact(manifest.panel_plan_ref, value_type=CampaignPanelPlanV5),
+            self.load_typed_artifact(manifest.evaluator_contract_ref, value_type=EvaluatorContractV5),
+            manifest.target,
+            tuple(sorted(source_authorities, key=lambda item: item.experiment_id)),
+            manifest.search.archive_capacity,
+        )
+        state = reduce_experiment_journal_v5(tuple(item.record for item in records), reducer)
+        expected_archive = ArchiveSnapshotV5(final_round, references, reducer.to_primitive(state))
+        if canonical_json_bytes_v5(expected_archive.to_primitive()) != self.authenticate(archive_ref).content:
+            raise ArtifactSchemaFailureV5(archive_ref)
         if (
             not state.archive.entries
             or state.next_round_index != final_round + 1
@@ -1279,6 +1333,70 @@ class LocalArtifactRepositoryV5:
         ):
             raise ArtifactSchemaFailureV5(archive_ref)
         return champion, record
+
+    def _verify_finalized_discovery_rounds(
+        self,
+        finalization: FinalizedDiscoveryCampaignV5,
+        manifest: CampaignManifestV5,
+        records: tuple[StoredExperimentRecordV5, ...],
+    ) -> None:
+        """Bind complete round chains, completed role slots, candidates, and cleanup."""
+        for closed_round in finalization.rounds:
+            events, payloads = [], []
+            for sequence, reference in enumerate(closed_round.event_refs):
+                expected_path = f"events/{manifest.campaign_id}/{closed_round.round_index:04d}/{sequence:06d}.json"
+                if reference.relative_path != expected_path:
+                    raise ArtifactSchemaFailureV5(reference)
+                raw = self.authenticate(reference).content
+                event = _decode_round_event(_strict_json_object(raw, reference))
+                if event.sha256 != reference.sha256 or canonical_json_bytes_v5(event.to_primitive()) != raw:
+                    raise ArtifactSchemaFailureV5(reference)
+                if event.campaign_id != manifest.campaign_id or event.round_index != closed_round.round_index:
+                    raise ArtifactSchemaFailureV5(reference)
+                events.append(event)
+                payloads.append(self.load_round_payload(event.payload_ref, expected_kind=event.event_kind))
+            fold_round_events_v5(events=tuple(events), payloads=tuple(payloads))
+            current = tuple(item for item in records if item.record.round_index == closed_round.round_index)
+            if (
+                tuple(item.reference for item in current) != closed_round.record_refs
+                or not payloads
+                or type(payloads[-1]) is not CleanupResultPayloadV5
+                or not payloads[-1].cleanup_complete
+                or any(type(item) is RoundOutcomePayloadV5 for item in payloads)
+                or {item.experiment_id for item in events if item.event_kind == "rendered_variant"}
+                != {item.record.experiment_id for item in current}
+            ):
+                raise ArtifactSchemaFailureV5(closed_round.event_refs[-1])
+            completions = tuple(item for item in payloads if type(item) is RoleCompletionPayloadV5)
+            if tuple(item.role for item in completions) != ("investigator", "author", "critic"):
+                raise ArtifactSchemaFailureV5(closed_round.event_refs[-1])
+            packages = tuple(self.load_role_invocation(completion) for completion in completions)
+            for completion, package in zip(completions, packages, strict=True):
+                if (
+                    completion.outcome != "accepted"
+                    or not package.accepted
+                    or package.call.campaign_id != manifest.campaign_id
+                    or package.call.round_index != closed_round.round_index
+                ):
+                    raise ArtifactSchemaFailureV5(completion.request_ref)
+            intents = tuple(item for item in payloads if type(item) is RoundIntentPayloadV5)
+            if len(intents) != 1 or any(
+                item.record.parent_revision_sha256 != intents[0].parent_revision_sha256
+                or item.record.parent_semantic_fingerprint_sha256 != intents[0].parent_semantic_fingerprint_sha256
+                or item.record.hypothesis != intents[0].hypothesis
+                or item.record.experiment_identity.discovery_plan_sha256 != intents[0].discovery_plan_sha256
+                or item.record.template != packages[1].artifact
+                for item in current
+            ):
+                raise ArtifactSchemaFailureV5(closed_round.event_refs[-1])
+            critic = packages[-1].artifact
+            if type(critic) is not CriticArtifactV5 or any(
+                item.record.critic_artifact_ref is None
+                or item.record.critic_artifact_ref.sha256 != critic.sha256
+                for item in current
+                if is_testable_experiment_status_v5(item.record.status)
+            ):
+                raise ArtifactSchemaFailureV5(completions[-1].artifact_ref)
 
     def _create_only_with_status(
         self,
