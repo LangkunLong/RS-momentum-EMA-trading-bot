@@ -1190,6 +1190,96 @@ class LocalArtifactRepositoryV5:
             raise ValueError("raw artifact authentication requires a V5 reference")
         return self._authenticate_raw_campaign_edge(reference)
 
+    def read_stage_ledger(self, relative_path: str) -> bytes:
+        """Read only an explicitly selected canonical V5 stage ledger."""
+        if relative_path not in {"panels/confirmation-retirement.json", "panels/qualification-retirement.json"}:
+            raise ValueError("stage ledger path is not canonical")
+        return self._read_relative(relative_path)
+
+    def load_confirmation_record(self, relative_path: str, *, value_type: type[T]) -> tuple[ArtifactRefV5, T] | None:
+        """Recover an exact attempt-owned immutable record, without path searches."""
+        parts = _safe_relative_path(relative_path)
+        if len(parts) != 3 or parts[0] != "confirmation" or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None:
+            raise ValueError("confirmation record path is not attempt-owned")
+        try:
+            raw = self._read_relative(relative_path)
+        except ArtifactMissingV5:
+            return None
+        reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
+        return reference, self.load_typed_artifact(reference, value_type=value_type)
+
+    def append_stage_ledger(self, relative_path: str, *, prior: bytes, event: bytes) -> None:
+        """Atomically publish a byte-preserving append while the stage lock is held."""
+        if not prior.endswith(b"\n") or not event.endswith(b"\n") or self.read_stage_ledger(relative_path) != prior:
+            raise ValueError("stage ledger changed before append")
+        parts = _safe_relative_path(relative_path)
+        with self._directory(tuple(parts[:-1]), create=False) as directory:
+            _atomic_replace_in_directory(directory, parts[-1], prior + event)
+
+    def load_confirmation_champion(
+        self,
+        *,
+        checkpoint_ref: ArtifactRefV5,
+        archive_ref: ArtifactRefV5,
+        final_round: int,
+    ):
+        """Select from explicitly authenticated final discovery edges, without repair."""
+        checkpoint = _strict_json_object(self.authenticate(checkpoint_ref).content, checkpoint_ref)
+        archive = _strict_json_object(self.authenticate(archive_ref).content, archive_ref)
+        _exact_keys(
+            checkpoint,
+            {"schema_version", "artifact_type", "generation", "archive_sha256", "record_refs"},
+            checkpoint_ref,
+        )
+        _exact_keys(
+            archive, {"schema_version", "artifact_type", "generation", "record_refs", "projection"}, archive_ref
+        )
+        if (
+            checkpoint["schema_version"] != 5
+            or checkpoint["artifact_type"] != "checkpoint"
+            or archive["schema_version"] != 5
+            or archive["artifact_type"] != "archive"
+            or checkpoint["archive_sha256"] != archive_ref.sha256
+            or checkpoint["generation"] != final_round
+            or archive["generation"] != final_round
+            or checkpoint["record_refs"] != archive["record_refs"]
+        ):
+            raise ArtifactSchemaFailureV5(checkpoint_ref)
+        references = tuple(_decode_dataclass(ArtifactRefV5, item) for item in checkpoint["record_refs"])
+        closed_checkpoint = RepositoryCheckpointV5(final_round, archive_ref.sha256, references)
+        if canonical_json_bytes_v5(closed_checkpoint.to_primitive()) != self.authenticate(checkpoint_ref).content:
+            raise ArtifactSchemaFailureV5(checkpoint_ref)
+        records = self._verify_record_refs(references)
+        state = _decode_dataclass(SearchStateV5, archive["projection"])
+        if (
+            not state.archive.entries
+            or state.next_round_index != final_round + 1
+            or not records
+            or max(item.record.round_index for item in records) != final_round
+        ):
+            raise ArtifactSchemaFailureV5(archive_ref)
+        champion = state.archive.entries[0]
+        matches = tuple(item.record for item in records if item.reference == champion.experiment_record_ref)
+        if len(matches) != 1:
+            raise ArtifactSchemaFailureV5(archive_ref)
+        record = matches[0]
+        if (
+            record.status != "evaluated"
+            or record.policy_revision != champion.policy_revision
+            or record.campaign_evidence != champion.campaign
+            or champion.source_bundle_ref not in record.artifact_refs
+            or any(entry.campaign_cagr_pct > champion.campaign_cagr_pct for entry in state.archive.entries)
+            or any(
+                item.record.status == "evaluated"
+                and item.record.campaign_evidence is not None
+                and item.record.campaign_evidence.closed_trades > 0
+                and item.record.campaign_evidence.campaign_cagr_pct > champion.campaign_cagr_pct
+                for item in records
+            )
+        ):
+            raise ArtifactSchemaFailureV5(archive_ref)
+        return champion, record
+
     def _create_only_with_status(
         self,
         relative_path: str,

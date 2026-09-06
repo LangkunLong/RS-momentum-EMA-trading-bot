@@ -107,6 +107,7 @@ from core.pit_optimizer_v5.selection import QuickScreenCandidateV5
 
 
 RuntimeStageV5 = Literal[
+    "confirmation_evaluation",
     "recovery",
     "parent_selection",
     "investigator",
@@ -158,6 +159,7 @@ CandidateRuntimeStatusV5 = Literal[
 
 _RUNTIME_STAGES = frozenset(
     {
+        "confirmation_evaluation",
         "recovery",
         "parent_selection",
         "investigator",

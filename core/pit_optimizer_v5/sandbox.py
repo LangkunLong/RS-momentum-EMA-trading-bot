@@ -288,7 +288,7 @@ class DockerPanelRequestV5:
         ):
             raise ValueError("Docker panel request differs from campaign authority")
         if (
-            self.execution_key.stage in {"semantic_probe", "quick_evaluation"}
+            self.execution_key.stage in {"semantic_probe", "quick_evaluation", "confirmation_evaluation"}
             and self.panel.episode_ordinal is not None
         ) or (
             self.execution_key.stage == "discovery_evaluation"
@@ -304,6 +304,10 @@ class DockerPanelRequestV5:
         )
         if self.scenario_ids not in permitted_scenarios:
             raise ValueError("Docker panel scenarios are outside the quick/full closed scopes")
+        if self.execution_key.stage == "confirmation_evaluation" and (
+            self.panel.purpose != "qualification" or self.scenario_ids != declared
+        ):
+            raise ValueError("confirmation requires its owned held-out panel and full friction grid")
         semantic_probe = self.execution_key.stage == "semantic_probe"
         if (
             type(self.source_mount) is not SandboxMountHandleV5
@@ -1094,6 +1098,15 @@ class DockerPanelEvaluatorV5:
             cap = request.manifest.resources.quick_timeout_seconds
             if request.execution_key.stage != "quick_evaluation" or request.panel.episode_ordinal is not None or request.scenario_ids != (
                 request.evaluator_contract.selection_scenario_id,
+            ):
+                return None
+        elif deadline.stage == "confirmation_evaluation":
+            cap = request.manifest.resources.discovery_episode_timeout_seconds
+            if (
+                request.execution_key.stage != "confirmation_evaluation"
+                or request.panel.episode_ordinal is not None
+                or request.panel.purpose != "qualification"
+                or request.scenario_ids != tuple(item.scenario_id for item in request.evaluator_contract.friction_grid)
             ):
                 return None
         elif deadline.stage == "discovery_evaluation":

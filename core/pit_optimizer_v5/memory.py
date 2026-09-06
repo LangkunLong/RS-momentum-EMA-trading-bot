@@ -828,6 +828,7 @@ CandidateExecutionStageV5 = Literal[
     "semantic_probe",
     "quick_evaluation",
     "discovery_evaluation",
+    "confirmation_evaluation",
 ]
 
 
@@ -839,7 +840,7 @@ class CandidateExecutionKeyV5:
 
     def __post_init__(self) -> None:
         _digest(self.experiment_id, "candidate execution experiment")
-        if self.stage in {"semantic_probe", "quick_evaluation"}:
+        if self.stage in {"semantic_probe", "quick_evaluation", "confirmation_evaluation"}:
             if self.episode_ordinal is not None:
                 raise ValueError("non-episode execution cannot carry an episode ordinal")
         elif self.stage == "discovery_evaluation":

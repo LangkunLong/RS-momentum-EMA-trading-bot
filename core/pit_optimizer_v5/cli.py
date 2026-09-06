@@ -100,6 +100,7 @@ V5CommandName = Literal["run", "run-fixture", "resume", "verify-run", "summarize
 _COMMANDS = frozenset({"run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"})
 _PANEL_COMMANDS = frozenset({"init-stage-ledgers", "build-panels", "verify-panels"})
 _MANIFEST_COMMANDS = frozenset({"build-manifest", "verify-manifest", "render-command"})
+_CONFIRMATION_COMMANDS = frozenset({"build-confirmation-attempt", "confirm"})
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _FAILURE_REASONS = frozenset(
     {
@@ -1106,6 +1107,26 @@ def build_parser_v5() -> argparse.ArgumentParser:
         command.add_argument("--artifact-root", required=True)
         command.add_argument("--manifest-path", required=True)
         command.add_argument("--manifest-sha256", required=True)
+    confirmation = commands.add_parser("build-confirmation-attempt", allow_abbrev=False)
+    confirmation.add_argument("--artifact-root", required=True)
+    confirmation.add_argument("--attempt-id", required=True)
+    confirmation.add_argument("--output-path", required=True)
+    confirmation.add_argument("--confirmation-ledger-path", required=True)
+    for prefix in (
+        "discovery-manifest",
+        "discovery-checkpoint",
+        "discovery-archive",
+        "confirmation-plan",
+        "scenario-grid",
+        "preopen-snapshot",
+        "execution-adapter",
+    ):
+        confirmation.add_argument(f"--{prefix}-path", required=True)
+        confirmation.add_argument(f"--{prefix}-sha256", required=True)
+    confirm = commands.add_parser("confirm", allow_abbrev=False)
+    confirm.add_argument("--artifact-root", required=True)
+    confirm.add_argument("--attempt-path", required=True)
+    confirm.add_argument("--attempt-sha256", required=True)
     return parser
 
 
@@ -1387,6 +1408,61 @@ def dispatch_manifest_cli_v5(
         return 2
 
 
+def dispatch_confirmation_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None] = print) -> int:
+    """Only explicit authenticated references can select or open confirmation."""
+    from core.pit_optimizer_v5.confirmation import ConfirmationCleanupV5, build_confirmation_attempt, run_confirmation
+    from core.pit_optimizer_v5.contracts import ConfirmationOutcomeV5, RetirementLedgerLocatorV5
+
+    try:
+        namespace = build_parser_v5().parse_args(argv)
+        root = Path(namespace.artifact_root)
+        if not root.is_absolute() or not root.is_dir():
+            raise ValueError("confirmation requires an existing absolute artifact root")
+        repository = LocalArtifactRepositoryV5(root)
+        if namespace.command == "build-confirmation-attempt":
+            reference = build_confirmation_attempt(
+                repository=repository,
+                discovery_manifest_ref=_manifest_ref_argument_v5(namespace, "discovery-manifest"),
+                discovery_checkpoint_ref=_manifest_ref_argument_v5(namespace, "discovery-checkpoint"),
+                discovery_archive_ref=_manifest_ref_argument_v5(namespace, "discovery-archive"),
+                confirmation_plan_ref=_manifest_ref_argument_v5(namespace, "confirmation-plan"),
+                scenario_grid_ref=_manifest_ref_argument_v5(namespace, "scenario-grid"),
+                retirement_ledger=RetirementLedgerLocatorV5(
+                    namespace.confirmation_ledger_path, _manifest_ref_argument_v5(namespace, "preopen-snapshot")
+                ),
+                execution_adapter_ref=_manifest_ref_argument_v5(namespace, "execution-adapter"),
+                attempt_id=namespace.attempt_id,
+                output_path=namespace.output_path,
+            )
+            payload = {"schema_version": 5, "status": "sealed", "attempt_sha256": reference.sha256, "provider_calls": 0}
+        else:
+            reference = run_confirmation(
+                repository=repository, attempt_ref=_manifest_ref_argument_v5(namespace, "attempt")
+            )
+            outcome = repository.load_typed_artifact(reference, value_type=ConfirmationOutcomeV5)
+            cleanup = repository.load_typed_artifact(outcome.cleanup_evidence_ref, value_type=ConfirmationCleanupV5)
+            payload = {
+                "schema_version": 5,
+                "status": outcome.status,
+                "outcome_sha256": reference.sha256,
+                "eligible_to_request_qualification": outcome.eligible_to_request_qualification,
+                "provider_calls": 0,
+                "source_unchanged": cleanup.source_unchanged,
+                "cleanup_complete": cleanup.cleanup_complete,
+            }
+        exit_code = 0 if payload["status"] in {"sealed", "completed"} else 1
+    except V5CliFailure as exc:
+        payload, exit_code = {"schema_version": 5, "status": "rejected", "reason": exc.reason}, exc.exit_code
+    except SystemExit as exc:
+        if exc.code == 0:
+            raise
+        payload, exit_code = {"schema_version": 5, "status": "rejected", "reason": "invalid_request"}, 2
+    except (ValueError, TypeError, OSError, RuntimeError):
+        payload, exit_code = {"schema_version": 5, "status": "rejected", "reason": "confirmation_authority_invalid"}, 2
+    emit("PIT_OPTIMIZER_V5_CONFIRMATION=" + canonical_json_bytes_v5(payload).decode("utf-8"))
+    return exit_code
+
+
 def dispatch_v5_cli(
     argv: Sequence[str],
     *,
@@ -1398,6 +1474,8 @@ def dispatch_v5_cli(
         return dispatch_panel_cli_v5(argv, emit=emit)
     if argv and argv[0] in _MANIFEST_COMMANDS:
         return dispatch_manifest_cli_v5(argv, emit=emit)
+    if argv and argv[0] in _CONFIRMATION_COMMANDS:
+        return dispatch_confirmation_cli_v5(argv, emit=emit)
     command: V5CommandName = (
         argv[0]  # type: ignore[assignment]
         if argv and argv[0] in _COMMANDS
@@ -1452,5 +1530,6 @@ __all__ = [
     "dispatch_v5_cli",
     "dispatch_manifest_cli_v5",
     "dispatch_panel_cli_v5",
+    "dispatch_confirmation_cli_v5",
     "parse_v5_args",
 ]
