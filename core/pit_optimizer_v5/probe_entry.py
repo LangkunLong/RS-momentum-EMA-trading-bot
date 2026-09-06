@@ -324,6 +324,12 @@ def main(argv: tuple[str, ...] | None = None) -> int:
             raise ValueError("trusted probe runtime authority differs")
         if arguments.suite_id != PROBE_SUITE_ID_V5:
             raise ValueError("probe suite is invalid")
+        from .image_manifest import verify_installed_evaluator_source_v5
+
+        verify_installed_evaluator_source_v5(
+            source_root=Path(__file__).resolve().parents[2],
+            expected_sha256=probe_runtime_sha256,
+        )
         source = read_policy_source_v5()
         revision = derive_policy_revision_identity_v5(
             source_bundle=source,

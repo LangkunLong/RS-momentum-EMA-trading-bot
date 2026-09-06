@@ -13,6 +13,7 @@ from core.pit_optimizer_evaluation import EvaluationPanelSpec
 
 from .candidate_ir import PolicyRevisionIdentityV5
 from .contracts import (
+    ArtifactRefV5,
     EpisodePlanV5,
     EvaluatorContractV5,
     PanelEvaluationV5,
@@ -55,6 +56,7 @@ class PanelExecutionRequestV5:
     policy_method_timeout_seconds: int
     worker_startup_timeout_seconds: int
     output_limit_bytes: int
+    baseline_capture_inputs_ref: ArtifactRefV5 | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -96,6 +98,14 @@ class PanelExecutionRequestV5:
             if discovery
             else None
         )
+        if self.baseline_capture_inputs_ref is not None:
+            if (
+                type(self.baseline_capture_inputs_ref) is not ArtifactRefV5
+                or not (quick or discovery)
+                or self.policy_revision.sha256 != self.evaluator_contract.baseline_policy_revision_sha256
+            ):
+                raise ValueError("baseline panel execution authority is invalid")
+            expected_scenarios = declared_scenarios
         if type(self.scenario_ids) is not tuple or self.scenario_ids != expected_scenarios:
             raise ValueError("panel execution stage or scenario scope is invalid")
         if (

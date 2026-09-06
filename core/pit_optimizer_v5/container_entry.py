@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+from types import SimpleNamespace
 
 from core.pit_data import PITDataBundle
 from core.strategy_policy import POLICY_INTERFACE_VERSION_V3
@@ -206,6 +207,12 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         raw_input = _read_input()
         request = decode_panel_execution_request_v5(raw_input)
         _validate_cli_authority(arguments, raw_input=raw_input, request=request)
+        from .image_manifest import verify_installed_evaluator_source_v5
+
+        verify_installed_evaluator_source_v5(
+            source_root=Path(__file__).resolve().parents[2],
+            expected_sha256=request.sandbox_profile.runtime_source_sha256,
+        )
         source = read_policy_source_v5()
         policy_revision = derive_policy_revision_identity_v5(
             source_bundle=source,
@@ -223,10 +230,17 @@ def main(argv: tuple[str, ...] | None = None) -> int:
             expected_sha256=request.evaluator_contract.pit_bundle_sha256,
             prices_provenance=_PROVENANCE_PATH,
         ) as bundle:
+            if request.baseline_capture_inputs_ref is not None and bundle.metadata.get("schema_version") != "3":
+                raise ValueError("baseline requires a schema-V3 three-universe bundle")
             evaluator = PitPanelEvaluatorV5(
                 contract=request.evaluator_contract,
                 sandbox_profile=request.sandbox_profile,
-                resource_manifest=request.sandbox_profile,
+                resource_manifest=SimpleNamespace(
+                    evaluation_cpu_limit=request.sandbox_profile.cpu_limit,
+                    evaluation_memory_mib=request.sandbox_profile.memory_limit_mib,
+                    evaluation_output_limit_bytes=request.sandbox_profile.output_limit_bytes,
+                    evaluation_pid_limit=request.sandbox_profile.pid_limit,
+                ),
                 execution_profile=request.execution_profile,
                 pit_bundle=bundle,
                 prices_provenance=_PROVENANCE_PATH,

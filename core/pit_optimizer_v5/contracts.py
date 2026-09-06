@@ -407,6 +407,37 @@ class ArtifactRefV5:
         return {"relative_path": self.relative_path, "sha256": self.sha256}
 
 
+@dataclass(frozen=True, slots=True)
+class BaselineAuthorityV5:
+    """Complete baseline truth; the separate parent projection keeps its V5 identity."""
+
+    schema_version: Literal[5]
+    evaluator_contract_ref: ArtifactRefV5
+    execution_profile_ref: ArtifactRefV5
+    sandbox_profile_ref: ArtifactRefV5
+    panel_plan_ref: ArtifactRefV5
+    baseline_policy_revision_ref: ArtifactRefV5
+    mechanics_evidence_ref: ArtifactRefV5
+    quick_evidence_ref: ArtifactRefV5
+    discovery_evidence_ref: ArtifactRefV5
+    deterministic_repeat_ref: ArtifactRefV5
+    capture_inputs_ref: ArtifactRefV5
+    parent_authority_ref: ArtifactRefV5
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("baseline authority schema must be V5")
+        references = tuple(getattr(self, item.name) for item in fields(self) if item.name != "schema_version")
+        if any(type(item) is not ArtifactRefV5 for item in references):
+            raise ValueError("baseline authority requires every authenticated edge")
+        if len({item.relative_path for item in references}) != len(references):
+            raise ValueError("baseline authority dependency paths must be distinct")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self)
+
+
 ArtifactGraphFailureCodeV5 = Literal["missing", "relocated", "cycle", "digest_mismatch"]
 
 
@@ -1964,6 +1995,7 @@ __all__ = [
     "ArtifactRefV5",
     "AuthenticatedArtifactV5",
     "AuthenticatedRawArtifactV5",
+    "BaselineAuthorityV5",
     "CampaignEvidenceV5",
     "CampaignManifestV5",
     "CampaignPanelPlanV5",

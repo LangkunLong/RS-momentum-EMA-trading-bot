@@ -102,6 +102,14 @@ _PANEL_COMMANDS = frozenset({"init-stage-ledgers", "build-panels", "verify-panel
 _MANIFEST_COMMANDS = frozenset({"build-manifest", "verify-manifest", "render-command"})
 _CONFIRMATION_COMMANDS = frozenset({"build-confirmation-attempt", "confirm"})
 _QUALIFICATION_COMMANDS = frozenset({"build-qualification-attempt", "qualify"})
+_BASELINE_COMMANDS = frozenset(
+    {
+        "write-execution-profile",
+        "build-sandbox-profile",
+        "capture-baseline",
+        "verify-baseline",
+    }
+)
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _FAILURE_REASONS = frozenset(
     {
@@ -1149,6 +1157,34 @@ def build_parser_v5() -> argparse.ArgumentParser:
     readiness.add_argument("--output-path", required=True)
     readiness.add_argument("--trusted-git-executable", required=True)
     readiness.add_argument("--trusted-git-sha256", required=True)
+    for name in sorted(_BASELINE_COMMANDS):
+        command = commands.add_parser(name, allow_abbrev=False)
+        command.add_argument("--artifact-root", required=True)
+        if name == "verify-baseline":
+            command.add_argument("--authority", required=True, help="Canonical V5 artifact-relative authority path")
+            command.add_argument("--authority-sha256", required=True)
+        else:
+            command.add_argument("--output-path", required=True)
+        if name == "capture-baseline":
+            command.add_argument("--capture-inputs-path", required=True)
+            command.add_argument("--capture-inputs-sha256", required=True)
+            for option in (
+                "source-root",
+                "scratch-root",
+                "trusted-git-executable",
+                "trusted-git-sha256",
+                "docker-executable",
+                "docker-sha256",
+            ):
+                command.add_argument(f"--{option}", required=True)
+        if name == "build-sandbox-profile":
+            command.add_argument("--image-name", required=True)
+            command.add_argument(
+                "--image-digest", required=True, help="Explicit immutable sha256 image digest; no Docker action"
+            )
+            for prefix in ("resources", "evaluator-source"):
+                command.add_argument(f"--{prefix}-path", required=True)
+                command.add_argument(f"--{prefix}-sha256", required=True)
     return parser
 
 
@@ -1586,6 +1622,82 @@ def dispatch_readiness_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None
     return exit_code
 
 
+def dispatch_baseline_cli_v5(
+    argv: Sequence[str],
+    *,
+    emit: Callable[[str], None] = print,
+    repository_factory=LocalArtifactRepositoryV5,
+    worker_factory=None,
+) -> int:
+    """Explicit V5 roots and digest references; verification owns no runtime."""
+    from core.pit_optimizer_v5.baseline import (
+        BaselineHostAuthorityV5,
+        LocalBaselineCaptureFactoryV5,
+        build_sandbox_profile_v5,
+        capture_baseline_v5,
+        verify_baseline_v5,
+        write_execution_profile_v5,
+    )
+
+    try:
+        args = build_parser_v5().parse_args(tuple(argv))
+        if args.command not in _BASELINE_COMMANDS:
+            raise ValueError("invalid baseline command")
+        root = Path(args.artifact_root)
+        if not root.is_absolute() or ".." in root.parts or root.parts[-2:] != (".artifacts", "pit-optimizer-v5"):
+            raise ValueError("baseline requires the explicit canonical V5 artifact root")
+        repository = repository_factory(root)
+        if args.command == "verify-baseline":
+            payload = verify_baseline_v5(
+                repository=repository,
+                authority_ref=ArtifactRefV5(args.authority, args.authority_sha256),
+            )
+        else:
+            ArtifactRefV5(args.output_path, "0" * 64)
+            if args.command == "capture-baseline":
+                from contextlib import nullcontext
+
+                host = BaselineHostAuthorityV5(
+                    args.source_root,
+                    args.scratch_root,
+                    args.trusted_git_executable,
+                    args.trusted_git_sha256,
+                    args.docker_executable,
+                    args.docker_sha256,
+                )
+                factory_context = (
+                    LocalBaselineCaptureFactoryV5(repository=repository, host=host)
+                    if worker_factory is None
+                    else nullcontext(worker_factory)
+                )
+                with factory_context as selected_factory:
+                    ref = capture_baseline_v5(
+                        repository=repository,
+                        inputs_ref=ArtifactRefV5(args.capture_inputs_path, args.capture_inputs_sha256),
+                        output_path=args.output_path,
+                        worker_factory=selected_factory,
+                    )
+            elif args.command == "write-execution-profile":
+                ref = write_execution_profile_v5(repository=repository, output_path=args.output_path)
+            else:
+                ref = build_sandbox_profile_v5(
+                    repository=repository,
+                    resources_ref=ArtifactRefV5(args.resources_path, args.resources_sha256),
+                    evaluator_source_ref=ArtifactRefV5(args.evaluator_source_path, args.evaluator_source_sha256),
+                    image_name=args.image_name,
+                    image_digest=args.image_digest,
+                    output_path=args.output_path,
+                )
+            payload = {"schema_version": 5, "status": "created", "artifact_ref": ref}
+        exit_code = 0
+    except Exception:
+        # Includes bounded process timeouts and malformed graph metadata; do
+        # not disclose source paths or subprocess arguments in CLI errors.
+        payload, exit_code = {"schema_version": 5, "status": "blocked", "blocker": "invalid_request"}, 2
+    emit("PIT_OPTIMIZER_V5_BASELINE=" + canonical_json_bytes_v5(payload).decode("utf-8"))
+    return exit_code
+
+
 def dispatch_v5_cli(
     argv: Sequence[str],
     *,
@@ -1593,6 +1705,8 @@ def dispatch_v5_cli(
     emit: Callable[[str], None] = print,
 ) -> int:
     """Parse and dispatch one command; dependency construction stays outside parsing."""
+    if argv and argv[0] in _BASELINE_COMMANDS:
+        return dispatch_baseline_cli_v5(argv, emit=emit)
     if argv and argv[0] in _PANEL_COMMANDS:
         return dispatch_panel_cli_v5(argv, emit=emit)
     if argv and argv[0] in _MANIFEST_COMMANDS:

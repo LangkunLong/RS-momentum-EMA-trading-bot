@@ -1446,6 +1446,32 @@ class LocalArtifactRepositoryV5:
             raise ValueError("typed artifact value must be a dataclass instance")
         return self._create_only(relative_path, canonical_primitive_v5(value))
 
+    def require_baseline_output_absent(self, relative_path: str) -> None:
+        """Preflight an exact output; final exclusive creation also closes races."""
+        parts = _safe_relative_path(relative_path)
+        if parts[0] != "evaluator" or len(parts) < 2:
+            raise ValueError("baseline outputs must belong to the V5 evaluator directory")
+        try:
+            with self._directory(tuple(parts[:-1]), create=False) as directory:
+                if directory.entry_exists(parts[-1]):
+                    raise ArtifactExistsV5()
+        except ArtifactMissingV5:
+            return
+
+    def create_baseline_artifact(self, relative_path: str, value: object) -> ArtifactRefV5:
+        """Strict create-only baseline/profile output, including identical retries."""
+        parts = _safe_relative_path(relative_path)
+        if parts[0] != "evaluator" or len(parts) < 2:
+            raise ValueError("baseline outputs must belong to the V5 evaluator directory")
+        raw = canonical_json_bytes_v5(value)
+        reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
+        try:
+            with self._directory(tuple(parts[:-1]), create=True) as directory:
+                _write_create_only_in_directory(directory, parts[-1], raw)
+        except FileExistsError:
+            raise ArtifactExistsV5(reference) from None
+        return reference
+
     def create_readiness_record(self, relative_path: str, value: object) -> ArtifactRefV5:
         """Strictly create one readiness record in an existing output directory.
 
