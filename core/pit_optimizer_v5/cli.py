@@ -1147,6 +1147,8 @@ def build_parser_v5() -> argparse.ArgumentParser:
     readiness.add_argument("--qualification-outcome-path", required=True)
     readiness.add_argument("--qualification-outcome-sha256", required=True)
     readiness.add_argument("--output-path", required=True)
+    readiness.add_argument("--trusted-git-executable", required=True)
+    readiness.add_argument("--trusted-git-sha256", required=True)
     return parser
 
 
@@ -1550,7 +1552,7 @@ def dispatch_qualification_cli_v5(argv: Sequence[str], *, emit: Callable[[str], 
 
 def dispatch_readiness_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None] = print) -> int:
     """Read-only qualification authentication followed by a non-executable projection."""
-    from core.pit_optimizer_v5.readiness import ReplayReadinessFailureV5, full_replay_readiness
+    from core.pit_optimizer_v5.readiness import ReadinessGitAuthorityV5, ReplayReadinessFailureV5, full_replay_readiness
 
     try:
         namespace = build_parser_v5().parse_args(argv)
@@ -1564,6 +1566,7 @@ def dispatch_readiness_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None
             repository=repository,
             qualification_outcome_ref=_manifest_ref_argument_v5(namespace, "qualification-outcome"),
             output_path=namespace.output_path,
+            git_authority=ReadinessGitAuthorityV5(namespace.trusted_git_executable, namespace.trusted_git_sha256),
         )
         payload = {
             "schema_version": 5,
