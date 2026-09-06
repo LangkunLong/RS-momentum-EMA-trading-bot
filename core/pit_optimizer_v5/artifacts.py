@@ -1446,6 +1446,26 @@ class LocalArtifactRepositoryV5:
             raise ValueError("typed artifact value must be a dataclass instance")
         return self._create_only(relative_path, canonical_primitive_v5(value))
 
+    def create_readiness_record(self, relative_path: str, value: object) -> ArtifactRefV5:
+        """Strictly create one readiness record in an existing output directory.
+
+        Unlike retryable stage terminal persistence, an existing readiness record
+        is always a blocker, including identical bytes. No parent is created.
+        """
+        from core.pit_optimizer_v5.readiness import FullReplayReadinessV5
+
+        if type(value) is not FullReplayReadinessV5:
+            raise ValueError("readiness requires its closed content-free contract")
+        parts = _safe_relative_path(relative_path)
+        raw = canonical_json_bytes_v5(value)
+        reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
+        try:
+            with self._directory(tuple(parts[:-1]), create=False) as directory:
+                _write_create_only_in_directory(directory, parts[-1], raw)
+        except FileExistsError:
+            raise ArtifactExistsV5(reference) from None
+        return reference
+
     def create_evaluation_panel_spec(
         self,
         relative_path: str,

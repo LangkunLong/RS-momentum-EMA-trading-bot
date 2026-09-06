@@ -1142,6 +1142,11 @@ def build_parser_v5() -> argparse.ArgumentParser:
     qualify.add_argument("--artifact-root", required=True)
     qualify.add_argument("--attempt-path", required=True)
     qualify.add_argument("--attempt-sha256", required=True)
+    readiness = commands.add_parser("full-replay-readiness", allow_abbrev=False)
+    readiness.add_argument("--artifact-root", required=True)
+    readiness.add_argument("--qualification-outcome-path", required=True)
+    readiness.add_argument("--qualification-outcome-sha256", required=True)
+    readiness.add_argument("--output-path", required=True)
     return parser
 
 
@@ -1543,6 +1548,41 @@ def dispatch_qualification_cli_v5(argv: Sequence[str], *, emit: Callable[[str], 
     return exit_code
 
 
+def dispatch_readiness_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None] = print) -> int:
+    """Read-only qualification authentication followed by a non-executable projection."""
+    from core.pit_optimizer_v5.readiness import ReplayReadinessFailureV5, full_replay_readiness
+
+    try:
+        namespace = build_parser_v5().parse_args(argv)
+        if namespace.command != "full-replay-readiness":
+            raise V5CliFailure("invalid_request")
+        root = Path(namespace.artifact_root)
+        if not root.is_absolute() or not root.is_dir():
+            raise V5CliFailure("invalid_request")
+        repository = LocalArtifactRepositoryV5(root)
+        reference = full_replay_readiness(
+            repository=repository,
+            qualification_outcome_ref=_manifest_ref_argument_v5(namespace, "qualification-outcome"),
+            output_path=namespace.output_path,
+        )
+        payload = {
+            "schema_version": 5,
+            "status": "ready",
+            "readiness_sha256": reference.sha256,
+            "projection": "local_full_replay_requires_separate_explicit_decision",
+            "executable": False,
+            "replay_started": False,
+            "provider_calls": 0,
+        }
+        exit_code = 0
+    except ReplayReadinessFailureV5 as exc:
+        payload, exit_code = {"schema_version": 5, "status": "blocked", "blocker": exc.code}, 2
+    except (V5CliFailure, ValueError, TypeError, OSError, RuntimeError):
+        payload, exit_code = {"schema_version": 5, "status": "blocked", "blocker": "invalid_request"}, 2
+    emit("PIT_OPTIMIZER_V5_READINESS=" + canonical_json_bytes_v5(payload).decode("utf-8"))
+    return exit_code
+
+
 def dispatch_v5_cli(
     argv: Sequence[str],
     *,
@@ -1558,6 +1598,8 @@ def dispatch_v5_cli(
         return dispatch_confirmation_cli_v5(argv, emit=emit)
     if argv and argv[0] in _QUALIFICATION_COMMANDS:
         return dispatch_qualification_cli_v5(argv, emit=emit)
+    if argv and argv[0] == "full-replay-readiness":
+        return dispatch_readiness_cli_v5(argv, emit=emit)
     command: V5CommandName = (
         argv[0]  # type: ignore[assignment]
         if argv and argv[0] in _COMMANDS
