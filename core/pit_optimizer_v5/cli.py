@@ -26,6 +26,7 @@ from core.pit_optimizer_v5.provider import (
     AuthorizedRoleRunnerV5,
     GatewayCompletionProviderV5,
     LedgerBackedRoleInvokerV5,
+    RoleInvocationPackageV5,
 )
 from core.pit_optimizer_v5.production_provider import (
     LocalRoleAuthorizationLedgerV5,
@@ -36,6 +37,16 @@ from core.pit_optimizer_v5.runtime import (
     FeedbackRoundInputV5,
     FeedbackRoundResultV5,
     run_feedback_round_v5,
+)
+from core.pit_optimizer_v5.memory import (
+    CandidateExecutionAuthorityV5,
+    CandidateExecutionKeyV5,
+    CandidateStageResultPayloadV5,
+    CleanupResultPayloadV5,
+    EpisodeEvidencePayloadV5,
+    QuickEvidencePayloadV5,
+    ResourceLeasePayloadV5,
+    RoleCompletionPayloadV5,
 )
 from core.pit_optimizer_v5.sandbox import (
     DockerCandidateRuntimeV5,
@@ -167,8 +178,13 @@ class V5CliRequest:
                 raise ValueError("V5 execution owner token is invalid")
             if self.adapter_config_ref is not None and type(self.adapter_config_ref) is not ArtifactRefV5:
                 raise ValueError("V5 execution adapter config is invalid")
+        elif self.command in {"verify-run", "summarize"}:
+            if self.round_index is not None or self.owner_token_sha256 is not None:
+                raise ValueError("read-only V5 commands cannot carry execution authority")
+            if self.adapter_config_ref is not None and type(self.adapter_config_ref) is not ArtifactRefV5:
+                raise ValueError("read-only V5 adapter config is invalid")
         elif self.round_index is not None or self.owner_token_sha256 is not None or self.adapter_config_ref is not None:
-            raise ValueError("read-only V5 commands cannot carry execution authority")
+            raise ValueError("V5 import command cannot carry production authority")
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,34 +654,72 @@ class ProductionV5CommandServices:
     def _verify_local_run(
         repository: LocalArtifactRepositoryV5,
         authorities: CampaignAuthoritiesV5,
+        adapter_config: ProductionAdapterConfigV5 | None = None,
     ) -> None:
-        role_evidence_seen = False
+        packages: list[RoleInvocationPackageV5] = []
+        resource_cleanup_states: list[bool] = []
+        last_cleanup: CleanupResultPayloadV5 | None = None
         for round_index in range(1, authorities.manifest.search.max_feedback_rounds + 1):
             events = repository.load_round_events(
                 campaign_id=authorities.manifest.campaign_id,
                 round_index=round_index,
             )
+            leases: list[ResourceLeasePayloadV5] = []
+            cleanups: list[CleanupResultPayloadV5] = []
+            successful_keys: list[CandidateExecutionKeyV5] = []
             for event in events:
                 payload = repository.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
-                if event.event_kind == "role_completion":
-                    role_evidence_seen = True
-                    repository.load_role_invocation(payload)  # type: ignore[arg-type]
-            repository.verify_candidate_execution_index(
+                if type(payload) is RoleCompletionPayloadV5:
+                    packages.append(repository.load_role_invocation(payload))
+                elif type(payload) is ResourceLeasePayloadV5:
+                    leases.append(payload)
+                elif type(payload) is CleanupResultPayloadV5:
+                    cleanups.append(payload)
+                elif type(payload) is CandidateStageResultPayloadV5 and payload.semantic_fingerprint is not None:
+                    successful_keys.append(CandidateExecutionKeyV5(payload.experiment_id, "semantic_probe", None))
+                elif type(payload) is QuickEvidencePayloadV5:
+                    successful_keys.append(CandidateExecutionKeyV5(payload.experiment_id, "quick_evaluation", None))
+                elif type(payload) is EpisodeEvidencePayloadV5:
+                    successful_keys.append(
+                        CandidateExecutionKeyV5(
+                            payload.experiment_id,
+                            "discovery_evaluation",
+                            payload.episode.episode_ordinal,
+                        )
+                    )
+            executions = repository.verify_candidate_execution_index(
                 campaign_id=authorities.manifest.campaign_id,
                 round_index=round_index,
             )
+            resource_cleanup_states.append(
+                ProductionV5CommandServices._verify_resource_history(
+                    repository,
+                    authorities,
+                    adapter_config,
+                    round_index,
+                    tuple(leases),
+                    executions,
+                    tuple(cleanups),
+                    tuple(successful_keys),
+                )
+            )
+            if cleanups:
+                last_cleanup = cleanups[-1]
+        if last_cleanup is not None and last_cleanup.cleanup_complete and not all(resource_cleanup_states):
+            raise V5CliFailure("artifact_graph_invalid")
         checkpoint = repository.load_checkpoint()
         if checkpoint is not None:
             tuple(repository.load_experiment(reference) for reference in checkpoint.record_refs)
         if authorities.manifest.provider is None:
-            if role_evidence_seen:
+            if packages:
                 raise V5CliFailure("production_provider_invalid")
         else:
             try:
-                LocalRoleAuthorizationLedgerV5(
+                ledger = LocalRoleAuthorizationLedgerV5(
                     repository=repository,
                     manifest=authorities.manifest,
                 )
+                ledger.authenticate_role_invocations(tuple(packages))
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 raise V5CliFailure("production_provider_invalid") from exc
         try:
@@ -674,6 +728,108 @@ class ProductionV5CommandServices:
                 panel_plan=authorities.panel_plan,
                 evaluator_contract=authorities.evaluator_contract,
             )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise V5CliFailure("artifact_graph_invalid") from exc
+
+    @staticmethod
+    def _verify_resource_history(
+        repository: LocalArtifactRepositoryV5,
+        authorities: CampaignAuthoritiesV5,
+        config: ProductionAdapterConfigV5 | None,
+        round_index: int,
+        leases: tuple[ResourceLeasePayloadV5, ...],
+        executions: tuple[CandidateExecutionAuthorityV5, ...],
+        cleanups: tuple[CleanupResultPayloadV5, ...],
+        successful_keys: tuple[CandidateExecutionKeyV5, ...] = (),
+    ) -> bool:
+        """Reconstruct only local read authorities; never launch or repair."""
+
+        if any(key not in {item.key for item in executions} for key in successful_keys):
+            raise V5CliFailure("artifact_graph_invalid")
+        expected_counts = (
+            sum(item.resource_kind == "workspace" for item in leases),
+            0,
+            len(executions),
+            len(executions),
+        )
+        if any(
+            result.cleanup_complete
+            and (
+                result.owned_workspaces,
+                result.owned_policy_workers,
+                result.owned_evaluators,
+                result.owned_containers,
+            )
+            != expected_counts
+            for result in cleanups
+        ):
+            raise V5CliFailure("artifact_graph_invalid")
+        if not leases and not executions:
+            return True
+        if config is None:
+            raise V5CliFailure("production_config_missing")
+        tokens = {item.owner_token_sha256 for item in leases} | {item.owner_token_sha256 for item in executions}
+        if (
+            len(tokens) != 1
+            or any(item.owner_campaign_id != authorities.manifest.campaign_id for item in leases)
+            or any(item.resource_kind != "workspace" for item in leases)
+        ):
+            raise V5CliFailure("artifact_graph_invalid")
+        token = next(iter(tokens))
+        try:
+            owner = WorkspaceOwnerV5(
+                authorities.manifest.campaign_id,
+                round_index,
+                token,
+                _controller_lease_id_v5(
+                    manifest_sha256=authorities.manifest.sha256,
+                    round_index=round_index,
+                    owner_token_sha256=token,
+                ),
+            )
+            driver = LocalGitWorkspaceDriverV5(
+                roots=WorkspaceRootsV5(config.source_root, config.workspace_root),
+                source_commit=authorities.manifest.source_commit,
+                git_executable=Path(config.git_executable),
+                repository=repository,
+                owner=owner,
+            )
+            workspace_states = tuple(driver.authenticate_lease_history(item) for item in leases)
+            retired = tuple(state.lifecycle == "retired" for state in workspace_states)
+            cleaned: tuple[bool, ...] = ()
+            if executions:
+                mounts = LocalSandboxMountFactoryV5(
+                    manifest=authorities.manifest,
+                    evaluator_contract=authorities.evaluator_contract,
+                    sandbox_profile=authorities.sandbox_profile,
+                    owner=owner,
+                    workspace_driver=driver,
+                    data_root=Path(config.data_root),
+                    output_root=Path(config.output_root),
+                    repository=repository,
+                )
+                executor = LocalContainerExecutorV5(
+                    manifest=authorities.manifest,
+                    sandbox_profile=authorities.sandbox_profile,
+                    owner=owner,
+                    mount_factory=mounts,
+                    docker_executable=Path(config.docker_executable),
+                    control_root=Path(config.control_root),
+                    repository=repository,
+                )
+                cleaned = tuple(
+                    executor.authenticate_execution_history(
+                        item,
+                        workspace_source_identity_sha256s=tuple(
+                            state.workspace_identity_sha256 for state in workspace_states
+                        ),
+                        require_successful_output=item.key in successful_keys,
+                    )
+                    for item in executions
+                )
+            if any(result.cleanup_complete for result in cleanups) and not all((*retired, *cleaned)):
+                raise ValueError("journal cleanup lacks durable resource retirement")
+            return all((*retired, *cleaned))
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             raise V5CliFailure("artifact_graph_invalid") from exc
 
@@ -715,7 +871,12 @@ class ProductionV5CommandServices:
         repository = self._repository(request)
         authorities = self._authorities(repository, request.manifest_ref)
         if request.command in {"verify-run", "summarize"}:
-            self._verify_local_run(repository, authorities)
+            config = (
+                None
+                if request.adapter_config_ref is None
+                else self._adapter_config(repository, authorities, request.adapter_config_ref)
+            )
+            self._verify_local_run(repository, authorities, config)
             return summarize_repository_v5(
                 repository=repository,
                 manifest=authorities.manifest,
@@ -764,7 +925,7 @@ class ProductionV5CommandServices:
         result = run_feedback_round_v5(composition.inputs, composition.dependencies)
         if type(result) is not FeedbackRoundResultV5:
             raise V5CliFailure("runtime_result_invalid")
-        self._verify_local_run(repository, authorities)
+        self._verify_local_run(repository, authorities, adapter_config)
         summary = summarize_repository_v5(
             repository=repository,
             manifest=authorities.manifest,
@@ -800,6 +961,7 @@ def build_parser_v5() -> argparse.ArgumentParser:
         if name in {"run", "resume"}:
             command.add_argument("--round-index", required=True, type=int)
             command.add_argument("--owner-token-sha256", required=True)
+        if name in {"run", "resume", "verify-run", "summarize"}:
             command.add_argument("--adapter-config-path")
             command.add_argument("--adapter-config-sha256")
     return parser
@@ -810,7 +972,7 @@ def parse_v5_args(argv: Sequence[str]) -> V5CliRequest:
     command = namespace.command
     if command not in _COMMANDS:
         raise ValueError("V5 command is invalid")
-    if command in {"run", "resume"} and (
+    if command in {"run", "resume", "verify-run", "summarize"} and (
         (namespace.adapter_config_path is None) != (namespace.adapter_config_sha256 is None)
     ):
         raise V5CliFailure("invalid_request")
@@ -820,7 +982,7 @@ def parse_v5_args(argv: Sequence[str]) -> V5CliRequest:
         manifest_ref=ArtifactRefV5(namespace.manifest_path, namespace.manifest_sha256),
         adapter_config_ref=(
             ArtifactRefV5(namespace.adapter_config_path, namespace.adapter_config_sha256)
-            if command in {"run", "resume"}
+            if command in {"run", "resume", "verify-run", "summarize"}
             and namespace.adapter_config_path is not None
             and namespace.adapter_config_sha256 is not None
             else None

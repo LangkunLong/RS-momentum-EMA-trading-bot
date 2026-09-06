@@ -411,6 +411,7 @@ class LocalCandidateBaseOperationsV5:
             variant,
         )
         source_ref = self._source_reference(variant)
+        self._check_deadline(deadline, "materialization")
         materialized = (
             self._materializer.materialize(
                 owner=self._owner,
@@ -426,7 +427,9 @@ class LocalCandidateBaseOperationsV5:
                 variant=variant,
             )
         )
-        self._check_deadline(deadline, "materialization")
+        # The runtime journals the returned owned lease before enforcing the
+        # post-call deadline.  Never raise between successful workspace
+        # creation and that durable registration boundary.
         return materialized.as_runtime_materialization(source_ref)
 
     def recover_materialized(
@@ -1119,7 +1122,8 @@ class CompositeOwnedCleanupV5:
         round_index: int,
     ) -> OwnedLeaseV5:
         if payload.resource_kind == "workspace":
-            lease = self.materializer.driver.load_lease(payload.lease_id)
+            state = self.materializer.driver.authenticate_lease_history(payload)
+            lease = state.lease
             if (
                 type(lease) is not WorkspaceLeaseV5
                 or lease.payload != payload

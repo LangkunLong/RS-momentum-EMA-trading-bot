@@ -119,8 +119,7 @@ def _panel_input_reference_v5(
 
 def _is_reparse(info: os.stat_result) -> bool:
     return stat.S_ISLNK(info.st_mode) or bool(
-        getattr(info, "st_file_attributes", 0)
-        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     )
 
 
@@ -136,11 +135,7 @@ def _canonical_directory(path: Path) -> tuple[Path, os.stat_result]:
                 raise ValueError("sandbox root identity changed")
     except (OSError, ValueError):
         raise ValueError("sandbox root is unavailable") from None
-    if (
-        _windows_key(str(resolved)) != _windows_key(text)
-        or not stat.S_ISDIR(info.st_mode)
-        or _is_reparse(info)
-    ):
+    if _windows_key(str(resolved)) != _windows_key(text) or not stat.S_ISDIR(info.st_mode) or _is_reparse(info):
         raise ValueError("sandbox root is not a link-free directory")
     current = resolved
     while True:
@@ -223,10 +218,7 @@ def _hash_docker_executable(path: Path) -> tuple[int, int, int, str]:
     try:
         descriptor = os.open(
             resolved,
-            os.O_RDONLY
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         stream = os.fdopen(descriptor, "rb", buffering=0)
         opened = os.fstat(stream.fileno())
@@ -263,11 +255,7 @@ def _hash_open_stream(
     *,
     maximum_bytes: int,
 ) -> tuple[int, int, int, str]:
-    if (
-        type(maximum_bytes) is not int
-        or maximum_bytes <= 0
-        or info.st_size > maximum_bytes
-    ):
+    if type(maximum_bytes) is not int or maximum_bytes <= 0 or info.st_size > maximum_bytes:
         raise ValueError("pinned file exceeds its authentication bound")
     stream.seek(0)  # type: ignore[attr-defined]
     digest = hashlib.sha256()
@@ -278,10 +266,10 @@ def _hash_open_stream(
             raise ValueError("pinned file exceeds its authentication bound")
         digest.update(chunk)
     after = os.fstat(stream.fileno())  # type: ignore[attr-defined]
-    if (
-        observed_bytes != info.st_size
-        or (after.st_dev, after.st_ino, after.st_size)
-        != (info.st_dev, info.st_ino, info.st_size)
+    if observed_bytes != info.st_size or (after.st_dev, after.st_ino, after.st_size) != (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
     ):
         raise ValueError("pinned file changed during authentication")
     return info.st_dev, info.st_ino, observed_bytes, digest.hexdigest()
@@ -465,10 +453,7 @@ class ExecutionPhaseRecordV5:
                 if self.phase in {"created", "started", "collected"}
                 else self.attestation_sha256 is not None
             )
-            or (
-                self.attestation_sha256 is not None
-                and re.fullmatch(r"[0-9a-f]{64}", self.attestation_sha256) is None
-            )
+            or (self.attestation_sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", self.attestation_sha256) is None)
             or (
                 self.phase in {"launch_claim", "start_claim"}
                 and any(
@@ -485,12 +470,9 @@ class ExecutionPhaseRecordV5:
             or (
                 self.phase in {"created", "started", "collected"}
                 and (
-                    re.fullmatch(r"[0-9a-f]{64}", self.container_identity_sha256 or "")
-                    is None
-                    or re.fullmatch(r"[0-9a-f]{64}", self.network_attestation_sha256 or "")
-                    is None
-                    or re.fullmatch(r"[0-9a-f]{64}", self.state_attestation_sha256 or "")
-                    is None
+                    re.fullmatch(r"[0-9a-f]{64}", self.container_identity_sha256 or "") is None
+                    or re.fullmatch(r"[0-9a-f]{64}", self.network_attestation_sha256 or "") is None
+                    or re.fullmatch(r"[0-9a-f]{64}", self.state_attestation_sha256 or "") is None
                     or self.network_namespace_status not in {"empty", "private"}
                     or self.lifecycle_status
                     not in (
@@ -577,26 +559,28 @@ class ExecutionControlRecordV5:
     docker_executable_identity_sha256: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 5 or any(
-            re.fullmatch(r"[0-9a-f]{64}", item) is None
-            for item in (
-                self.executor_identity_sha256,
-                self.command_sha256,
-                self.control_root_identity_sha256,
-                self.transaction_root_identity_sha256,
-                self.docker_config_file_identity_sha256,
-                self.docker_executable_identity_sha256,
-            )
-        ) or (
-            type(self.child_identity_sha256s) is not tuple
-            or tuple(item[0] for item in self.child_identity_sha256s) != _CONTROL_CHILDREN_V5
+        if (
+            self.schema_version != 5
             or any(
-                type(item) is not tuple
-                or len(item) != 2
-                or re.fullmatch(r"[0-9a-f]{64}", item[1]) is None
-                for item in self.child_identity_sha256s
+                re.fullmatch(r"[0-9a-f]{64}", item) is None
+                for item in (
+                    self.executor_identity_sha256,
+                    self.command_sha256,
+                    self.control_root_identity_sha256,
+                    self.transaction_root_identity_sha256,
+                    self.docker_config_file_identity_sha256,
+                    self.docker_executable_identity_sha256,
+                )
             )
-            or self.docker_config_content != _DOCKER_CONFIG_TEXT_V5
+            or (
+                type(self.child_identity_sha256s) is not tuple
+                or tuple(item[0] for item in self.child_identity_sha256s) != _CONTROL_CHILDREN_V5
+                or any(
+                    type(item) is not tuple or len(item) != 2 or re.fullmatch(r"[0-9a-f]{64}", item[1]) is None
+                    for item in self.child_identity_sha256s
+                )
+                or self.docker_config_content != _DOCKER_CONFIG_TEXT_V5
+            )
         ):
             raise ValueError("container execution control record is invalid")
 
@@ -712,9 +696,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         repository: LocalArtifactRepositoryV5,
     ) -> None:
         if os.name != "nt":
-            raise RuntimeError(
-                "the concrete V5 sandbox mount adapter requires Windows handle authority"
-            )
+            raise RuntimeError("the concrete V5 sandbox mount adapter requires Windows handle authority")
         if (
             type(manifest) is not CampaignManifestV5
             or type(evaluator_contract) is not EvaluatorContractV5
@@ -734,9 +716,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         validate_sandbox_profile_resources_v5(sandbox_profile, manifest.resources)
         data_path, data_info = _canonical_directory(data_root)
         output_path, output_info = _canonical_directory(output_root)
-        workspace_roots = tuple(
-            (Path(path), identity) for path, identity in workspace_driver.root_identities
-        )
+        workspace_roots = tuple((Path(path), identity) for path, identity in workspace_driver.root_identities)
         try:
             for path, identity in workspace_roots:
                 with acquire_absolute_directory_v5(path, expected_identity=identity):
@@ -817,6 +797,91 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
     def output_root(self) -> Path:
         return self._output_root
 
+    def authenticate_output_history(
+        self,
+        authority: CandidateExecutionAuthorityV5,
+    ) -> str:
+        """Read-only authentication of one execution's durable output mount."""
+
+        if (
+            type(authority) is not CandidateExecutionAuthorityV5
+            or authority.campaign_id != self._owner.campaign_id
+            or authority.round_index != self._owner.round_index
+            or authority.owner_token_sha256 != self._owner.owner_token_sha256
+        ):
+            raise ValueError("sandbox output history authority is invalid")
+        key = authority.output_mount_authority_sha256
+        reservation = self._repository.load_typed_state(
+            namespace="sandbox-mount-reservation",
+            key=key,
+            value_type=MountReservationRecordV5,
+            repair=False,
+        )
+        created = self._repository.load_typed_state(
+            namespace="sandbox-mount-created",
+            key=key,
+            value_type=MountCreatedRecordV5,
+            repair=False,
+        )
+        ready = self._repository.load_typed_state(
+            namespace="sandbox-mount-ready",
+            key=key,
+            value_type=MountReadyRecordV5,
+            repair=False,
+        )
+        expected_data_identity = (
+            canonical_sha256_v5(
+                {
+                    "domain": "pit-optimizer-v5-absent-data-mount-v1",
+                    "execution_key": canonical_sha256_v5(authority.key),
+                }
+            )
+            if authority.key.stage == "semantic_probe"
+            else _directory_identity(self._data_root, self._data_info)
+        )
+        expected_relative = f"pit-v5-output-{key[:24]}"
+        if (
+            reservation is None
+            or created is None
+            or ready is None
+            or reservation.factory_identity_sha256 != self.mount_identity_sha256
+            or reservation.owner != self._owner
+            or reservation.execution_key_sha256 != canonical_sha256_v5(authority.key)
+            or reservation.output_authority_sha256 != key
+            or reservation.output_relative_path != expected_relative
+            or reservation.output_parent_identity_sha256 != _directory_identity(self._output_root, self._output_info)
+            or reservation.data_root_identity_sha256 != expected_data_identity
+            or created.factory_identity_sha256 != self.mount_identity_sha256
+            or created.output_authority_sha256 != key
+            or ready.factory_identity_sha256 != self.mount_identity_sha256
+            or ready.output_authority_sha256 != key
+            or (created.output_device, created.output_inode) != (ready.output_device, ready.output_inode)
+        ):
+            raise ValueError("sandbox output history differs from durable authority")
+        try:
+            with (
+                acquire_absolute_directory_v5(
+                    self._output_root,
+                    expected_identity=(self._output_info.st_dev, self._output_info.st_ino),
+                ) as root,
+                acquire_directory_v5(
+                    root.path,
+                    (expected_relative,),
+                    create=False,
+                    expected_root_identity=root.identity,
+                ) as target,
+            ):
+                info = target.path.lstat()
+                if (
+                    target.identity != (ready.output_device, ready.output_inode)
+                    or (info.st_dev, info.st_ino) != target.identity
+                    or _directory_identity(target.path, info) != ready.output_root_identity_sha256
+                ):
+                    raise ValueError("sandbox output target identity changed")
+        except (OSError, ValueError):
+            raise ValueError("sandbox output history path is unavailable") from None
+        return reservation.source_root_identity_sha256
+
     @property
     def fixed_roots(self) -> tuple[Path, Path, Path, Path]:
         return self._fixed_roots
@@ -855,16 +920,10 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             or candidate.lease.owner != self._owner
         ):
             raise ValueError("sandbox source authority is foreign")
-        source_path, source_binding, source_identity = self._workspace.authorize_materialized_source(
-            candidate
-        )
+        source_path, source_binding, source_identity = self._workspace.authorize_materialized_source(candidate)
         workspace_root = self._fixed_roots[1]
-        if (
-            _windows_key(str(source_path.parent)) != _windows_key(str(workspace_root))
-            or any(
-                _roots_overlap(source_path, fixed)
-                for fixed in (self._fixed_roots[0], self._data_root, self._output_root)
-            )
+        if _windows_key(str(source_path.parent)) != _windows_key(str(workspace_root)) or any(
+            _roots_overlap(source_path, fixed) for fixed in (self._fixed_roots[0], self._data_root, self._output_root)
         ):
             raise ValueError("sandbox candidate subtree is outside its workspace authority")
         authorities = derive_sandbox_mount_authorities_v5(
@@ -1017,9 +1076,10 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         output_authority: str,
     ) -> tuple[Path, os.stat_result]:
         relative = f"pit-v5-output-{output_authority[:24]}"
-        if getattr(output_parent, "path", None) != self._output_root or getattr(
-            output_parent, "identity", None
-        ) != (self._output_info.st_dev, self._output_info.st_ino):
+        if getattr(output_parent, "path", None) != self._output_root or getattr(output_parent, "identity", None) != (
+            self._output_info.st_dev,
+            self._output_info.st_ino,
+        ):
             raise ValueError("sandbox output parent authority is foreign")
         record = MountReservationRecordV5(
             5,
@@ -1065,8 +1125,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 created is None
                 or ready.factory_identity_sha256 != self.mount_identity_sha256
                 or ready.output_authority_sha256 != output_authority
-                or (ready.output_device, ready.output_inode)
-                != (created.output_device, created.output_inode)
+                or (ready.output_device, ready.output_inode) != (created.output_device, created.output_inode)
             ):
                 raise ValueError("sandbox output readiness is foreign")
             created_identity: tuple[int, int] | None = None
@@ -1082,9 +1141,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                                 )
                             )
                         except FileExistsError:
-                            raise ValueError(
-                                "sandbox output target predates durable creation"
-                            ) from None
+                            raise ValueError("sandbox output target predates durable creation") from None
                         created_identity = target_access.identity
                         expected_created = MountCreatedRecordV5(
                             5,
@@ -1129,9 +1186,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                             created.output_device,
                             created.output_inode,
                         ):
-                            raise ValueError(
-                                "sandbox output identity differs from durable creation"
-                            )
+                            raise ValueError("sandbox output identity differs from durable creation")
                     target_path = target_access.path
                     target_info = target_path.lstat()
                     if (target_info.st_dev, target_info.st_ino) != target_access.identity:
@@ -1156,8 +1211,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                         ready.factory_identity_sha256 != self.mount_identity_sha256
                         or ready.output_authority_sha256 != output_authority
                         or ready.output_root_identity_sha256 != identity
-                        or (ready.output_device, ready.output_inode)
-                        != target_access.identity
+                        or (ready.output_device, ready.output_inode) != target_access.identity
                     ):
                         raise ValueError("sandbox output readiness is foreign")
                     if _roots_overlap(source_path, target_path):
@@ -1203,8 +1257,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             _directory_identity(path, info),
             content_authority,
             str(path),
-            container_path
-            or {"source": "/pit/candidate", "data": "/pit/data", "output": "/pit/output"}[kind],
+            container_path or {"source": "/pit/candidate", "data": "/pit/data", "output": "/pit/output"}[kind],
             self._manifest.resources.evaluation_output_limit_bytes if kind == "output" else None,
             capability,
         )
@@ -1236,9 +1289,8 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                     )
                 )
                 info = access.path.lstat()
-                if (
-                    (info.st_dev, info.st_ino) != access.identity
-                    or handle.root_identity_sha256 != _directory_identity(access.path, info)
+                if (info.st_dev, info.st_ino) != access.identity or handle.root_identity_sha256 != _directory_identity(
+                    access.path, info
                 ):
                     raise ValueError("sandbox mount root changed")
                 if handle.kind == "data":
@@ -1263,14 +1315,12 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                                 maximum_bytes=maximum,
                             )
                         )
-                    if tuple(
-                        (name, identity[3])
-                        for name, identity in zip(_DATA_FILES_V5, observed, strict=True)
-                    ) != self._data_file_authorities:
-                        raise ValueError("sandbox data files changed")
-                    if capability.binding_sha256 != canonical_sha256_v5(
-                        tuple(observed)
+                    if (
+                        tuple((name, identity[3]) for name, identity in zip(_DATA_FILES_V5, observed, strict=True))
+                        != self._data_file_authorities
                     ):
+                        raise ValueError("sandbox data files changed")
+                    if capability.binding_sha256 != canonical_sha256_v5(tuple(observed)):
                         raise ValueError("sandbox data binding is foreign")
                 yield access
         except (OSError, ValueError):
@@ -1300,16 +1350,9 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 if request.data_mount is None
                 else (request.source_mount, request.data_mount, request.output_mount)
             )
-            accesses = tuple(
-                stack.enter_context(self._pin_handle(handle))
-                for handle in handles
-            )
+            accesses = tuple(stack.enter_context(self._pin_handle(handle)) for handle in handles)
             paths = tuple(access.path for access in accesses)
-            if any(
-                _roots_overlap(first, second)
-                for index, first in enumerate(paths)
-                for second in paths[index + 1 :]
-            ):
+            if any(_roots_overlap(first, second) for index, first in enumerate(paths) for second in paths[index + 1 :]):
                 raise ValueError("sandbox request mount roots overlap")
             access_by_kind = dict(zip((item.kind for item in handles), accesses, strict=True))
             path_by_kind = {kind: access.path for kind, access in access_by_kind.items()}
@@ -1356,17 +1399,12 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 output_created is None
                 or output_ready is None
                 or output_created.factory_identity_sha256 != self.mount_identity_sha256
-                or output_created.output_authority_sha256
-                != request.output_mount.content_authority_sha256
+                or output_created.output_authority_sha256 != request.output_mount.content_authority_sha256
                 or output_ready.factory_identity_sha256 != self.mount_identity_sha256
-                or output_ready.output_authority_sha256
-                != request.output_mount.content_authority_sha256
-                or output_ready.output_root_identity_sha256
-                != request.output_mount.root_identity_sha256
-                or (output_created.output_device, output_created.output_inode)
-                != access_by_kind["output"].identity
-                or (output_ready.output_device, output_ready.output_inode)
-                != access_by_kind["output"].identity
+                or output_ready.output_authority_sha256 != request.output_mount.content_authority_sha256
+                or output_ready.output_root_identity_sha256 != request.output_mount.root_identity_sha256
+                or (output_created.output_device, output_created.output_inode) != access_by_kind["output"].identity
+                or (output_ready.output_device, output_ready.output_inode) != access_by_kind["output"].identity
             ):
                 raise ValueError("sandbox output mount is not durably ready")
             pinned_paths = tuple(path_by_kind[item.kind] for item in handles)
@@ -1382,9 +1420,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                     raise ValueError("sandbox panel input is not durably authenticated")
                 parts = PurePosixPath(reference.relative_path).parts
                 try:
-                    repository_root = stack.enter_context(
-                        acquire_absolute_directory_v5(self._repository.root)
-                    )
+                    repository_root = stack.enter_context(acquire_absolute_directory_v5(self._repository.root))
                     if self._repository.root_identity_sha256 != canonical_sha256_v5(
                         {
                             "device": repository_root.identity[0],
@@ -1446,9 +1482,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         repository: LocalArtifactRepositoryV5,
     ) -> None:
         if os.name != "nt":
-            raise RuntimeError(
-                "the concrete V5 Docker executor requires Windows handle authority"
-            )
+            raise RuntimeError("the concrete V5 Docker executor requires Windows handle authority")
         if (
             type(manifest) is not CampaignManifestV5
             or type(sandbox_profile) is not SandboxProfileV5
@@ -1675,9 +1709,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         else:
             if type(data_mount) is not SandboxMountHandleV5:
                 raise ValueError("panel Docker grammar lacks its data authority")
-            data_root_argument = (
-                f"type=bind,src={data_mount.host_path},dst={data_mount.container_path},readonly"
-            )
+            data_root_argument = f"type=bind,src={data_mount.host_path},dst={data_mount.container_path},readonly"
             try:
                 data_argument_index = generic.index(data_root_argument)
             except ValueError:
@@ -1697,17 +1729,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 raise ValueError("container data mount grammar is malformed")
             generic[data_argument_index - 1 : data_argument_index + 1] = data_file_arguments
             _panel_input, input_reference = _panel_input_reference_v5(command.request)
-            input_path = self._repository.root.joinpath(
-                *PurePosixPath(input_reference.relative_path).parts
-            )
+            input_path = self._repository.root.joinpath(*PurePosixPath(input_reference.relative_path).parts)
             input_host_path = _docker_host_path_v5(input_path)
             separator = generic.index("--")
             generic[separator:separator] = [
                 "--mount",
-                (
-                    f"type=bind,src={input_host_path},"
-                    f"dst={_PANEL_INPUT_TARGET_V5},readonly"
-                ),
+                (f"type=bind,src={input_host_path},dst={_PANEL_INPUT_TARGET_V5},readonly"),
             ]
         separator = generic.index("--")
         if generic[separator + 1] != self._profile.image_reference or generic[separator + 2] != "python":
@@ -1717,19 +1744,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
 
     def _reservation_record(self, command: ContainerCommandV5) -> ExecutionReservationRecordV5:
         lease_ids = tuple(
-            derive_execution_lease_id_v5(command.sha256, role)
-            for role in ("evaluator_process", "container")
+            derive_execution_lease_id_v5(command.sha256, role) for role in ("evaluator_process", "container")
         )
         runtime_argv = self._runtime_argv(command)
         source_mounts = tuple(
             (
-                _windows_key(
-                    str(
-                        Path(command.request.source_mount.host_path).joinpath(
-                            *relative.split("/")
-                        )
-                    )
-                ),
+                _windows_key(str(Path(command.request.source_mount.host_path).joinpath(*relative.split("/")))),
                 f"{command.request.source_mount.container_path}/{relative.rsplit('/', 1)[-1]}",
                 False,
             )
@@ -1753,9 +1773,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 for name in _DATA_FILES_V5
             )
             _panel_input, input_reference = _panel_input_reference_v5(command.request)
-            input_path = self._repository.root.joinpath(
-                *PurePosixPath(input_reference.relative_path).parts
-            )
+            input_path = self._repository.root.joinpath(*PurePosixPath(input_reference.relative_path).parts)
             input_mounts = (
                 (
                     _windows_key(_docker_host_path_v5(input_path)),
@@ -1792,15 +1810,20 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             f"execution-{command.sha256[:24]}",
         )
 
-    def _load_reservation(self, command_sha256: str) -> ExecutionReservationRecordV5 | None:
+    def _load_reservation(
+        self,
+        command_sha256: str,
+        *,
+        repair: bool = True,
+    ) -> ExecutionReservationRecordV5 | None:
         record = self._repository.load_typed_state(
             namespace="container-reservation",
             key=command_sha256,
             value_type=ExecutionReservationRecordV5,
+            repair=repair,
         )
         if record is not None and (
-            record.executor_identity_sha256 != self.executor_identity_sha256
-            or record.command_sha256 != command_sha256
+            record.executor_identity_sha256 != self.executor_identity_sha256 or record.command_sha256 != command_sha256
         ):
             raise ValueError("container execution reservation is foreign")
         return record
@@ -1865,11 +1888,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         self,
         command_sha256: str,
         phase: Literal["launch_claim", "created", "start_claim", "started", "collected"],
+        *,
+        repair: bool = True,
     ) -> ExecutionPhaseRecordV5 | None:
         record = self._repository.load_typed_state(
             namespace=f"container-{phase.replace('_', '-')}",
             key=command_sha256,
             value_type=ExecutionPhaseRecordV5,
+            repair=repair,
         )
         if record is not None and (
             record.executor_identity_sha256 != self.executor_identity_sha256
@@ -1913,15 +1939,17 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     def _container_identity(
         self,
         command_sha256: str,
+        *,
+        repair: bool = True,
     ) -> ExecutionContainerIdentityRecordV5 | None:
         record = self._repository.load_typed_state(
             namespace="container-identity",
             key=command_sha256,
             value_type=ExecutionContainerIdentityRecordV5,
+            repair=repair,
         )
         if record is not None and (
-            record.executor_identity_sha256 != self.executor_identity_sha256
-            or record.command_sha256 != command_sha256
+            record.executor_identity_sha256 != self.executor_identity_sha256 or record.command_sha256 != command_sha256
         ):
             raise ValueError("container identity record is foreign")
         return record
@@ -1953,11 +1981,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     def _control_created(
         self,
         command_sha256: str,
+        *,
+        repair: bool = True,
     ) -> ExecutionControlCreatedRecordV5 | None:
         created = self._repository.load_typed_state(
             namespace="container-control-created",
             key=command_sha256,
             value_type=ExecutionControlCreatedRecordV5,
+            repair=repair,
         )
         if created is not None and (
             created.executor_identity_sha256 != self.executor_identity_sha256
@@ -2045,9 +2076,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     )
                 )
                 root_identity_sha256 = self._control_root_identity(root)
-                if created is not None and (
-                    created.control_root_identity_sha256 != root_identity_sha256
-                ):
+                if created is not None and (created.control_root_identity_sha256 != root_identity_sha256):
                     raise ValueError("container control creation root is foreign")
                 if created is None:
                     try:
@@ -2058,9 +2087,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             )
                         )
                     except FileExistsError:
-                        raise ValueError(
-                            "container control directory predates durable authority"
-                        ) from None
+                        raise ValueError("container control directory predates durable authority") from None
                     created_identity = target_access.identity
                     expected_created = ExecutionControlCreatedRecordV5(
                         5,
@@ -2078,9 +2105,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         )
                     except BaseException:
                         try:
-                            observed_created = self._control_created(
-                                reservation.command_sha256
-                            )
+                            observed_created = self._control_created(reservation.command_sha256)
                         except BaseException:
                             created_durable = None
                         else:
@@ -2143,7 +2168,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         maximum_bytes=len(_DOCKER_CONFIG_CONTENT_V5),
                     )
                 if (
-                    config_identity[2:] != (
+                    config_identity[2:]
+                    != (
                         len(_DOCKER_CONFIG_CONTENT_V5),
                         hashlib.sha256(_DOCKER_CONFIG_CONTENT_V5).hexdigest(),
                     )
@@ -2216,10 +2242,9 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     expected_root_identity=root.identity,
                 )
             )
-            if (
-                created.control_root_identity_sha256 != self._control_root_identity(root)
-                or target.identity
-                != (created.transaction_device, created.transaction_inode)
+            if created.control_root_identity_sha256 != self._control_root_identity(root) or target.identity != (
+                created.transaction_device,
+                created.transaction_inode,
             ):
                 raise ValueError("container control creation authority changed")
             children = {}
@@ -2266,7 +2291,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             try:
                 if (
                     ready != expected
-                    or config_identity[2:] != (
+                    or config_identity[2:]
+                    != (
                         len(_DOCKER_CONFIG_CONTENT_V5),
                         hashlib.sha256(_DOCKER_CONFIG_CONTENT_V5).hexdigest(),
                     )
@@ -2322,8 +2348,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     )
                     if (
                         after != self._docker_identity
-                        or _hash_docker_executable(self._docker_executable)
-                        != self._docker_identity
+                        or _hash_docker_executable(self._docker_executable) != self._docker_identity
                     ):
                         raise ValueError("Docker executable identity changed")
                     parent.assert_current()
@@ -2367,6 +2392,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         ):
             raise ValueError("Docker control invocation is invalid")
         from agent_loop import _bounded_process
+
         result = _bounded_process(
             (str(self._docker_executable), *arguments),
             env=dict(transaction.environment),
@@ -2412,12 +2438,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or self._profile.image_reference not in repo_digests
             or type(image_config) is not dict
             or type(image_environment) is not list
-            or any(
-                type(value) is not str or "=" not in value or "\x00" in value
-                for value in image_environment
-            )
-            or len({value.split("=", 1)[0] for value in image_environment})
-            != len(image_environment)
+            or any(type(value) is not str or "=" not in value or "\x00" in value for value in image_environment)
+            or len({value.split("=", 1)[0] for value in image_environment}) != len(image_environment)
             or image_labels
             != {
                 EVALUATOR_RUNTIME_KIND_LABEL_V5: EVALUATOR_RUNTIME_KIND_V5,
@@ -2897,9 +2919,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or state["Pid"] < 0
             or type(state["ExitCode"]) is not int
             or any(
-                type(state[key]) is not str
-                or "\x00" in state[key]
-                or len(state[key]) > 4096
+                type(state[key]) is not str or "\x00" in state[key] or len(state[key]) > 4096
                 for key in ("Error", "StartedAt", "FinishedAt")
             )
             or state["Error"] != ""
@@ -2921,9 +2941,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         ):
             raise ValueError("container running state differs from the closed lifecycle")
         if status == "exited" and (
-            state["Pid"] != 0
-            or state["StartedAt"] == zero_time
-            or state["FinishedAt"] == zero_time
+            state["Pid"] != 0 or state["StartedAt"] == zero_time or state["FinishedAt"] == zero_time
         ):
             raise ValueError("container exited state differs from the closed lifecycle")
         return {key: state[key] for key in sorted(expected_keys)}
@@ -3113,11 +3131,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         )
         if not self._successful(result):
             field = "{{.Names}}" if container_id is None else "{{.ID}}"
-            filter_value = (
-                f"name=^{reservation.container_name}$"
-                if container_id is None
-                else f"id={container_id}"
-            )
+            filter_value = f"name=^{reservation.container_name}$" if container_id is None else f"id={container_id}"
             listing = self._control(
                 transaction,
                 (
@@ -3311,8 +3325,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             and phase.lifecycle_status == "running"
             and current_status == "exited"
             and (
-                inspection.network_attestation_sha256 == phase.network_attestation_sha256
-                or current_network == "empty"
+                inspection.network_attestation_sha256 == phase.network_attestation_sha256 or current_network == "empty"
             )
         ):
             raise ValueError("container lifecycle transition is outside authority")
@@ -3464,15 +3477,20 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             except Exception:
                 self._persist_failure(command)
 
-    def _terminal_record(self, command_sha256: str) -> ExecutionTerminalRecordV5 | None:
+    def _terminal_record(
+        self,
+        command_sha256: str,
+        *,
+        repair: bool = True,
+    ) -> ExecutionTerminalRecordV5 | None:
         record = self._repository.load_typed_state(
             namespace="container-terminal",
             key=command_sha256,
             value_type=ExecutionTerminalRecordV5,
+            repair=repair,
         )
         if record is not None and (
-            record.executor_identity_sha256 != self.executor_identity_sha256
-            or record.command_sha256 != command_sha256
+            record.executor_identity_sha256 != self.executor_identity_sha256 or record.command_sha256 != command_sha256
         ):
             raise ValueError("container terminal is foreign")
         return record
@@ -3520,8 +3538,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     ) -> ContainerExecutionResultV5:
         if (
             terminal.request_sha256 != command.request.sha256
-            or terminal.output_mount_authority_sha256
-            != command.request.output_mount.content_authority_sha256
+            or terminal.output_mount_authority_sha256 != command.request.output_mount.content_authority_sha256
         ):
             raise ValueError("container terminal differs from command authority")
         content = None
@@ -3565,10 +3582,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     stream.close()
             except (OSError, ValueError):
                 raise ValueError("container output could not be read") from None
-            if (
-                len(content) <= self._manifest.resources.evaluation_output_limit_bytes
-                and info.st_size != len(content)
-            ):
+            if len(content) <= self._manifest.resources.evaluation_output_limit_bytes and info.st_size != len(content):
                 raise ValueError("container output changed during bounded read")
             return content
 
@@ -3683,9 +3697,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             return self._result_from_terminal(command, terminal)
                         if not self._successful(waited):
                             return self._result_from_terminal(command, self._persist_failure(command))
-                        wait_lines = tuple(
-                            line.strip() for line in waited.stdout.splitlines() if line.strip()
-                        )
+                        wait_lines = tuple(line.strip() for line in waited.stdout.splitlines() if line.strip())
                         if len(wait_lines) != 1 or re.fullmatch(r"-?[0-9]+", wait_lines[0]) is None:
                             return self._result_from_terminal(command, self._persist_failure(command))
                         waited_exit_code = int(wait_lines[0])
@@ -3709,9 +3721,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     if state["Status"] != "exited":
                         return self._result_from_terminal(command, self._persist_failure(command))
                     exit_code = state["ExitCode"]
-                    if type(exit_code) is not int or (
-                        waited_exit_code is not None and waited_exit_code != exit_code
-                    ):
+                    if type(exit_code) is not int or (waited_exit_code is not None and waited_exit_code != exit_code):
                         return self._result_from_terminal(command, self._persist_failure(command))
                     collected = self._phase(command.sha256, "collected")
                     if collected is None:
@@ -3757,8 +3767,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or authority.owner_token_sha256 != self._owner.owner_token_sha256
             or authority.key != request.execution_key
             or authority.request_sha256 != request.sha256
-            or authority.output_mount_authority_sha256
-            != request.output_mount.content_authority_sha256
+            or authority.output_mount_authority_sha256 != request.output_mount.content_authority_sha256
         ):
             raise ValueError("container recovery authority is invalid")
         command = ContainerCommandV5(request, build_docker_argv_v5(request), remaining_timeout_seconds)
@@ -3796,9 +3805,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             campaign_id=self._owner.campaign_id,
             round_index=round_index,
         )
-        matches = tuple(
-            authority for authority in authorities if payload in authority.lease_payloads
-        )
+        matches = tuple(authority for authority in authorities if payload in authority.lease_payloads)
         if len(matches) != 1:
             raise ValueError("container recovery lease is absent or ambiguous")
         authority = matches[0]
@@ -3810,12 +3817,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or record.owner != self._owner
             or record.request_sha256 != authority.request_sha256
             or record.command_sha256 != authority.command_sha256
-            or record.output_mount_authority_sha256
-            != authority.output_mount_authority_sha256
+            or record.output_mount_authority_sha256 != authority.output_mount_authority_sha256
             or record.lease_ids != tuple(item.lease_id for item in authority.lease_payloads)
             or authority.lease_payloads[role_index] != payload
-            or payload.lease_id
-            != derive_execution_lease_id_v5(authority.command_sha256, payload.resource_kind)
+            or payload.lease_id != derive_execution_lease_id_v5(authority.command_sha256, payload.resource_kind)
         ):
             raise ValueError("container recovery lease differs from durable authority")
         capability = _RecoveredExecutionLeaseCapabilityV5(
@@ -3825,6 +3830,311 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             self._owner.sha256,
         )
         return OwnedLeaseV5(payload, round_index, capability)
+
+    def _authenticate_control_history_read_only(
+        self,
+        reservation: ExecutionReservationRecordV5,
+        *,
+        cleanup_complete: bool,
+        container_absent: bool,
+        require_ready: bool,
+    ) -> None:
+        created = self._control_created(
+            reservation.command_sha256,
+            repair=False,
+        )
+        ready = self._repository.load_typed_state(
+            namespace="container-control-ready",
+            key=reservation.command_sha256,
+            value_type=ExecutionControlRecordV5,
+            repair=False,
+        )
+        if require_ready and (created is None or ready is None):
+            raise ValueError("container phases lack control readiness")
+        try:
+            with ExitStack() as stack:
+                root = stack.enter_context(
+                    acquire_absolute_directory_v5(
+                        self._control_root,
+                        expected_identity=(
+                            self._control_root_info.st_dev,
+                            self._control_root_info.st_ino,
+                        ),
+                    )
+                )
+                absent = directory_child_absent_v5(
+                    root,
+                    reservation.control_relative_path,
+                )
+                if ready is not None and (
+                    created is None
+                    or ready.executor_identity_sha256 != self.executor_identity_sha256
+                    or ready.command_sha256 != reservation.command_sha256
+                    or ready.control_root_identity_sha256 != self._control_root_identity(root)
+                    or ready.transaction_root_identity_sha256
+                    != canonical_sha256_v5(
+                        {
+                            "path": _windows_key(str(root.path / reservation.control_relative_path)),
+                            "identity": (created.transaction_device, created.transaction_inode),
+                        }
+                    )
+                    or ready.docker_executable_identity_sha256 != canonical_sha256_v5(self._docker_identity)
+                ):
+                    raise ValueError("container control readiness identity is foreign")
+                if cleanup_complete or absent and container_absent:
+                    if created is None or ready is None or not absent:
+                        raise ValueError("container cleanup control history is incomplete")
+                    if created.control_root_identity_sha256 != self._control_root_identity(root):
+                        raise ValueError("container cleanup control root is foreign")
+                    return
+                if created is None:
+                    if ready is not None or not absent:
+                        raise ValueError("container control path lacks creation authority")
+                    return
+                if absent:
+                    raise ValueError("container control path disappeared before cleanup")
+                target = stack.enter_context(
+                    acquire_directory_v5(
+                        root.path,
+                        (reservation.control_relative_path,),
+                        create=False,
+                        expected_root_identity=root.identity,
+                    )
+                )
+                if created.control_root_identity_sha256 != self._control_root_identity(root) or target.identity != (
+                    created.transaction_device,
+                    created.transaction_inode,
+                ):
+                    raise ValueError("container control creation authority changed")
+                if ready is None:
+                    return
+                children = {
+                    name: stack.enter_context(
+                        acquire_directory_v5(
+                            target.path,
+                            (name,),
+                            create=False,
+                            expected_root_identity=target.identity,
+                        )
+                    )
+                    for name in _CONTROL_CHILDREN_V5
+                }
+                if directory_entry_names_v5(target) != _CONTROL_CHILDREN_V5:
+                    raise ValueError("container control layout is not closed")
+                config = children["config"]
+                config_stream, config_info = open_regular_in_directory_v5(
+                    config,
+                    _DOCKER_CONFIG_NAME_V5,
+                    writable=False,
+                )
+                stack.enter_context(config_stream)
+                config_identity = _hash_open_stream(
+                    config_stream,
+                    config_info,
+                    maximum_bytes=len(_DOCKER_CONFIG_CONTENT_V5),
+                )
+                expected = self._control_record(
+                    reservation,
+                    root=root,
+                    target=target,
+                    children=children,
+                    config_identity=config_identity,
+                )
+                if (
+                    ready != expected
+                    or directory_entry_names_v5(config) != (_DOCKER_CONFIG_NAME_V5,)
+                    or config_identity[2:]
+                    != (
+                        len(_DOCKER_CONFIG_CONTENT_V5),
+                        hashlib.sha256(_DOCKER_CONFIG_CONTENT_V5).hexdigest(),
+                    )
+                ):
+                    raise ValueError("container control readiness is foreign")
+                self._authenticate_executable()
+        except (OSError, ValueError):
+            raise ValueError("container control history is unauthenticated") from None
+
+    def authenticate_execution_history(
+        self,
+        authority: CandidateExecutionAuthorityV5,
+        *,
+        workspace_source_identity_sha256s: tuple[str, ...],
+        require_successful_output: bool = False,
+    ) -> bool:
+        """Authenticate one journal execution and return durable cleanup state."""
+
+        if (
+            type(authority) is not CandidateExecutionAuthorityV5
+            or authority.campaign_id != self._owner.campaign_id
+            or authority.round_index != self._owner.round_index
+            or authority.owner_token_sha256 != self._owner.owner_token_sha256
+        ):
+            raise ValueError("container execution history authority is invalid")
+        command_sha256 = authority.command_sha256
+        reservation = self._load_reservation(command_sha256, repair=False)
+        expected_lease_ids = tuple(
+            derive_execution_lease_id_v5(command_sha256, role) for role in ("evaluator_process", "container")
+        )
+        if (
+            reservation is None
+            or reservation.owner != self._owner
+            or reservation.request_sha256 != authority.request_sha256
+            or reservation.command_sha256 != command_sha256
+            or canonical_sha256_v5(
+                {
+                    "request_sha256": authority.request_sha256,
+                    "argv": reservation.command_argv,
+                }
+            )
+            != command_sha256
+            or reservation.container_name != self._container_name(command_sha256)
+            or reservation.control_relative_path != f"execution-{command_sha256[:24]}"
+            or reservation.output_mount_authority_sha256 != authority.output_mount_authority_sha256
+            or reservation.lease_ids != expected_lease_ids
+            or tuple(item.lease_id for item in authority.lease_payloads) != expected_lease_ids
+        ):
+            raise ValueError("container reservation differs from journal authority")
+        source_identity = self._mount_factory.authenticate_output_history(authority)
+        if (
+            type(workspace_source_identity_sha256s) is not tuple
+            or source_identity not in workspace_source_identity_sha256s
+        ):
+            raise ValueError("container output reservation lacks its journaled workspace")
+        panel_input = self._repository.load_typed_state(
+            namespace=_PANEL_INPUT_NAMESPACE_V5,
+            key=authority.request_sha256,
+            value_type=PanelExecutionRequestV5,
+            repair=False,
+        )
+        if authority.key.stage == "semantic_probe":
+            if panel_input is not None:
+                raise ValueError("semantic probe unexpectedly has PIT panel input")
+        elif (
+            panel_input is None
+            or panel_input.request_sha256 != authority.request_sha256
+            or panel_input.evaluator_contract != self._mount_factory.evaluator_contract
+            or panel_input.sandbox_profile != self._profile
+            or (
+                authority.key.stage == "quick_evaluation"
+                and (panel_input.episode.episode_ordinal is not None or panel_input.panel.purpose != "quick")
+            )
+            or (
+                authority.key.stage == "discovery_evaluation"
+                and (
+                    panel_input.episode.episode_ordinal != authority.key.episode_ordinal
+                    or panel_input.panel.purpose != "discovery"
+                )
+            )
+        ):
+            raise ValueError("container panel input differs from journal authority")
+
+        phases = {
+            phase: self._phase(command_sha256, phase, repair=False)
+            for phase in (
+                "launch_claim",
+                "created",
+                "start_claim",
+                "started",
+                "collected",
+            )
+        }
+        identity = self._container_identity(command_sha256, repair=False)
+        if (
+            (phases["created"] is not None and phases["launch_claim"] is None)
+            or (phases["start_claim"] is not None and phases["created"] is None)
+            or (phases["started"] is not None and phases["start_claim"] is None)
+            or (phases["collected"] is not None and phases["started"] is None)
+            or (identity is not None and phases["launch_claim"] is None)
+        ):
+            raise ValueError("container phase history is not a valid prefix")
+        observed_phases = tuple(
+            record for phase in ("created", "started", "collected") if (record := phases[phase]) is not None
+        )
+        if (
+            observed_phases
+            and identity is None
+            or any(record.container_identity_sha256 != identity.sha256 for record in observed_phases)
+        ):
+            raise ValueError("container phase identity differs from durable identity")
+        created = phases["created"]
+        started = phases["started"]
+        collected = phases["collected"]
+        if created is not None and (
+            created.lifecycle_status != "created" or created.network_namespace_status != "empty"
+        ):
+            raise ValueError("container creation phase is not closed")
+        if collected is not None and collected.lifecycle_status != "exited":
+            raise ValueError("container collection phase is not closed")
+        if started is not None and collected is not None:
+            same_exited_state = (
+                started.lifecycle_status == "exited"
+                and started.state_attestation_sha256 == collected.state_attestation_sha256
+            )
+            network_transition = started.network_attestation_sha256 == collected.network_attestation_sha256 or (
+                same_exited_state
+                and started.network_namespace_status == "private"
+                and collected.network_namespace_status == "empty"
+            )
+            if started.lifecycle_status == "exited" and (not same_exited_state or not network_transition):
+                raise ValueError("container exited namespace history changed")
+
+        terminal = self._terminal_record(command_sha256, repair=False)
+        if require_successful_output and (
+            terminal is None or terminal.status != "succeeded" or terminal.output_ref is None
+        ):
+            raise ValueError("journal execution evidence lacks its durable successful output")
+        if terminal is not None and (
+            terminal.request_sha256 != authority.request_sha256
+            or terminal.output_mount_authority_sha256 != authority.output_mount_authority_sha256
+            or terminal.status in {"succeeded", "nonzero_exit"}
+            and phases["collected"] is None
+            or terminal.status != "succeeded"
+            and terminal.output_ref is not None
+        ):
+            raise ValueError("container terminal differs from execution history")
+        if terminal is not None and terminal.output_ref is not None:
+            content = self._repository.load_binary_state(
+                namespace="container-output",
+                key=command_sha256,
+                reference=terminal.output_ref,
+                maximum_bytes=self._manifest.resources.evaluation_output_limit_bytes + 1,
+            )
+            if terminal.observed_byte_count != len(content):
+                raise ValueError("container terminal output length is invalid")
+
+        expected_cleanup = ExecutionCleanupRecordV5(
+            5,
+            self.executor_identity_sha256,
+            command_sha256,
+            self._owner.sha256,
+        )
+        container_absent = self._repository.load_typed_state(
+            namespace="container-cleanup-container-absent",
+            key=command_sha256,
+            value_type=ExecutionCleanupRecordV5,
+            repair=False,
+        )
+        cleanup = self._repository.load_typed_state(
+            namespace="container-cleanup",
+            key=command_sha256,
+            value_type=ExecutionCleanupRecordV5,
+            repair=False,
+        )
+        if (
+            container_absent is not None
+            and container_absent != expected_cleanup
+            or cleanup is not None
+            and (cleanup != expected_cleanup or container_absent != expected_cleanup)
+        ):
+            raise ValueError("container cleanup history is foreign")
+        cleanup_complete = cleanup is not None
+        self._authenticate_control_history_read_only(
+            reservation,
+            cleanup_complete=cleanup_complete,
+            container_absent=container_absent is not None,
+            require_ready=any(record is not None for record in phases.values()),
+        )
+        return cleanup_complete
 
     def cleanup(
         self,
@@ -3837,10 +4147,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             record = self._load_reservation(command_sha256)
             if record is None:
                 raise ValueError("container cleanup reservation is absent")
-            if (
-                record.owner != owner
-                or record.lease_ids != tuple(item.payload.lease_id for item in leases)
-            ):
+            if record.owner != owner or record.lease_ids != tuple(item.payload.lease_id for item in leases):
                 raise ValueError("container cleanup reservation is foreign")
             complete = self._repository.load_typed_state(
                 namespace="container-cleanup",
@@ -3931,21 +4238,27 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         )
                         if not self._successful(removed):
                             raise ValueError("owned container cleanup failed")
-                        if self._inspect_container(
+                        if (
+                            self._inspect_container(
+                                transaction=transaction,
+                                reservation=record,
+                                image_authority=image_authority,
+                                container_id=identity.container_id,
+                                allowed_statuses=("created", "running", "exited"),
+                            )
+                            is not None
+                        ):
+                            raise ValueError("owned container remains after cleanup")
+                    if (
+                        self._inspect_container(
                             transaction=transaction,
                             reservation=record,
                             image_authority=image_authority,
-                            container_id=identity.container_id,
+                            container_id=None,
                             allowed_statuses=("created", "running", "exited"),
-                        ) is not None:
-                            raise ValueError("owned container remains after cleanup")
-                    if self._inspect_container(
-                        transaction=transaction,
-                        reservation=record,
-                        image_authority=image_authority,
-                        container_id=None,
-                        allowed_statuses=("created", "running", "exited"),
-                    ) is not None:
+                        )
+                        is not None
+                    ):
                         raise ValueError("deterministic container name was replaced during cleanup")
                 self._repository.append_typed_state(
                     namespace="container-cleanup-container-absent",
@@ -4005,8 +4318,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         """Clean exact complete evaluator/container lease pairs by execution."""
 
         if type(leases) is not tuple or any(
-            type(item) is not OwnedLeaseV5
-            or item.payload.resource_kind not in {"evaluator_process", "container"}
+            type(item) is not OwnedLeaseV5 or item.payload.resource_kind not in {"evaluator_process", "container"}
             for item in leases
         ):
             raise ValueError("container cleanup lease collection is invalid")
@@ -4064,8 +4376,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             capability = lease.opaque_handle
             if (
                 type(lease) is not OwnedLeaseV5
-                or type(capability)
-                not in {_ExecutionLeaseCapabilityV5, _RecoveredExecutionLeaseCapabilityV5}
+                or type(capability) not in {_ExecutionLeaseCapabilityV5, _RecoveredExecutionLeaseCapabilityV5}
                 or capability.executor_identity_sha256 != self.executor_identity_sha256
                 or capability.role_kind != role
                 or capability.owner_sha256 != owner.sha256
@@ -4085,6 +4396,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         if len(command_digests) != 1:
             raise ValueError("container cleanup leases span multiple executions")
         return command_digests.pop()
+
 
 __all__ = [
     "ExecutionCleanupRecordV5",

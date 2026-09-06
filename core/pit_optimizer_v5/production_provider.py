@@ -15,6 +15,7 @@ from core.pit_optimizer_v5.provider import (
     AuthorizedRoleSlotV5,
     CompletionResultV5,
     ExistingPersistedRoleRequestV5,
+    FixtureRoleTerminalAuthorityV5,
     LedgerRoleTerminalAuthorityV5,
     ParsedRoleArtifactV5,
     RecoveredRoleTerminalV5,
@@ -55,10 +56,7 @@ class OpenRouterOneShotJsonCompletionV5:
         ledger: LocalRoleAuthorizationLedgerV5,
         api_key_environment_variable: str = "OPENROUTER_API_KEY",
     ) -> None:
-        if (
-            type(ledger) is not LocalRoleAuthorizationLedgerV5
-            or api_key_environment_variable != "OPENROUTER_API_KEY"
-        ):
+        if type(ledger) is not LocalRoleAuthorizationLedgerV5 or api_key_environment_variable != "OPENROUTER_API_KEY":
             raise ValueError("OpenRouter V5 gateway requires the concrete local role ledger")
         self._ledger = ledger
         self.api_key_environment_variable = api_key_environment_variable
@@ -492,6 +490,67 @@ class LocalRoleAuthorizationLedgerV5:
                     request=requests_by_slot[slot.slot_id],
                 )
         return ordered_reservations, ordered
+
+    def authenticate_role_invocations(
+        self,
+        packages: tuple[RoleInvocationPackageV5, ...],
+    ) -> None:
+        """Bind every journal terminal to the exact production ledger record."""
+
+        if type(packages) is not tuple or any(type(package) is not RoleInvocationPackageV5 for package in packages):
+            raise ValueError("local V5 role invocation collection is invalid")
+        reservations, terminals = self._load_verified()
+        if len(reservations) != len(terminals) or len(terminals) != len(packages):
+            raise ValueError("local V5 role ledger differs from journal completion state")
+        by_slot = {record.slot.slot_id: record for record in reservations}
+        terminal_by_slot = {record.receipt.slot_id: record for record in terminals}
+        ordered_packages: list[tuple[int, RoleInvocationPackageV5]] = []
+        provider = self._manifest.provider
+        assert provider is not None
+        for package in packages:
+            authority = package.terminal_authority
+            if type(authority) is FixtureRoleTerminalAuthorityV5:
+                raise ValueError("fixture role terminal is not production authority")
+            if type(authority) is not LedgerRoleTerminalAuthorityV5:
+                raise ValueError("role terminal lacks production ledger authority")
+            call = package.call
+            request = package.request
+            attempt = package.attempt
+            receipt = authority.receipt
+            reservation = by_slot.get(receipt.slot_id)
+            terminal = terminal_by_slot.get(receipt.slot_id)
+            slot_request = RoleSlotRequestV5(
+                request_sha256=request.sha256,
+                role=call.role,
+                attempt_kind=call.attempt_kind,
+                attempt_index=call.attempt_index,
+                model=provider.model,
+                max_output_tokens=request.max_output_tokens,
+                response_schema_sha256=request.response_schema_sha256,
+            )
+            persisted_call, persisted_request = self._repository.load_unique_role_request_entry_by_sha256(
+                request.sha256,
+            )
+            if (
+                call.campaign_id != self._manifest.campaign_id
+                or call.round_index > self._manifest.search.max_feedback_rounds
+                or persisted_call != call
+                or persisted_request != request
+                or reservation is None
+                or terminal is None
+                or reservation.slot.request != slot_request
+                or reservation.slot.slot_id != attempt.slot_id
+                or reservation.sha256 != terminal.reservation_sha256
+                or terminal.facts != attempt
+                or terminal.receipt != receipt
+                or terminal.artifact != package.artifact
+                or authority.call_key_sha256 != call.sha256
+                or receipt.attempt_facts_sha256 != attempt.sha256
+            ):
+                raise ValueError("journal role completion differs from production ledger")
+            ordered_packages.append((receipt.terminal_sequence, package))
+        if tuple(item[0] for item in ordered_packages) != tuple(range(1, len(packages) + 1)):
+            raise ValueError("journal role completion order differs from production ledger")
 
     def reserve_role_slot(self, request: RoleSlotRequestV5) -> AuthorizedRoleSlotV5:
         if type(request) is not RoleSlotRequestV5:
