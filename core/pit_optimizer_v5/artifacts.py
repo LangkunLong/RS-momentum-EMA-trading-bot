@@ -1182,6 +1182,13 @@ class LocalArtifactRepositoryV5:
             child_references=_extract_artifact_refs(primitive),
         )
 
+    def authenticate_raw_artifact(self, reference: ArtifactRefV5) -> AuthenticatedRawArtifactV5:
+        """Stream-authenticate one explicitly typed non-JSON campaign data edge."""
+
+        if type(reference) is not ArtifactRefV5:
+            raise ValueError("raw artifact authentication requires a V5 reference")
+        return self._authenticate_raw_campaign_edge(reference)
+
     def _create_only_with_status(
         self,
         relative_path: str,

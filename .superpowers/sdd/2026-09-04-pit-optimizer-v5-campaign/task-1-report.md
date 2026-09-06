@@ -131,3 +131,96 @@ exact authenticated bundle; artifacts from the parent/main worktree must not be 
 - Stage opening/terminal retirement execution remains intentionally owned by later confirmation and
   qualification tasks. Task 1 seals the domain, immutable pre-open snapshot, typed attempt contract,
   and binding rules but does not open either held-out plan.
+
+## Fix round 1 — authority-gap correction (2026-09-05)
+
+### Changed scope
+
+- Bound the confirmation and qualification retirement domains to their single canonical mutable
+  ledger locations, respectively `panels/confirmation-retirement.json` and
+  `panels/qualification-retirement.json`. The location is now included in the domain preimage and
+  immutable snapshot, and is reauthenticated by initialization, panel build, owner verification,
+  confirmation-attempt construction, and qualification-attempt construction. Substituting an
+  alternate relative path fails before bundle loading or ledger creation.
+- Initialization now authenticates both raw bundle authorities inside the public operation rather
+  than relying on its CLI caller. Panel build likewise authenticates the raw inputs before reading
+  their structure. Confirmation-attempt construction resolves its plan, manifest, discovery owner,
+  immutable snapshot, and live unopened ledger through the supplied repository.
+- Replaced the former one-prefix-row eligibility test with an explicit causal feature-history
+  contract. Every active occurrence must have its current ticker row and a continuous 252-session
+  lineage window over authenticated aliases; this includes the event plus 50 prior rows required by
+  ADV50 and the 252 rows required by distance from the annual high. A missing session anywhere in
+  the window fails eligibility before allocation.
+- Added the immutable `ScenarioGridV5` artifact contract for the attempt commitments' existing
+  `scenario_grid_ref`, plus the repository's public authenticated raw-edge adapter.
+- Qualification-attempt construction now resolves the confirmation outcome, confirmation attempt,
+  campaign manifest, discovery plan, held-out confirmation plan and raw panel, discovery champion
+  experiment/policy, evaluator, execution profile, sandbox, scenario grid, raw bundle/provenance,
+  baseline authority/policy, both same-panel evaluations, retirement terminal, and cleanup evidence.
+  It proves campaign, policy, panel, scenario, date, evaluator, sandbox, stage-domain, and snapshot
+  bindings. The confirmation baseline/candidate CAGRs are recomputed from authenticated equity
+  endpoints, the activity and strict-excess gate is rebuilt, and the stored outcome must equal that
+  rebuilt outcome exactly. Missing, relocated, cross-campaign, digest-substituted, or inconsistent
+  evidence fails closed.
+- Kept the ruled legacy raw-panel purpose vocabulary unchanged. Confirmation's raw spec remains
+  `qualification`; the authenticated `ConfirmationPanelPlanV5`, confirmation attempt, canonical
+  stage domain, and confirmation command remain the only stage authority. The confirmation evidence
+  graph now authenticates the raw spec only through that typed owner, so raw purpose cannot bypass
+  stage separation.
+- No test file was created, modified, read, or run. No provider, Docker, market-data evaluation,
+  Git materialization, replay, network, stage opening, or real artifact creation occurred.
+
+### Commands and observed output
+
+1. Fix-base preflight:
+
+   `git rev-parse HEAD` and `git branch --show-current`
+
+   Observed: `9a7665cb7273203b91641bdc0e16ce39cf1987df` on
+   `codex/pit-optimizer-v5-architecture`, with a clean starting tree.
+
+2. Bounded direct synthetic path/history command (in-memory values only; no test file):
+
+   `synthetic-fix1: alternate-ledger=rejected feature-history=252-continuous alias-continuity=yes gap-and-prefix=rejected`
+
+   This exercised alternate build-ledger and snapshot-path rejection, successful continuous coverage
+   across two aliases, and rejection of both one-prior-row and internally gapped histories.
+
+3. Bounded direct synthetic authenticated-ancestry command (1,700 synthetic lineages and in-memory
+   repository fake; no test file):
+
+   `synthetic-fix1-ancestry: valid-graph=accepted panel-owner=authenticated cross-campaign=rejected substituted-evidence=rejected gate=recomputed`
+
+   This exercised the complete qualification precondition graph, including typed confirmation panel
+   ownership, then independently substituted the discovery campaign identity and candidate evidence.
+
+4. Static/import checks:
+
+   - `python -m compileall -q core/pit_optimizer_v5`
+   - `python -c "import core.pit_optimizer_v5.panels; import core.pit_optimizer_v5.cli; import core.pit_optimizer_v5"`
+   - `python -m ruff check core/pit_optimizer_v5/panels.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/__init__.py`
+   - `git diff --check`
+
+   Observed: compile/import succeeded without output; Ruff reported `All checks passed!`; diff check
+   exited zero (Git emitted only the repository's existing LF-to-CRLF checkout notices).
+
+5. CLI ownership checks:
+
+   - `python -B -m core.pit_optimizer_v5.cli init-stage-ledgers --help`
+   - `python -B -m core.pit_optimizer_v5.cli build-panels --help`
+   - `python -B -m core.pit_optimizer_v5.cli verify-panels --help`
+
+   Observed: all three parsers loaded and returned exit zero. Initialization now accepts only
+   authenticated bundle/provenance references and the two canonical stage-ledger path arguments;
+   build and verify retain their prior closed V5 ownership arguments.
+
+### Remaining actual-bundle blocker and concerns
+
+The exact non-blocking runtime blocker remains unchanged: this isolated worktree does not contain
+the authenticated V5 schema-V3 three-universe PIT bundle and its matching authenticated
+price-identity provenance. The real ledgers and panel artifacts therefore were not initialized,
+built, or verified, and no parent/main-worktree artifact was accessed or substituted.
+
+Actual bundle-derived capacity and complete causal-history counts remain unobserved. The source now
+fails closed for fewer than 1,620 eligible disjoint lineages, for any active lineage lacking its full
+252-session feature window, or for any absent/inconsistent evidence edge in the confirmation graph.

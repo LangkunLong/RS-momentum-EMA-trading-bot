@@ -1028,6 +1028,24 @@ def initial_friction_grid_v5() -> tuple[FrictionScenario, ...]:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ScenarioGridV5:
+    """Immutable artifact form of the evaluator's complete friction grid."""
+
+    schema_version: Literal[5]
+    scenarios: tuple[FrictionScenario, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("scenario grid schema must be V5")
+        if self.scenarios != initial_friction_grid_v5():
+            raise ValueError("scenario grid differs from the canonical V5 friction authority")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self)
+
+
 def evaluator_source_sha256(source_sha256_by_path: Mapping[str, str]) -> str:
     """Derive the evaluator identity from the complete closed source map."""
 
@@ -1927,6 +1945,7 @@ __all__ = [
     "SandboxProfileV5",
     "SandboxResourceManifestV5",
     "ScenarioPanelEvaluationV5",
+    "ScenarioGridV5",
     "SearchCapabilitiesV5",
     "SliceMetricsV5",
     "StageOutcomeStatusV5",

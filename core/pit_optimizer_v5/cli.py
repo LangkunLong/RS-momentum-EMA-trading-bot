@@ -26,7 +26,6 @@ from core.pit_optimizer_v5.contracts import (
 from core.pit_optimizer_v5.panels import (
     build_panels_v5,
     initialize_stage_ledgers_v5,
-    load_bundle_panel_authority_v5,
     verify_panels_v5,
 )
 from core.pit_optimizer_v5.provider import (
@@ -974,8 +973,6 @@ def build_parser_v5() -> argparse.ArgumentParser:
             command.add_argument("--adapter-config-sha256")
     initialize = commands.add_parser("init-stage-ledgers", allow_abbrev=False)
     _add_panel_data_arguments_v5(initialize)
-    initialize.add_argument("--start-date", required=True)
-    initialize.add_argument("--end-date", required=True)
     initialize.add_argument("--confirmation-ledger-path", required=True)
     initialize.add_argument("--qualification-ledger-path", required=True)
     build = commands.add_parser("build-panels", allow_abbrev=False)
@@ -1065,18 +1062,10 @@ def dispatch_panel_cli_v5(
                 namespace.prices_provenance_sha256,
             )
             if namespace.command == "init-stage-ledgers":
-                lineages, _sessions, _eligibility = load_bundle_panel_authority_v5(
-                    repository=repository,
-                    pit_bundle_ref=pit_bundle_ref,
-                    prices_provenance_ref=prices_provenance_ref,
-                    start_date=namespace.start_date,
-                    end_date=namespace.end_date,
-                )
                 projection = initialize_stage_ledgers_v5(
                     repository=repository,
                     pit_bundle_ref=pit_bundle_ref,
                     prices_provenance_ref=prices_provenance_ref,
-                    lineages=lineages,
                     confirmation_ledger_path=namespace.confirmation_ledger_path,
                     qualification_ledger_path=namespace.qualification_ledger_path,
                 )
