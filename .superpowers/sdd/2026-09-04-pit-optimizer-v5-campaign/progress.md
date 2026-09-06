@@ -25,6 +25,19 @@
   wrong: a consumer that reads a raw panel without its required V5 owner could mislabel its stage,
   so V5 composition must require and verify the owning stage plan rather than infer stage from the
   legacy panel alone.
+- Ruling: the accepted `BaselineParentAuthorityV5.policy_revision_ref` remains the baseline-policy
+  revision descriptor at its exact existing path, because the evaluator and baseline authority bind
+  that reference/digest directly. The new policy-scope descriptor carries the clean source commit,
+  exact ordered editable paths/digests, and a child reference to that existing revision instead of
+  inserting an incompatible wrapper. Cost if wrong: a future baseline descriptor needing fields not
+  present in `PolicyRevisionIdentityV5` requires a schema migration rather than silently changing
+  the established reference semantics.
+- Ruling: Task 2 `render-command` is a manifest-only authorization/readiness projection, not a
+  runnable production `run` invocation, because the accepted `CampaignManifestV5` has no adapter
+  configuration reference and production execution rejects an undisclosed adapter. It must report
+  that adapter composition is pending rather than inventing command arguments or defaults. Cost if
+  wrong: a later explicit adapter authority must be added to a versioned manifest/command contract
+  before live execution; rendering cannot by itself launch a campaign.
 
 ## Pre-flight dependency and conflict scan
 
@@ -83,5 +96,10 @@
   content-free verification, and CLI ownership are implemented and directly verified with synthetic
   authorities. No tests were created, modified, or run. Actual panel emission remains deferred
   because this worktree has no authenticated V5 three-universe bundle.
-- Task 2: next — provider/search manifest contracts, subject to the same source-first and no-tests
-  ruling until the optimizer goal is reached.
+- Task 2: fix round 1/5 (2 addressed, 0 open; commits 3aa0c7d..9b99c12).
+- Task 2: complete (commits 6ab4a90..9b99c12, review clean). Canonical campaign/resource manifest
+  composition, complete graph-before-parse verification, clean-source capture, and content-free
+  readiness rendering are source-complete; real manifest emission awaits the authenticated bundle
+  and explicit adapter composition. Tests remain overridden by the user.
+- Task 3: next — provider-free fixture composition through the normal V5 feedback runtime, under the
+  same source-first and no-tests ruling.
