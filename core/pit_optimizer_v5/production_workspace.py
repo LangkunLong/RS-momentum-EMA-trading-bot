@@ -13,8 +13,8 @@ import stat
 import subprocess
 from typing import Literal
 
-from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
-from core.pit_optimizer_v5.contracts import canonical_sha256_v5
+from core.pit_optimizer_v5.artifacts import AdapterStateAuthorityV5, ArtifactMissingV5, LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_sha256_v5
 from core.pit_optimizer_v5.memory import ResourceLeasePayloadV5
 from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 from core.pit_optimizer_v5.production_fs import (
@@ -862,6 +862,30 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
     ) -> WorkspaceLeaseStateV5:
         """Authenticate reservation/readiness/retirement without locks or mutation."""
 
+        return self._authenticate_lease_history(payload, recover_retirement_index=False)
+
+    def recover_lease_history(self, payload: ResourceLeasePayloadV5) -> WorkspaceLeaseStateV5:
+        """Operational cleanup recovery may repair only an exact orphan retirement index."""
+
+        if (
+            type(payload) is not ResourceLeasePayloadV5
+            or re.fullmatch(
+                r"workspace\.[0-9a-f]{64}",
+                payload.lease_id,
+            )
+            is None
+        ):
+            raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
+        key = payload.lease_id.removeprefix("workspace.")
+        with self._repository.adapter_state_transition(namespace="workspace", key=key):
+            return self._authenticate_lease_history(payload, recover_retirement_index=True)
+
+    def _authenticate_lease_history(
+        self,
+        payload: ResourceLeasePayloadV5,
+        *,
+        recover_retirement_index: bool,
+    ) -> WorkspaceLeaseStateV5:
         if (
             type(payload) is not ResourceLeasePayloadV5
             or payload.resource_kind != "workspace"
@@ -879,10 +903,7 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         )
         created = self._created(key, repair=False)
         ready = self._ready(key, repair=False)
-        retirement = self._retirement(key, repair=False)
         if record is None:
-            if created is not None or ready is not None or retirement is not None:
-                raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
         lease = record.lease
         if (
@@ -919,6 +940,31 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             )
         ):
             raise WorkspaceDriverBoundaryErrorV5("foreign_lease")
+        try:
+            retirement = self._retirement(key, repair=False)
+        except ArtifactMissingV5 as exc:
+            expected = WorkspaceLeaseRetirementV5(5, self.driver_identity_sha256, payload.lease_id, lease.sha256)
+            expected_authority = AdapterStateAuthorityV5(
+                5,
+                "workspace-retirement",
+                key,
+                ArtifactRefV5(f"adapter-state/workspace-retirement/{key}.json", canonical_sha256_v5(expected)),
+            )
+            missing_index = ArtifactRefV5(
+                f"adapter-state-authority/workspace-retirement/{key}.json",
+                canonical_sha256_v5(expected_authority),
+            )
+            if (
+                not recover_retirement_index
+                or exc.reference != missing_index
+                or not self._workspace_child_absent(lease)
+            ):
+                raise
+            retirement = self._repository.recover_typed_state_index(
+                namespace="workspace-retirement",
+                key=key,
+                expected_value=expected,
+            )
         if retirement is None:
             if self._workspace_child_absent(lease):
                 return WorkspaceLeaseStateV5(lease, "removed", ready.workspace_identity_sha256)

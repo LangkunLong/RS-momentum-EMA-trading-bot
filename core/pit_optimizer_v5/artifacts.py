@@ -1384,6 +1384,40 @@ class LocalArtifactRepositoryV5:
         authority, _authority_reference = loaded_authority
         return self.load_typed_artifact(authority.value_ref, value_type=value_type)
 
+    def recover_typed_state_index(self, *, namespace: str, key: str, expected_value: T) -> T:
+        """Publish only an exact missing index for independently authorized existing bytes."""
+
+        safe_namespace = _safe_component(namespace, "typed state namespace")
+        safe_key = _safe_component(key, "typed state key")
+        if not is_dataclass(expected_value) or isinstance(expected_value, type):
+            raise ValueError("typed state recovery requires an exact dataclass value")
+        value_ref = ArtifactRefV5(
+            f"adapter-state/{safe_namespace}/{safe_key}.json",
+            hashlib.sha256(canonical_json_bytes_v5(expected_value)).hexdigest(),
+        )
+        authority = AdapterStateAuthorityV5(5, safe_namespace, safe_key, value_ref)
+        prior = self._load_adapter_state_authority(namespace=safe_namespace, key=safe_key)
+        if prior is not None and prior[0] != authority:
+            raise ArtifactSchemaFailureV5(prior[1])
+        # Never create value bytes: missing, changed, or noncanonical values fail
+        # before the sole permitted write, even when the authority is absent.
+        if self.load_typed_artifact(value_ref, value_type=type(expected_value)) != expected_value:
+            raise ArtifactSchemaFailureV5(value_ref)
+        if prior is None:
+            self._create_or_authenticate_typed(
+                f"adapter-state-authority/{safe_namespace}/{safe_key}.json",
+                authority,
+            )
+        observed = self.load_typed_state(
+            namespace=safe_namespace,
+            key=safe_key,
+            value_type=type(expected_value),
+            repair=False,
+        )
+        if observed != expected_value:
+            raise ArtifactSchemaFailureV5(value_ref)
+        return observed
+
     def append_binary_state(self, *, namespace: str, key: str, content: bytes) -> ArtifactRefV5:
         """Create or authenticate one exact bounded adapter-owned byte payload."""
 

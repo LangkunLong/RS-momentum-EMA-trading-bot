@@ -1121,8 +1121,10 @@ class CompositeOwnedCleanupV5:
         *,
         round_index: int,
     ) -> OwnedLeaseV5:
+        if round_index != self.owner.round_index:
+            raise ValueError("cleanup recovery round is foreign")
         if payload.resource_kind == "workspace":
-            state = self.materializer.driver.authenticate_lease_history(payload)
+            state = self.materializer.driver.recover_lease_history(payload)
             lease = state.lease
             if (
                 type(lease) is not WorkspaceLeaseV5
