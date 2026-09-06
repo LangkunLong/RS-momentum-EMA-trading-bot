@@ -2323,6 +2323,8 @@ class QualificationRetirementLedger:
         self,
         path: Path,
         qualification_retirement_domain_id: str,
+        *,
+        create_if_missing: bool = True,
     ) -> None:
         candidate = Path(path)
         if not candidate.is_absolute():
@@ -2331,6 +2333,8 @@ class QualificationRetirementLedger:
             qualification_retirement_domain_id,
             "qualification retirement domain ID",
         )
+        if type(create_if_missing) is not bool:
+            raise ValueError("qualification retirement creation authority is invalid")
         candidate.parent.mkdir(parents=True, exist_ok=True)
         if candidate.parent.is_symlink() or not candidate.parent.is_dir() or candidate.is_symlink():
             raise ValueError("qualification retirement ledger path is invalid")
@@ -2339,7 +2343,11 @@ class QualificationRetirementLedger:
         self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
         with _validation_file_lock(self._lock_path):
             if not self._path.exists():
+                if not create_if_missing:
+                    raise FileNotFoundError("qualification retirement ledger is absent")
                 self._initialize_unlocked()
+            if self._path.is_symlink() or not self._path.is_file():
+                raise ValueError("qualification retirement ledger is not a regular non-link file")
             self._read_records_unlocked()
 
     @staticmethod

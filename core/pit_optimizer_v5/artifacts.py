@@ -86,6 +86,7 @@ from core.pit_optimizer_v5.memory import (
     round_event_payload_primitive_v5,
 )
 from core.pit_optimizer_v5.probes import ProbeObservationV5, SemanticFingerprintV5
+from core.pit_optimizer_v5.search import ArchiveEntryV5, SearchStateV5
 from core.pit_optimizer_v5.provider import (
     AuthorizedRoleSlotV5,
     ExistingPersistedRoleRequestV5,
@@ -2901,6 +2902,49 @@ class LocalArtifactRepositoryV5:
         """Authenticate the current checkpoint without repairing or mutating it."""
 
         return self._load_checkpoint()
+
+    def load_frozen_discovery_champion(
+        self,
+        experiment_ref: ArtifactRefV5,
+    ) -> ArchiveEntryV5:
+        """Read the checkpoint-authenticated leading archive entry without repair."""
+
+        checkpoint = self._load_checkpoint()
+        if checkpoint is None or experiment_ref not in checkpoint.record_refs:
+            raise ArtifactSchemaFailureV5(experiment_ref)
+        archive_ref = ArtifactRefV5("archive.json", checkpoint.archive_sha256)
+        authenticated = self.authenticate(archive_ref)
+        primitive = _strict_json_object(authenticated.content, archive_ref)
+        item = _exact_keys(
+            primitive,
+            {"schema_version", "artifact_type", "generation", "record_refs", "projection"},
+            archive_ref,
+        )
+        refs = item["record_refs"]
+        if (
+            item["schema_version"] != 5
+            or item["artifact_type"] != "archive"
+            or type(refs) is not list
+        ):
+            raise ArtifactSchemaFailureV5(archive_ref)
+        try:
+            snapshot = ArchiveSnapshotV5(
+                generation=item["generation"],  # type: ignore[arg-type]
+                record_refs=tuple(_decode_dataclass(ArtifactRefV5, value) for value in refs),
+                projection=item["projection"],
+            )
+            state = _decode_dataclass(SearchStateV5, snapshot.projection)
+        except (TypeError, ValueError, ArithmeticError):
+            raise ArtifactSchemaFailureV5(archive_ref) from None
+        if (
+            canonical_json_bytes_v5(snapshot.to_primitive()) != authenticated.content
+            or snapshot.generation != checkpoint.generation
+            or snapshot.record_refs != checkpoint.record_refs
+            or not state.archive.entries
+            or state.archive.entries[0].experiment_record_ref != experiment_ref
+        ):
+            raise ArtifactSchemaFailureV5(archive_ref)
+        return state.archive.entries[0]
 
     def recover_projection(self, reducer: ArchiveReducerV5[T]) -> tuple[RepositoryCheckpointV5 | None, T]:
         checkpoint = self._load_checkpoint()

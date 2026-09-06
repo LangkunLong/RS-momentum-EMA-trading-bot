@@ -18,6 +18,13 @@ from core.pit_optimizer_evaluation import (
     QualificationRetirementLedger,
 )
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.memory import ExperimentRecordV5
+from core.pit_optimizer_v5.search import (
+    ArchiveEntryV5,
+    BaselineParentAuthorityV5,
+    baseline_parent_candidate_v5,
+    verified_campaign_cagr_pct,
+)
 from core.pit_optimizer_v5.contracts import (
     AnnualizedReturnTargetV5,
     ArtifactRefV5,
@@ -645,7 +652,11 @@ def _authenticate_initial_snapshot_v5(
     ledger_path: str,
 ) -> StageRetirementSnapshotV5:
     ledger_path_on_disk = _existing_stage_ledger_path_v5(repository.root, ledger_path)
-    ledger = QualificationRetirementLedger(ledger_path_on_disk, domain_id)
+    ledger = QualificationRetirementLedger(
+        ledger_path_on_disk,
+        domain_id,
+        create_if_missing=False,
+    )
     live = _snapshot_from_ledger_v5(
         stage=stage,
         ledger_relative_path=ledger_path,
@@ -909,6 +920,8 @@ def confirmation_attempt_commitment_v5(
     *,
     repository: object,
     attempt: ConfirmationAttemptCommitmentV5,
+    discovery_manifest_ref: ArtifactRefV5,
+    campaign_id: str,
     confirmation_plan_ref: ArtifactRefV5,
     confirmation_plan: ConfirmationPanelPlanV5,
     discovery_plan: CampaignPanelPlanV5,
@@ -932,6 +945,8 @@ def confirmation_attempt_commitment_v5(
     ) = _authenticate_confirmation_attempt_dependencies_v5(
         repository=repository,
         attempt=attempt,
+        discovery_manifest_ref=discovery_manifest_ref,
+        campaign_id=campaign_id,
     )
     if (
         type(confirmation_plan) is not ConfirmationPanelPlanV5
@@ -1028,6 +1043,7 @@ def _authenticate_live_unopened_stage_v5(
         ledger = QualificationRetirementLedger(
             ledger_path,
             expected.retirement_domain_id,
+            create_if_missing=False,
         )
         live = _snapshot_from_ledger_v5(
             stage=expected.stage,
@@ -1051,6 +1067,8 @@ def _authenticate_confirmation_attempt_dependencies_v5(
     *,
     repository: object,
     attempt: ConfirmationAttemptCommitmentV5,
+    discovery_manifest_ref: ArtifactRefV5,
+    campaign_id: str,
 ) -> tuple[
     ConfirmationPanelPlanV5,
     CampaignManifestV5,
@@ -1103,10 +1121,23 @@ def _authenticate_confirmation_attempt_dependencies_v5(
         attempt.retirement_ledger.preopen_snapshot_ref,
         StageRetirementSnapshotV5,
     )
+    baseline = _load_typed_artifact_v5(
+        repository,
+        attempt.baseline_authority_ref,
+        BaselineParentAuthorityV5,
+    )
     load_experiment = getattr(repository, "load_experiment", None)
     if not callable(load_experiment):
         raise ValueError("confirmation attempt requires authenticated experiment resolution")
     experiment = load_experiment(attempt.discovery_champion_experiment_ref)
+    if type(experiment) is not ExperimentRecordV5:
+        raise ValueError("confirmation champion must be an authenticated experiment record")
+    load_champion = getattr(repository, "load_frozen_discovery_champion", None)
+    if not callable(load_champion):
+        raise ValueError("confirmation attempt requires frozen archive resolution")
+    champion = load_champion(attempt.discovery_champion_experiment_ref)
+    if type(champion) is not ArchiveEntryV5:
+        raise ValueError("confirmation champion archive entry is invalid")
     load_panel = getattr(repository, "load_evaluation_panel_spec", None)
     if not callable(load_panel):
         raise ValueError("confirmation attempt requires authenticated panel resolution")
@@ -1114,7 +1145,6 @@ def _authenticate_confirmation_attempt_dependencies_v5(
     validate_episode_plan_panel_v5(confirmation_plan.episode, confirmation_panel)
     for reference in (
         attempt.discovery_champion_policy_ref,
-        attempt.baseline_authority_ref,
         manifest.baseline_policy_revision_ref,
         manifest.policy_scope_ref,
     ):
@@ -1126,6 +1156,18 @@ def _authenticate_confirmation_attempt_dependencies_v5(
         panel_plan=discovery_plan,
         evaluator_contract=evaluator,
     )
+    baseline_parent = baseline_parent_candidate_v5(
+        authority=baseline,
+        discovery_plan=discovery_plan,
+        evaluator_contract=evaluator,
+    )
+    if experiment.campaign_evidence is not None and experiment.policy_revision is not None:
+        verified_campaign_cagr_pct(
+            campaign=experiment.campaign_evidence,
+            discovery_plan=discovery_plan,
+            evaluator_contract=evaluator,
+            policy_identity_sha256=experiment.policy_revision.sha256,
+        )
     expected_domain = _stage_domain_id_v5(
         stage="confirmation",
         pit_bundle_ref=discovery_plan.pit_bundle_ref,
@@ -1135,13 +1177,18 @@ def _authenticate_confirmation_attempt_dependencies_v5(
     experiment_identity = getattr(experiment, "experiment_identity", None)
     experiment_policy = getattr(experiment, "policy_revision", None)
     if (
-        attempt.discovery_manifest_ref.sha256 != manifest.sha256
+        attempt.discovery_manifest_ref != discovery_manifest_ref
+        or manifest.campaign_id != campaign_id
+        or attempt.discovery_manifest_ref.sha256 != manifest.sha256
         or discovery_plan.confirmation_plan_sha256 != confirmation_plan.sha256
         or attempt.pit_bundle_ref != discovery_plan.pit_bundle_ref
         or attempt.prices_provenance_ref != discovery_plan.prices_provenance_ref
         or attempt.execution_profile_ref != manifest.execution_profile_ref
         or attempt.evaluator_contract_ref != manifest.evaluator_contract_ref
         or attempt.baseline_authority_ref != manifest.baseline_authority_ref
+        or manifest.baseline_policy_revision_ref != baseline.policy_revision_ref
+        or baseline.policy_revision.sha256 != evaluator.baseline_policy_revision_sha256
+        or baseline.source_bundle.sha256 != evaluator.baseline_source_bundle_sha256
         or attempt.sandbox_profile_ref != manifest.sandbox_profile_ref
         or execution.sha256 != evaluator.execution_profile_sha256
         or sandbox.sha256 != evaluator.sandbox_profile_sha256
@@ -1169,6 +1216,14 @@ def _authenticate_confirmation_attempt_dependencies_v5(
         != attempt.discovery_champion_policy_ref.sha256
         or getattr(experiment_policy, "sha256", None)
         != attempt.discovery_champion_policy_ref.sha256
+        or experiment.status != "evaluated"
+        or experiment.campaign_evidence is None
+        or experiment.policy_revision is None
+        or champion.experiment_record_ref != attempt.discovery_champion_experiment_ref
+        or champion.policy_revision != experiment.policy_revision
+        or champion.campaign != experiment.campaign_evidence
+        or champion.policy_identity_sha256 != attempt.discovery_champion_policy_ref.sha256
+        or champion.campaign_cagr_pct <= baseline_parent.campaign_cagr_pct
     ):
         raise ValueError("confirmation attempt dependency graph is inconsistent")
     return (

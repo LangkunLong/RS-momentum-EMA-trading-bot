@@ -303,3 +303,78 @@ PIT bundle and matching price-identity provenance in this isolated worktree. No 
 artifact was created and no parent/main-worktree artifact was inspected or reused. Actual eligible
 capacity/history counts and real filesystem ledger lifecycle remain unobserved until that bundle is
 available under the authorized V5 artifact root.
+
+## Fix round 3 — locked non-creation and frozen champion authority (2026-09-06)
+
+### Changed scope
+
+- Extended the established `QualificationRetirementLedger` with an explicit, default-preserving
+  `create_if_missing` authority. The existence decision now occurs while holding the ledger's
+  cross-process validation lock. Initialization retains creation authority; panel build and both
+  held-out attempt authentication paths pass `create_if_missing=False`. Disappearance before or
+  during lock acquisition therefore raises without invoking genesis creation. The locked path also
+  rechecks that the ledger is a regular non-symlink file before reading it.
+- Added read-only `LocalArtifactRepositoryV5.load_frozen_discovery_champion`. It authenticates the
+  current checkpoint and exact `archive.json`, decodes the canonical search-state projection,
+  requires the experiment reference in the checkpoint journal, and returns only the frozen leading
+  admitted archive entry. It does not invoke projection recovery or its repair/write behavior.
+- Confirmation commitment now takes the controller's expected discovery-manifest reference and
+  campaign ID explicitly and requires the attempt's authenticated manifest to equal both. This
+  rejects otherwise compatible manifests with changed campaign IDs or policy scopes.
+- Baseline authority is decoded as `BaselineParentAuthorityV5`. Its policy/source references,
+  evaluator baseline policy/source identities, and complete four-episode discovery campaign
+  evidence are validated through `baseline_parent_candidate_v5` against the exact plan/evaluator.
+- The champion must be an authenticated `ExperimentRecordV5` with status `evaluated`, complete
+  campaign evidence, and a policy revision. Its evidence is reverified against the exact
+  plan/evaluator. The record must correspond to the frozen leading `ArchiveEntryV5`, bind the
+  committed policy, and strictly outperform the authenticated baseline campaign. A merely
+  digest-matching, non-admitted, stale, zero-activity, or baseline-losing record cannot open
+  confirmation.
+- No tests/test files, provider, Docker, market data, network, Git materialization, replay, push,
+  merge, real ledger, or real panel artifact were used.
+
+### Commands and observed output
+
+1. Preflight: `git status --short --branch`, `git rev-parse HEAD`.
+
+   Observed: clean `codex/pit-optimizer-v5-architecture` at
+   `89664eea3d9b6fe33499c1b00e23b49399757620`.
+
+2. Bounded lock-boundary race fake in an exact disposable worktree directory:
+
+   `synthetic-fix3-race: disappeared-at-lock-boundary=rejected genesis-not-recreated=yes`
+
+   The fake began with an existing ledger path, forced it to disappear exactly upon validation-lock
+   acquisition, and invoked `QualificationRetirementLedger(..., create_if_missing=False)`. It raised
+   `FileNotFoundError`, did not recreate the ledger, and the disposable directory was removed and
+   verified absent.
+
+3. Bounded typed dependency fake:
+
+   `synthetic-fix3-graph: valid=accepted cross-campaign-id=rejected baseline-authority=rejected non-admitted-champion=rejected`
+
+   The valid graph used typed baseline campaign/source/policy authority, complete discovery evidence,
+   an evaluated champion record, and its leading frozen archive entry. Independent substitutions of
+   campaign ID/manifest, baseline authority, and archive admission correspondence failed closed. The
+   valid champion's campaign CAGR strictly exceeded the baseline.
+
+4. Final source verification:
+
+   - `python -m compileall -q core/pit_optimizer_evaluation.py core/pit_optimizer_v5`
+   - `python -c "import core.pit_optimizer_v5.panels; import core.pit_optimizer_v5.artifacts; import core.pit_optimizer_v5.cli"`
+   - `python -m ruff check core/pit_optimizer_evaluation.py core/pit_optimizer_v5/panels.py core/pit_optimizer_v5/artifacts.py`
+   - `python -B -m core.pit_optimizer_v5.cli init-stage-ledgers --help`
+   - `python -B -m core.pit_optimizer_v5.cli build-panels --help`
+   - `python -B -m core.pit_optimizer_v5.cli verify-panels --help`
+   - `git diff --check`
+
+   Observed: compile/import and all CLI parsers exited zero; Ruff reported `All checks passed!`;
+   diff checking exited zero with only the repository's LF-to-CRLF checkout notices.
+
+### Remaining blocker and concerns
+
+The exact non-blocking runtime blocker remains the absent authenticated V5 schema-V3 three-universe
+PIT bundle and matching price-identity provenance in this isolated worktree. Consequently actual
+capacity/history, real checkpoint/archive decoding, and the filesystem ledger lifecycle have not
+been exercised against campaign artifacts. All adapters fail closed until those exact authenticated
+authorities exist; no parent/main-worktree artifact was inspected or substituted.
