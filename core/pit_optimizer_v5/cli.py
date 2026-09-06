@@ -12,6 +12,7 @@ from typing import Callable, Literal, Protocol, Sequence, runtime_checkable
 
 from core.pit_optimizer_v5.artifacts import ArtifactRepositoryFailureV5, LocalArtifactRepositoryV5
 from core.pit_optimizer_v5.contracts import (
+    AnnualizedReturnTargetV5,
     ArtifactRefV5,
     CampaignManifestV5,
     CampaignPanelPlanV5,
@@ -21,6 +22,12 @@ from core.pit_optimizer_v5.contracts import (
     canonical_sha256_v5,
     validate_campaign_manifest_bindings_v5,
     validate_sandbox_profile_resources_v5,
+)
+from core.pit_optimizer_v5.panels import (
+    build_panels_v5,
+    initialize_stage_ledgers_v5,
+    load_bundle_panel_authority_v5,
+    verify_panels_v5,
 )
 from core.pit_optimizer_v5.provider import (
     AuthorizedRoleRunnerV5,
@@ -79,6 +86,7 @@ from core.pit_optimizer_v5.workspace import (
 
 V5CommandName = Literal["run", "resume", "verify-run", "summarize", "import-v4-candidate"]
 _COMMANDS = frozenset({"run", "resume", "verify-run", "summarize", "import-v4-candidate"})
+_PANEL_COMMANDS = frozenset({"init-stage-ledgers", "build-panels", "verify-panels"})
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _FAILURE_REASONS = frozenset(
     {
@@ -964,7 +972,38 @@ def build_parser_v5() -> argparse.ArgumentParser:
         if name in {"run", "resume", "verify-run", "summarize"}:
             command.add_argument("--adapter-config-path")
             command.add_argument("--adapter-config-sha256")
+    initialize = commands.add_parser("init-stage-ledgers", allow_abbrev=False)
+    _add_panel_data_arguments_v5(initialize)
+    initialize.add_argument("--start-date", required=True)
+    initialize.add_argument("--end-date", required=True)
+    initialize.add_argument("--confirmation-ledger-path", required=True)
+    initialize.add_argument("--qualification-ledger-path", required=True)
+    build = commands.add_parser("build-panels", allow_abbrev=False)
+    _add_panel_data_arguments_v5(build)
+    build.add_argument("--start-date", required=True)
+    build.add_argument("--end-date", required=True)
+    build.add_argument("--partition-seed", required=True)
+    build.add_argument("--target-pct", required=True)
+    build.add_argument("--confirmation-ledger-path", required=True)
+    build.add_argument("--qualification-ledger-path", required=True)
+    build.add_argument("--discovery-output-path", required=True)
+    build.add_argument("--confirmation-output-path", required=True)
+    build.add_argument("--qualification-output-path", required=True)
+    verify = commands.add_parser("verify-panels", allow_abbrev=False)
+    verify.add_argument("--artifact-root", required=True)
+    for prefix in ("discovery", "confirmation", "qualification"):
+        verify.add_argument(f"--{prefix}-plan-path", required=True)
+        verify.add_argument(f"--{prefix}-plan-sha256", required=True)
+    verify.add_argument("--keep-held-out-sealed", action="store_true")
     return parser
+
+
+def _add_panel_data_arguments_v5(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--artifact-root", required=True)
+    parser.add_argument("--pit-bundle-path", required=True)
+    parser.add_argument("--pit-bundle-sha256", required=True)
+    parser.add_argument("--prices-provenance-path", required=True)
+    parser.add_argument("--prices-provenance-sha256", required=True)
 
 
 def parse_v5_args(argv: Sequence[str]) -> V5CliRequest:
@@ -992,6 +1031,91 @@ def parse_v5_args(argv: Sequence[str]) -> V5CliRequest:
     )
 
 
+def dispatch_panel_cli_v5(
+    argv: Sequence[str],
+    *,
+    emit: Callable[[str], None] = print,
+) -> int:
+    """Own panel build/verification without exposing held-out content."""
+
+    try:
+        namespace = build_parser_v5().parse_args(tuple(argv))
+        if namespace.command not in _PANEL_COMMANDS:
+            raise V5CliFailure("invalid_request")
+        repository = LocalArtifactRepositoryV5(Path(namespace.artifact_root))
+        if namespace.command == "verify-panels":
+            if not namespace.keep_held_out_sealed:
+                raise V5CliFailure("invalid_request")
+            projection = verify_panels_v5(
+                repository=repository,
+                discovery_ref=ArtifactRefV5(namespace.discovery_plan_path, namespace.discovery_plan_sha256),
+                confirmation_ref=ArtifactRefV5(
+                    namespace.confirmation_plan_path,
+                    namespace.confirmation_plan_sha256,
+                ),
+                qualification_ref=ArtifactRefV5(
+                    namespace.qualification_plan_path,
+                    namespace.qualification_plan_sha256,
+                ),
+            )
+        else:
+            pit_bundle_ref = ArtifactRefV5(namespace.pit_bundle_path, namespace.pit_bundle_sha256)
+            prices_provenance_ref = ArtifactRefV5(
+                namespace.prices_provenance_path,
+                namespace.prices_provenance_sha256,
+            )
+            if namespace.command == "init-stage-ledgers":
+                lineages, _sessions, _eligibility = load_bundle_panel_authority_v5(
+                    repository=repository,
+                    pit_bundle_ref=pit_bundle_ref,
+                    prices_provenance_ref=prices_provenance_ref,
+                    start_date=namespace.start_date,
+                    end_date=namespace.end_date,
+                )
+                projection = initialize_stage_ledgers_v5(
+                    repository=repository,
+                    pit_bundle_ref=pit_bundle_ref,
+                    prices_provenance_ref=prices_provenance_ref,
+                    lineages=lineages,
+                    confirmation_ledger_path=namespace.confirmation_ledger_path,
+                    qualification_ledger_path=namespace.qualification_ledger_path,
+                )
+            else:
+                _plans, references = build_panels_v5(
+                    repository=repository,
+                    pit_bundle_ref=pit_bundle_ref,
+                    prices_provenance_ref=prices_provenance_ref,
+                    start_date=namespace.start_date,
+                    end_date=namespace.end_date,
+                    partition_seed=namespace.partition_seed,
+                    target=AnnualizedReturnTargetV5.from_text(namespace.target_pct),
+                    confirmation_ledger_path=namespace.confirmation_ledger_path,
+                    qualification_ledger_path=namespace.qualification_ledger_path,
+                    discovery_output_path=namespace.discovery_output_path,
+                    confirmation_output_path=namespace.confirmation_output_path,
+                    qualification_output_path=namespace.qualification_output_path,
+                )
+                projection = {
+                    "schema_version": 5,
+                    "status": "created",
+                    "discovery_plan_sha256": references[0].sha256,
+                    "confirmation_plan_sha256": references[1].sha256,
+                    "qualification_plan_sha256": references[2].sha256,
+                }
+        emit("PIT_OPTIMIZER_V5_PANELS=" + canonical_json_bytes_v5(projection).decode("utf-8"))
+        return 0
+    except SystemExit:
+        raise
+    except BaseException:
+        emit(
+            "PIT_OPTIMIZER_V5_PANELS="
+            + canonical_json_bytes_v5(
+                {"schema_version": 5, "status": "failed", "reason": "panel_command_failed"}
+            ).decode("utf-8")
+        )
+        return 2
+
+
 def dispatch_v5_cli(
     argv: Sequence[str],
     *,
@@ -999,6 +1123,8 @@ def dispatch_v5_cli(
     emit: Callable[[str], None] = print,
 ) -> int:
     """Parse and dispatch one command; dependency construction stays outside parsing."""
+    if argv and argv[0] in _PANEL_COMMANDS:
+        return dispatch_panel_cli_v5(argv, emit=emit)
     command: V5CommandName = (
         argv[0]  # type: ignore[assignment]
         if argv and argv[0] in _COMMANDS
@@ -1051,5 +1177,6 @@ __all__ = [
     "V5CommandServices",
     "build_parser_v5",
     "dispatch_v5_cli",
+    "dispatch_panel_cli_v5",
     "parse_v5_args",
 ]

@@ -622,6 +622,307 @@ class CampaignPanelPlanV5:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfirmationPanelPlanV5:
+    schema_version: Literal[5]
+    pit_bundle_sha256: str
+    partition_seed_sha256: str
+    target_sha256: str
+    confirmation_retirement_domain_id: str
+    confirmation_ledger_snapshot_sha256: str
+    episode: EpisodePlanV5
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("confirmation panel plan schema must be V5")
+        for value, label in (
+            (self.pit_bundle_sha256, "confirmation PIT bundle SHA-256"),
+            (self.partition_seed_sha256, "confirmation partition seed SHA-256"),
+            (self.target_sha256, "confirmation target SHA-256"),
+            (self.confirmation_retirement_domain_id, "confirmation retirement domain ID"),
+            (self.confirmation_ledger_snapshot_sha256, "confirmation ledger snapshot SHA-256"),
+        ):
+            _digest(value, label)
+        if type(self.episode) is not EpisodePlanV5 or self.episode.episode_ordinal is not None:
+            raise ValueError("confirmation plan must contain one unnumbered V5 episode")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self)
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationPanelPlanV5:
+    schema_version: Literal[5]
+    pit_bundle_sha256: str
+    partition_seed_sha256: str
+    target: AnnualizedReturnTargetV5
+    qualification_retirement_domain_id: str
+    qualification_ledger_snapshot_sha256: str
+    episode: EpisodePlanV5
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("qualification panel plan schema must be V5")
+        for value, label in (
+            (self.pit_bundle_sha256, "qualification PIT bundle SHA-256"),
+            (self.partition_seed_sha256, "qualification partition seed SHA-256"),
+            (self.qualification_retirement_domain_id, "qualification retirement domain ID"),
+            (self.qualification_ledger_snapshot_sha256, "qualification ledger snapshot SHA-256"),
+        ):
+            _digest(value, label)
+        if type(self.target) is not AnnualizedReturnTargetV5:
+            raise ValueError("qualification target must use the V5 contract")
+        if type(self.episode) is not EpisodePlanV5 or self.episode.episode_ordinal is not None:
+            raise ValueError("qualification plan must contain one unnumbered V5 episode")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self)
+
+
+@dataclass(frozen=True, slots=True)
+class RetirementLedgerLocatorV5:
+    relative_path: str
+    preopen_snapshot_ref: ArtifactRefV5
+
+    def __post_init__(self) -> None:
+        if type(self.preopen_snapshot_ref) is not ArtifactRefV5:
+            raise ValueError("retirement ledger snapshot reference is invalid")
+        # The mutable ledger uses the exact containment/canonicalization grammar
+        # of an immutable artifact reference without pretending its digest is
+        # stable after the stage is opened.
+        ArtifactRefV5(self.relative_path, self.preopen_snapshot_ref.sha256)
+
+
+def _require_artifact_refs_v5(*references: ArtifactRefV5) -> None:
+    if any(type(item) is not ArtifactRefV5 for item in references):
+        raise ValueError("stage commitment contains an invalid artifact reference")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationAttemptCommitmentV5:
+    schema_version: Literal[5]
+    attempt_id: str
+    confirmation_plan_ref: ArtifactRefV5
+    discovery_manifest_ref: ArtifactRefV5
+    discovery_champion_policy_ref: ArtifactRefV5
+    discovery_champion_experiment_ref: ArtifactRefV5
+    pit_bundle_ref: ArtifactRefV5
+    prices_provenance_ref: ArtifactRefV5
+    execution_profile_ref: ArtifactRefV5
+    evaluator_contract_ref: ArtifactRefV5
+    scenario_grid_ref: ArtifactRefV5
+    baseline_authority_ref: ArtifactRefV5
+    sandbox_profile_ref: ArtifactRefV5
+    retirement_domain_id: str
+    retirement_ledger: RetirementLedgerLocatorV5
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("confirmation attempt schema must be V5")
+        _text(self.attempt_id, "confirmation attempt ID")
+        _require_artifact_refs_v5(
+            self.confirmation_plan_ref,
+            self.discovery_manifest_ref,
+            self.discovery_champion_policy_ref,
+            self.discovery_champion_experiment_ref,
+            self.pit_bundle_ref,
+            self.prices_provenance_ref,
+            self.execution_profile_ref,
+            self.evaluator_contract_ref,
+            self.scenario_grid_ref,
+            self.baseline_authority_ref,
+            self.sandbox_profile_ref,
+        )
+        _digest(self.retirement_domain_id, "confirmation attempt retirement domain ID")
+        if type(self.retirement_ledger) is not RetirementLedgerLocatorV5:
+            raise ValueError("confirmation attempt retirement ledger is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self)
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationAttemptCommitmentV5:
+    schema_version: Literal[5]
+    attempt_id: str
+    qualification_plan_ref: ArtifactRefV5
+    confirmation_outcome_ref: ArtifactRefV5
+    confirmed_policy_ref: ArtifactRefV5
+    pit_bundle_ref: ArtifactRefV5
+    prices_provenance_ref: ArtifactRefV5
+    execution_profile_ref: ArtifactRefV5
+    evaluator_contract_ref: ArtifactRefV5
+    scenario_grid_ref: ArtifactRefV5
+    baseline_authority_ref: ArtifactRefV5
+    sandbox_profile_ref: ArtifactRefV5
+    retirement_domain_id: str
+    retirement_ledger: RetirementLedgerLocatorV5
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("qualification attempt schema must be V5")
+        _text(self.attempt_id, "qualification attempt ID")
+        _require_artifact_refs_v5(
+            self.qualification_plan_ref,
+            self.confirmation_outcome_ref,
+            self.confirmed_policy_ref,
+            self.pit_bundle_ref,
+            self.prices_provenance_ref,
+            self.execution_profile_ref,
+            self.evaluator_contract_ref,
+            self.scenario_grid_ref,
+            self.baseline_authority_ref,
+            self.sandbox_profile_ref,
+        )
+        _digest(self.retirement_domain_id, "qualification attempt retirement domain ID")
+        if type(self.retirement_ledger) is not RetirementLedgerLocatorV5:
+            raise ValueError("qualification attempt retirement ledger is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self)
+
+
+StageOutcomeStatusV5 = Literal["completed", "failed", "timed_out", "cancelled"]
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationOutcomeV5:
+    schema_version: Literal[5]
+    attempt_ref: ArtifactRefV5
+    status: StageOutcomeStatusV5
+    confirmed_policy_ref: ArtifactRefV5
+    baseline_evidence_ref: ArtifactRefV5 | None
+    candidate_evidence_ref: ArtifactRefV5 | None
+    baseline_cagr_pct: Decimal | None
+    candidate_cagr_pct: Decimal | None
+    candidate_excess_cagr_pct: Decimal | None
+    behaviorally_active: bool | None
+    eligible_to_request_qualification: bool
+    retirement_terminal_ref: ArtifactRefV5
+    cleanup_evidence_ref: ArtifactRefV5
+    provider_calls: Literal[0]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("confirmation outcome schema must be V5")
+        if self.status not in {"completed", "failed", "timed_out", "cancelled"}:
+            raise ValueError("confirmation outcome status is invalid")
+        _require_artifact_refs_v5(
+            self.attempt_ref,
+            self.confirmed_policy_ref,
+            self.retirement_terminal_ref,
+            self.cleanup_evidence_ref,
+        )
+        if type(self.provider_calls) is not int or self.provider_calls != 0:
+            raise ValueError("confirmation must make zero provider calls")
+        if self.status != "completed":
+            if any(
+                item is not None
+                for item in (
+                    self.baseline_evidence_ref,
+                    self.candidate_evidence_ref,
+                    self.baseline_cagr_pct,
+                    self.candidate_cagr_pct,
+                    self.candidate_excess_cagr_pct,
+                    self.behaviorally_active,
+                )
+            ) or self.eligible_to_request_qualification is not False:
+                raise ValueError("non-completed confirmation must carry null metrics and a false gate")
+            return
+        if type(self.baseline_evidence_ref) is not ArtifactRefV5 or type(self.candidate_evidence_ref) is not ArtifactRefV5:
+            raise ValueError("completed confirmation requires authenticated evidence references")
+        baseline = _decimal(self.baseline_cagr_pct, "confirmation baseline CAGR")
+        candidate = _decimal(self.candidate_cagr_pct, "confirmation candidate CAGR")
+        excess = _decimal(self.candidate_excess_cagr_pct, "confirmation excess CAGR")
+        if excess != candidate - baseline:
+            raise ValueError("confirmation excess CAGR must be recomputed from same-panel evidence")
+        if type(self.behaviorally_active) is not bool:
+            raise ValueError("completed confirmation requires behavioral activity evidence")
+        expected = self.behaviorally_active and candidate > baseline
+        if type(self.eligible_to_request_qualification) is not bool or self.eligible_to_request_qualification != expected:
+            raise ValueError("confirmation qualification gate differs from recomputed evidence")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self)
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationOutcomeV5:
+    schema_version: Literal[5]
+    attempt_ref: ArtifactRefV5
+    status: StageOutcomeStatusV5
+    qualified_policy_ref: ArtifactRefV5
+    baseline_evidence_ref: ArtifactRefV5 | None
+    candidate_evidence_ref: ArtifactRefV5 | None
+    target_pct: Decimal
+    baseline_cagr_pct: Decimal | None
+    candidate_cagr_pct: Decimal | None
+    candidate_excess_cagr_pct: Decimal | None
+    target_reached: bool
+    baseline_beaten: bool
+    qualified: bool
+    retirement_terminal_ref: ArtifactRefV5
+    cleanup_evidence_ref: ArtifactRefV5
+    provider_calls: Literal[0]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("qualification outcome schema must be V5")
+        if self.status not in {"completed", "failed", "timed_out", "cancelled"}:
+            raise ValueError("qualification outcome status is invalid")
+        _require_artifact_refs_v5(
+            self.attempt_ref,
+            self.qualified_policy_ref,
+            self.retirement_terminal_ref,
+            self.cleanup_evidence_ref,
+        )
+        target = _decimal(self.target_pct, "qualification target")
+        if target <= 0:
+            raise ValueError("qualification target must be positive")
+        if type(self.provider_calls) is not int or self.provider_calls != 0:
+            raise ValueError("qualification must make zero provider calls")
+        if self.status != "completed":
+            if any(
+                item is not None
+                for item in (
+                    self.baseline_evidence_ref,
+                    self.candidate_evidence_ref,
+                    self.baseline_cagr_pct,
+                    self.candidate_cagr_pct,
+                    self.candidate_excess_cagr_pct,
+                )
+            ) or any((self.target_reached, self.baseline_beaten, self.qualified)):
+                raise ValueError("non-completed qualification must carry null metrics and false gates")
+            return
+        if type(self.baseline_evidence_ref) is not ArtifactRefV5 or type(self.candidate_evidence_ref) is not ArtifactRefV5:
+            raise ValueError("completed qualification requires authenticated evidence references")
+        baseline = _decimal(self.baseline_cagr_pct, "qualification baseline CAGR")
+        candidate = _decimal(self.candidate_cagr_pct, "qualification candidate CAGR")
+        excess = _decimal(self.candidate_excess_cagr_pct, "qualification excess CAGR")
+        if excess != candidate - baseline:
+            raise ValueError("qualification excess CAGR must be recomputed from same-panel evidence")
+        expected_target = candidate >= target
+        expected_baseline = candidate > baseline
+        if (
+            type(self.target_reached) is not bool
+            or type(self.baseline_beaten) is not bool
+            or type(self.qualified) is not bool
+            or self.target_reached != expected_target
+            or self.baseline_beaten != expected_baseline
+            or self.qualified != (expected_target and expected_baseline)
+        ):
+            raise ValueError("qualification gates differ from recomputed evidence")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceCapabilitiesV5:
     max_parallel_evaluations: int = 2
     evaluation_cpu_limit: Decimal = Decimal("1")
@@ -1594,6 +1895,9 @@ __all__ = [
     "CampaignEvidenceV5",
     "CampaignManifestV5",
     "CampaignPanelPlanV5",
+    "ConfirmationAttemptCommitmentV5",
+    "ConfirmationOutcomeV5",
+    "ConfirmationPanelPlanV5",
     "CriticArtifactV5",
     "CriticReviewV5",
     "DistributionSummaryV5",
@@ -1612,7 +1916,11 @@ __all__ = [
     "MAX_ROLE_EVIDENCE_ITEMS_V5",
     "PanelEvaluationV5",
     "ProviderCapabilitiesV5",
+    "QualificationAttemptCommitmentV5",
+    "QualificationOutcomeV5",
+    "QualificationPanelPlanV5",
     "ResourceCapabilitiesV5",
+    "RetirementLedgerLocatorV5",
     "RollingReturnV5",
     "RoleEvidenceItemV5",
     "RoleEvidenceV5",
@@ -1621,6 +1929,7 @@ __all__ = [
     "ScenarioPanelEvaluationV5",
     "SearchCapabilitiesV5",
     "SliceMetricsV5",
+    "StageOutcomeStatusV5",
     "ValidationResultV5",
     "canonical_json_bytes_v5",
     "canonical_primitive_v5",

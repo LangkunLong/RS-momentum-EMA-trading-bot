@@ -1,0 +1,83 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-09-04-pit-optimizer-v5-campaign.md
+
+## Controller constraints and rulings
+
+- User override: do not create, modify, or run tests until the optimizer goal is reached. Every test
+  step in this plan is replaced by bounded deterministic direct fakes plus compile, Ruff, import,
+  coupling, and diff verification. Cost if wrong: less conventional regression coverage before the
+  first real provider-free campaign, offset by end-to-end contract fakes and later runtime evidence.
+- Keep this work local and confidential. No push, merge, upload, live provider call, Docker run,
+  Git materialization, PIT market-data evaluation, confirmation/qualification opening, or replay in
+  source implementation tasks.
+- The currently available worktree artifact cache does not contain a V5 authenticated three-universe
+  bundle. Implement Tasks 1–3 against closed contracts and synthetic direct authorities; actual local
+  panel emission/mechanics evidence waits for the bundle and does not authorize hidden-data reuse.
+- Current accepted V5 identity and CLI conventions supersede stale example spellings in this plan:
+  commands consume canonical artifact roots plus authenticated relative path/digest references, and
+  typed raw data edges remain selected only by exact manifest/plan authority.
+- Task 4 must stop for approval of the exact rendered discovery manifest even though earlier broad
+  call allowances exist. Tasks 6, 7, and 8 retain their separate confirmation, qualification, and
+  full-replay decisions.
+- Ruling: retain the legacy `EvaluationPanelSpec` purpose vocabulary. Mechanics serializes through
+  the existing `quick` purpose and confirmation through the existing `qualification` purpose; the
+  typed owning V5 campaign/stage plan, authenticated commitment, and command determine the actual
+  stage. This avoids widening a legacy allocation/evaluator surface solely for V5 labels. Cost if
+  wrong: a consumer that reads a raw panel without its required V5 owner could mislabel its stage,
+  so V5 composition must require and verify the owning stage plan rather than infer stage from the
+  legacy panel alone.
+
+## Pre-flight dependency and conflict scan
+
+| Tasks | Producer → consumer / shared surface | Finding or ruling |
+|---|---|---|
+| 1 → 2 | `CampaignPanelPlanV5`, held-out commitments; shared contracts/CLI | Compatible; Task 2 references exact Task 1 artifacts. |
+| 1 → 3 | panels and CLI | Compatible; fixture composition must use exact serialized panel specs. |
+| 1 → 4 | discovery and sealed held-out plan commitments | Compatible; verification exposes only content-free commitments. |
+| 1 → 5 | four discovery episodes/security cohorts | Compatible; runtime canonicalizes episode ordinal. |
+| 1 → 6 | confirmation plan and retirement domain | Compatible; opening stays outside search memory. |
+| 1 → 7 | qualification plan and retirement domain | Compatible; one-use stage remains sealed. |
+| 1 → 8 | panel/evaluator identity ancestry | Compatible through qualification outcome graph. |
+| 2 → 3 | provider-free manifest; shared CLI | Compatible; no provider capability in fixture mode. |
+| 2 → 4 | discovery manifest builder/verification | Compatible; exact operator allowance is manifest data. |
+| 2 → 5 | manifest search/provider/resource limits | Compatible; runtime may not inflate limits. |
+| 2 → 6 | evaluator/baseline/scenario/sandbox references | Compatible; confirmation reuses exact authorities. |
+| 2 → 7 | evaluator/baseline/scenario/sandbox references | Compatible; qualification reuses exact authorities. |
+| 2 → 8 | manifest and dependency graph | Compatible; readiness is content-free and read-only. |
+| 3 → 4 | completed provider-free proof gate | Compatible; Task 4 cannot bypass missing proof. |
+| 3 → 5 | shared runtime/summary; restored critic learning | Compatible; fixture and live runners share strict bindings. |
+| 3 → 6 | authenticated archive/champion mechanics | Compatible; Task 6 freezes rather than mutates it. |
+| 3 → 7 | candidate reconstruction/evaluator adapters | Compatible through confirmation commitment. |
+| 3 → 8 | content-free summary conventions | Compatible; readiness adds no source/content fields. |
+| 4 → 5 | exact authorized discovery command | Compatible; execution stops at manifest caps. |
+| 4 → 6 | discovery manifest/held-out commitment ancestry | Compatible; champion is bound only after discovery closes. |
+| 4 → 7 | qualification remains forbidden in discovery manifest | Compatible; later explicit attempt required. |
+| 4 → 8 | full replay remains forbidden in discovery manifest | Compatible. |
+| 5 → 6 | frozen final discovery champion | Compatible; confirmation cannot feed search. |
+| 5 → 7 | discovery ancestry through confirmation | Compatible; no direct qualification shortcut. |
+| 5 → 8 | campaign evidence ancestry | Compatible through retired qualification. |
+| 6 → 7 | eligible `ConfirmationOutcomeV5`; shared CLI/holdout checks | Compatible; operator approval cannot override failed evidence. |
+| 6 → 8 | confirmation ancestry; shared holdout checks | Compatible through qualification. |
+| 7 → 8 | successful retired `QualificationOutcomeV5`; shared CLI/checks | Compatible; readiness renders but never runs replay. |
+
+## Per-task self-consistency scan
+
+| Task | Internal consistency | Ruling |
+|---|---|---|
+| 1 | Contracts, builder, commands, local artifacts, tests | Source/CLI/direct-fake implementation first; real artifacts await the bundle; tests overridden. |
+| 2 | Reuses Task 1 + accepted V5 contracts; examples use older CLI spelling | Preserve accepted authenticated reference grammar; do not duplicate contracts; tests overridden. |
+| 3 | Fixture runner must exercise normal runtime and several distinct variants | Use accepted provider-neutral invocation/parser path and direct synthetic evaluator; no shortcut runtime. |
+| 4 | Explicit readiness then STOP | Source preparation only until exact manifest authorization. |
+| 5 | Ten live rounds and accounting | Requires Task 4 exact approval and local bundle; no silent use of historical authorization. |
+| 6 | Confirmation source implementation plus one-use execution | Implement adapter provider-free; actual opening requires eligible champion and separate decision. |
+| 7 | Qualification implementation plus one-use execution | Implement adapter provider-free; actual opening requires explicit decision. |
+| 8 | Readiness implementation and STOP | May render only after successful retired qualification; never starts replay. |
+
+## Task status
+
+- Task 1: source implementation complete — deterministic V5 episode plans, typed held-out owners,
+  create-only stage-ledger initialization, attempt/outcome contracts, content-free verification, and
+  CLI ownership are implemented and directly verified with synthetic authorities. No tests were
+  created, modified, or run. Actual panel emission remains deferred because this worktree still has
+  no authenticated V5 three-universe bundle.
+- Task 2: next — provider/search manifest contracts, subject to the same source-first and no-tests
+  ruling until the optimizer goal is reached.

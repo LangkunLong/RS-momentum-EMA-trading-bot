@@ -1211,6 +1211,41 @@ class LocalArtifactRepositoryV5:
     def _create_only(self, relative_path: str, primitive: object) -> ArtifactRefV5:
         return self._create_only_with_status(relative_path, primitive)[0]
 
+    def create_typed_artifact(self, relative_path: str, value: object) -> ArtifactRefV5:
+        """Create or authenticate one immutable canonical V5 dataclass artifact."""
+
+        if not is_dataclass(value) or isinstance(value, type):
+            raise ValueError("typed artifact value must be a dataclass instance")
+        return self._create_only(relative_path, canonical_primitive_v5(value))
+
+    def create_evaluation_panel_spec(
+        self,
+        relative_path: str,
+        panel: EvaluationPanelSpec,
+    ) -> ArtifactRefV5:
+        """Create or authenticate the canonical newline-bearing raw panel contract."""
+
+        if type(panel) is not EvaluationPanelSpec:
+            raise ValueError("evaluation panel artifact must use the canonical panel schema")
+        parts = _safe_relative_path(relative_path)
+        raw = _canonical_panel_json_bytes(_panel_json_value(panel))
+        reference = ArtifactRefV5(relative_path, hashlib.sha256(raw).hexdigest())
+        try:
+            with self._directory(tuple(parts[:-1]), create=True) as directory:
+                _write_create_only_in_directory(directory, parts[-1], raw)
+        except FileExistsError:
+            try:
+                authenticated = self.load_evaluation_panel_spec(reference)
+            except ArtifactRepositoryFailureV5:
+                raise ArtifactExistsV5(reference) from None
+            if authenticated != panel:
+                raise ArtifactExistsV5(reference) from None
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (OSError, ValueError):
+            raise ArtifactRelocatedV5(reference, relative_path) from None
+        return reference
+
     def _replace(self, relative_path: str, primitive: object) -> ArtifactRefV5:
         if relative_path not in {"archive.json", "checkpoint.json"}:
             raise ValueError("only archive and checkpoint artifacts are replaceable")
