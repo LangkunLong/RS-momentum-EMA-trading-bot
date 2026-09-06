@@ -38,6 +38,12 @@
   that adapter composition is pending rather than inventing command arguments or defaults. Cost if
   wrong: a later explicit adapter authority must be added to a versioned manifest/command contract
   before live execution; rendering cannot by itself launch a campaign.
+- Ruling: the provider-free Task 3 proof uses an explicit synthetic V3-contract baseline containing
+  a declared fixture entry constant, and fixture composition fails closed when that declared
+  authority is absent. The current production V3 entry wrapper has no editable entry constant, so
+  the proof may not invent one or mutate production policy source. Cost if wrong: the fixture proves
+  orchestration and variant mechanics rather than a production strategy threshold; real discovery
+  still requires an authenticated policy-authoring path with a valid declared edit.
 
 ## Pre-flight dependency and conflict scan
 
@@ -101,5 +107,11 @@
   composition, complete graph-before-parse verification, clean-source capture, and content-free
   readiness rendering are source-complete; real manifest emission awaits the authenticated bundle
   and explicit adapter composition. Tests remain overridden by the user.
-- Task 3: next — provider-free fixture composition through the normal V5 feedback runtime, under the
-  same source-first and no-tests ruling.
+- Task 3: complete (commit 9f68679, review clean). The provider-free fixture uses the normal V5
+  recoverable role/runtime path with strict bindings, three distinct variants per round, durable
+  critic-feedback restoration, exact zero-external-usage accounting, content-free summaries, and
+  verified cleanup. Two synthetic rounds were directly exercised; the fixture entry fails closed
+  without its declared synthetic authority. No tests were created, modified, or run, and no
+  provider, Docker, market-data, or replay action occurred. This proves V5 orchestration and
+  variant mechanics, not production strategy performance; real discovery remains blocked on the
+  authenticated V5 three-universe bundle and the Task 4 exact-manifest approval gate.
