@@ -28,6 +28,7 @@ from core.pit_optimizer_v5.policy_scope import (
     EDITABLE_POLICY_PATHS_V5,
     REQUIRED_POLICY_EXPORTS_V5,
     validate_policy_symbol_edit_v5,
+    validate_full_source_symbol_v5,
 )
 
 
@@ -146,11 +147,7 @@ def _apply_replacements(
         previous_end = replacement.end
     rendered = source
     for replacement in reversed(ordered):
-        rendered = (
-            rendered[: replacement.start]
-            + replacement.source
-            + rendered[replacement.end :]
-        )
+        rendered = rendered[: replacement.start] + replacement.source + rendered[replacement.end :]
     return rendered
 
 
@@ -194,11 +191,7 @@ def _render_markers(
     assignment: Mapping[str, LiteralValueV5],
 ) -> tuple[str, tuple[str, ...]]:
     tree = _parse_source(path=path, source=source)
-    parents = {
-        child: parent
-        for parent in ast.walk(tree)
-        for child in ast.iter_child_nodes(parent)
-    }
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     replacements: list[_SourceReplacement] = []
     marker_names: list[str] = []
     for node in ast.walk(tree):
@@ -216,8 +209,7 @@ def _render_markers(
             raise ValueError('axis marker must be exactly PIT_AXIS("name")')
         start, end = _node_span(source, call)
         if not any(
-            authorized_start <= start and end <= authorized_end
-            for authorized_start, authorized_end in authorized_spans
+            authorized_start <= start and end <= authorized_end for authorized_start, authorized_end in authorized_spans
         ):
             raise ValueError("axis marker is outside an authorized replacement")
         axis_name = call.args[0].value
@@ -237,17 +229,9 @@ def _render_markers(
 
 
 def _constant_name(statement: ast.stmt) -> str | None:
-    if (
-        isinstance(statement, ast.Assign)
-        and len(statement.targets) == 1
-        and isinstance(statement.targets[0], ast.Name)
-    ):
+    if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
         return statement.targets[0].id
-    if (
-        isinstance(statement, ast.AnnAssign)
-        and isinstance(statement.target, ast.Name)
-        and statement.value is not None
-    ):
+    if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.value is not None:
         return statement.target.id
     return None
 
@@ -260,16 +244,10 @@ def _find_symbol_node(
 ) -> ast.stmt:
     if kind == "replace_function":
         matches = tuple(
-            statement
-            for statement in tree.body
-            if isinstance(statement, ast.FunctionDef) and statement.name == symbol
+            statement for statement in tree.body if isinstance(statement, ast.FunctionDef) and statement.name == symbol
         )
     elif kind == "replace_constant":
-        matches = tuple(
-            statement
-            for statement in tree.body
-            if _constant_name(statement) == symbol
-        )
+        matches = tuple(statement for statement in tree.body if _constant_name(statement) == symbol)
     else:
         raise ValueError("source operation kind is invalid")
     if len(matches) != 1:
@@ -295,7 +273,7 @@ def _authorized_marker_span(
     raise ValueError("source operation target kind is inconsistent")
 
 
-def _qualified_symbol_parts(symbol: str) -> tuple[str, str, str]:
+def _qualified_symbol_parts(symbol: str, *, structural: bool = False) -> tuple[str, str, str]:
     for path in EDITABLE_POLICY_PATHS_V5:
         prefix = f"{path.removesuffix('.py').replace('/', '.')}."
         if not symbol.startswith(prefix):
@@ -305,34 +283,26 @@ def _qualified_symbol_parts(symbol: str) -> tuple[str, str, str]:
             break
         kind = (
             "replace_function"
-            if name in REQUIRED_POLICY_EXPORTS_V5[path]
+            if name in REQUIRED_POLICY_EXPORTS_V5[path] or (structural and name.startswith("_"))
             else "replace_constant"
         )
-        validate_policy_symbol_edit_v5(
-            path=path,
-            symbol=name,
-            kind="function" if kind == "replace_function" else "constant",
-        )
+        if structural:
+            validate_full_source_symbol_v5(path=path, symbol=name)
+        else:
+            validate_policy_symbol_edit_v5(
+                path=path, symbol=name, kind="function" if kind == "replace_function" else "constant"
+            )
         return path, name, kind
     raise ValueError("changed symbol is outside the V5 editable policy scope")
 
 
 def _import_fingerprint(*, path: str, source: str) -> tuple[str, ...]:
     tree = _parse_source(path=path, source=source)
-    parents = {
-        child: parent
-        for parent in ast.walk(tree)
-        for child in ast.iter_child_nodes(parent)
-    }
-    imports = tuple(
-        node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
-    )
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    imports = tuple(node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom)))
     if any(parents.get(node) is not tree for node in imports):
         raise ValueError("rendered policy imports must remain top-level")
-    return tuple(
-        ast.dump(node, annotate_fields=True, include_attributes=False)
-        for node in imports
-    )
+    return tuple(ast.dump(node, annotate_fields=True, include_attributes=False) for node in imports)
 
 
 def _assert_imports_unchanged(
@@ -362,9 +332,7 @@ def _assignment(
     axes: tuple[LiteralAxisV5, ...],
     values: tuple[LiteralValueV5, ...],
 ) -> VariantAssignmentV5:
-    return VariantAssignmentV5(
-        values=tuple((axis.name, value) for axis, value in zip(axes, values, strict=True))
-    )
+    return VariantAssignmentV5(values=tuple((axis.name, value) for axis, value in zip(axes, values, strict=True)))
 
 
 def _ordered_assignments(
@@ -403,10 +371,7 @@ def _ordered_assignments(
         remaining,
         key=lambda item: (
             item.sha256,
-            tuple(
-                (name, type(value).__name__, repr(value))
-                for name, value in item.values
-            ),
+            tuple((name, type(value).__name__, repr(value)) for name, value in item.values),
         ),
     )
 
@@ -434,10 +399,7 @@ def _operation_root_segment(operation: SourceOperationV5) -> str:
         tree=tree,
         node=node,
     )
-    if (
-        operation.replacement_source[:start].strip()
-        or operation.replacement_source[end:].strip()
-    ):
+    if operation.replacement_source[:start].strip() or operation.replacement_source[end:].strip():
         raise ValueError("source operation contains content outside its replacement")
     return operation.replacement_source[start:end]
 
@@ -449,17 +411,13 @@ def _render_operation_sources(
     assignment: VariantAssignmentV5,
 ) -> dict[str, str]:
     assignment_map = dict(assignment.values)
-    by_path: dict[str, list[_SourceReplacement]] = {
-        path: [] for path in EDITABLE_POLICY_PATHS_V5
-    }
+    by_path: dict[str, list[_SourceReplacement]] = {path: [] for path in EDITABLE_POLICY_PATHS_V5}
     marker_names: list[str] = []
     for operation in template.source_operations:
         validate_policy_symbol_edit_v5(
             path=operation.path,
             symbol=operation.symbol,
-            kind=(
-                "function" if operation.kind == "replace_function" else "constant"
-            ),
+            kind=("function" if operation.kind == "replace_function" else "constant"),
         )
         parent_tree = _parse_source(
             path=operation.path,
@@ -508,8 +466,7 @@ def _render_operation_sources(
 
     _validate_marker_counts(template.axes, tuple(marker_names))
     rendered = {
-        path: _apply_replacements(parent_sources[path], tuple(by_path[path]))
-        for path in EDITABLE_POLICY_PATHS_V5
+        path: _apply_replacements(parent_sources[path], tuple(by_path[path])) for path in EDITABLE_POLICY_PATHS_V5
     }
     for path, source in rendered.items():
         _assert_no_marker_token(path=path, source=source)
@@ -527,43 +484,16 @@ def _prepare_full_source_escape(
     if tuple(escape_sources) != EDITABLE_POLICY_PATHS_V5:
         raise ValueError("full-source escape must preserve the exact four-file path order")
 
-    parent_replacements: dict[str, list[_SourceReplacement]] = {
-        path: [] for path in EDITABLE_POLICY_PATHS_V5
-    }
-    authorized_spans: dict[str, list[tuple[int, int]]] = {
-        path: [] for path in EDITABLE_POLICY_PATHS_V5
-    }
+    changed_by_path: dict[str, set[str]] = {path: set() for path in EDITABLE_POLICY_PATHS_V5}
+    authorized_spans: dict[str, list[tuple[int, int]]] = {path: [] for path in EDITABLE_POLICY_PATHS_V5}
     for qualified_symbol in template.changed_symbols:
-        path, symbol, kind = _qualified_symbol_parts(qualified_symbol)
-        parent_tree = _parse_source(path=path, source=parent_sources[path])
+        path, symbol, kind = _qualified_symbol_parts(qualified_symbol, structural=True)
+        changed_by_path[path].add(symbol)
         escape_tree = _parse_source(path=path, source=escape_sources[path])
-        parent_node = _find_symbol_node(
-            tree=parent_tree,
-            symbol=symbol,
-            kind=kind,
-        )
         escape_node = _find_symbol_node(
             tree=escape_tree,
             symbol=symbol,
             kind=kind,
-        )
-        parent_start, parent_end = _statement_line_span(
-            parent_sources[path],
-            tree=parent_tree,
-            node=parent_node,
-        )
-        escape_start, escape_end = _statement_line_span(
-            escape_sources[path],
-            tree=escape_tree,
-            node=escape_node,
-        )
-        replacement_source = escape_sources[path][escape_start:escape_end]
-        parent_replacements[path].append(
-            _SourceReplacement(
-                start=parent_start,
-                end=parent_end,
-                source=replacement_source,
-            )
         )
         authorized_spans[path].append(
             _authorized_marker_span(
@@ -573,22 +503,23 @@ def _prepare_full_source_escape(
             )
         )
 
-    reconstructed = {
-        path: _apply_replacements(
-            parent_sources[path],
-            tuple(parent_replacements[path]),
-        )
-        for path in EDITABLE_POLICY_PATHS_V5
-    }
-    if reconstructed != escape_sources:
-        raise ValueError("full-source escape changes bytes outside declared policy symbols")
+    for path in EDITABLE_POLICY_PATHS_V5:
+
+        def unchanged(source: str, path: str = path) -> tuple[str, ...]:
+            return tuple(
+                ast.dump(node, include_attributes=False)
+                for node in _parse_source(path=path, source=source).body
+                if (node.name if isinstance(node, ast.FunctionDef) else _constant_name(node))
+                not in changed_by_path[path]
+            )
+
+        if unchanged(parent_sources[path]) != unchanged(escape_sources[path]):
+            raise ValueError("full-source escape changes undeclared policy structure")
     _assert_imports_unchanged(
         parent_sources=parent_sources,
         rendered_sources=escape_sources,
     )
-    return escape_sources, {
-        path: tuple(spans) for path, spans in authorized_spans.items()
-    }
+    return escape_sources, {path: tuple(spans) for path, spans in authorized_spans.items()}
 
 
 def _render_full_source_escape(
@@ -702,18 +633,12 @@ def render_variants(
         bundle_key = tuple((item.path, item.source) for item in source_bundle.files)
         prior_assignment = seen_bundles.get(bundle_key)
         if prior_assignment is not None:
-            raise VariantRenderingCollisionV5(
-                "distinct strict assignments rendered identical complete source bytes"
-            )
+            raise VariantRenderingCollisionV5("distinct strict assignments rendered identical complete source bytes")
         seen_bundles[bundle_key] = _assignment_key(assignment)
         policy_revision = derive_policy_revision_identity_v5(
             source_bundle=source_bundle,
-            trusted_policy_runtime_sha256=(
-                parent_revision.trusted_policy_runtime_sha256
-            ),
-            immutable_constraints_sha256=(
-                parent_revision.immutable_constraints_sha256
-            ),
+            trusted_policy_runtime_sha256=(parent_revision.trusted_policy_runtime_sha256),
+            immutable_constraints_sha256=(parent_revision.immutable_constraints_sha256),
         )
         rendered_variants.append(
             RenderedVariantV5(

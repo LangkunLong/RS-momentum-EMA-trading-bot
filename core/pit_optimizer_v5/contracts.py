@@ -34,8 +34,8 @@ _WINDOWS_RESERVED_ARTIFACT_COMPONENTS = frozenset(
 )
 _TARGET_QUANTUM_V5 = Decimal("0.01")
 ARTIFACT_ROOT_V5 = ".artifacts/pit-optimizer-v5"
-MAX_ROLE_EVIDENCE_ITEMS_V5 = 128
-MAX_ROLE_EVIDENCE_BYTES_V5 = 64 * 1024
+MAX_ROLE_EVIDENCE_ITEMS_V5 = 2048
+MAX_ROLE_EVIDENCE_BYTES_V5 = 384 * 1024
 
 # This is a closed semantic-runtime set, not a repository hash.  In particular,
 # documentation, orchestration, provider, and CLI files do not affect evaluator
@@ -170,14 +170,20 @@ def _validate_ordered_disjoint_date_intervals_v5(intervals: tuple[tuple[str, str
 def _decimal_primitive(value: Decimal) -> str:
     if value.is_zero():
         return "0"
-    normalized = value.normalize()
-    rendered = format(normalized, "f")
+    # normalize() applies the ambient Decimal precision and can round an
+    # authenticated price/cost before hashing it.
+    rendered = format(value, "f")
     return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
 
 
 def _primitive(value: object) -> object:
     if isinstance(value, Decimal):
         return _decimal_primitive(value)
+    if isinstance(value, bytes):
+        # Closed protocol JSON bytes (for example semantic probe decisions)
+        # retain their exact UTF-8 text inside authenticated authority records.
+        # Binary campaign artifacts never pass through this JSON codec.
+        return value.decode("utf-8")
     if isinstance(value, FrictionScenario):
         return {
             "scenario_id": value.scenario_id,
@@ -298,6 +304,7 @@ class SearchCapabilitiesV5:
     archive_capacity: int = 8
     max_feedback_rounds: int = 10
     allow_full_source_escape: bool = True
+    investigator_memory_max_bytes: int = 96 * 1024
 
     def __post_init__(self) -> None:
         for value, label in (
@@ -316,6 +323,22 @@ class SearchCapabilitiesV5:
             raise ValueError("discovery survivor capacity exceeds variant capacity")
         if type(self.allow_full_source_escape) is not bool:
             raise ValueError("full source escape capability must be boolean")
+        _count(self.investigator_memory_max_bytes, "investigator memory byte budget", positive=True)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPriceUpperBoundV5:
+    """Operator-authenticated worst-case model prices, including provider surcharges."""
+
+    model: str
+    input_usd_per_million_tokens: Decimal
+    output_usd_per_million_tokens: Decimal
+
+    def __post_init__(self) -> None:
+        _text(self.model, "priced provider model")
+        for value in (self.input_usd_per_million_tokens, self.output_usd_per_million_tokens):
+            if _decimal(value, "model price upper bound") < 0:
+                raise ValueError("model price upper bound must be nonnegative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,6 +350,8 @@ class ProviderCapabilitiesV5:
     maximum_usd: Decimal | None = None
     automatic_retries: int = 0
     schema_repair_calls: int = 0
+    price_upper_bound: ModelPriceUpperBoundV5 | None = None
+    input_token_overhead_upper_bound: int = 4096
 
     def __post_init__(self) -> None:
         _text(self.model, "provider model")
@@ -343,6 +368,13 @@ class ProviderCapabilitiesV5:
             raise ValueError("maximum provider USD must be positive")
         _count(self.automatic_retries, "automatic retries")
         _count(self.schema_repair_calls, "schema repair calls")
+        _count(self.input_token_overhead_upper_bound, "input token overhead upper bound", positive=True)
+        if self.price_upper_bound is not None and (
+            type(self.price_upper_bound) is not ModelPriceUpperBoundV5 or self.price_upper_bound.model != self.model
+        ):
+            raise ValueError("provider model price authority differs")
+        if self.maximum_usd is not None and self.price_upper_bound is None:
+            raise ValueError("finite provider USD ceiling requires model price upper bounds")
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,6 +459,19 @@ class AuthenticatedArtifactV5:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthenticatedRawArtifactV5:
+    """Digest-verified campaign bytes, streamed without treating data as a graph."""
+
+    reference: ArtifactRefV5
+    byte_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.reference) is not ArtifactRefV5:
+            raise ValueError("raw artifact reference is invalid")
+        _count(self.byte_count, "raw artifact byte count")
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactIndexV5:
     """Canonical authenticated child list for a multi-file artifact."""
 
@@ -454,14 +499,14 @@ class ArtifactIndexV5:
 @dataclass(frozen=True, slots=True)
 class ArtifactGraphVerificationV5:
     manifest_ref: ArtifactRefV5
-    authenticated: tuple[AuthenticatedArtifactV5, ...]
+    authenticated: tuple[AuthenticatedArtifactV5 | AuthenticatedRawArtifactV5, ...]
     failure: ArtifactGraphFailureV5 | None
 
     def __post_init__(self) -> None:
         if type(self.manifest_ref) is not ArtifactRefV5:
             raise ValueError("artifact graph manifest reference is invalid")
         if type(self.authenticated) is not tuple or any(
-            type(item) is not AuthenticatedArtifactV5 for item in self.authenticated
+            type(item) not in {AuthenticatedArtifactV5, AuthenticatedRawArtifactV5} for item in self.authenticated
         ):
             raise ValueError("artifact graph authenticated nodes are invalid")
         keys = tuple((item.reference.relative_path, item.reference.sha256) for item in self.authenticated)
@@ -1391,6 +1436,7 @@ class HypothesisV5:
     predicted_changes: tuple[MetricPredictionV5, ...]
     evidence_ids: tuple[str, ...]
     author_instructions: str
+    authoring_mode: Literal["symbol_edits", "full_source_escape"] = "symbol_edits"
 
     def __post_init__(self) -> None:
         _text(self.hypothesis_id, "hypothesis ID")
@@ -1415,6 +1461,8 @@ class HypothesisV5:
             raise ValueError("hypothesis predicted metric IDs must be unique")
         _evidence_ids(self.evidence_ids, "hypothesis evidence IDs")
         _text(self.author_instructions, "hypothesis author instructions")
+        if self.authoring_mode not in {"symbol_edits", "full_source_escape"}:
+            raise ValueError("hypothesis authoring mode is invalid")
 
     @property
     def sha256(self) -> str:
@@ -1542,6 +1590,7 @@ __all__ = [
     "ArtifactIndexV5",
     "ArtifactRefV5",
     "AuthenticatedArtifactV5",
+    "AuthenticatedRawArtifactV5",
     "CampaignEvidenceV5",
     "CampaignManifestV5",
     "CampaignPanelPlanV5",
@@ -1558,6 +1607,7 @@ __all__ = [
     "InvestigatorArtifactV5",
     "MetricCountV5",
     "MetricPredictionV5",
+    "ModelPriceUpperBoundV5",
     "MAX_ROLE_EVIDENCE_BYTES_V5",
     "MAX_ROLE_EVIDENCE_ITEMS_V5",
     "PanelEvaluationV5",

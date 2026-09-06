@@ -18,6 +18,7 @@ from core.pit_optimizer_v5.policy_scope import (
     REQUIRED_POLICY_EXPORTS_V5,
     validate_policy_authoring_scope_v5,
     validate_policy_symbol_edit_v5,
+    validate_full_source_symbol_v5,
 )
 
 
@@ -92,9 +93,7 @@ _SAFE_POLICY_IMPORTS_V5: Mapping[str, frozenset[str]] = {
     ),
     "core.strategy_policy.entry": frozenset({"evaluate_entry"}),
     "core.strategy_policy.exit": frozenset({"evaluate_exit"}),
-    "core.strategy_policy.risk": frozenset(
-        {"recommend_allocation", "recommend_capacity", "select_eviction"}
-    ),
+    "core.strategy_policy.risk": frozenset({"recommend_allocation", "recommend_capacity", "select_eviction"}),
 }
 _SELECTOR_BUILTINS_V5 = frozenset({"max", "min"})
 _AUTHENTICATED_COLLECTION_CHAINS_V5 = frozenset(
@@ -152,12 +151,7 @@ def _digest(value: object, label: str) -> str:
 
 
 def _text(value: object, label: str) -> str:
-    if (
-        type(value) is not str
-        or not value
-        or value != value.strip()
-        or "\x00" in value
-    ):
+    if type(value) is not str or not value or value != value.strip() or "\x00" in value:
         raise ValueError(f"{label} must be non-empty canonical text")
     return value
 
@@ -199,10 +193,7 @@ def _primitive(value: object) -> object:
     if isinstance(value, tuple):
         return [_primitive(item) for item in value]
     if isinstance(value, Mapping):
-        return {
-            str(key): _primitive(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
+        return {str(key): _primitive(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
     return value
 
 
@@ -232,10 +223,7 @@ def _split_qualified_symbol(symbol: str) -> tuple[str, str]:
 
 
 def _source_hashes(bundle: SourceBundleV5) -> tuple[tuple[str, str], ...]:
-    return tuple(
-        (item.path, hashlib.sha256(item.source.encode("utf-8")).hexdigest())
-        for item in bundle.files
-    )
+    return tuple((item.path, hashlib.sha256(item.source.encode("utf-8")).hexdigest()) for item in bundle.files)
 
 
 def _policy_assignment_name_and_value_v5(
@@ -274,11 +262,7 @@ def _policy_local_target_names_v5(target: ast.expr) -> tuple[str, ...]:
             raise ValueError("V5 policy assignment target is invalid")
         return (target.id,)
     if isinstance(target, ast.Tuple) and 1 <= len(target.elts) <= 8:
-        names = tuple(
-            name
-            for item in target.elts
-            for name in _policy_local_target_names_v5(item)
-        )
+        names = tuple(name for item in target.elts for name in _policy_local_target_names_v5(item))
         if len(names) != len(set(names)):
             raise ValueError("V5 policy assignment targets are duplicated")
         return names
@@ -498,9 +482,7 @@ def _parse_policy_source_ast_v5(*, path: str, source: str) -> ast.Module:
     except (SyntaxError, TypeError, ValueError) as exc:
         raise ValueError("V5 policy AST syntax is invalid") from exc
     public_functions = {
-        node.name
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+        node.name for node in tree.body if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
     }
     if public_functions != set(REQUIRED_POLICY_EXPORTS_V5[path]):
         raise ValueError("V5 policy public symbols differ from the closed interface")
@@ -914,11 +896,7 @@ def derive_changed_symbols_v5(
         left = _policy_symbol_nodes_v5(before_files[path])
         right = _policy_symbol_nodes_v5(after_files[path])
         module = path.removesuffix(".py").replace("/", ".")
-        changed.extend(
-            f"{module}.{name}"
-            for name in left.keys() | right.keys()
-            if left.get(name) != right.get(name)
-        )
+        changed.extend(f"{module}.{name}" for name in left.keys() | right.keys() if left.get(name) != right.get(name))
     return tuple(sorted(changed))
 
 
@@ -943,8 +921,7 @@ class PolicyRevisionIdentityV5:
             type(self.editable_source_sha256) is not tuple
             or len(self.editable_source_sha256) != len(EDITABLE_POLICY_PATHS_V5)
             or any(type(item) is not tuple or len(item) != 2 for item in self.editable_source_sha256)
-            or tuple(path for path, _ in self.editable_source_sha256)
-            != EDITABLE_POLICY_PATHS_V5
+            or tuple(path for path, _ in self.editable_source_sha256) != EDITABLE_POLICY_PATHS_V5
         ):
             raise ValueError("policy revision must identify the exact four editable sources")
         for path, digest in self.editable_source_sha256:
@@ -986,9 +963,7 @@ class LiteralAxisV5:
             raise ValueError("literal axis values must be a non-empty tuple")
         identities: list[tuple[type[object], object]] = []
         for value in self.values:
-            identities.append(
-                _literal_identity(_literal(value, f"literal axis {name} value"))
-            )
+            identities.append(_literal_identity(_literal(value, f"literal axis {name} value")))
         if len(identities) != len(set(identities)):
             raise ValueError("literal axis values must be unique by strict primitive type")
         if _literal_identity(default) not in identities:
@@ -1017,9 +992,7 @@ class SourceFileV5:
         source = _source_text(self.source, f"policy source {self.path}")
         tree = validate_policy_source_ast_v5(path=self.path, source=source)
         public_definitions = tuple(
-            node.name
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
         )
         if len(public_definitions) != len(set(public_definitions)):
             raise ValueError("policy public symbols must have one definition each")
@@ -1091,11 +1064,7 @@ class SourceOperationV5:
             raise ValueError("source operation must contain exactly one complete replacement")
         statement = tree.body[0]
         if self.kind == "replace_function":
-            if (
-                not isinstance(statement, ast.FunctionDef)
-                or statement.name != self.symbol
-                or statement.decorator_list
-            ):
+            if not isinstance(statement, ast.FunctionDef) or statement.name != self.symbol or statement.decorator_list:
                 raise ValueError("function operation must replace one complete authorized function")
         elif not _is_constant_replacement(statement, self.symbol):
             raise ValueError("constant operation must replace one complete authorized constant")
@@ -1116,16 +1085,10 @@ class SourceOperationV5:
 
 
 def _is_constant_replacement(statement: ast.stmt, symbol: str) -> bool:
-    if (
-        isinstance(statement, ast.Assign)
-        and len(statement.targets) == 1
-        and isinstance(statement.targets[0], ast.Name)
-    ):
+    if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
         return statement.targets[0].id == symbol
     return isinstance(statement, ast.AnnAssign) and (
-        isinstance(statement.target, ast.Name)
-        and statement.target.id == symbol
-        and statement.value is not None
+        isinstance(statement.target, ast.Name) and statement.target.id == symbol and statement.value is not None
     )
 
 
@@ -1141,9 +1104,7 @@ def _declared_source_symbols(source_file: SourceFileV5) -> frozenset[str]:
             and isinstance(statement.targets[0], ast.Name)
         ):
             symbols.add(statement.targets[0].id)
-        elif isinstance(statement, ast.AnnAssign) and isinstance(
-            statement.target, ast.Name
-        ):
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
             symbols.add(statement.target.id)
     return frozenset(symbols)
 
@@ -1155,10 +1116,7 @@ class VariantAssignmentV5:
     values: tuple[tuple[str, LiteralValueV5], ...]
 
     def __post_init__(self) -> None:
-        if (
-            type(self.values) is not tuple
-            or any(type(item) is not tuple or len(item) != 2 for item in self.values)
-        ):
+        if type(self.values) is not tuple or any(type(item) is not tuple or len(item) != 2 for item in self.values):
             raise ValueError("variant assignment values are invalid")
         names: list[str] = []
         for name, value in self.values:
@@ -1218,9 +1176,7 @@ class StructuralTemplateV5:
         ):
             raise ValueError("structural template full-source escape is invalid")
         full_source_paths = (
-            tuple(item.path for item in self.full_source_escape)
-            if self.full_source_escape is not None
-            else ()
+            tuple(item.path for item in self.full_source_escape) if self.full_source_escape is not None else ()
         )
         symbol_edits = tuple(
             (
@@ -1237,6 +1193,9 @@ class StructuralTemplateV5:
 
         for symbol in self.changed_symbols:
             path, name = _split_qualified_symbol(symbol)
+            if self.full_source_escape is not None:
+                validate_full_source_symbol_v5(path=path, symbol=name)
+                continue
             validate_policy_symbol_edit_v5(
                 path=path,
                 symbol=name,
@@ -1252,17 +1211,12 @@ class StructuralTemplateV5:
             if self.source_operations != canonical_operations:
                 raise ValueError("structural template operations must be canonically sorted")
             expected_symbols = tuple(
-                sorted(
-                    _qualified_symbol(operation.path, operation.symbol)
-                    for operation in self.source_operations
-                )
+                sorted(_qualified_symbol(operation.path, operation.symbol) for operation in self.source_operations)
             )
             if self.changed_symbols != expected_symbols:
                 raise ValueError("template changed symbols must exactly match source operations")
         elif self.full_source_escape is not None:
-            declared_by_path = {
-                item.path: _declared_source_symbols(item) for item in self.full_source_escape
-            }
+            declared_by_path = {item.path: _declared_source_symbols(item) for item in self.full_source_escape}
             if any(
                 name not in declared_by_path[path]
                 for symbol in self.changed_symbols
@@ -1301,15 +1255,11 @@ def _validated_template_assignment_digests_v5(
     axis_names = tuple(axis.name for axis in template.axes)
     assignment_names = tuple(name for name, _ in assignment.values)
     if assignment_names != axis_names:
-        raise ValueError(
-            "experiment assignment axes must exactly match the structural template"
-        )
+        raise ValueError("experiment assignment axes must exactly match the structural template")
     for axis, (_, value) in zip(template.axes, assignment.values, strict=True):
         permitted_values = tuple(_literal_identity(item) for item in axis.values)
         if _literal_identity(value) not in permitted_values:
-            raise ValueError(
-                "experiment assignment value is outside its strictly typed template axis"
-            )
+            raise ValueError("experiment assignment value is outside its strictly typed template axis")
     return template.sha256, assignment.sha256
 
 

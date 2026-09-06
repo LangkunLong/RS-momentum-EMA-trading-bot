@@ -7,8 +7,23 @@ from decimal import Decimal
 from typing import Literal
 
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
-from core.pit_optimizer_v5.contracts import CampaignManifestV5, canonical_primitive_v5
-from core.pit_optimizer_v5.memory import CleanupResultPayloadV5, RoleCompletionPayloadV5, RoundOutcomePayloadV5
+from core.pit_optimizer_v5.contracts import (
+    CampaignManifestV5,
+    CampaignPanelPlanV5,
+    EvaluatorContractV5,
+    canonical_primitive_v5,
+)
+from core.pit_optimizer_v5.memory import (
+    CleanupResultPayloadV5,
+    RoleCompletionPayloadV5,
+    RoundOutcomePayloadV5,
+    RuntimeFailureAuthorityV5,
+    StoredExperimentRecordV5,
+)
+from core.pit_optimizer_v5.production_runtime import LocalArchiveReducerFactoryV5
+from core.pit_optimizer_v5.provider import sum_cost_usd_v5
+from core.pit_optimizer_v5.search import BaselineParentAuthorityV5
+from core.pit_optimizer_v5.selection import reported_champion_v5
 
 
 V5SummaryStatus = Literal["ready", "running", "completed", "failed", "unavailable"]
@@ -125,7 +140,8 @@ def summarize_repository_v5(
     role_calls = 0
     total_tokens = 0
     cost_usd = Decimal("0")
-    cleanups: list[CleanupResultPayloadV5] = []
+    cleanups: dict[int, CleanupResultPayloadV5] = {}
+    runtime_failed = False
     for round_index in range(1, manifest.search.max_feedback_rounds + 1):
         events = repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index)
         if not events:
@@ -137,19 +153,43 @@ def summarize_repository_v5(
                 package = repository.load_role_invocation(payload)
                 role_calls += package.attempt.usage.external_attempt_count
                 total_tokens += package.attempt.usage.total_tokens
-                cost_usd += package.attempt.usage.cost_usd
+                cost_usd = sum_cost_usd_v5(cost_usd, package.attempt.usage.cost_usd)
             elif type(payload) is RoundOutcomePayloadV5:
                 terminal_rounds += 1
+                runtime_failed |= type(payload.authority) is RuntimeFailureAuthorityV5
             elif type(payload) is CleanupResultPayloadV5:
-                cleanups.append(payload)
+                cleanups[round_index] = payload
     checkpoint = repository.load_checkpoint()
     records = () if checkpoint is None else tuple(repository.load_experiment(ref) for ref in checkpoint.record_refs)
     evaluated = tuple(item for item in records if item.status == "evaluated" and item.campaign_evidence is not None)
-    best = max((item.campaign_evidence.campaign_cagr_pct for item in evaluated), default=None)
+    panel_plan = repository.load_typed_artifact(manifest.panel_plan_ref, value_type=CampaignPanelPlanV5)
+    evaluator_contract = repository.load_typed_artifact(manifest.evaluator_contract_ref, value_type=EvaluatorContractV5)
+    baseline = repository.load_typed_artifact(manifest.baseline_authority_ref, value_type=BaselineParentAuthorityV5)
+    state = LocalArchiveReducerFactoryV5(repository).verify_projection(
+        manifest=manifest,
+        panel_plan=panel_plan,
+        evaluator_contract=evaluator_contract,
+    )
+    stored = (
+        ()
+        if checkpoint is None
+        else tuple(
+            StoredExperimentRecordV5(ref, record) for ref, record in zip(checkpoint.record_refs, records, strict=True)
+        )
+    )
+    best = reported_champion_v5(
+        state=state,
+        baseline=baseline,
+        discovery_plan=panel_plan,
+        evaluator_contract=evaluator_contract,
+        stored_records=stored,
+    ).campaign_cagr_pct
     gap = None if best is None else manifest.target.target_pct - best
-    cleanup_complete = None if not cleanups else cleanups[-1].cleanup_complete
+    cleanup_complete = None if not cleanups else all(item.cleanup_complete for item in cleanups.values())
     status: V5SummaryStatus = (
-        "completed"
+        "failed"
+        if runtime_failed
+        else "completed"
         if (checkpoint is not None or terminal_rounds > 0) and cleanup_complete is True
         else "failed"
         if terminal_rounds > 0 and cleanup_complete is False
@@ -161,7 +201,7 @@ def summarize_repository_v5(
         5,
         command,
         status,
-        readiness_code,
+        "runtime_failed" if runtime_failed else readiness_code,
         rounds_seen,
         terminal_rounds,
         role_calls,

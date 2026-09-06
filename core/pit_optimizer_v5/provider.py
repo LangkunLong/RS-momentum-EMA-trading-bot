@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
-from decimal import Decimal
+from decimal import Context, Decimal, ROUND_CEILING, localcontext
 from enum import StrEnum
 import hashlib
 import json
 import math
 import re
+import time
 from types import MappingProxyType
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, get_args, get_type_hints, runtime_checkable
 
 from core.pit_optimizer_v5.candidate_ir import (
     LiteralAxisV5,
@@ -38,6 +39,19 @@ from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 
 
 RoleNameV5 = Literal["investigator", "author", "critic"]
+
+
+def sum_cost_usd_v5(left: Decimal, right: Decimal) -> Decimal:
+    """Add finite nonnegative cost authorities without ambient-context rounding."""
+    if any(type(value) is not Decimal or not value.is_finite() or value < 0 for value in (left, right)):
+        raise ValueError("cost addition requires finite nonnegative Decimal values")
+    values = (left.as_tuple(), right.as_tuple())
+    exponent = min(value.exponent for value in values)
+    precision = max(len(value.digits) + value.exponent - exponent for value in values) + 1
+    with localcontext(Context(prec=precision)):
+        return left + right
+
+
 RoleAttemptKindV5 = Literal["primary", "retry", "repair"]
 RoleOutcomeV5 = Literal[
     "accepted",
@@ -178,7 +192,7 @@ _FORBIDDEN_KEY_FRAGMENTS = (
     "ticker",
     "token",
 )
-_MAX_ROLE_REQUEST_BYTES = 256 * 1024
+_MAX_ROLE_REQUEST_BYTES = 768 * 1024
 _SENSITIVE_VALUE_RE = re.compile(
     r"(?:"
     r"\bbearer\s+\S+"
@@ -429,6 +443,7 @@ def _hypothesis_schema() -> dict[str, object]:
     )
     properties = {
         "author_instructions": _text_schema(),
+        "authoring_mode": {"enum": ["symbol_edits", "full_source_escape"], "type": "string"},
         "causal_claim": _text_schema(),
         "evidence_ids": _evidence_ids_schema(),
         "hypothesis_id": _text_schema(),
@@ -859,10 +874,58 @@ class CriticDirectionAggregateV5:
 
 
 @dataclass(frozen=True, slots=True)
+class CampaignCriticDirectionV5:
+    critic_artifact_sha256: str
+    comparative_assessment: str
+    next_campaign_direction: str
+    evidence_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _digest(self.critic_artifact_sha256, "campaign critic artifact")
+        _validate_safe_text(self.comparative_assessment, "campaign comparative assessment")
+        _validate_safe_text(self.next_campaign_direction, "next campaign direction")
+        _evidence_id_tuple(self.evidence_ids, "campaign critic evidence", required=True)
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentMemoryAggregateV5:
+    experiment_id: str
+    primary_mechanism: PrimaryMechanismV5
+    status: str
+    evidence_ids: tuple[str, ...]
+    hypothesis: HypothesisV5 | None = None
+    parent_revision_sha256: str | None = None
+    policy_revision_sha256: str | None = None
+    round_index: int | None = None
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "memory experiment")
+        _primary_mechanism(self.primary_mechanism)
+        _validate_safe_text(self.status, "memory status")
+        _evidence_id_tuple(self.evidence_ids, "memory measured evidence", required=True)
+        if self.hypothesis is not None:
+            if type(self.hypothesis) is not HypothesisV5 or self.hypothesis.primary_mechanism != self.primary_mechanism:
+                raise ValueError("complete memory hypothesis differs")
+            _validate_hypothesis_text(self.hypothesis)
+            if not set(self.hypothesis.evidence_ids).issubset(self.evidence_ids):
+                raise ValueError("complete memory hypothesis lacks reissued evidence")
+            _digest(self.parent_revision_sha256, "memory parent revision")
+            if self.policy_revision_sha256 is not None:
+                _digest(self.policy_revision_sha256, "memory policy revision")
+            _count(self.round_index, "memory round", positive=True)
+        elif any(
+            value is not None for value in (self.parent_revision_sha256, self.policy_revision_sha256, self.round_index)
+        ):
+            raise ValueError("compact memory cannot carry incomplete lineage metadata")
+
+
+@dataclass(frozen=True, slots=True)
 class InvestigatorRoleInputV5:
     aggregate_evaluator_evidence: tuple[str, ...]
     archive_family_summaries: tuple[ArchiveFamilyAggregateV5, ...]
     critic_directions: tuple[CriticDirectionAggregateV5, ...]
+    campaign_directions: tuple[CampaignCriticDirectionV5, ...] = ()
+    experiment_summaries: tuple[ExperimentMemoryAggregateV5, ...] = ()
 
     def __post_init__(self) -> None:
         _evidence_id_tuple(
@@ -884,17 +947,84 @@ class InvestigatorRoleInputV5:
         experiments = tuple(item.experiment_id for item in self.critic_directions)
         if len(set(experiments)) != len(experiments):
             raise ValueError("investigator critic directions must be unique by experiment")
+        for values, expected in (
+            (self.campaign_directions, CampaignCriticDirectionV5),
+            (self.experiment_summaries, ExperimentMemoryAggregateV5),
+        ):
+            if type(values) is not tuple or any(type(item) is not expected for item in values):
+                raise ValueError("investigator learning projection is invalid")
+
+
+def author_policy_surface_v5() -> tuple[str, ...]:
+    """Generate the usable interface from trusted dataclass declarations."""
+    from core.strategy_policy import contracts as v1, contracts_v3 as v3
+
+    methods = (
+        ("evaluate_entry", v3.EntrySnapshotV3, v1.EntryDecision),
+        ("recommend_capacity", v3.CapacitySnapshotV3, v1.CapacityDecision),
+        ("recommend_allocation", v3.AllocationSnapshotV3, v1.AllocationDecision),
+        ("select_eviction", v3.EvictionSnapshotV3, v1.EvictionDecision),
+        ("evaluate_add_on", v3.AddOnSnapshotV3, v3.AddOnDecisionV3),
+        ("evaluate_exit", v3.ExitSnapshotV3, v1.ExitDecision),
+    )
+    result = [f"{name}(snapshot: {snapshot.__name__}) -> {decision.__name__}" for name, snapshot, decision in methods]
+    pending = [kind for _name, snapshot, decision in methods for kind in (snapshot, decision)]
+    seen = set()
+    while pending:
+        kind = pending.pop(0)
+        if kind in seen:
+            continue
+        seen.add(kind)
+        hints = get_type_hints(kind)
+        result.append(
+            kind.__name__ + "(" + ", ".join(f"{item.name}: {hints[item.name]}" for item in fields(kind)) + ")"
+        )
+        annotations = list(hints.values())
+        while annotations:
+            annotation = annotations.pop()
+            if isinstance(annotation, type) and is_dataclass(annotation):
+                pending.append(annotation)
+            annotations.extend(get_args(annotation))
+    result.extend(
+        (
+            "MarketContextV1.regime values: " + ", ".join(sorted(v1._MARKET_REGIMES)) + ".",
+            "ExitAction close reasons: "
+            + ", ".join(sorted(v1._CLOSE_REASONS))
+            + "; scale_out reason: "
+            + v1._SCALE_OUT_REASON
+            + ".",
+            "EntryDecision.rank is exactly two finite floats or None; qualified and market_permitted are bool; blocking_codes is a tuple of strings.",
+            "Capacity max_positions is None or a positive int no larger than base.maximum_policy_positions; eviction slot is None or a slot present in base.positions.",
+            "Allocation risk_fraction must not exceed base.maximum_position_risk_fraction; stop_distance_fraction must not exceed base.maximum_stop_fraction. Fractions are in [0,1].",
+            "Exit scale_out_tier equals base.scale_out_tier plus the count of scale_out actions, and cannot exceed the tier count. Each trigger_gain_fraction equals the next sequential declared tier crossed by current_high; summed original-quantity fractions cannot exceed remaining_qty.",
+            "ExitAction close carries trigger_gain_fraction=None and fraction_of_original_quantity=None. No action follows close. An absent action sequence is an empty tuple.",
+            "AddOnDecisionV3 reason_code is lowercase [a-z][a-z0-9_]{0,63}; add=False requires risk_fraction=0 and notional_fraction_cap=None, while add=True requires positive risk and no averaging down.",
+            "Snapshots are immutable completed-session information. Optional unavailable features are None; never invent values.",
+            "V3 snapshots wrap legacy fields in base and causal feature fields in features; portfolio fields describe authenticated current exposure and risk.",
+            "Return the exact decision dataclass, using finite numeric values and its declared reason-code enums. Retain O'Neil entry eligibility and CAN SLIM identity.",
+            "Allocation, capacity, eviction and add-on validators enforce available cash, no leverage, portfolio and aggregate position risk, position-count and notional limits.",
+            "Exit actions are ordered scale_out or close; scale_out uses fraction of original quantity and declared tier triggers. Completed-close actions fill at a later eligible open.",
+            "Stop updates may only tighten to a supplied protective-stop candidate. No stop loosening, shorting, fabricated fills or accounting changes.",
+            "Normal authoring replaces existing exported functions or uppercase literal constants. Set authoring_mode to full_source_escape for structural helpers and new constants.",
+            "Structural source must preserve exact imports and __all__, declare every changed symbol, and retain all six exported functions. Private helpers must start with one underscore.",
+            "Only bounded deterministic expressions, conditionals, literal tuples, approved numeric builtins and authenticated bounded collection selectors are supported. No loops, recursion, mutation, reflection, IO or dynamic imports.",
+            'Tunable axes use PIT_AXIS("name") exactly once per declared axis inside a changed function or constant; the controller renders literal assignments.',
+        )
+    )
+    return tuple(result)
 
 
 @dataclass(frozen=True, slots=True)
 class AuthorPolicyContractsV5:
     parent_revision: PolicyRevisionIdentityV5
     policy_scope_sha256: str
+    interface_surface: tuple[str, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         if type(self.parent_revision) is not PolicyRevisionIdentityV5:
             raise ValueError("author parent revision must use the exact V5 identity")
         _digest(self.policy_scope_sha256, "author policy scope")
+        object.__setattr__(self, "interface_surface", author_policy_surface_v5())
 
 
 @dataclass(frozen=True, slots=True)
@@ -965,7 +1095,7 @@ class ExperimentEvaluationAggregateV5:
             raise ValueError("evaluation aggregate scenarios must be unique")
         if self.status == "evaluated":
             expected = (
-                *(("quick", None, scenario) for scenario in ("gross", "base", "stress")),
+                ("quick", None, "base"),
                 *(
                     ("discovery_episode", ordinal, scenario)
                     for ordinal in (1, 2, 3, 4)
@@ -999,6 +1129,33 @@ class ExperimentPredictionAggregateV5:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticDecisionTraceV5:
+    probe_id: str
+    method: str
+    parent_decision: str
+    candidate_decision: str
+
+    def __post_init__(self) -> None:
+        _canonical_id(self.probe_id, "semantic trace probe")
+        if self.method not in {
+            "evaluate_entry",
+            "recommend_capacity",
+            "recommend_allocation",
+            "select_eviction",
+            "evaluate_add_on",
+            "evaluate_exit",
+        }:
+            raise ValueError("semantic trace method is invalid")
+        for value in (self.parent_decision, self.candidate_decision):
+            _validate_safe_text(value, "symbol-neutral semantic decision")
+            if len(value.encode("utf-8")) > 4096:
+                raise ValueError("semantic decision exceeds trace budget")
+            _duplicate_rejecting_json(value, require_canonical=True)
+        if self.parent_decision == self.candidate_decision:
+            raise ValueError("semantic trace must show an actual difference")
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentSemanticDifferenceAggregateV5:
     experiment_id: str
     parent_fingerprint_sha256: str
@@ -1009,6 +1166,7 @@ class ExperimentSemanticDifferenceAggregateV5:
     ]
     differing_decision_count: int
     evidence_ids: tuple[str, ...]
+    traces: tuple[SemanticDecisionTraceV5, ...] = ()
     suite_id: Literal["pit-policy-v3-probes-v1"] = field(
         init=False,
         default="pit-policy-v3-probes-v1",
@@ -1028,6 +1186,12 @@ class ExperimentSemanticDifferenceAggregateV5:
         if (self.classification == "behavioral_equivalent_on_suite_v1") != (self.differing_decision_count == 0):
             raise ValueError("semantic aggregate classification differs from its decision count")
         _evidence_id_tuple(self.evidence_ids, "semantic aggregate evidence", required=True)
+        if (
+            type(self.traces) is not tuple
+            or len(self.traces) > min(8, self.differing_decision_count)
+            or any(type(item) is not SemanticDecisionTraceV5 for item in self.traces)
+        ):
+            raise ValueError("semantic aggregate traces are invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1108,6 +1272,7 @@ def _decode_hypothesis(value: object) -> HypothesisV5:
                 "predicted_changes",
                 "evidence_ids",
                 "author_instructions",
+                "authoring_mode",
             )
         ),
     )
@@ -1122,6 +1287,7 @@ def _decode_hypothesis(value: object) -> HypothesisV5:
         predicted_changes=tuple(_decode_prediction(prediction) for prediction in predictions),
         evidence_ids=_string_tuple(item["evidence_ids"], "hypothesis evidence", required=True),
         author_instructions=item["author_instructions"],  # type: ignore[arg-type]
+        authoring_mode=item["authoring_mode"],
     )
 
 
@@ -1133,6 +1299,8 @@ def _role_citation_sequence(role_input: RoleInputV5) -> tuple[str, ...]:
             *role_input.aggregate_evaluator_evidence,
             *(evidence_id for row in role_input.archive_family_summaries for evidence_id in row.evidence_ids),
             *(evidence_id for row in role_input.critic_directions for evidence_id in row.evidence_ids),
+            *(evidence_id for row in role_input.campaign_directions for evidence_id in row.evidence_ids),
+            *(evidence_id for row in role_input.experiment_summaries for evidence_id in row.evidence_ids),
         )
     if type(role_input) is AuthorRoleInputV5:
         return role_input.hypothesis.evidence_ids
@@ -1726,11 +1894,52 @@ def validate_parsed_role_artifact_v5(
 class ProviderCompletionRequestV5:
     role_request: RoleRequestV5
     model: str
+    deadline_monotonic: float
 
     def __post_init__(self) -> None:
         if type(self.role_request) is not RoleRequestV5:
             raise ValueError("provider completion role request is invalid")
         _text(self.model, "provider completion model")
+        if type(self.deadline_monotonic) is not float or not math.isfinite(self.deadline_monotonic):
+            raise ValueError("provider completion deadline is invalid")
+
+
+def wire_role_messages_v5(messages: tuple[Mapping[str, object], ...]) -> list[dict[str, str]]:
+    """Encode only the authenticated internal envelope as chat text."""
+
+    if type(messages) is not tuple or not messages:
+        raise ValueError("role transport messages are invalid")
+    result = []
+    for item in messages:
+        if not isinstance(item, Mapping) or set(item) != {"role", "content"} or item["role"] != "user":
+            raise ValueError("role transport envelope is invalid")
+        if not isinstance(item["content"], Mapping):
+            raise ValueError("role transport content must be the authenticated envelope")
+        result.append({"role": "user", "content": canonical_json_bytes_v5(item["content"]).decode("utf-8")})
+    return result
+
+
+def prospective_role_usage_v5(
+    request: RoleRequestV5, capabilities: ProviderCapabilitiesV5
+) -> tuple[int, Decimal | None]:
+    """UTF-8 byte bound plus declared chat overhead; output includes reasoning tokens."""
+
+    input_bound = (
+        len(canonical_json_bytes_v5(wire_role_messages_v5(request.messages)))
+        + len(request.schema_authority.canonical_schema_json)
+        + capabilities.input_token_overhead_upper_bound
+    )
+    price = capabilities.price_upper_bound
+    if capabilities.maximum_usd is not None and price is None:
+        raise ValueError("finite USD authority lacks model prices")
+    if price is None:
+        return input_bound, None
+    with localcontext(Context(prec=50, rounding=ROUND_CEILING)):
+        cost = (
+            Decimal(input_bound) * price.input_usd_per_million_tokens
+            + Decimal(request.max_output_tokens) * price.output_usd_per_million_tokens
+        ) / Decimal(1_000_000)
+    return input_bound, cost
 
 
 @dataclass(frozen=True, slots=True)
@@ -1784,6 +1993,7 @@ class OneShotJsonCompletionV5(Protocol):
         max_output_tokens: int,
         automatic_retries: int,
         schema_repair_calls: int,
+        deadline_monotonic: float,
     ) -> CompletionResultV5: ...
 
 
@@ -1812,6 +2022,7 @@ class GatewayCompletionProviderV5:
             max_output_tokens=request.role_request.max_output_tokens,
             automatic_retries=0,
             schema_repair_calls=0,
+            deadline_monotonic=request.deadline_monotonic,
         )
         if type(result) is not CompletionResultV5:
             raise ValueError("V5 completion gateway returned an invalid result")
@@ -1851,6 +2062,8 @@ class AuthorizedRoleSlotV5:
     prior_total_tokens: int
     prior_cost_usd: Decimal
     prior_terminal_sequence: int
+    input_tokens_upper_bound: int
+    cost_upper_bound_usd: Decimal | None
 
     def __post_init__(self) -> None:
         _text(self.slot_id, "authorized role slot ID")
@@ -1862,6 +2075,13 @@ class AuthorizedRoleSlotV5:
         if type(self.prior_cost_usd) is not Decimal or not self.prior_cost_usd.is_finite() or self.prior_cost_usd < 0:
             raise ValueError("role slot prior cost is invalid")
         _count(self.prior_terminal_sequence, "role slot prior terminal sequence")
+        _count(self.input_tokens_upper_bound, "role slot input token upper bound", positive=True)
+        if self.cost_upper_bound_usd is not None and (
+            type(self.cost_upper_bound_usd) is not Decimal
+            or not self.cost_upper_bound_usd.is_finite()
+            or self.cost_upper_bound_usd < 0
+        ):
+            raise ValueError("role slot cost upper bound is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2340,6 +2560,8 @@ class RecoverableRoleInvokerV5(Protocol):
     def invoke_once(
         self,
         persisted_request: FreshPersistedRoleRequestV5,
+        *,
+        deadline_monotonic: float,
     ) -> RoleInvocationPackageV5: ...
 
     def reconcile_once(
@@ -2716,7 +2938,7 @@ class AuthorizedRoleRunnerV5:
             or receipt.attempt_facts_sha256 != facts.sha256
             or receipt.cumulative_external_attempts != prior_attempts + facts.usage.external_attempt_count
             or receipt.cumulative_total_tokens != prior_tokens + facts.usage.total_tokens
-            or receipt.cumulative_cost_usd != prior_cost + facts.usage.cost_usd
+            or receipt.cumulative_cost_usd != sum_cost_usd_v5(prior_cost, facts.usage.cost_usd)
             or receipt.terminal_sequence != prior_sequence + 1
         ):
             raise ValueError("role terminal receipt differs from its slot and facts")
@@ -2892,12 +3114,15 @@ class AuthorizedRoleRunnerV5:
         request: RoleRequestV5,
         *,
         call_key: RoleCallKeyV5,
+        deadline_monotonic: float,
     ) -> ParsedRoleArtifactV5:
         if (
             type(request) is not RoleRequestV5
             or type(call_key) is not RoleCallKeyV5
             or call_key.role != request.role
             or call_key.request_sha256 != request.sha256
+            or type(deadline_monotonic) is not float
+            or not math.isfinite(deadline_monotonic)
         ):
             raise ValueError("authorized runner requires the exact V5 role call and request")
         canonical_kind = _attempt_kind(call_key.attempt_kind)
@@ -2917,6 +3142,12 @@ class AuthorizedRoleRunnerV5:
                 request=request,
                 attempt_kind=canonical_kind,
                 attempt_index=attempt_index,
+            )
+        input_bound, cost_bound = prospective_role_usage_v5(request, capabilities)
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            return self._fail_before_reservation(
+                request=request, attempt_kind=canonical_kind, attempt_index=attempt_index
             )
         slot_request = RoleSlotRequestV5(
             request_sha256=request.sha256,
@@ -2942,7 +3173,12 @@ class AuthorizedRoleRunnerV5:
                 attempt_index=attempt_index,
                 slot_id=None,
             )
-        malformed_slot = slot.request != slot_request or slot.slot_id in self._slot_ids
+        malformed_slot = (
+            slot.request != slot_request
+            or slot.slot_id in self._slot_ids
+            or slot.input_tokens_upper_bound != input_bound
+            or slot.cost_upper_bound_usd != cost_bound
+        )
         try:
             self._lifecycle.verify_role_slot(slot)
         except BaseException:
@@ -2968,8 +3204,11 @@ class AuthorizedRoleRunnerV5:
             raise RoleAuthorizationFailureV5(role=request.role, attempt=facts)
         exhausted_slot = (
             slot.prior_external_attempts >= capabilities.maximum_role_calls
-            or slot.prior_total_tokens >= capabilities.maximum_total_tokens
-            or (capabilities.maximum_usd is not None and slot.prior_cost_usd >= capabilities.maximum_usd)
+            or slot.prior_total_tokens + input_bound + request.max_output_tokens > capabilities.maximum_total_tokens
+            or (
+                capabilities.maximum_usd is not None
+                and (cost_bound is None or sum_cost_usd_v5(slot.prior_cost_usd, cost_bound) > capabilities.maximum_usd)
+            )
         )
         if exhausted_slot:
             facts = self._attempt_facts(
@@ -2993,6 +3232,7 @@ class AuthorizedRoleRunnerV5:
         completion_request = ProviderCompletionRequestV5(
             role_request=request,
             model=capabilities.model,
+            deadline_monotonic=deadline_monotonic,
         )
         try:
             result = self._provider.complete_once(completion_request)
@@ -3017,13 +3257,16 @@ class AuthorizedRoleRunnerV5:
             slot.prior_external_attempts + usage.external_attempt_count > capabilities.maximum_role_calls
             or slot.prior_total_tokens + usage.total_tokens > capabilities.maximum_total_tokens
             or (
-                capabilities.maximum_usd is not None and slot.prior_cost_usd + usage.cost_usd > capabilities.maximum_usd
+                capabilities.maximum_usd is not None
+                and sum_cost_usd_v5(slot.prior_cost_usd, usage.cost_usd) > capabilities.maximum_usd
             )
         )
         if (
             result.returned_model != capabilities.model
             or result.external_attempt_count != 1
             or result.output_tokens > request.max_output_tokens
+            or result.input_tokens > input_bound
+            or (cost_bound is not None and result.cost_usd > cost_bound)
             or exceeds_cumulative_cap
         ):
             facts = self._attempt_facts(
@@ -3152,7 +3395,9 @@ class LedgerBackedRoleInvokerV5:
     def reconciler(self) -> PaidRoleReconcilerV5:
         return self._reconciler
 
-    def invoke_once(self, persisted_request: FreshPersistedRoleRequestV5) -> RoleInvocationPackageV5:
+    def invoke_once(
+        self, persisted_request: FreshPersistedRoleRequestV5, *, deadline_monotonic: float
+    ) -> RoleInvocationPackageV5:
         if type(persisted_request) is not FreshPersistedRoleRequestV5:
             raise ValueError("fresh role invocation capability is invalid")
         before_attempts = len(self._runner.attempts)
@@ -3163,6 +3408,7 @@ class LedgerBackedRoleInvokerV5:
             artifact = self._runner.invoke_once(
                 persisted_request.request,
                 call_key=persisted_request.call,
+                deadline_monotonic=deadline_monotonic,
             )
         except RoleFailureV5 as exc:
             failure = exc
@@ -3336,11 +3582,13 @@ __all__ = [
     "AuthorizedRoleSlotV5",
     "CompletionProvider",
     "CompletionResultV5",
+    "CampaignCriticDirectionV5",
     "CriticDirectionAggregateV5",
     "CriticRoleInputV5",
     "EvaluationStageV5",
     "ExperimentEvaluationAggregateV5",
     "ExperimentFailureAggregateV5",
+    "ExperimentMemoryAggregateV5",
     "ExperimentPredictionAggregateV5",
     "ExperimentSemanticDifferenceAggregateV5",
     "ExistingPersistedRoleRequestV5",
@@ -3393,13 +3641,18 @@ __all__ = [
     "RoleTransportFailureV5",
     "RoleUsageFactsV5",
     "ScenarioAggregateV5",
+    "SemanticDecisionTraceV5",
     "TestableExperimentStatusV5",
     "build_role_request_v5",
+    "author_policy_surface_v5",
     "canonical_role_response_sha256_v5",
     "decode_parsed_role_artifact_v5",
     "parse_and_bind_role_artifact",
     "parsed_role_artifact_primitive_v5",
+    "prospective_role_usage_v5",
     "role_schema_authority_from_manifest_v5",
     "role_request_artifact_primitive_v5",
     "validate_parsed_role_artifact_v5",
+    "wire_role_messages_v5",
+    "sum_cost_usd_v5",
 ]

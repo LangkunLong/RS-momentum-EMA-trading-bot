@@ -90,6 +90,13 @@ class SearchCapabilitiesV5:
     archive_capacity: int = 8
     max_feedback_rounds: int = 10
     allow_full_source_escape: bool = True
+    investigator_memory_max_bytes: int = 96 * 1024
+
+@dataclass(frozen=True, slots=True)
+class ModelPriceUpperBoundV5:
+    model: str
+    input_usd_per_million_tokens: Decimal
+    output_usd_per_million_tokens: Decimal
 
 @dataclass(frozen=True, slots=True)
 class ProviderCapabilitiesV5:
@@ -100,6 +107,8 @@ class ProviderCapabilitiesV5:
     maximum_usd: Decimal | None = None
     automatic_retries: int = 0
     schema_repair_calls: int = 0
+    price_upper_bound: ModelPriceUpperBoundV5 | None = None
+    input_token_overhead_upper_bound: int = 4096
 
 @dataclass(frozen=True, slots=True)
 class ArtifactRefV5:
@@ -695,6 +704,12 @@ If all manifest-declared hypotheses are non-novel for the selected parent, persi
 parent. Terminate with `novelty_exhausted` only after every reconstructible archive parent yields no
 novel hypothesis; never spin or silently reuse an old hypothesis.
 
+Persist the full before/after scheduling cursor with each terminal no-novel authority: next round,
+checkpoint-archive digest, and canonical attempted novelty keys. Recovery authenticates and folds
+that cursor chain chronologically alongside checkpoint-owned records. This advances scheduling
+without publishing an archive or checkpoint; resuming either old or current terminal rounds is
+idempotent. Exhaustion carries the exact ordered per-parent chain covering the reconstructible pool.
+
 - [ ] **Step 5: Run focused search checks**
 
 ```powershell
@@ -810,11 +825,27 @@ fixture responses, invokes the same `parse_and_bind_role_artifact`, and records 
 calls/tokens/cost. It needs no model because provider-free manifests have `provider=None`. Every
 optional repair or retry is a separate authorized, audited, and costed call.
 
+Before dispatch, reserve the authenticated input-envelope/schema UTF-8 byte bound plus declared
+framing overhead and maximum output tokens. Finite USD caps additionally require matching-model
+input/output price upper bounds and enough remaining worst-case cost. Missing price authority
+fails before dispatch; no ceiling remains unrestricted. Settle actual receipts against that exact
+reservation; unknown usage consumes the entire reservation. Convert internal frozen messages to
+canonical JSON text/plain dictionaries only at the transport boundary, and propagate the remaining
+role/round deadline through cancellation of the entire live network call.
+
 Role inputs are explicit: the investigator receives bounded aggregate evaluator evidence, archive
-family summaries, and complete relevant critic directions; the author receives the selected
+family summaries, and lineage-projector-selected complete relevant feedback under the explicit
+memory byte budget. Preserve mandatory ancestor hypotheses and measured evidence; reissue original
+evidence citations and retain authenticated batch comparative assessment and campaign direction.
+The author receives the selected
 hypothesis, V3 contracts, and only the exact editable parent policy files needed for the declared
-scope (all four only for manifest-enabled full-source escape); the critic receives predictions,
-semantic differences, typed failures, and quick/per-episode scenario metrics for the complete batch.
+scope (all four only when the hypothesis explicitly selects manifest-permitted full-source escape).
+Contracts include nested V3 snapshot/decision fields and their invariants. Structural mode may add
+private helpers and constants while retaining closed imports, exports, and declared symbol bounds.
+The critic receives predictions, actual bounded semantic decision differences, parent deltas,
+activity/exposure/expectancy/excursion/friction/exit/regime diagnostics, typed failures, quick base
+metrics, and all discovery-episode scenarios for the complete batch. Behaviorally equivalent
+siblings are retained as explicit outcomes but share no duplicate quick/discovery execution.
 No role receives raw market rows, held-out composition/results, credentials, or filesystem paths.
 
 - [ ] **Step 5: Run focused provider checks**
@@ -943,8 +974,10 @@ legacy two-hour minimum.
 - [ ] **Step 5: Add interruption recovery**
 
 Restart must resume local evaluation from durable evidence without duplicating provider calls or
-promoting an incomplete experiment. A missing critic may use a separately authorized remaining
-critic slot; otherwise finalize experiments without critic review and leave archive unchanged.
+promoting an incomplete experiment. A missing critic preserves authenticated precritic evidence
+and emits a typed `critic_unavailable` outcome. It creates no finalized experiment record and does
+not change archive/checkpoint promotion authority. Automatic retry and repair remain disabled;
+an unavailable or already-started paid slot is never silently replaced by a new call.
 
 Persist a campaign/round ownership lease for every disposable workspace, policy worker, evaluator
 process, and container. Startup may reclaim only resources whose authenticated owner is this

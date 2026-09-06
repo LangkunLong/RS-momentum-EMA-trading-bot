@@ -282,8 +282,10 @@ class PendingPolicyExit:
             or any(type(action) is not ExitAction for action in self.actions)
         ):
             raise ValueError("pending policy exit actions are invalid")
-        if any(action.kind != "close" for action in self.actions):
-            raise ValueError("pending policy exits may contain only close actions")
+        if any(action.kind not in {"close", "scale_out"} for action in self.actions):
+            raise ValueError("pending policy exit action kind is invalid")
+        if target_date <= signal_date:
+            raise ValueError("pending policy exits require a later session")
 
     def to_primitive(self) -> dict[str, object]:
         return {
@@ -5215,15 +5217,20 @@ class PortfolioSimulator:
                 self._policy_intent_outcomes["delayed_missing_open_sessions"] += 1
                 survivors.append(pending)
                 continue
-            close_action = pending.actions[-1]
-            self._close_trade(
-                pending.symbol,
-                open_price,
-                close_action.reason,
-                date_str,
-            )
+            for action in pending.actions:
+                trade = self._open_positions.get(pending.symbol)
+                if trade is None:
+                    break
+                if action.kind == "scale_out":
+                    self._scale_out_trade(
+                        pending.symbol, open_price, date_str, action.reason,
+                        sell_qty=trade.qty * action.fraction_of_original_quantity,
+                    )
+                else:
+                    self._close_trade(pending.symbol, open_price, action.reason, date_str)
             self._policy_intent_outcomes["executed_next_open"] += 1
-            exited.add(pending.symbol)
+            if pending.symbol not in self._open_positions:
+                exited.add(pending.symbol)
         return survivors, exited
 
     def _execute_v5_pending_add_ons(
@@ -5501,26 +5508,8 @@ class PortfolioSimulator:
         trade.ema_trailing_active = decision.ema_trailing_active
         if decision.next_stop_price is not None:
             trade.stop_price = decision.next_stop_price
-        for action in decision.actions:
-            if action.kind != "scale_out":
-                continue
-            if (
-                action.trigger_gain_fraction is None
-                or action.fraction_of_original_quantity is None
-            ):
-                raise ValueError("exit scale-out action is invalid")
-            self._scale_out_trade(
-                symbol,
-                trade.entry_price * (1 + action.trigger_gain_fraction),
-                date_str,
-                action.reason,
-                sell_qty=trade.qty * action.fraction_of_original_quantity,
-            )
         trade.scale_out_tier = decision.scale_out_tier
-        close_actions = tuple(
-            action for action in decision.actions if action.kind == "close"
-        )
-        if not close_actions:
+        if not decision.actions:
             return None
         if next_session is None:
             self._policy_intent_outcomes["queued"] += 1
@@ -5530,7 +5519,7 @@ class PortfolioSimulator:
             symbol=symbol,
             signal_date=date_str,
             target_entry_date=str(next_session.date()),
-            actions=close_actions,
+            actions=decision.actions,
         )
 
     def _queue_v3_add_on_after_close(

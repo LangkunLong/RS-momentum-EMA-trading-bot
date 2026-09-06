@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal
 import hashlib
+import json
 import math
 import re
 import threading
@@ -41,11 +43,16 @@ from core.pit_optimizer_v5.memory import (
     CleanupResultPayloadV5,
     ExperimentRecordV5,
     NoNovelHypothesisAuthorityV5,
+    NoveltyExhaustedAuthorityV5,
+    RoleCompletionPayloadV5,
+    RoundOutcomePayloadV5,
+    SchedulingCursorV5,
     PreValidationInvalidExperimentIdentityV5,
     ResourceLeasePayloadV5,
     StoredExperimentRecordV5,
     is_testable_experiment_status_v5,
     reduce_experiment_journal_v5,
+    project_investigator_memory_v5,
 )
 from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 from core.pit_optimizer_v5.probes import (
@@ -62,6 +69,8 @@ from core.pit_optimizer_v5.provider import (
     AuthorPolicyContractsV5,
     AuthorRoleInputV5,
     CriticDirectionAggregateV5,
+    CampaignCriticDirectionV5,
+    ExperimentMemoryAggregateV5,
     CriticRoleInputV5,
     ExperimentEvaluationAggregateV5,
     ExperimentFailureAggregateV5,
@@ -72,6 +81,7 @@ from core.pit_optimizer_v5.provider import (
     RoleInvocationPackageV5,
     RoleRequestV5,
     ScenarioAggregateV5,
+    SemanticDecisionTraceV5,
     build_role_request_v5,
     role_schema_authority_from_manifest_v5,
 )
@@ -89,13 +99,17 @@ from core.pit_optimizer_v5.search import (
     BaselineParentAuthorityV5,
     CandidateArchiveReducerV5,
     ParentCandidateV5,
+    SearchStateV5,
     PRIMARY_MECHANISMS_V5,
     expected_target_gap_pct_v5,
 )
 from core.pit_optimizer_v5.selection import (
     ScheduledHypothesisV5,
+    NoNovelHypothesisV5,
     advance_no_novel_parent_v5,
     select_novel_hypothesis_v5,
+    select_parent_v5,
+    parent_schedule_v5,
 )
 from core.pit_optimizer_v5.workspace import (
     GitCandidateMaterializerV5,
@@ -590,15 +604,59 @@ class LocalRoleRequestFactoryV5:
                 )
             )
 
+        relevant = parent.primary_mechanism or (
+            max(
+                projection.stored_records, key=lambda item: (item.record.round_index, item.record.experiment_id)
+            ).record.hypothesis.primary_mechanism
+            if projection.stored_records
+            else "cross_policy"
+        )
+        memory = project_investigator_memory_v5(
+            stored_records=projection.stored_records,
+            selected_parent_revision_sha256=parent.policy_identity_sha256,
+            selected_parent_record_ref=parent.selected_parent_record_ref,
+            relevant_mechanism=relevant,
+            maximum_bytes=inputs.manifest.search.investigator_memory_max_bytes,
+        )
+        by_experiment = {item.record.experiment_id: item.record for item in projection.stored_records}
+        packages = {}
+
+        def prior_critic(record):
+            if record.round_index not in packages:
+                events = self._repository.load_round_events(
+                    campaign_id=inputs.campaign_id, round_index=record.round_index
+                )
+                payloads = tuple(
+                    self._repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind)
+                    for item in events
+                )
+                critic_payloads = tuple(
+                    item for item in payloads if type(item) is RoleCompletionPayloadV5 and item.role == "critic"
+                )
+                if len(critic_payloads) != 1:
+                    raise ValueError("stored learning lacks its authenticated batch critic")
+                packages[record.round_index] = self._repository.load_role_invocation(critic_payloads[0])
+            package = packages[record.round_index]
+            if (
+                not package.accepted
+                or type(package.artifact) is not CriticArtifactV5
+                or record.critic_artifact_ref is None
+                or canonical_sha256_v5(package.artifact) != record.critic_artifact_ref.sha256
+            ):
+                raise ValueError("stored learning differs from its batch critic")
+            return package
+
+        def reissue(package, cited_ids):
+            items = {item.evidence_id: item for item in package.request.role_evidence.items}
+            return tuple(evidence.add(items[cited].metric_id, items[cited].value) for cited in cited_ids)
+
         directions: list[CriticDirectionAggregateV5] = []
-        completed = tuple(stored for stored in projection.stored_records if stored.record.critic_review is not None)[
-            -12:
-        ]
-        for stored in completed:
-            record = stored.record
+        complete_records = tuple(by_experiment[item.experiment_id] for item in memory.complete_feedback)
+        for record in complete_records:
             review = record.critic_review
-            assert review is not None
-            evidence_id = evidence.add("archive.critic.target_gap_pct", record.target_gap_pct)
+            if review is None:
+                continue
+            package = prior_critic(record)
             directions.append(
                 CriticDirectionAggregateV5(
                     record.experiment_id,
@@ -607,13 +665,86 @@ class LocalRoleRequestFactoryV5:
                     review.causal_explanation,
                     review.disposition,
                     review.next_direction,
-                    (evidence_id,),
+                    reissue(package, review.evidence_ids),
+                )
+            )
+        batch_records = {record.round_index: record for record in complete_records if record.critic_review is not None}
+        reviewed = tuple(item.record for item in projection.stored_records if item.record.critic_review is not None)
+        if reviewed:
+            latest = max(reviewed, key=lambda record: (record.round_index, record.experiment_id))
+            batch_records[latest.round_index] = latest
+        campaign_directions = []
+        for _round, record in sorted(batch_records.items()):
+            package = prior_critic(record)
+            critic = package.artifact
+            campaign_directions.append(
+                CampaignCriticDirectionV5(
+                    canonical_sha256_v5(critic),
+                    critic.comparative_assessment,
+                    critic.next_campaign_direction,
+                    reissue(package, critic.evidence_ids),
+                )
+            )
+        summaries = []
+        complete_ids = {item.experiment_id for item in memory.complete_feedback}
+        investigator_packages = {}
+        for summary in (*memory.complete_feedback, *memory.summaries):
+            record = by_experiment[summary.experiment_id]
+            ids = [evidence.add("archive.experiment.target_gap_pct", record.target_gap_pct)]
+            if record.campaign_evidence is not None:
+                ids.append(
+                    evidence.add("archive.experiment.campaign_cagr_pct", record.campaign_evidence.campaign_cagr_pct)
+                )
+            else:
+                ids.append(evidence.add("archive.experiment.valid_count", int(record.validation.valid)))
+            hypothesis = None
+            if record.experiment_id in complete_ids:
+                if record.round_index not in investigator_packages:
+                    events = self._repository.load_round_events(
+                        campaign_id=inputs.campaign_id, round_index=record.round_index
+                    )
+                    payloads = tuple(
+                        self._repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind)
+                        for item in events
+                    )
+                    investigators = tuple(
+                        item
+                        for item in payloads
+                        if type(item) is RoleCompletionPayloadV5 and item.role == "investigator"
+                    )
+                    if len(investigators) != 1:
+                        raise ValueError("complete memory lacks its authenticated investigator")
+                    investigator_packages[record.round_index] = self._repository.load_role_invocation(investigators[0])
+                package = investigator_packages[record.round_index]
+                if (
+                    not package.accepted
+                    or type(package.artifact) is not InvestigatorArtifactV5
+                    or record.hypothesis not in package.artifact.hypotheses
+                ):
+                    raise ValueError("complete memory hypothesis differs from its investigator")
+                hypothesis_ids = reissue(package, record.hypothesis.evidence_ids)
+                ids.extend(hypothesis_ids)
+                hypothesis = replace(record.hypothesis, evidence_ids=hypothesis_ids)
+            summaries.append(
+                ExperimentMemoryAggregateV5(
+                    record.experiment_id,
+                    record.hypothesis.primary_mechanism,
+                    record.status,
+                    tuple(ids),
+                    hypothesis,
+                    record.parent_revision_sha256 if hypothesis is not None else None,
+                    record.policy_revision.sha256
+                    if hypothesis is not None and record.policy_revision is not None
+                    else None,
+                    record.round_index if hypothesis is not None else None,
                 )
             )
         role_input = InvestigatorRoleInputV5(
             tuple(evaluator_ids),
             tuple(families),
             tuple(directions),
+            tuple(campaign_directions),
+            tuple(summaries),
         )
         return role_input, evidence.build()
 
@@ -668,7 +799,9 @@ class LocalRoleRequestFactoryV5:
             decision.parent.policy_revision.editable_source_sha256
         ):
             raise ValueError("author source differs from parent revision")
-        full_source_allowed = inputs.manifest.search.allow_full_source_escape
+        full_source_allowed = decision.hypothesis.authoring_mode == "full_source_escape"
+        if full_source_allowed and not inputs.manifest.search.allow_full_source_escape:
+            raise ValueError("requested structural authoring is not authorized")
         if full_source_allowed or decision.hypothesis.primary_mechanism == "cross_policy":
             paths = EDITABLE_POLICY_PATHS_V5
         else:
@@ -708,6 +841,111 @@ class LocalRoleRequestFactoryV5:
         )
 
     @staticmethod
+    def _report_evidence(evidence, report, *, prefix, parent_report=None, detailed=True):
+        names = (
+            (
+                "portfolio_annualized_return_pct",
+                "portfolio_total_return_pct",
+                "max_drawdown_pct",
+                "closed_trades",
+                "average_exposure_pct",
+                "average_cash_pct",
+                "turnover_pct",
+                "friction_drag_pct",
+                "total_friction_usd",
+                "win_rate_pct",
+                "average_win_pct",
+                "average_loss_pct",
+                "payoff_ratio",
+                "expectancy_pct",
+                "median_holding_sessions",
+                "invested_sleeve_annualized_return_pct",
+                "estimated_idle_cash_drag_pct",
+                "scale_out_opportunity_cost_pct",
+            )
+            if detailed
+            else ("portfolio_annualized_return_pct", "friction_drag_pct")
+        )
+        ids = [evidence.add(f"{prefix}.{name}", getattr(report, name)) for name in names]
+        if parent_report is not None:
+            delta_names = (
+                (
+                    "portfolio_annualized_return_pct",
+                    "closed_trades",
+                    "average_exposure_pct",
+                    "expectancy_pct",
+                    "friction_drag_pct",
+                    "scale_out_opportunity_cost_pct",
+                )
+                if detailed
+                else ("portfolio_annualized_return_pct",)
+            )
+            for name in delta_names:
+                current, prior = getattr(report, name), getattr(parent_report, name)
+                ids.append(
+                    evidence.add(
+                        f"{prefix}.parent_delta.{name}",
+                        None if current is None or prior is None else Decimal(current) - Decimal(prior),
+                    )
+                )
+        if detailed:
+            for name, distribution in (
+                ("mfe", report.maximum_favorable_excursion_pct),
+                ("mae", report.maximum_adverse_excursion_pct),
+            ):
+                for statistic in ("minimum", "median", "maximum"):
+                    ids.append(
+                        evidence.add(
+                            f"{prefix}.{name}.{statistic}",
+                            None if distribution is None else getattr(distribution, statistic),
+                        )
+                    )
+            for category, values in (
+                ("exit", report.exit_attribution),
+                ("entry", report.entry_funnel),
+                ("intent", report.policy_intent_outcomes),
+            ):
+                for metric in sorted(values, key=lambda item: (-item.count, item.metric_id))[:4]:
+                    ids.append(evidence.add(f"{prefix}.{category}.{metric.metric_id}", metric.count))
+            for row in report.regime_slices[:3]:
+                for name in ("total_return_pct", "closed_trades", "average_exposure_pct"):
+                    ids.append(evidence.add(f"{prefix}.regime.{row.label}.{name}", getattr(row.metrics, name)))
+        return tuple(ids)
+
+    @staticmethod
+    def _semantic_traces(parent, candidate, differing_ids):
+        left = {item.probe_id: item for item in parent.observations}
+        right = {item.probe_id: item for item in candidate.observations}
+
+        # Decisions use slot numbers, not market identifiers. The fixed suite
+        # contains no market rows; reject any unexpected identifying field.
+        def decision(raw):
+            value = json.loads(raw)
+
+            def check(item):
+                if type(item) is dict:
+                    if any(key in {"symbol", "ticker", "lineage_id", "security_id"} for key in item):
+                        raise ValueError("semantic decision contains an identifying field")
+                    for child in item.values():
+                        check(child)
+                elif type(item) is list:
+                    for child in item:
+                        check(child)
+
+            check(value)
+            return canonical_json_bytes_v5(value).decode("utf-8")
+
+        return tuple(
+            SemanticDecisionTraceV5(
+                probe_id,
+                left[probe_id].method,
+                decision(left[probe_id].decision_json),
+                decision(right[probe_id].decision_json),
+            )
+            for probe_id in differing_ids[:8]
+        )
+
+    @staticmethod
     def _ordered_scenarios(panel: PanelEvaluationV5):
         by_id = {item.scenario_id: item for item in panel.scenarios}
         try:
@@ -728,6 +966,9 @@ class LocalRoleRequestFactoryV5:
         if len(set(experiment_ids)) != len(experiment_ids):
             raise ValueError("critic candidate identities are not unique")
         parent_fingerprint = _parent_fingerprint(inputs, projection, decision.parent)
+        parent_episodes = {
+            item.episode_ordinal: item for item in _parent_campaign(inputs, projection, decision.parent).episodes
+        }
         evidence = _EvidenceBuilderV5("critic")
         evaluations: list[ExperimentEvaluationAggregateV5] = []
         semantic_rows: list[ExperimentSemanticDifferenceAggregateV5] = []
@@ -736,30 +977,35 @@ class LocalRoleRequestFactoryV5:
             scenarios: list[ScenarioAggregateV5] = []
             if candidate.quick_evidence is not None:
                 scenario = selected_scenario(candidate.quick_evidence)
-                evidence_id = evidence.add(
-                    "quick.portfolio_annualized_return_pct",
-                    scenario.report.portfolio_annualized_return_pct,
-                )
+                evidence_ids = self._report_evidence(evidence, scenario.report, prefix="quick")
                 scenarios.append(
                     ScenarioAggregateV5(
                         "quick",
                         None,
                         scenario.scenario_id,
-                        (evidence_id,),
+                        evidence_ids,
                     )
                 )
             for episode in candidate.discovery_episodes:
                 for scenario in self._ordered_scenarios(episode.evaluation):
-                    evidence_id = evidence.add(
-                        "episode.portfolio_annualized_return_pct",
-                        scenario.report.portfolio_annualized_return_pct,
+                    parent_report = next(
+                        item.report
+                        for item in parent_episodes[episode.episode_ordinal].evaluation.scenarios
+                        if item.scenario_id == scenario.scenario_id
+                    )
+                    evidence_ids = self._report_evidence(
+                        evidence,
+                        scenario.report,
+                        prefix="episode",
+                        parent_report=parent_report,
+                        detailed=scenario.scenario_id == "base",
                     )
                     scenarios.append(
                         ScenarioAggregateV5(
                             "discovery_episode",
                             episode.episode_ordinal,
                             scenario.scenario_id,
-                            (evidence_id,),
+                            evidence_ids,
                         )
                     )
             evaluations.append(
@@ -787,6 +1033,7 @@ class LocalRoleRequestFactoryV5:
                     comparison.classification,
                     len(comparison.differing_probe_ids),
                     (evidence_id,),
+                    self._semantic_traces(parent_fingerprint, fingerprint, comparison.differing_probe_ids),
                 )
             )
 
@@ -843,6 +1090,33 @@ class LocalRoleRequestFactoryV5:
         )
 
 
+def _scheduling_cursor(state: SearchStateV5) -> SchedulingCursorV5:
+    return SchedulingCursorV5(
+        state.next_round_index, canonical_sha256_v5(state.archive.to_primitive()), state.attempted_novelty_keys
+    )
+
+
+def _no_novel_authority(manifest, panel_plan, state, parent, request, package, artifact):
+    outcome = select_novel_hypothesis_v5(state=state, parent=parent, artifact=artifact, capabilities=manifest.search)
+    if type(outcome) is not NoNovelHypothesisV5:
+        raise ValueError("terminal scheduling authority contains a novel hypothesis")
+    after = advance_no_novel_parent_v5(state, outcome, artifact=artifact, capabilities=manifest.search)
+    return after, NoNovelHypothesisAuthorityV5(
+        "no_novel_hypothesis",
+        panel_plan.discovery_plan_sha256,
+        canonical_sha256_v5(state.to_primitive()),
+        canonical_sha256_v5(after.to_primitive()),
+        parent.policy_identity_sha256,
+        request.sha256,
+        request.role_evidence.sha256,
+        (package.attempt.sha256,),
+        canonical_sha256_v5(artifact),
+        canonical_sha256_v5(outcome.to_primitive()),
+        _scheduling_cursor(state),
+        _scheduling_cursor(after),
+    )
+
+
 class SelectionNoveltyResolverV5:
     def resolve(
         self,
@@ -862,24 +1136,26 @@ class SelectionNoveltyResolverV5:
         )
         if type(outcome) is ScheduledHypothesisV5:
             return outcome
-        after = advance_no_novel_parent_v5(
-            projection.state,
-            outcome,
-            artifact=artifact,
-            capabilities=inputs.manifest.search,
+        _after, authority = _no_novel_authority(
+            inputs.manifest, inputs.panel_plan, projection.state, parent, request, package, artifact
         )
-        return NoNovelHypothesisAuthorityV5(
-            "no_novel_hypothesis",
-            inputs.panel_plan.discovery_plan_sha256,
-            canonical_sha256_v5(projection.state.to_primitive()),
-            canonical_sha256_v5(after.to_primitive()),
-            parent.policy_identity_sha256,
-            request.sha256,
-            request.role_evidence.sha256,
-            (package.attempt.sha256,),
-            canonical_sha256_v5(artifact),
-            canonical_sha256_v5(outcome.to_primitive()),
+        chain = (*projection.no_novel_outcomes, authority)
+        parents = parent_schedule_v5(
+            state=projection.state,
+            baseline=inputs.baseline,
+            discovery_plan=inputs.panel_plan,
+            evaluator_contract=inputs.evaluator_contract,
+            stored_records=projection.stored_records,
         )
+        if {item.parent_revision_sha256 for item in chain} == {item.policy_identity_sha256 for item in parents}:
+            return NoveltyExhaustedAuthorityV5(
+                "novelty_exhausted",
+                inputs.panel_plan.discovery_plan_sha256,
+                chain[0].search_state_before_sha256,
+                authority.search_state_after_sha256,
+                chain,
+            )
+        return authority
 
 
 class CanonicalExperimentRecordFactoryV5:
@@ -1012,7 +1288,7 @@ class LocalArchiveReducerFactoryV5:
         manifest: CampaignManifestV5,
         panel_plan: CampaignPanelPlanV5,
         evaluator_contract: EvaluatorContractV5,
-    ) -> None:
+    ) -> SearchStateV5:
         """Authenticate the committed checkpoint/archive without repairing either file."""
 
         if (
@@ -1024,14 +1300,16 @@ class LocalArchiveReducerFactoryV5:
         ):
             raise ValueError("archive verification authority is invalid")
         checkpoint = self._repository.load_checkpoint()
-        if checkpoint is None:
-            return
-        records = tuple(
-            StoredExperimentRecordV5(
-                reference,
-                self._repository.load_experiment(reference),
+        records = (
+            ()
+            if checkpoint is None
+            else tuple(
+                StoredExperimentRecordV5(
+                    reference,
+                    self._repository.load_experiment(reference),
+                )
+                for reference in checkpoint.record_refs
             )
-            for reference in checkpoint.record_refs
         )
         reducer = CandidateArchiveReducerV5(
             panel_plan,
@@ -1040,6 +1318,12 @@ class LocalArchiveReducerFactoryV5:
             self._authorities(records),
             manifest.search.archive_capacity,
         )
+        baseline = self._repository.load_typed_artifact(
+            manifest.baseline_authority_ref, value_type=BaselineParentAuthorityV5
+        )
+        self._scheduling_history(manifest, panel_plan, evaluator_contract, baseline, records, reducer)
+        if checkpoint is None:
+            return reducer.initial()
         state = reduce_experiment_journal_v5(
             tuple(item.record for item in records),
             reducer,
@@ -1054,6 +1338,110 @@ class LocalArchiveReducerFactoryV5:
         authenticated = self._repository.authenticate(archive_ref)
         if authenticated.content != raw:
             raise ValueError("archive projection differs from checkpoint authority")
+        return state
+
+    def _scheduling_history(self, manifest, panel_plan, evaluator_contract, baseline, records, reducer):
+        """Fold terminal cursors and checkpoint-owned records in chronological order."""
+        state = reducer.initial()
+        chain = ()
+        history = {}
+        prior_records = []
+        stopped = False
+        for round_index in range(1, manifest.search.max_feedback_rounds + 1):
+            history[round_index] = (state, chain)
+            events = self._repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index)
+            current_records = tuple(item for item in records if item.record.round_index == round_index)
+            payloads = tuple(
+                self._repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind) for item in events
+            )
+            terminals = tuple(item for item in payloads if type(item) is RoundOutcomePayloadV5)
+            if stopped:
+                if events or current_records:
+                    raise ValueError("scheduling history advances past an unfinished or exhausted round")
+                continue
+            if current_records:
+                if state.next_round_index != round_index or terminals:
+                    raise ValueError("checkpoint records conflict with terminal scheduling authority")
+                for item in sorted(current_records, key=lambda item: item.record.experiment_id):
+                    state = reducer.apply(state, item.record)
+                prior_records.extend(current_records)
+                chain = ()
+                continue
+            if not terminals:
+                stopped = True
+                continue
+            if len(terminals) != 1:
+                raise ValueError("scheduling history has duplicate terminal outcomes")
+            terminal = terminals[0].authority
+            if type(terminal) not in {NoNovelHypothesisAuthorityV5, NoveltyExhaustedAuthorityV5}:
+                stopped = True
+                continue
+            completions = tuple(item for item in payloads if type(item) is RoleCompletionPayloadV5)
+            if len(completions) != 1 or completions[0].role != "investigator":
+                raise ValueError("terminal scheduling requires exactly one investigator completion")
+            package = self._repository.load_role_invocation(completions[0])
+            if (
+                not package.accepted
+                or type(package.artifact) is not InvestigatorArtifactV5
+                or package.call.round_index != round_index
+            ):
+                raise ValueError("terminal scheduling investigator is invalid")
+            parent = select_parent_v5(
+                state=state,
+                baseline=baseline,
+                discovery_plan=panel_plan,
+                evaluator_contract=evaluator_contract,
+                stored_records=tuple(prior_records),
+            )
+            if (
+                package.request.expected_binding.parent_revision_sha256 != parent.policy_identity_sha256
+                or package.request.expected_binding.discovery_plan_sha256 != panel_plan.discovery_plan_sha256
+            ):
+                raise ValueError("terminal scheduling parent differs")
+            parents = parent_schedule_v5(
+                state=state,
+                baseline=baseline,
+                discovery_plan=panel_plan,
+                evaluator_contract=evaluator_contract,
+                stored_records=tuple(prior_records),
+            )
+            state, expected = _no_novel_authority(
+                manifest, panel_plan, state, parent, package.request, package, package.artifact
+            )
+            chain = (*chain, expected)
+            exhausted = {item.parent_revision_sha256 for item in chain} == {
+                item.policy_identity_sha256 for item in parents
+            }
+            expected_terminal = (
+                NoveltyExhaustedAuthorityV5(
+                    "novelty_exhausted",
+                    panel_plan.discovery_plan_sha256,
+                    chain[0].search_state_before_sha256,
+                    expected.search_state_after_sha256,
+                    chain,
+                )
+                if exhausted
+                else expected
+            )
+            if terminal != expected_terminal:
+                raise ValueError("terminal scheduling cursor or exhaustion proof differs")
+            stopped = exhausted
+        return history
+
+    def recover_scheduling(self, inputs: FeedbackRoundInputV5, projection: SearchProjectionV5) -> SearchProjectionV5:
+        reducer = self.recovery_reducer(inputs)
+        history = self._scheduling_history(
+            inputs.manifest,
+            inputs.panel_plan,
+            inputs.evaluator_contract,
+            inputs.baseline,
+            projection.stored_records,
+            reducer,
+        )
+        state, chain = history[inputs.round_index]
+        # A read-only resume of an older terminal round uses its authenticated
+        # checkpoint-owned prefix, not the archive after later completed rounds.
+        return SearchProjectionV5(projection.checkpoint, state, projection.stored_records, chain)
 
     def publication_reducer(
         self,

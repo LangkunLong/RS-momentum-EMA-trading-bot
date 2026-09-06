@@ -45,6 +45,7 @@ from core.pit_optimizer_v5.contracts import (
     ArtifactGraphVerificationV5,
     ArtifactRefV5,
     AuthenticatedArtifactV5,
+    AuthenticatedRawArtifactV5,
     CampaignEvidenceV5,
     CampaignManifestV5,
     CampaignPanelPlanV5,
@@ -447,6 +448,8 @@ def _decode_role_ledger_reservation(
         "prior_total_tokens",
         "prior_cost_usd",
         "prior_terminal_sequence",
+        "input_tokens_upper_bound",
+        "cost_upper_bound_usd",
     }
     authorized_slot_primitive = _exact_keys(authorized_slot_value, authorized_slot_keys)
     slot_value = authorized_slot_primitive["request"]
@@ -2883,15 +2886,84 @@ class LocalArtifactRepositoryV5:
                 raise ArtifactNonCanonicalV5(repaired) from None
         return checkpoint, state
 
+    def _authenticate_raw_campaign_edge(self, reference: ArtifactRefV5) -> AuthenticatedRawArtifactV5:
+        """Stream exact data bytes. Only verify_graph's closed plan edges select this codec."""
+
+        def same_file_version(left, right):
+            return (
+                _metadata_identity(left) == _metadata_identity(right)
+                and left.st_size == right.st_size
+                and left.st_mtime_ns == right.st_mtime_ns
+                # Windows stat and descriptor-stat disagree on creation/change
+                # time; file identity, size, mtime, and exact digest bind bytes.
+                and (os.name == "nt" or left.st_ctime_ns == right.st_ctime_ns)
+                and stat.S_ISREG(right.st_mode)
+                and right.st_nlink == 1
+            )
+
+        parts = _safe_relative_path(reference.relative_path)
+        try:
+            with self._directory(tuple(parts[:-1]), create=False) as directory:
+                name = parts[-1]
+                if os.name == "nt":
+                    before = os.lstat(directory.path / name)
+                    if _is_link_or_reparse(directory.path / name):
+                        raise ArtifactRelocatedV5(reference, reference.relative_path)
+                    descriptor = os.open(directory.path / name, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                else:
+                    before = os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+                    descriptor = os.open(
+                        name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory.descriptor,
+                    )
+                try:
+                    opened = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or opened.st_nlink != 1
+                        or not same_file_version(before, opened)
+                    ):
+                        raise ArtifactRelocatedV5(reference, reference.relative_path)
+                    digest = hashlib.sha256()
+                    size = 0
+                    while size < opened.st_size:
+                        chunk = os.read(descriptor, min(1024 * 1024, opened.st_size - size))
+                        if not chunk:
+                            raise ArtifactRelocatedV5(reference, reference.relative_path)
+                        digest.update(chunk)
+                        size += len(chunk)
+                    if os.read(descriptor, 1) or not same_file_version(opened, os.fstat(descriptor)):
+                        raise ArtifactRelocatedV5(reference, reference.relative_path)
+                finally:
+                    os.close(descriptor)
+                after = (
+                    os.lstat(directory.path / name)
+                    if os.name == "nt"
+                    else os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+                )
+                if not same_file_version(opened, after):
+                    raise ArtifactRelocatedV5(reference, reference.relative_path)
+                if digest.hexdigest() != reference.sha256:
+                    raise ArtifactDigestMismatchV5(reference, digest.hexdigest())
+                return AuthenticatedRawArtifactV5(reference, size)
+        except ArtifactRepositoryFailureV5:
+            raise
+        except FileNotFoundError:
+            raise ArtifactMissingV5(reference) from None
+        except (OSError, ValueError):
+            raise ArtifactRelocatedV5(reference, reference.relative_path) from None
+
     def verify_graph(self, manifest_ref: ArtifactRefV5) -> ArtifactGraphVerificationV5:
-        authenticated: list[AuthenticatedArtifactV5] = []
+        authenticated: list[AuthenticatedArtifactV5 | AuthenticatedRawArtifactV5] = []
         authenticated_keys: set[tuple[str, str]] = set()
         panels: dict[tuple[str, str], EvaluationPanelSpec] = {}
         complete: set[tuple[str, str, str]] = set()
         active: set[tuple[str, str]] = set()
 
         def visit(
-            reference: ArtifactRefV5, kind: Literal["generic", "manifest", "panel_plan", "panel"] = "generic"
+            reference: ArtifactRefV5,
+            kind: Literal["generic", "manifest", "panel_plan", "panel", "campaign_raw"] = "generic",
         ) -> None:
             key = (reference.relative_path, reference.sha256)
             if key in active:
@@ -2902,6 +2974,8 @@ class LocalArtifactRepositoryV5:
             active.add(key)
             if kind == "panel":
                 panels[key], item = self._authenticate_evaluation_panel_spec(reference)
+            elif kind == "campaign_raw":
+                item = self._authenticate_raw_campaign_edge(reference)
             else:
                 item = self.authenticate(reference)
             if key not in authenticated_keys:
@@ -2921,8 +2995,8 @@ class LocalArtifactRepositoryV5:
                     for child in item.child_references:
                         visit(child, "panel_plan" if child == value.panel_plan_ref else "generic")
                 else:
-                    visit(value.pit_bundle_ref)
-                    visit(value.prices_provenance_ref)
+                    visit(value.pit_bundle_ref, "campaign_raw")
+                    visit(value.prices_provenance_ref, "campaign_raw")
                     for episode in (value.mechanics, value.quick, *value.discovery):
                         visit(episode.panel_ref, "panel")
                         panel = panels[(episode.panel_ref.relative_path, episode.panel_ref.sha256)]
@@ -2932,7 +3006,7 @@ class LocalArtifactRepositoryV5:
                                 raise ValueError
                         except ValueError:
                             raise ArtifactSchemaFailureV5(episode.panel_ref) from None
-            else:
+            elif kind != "campaign_raw":
                 for child in item.child_references:
                     visit(child)
             active.remove(key)

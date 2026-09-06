@@ -37,6 +37,7 @@ ExperimentStatusV5 = Literal[
     "invalid",
     "exact_duplicate",
     "behavioral_equivalent",
+    "sibling_equivalent",
     "zero_trade",
     "quick_rejected",
     "timed_out",
@@ -70,6 +71,7 @@ CandidateStageOutcomeV5 = Literal[
     "validation_failed",
     "exact_duplicate",
     "behavioral_equivalent",
+    "sibling_equivalent",
     "behaviorally_distinct",
     "semantic_probe_failed",
     "quick_evaluation_failed",
@@ -116,6 +118,7 @@ _STATUSES = frozenset(
         "invalid",
         "exact_duplicate",
         "behavioral_equivalent",
+        "sibling_equivalent",
         "zero_trade",
         "quick_rejected",
         "timed_out",
@@ -161,6 +164,7 @@ _CANDIDATE_STAGE_OUTCOMES = frozenset(
         "validation_failed",
         "exact_duplicate",
         "behavioral_equivalent",
+        "sibling_equivalent",
         "behaviorally_distinct",
         "semantic_probe_failed",
         "quick_evaluation_failed",
@@ -483,10 +487,13 @@ class ExperimentRecordV5:
                 or self.target_gap_pct is not None
             ):
                 raise ValueError("exact duplicate experiment evidence is inconsistent")
-        elif self.status == "behavioral_equivalent":
+        elif self.status in {"behavioral_equivalent", "sibling_equivalent"}:
             if (
                 self.semantic_fingerprint is None
-                or self.semantic_fingerprint.fingerprint_sha256 != self.parent_semantic_fingerprint_sha256
+                or (
+                    self.status == "behavioral_equivalent"
+                    and self.semantic_fingerprint.fingerprint_sha256 != self.parent_semantic_fingerprint_sha256
+                )
                 or self.quick_evidence is not None
                 or self.discovery_episodes
                 or self.campaign_evidence is not None
@@ -722,6 +729,7 @@ class CandidateStageResultPayloadV5:
             "validation_failed": "validation",
             "exact_duplicate": "semantic_probe",
             "behavioral_equivalent": "semantic_probe",
+            "sibling_equivalent": "semantic_probe",
             "behaviorally_distinct": "semantic_probe",
             "semantic_probe_failed": "semantic_probe",
             "quick_evaluation_failed": "quick_evaluation",
@@ -731,7 +739,7 @@ class CandidateStageResultPayloadV5:
             raise ValueError("candidate-stage outcome differs from its stage")
 
         validation_outcomes = {"validation_valid", "validation_invalid", "validation_failed"}
-        semantic_outcomes = {"behavioral_equivalent", "behaviorally_distinct"}
+        semantic_outcomes = {"behavioral_equivalent", "sibling_equivalent", "behaviorally_distinct"}
         failure_outcomes = {
             "validation_failed": "validation_execution_failed",
             "semantic_probe_failed": "semantic_probe_failed",
@@ -907,6 +915,22 @@ class CleanupResultPayloadV5:
 
 
 @dataclass(frozen=True, slots=True)
+class SchedulingCursorV5:
+    """Complete scheduling state; archive authority remains checkpoint-owned."""
+
+    next_round_index: int
+    archive_sha256: str
+    attempted_novelty_keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _count(self.next_round_index, "scheduling next round", positive=True)
+        _digest(self.archive_sha256, "scheduling archive")
+        _digest_tuple(self.attempted_novelty_keys, "scheduling attempted novelty")
+        if self.attempted_novelty_keys != tuple(sorted(set(self.attempted_novelty_keys))):
+            raise ValueError("scheduling novelty keys are not canonical")
+
+
+@dataclass(frozen=True, slots=True)
 class NoNovelHypothesisAuthorityV5:
     """Exact controller and investigator facts for one exhausted parent."""
 
@@ -920,10 +944,20 @@ class NoNovelHypothesisAuthorityV5:
     investigator_attempt_sha256s: tuple[str, ...]
     investigator_artifact_sha256: str
     selection_outcome_sha256: str
+    scheduling_before: SchedulingCursorV5
+    scheduling_after: SchedulingCursorV5
 
     def __post_init__(self) -> None:
         if self.outcome != "no_novel_hypothesis":
             raise ValueError("no-novel authority kind is invalid")
+        if (
+            type(self.scheduling_before) is not SchedulingCursorV5
+            or type(self.scheduling_after) is not SchedulingCursorV5
+            or self.scheduling_after.next_round_index != self.scheduling_before.next_round_index + 1
+            or self.scheduling_before.archive_sha256 != self.scheduling_after.archive_sha256
+            or self.scheduling_before.attempted_novelty_keys != self.scheduling_after.attempted_novelty_keys
+        ):
+            raise ValueError("no-novel scheduling transition is invalid")
         for value, label in (
             (self.discovery_plan_sha256, "no-novel discovery plan"),
             (self.search_state_before_sha256, "no-novel prior search state"),
@@ -2000,6 +2034,7 @@ __all__ = [
     "RoundOutcomeAuthorityV5",
     "RoundOutcomePayloadV5",
     "RuntimeFailureAuthorityV5",
+    "SchedulingCursorV5",
     "RoundRecoveryV5",
     "StoredExperimentRecordV5",
     "event_kind_for_payload_v5",

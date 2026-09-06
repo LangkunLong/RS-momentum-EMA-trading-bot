@@ -85,7 +85,8 @@ The profile must:
 - execute decisions based on a completed close no earlier than the next eligible session open;
 - fill a long protective stop at the opening price when the market gaps below the stop, otherwise
   at the stop when the session trades through it;
-- distinguish intraday price-triggered scale-outs from close-derived policy exits;
+- execute all close-derived policy actions, including scale-outs, at the next eligible open;
+  only an order precommitted before the bar may be treated as intraday price-triggered;
 - apply separately declared commission, half-spread, and market-impact/slippage costs to every fill;
 - retain exact no-leverage and cash accounting; and
 - seal the execution-profile identity into baseline, candidate, panel, and checkpoint artifacts.
@@ -193,10 +194,27 @@ separate from search iterations, and default to disabled unless the operator aut
 No model name, call count, token ceiling, or USD ceiling is hard-coded into the search engine. A
 run manifest supplies those limits. `apply=false` remains mandatory throughout discovery.
 
+Before dispatch, the manifest-authenticated provider authority reserves a conservative input-token
+bound (canonical wire-envelope and schema UTF-8 byte counts plus an explicit framing-overhead
+upper bound) and the maximum output tokens. A finite USD ceiling additionally requires exact-model
+input/output price upper bounds, including provider surcharges; the full worst-case cost must fit
+the remaining ceiling before any paid call. Missing price authority fails closed. `maximum_usd=None`
+remains unrestricted. Exact receipts settle the reservation; an unreported response consumes its
+full token/cost reservation, never a guessed equal share of the remaining budget. Finite-ceiling
+campaigns lacking these fields require manifest migration before execution.
+
+Internal frozen role messages retain their request identity. Only the transport boundary converts
+their authenticated content into canonical JSON text and plain chat dictionaries. The remaining
+role/round deadline bounds both transport operations and cancellation of the entire live request;
+no fixed 30-second fallback, hidden retry, or schema repair is introduced.
+
 The manifest is also the root of a resolvable authenticated dependency graph. Each evaluator,
 baseline, panel, policy, sandbox, source, and stage dependency is a canonical relative artifact
 reference with its digest, not a digest that requires a hidden path lookup. Commands authenticate
 referenced bytes before parsing and fail closed on a missing, relocated, or mismatched artifact.
+Only the exact strictly decoded manifest-to-panel-plan-to-data edges select streamed raw-byte
+authentication for the PIT bundle and prices provenance. Raw bytes are neither normalized nor
+parsed for child references; a generic alias to those bytes still requires canonical JSON.
 
 ### 8. Adaptive O'Neil policy interface
 

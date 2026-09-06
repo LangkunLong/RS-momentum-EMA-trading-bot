@@ -79,6 +79,17 @@ def validate_full_source_escape_v5(paths: Iterable[str]) -> tuple[str, ...]:
     return supplied
 
 
+def validate_full_source_symbol_v5(*, path: str, symbol: str) -> None:
+    """Structural mode may add private helpers and public literal constants."""
+
+    required_policy_exports_v5(path)
+    if type(symbol) is str and symbol.isidentifier() and symbol.startswith("_") and not symbol.startswith("__"):
+        return
+    validate_policy_symbol_edit_v5(
+        path=path, symbol=symbol, kind="function" if symbol in REQUIRED_POLICY_EXPORTS_V5[path] else "constant"
+    )
+
+
 def validate_policy_authoring_scope_v5(
     *,
     symbol_edits: Iterable[tuple[str, str, PolicySymbolKindV5]] = (),

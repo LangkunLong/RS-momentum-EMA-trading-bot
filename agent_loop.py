@@ -3864,10 +3864,13 @@ class OpenRouterGateway:
         messages: tuple[Mapping[str, object], ...],
         response_schema_json: bytes,
         max_output_tokens: int,
+        wall_deadline: float,
     ) -> object:
         """Perform one retry-free V5 JSON-schema completion without owning its ledger."""
 
-        from core.pit_optimizer_v5.provider import CompletionResultV5
+        import asyncio
+
+        from core.pit_optimizer_v5.provider import CompletionResultV5, wire_role_messages_v5
 
         if (
             type(request_sha256) is not str
@@ -3880,6 +3883,8 @@ class OpenRouterGateway:
             or type(response_schema_json) is not bytes
             or type(max_output_tokens) is not int
             or max_output_tokens < 1
+            or type(wall_deadline) is not float
+            or not math.isfinite(wall_deadline)
         ):
             raise ConfigurationError("V5 provider request is invalid")
         try:
@@ -3895,9 +3900,13 @@ class OpenRouterGateway:
             raise ConfigurationError("V5 provider schema is invalid") from None
         if not isinstance(schema, Mapping):
             raise ConfigurationError("V5 provider schema is invalid")
-        response = self._get_client().chat.completions.create(
+        transport_messages = wire_role_messages_v5(messages)
+        remaining = min(self.timeout_seconds, wall_deadline - time.monotonic())
+        if remaining <= 0:
+            raise ConfigurationError("V5 provider deadline is exhausted")
+        arguments = dict(
             model=model,
-            messages=list(messages),
+            messages=transport_messages,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -3908,13 +3917,49 @@ class OpenRouterGateway:
             },
             stream=False,
             max_tokens=max_output_tokens,
-            timeout=self.timeout_seconds,
+            timeout=remaining,
             extra_headers={"X-Session-Id": f"{self.run_id}:pit-optimizer-v5:{request_sha256[:16]}"},
             extra_body={
                 "provider": {"require_parameters": True},
                 "reasoning": {"exclude": True},
             },
         )
+
+        async def complete_before_deadline():
+            client = self._client
+            owned_client = client is None
+            if owned_client:
+                from openai import AsyncOpenAI
+
+                headers: dict[str, str] = {}
+                if self.app_url:
+                    headers["HTTP-Referer"] = self.app_url
+                if self.app_name:
+                    headers["X-Title"] = self.app_name
+                client = AsyncOpenAI(
+                    api_key=self.api_key,
+                    base_url=OPENROUTER_BASE_URL,
+                    timeout=remaining,
+                    max_retries=0,
+                    default_headers=headers,
+                )
+            try:
+                # HTTP per-operation timeouts alone do not bound a slow-drip
+                # response. Cancellation also bounds the entire live request.
+                left = min(remaining, wall_deadline - time.monotonic())
+                if left <= 0:
+                    raise TimeoutError("V5 provider deadline is exhausted")
+                return await asyncio.wait_for(client.chat.completions.create(**arguments), timeout=left)
+            finally:
+                if owned_client:
+                    await client.close()
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            response = asyncio.run(complete_before_deadline())
+        else:
+            raise ConfigurationError("V5 synchronous provider boundary requires a controller thread")
         usage = _usage_from_response(response, require_complete=True)
         if (
             usage.prompt_tokens is None

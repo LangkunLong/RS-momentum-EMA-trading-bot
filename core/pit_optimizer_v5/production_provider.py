@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from decimal import Context, Decimal, ROUND_CEILING, localcontext
+from decimal import Decimal
+import math
 import os
 import re
 import secrets
@@ -36,6 +37,8 @@ from core.pit_optimizer_v5.provider import (
     canonical_role_response_sha256_v5,
     parse_and_bind_role_artifact,
     parsed_role_artifact_primitive_v5,
+    prospective_role_usage_v5,
+    sum_cost_usd_v5,
 )
 
 
@@ -86,6 +89,7 @@ class OpenRouterOneShotJsonCompletionV5:
         max_output_tokens: int,
         automatic_retries: int,
         schema_repair_calls: int,
+        deadline_monotonic: float,
     ) -> CompletionResultV5:
         capabilities = self._ledger._manifest.provider
         if (
@@ -98,6 +102,8 @@ class OpenRouterOneShotJsonCompletionV5:
             or max_output_tokens > capabilities.maximum_output_tokens_per_role
             or automatic_retries != 0
             or schema_repair_calls != 0
+            or type(deadline_monotonic) is not float
+            or not math.isfinite(deadline_monotonic)
         ):
             raise ValueError("OpenRouter V5 completion exceeds its manifest authority")
         # The legacy transport resolves the controller-local secret lazily here.
@@ -111,6 +117,7 @@ class OpenRouterOneShotJsonCompletionV5:
             api_key=api_key,
             run_id=f"pit-optimizer-v5-{self._ledger._manifest.campaign_id}",
             max_attempts=1,
+            timeout_seconds=self._ledger.manifest.resources.role_call_timeout_seconds,
         )
         result = gateway.request_pit_optimizer_v5_json_once(
             request_sha256=request_sha256,
@@ -118,6 +125,7 @@ class OpenRouterOneShotJsonCompletionV5:
             messages=messages,
             response_schema_json=response_schema_json,
             max_output_tokens=max_output_tokens,
+            wall_deadline=deadline_monotonic,
         )
         if type(result) is not CompletionResultV5:
             raise ValueError("OpenRouter V5 gateway returned an invalid completion")
@@ -198,23 +206,8 @@ class LocalRoleAuthorizationLedgerV5:
 
         provider = self._manifest.provider
         assert provider is not None
-        remaining_attempts = provider.maximum_role_calls - slot.prior_external_attempts
-        remaining_tokens = provider.maximum_total_tokens - slot.prior_total_tokens
-        if remaining_attempts < 1 or remaining_tokens < 0:
-            raise ValueError("local V5 role-ledger prior accounting exceeds authority")
-        fair_token_reservation = (remaining_tokens + remaining_attempts - 1) // remaining_attempts
-        reserved_tokens = min(
-            remaining_tokens,
-            max(slot.request.max_output_tokens, fair_token_reservation),
-        )
-        if provider.maximum_usd is None:
-            reserved_cost = Decimal("0")
-        else:
-            remaining_cost = provider.maximum_usd - slot.prior_cost_usd
-            if remaining_cost < 0:
-                raise ValueError("local V5 role-ledger prior cost accounting exceeds authority")
-            with localcontext(Context(prec=50, rounding=ROUND_CEILING)):
-                reserved_cost = remaining_cost / Decimal(remaining_attempts)
+        reserved_tokens = slot.input_tokens_upper_bound + slot.request.max_output_tokens
+        reserved_cost = slot.cost_upper_bound_usd or Decimal("0")
         return RoleUsageFactsV5(
             1,
             True,
@@ -274,9 +267,14 @@ class LocalRoleAuthorizationLedgerV5:
         overage = (
             completion.returned_model != slot.request.model
             or completion.output_tokens > slot.request.max_output_tokens
+            or completion.input_tokens > slot.input_tokens_upper_bound
+            or (slot.cost_upper_bound_usd is not None and completion.cost_usd > slot.cost_upper_bound_usd)
             or slot.prior_external_attempts + usage.external_attempt_count > provider.maximum_role_calls
             or slot.prior_total_tokens + usage.total_tokens > provider.maximum_total_tokens
-            or (provider.maximum_usd is not None and slot.prior_cost_usd + usage.cost_usd > provider.maximum_usd)
+            or (
+                provider.maximum_usd is not None
+                and sum_cost_usd_v5(slot.prior_cost_usd, usage.cost_usd) > provider.maximum_usd
+            )
         )
         artifact: ParsedRoleArtifactV5 | None = None
         failure_code: RoleFailureCode | None
@@ -392,6 +390,7 @@ class LocalRoleAuthorizationLedgerV5:
         terminal_slots: set[str] = set()
         for reservation in reservations:
             request = self._repository.load_unique_role_request_by_sha256(reservation.slot.request.request_sha256)
+            input_bound, cost_bound = prospective_role_usage_v5(request, provider)
             if (
                 reservation.campaign_id != self._manifest.campaign_id
                 or reservation.campaign_manifest_sha256 != self.campaign_manifest_sha256
@@ -402,6 +401,18 @@ class LocalRoleAuthorizationLedgerV5:
                 or reservation.slot.request.role != request.role
                 or reservation.slot.request.max_output_tokens != request.max_output_tokens
                 or reservation.slot.request.response_schema_sha256 != request.response_schema_sha256
+                or reservation.slot.input_tokens_upper_bound != input_bound
+                or reservation.slot.cost_upper_bound_usd != cost_bound
+                or reservation.slot.prior_external_attempts + 1 > provider.maximum_role_calls
+                or reservation.slot.prior_total_tokens + input_bound + request.max_output_tokens
+                > provider.maximum_total_tokens
+                or (
+                    provider.maximum_usd is not None
+                    and (
+                        cost_bound is None
+                        or sum_cost_usd_v5(reservation.slot.prior_cost_usd, cost_bound) > provider.maximum_usd
+                    )
+                )
                 or (
                     reservation.record_schema_revision == 3
                     and reservation.invocation_claim.lease_deadline_epoch_ms
@@ -467,7 +478,7 @@ class LocalRoleAuthorizationLedgerV5:
                         slot.prior_external_attempts + terminal.facts.usage.external_attempt_count
                     ),
                     "cumulative_total_tokens": slot.prior_total_tokens + terminal.facts.usage.total_tokens,
-                    "cumulative_cost_usd": slot.prior_cost_usd + terminal.facts.usage.cost_usd,
+                    "cumulative_cost_usd": sum_cost_usd_v5(slot.prior_cost_usd, terminal.facts.usage.cost_usd),
                     "terminal_sequence": slot.prior_terminal_sequence + 1,
                 }
                 expected_receipt = RoleTerminalReceiptV5(
@@ -565,6 +576,24 @@ class LocalRoleAuthorizationLedgerV5:
             prior_tokens = terminals[-1].receipt.cumulative_total_tokens if terminals else 0
             prior_cost = terminals[-1].receipt.cumulative_cost_usd if terminals else Decimal("0")
             prior_sequence = terminals[-1].receipt.terminal_sequence if terminals else 0
+            provider = self._manifest.provider
+            assert provider is not None
+            role_request = self._repository.load_unique_role_request_by_sha256(request.request_sha256)
+            input_bound, cost_bound = prospective_role_usage_v5(role_request, provider)
+            if (
+                request.model != provider.model
+                or request.role != role_request.role
+                or request.max_output_tokens != role_request.max_output_tokens
+                or request.max_output_tokens != provider.maximum_output_tokens_per_role
+                or request.response_schema_sha256 != role_request.response_schema_sha256
+                or prior_attempts + 1 > provider.maximum_role_calls
+                or prior_tokens + input_bound + request.max_output_tokens > provider.maximum_total_tokens
+                or (
+                    provider.maximum_usd is not None
+                    and (cost_bound is None or sum_cost_usd_v5(prior_cost, cost_bound) > provider.maximum_usd)
+                )
+            ):
+                raise ValueError("local V5 prospective role reservation exceeds authority")
             authorization = canonical_sha256_v5(
                 {
                     "domain": "pit-optimizer-v5-role-slot-v1",
@@ -587,6 +616,8 @@ class LocalRoleAuthorizationLedgerV5:
                 prior_total_tokens=prior_tokens,
                 prior_cost_usd=prior_cost,
                 prior_terminal_sequence=prior_sequence,
+                input_tokens_upper_bound=input_bound,
+                cost_upper_bound_usd=cost_bound,
             )
             lease_started = self._now_ms()
             record = RoleLedgerReservationV5(
@@ -716,7 +747,7 @@ class LocalRoleAuthorizationLedgerV5:
             "attempt_facts_sha256": facts.sha256,
             "cumulative_external_attempts": slot.prior_external_attempts + facts.usage.external_attempt_count,
             "cumulative_total_tokens": slot.prior_total_tokens + facts.usage.total_tokens,
-            "cumulative_cost_usd": slot.prior_cost_usd + facts.usage.cost_usd,
+            "cumulative_cost_usd": sum_cost_usd_v5(slot.prior_cost_usd, facts.usage.cost_usd),
             "terminal_sequence": slot.prior_terminal_sequence + 1,
         }
         receipt = RoleTerminalReceiptV5(

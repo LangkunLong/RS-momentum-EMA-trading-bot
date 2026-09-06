@@ -61,6 +61,7 @@ from core.pit_optimizer_v5.memory import (
     RoundIntentPayloadV5,
     RoundOutcomePayloadV5,
     RuntimeFailureAuthorityV5,
+    SchedulingCursorV5,
     StoredExperimentRecordV5,
     is_testable_experiment_status_v5,
 )
@@ -90,10 +91,14 @@ from core.pit_optimizer_v5.search import (
     expected_target_gap_pct_v5,
 )
 from core.pit_optimizer_v5.selection import (
+    NoNovelHypothesisV5,
     ScheduledHypothesisV5,
+    advance_no_novel_parent_v5,
     canonicalize_discovery_evidence_v5,
     discovery_episode_execution_order_v5,
     record_novelty_attempt_v5,
+    parent_schedule_v5,
+    select_novel_hypothesis_v5,
     select_parent_v5,
     select_manifest_discovery_survivors_v5,
 )
@@ -140,6 +145,7 @@ CandidateRuntimeStatusV5 = Literal[
     "invalid",
     "exact_duplicate",
     "behavioral_equivalent",
+    "sibling_equivalent",
     "quick_ready",
     "quick_rejected",
     "zero_trade",
@@ -300,6 +306,7 @@ class CandidateEvidenceV5:
             "invalid",
             "exact_duplicate",
             "behavioral_equivalent",
+            "sibling_equivalent",
             "quick_ready",
             "quick_rejected",
             "zero_trade",
@@ -326,6 +333,7 @@ class SearchProjectionV5:
     checkpoint: RepositoryCheckpointV5 | None
     state: SearchStateV5
     stored_records: tuple[StoredExperimentRecordV5, ...]
+    no_novel_outcomes: tuple[NoNovelHypothesisAuthorityV5, ...] = ()
 
     def __post_init__(self) -> None:
         if self.checkpoint is not None and type(self.checkpoint) is not RepositoryCheckpointV5:
@@ -336,6 +344,13 @@ class SearchProjectionV5:
             type(item) is not StoredExperimentRecordV5 for item in self.stored_records
         ):
             raise ValueError("search projection records are invalid")
+        if type(self.no_novel_outcomes) is not tuple or any(
+            type(item) is not NoNovelHypothesisAuthorityV5 for item in self.no_novel_outcomes
+        ):
+            raise ValueError("search projection scheduling history is invalid")
+        for left, right in zip(self.no_novel_outcomes, self.no_novel_outcomes[1:], strict=False):
+            if left.scheduling_after != right.scheduling_before:
+                raise ValueError("search projection scheduling history is discontinuous")
         references = tuple(item.reference for item in self.stored_records)
         if self.checkpoint is None:
             if references:
@@ -696,6 +711,10 @@ class ExperimentRecordFactoryV5(Protocol):
 class ArchiveReducerFactoryV5(Protocol):
     def recovery_reducer(self, inputs: FeedbackRoundInputV5) -> ArchiveReducerV5[SearchStateV5]: ...
 
+    def recover_scheduling(
+        self, inputs: FeedbackRoundInputV5, projection: SearchProjectionV5
+    ) -> SearchProjectionV5: ...
+
     def publication_reducer(
         self,
         *,
@@ -856,6 +875,7 @@ class _Runtime:
         self.record_refs: tuple[ArtifactRefV5, ...] = ()
         self.checkpoint: RepositoryCheckpointV5 | None = None
         self._owned_leases: dict[str, OwnedLeaseV5] = {}
+        self._seen_semantic_fingerprints: set[str] = set()
 
     def _deadline(self, stage: RuntimeStageV5, seconds: int) -> StageDeadlineV5:
         if self.dependencies.cancellation.is_cancelled():
@@ -935,7 +955,10 @@ class _Runtime:
         persisted = self.dependencies.persistence.append_role_request(call=call, request=request)
         try:
             if type(persisted) is FreshPersistedRoleRequestV5:
-                package = self.dependencies.invoker.invoke_once(persisted)
+                package = self.dependencies.invoker.invoke_once(
+                    persisted,
+                    deadline_monotonic=deadline.expires_at_monotonic,
+                )
             elif type(persisted) is ExistingPersistedRoleRequestV5:
                 reconciled = self.dependencies.invoker.reconcile_once(persisted)
                 if type(reconciled) is RoleReconciliationFailureV5:
@@ -974,11 +997,19 @@ class _Runtime:
         projection = SearchProjectionV5(checkpoint=checkpoint, state=state, stored_records=stored)
         self.projection = projection
         if not self._adopt_completed_projection(projection):
+            projection = self.dependencies.archive_reducers.recover_scheduling(self.inputs, projection)
+            if (
+                type(projection) is not SearchProjectionV5
+                or projection.checkpoint != checkpoint
+                or projection.stored_records != stored
+            ):
+                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+            self.projection = projection
             self._deadline("recovery", self.inputs.manifest.resources.round_wall_timeout_seconds)
         return projection
 
     def _adopt_completed_projection(self, projection: SearchProjectionV5) -> bool:
-        if projection.state.next_round_index != self.inputs.round_index + 1:
+        if not any(item.record.round_index == self.inputs.round_index for item in projection.stored_records):
             return False
         checkpoint = projection.checkpoint
         if type(checkpoint) is not RepositoryCheckpointV5:
@@ -990,7 +1021,6 @@ class _Runtime:
         if (
             not current
             or not completed_rounds
-            or completed_rounds[-1] != self.inputs.round_index
             or checkpoint.generation != len(completed_rounds)
             or checkpoint.record_refs != tuple(item.reference for item in projection.stored_records)
         ):
@@ -1436,12 +1466,45 @@ class _Runtime:
         current = tuple(item for item in matches if item.parent_revision_sha256 == parent.policy_identity_sha256)
         if (
             authority.discovery_plan_sha256 != self.inputs.panel_plan.discovery_plan_sha256
-            or authority.search_state_before_sha256 != state_sha256
+            or not current
+            or current[0].search_state_before_sha256 != state_sha256
             or len(current) != 1
             or current[0].investigator_request_sha256 != request.sha256
             or current[0].investigator_evidence_sha256 != request.role_evidence.sha256
             or current[0].investigator_attempt_sha256s != (package.attempt.sha256,)
             or current[0].investigator_artifact_sha256 != canonical_sha256_v5(artifact)
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("novelty", "invalid_dependency_result"))
+        outcome = select_novel_hypothesis_v5(
+            state=projection.state, parent=parent, artifact=artifact, capabilities=self.inputs.manifest.search
+        )
+        if type(outcome) is not NoNovelHypothesisV5:
+            raise _RuntimeAbort(RuntimeFailureV5("novelty", "invalid_dependency_result"))
+        after = advance_no_novel_parent_v5(
+            projection.state, outcome, artifact=artifact, capabilities=self.inputs.manifest.search
+        )
+
+        def cursor(state: SearchStateV5) -> SchedulingCursorV5:
+            return SchedulingCursorV5(
+                state.next_round_index, canonical_sha256_v5(state.archive.to_primitive()), state.attempted_novelty_keys
+            )
+
+        chain = (*projection.no_novel_outcomes, current[0])
+        parents = parent_schedule_v5(
+            state=projection.state,
+            baseline=self.inputs.baseline,
+            discovery_plan=self.inputs.panel_plan,
+            evaluator_contract=self.inputs.evaluator_contract,
+            stored_records=projection.stored_records,
+        )
+        exhausted = {item.parent_revision_sha256 for item in chain} == {item.policy_identity_sha256 for item in parents}
+        if (
+            current[0].selection_outcome_sha256 != canonical_sha256_v5(outcome.to_primitive())
+            or current[0].search_state_after_sha256 != canonical_sha256_v5(after.to_primitive())
+            or current[0].scheduling_before != cursor(projection.state)
+            or current[0].scheduling_after != cursor(after)
+            or (type(authority) is NoveltyExhaustedAuthorityV5) != exhausted
+            or (exhausted and matches != chain)
         ):
             raise _RuntimeAbort(RuntimeFailureV5("novelty", "invalid_dependency_result"))
 
@@ -1734,9 +1797,7 @@ class _Runtime:
                 artifact_refs=references,
             )
         expected_changed_symbols = (
-            ()
-            if identity.policy_revision_sha256 == parent.policy_identity_sha256
-            else template.changed_symbols
+            () if identity.policy_revision_sha256 == parent.policy_identity_sha256 else template.changed_symbols
         )
         if validation.changed_symbols != expected_changed_symbols:
             raise _RuntimeAbort(
@@ -1783,21 +1844,28 @@ class _Runtime:
             semantic_ref = self.journal.payload_reference(semantic_stage)
             if semantic_stage.outcome == "semantic_probe_failed":
                 return self._recover_candidate_failure(candidate, semantic_stage)
-            if semantic_stage.outcome not in {"behavioral_equivalent", "behaviorally_distinct"}:
+            if semantic_stage.outcome not in {"behavioral_equivalent", "sibling_equivalent", "behaviorally_distinct"}:
                 raise _RuntimeAbort(
                     RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
                 )
             assert semantic_stage.semantic_fingerprint is not None
             fingerprint = semantic_stage.semantic_fingerprint
+            sibling_duplicate = fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
+            if (semantic_stage.outcome == "sibling_equivalent") != sibling_duplicate:
+                raise _RuntimeAbort(
+                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                )
             candidate = replace(
                 candidate,
                 semantic_fingerprint=fingerprint,
                 status=(
-                    "behavioral_equivalent" if semantic_stage.outcome == "behavioral_equivalent" else "quick_ready"
+                    semantic_stage.outcome
+                    if semantic_stage.outcome in {"behavioral_equivalent", "sibling_equivalent"}
+                    else "quick_ready"
                 ),
                 artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)),
             )
-            if candidate.status == "behavioral_equivalent":
+            if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
                 return candidate
         else:
             probe_deadline = self._deadline("semantic_probe", self.inputs.manifest.resources.mechanics_timeout_seconds)
@@ -1849,6 +1917,8 @@ class _Runtime:
             semantic_outcome: CandidateStageOutcomeV5 = (
                 "behavioral_equivalent"
                 if comparison.classification == BEHAVIORAL_EQUIVALENT_ON_SUITE_V1
+                else "sibling_equivalent"
+                if fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
                 else "behaviorally_distinct"
             )
             semantic_event = self.journal.append(
@@ -1864,12 +1934,18 @@ class _Runtime:
             candidate = replace(
                 candidate,
                 semantic_fingerprint=fingerprint,
-                status=("behavioral_equivalent" if semantic_outcome == "behavioral_equivalent" else "quick_ready"),
+                status=(
+                    semantic_outcome
+                    if semantic_outcome in {"behavioral_equivalent", "sibling_equivalent"}
+                    else "quick_ready"
+                ),
                 artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_event.payload_ref,)),
             )
             self._check_finished(probe_deadline, experiment_id=identity.sha256)
-            if candidate.status == "behavioral_equivalent":
+            if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
                 return candidate
+
+        self._seen_semantic_fingerprints.add(fingerprint.fingerprint_sha256)
 
         quick_failure = self._candidate_stage(identity.sha256, "quick_evaluation")
         if quick_failure is not None:
