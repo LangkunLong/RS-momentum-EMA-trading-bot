@@ -157,7 +157,7 @@ def _graph(repository, roots, *, input_ref):
     cached, paths, active = {}, {}, set()
 
     def read(ref):
-        item = repository.authenticate(ref)
+        item = repository.authenticate_exact(ref)
         if item.reference != ref or hashlib.sha256(item.content).hexdigest() != ref.sha256:
             raise ValueError("baseline graph digest mismatch")
         return item
@@ -258,7 +258,7 @@ def _inputs(repository, reference, cached):
         raise ValueError("baseline input identities differ")
     validate_sandbox_profile_resources_v5(sandbox, resources)
     for episode in (plan.mechanics, plan.quick, *plan.discovery):
-        panel = repository.load_evaluation_panel_spec(episode.panel_ref)
+        panel = repository.load_evaluation_panel_spec_exact(episode.panel_ref)
         validate_episode_plan_panel_v5(episode, panel)
         if panel.purpose != episode.purpose:
             raise ValueError("baseline panel purpose differs from owner")
@@ -300,7 +300,7 @@ def _campaign(inputs, evaluations):
 
 def verify_baseline_v5(*, repository, authority_ref: ArtifactRefV5) -> dict[str, object]:
     """Authenticate the complete baseline graph and return content-free identities."""
-    item = repository.authenticate(authority_ref)
+    item = repository.authenticate_exact(authority_ref)
     if item.reference != authority_ref or hashlib.sha256(item.content).hexdigest() != authority_ref.sha256:
         raise ValueError("baseline root identity differs")
     primitive = _strict_json_object(item.content, authority_ref)
@@ -476,10 +476,10 @@ def capture_baseline_v5(*, repository, inputs_ref, output_path, worker_factory=N
     raw = canonical_json_bytes_v5(authority)
 
     class PendingAuthorityRepository:
-        def authenticate(self, ref):
+        def authenticate_exact(self, ref):
             if ref == reference:
                 return AuthenticatedArtifactV5(ref, raw, _extract_artifact_refs(_strict_json_object(raw, ref)))
-            return repository.authenticate(ref)
+            return repository.authenticate_exact(ref)
 
         def __getattr__(self, name):
             return getattr(repository, name)
@@ -508,8 +508,8 @@ def write_execution_profile_v5(*, repository, output_path):
 
 def build_sandbox_profile_v5(*, repository, resources_ref, evaluator_source_ref, image_name, image_digest, output_path):
     """Compose a digest-pinned contract only; never build, inspect, pull or run."""
-    source = repository.authenticate(evaluator_source_ref)
-    resources_item = repository.authenticate(resources_ref)
+    source = repository.authenticate_exact(evaluator_source_ref)
+    resources_item = repository.authenticate_exact(resources_ref)
     if source.child_references or resources_item.child_references:
         raise ValueError("sandbox profile requires leaf source and resource authority")
     source_map = _strict_json_object(source.content, evaluator_source_ref)
@@ -600,7 +600,7 @@ class BaselineSandboxWorkerV5:
             execution_profile=self.inputs.execution,
             policy_revision=self.inputs.policy,
             episode=episode,
-            panel=self.repository.load_evaluation_panel_spec(episode.panel_ref),
+            panel=self.repository.load_evaluation_panel_spec_exact(episode.panel_ref),
             scenario_ids=scenario_ids,
             policy_method_timeout_seconds=self.inputs.resources.policy_method_timeout_seconds,
             worker_startup_timeout_seconds=self.inputs.resources.worker_startup_timeout_seconds,
@@ -638,7 +638,7 @@ class BaselineSandboxWorkerV5:
 
 
 def baseline_container_argv_v5(
-    *, inputs, source_root, input_root, output_root, bundle_path, provenance_path, module_args, container_name
+    *, inputs, policy_root, input_root, output_root, bundle_path, provenance_path, module_args, container_name
 ):
     """Pure pre-manifest argv; image pull, networking and host execution are absent."""
     from .policy_scope import EDITABLE_POLICY_PATHS_V5
@@ -677,7 +677,7 @@ def baseline_container_argv_v5(
         "/tmp:rw,noexec,nosuid,nodev,size=16m",
     ]
     mounts = [
-        (ntpath.join(source_root, *path.split("/")), "/pit/candidate/" + path.rsplit("/", 1)[-1], True)
+        (ntpath.join(policy_root, path.rsplit("/", 1)[-1]), "/pit/candidate/" + path.rsplit("/", 1)[-1], True)
         for path in EDITABLE_POLICY_PATHS_V5
     ]
     mounts.extend(((input_root, "/pit/request", True), (output_root, "/pit/output", False)))
@@ -694,6 +694,32 @@ def baseline_container_argv_v5(
         argv.extend(("--mount", f"type=bind,src={host},dst={target}" + (",readonly" if read_only else "")))
     argv.extend(("--", sandbox.image_reference, "-P", "-B", "-m", *module_args))
     return tuple(argv)
+
+
+def _pin_baseline_policy_overlay_v5(*, inputs, directory, stack):
+    """Materialize authenticated LF source into an owned, deny-write-pinned overlay.
+
+    The caller owns the directory and closes these pins only after container
+    cleanup, then removes that exact directory even if materialization fails.
+    """
+    from .production_fs import write_new_regular_in_directory_v5
+    from .readiness import _pin_inspection_file
+
+    if (
+        type(inputs.source) is not SourceBundleV5
+        or tuple((file.path, file.sha256) for file in inputs.source.files) != inputs.policy.editable_source_sha256
+    ):
+        raise ValueError("baseline overlay source identity differs")
+    pins = []
+    for file in inputs.source.files:
+        raw = file.source.encode("utf-8")
+        name = file.path.rsplit("/", 1)[-1]
+        write_new_regular_in_directory_v5(directory, name, raw)
+        pin, mounted = _pin_inspection_file(stack, directory, name)
+        if mounted != raw or pin.sha256 != file.sha256:
+            raise ValueError("baseline overlay bytes differ from authenticated source")
+        pins.append(pin)
+    return tuple(pins)
 
 
 class LocalBaselineCaptureFactoryV5:
@@ -833,15 +859,17 @@ class _LocalBaselineTransportV5:
         root = create_directory_in_directory_v5(parent, name)
         identity, container_id, reserved = root.identity, None, False
         children = []
+        policy_stack = ExitStack()
         try:
-            for child in ("input", "output", "config"):
+            for child in ("input", "output", "config", "policy"):
                 children.append(create_directory_in_directory_v5(root, child))
-            input_dir, output_dir, config_dir = children
+            input_dir, output_dir, config_dir, policy_dir = children
+            policy_pins = _pin_baseline_policy_overlay_v5(inputs=self.inputs, directory=policy_dir, stack=policy_stack)
             if input_bytes is not None:
                 write_new_regular_in_directory_v5(input_dir, "panel-request.json", input_bytes)
             args = baseline_container_argv_v5(
                 inputs=self.inputs,
-                source_root=self.factory.host.source_root,
+                policy_root=str(policy_dir.path),
                 input_root=str(input_dir.path),
                 output_root=str(output_dir.path),
                 bundle_path=self.factory.data_paths[0] if with_data else None,
@@ -849,6 +877,8 @@ class _LocalBaselineTransportV5:
                 module_args=module_args,
                 container_name=name,
             )
+            for pin in policy_pins:
+                pin.revalidate()
             # Reserve before invocation: ambiguous create completion also gets
             # exact owner-name cleanup, never enumeration of other containers.
             reserved = True
@@ -867,6 +897,8 @@ class _LocalBaselineTransportV5:
                 output_dir, output_name, maximum_bytes=self.inputs.sandbox.output_limit_bytes
             )
             self.source_snapshot()
+            for pin in policy_pins:
+                pin.revalidate()
             return raw
         finally:
             try:
@@ -878,9 +910,13 @@ class _LocalBaselineTransportV5:
                     )
             except BaseException:
                 self.clean = False
-            for child in reversed(children):
-                child.close()
-            root.close()
+            # Release all overlay pins before deleting the owned invocation.
+            # A failed close must not skip later cleanup or bless success.
+            for resource in (policy_stack, *reversed(children), root):
+                try:
+                    resource.close()
+                except BaseException:
+                    self.clean = False
             try:
                 if not remove_owned_tree_in_directory_v5(parent, name, expected_identity=identity):
                     self.clean = False

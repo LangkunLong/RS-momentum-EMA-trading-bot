@@ -95,12 +95,14 @@ class _PinnedReadinessFileV5:
     stream: object
     metadata: tuple
     sha256: str
+    path_metadata: tuple
 
     def revalidate(self):
         self.parent.assert_current()
         path = self.parent.path / self.name
         if (
-            _file_metadata(os.lstat(path)) != self.metadata
+            self.path_metadata[:2] != self.metadata[:2]
+            or _file_metadata(os.lstat(path)) != self.path_metadata
             or _file_metadata(os.fstat(self.stream.fileno())) != self.metadata
         ):
             raise ValueError("pinned inspection file identity changed")
@@ -109,7 +111,7 @@ class _PinnedReadinessFileV5:
             raise ValueError("pinned inspection file bytes changed")
         if (
             _file_metadata(os.fstat(self.stream.fileno())) != self.metadata
-            or _file_metadata(os.lstat(path)) != self.metadata
+            or _file_metadata(os.lstat(path)) != self.path_metadata
         ):
             raise ValueError("pinned inspection file metadata changed")
         self.parent.assert_current()
@@ -121,7 +123,17 @@ def _pin_inspection_file(stack, parent, name):
     raw = stream.read(32 * 1024 * 1024 + 1)
     if len(raw) > 32 * 1024 * 1024 or len(raw) != info.st_size:
         raise ValueError("inspection file exceeds its immutable bound")
-    pin = _PinnedReadinessFileV5(parent, name, stream, _file_metadata(info), hashlib.sha256(raw).hexdigest())
+    # The opener binds the same regular file in both views and denies writes
+    # and deletes. Windows path stat and fstat may expose different ctime values;
+    # retain and revalidate each view independently without dropping any field.
+    pin = _PinnedReadinessFileV5(
+        parent,
+        name,
+        stream,
+        _file_metadata(info),
+        hashlib.sha256(raw).hexdigest(),
+        _file_metadata(os.lstat(parent.path / name)),
+    )
     pin.revalidate()
     return pin, raw
 

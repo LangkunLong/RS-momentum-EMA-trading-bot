@@ -1165,15 +1165,22 @@ class LocalArtifactRepositoryV5:
         return walk(self._root, ())
 
     def authenticate(self, reference: ArtifactRefV5) -> AuthenticatedArtifactV5:
+        try:
+            return self.authenticate_exact(reference)
+        except ArtifactMissingV5:
+            relocated = self._find_digest(reference.sha256, reference.relative_path)
+            if relocated is not None:
+                raise ArtifactRelocatedV5(reference, relocated) from None
+            raise ArtifactMissingV5(reference) from None
+
+    def authenticate_exact(self, reference: ArtifactRefV5) -> AuthenticatedArtifactV5:
+        """Authenticate only the named JSON edge; never search for relocation."""
         if type(reference) is not ArtifactRefV5:
             raise ValueError("artifact authentication requires a V5 reference")
         _safe_relative_path(reference.relative_path)
         try:
             raw = self._read_relative(reference.relative_path)
         except ArtifactMissingV5:
-            relocated = self._find_digest(reference.sha256, reference.relative_path)
-            if relocated is not None:
-                raise ArtifactRelocatedV5(reference, relocated) from None
             raise ArtifactMissingV5(reference) from None
         actual = hashlib.sha256(raw).hexdigest()
         if actual != reference.sha256:
@@ -2247,8 +2254,13 @@ class LocalArtifactRepositoryV5:
         panel, _ = self._authenticate_evaluation_panel_spec(reference)
         return panel
 
+    def load_evaluation_panel_spec_exact(self, reference: ArtifactRefV5) -> EvaluationPanelSpec:
+        """Decode only the named digest-authenticated panel, without relocation."""
+        panel, _ = self._authenticate_evaluation_panel_spec(reference, exact=True)
+        return panel
+
     def _authenticate_evaluation_panel_spec(
-        self, reference: ArtifactRefV5
+        self, reference: ArtifactRefV5, *, exact: bool = False
     ) -> tuple[EvaluationPanelSpec, AuthenticatedArtifactV5]:
         if type(reference) is not ArtifactRefV5:
             raise ValueError("panel authentication requires a V5 reference")
@@ -2256,9 +2268,10 @@ class LocalArtifactRepositoryV5:
         try:
             raw = self._read_relative(reference.relative_path)
         except ArtifactMissingV5:
-            relocated = self._find_digest(reference.sha256, reference.relative_path)
-            if relocated is not None:
-                raise ArtifactRelocatedV5(reference, relocated) from None
+            if not exact:
+                relocated = self._find_digest(reference.sha256, reference.relative_path)
+                if relocated is not None:
+                    raise ArtifactRelocatedV5(reference, relocated) from None
             raise ArtifactMissingV5(reference) from None
         actual = hashlib.sha256(raw).hexdigest()
         if actual != reference.sha256:
