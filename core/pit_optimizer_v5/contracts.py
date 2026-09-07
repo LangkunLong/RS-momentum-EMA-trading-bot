@@ -1038,6 +1038,16 @@ class ResourceCapabilitiesV5:
             raise ValueError("campaign wall timeout is shorter than one round")
 
 
+def validate_semantic_mode_v5(pit_data_scope: str, semantic_mode: str) -> None:
+    """Authorize semantic absence only for explicitly scoped development."""
+    if pit_data_scope not in {"production", "development_sp500_v2"}:
+        raise ValueError("semantic PIT data scope is invalid")
+    if semantic_mode not in {"required", "disabled_development"}:
+        raise ValueError("semantic mode is invalid")
+    if semantic_mode == "disabled_development" and pit_data_scope != "development_sp500_v2":
+        raise ValueError("disabled semantics require development PIT data scope")
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignManifestV5:
     schema_version: Literal[5]
@@ -1059,8 +1069,10 @@ class CampaignManifestV5:
     qualification_allowed: Literal[False]
     full_replay_allowed: Literal[False]
     pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
+        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
         if type(self.schema_version) is not int or self.schema_version != 5:
             raise ValueError("campaign manifest schema must be V5")
         _text(self.campaign_id, "campaign ID")
@@ -2056,4 +2068,5 @@ __all__ = [
     "validate_campaign_manifest_bindings_v5",
     "validate_episode_plan_panel_v5",
     "validate_sandbox_profile_resources_v5",
+    "validate_semantic_mode_v5",
 ]

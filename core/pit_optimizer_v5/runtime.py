@@ -73,6 +73,7 @@ from core.pit_optimizer_v5.probes import (
 from core.pit_optimizer_v5.provider import (
     ControllerRoleResponsePendingV5,
     ControllerRoleTerminalAuthorityV5,
+    CriticRoleInputV5,
     ExistingPersistedRoleRequestV5,
     FreshPersistedRoleRequestV5,
     FixtureRoleTerminalAuthorityV5,
@@ -415,8 +416,11 @@ class FeedbackRoundInputV5:
             panel_plan=self.panel_plan,
             evaluator_contract=self.evaluator_contract,
         )
-        if self.manifest.pit_data_scope != self.baseline.pit_data_scope:
-            raise ValueError("feedback-round PIT data scope differs from baseline authority")
+        if (self.manifest.pit_data_scope, self.manifest.semantic_mode) != (
+            self.baseline.pit_data_scope,
+            self.baseline.semantic_mode,
+        ):
+            raise ValueError("feedback-round PIT data scope or semantic mode differs from baseline authority")
 
     @property
     def campaign_id(self) -> str:
@@ -871,6 +875,30 @@ class _Journal:
         self.payloads = [
             persistence.load_round_payload(event.payload_ref, expected_kind=event.event_kind) for event in self.events
         ]
+        for payload in self.payloads:
+            if isinstance(payload, (RoundIntentPayloadV5, QuickEvidencePayloadV5)) and (
+                payload.pit_data_scope,
+                payload.semantic_mode,
+            ) != (inputs.manifest.pit_data_scope, inputs.manifest.semantic_mode):
+                raise ValueError("recovery semantic mode differs from runtime manifest")
+            if isinstance(payload, CandidateStageResultPayloadV5):
+                if (
+                    payload.outcome == "semantic_skipped_development"
+                    and inputs.manifest.semantic_mode != "disabled_development"
+                ):
+                    raise ValueError("required semantics cannot resume a skipped stage")
+                if (
+                    inputs.manifest.semantic_mode == "disabled_development"
+                    and payload.stage == "semantic_probe"
+                    and payload.outcome not in {"exact_duplicate", "semantic_skipped_development"}
+                ):
+                    raise ValueError("disabled semantics cannot resume semantic execution")
+            if (
+                isinstance(payload, CandidateExecutionAuthorityV5)
+                and payload.key.stage == "semantic_probe"
+                and inputs.manifest.semantic_mode == "disabled_development"
+            ):
+                raise ValueError("disabled semantics cannot resume a semantic lease")
 
     def role_completion(self, role: RoleNameV5) -> RoleCompletionPayloadV5 | None:
         matches = tuple(
@@ -1049,6 +1077,11 @@ class _Runtime:
     ) -> None:
         if type(request) is not RoleRequestV5 or request.role != role:
             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
+        if role == "critic" and (
+            type(request.role_input) is not CriticRoleInputV5
+            or request.role_input.semantic_evidence_unavailable != (self.inputs.manifest.semantic_mode == "disabled_development")
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
         binding = request.expected_binding
         if (
             binding.parent_revision_sha256 != parent.policy_identity_sha256
@@ -2013,113 +2046,141 @@ class _Runtime:
             return replace(candidate, artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)))
 
         semantic_stage = self._candidate_stage(identity.sha256, "semantic_probe")
-        if semantic_stage is not None:
-            semantic_ref = self.journal.payload_reference(semantic_stage)
-            if semantic_stage.outcome == "semantic_probe_failed":
-                return self._recover_candidate_failure(candidate, semantic_stage)
-            if semantic_stage.outcome not in {"behavioral_equivalent", "sibling_equivalent", "behaviorally_distinct"}:
-                raise _RuntimeAbort(
-                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
-                )
-            assert semantic_stage.semantic_fingerprint is not None
-            fingerprint = semantic_stage.semantic_fingerprint
-            sibling_duplicate = fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
-            if (semantic_stage.outcome == "sibling_equivalent") != sibling_duplicate:
+        if self.inputs.manifest.semantic_mode == "disabled_development":
+            if semantic_stage is None:
+                semantic_ref = self.journal.append(
+                    CandidateStageResultPayloadV5(
+                        experiment_id=identity.sha256,
+                        stage="semantic_probe",
+                        stage_index=2,
+                        outcome="semantic_skipped_development",
+                    ),
+                    experiment_id=identity.sha256,
+                ).payload_ref
+            elif semantic_stage.outcome == "semantic_skipped_development":
+                semantic_ref = self.journal.payload_reference(semantic_stage)
+            else:
                 raise _RuntimeAbort(
                     RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
                 )
             candidate = replace(
                 candidate,
-                semantic_fingerprint=fingerprint,
-                status=(
-                    semantic_stage.outcome
-                    if semantic_stage.outcome in {"behavioral_equivalent", "sibling_equivalent"}
-                    else "quick_ready"
-                ),
+                status="quick_ready",
                 artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)),
             )
-            if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
-                return candidate
         else:
-            probe_deadline = self._deadline("semantic_probe", self.inputs.manifest.resources.mechanics_timeout_seconds)
-            try:
-                if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
-                    execution_key = CandidateExecutionKeyV5(
-                        identity.sha256,
-                        "semantic_probe",
-                        None,
+            if semantic_stage is not None:
+                semantic_ref = self.journal.payload_reference(semantic_stage)
+                if semantic_stage.outcome == "semantic_probe_failed":
+                    return self._recover_candidate_failure(candidate, semantic_stage)
+                if semantic_stage.outcome not in {
+                    "behavioral_equivalent",
+                    "sibling_equivalent",
+                    "behaviorally_distinct",
+                }:
+                    raise _RuntimeAbort(
+                        RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
                     )
-                    execution = self._existing_execution(execution_key)
-                    if execution is None:
-                        fingerprint = self.dependencies.candidates.fingerprint_registered(
-                            materialized,
-                            deadline=probe_deadline,
-                            execution_key=execution_key,
-                            register_execution=self._register_execution,
-                        )
-                    else:
-                        fingerprint = self.dependencies.candidates.recover_fingerprint_registered(
-                            materialized,
-                            deadline=probe_deadline,
-                            authority=execution,
-                        )
-                else:
-                    fingerprint = self.dependencies.candidates.fingerprint(
-                        materialized,
-                        deadline=probe_deadline,
+                assert semantic_stage.semantic_fingerprint is not None
+                fingerprint = semantic_stage.semantic_fingerprint
+                sibling_duplicate = fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
+                if (semantic_stage.outcome == "sibling_equivalent") != sibling_duplicate:
+                    raise _RuntimeAbort(
+                        RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
                     )
-                if type(fingerprint) is not SemanticFingerprintV5:
-                    raise TypeError
-                comparison = classify_semantic_fingerprints_v5(
-                    self.inputs.baseline.semantic_fingerprint
-                    if parent.origin == "baseline"
-                    else self._parent_fingerprint(parent, materialized, probe_deadline),
-                    fingerprint,
-                )
-            except _RuntimeAbort:
-                raise
-            except BaseException:
-                failed = self._record_candidate_failure(
+                candidate = replace(
                     candidate,
-                    stage="semantic_probe",
-                    outcome="semantic_probe_failed",
-                    code="semantic_probe_failed",
+                    semantic_fingerprint=fingerprint,
+                    status=(
+                        semantic_stage.outcome
+                        if semantic_stage.outcome in {"behavioral_equivalent", "sibling_equivalent"}
+                        else "quick_ready"
+                    ),
+                    artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)),
+                )
+                if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
+                    return candidate
+            else:
+                probe_deadline = self._deadline(
+                    "semantic_probe", self.inputs.manifest.resources.mechanics_timeout_seconds
+                )
+                try:
+                    if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
+                        execution_key = CandidateExecutionKeyV5(
+                            identity.sha256,
+                            "semantic_probe",
+                            None,
+                        )
+                        execution = self._existing_execution(execution_key)
+                        if execution is None:
+                            fingerprint = self.dependencies.candidates.fingerprint_registered(
+                                materialized,
+                                deadline=probe_deadline,
+                                execution_key=execution_key,
+                                register_execution=self._register_execution,
+                            )
+                        else:
+                            fingerprint = self.dependencies.candidates.recover_fingerprint_registered(
+                                materialized,
+                                deadline=probe_deadline,
+                                authority=execution,
+                            )
+                    else:
+                        fingerprint = self.dependencies.candidates.fingerprint(
+                            materialized,
+                            deadline=probe_deadline,
+                        )
+                    if type(fingerprint) is not SemanticFingerprintV5:
+                        raise TypeError
+                    comparison = classify_semantic_fingerprints_v5(
+                        self.inputs.baseline.semantic_fingerprint
+                        if parent.origin == "baseline"
+                        else self._parent_fingerprint(parent, materialized, probe_deadline),
+                        fingerprint,
+                    )
+                except _RuntimeAbort:
+                    raise
+                except BaseException:
+                    failed = self._record_candidate_failure(
+                        candidate,
+                        stage="semantic_probe",
+                        outcome="semantic_probe_failed",
+                        code="semantic_probe_failed",
+                    )
+                    self._check_finished(probe_deadline, experiment_id=identity.sha256)
+                    return failed
+                semantic_outcome: CandidateStageOutcomeV5 = (
+                    "behavioral_equivalent"
+                    if comparison.classification == BEHAVIORAL_EQUIVALENT_ON_SUITE_V1
+                    else "sibling_equivalent"
+                    if fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
+                    else "behaviorally_distinct"
+                )
+                semantic_event = self.journal.append(
+                    CandidateStageResultPayloadV5(
+                        experiment_id=identity.sha256,
+                        stage="semantic_probe",
+                        stage_index=2,
+                        outcome=semantic_outcome,
+                        semantic_fingerprint=fingerprint,
+                    ),
+                    experiment_id=identity.sha256,
+                )
+                candidate = replace(
+                    candidate,
+                    semantic_fingerprint=fingerprint,
+                    status=(
+                        semantic_outcome
+                        if semantic_outcome in {"behavioral_equivalent", "sibling_equivalent"}
+                        else "quick_ready"
+                    ),
+                    artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_event.payload_ref,)),
                 )
                 self._check_finished(probe_deadline, experiment_id=identity.sha256)
-                return failed
-            semantic_outcome: CandidateStageOutcomeV5 = (
-                "behavioral_equivalent"
-                if comparison.classification == BEHAVIORAL_EQUIVALENT_ON_SUITE_V1
-                else "sibling_equivalent"
-                if fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
-                else "behaviorally_distinct"
-            )
-            semantic_event = self.journal.append(
-                CandidateStageResultPayloadV5(
-                    experiment_id=identity.sha256,
-                    stage="semantic_probe",
-                    stage_index=2,
-                    outcome=semantic_outcome,
-                    semantic_fingerprint=fingerprint,
-                ),
-                experiment_id=identity.sha256,
-            )
-            candidate = replace(
-                candidate,
-                semantic_fingerprint=fingerprint,
-                status=(
-                    semantic_outcome
-                    if semantic_outcome in {"behavioral_equivalent", "sibling_equivalent"}
-                    else "quick_ready"
-                ),
-                artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_event.payload_ref,)),
-            )
-            self._check_finished(probe_deadline, experiment_id=identity.sha256)
-            if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
-                return candidate
+                if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
+                    return candidate
 
-        self._seen_semantic_fingerprints.add(fingerprint.fingerprint_sha256)
-
+            self._seen_semantic_fingerprints.add(fingerprint.fingerprint_sha256)
         quick_failure = self._candidate_stage(identity.sha256, "quick_evaluation")
         if quick_failure is not None:
             if quick_failure.outcome != "quick_evaluation_failed":
@@ -2188,11 +2249,12 @@ class _Runtime:
             )
             self._check_finished(quick_deadline, experiment_id=identity.sha256)
             return failed
-        assert candidate.semantic_fingerprint is not None
         quick_event = self.journal.append(
             QuickEvidencePayloadV5(
                 experiment_id=identity.sha256,
                 semantic_fingerprint=candidate.semantic_fingerprint,
+                pit_data_scope=self.inputs.manifest.pit_data_scope,
+                semantic_mode=self.inputs.manifest.semantic_mode,
                 evaluation=quick,
             ),
             experiment_id=identity.sha256,
@@ -2262,6 +2324,8 @@ class _Runtime:
                 validation=item.validation,
                 semantic_fingerprint=item.semantic_fingerprint,
                 parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
+                pit_data_scope=self.inputs.manifest.pit_data_scope,
+                semantic_mode=self.inputs.manifest.semantic_mode,
                 quick_evidence=item.quick_evidence,
             )
             for item in candidates
@@ -2543,6 +2607,8 @@ class _Runtime:
                         round_index=self.inputs.round_index,
                         parent_revision_sha256=parent.policy_identity_sha256,
                         parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
+                        pit_data_scope=self.inputs.manifest.pit_data_scope,
+                        semantic_mode=self.inputs.manifest.semantic_mode,
                         hypothesis=decision.hypothesis,
                         template=template,
                         template_sha256=template.sha256,
@@ -2739,6 +2805,8 @@ class _Runtime:
             RoundIntentPayloadV5(
                 parent_revision_sha256=parent.policy_identity_sha256,
                 parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
+                pit_data_scope=self.inputs.manifest.pit_data_scope,
+                semantic_mode=self.inputs.manifest.semantic_mode,
                 hypothesis=decision.hypothesis,
                 discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
             )

@@ -298,6 +298,7 @@ class CampaignAuthoritiesV5:
             self.manifest.baseline_authority_ref.sha256 != canonical_sha256_v5(self.baseline)
             or self.manifest.sandbox_profile_ref.sha256 != self.sandbox_profile.sha256
             or self.manifest.pit_data_scope != self.baseline.pit_data_scope
+            or self.manifest.semantic_mode != self.baseline.semantic_mode
         ):
             raise ValueError("V5 campaign authority identity differs from the manifest")
 
@@ -1155,6 +1156,11 @@ def build_parser_v5() -> argparse.ArgumentParser:
         choices=("production", "development_sp500_v2"),
         default="production",
     )
+    build_manifest.add_argument(
+        "--semantic-mode",
+        choices=("required", "disabled_development"),
+        default="required",
+    )
     build_manifest.add_argument("--deny-full-source-escape", action="store_true")
     build_manifest.add_argument("--investigator-memory-max-bytes", type=int, default=96 * 1024)
     build_manifest.add_argument("--max-parallel-evaluations", type=int, default=2)
@@ -1495,6 +1501,7 @@ def _manifest_projection_v5(
         "target_pct": manifest.target.to_text(),
         "source_commit": manifest.source_commit,
         "pit_data_scope": manifest.pit_data_scope,
+        "semantic_mode": manifest.semantic_mode,
         "provider": (
             None
             if provider is None
@@ -1551,6 +1558,7 @@ def dispatch_manifest_cli_v5(
                 provider=_manifest_provider_capabilities_v5(namespace),
                 resources=_manifest_resource_capabilities_v5(namespace),
                 pit_data_scope=namespace.pit_data_scope,
+                semantic_mode=namespace.semantic_mode,
             )
             projection = _manifest_projection_v5(authenticated, status="created")
         else:

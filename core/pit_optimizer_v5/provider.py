@@ -1221,8 +1221,13 @@ class CriticRoleInputV5:
     predictions: tuple[ExperimentPredictionAggregateV5, ...]
     semantic_differences: tuple[ExperimentSemanticDifferenceAggregateV5, ...]
     typed_failures: tuple[ExperimentFailureAggregateV5, ...]
+    semantic_evidence_unavailable: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.semantic_evidence_unavailable) is not bool:
+            raise ValueError("critic semantic availability is invalid")
+        if self.semantic_evidence_unavailable and self.semantic_differences:
+            raise ValueError("unavailable semantics cannot carry differences")
         expected_types = (
             (self.evaluation_summaries, ExperimentEvaluationAggregateV5),
             (self.predictions, ExperimentPredictionAggregateV5),
@@ -1363,6 +1368,8 @@ def _validate_role_input(
             ("semantic differences", role_input.semantic_differences),
             ("typed failures", role_input.typed_failures),
         ):
+            if label == "semantic differences" and role_input.semantic_evidence_unavailable:
+                continue
             if tuple(item.experiment_id for item in values) != binding.experiment_ids:
                 raise ValueError(f"critic {label} differs from the complete experiment batch")
         _scan_aggregate_value(canonical_primitive_v5(role_input))

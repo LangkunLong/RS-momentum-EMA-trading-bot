@@ -28,6 +28,7 @@ from core.pit_optimizer_v5.contracts import (
     canonical_json_bytes_v5,
     canonical_primitive_v5,
     canonical_sha256_v5,
+    validate_semantic_mode_v5,
 )
 from core.pit_optimizer_v5.probes import SemanticFingerprintV5
 from core.pit_optimizer_v5.provider import RoleNameV5, RoleOutcomeV5
@@ -73,6 +74,7 @@ CandidateStageOutcomeV5 = Literal[
     "behavioral_equivalent",
     "sibling_equivalent",
     "behaviorally_distinct",
+    "semantic_skipped_development",
     "semantic_probe_failed",
     "quick_evaluation_failed",
     "discovery_evaluation_failed",
@@ -166,6 +168,7 @@ _CANDIDATE_STAGE_OUTCOMES = frozenset(
         "behavioral_equivalent",
         "sibling_equivalent",
         "behaviorally_distinct",
+        "semantic_skipped_development",
         "semantic_probe_failed",
         "quick_evaluation_failed",
         "discovery_evaluation_failed",
@@ -343,7 +346,7 @@ class ExperimentRecordV5:
     experiment_identity: ExperimentIdentityLikeV5
     round_index: int
     parent_revision_sha256: str
-    parent_semantic_fingerprint_sha256: str
+    parent_semantic_fingerprint_sha256: str | None
     hypothesis: HypothesisV5
     template: StructuralTemplateV5
     template_sha256: str
@@ -359,15 +362,18 @@ class ExperimentRecordV5:
     critic_review: CriticReviewV5 | None
     artifact_refs: tuple[ArtifactRefV5, ...]
     critic_artifact_ref: ArtifactRefV5 | None = None
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
         _digest(self.experiment_id, "experiment ID")
         _count(self.round_index, "experiment round", positive=True)
         _digest(self.parent_revision_sha256, "parent revision SHA-256")
-        _digest(
-            self.parent_semantic_fingerprint_sha256,
-            "parent semantic fingerprint SHA-256",
-        )
+        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+        if (self.parent_semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
+            raise ValueError("parent fingerprint differs from semantic mode")
+        if self.parent_semantic_fingerprint_sha256 is not None:
+            _digest(self.parent_semantic_fingerprint_sha256, "parent semantic fingerprint SHA-256")
         if type(self.hypothesis) is not HypothesisV5:
             raise ValueError("experiment hypothesis must use the V5 schema")
         if type(self.template) is not StructuralTemplateV5:
@@ -385,6 +391,8 @@ class ExperimentRecordV5:
             raise ValueError("experiment status is invalid")
         if type(self.validation) is not ValidationResultV5:
             raise ValueError("experiment validation must use the V5 schema")
+        if self.semantic_mode == "disabled_development" and self.semantic_fingerprint is not None:
+            raise ValueError("disabled semantics cannot carry a fingerprint")
         if self.semantic_fingerprint is not None and type(self.semantic_fingerprint) is not SemanticFingerprintV5:
             raise ValueError("experiment semantic fingerprint is invalid")
         if self.quick_evidence is not None and type(self.quick_evidence) is not PanelEvaluationV5:
@@ -502,7 +510,7 @@ class ExperimentRecordV5:
                 raise ValueError("behaviorally equivalent experiment evidence is inconsistent")
         elif self.status == "quick_rejected":
             if (
-                self.semantic_fingerprint is None
+                (self.semantic_fingerprint is None and self.semantic_mode == "required")
                 or self.quick_evidence is None
                 or self.discovery_episodes
                 or self.campaign_evidence is not None
@@ -511,7 +519,7 @@ class ExperimentRecordV5:
                 raise ValueError("quick-rejected experiment evidence is inconsistent")
         elif self.status == "zero_trade":
             if (
-                self.semantic_fingerprint is None
+                (self.semantic_fingerprint is None and self.semantic_mode == "required")
                 or self.quick_evidence is None
                 or len(self.discovery_episodes) != 4
                 or self.campaign_evidence is None
@@ -521,7 +529,7 @@ class ExperimentRecordV5:
                 raise ValueError("zero-trade experiment requires complete zero-activity evidence")
         elif self.status == "evaluated":
             if (
-                self.semantic_fingerprint is None
+                (self.semantic_fingerprint is None and self.semantic_mode == "required")
                 or self.quick_evidence is None
                 or len(self.discovery_episodes) != 4
                 or self.campaign_evidence is None
@@ -579,6 +587,8 @@ class ExperimentRecordV5:
             "round_index": self.round_index,
             "parent_revision_sha256": self.parent_revision_sha256,
             "parent_semantic_fingerprint_sha256": self.parent_semantic_fingerprint_sha256,
+            "pit_data_scope": self.pit_data_scope,
+            "semantic_mode": self.semantic_mode,
             "hypothesis": canonical_primitive_v5(self.hypothesis),
             "template": _template_artifact_primitive(self.template),
             "template_sha256": self.template_sha256,
@@ -611,16 +621,19 @@ class ExperimentRecordV5:
 @dataclass(frozen=True, slots=True)
 class RoundIntentPayloadV5:
     parent_revision_sha256: str
-    parent_semantic_fingerprint_sha256: str
+    parent_semantic_fingerprint_sha256: str | None
     hypothesis: HypothesisV5
     discovery_plan_sha256: str
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
         _digest(self.parent_revision_sha256, "round-intent parent revision")
-        _digest(
-            self.parent_semantic_fingerprint_sha256,
-            "round-intent parent fingerprint",
-        )
+        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+        if (self.parent_semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
+            raise ValueError("parent fingerprint differs from semantic mode")
+        if self.parent_semantic_fingerprint_sha256 is not None:
+            _digest(self.parent_semantic_fingerprint_sha256, "round-intent parent fingerprint")
         if type(self.hypothesis) is not HypothesisV5:
             raise ValueError("round-intent hypothesis is invalid")
         _digest(self.discovery_plan_sha256, "round-intent discovery plan")
@@ -731,6 +744,7 @@ class CandidateStageResultPayloadV5:
             "behavioral_equivalent": "semantic_probe",
             "sibling_equivalent": "semantic_probe",
             "behaviorally_distinct": "semantic_probe",
+            "semantic_skipped_development": "semantic_probe",
             "semantic_probe_failed": "semantic_probe",
             "quick_evaluation_failed": "quick_evaluation",
             "discovery_evaluation_failed": "discovery_evaluation",
@@ -782,12 +796,17 @@ class CandidateStageResultPayloadV5:
 @dataclass(frozen=True, slots=True)
 class QuickEvidencePayloadV5:
     experiment_id: str
-    semantic_fingerprint: SemanticFingerprintV5
+    semantic_fingerprint: SemanticFingerprintV5 | None
     evaluation: PanelEvaluationV5
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
         _digest(self.experiment_id, "quick-evidence experiment ID")
-        if type(self.semantic_fingerprint) is not SemanticFingerprintV5:
+        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+        if (self.semantic_fingerprint is None) != (self.semantic_mode == "disabled_development"):
+            raise ValueError("quick fingerprint differs from semantic mode")
+        if self.semantic_fingerprint is not None and type(self.semantic_fingerprint) is not SemanticFingerprintV5:
             raise ValueError("quick-evidence semantic fingerprint is invalid")
         if type(self.evaluation) is not PanelEvaluationV5:
             raise ValueError("quick-evidence panel is invalid")
@@ -1247,7 +1266,11 @@ def round_event_payload_primitive_v5(
     elif isinstance(payload, QuickEvidencePayloadV5):
         body = {
             "experiment_id": payload.experiment_id,
-            "semantic_fingerprint": payload.semantic_fingerprint.to_primitive(),
+            "semantic_fingerprint": (
+                None if payload.semantic_fingerprint is None else payload.semantic_fingerprint.to_primitive()
+            ),
+            "pit_data_scope": payload.pit_data_scope,
+            "semantic_mode": payload.semantic_mode,
             "evaluation": canonical_primitive_v5(payload.evaluation),
         }
     elif isinstance(payload, EpisodeEvidencePayloadV5):
@@ -1438,6 +1461,8 @@ def _validate_candidate_stage_chain_v5(
     events: tuple[RoundEventV5, ...],
     payloads: tuple[RoundEventPayloadV5, ...],
 ) -> None:
+    intents = tuple(item for item in payloads if isinstance(item, RoundIntentPayloadV5))
+    semantic_disabled = len(intents) == 1 and intents[0].semantic_mode == "disabled_development"
     states: dict[str, str] = {}
     fingerprints: dict[str, SemanticFingerprintV5] = {}
     episode_ordinals: dict[str, set[int]] = {}
@@ -1468,10 +1493,10 @@ def _validate_candidate_stage_chain_v5(
                 raise ValueError("candidate execution authority is duplicated")
             state = states.get(experiment_id)
             if payload.key.stage == "semantic_probe":
-                if state != "validated":
-                    raise ValueError("candidate semantic-probe execution is out of order")
+                if semantic_disabled or state != "validated":
+                    raise ValueError("candidate semantic-probe execution is out of order or disabled")
             elif payload.key.stage == "quick_evaluation":
-                if state != "distinct":
+                if state not in {"distinct", "semantic_skipped"}:
                     raise ValueError("candidate quick execution is out of order")
             elif state not in {"quick", "episodes"}:
                 raise ValueError("candidate discovery execution is out of order")
@@ -1494,14 +1519,25 @@ def _validate_candidate_stage_chain_v5(
             elif payload.stage == "semantic_probe":
                 if state != "validated":
                     raise ValueError("candidate semantic result is duplicated or out of order")
-                if payload.outcome == "behaviorally_distinct":
+                if semantic_disabled and payload.outcome not in {"exact_duplicate", "semantic_skipped_development"}:
+                    raise ValueError("disabled semantics cannot carry semantic execution outcomes")
+                if payload.outcome == "semantic_skipped_development":
+                    if (
+                        not semantic_disabled
+                        or CandidateExecutionKeyV5(experiment_id, "semantic_probe", None) in execution_keys
+                    ):
+                        raise ValueError("semantic skip lacks explicit development authority")
+                    states[experiment_id] = "semantic_skipped"
+                elif payload.outcome == "behaviorally_distinct":
+                    if semantic_disabled:
+                        raise ValueError("disabled semantics cannot carry behavioral evidence")
                     assert payload.semantic_fingerprint is not None
                     fingerprints[experiment_id] = payload.semantic_fingerprint
                     states[experiment_id] = "distinct"
                 else:
                     states[experiment_id] = "terminal"
             elif payload.stage == "quick_evaluation":
-                if state != "distinct":
+                if state not in {"distinct", "semantic_skipped"}:
                     raise ValueError("candidate quick failure is duplicated or out of order")
                 states[experiment_id] = "terminal"
             elif payload.stage == "discovery_evaluation":
@@ -1514,8 +1550,13 @@ def _validate_candidate_stage_chain_v5(
             continue
         if isinstance(payload, QuickEvidencePayloadV5):
             assert experiment_id is not None
-            if states.get(experiment_id) != "distinct":
+            if states.get(experiment_id) not in {"distinct", "semantic_skipped"}:
                 raise ValueError("candidate quick evidence is duplicated or out of order")
+            if not intents or (payload.pit_data_scope, payload.semantic_mode) != (
+                intents[0].pit_data_scope,
+                intents[0].semantic_mode,
+            ):
+                raise ValueError("quick semantic mode differs from round intent")
             if payload.semantic_fingerprint != fingerprints.get(experiment_id):
                 raise ValueError("candidate quick evidence differs from its durable semantic result")
             states[experiment_id] = "quick"

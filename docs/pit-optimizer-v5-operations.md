@@ -6,7 +6,7 @@ The production entry point is `python -B -m core.pit_optimizer_v5.cli` on the Wi
 
 Start with a real, authenticated discovery manifest and every artifact it references. The manifest fixes the source commit, baseline, discovery panels, evaluator, sandbox image, provider limits, and resource limits. Setup does not invent these artifacts or modify the manifest. A separately persisted adapter configuration supplies the local host paths and adapter identities.
 
-Current manifests and baseline-parent authorities must contain an explicit `pit_data_scope`. The Python constructor default preserves source-call compatibility; it is not a migration for persisted JSON because typed artifact decoding requires exact keys. Pre-scope bytes remain readable and content-authenticatable under their original references, but typed manifest or parent loading reports that the graph must be rebuilt. Retain those artifacts unchanged, create a replacement manifest and parent with explicit scope, and use the newly computed content-addressed references throughout the rebuilt graph. Never edit old bytes in place or reuse their digests for re-emitted content.
+Current manifests and baseline-parent authorities must contain explicit `pit_data_scope` and `semantic_mode` fields. The Python constructor default preserves source-call compatibility; it is not a migration for persisted JSON because typed artifact decoding requires exact keys. Pre-scope or pre-mode bytes remain readable and content-authenticatable under their original references, but typed manifest or parent loading reports that the graph must be rebuilt. Retain those artifacts unchanged, create a replacement manifest and parent with explicit scope and semantic mode, and use the newly computed content-addressed references throughout the rebuilt graph. Never edit old bytes in place or reuse their digests for re-emitted content.
 
 The source, workspace, data, output, and control directories must already exist and be mutually disjoint. For example, use sibling directories under `C:\pit-v5`, with a clean source checkout at `C:\pit-v5\source`. The data directory must contain exactly `pit_bundle.sqlite3` and `prices_provenance.json`, matching the manifest's evaluator digests. Keep the artifact repository outside the data directory. Git and Docker must be installed; their paths can be discovered from `PATH` or supplied explicitly.
 
@@ -171,3 +171,44 @@ development input, distinct from deterministic synthetic fixtures, and it does
 not run an automatic external-model campaign. Production provider-free execution
 continues to require fixture authority, while paid production continues to require
 ledger authority.
+
+
+## Explicit development semantic skip
+
+The manifest defaults to `semantic_mode="required"`. `build-manifest` accepts
+`--semantic-mode disabled_development` only with
+`--pit-data-scope development_sp500_v2` and no provider configuration. The
+baseline scheduling parent must carry the same scope and mode. Production and
+fixture compositions remain semantic-required; development scope alone does
+not disable probes.
+
+In disabled mode the baseline, scheduling parent, round intent, experiment
+record, and quick evidence preserve unavailable semantic fingerprints as `None`.
+The nullable durable contracts persist their scope and mode. Source/AST validation
+and exact policy duplicate checks still run. Each valid nonduplicate candidate
+journals one `semantic_skipped_development` outcome at the semantic stage,
+without executing probes or obtaining a semantic execution lease. Recovery
+requires the same manifest mode, rejects semantic leases in disabled mode, and
+rejects skipped stages in required mode. Old JSON graphs are not migrated or
+filled with placeholder hashes; retain them unchanged and build new explicit
+content-addressed graphs.
+
+Quick screening retains canonical source identity and conflict checks, but
+skips parent/sibling fingerprint grouping in disabled mode. Eligibility for real
+bounded discovery is separate from behavioral distinctness: source differences
+are not behavioral evidence. A zero-trade quick evaluation can continue to the
+bounded discovery budget. Four complete zero-activity episodes remain a real
+`zero_trade` record and cannot enter the profitable archive. All normal panel,
+policy, evaluator, scenario, resource, and lifecycle bindings remain enforced.
+The critic receives actual available reports with
+`semantic_evidence_unavailable=true` and an empty semantic-difference section;
+no probe traces or novelty claims are invented. Archive replay and next-parent
+selection retain the same scope/mode. Skipping equivalence checks can cause
+redundant real candidate evaluations.
+
+This contract increment does not compose or demonstrate a development loop.
+Before real execution, rebuild the matching evaluator image (the manifest
+contract module is image-covered), obtain four authenticated real parent windows
+with gross/base/stress evidence, and compose the existing feedback runtime with
+the provider-free controller role adapter. Apply, qualification, and full replay
+remain disabled.

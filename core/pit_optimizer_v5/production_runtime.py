@@ -46,6 +46,7 @@ from core.pit_optimizer_v5.memory import (
     NoveltyExhaustedAuthorityV5,
     RoleCompletionPayloadV5,
     RoundOutcomePayloadV5,
+    RoundIntentPayloadV5,
     SchedulingCursorV5,
     PreValidationInvalidExperimentIdentityV5,
     ResourceLeasePayloadV5,
@@ -172,9 +173,15 @@ def _parent_fingerprint(
             if stored.reference == parent.experiment_record_ref
             and stored.record.policy_revision == parent.policy_revision
         )
-        if len(matches) != 1 or matches[0] is None:
+        if len(matches) != 1:
             raise ValueError("archive parent semantic authority is unavailable")
         fingerprint = matches[0]
+    if (parent.pit_data_scope, parent.semantic_mode) != (inputs.manifest.pit_data_scope, inputs.manifest.semantic_mode):
+        raise ValueError("parent semantic mode differs from manifest")
+    if fingerprint is None:
+        if inputs.manifest.semantic_mode != "disabled_development" or parent.semantic_fingerprint_sha256 is not None:
+            raise ValueError("parent semantic authority is unavailable")
+        return None
     if fingerprint.fingerprint_sha256 != parent.semantic_fingerprint_sha256:
         raise ValueError("parent semantic authority differs from scheduling identity")
     return fingerprint
@@ -1019,7 +1026,11 @@ class LocalRoleRequestFactoryV5:
 
         for candidate in candidates:
             fingerprint = candidate.semantic_fingerprint
-            if fingerprint is None:
+            if inputs.manifest.semantic_mode == "disabled_development":
+                if fingerprint is not None or parent_fingerprint is not None:
+                    raise ValueError("disabled semantics cannot carry critic fingerprints")
+                continue
+            if fingerprint is None or parent_fingerprint is None:
                 raise ValueError("testable critic candidate lacks semantic evidence")
             comparison = classify_semantic_fingerprints_v5(parent_fingerprint, fingerprint)
             evidence_id = evidence.add(
@@ -1075,6 +1086,7 @@ class LocalRoleRequestFactoryV5:
                 predictions,
                 tuple(semantic_rows),
                 tuple(failures),
+                semantic_evidence_unavailable=inputs.manifest.semantic_mode == "disabled_development",
             ),
             issued_evidence=evidence.build(),
             expected_binding=RoleBindingV5(
@@ -1212,6 +1224,8 @@ class CanonicalExperimentRecordFactoryV5:
                     reviews[candidate.experiment_id] if testable else None,
                     candidate.artifact_refs,
                     critic_ref if testable else None,
+                    pit_data_scope=inputs.manifest.pit_data_scope,
+                    semantic_mode=inputs.manifest.semantic_mode,
                 )
             )
         return tuple(records)
@@ -1281,6 +1295,8 @@ class LocalArchiveReducerFactoryV5:
             inputs.manifest.target,
             self._authorities(records),
             inputs.manifest.search.archive_capacity,
+            pit_data_scope=inputs.manifest.pit_data_scope,
+            semantic_mode=inputs.manifest.semantic_mode,
         )
 
     def verify_projection(
@@ -1318,6 +1334,8 @@ class LocalArchiveReducerFactoryV5:
             manifest.target,
             self._authorities(records),
             manifest.search.archive_capacity,
+            pit_data_scope=manifest.pit_data_scope,
+            semantic_mode=manifest.semantic_mode,
         )
         baseline = self._repository.load_typed_artifact(
             manifest.baseline_authority_ref, value_type=BaselineParentAuthorityV5
@@ -1343,6 +1361,8 @@ class LocalArchiveReducerFactoryV5:
 
     def _scheduling_history(self, manifest, panel_plan, evaluator_contract, baseline, records, reducer):
         """Fold terminal cursors and checkpoint-owned records in chronological order."""
+        if (baseline.pit_data_scope, baseline.semantic_mode) != (manifest.pit_data_scope, manifest.semantic_mode):
+            raise ValueError("scheduling baseline semantic mode differs from manifest")
         state = reducer.initial()
         chain = ()
         history = {}
@@ -1355,6 +1375,12 @@ class LocalArchiveReducerFactoryV5:
             payloads = tuple(
                 self._repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind) for item in events
             )
+            if any(
+                (item.pit_data_scope, item.semantic_mode) != (manifest.pit_data_scope, manifest.semantic_mode)
+                for item in payloads
+                if type(item) is RoundIntentPayloadV5
+            ):
+                raise ValueError("scheduling history semantic mode differs from manifest")
             terminals = tuple(item for item in payloads if type(item) is RoundOutcomePayloadV5)
             if stopped:
                 if events or current_records:
@@ -1469,6 +1495,8 @@ class LocalArchiveReducerFactoryV5:
             inputs.manifest.target,
             authorities,
             inputs.manifest.search.archive_capacity,
+            pit_data_scope=inputs.manifest.pit_data_scope,
+            semantic_mode=inputs.manifest.semantic_mode,
         )
 
 

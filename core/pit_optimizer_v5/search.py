@@ -22,6 +22,7 @@ from core.pit_optimizer_v5.contracts import (
     canonical_sha256_v5,
     selected_scenario,
     validate_campaign_evidence_v5,
+    validate_semantic_mode_v5,
 )
 from core.pit_optimizer_v5.memory import ExperimentRecordV5, StoredExperimentRecordV5
 from core.pit_optimizer_v5.probes import SemanticFingerprintV5
@@ -735,8 +736,11 @@ class CandidateArchiveReducerV5:
     target: AnnualizedReturnTargetV5
     authorities: tuple[ArchiveRecordAuthorityV5, ...]
     capacity: int = DEFAULT_ARCHIVE_CAPACITY_V5
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
+        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
         if (
             type(self.discovery_plan) is not CampaignPanelPlanV5
             or type(self.evaluator_contract) is not EvaluatorContractV5
@@ -772,6 +776,8 @@ class CandidateArchiveReducerV5:
     ) -> SearchStateV5:
         if type(state) is not SearchStateV5 or type(record) is not ExperimentRecordV5:
             raise ValueError("archive reducer inputs are invalid")
+        if (record.pit_data_scope, record.semantic_mode) != (self.pit_data_scope, self.semantic_mode):
+            raise ArchiveAuthorityMismatchV5()
         if state.archive.capacity != self.capacity:
             raise ValueError("archive reducer state capacity changed")
         if record.experiment_identity.discovery_plan_sha256 != self.discovery_plan.discovery_plan_sha256:
@@ -810,22 +816,26 @@ class BaselineParentAuthorityV5:
 
     policy_revision: PolicyRevisionIdentityV5
     policy_revision_ref: ArtifactRefV5
-    semantic_fingerprint: SemanticFingerprintV5
+    semantic_fingerprint: SemanticFingerprintV5 | None
     campaign: CampaignEvidenceV5
     source_bundle: SourceBundleV5
     source_bundle_ref: ArtifactRefV5
     pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
         if (
             type(self.policy_revision) is not PolicyRevisionIdentityV5
             or type(self.policy_revision_ref) is not ArtifactRefV5
-            or type(self.semantic_fingerprint) is not SemanticFingerprintV5
+            or (self.semantic_fingerprint is not None and type(self.semantic_fingerprint) is not SemanticFingerprintV5)
             or type(self.campaign) is not CampaignEvidenceV5
             or type(self.source_bundle) is not SourceBundleV5
             or type(self.source_bundle_ref) is not ArtifactRefV5
         ):
             raise ValueError("baseline parent authority is invalid")
+        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+        if (self.semantic_fingerprint is None) != (self.semantic_mode == "disabled_development"):
+            raise ValueError("baseline fingerprint differs from semantic mode")
         if self.pit_data_scope not in {"production", "development_sp500_v2"}:
             raise ValueError("baseline parent PIT data scope is invalid")
         if (
@@ -849,22 +859,25 @@ class ParentCandidateV5:
 
     origin: ParentOriginV5
     policy_revision: PolicyRevisionIdentityV5
-    semantic_fingerprint_sha256: str
+    semantic_fingerprint_sha256: str | None
     campaign_cagr_pct: Decimal
     source_bundle_ref: ArtifactRefV5
     experiment_record_ref: ArtifactRefV5 | None
     primary_mechanism: PrimaryMechanismV5 | None
     admitted_round: int | None
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
         if self.origin not in {"baseline", "archive"}:
             raise ValueError("parent candidate origin is invalid")
         if type(self.policy_revision) is not PolicyRevisionIdentityV5:
             raise ValueError("parent candidate policy revision is invalid")
-        _digest(
-            self.semantic_fingerprint_sha256,
-            "parent semantic fingerprint",
-        )
+        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+        if (self.semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
+            raise ValueError("parent fingerprint differs from semantic mode")
+        if self.semantic_fingerprint_sha256 is not None:
+            _digest(self.semantic_fingerprint_sha256, "parent semantic fingerprint")
         score = _finite_decimal(self.campaign_cagr_pct, "parent campaign CAGR")
         if score != score.quantize(
             CAMPAIGN_CAGR_QUANTUM_V5,
@@ -898,6 +911,8 @@ class ParentCandidateV5:
 
     def to_primitive(self) -> dict[str, object]:
         return {
+            "pit_data_scope": self.pit_data_scope,
+            "semantic_mode": self.semantic_mode,
             "origin": self.origin,
             "policy_revision": self.policy_revision.to_primitive(),
             "semantic_fingerprint_sha256": self.semantic_fingerprint_sha256,
@@ -933,12 +948,16 @@ def baseline_parent_candidate_v5(
     return ParentCandidateV5(
         origin="baseline",
         policy_revision=authority.policy_revision,
-        semantic_fingerprint_sha256=(authority.semantic_fingerprint.fingerprint_sha256),
+        semantic_fingerprint_sha256=(
+            None if authority.semantic_fingerprint is None else authority.semantic_fingerprint.fingerprint_sha256
+        ),
         campaign_cagr_pct=score,
         source_bundle_ref=authority.source_bundle_ref,
         experiment_record_ref=None,
         primary_mechanism=None,
         admitted_round=None,
+        pit_data_scope=authority.pit_data_scope,
+        semantic_mode=authority.semantic_mode,
     )
 
 
@@ -956,7 +975,6 @@ def archive_parent_from_record_v5(
         stored_record.reference != entry.experiment_record_ref
         or record.status != "evaluated"
         or record.policy_revision != entry.policy_revision
-        or record.semantic_fingerprint is None
         or record.campaign_evidence != entry.campaign
         or record.hypothesis.primary_mechanism != entry.primary_mechanism
         or entry.source_bundle_ref not in record.artifact_refs
@@ -965,12 +983,16 @@ def archive_parent_from_record_v5(
     return ParentCandidateV5(
         origin="archive",
         policy_revision=entry.policy_revision,
-        semantic_fingerprint_sha256=(record.semantic_fingerprint.fingerprint_sha256),
+        semantic_fingerprint_sha256=(
+            None if record.semantic_fingerprint is None else record.semantic_fingerprint.fingerprint_sha256
+        ),
         campaign_cagr_pct=entry.campaign_cagr_pct,
         source_bundle_ref=entry.source_bundle_ref,
         experiment_record_ref=entry.experiment_record_ref,
         primary_mechanism=entry.primary_mechanism,
         admitted_round=entry.admitted_round,
+        pit_data_scope=record.pit_data_scope,
+        semantic_mode=record.semantic_mode,
     )
 
 

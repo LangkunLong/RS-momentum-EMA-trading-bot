@@ -718,6 +718,8 @@ def _decode_experiment_record(value: object) -> ExperimentRecordV5:
         "round_index",
         "parent_revision_sha256",
         "parent_semantic_fingerprint_sha256",
+        "pit_data_scope",
+        "semantic_mode",
         "hypothesis",
         "template",
         "template_sha256",
@@ -756,6 +758,8 @@ def _decode_experiment_record(value: object) -> ExperimentRecordV5:
         round_index=primitive["round_index"],  # type: ignore[arg-type]
         parent_revision_sha256=primitive["parent_revision_sha256"],  # type: ignore[arg-type]
         parent_semantic_fingerprint_sha256=primitive["parent_semantic_fingerprint_sha256"],  # type: ignore[arg-type]
+        pit_data_scope=primitive["pit_data_scope"],
+        semantic_mode=primitive["semantic_mode"],
         hypothesis=_decode_dataclass(HypothesisV5, primitive["hypothesis"]),
         template=template,
         template_sha256=primitive["template_sha256"],  # type: ignore[arg-type]
@@ -861,10 +865,18 @@ def _decode_round_payload(expected_kind: str, value: object) -> RoundEventPayloa
             episode_ordinal=item["episode_ordinal"],  # type: ignore[arg-type]
         )
     if expected_kind == "quick_evidence":
-        item = _exact_keys(body, {"experiment_id", "semantic_fingerprint", "evaluation"})
+        item = _exact_keys(
+            body, {"experiment_id", "semantic_fingerprint", "evaluation", "pit_data_scope", "semantic_mode"}
+        )
         return QuickEvidencePayloadV5(
             experiment_id=item["experiment_id"],  # type: ignore[arg-type]
-            semantic_fingerprint=_decode_semantic_fingerprint(item["semantic_fingerprint"]),
+            semantic_fingerprint=(
+                None
+                if item["semantic_fingerprint"] is None
+                else _decode_semantic_fingerprint(item["semantic_fingerprint"])
+            ),
+            pit_data_scope=item["pit_data_scope"],
+            semantic_mode=item["semantic_mode"],
             evaluation=_decode_dataclass(PanelEvaluationV5, item["evaluation"]),
         )
     if expected_kind == "episode_evidence":
@@ -1403,6 +1415,8 @@ class LocalArtifactRepositoryV5:
             if len(intents) != 1 or any(
                 item.record.parent_revision_sha256 != intents[0].parent_revision_sha256
                 or item.record.parent_semantic_fingerprint_sha256 != intents[0].parent_semantic_fingerprint_sha256
+                or item.record.pit_data_scope != intents[0].pit_data_scope
+                or item.record.semantic_mode != intents[0].semantic_mode
                 or item.record.hypothesis != intents[0].hypothesis
                 or item.record.experiment_identity.discovery_plan_sha256 != intents[0].discovery_plan_sha256
                 or item.record.template != packages[1].artifact

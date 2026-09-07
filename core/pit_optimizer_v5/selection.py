@@ -21,6 +21,7 @@ from core.pit_optimizer_v5.contracts import (
     SearchCapabilitiesV5,
     ValidationResultV5,
     selected_scenario,
+    validate_semantic_mode_v5,
 )
 from core.pit_optimizer_v5.memory import StoredExperimentRecordV5
 from core.pit_optimizer_v5.probes import SemanticFingerprintV5
@@ -117,8 +118,10 @@ class QuickScreenCandidateV5:
     variant: RenderedVariantV5
     validation: ValidationResultV5
     semantic_fingerprint: SemanticFingerprintV5 | None
-    parent_semantic_fingerprint_sha256: str
+    parent_semantic_fingerprint_sha256: str | None
     quick_evidence: PanelEvaluationV5 | None
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
         if (
@@ -131,10 +134,13 @@ class QuickScreenCandidateV5:
             raise ValueError("quick-screen semantic fingerprint is invalid")
         if self.quick_evidence is not None and type(self.quick_evidence) is not PanelEvaluationV5:
             raise ValueError("quick-screen panel evidence is invalid")
-        _digest(
-            self.parent_semantic_fingerprint_sha256,
-            "quick-screen parent fingerprint",
-        )
+        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+        if (self.parent_semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
+            raise ValueError("quick-screen parent fingerprint differs from semantic mode")
+        if self.semantic_mode == "disabled_development" and self.semantic_fingerprint is not None:
+            raise ValueError("disabled semantics cannot carry a fingerprint")
+        if self.parent_semantic_fingerprint_sha256 is not None:
+            _digest(self.parent_semantic_fingerprint_sha256, "quick-screen parent fingerprint")
         if not _assignment_matches_template(self):
             raise ValueError("quick-screen assignment differs from its template")
         if self.validation.valid and (self.validation.changed_symbols != self.template.changed_symbols):
@@ -167,7 +173,7 @@ class QuickScreenCandidateV5:
         return (
             self.validation.valid
             and self.variant.policy_revision.sha256 != self.template.parent_revision_sha256
-            and self.is_behaviorally_distinct
+            and (self.is_behaviorally_distinct or self.semantic_mode == "disabled_development")
             and self.quick_evidence is not None
         )
 
@@ -233,6 +239,11 @@ def _deduplicate_quick_candidates(
         if prior is not None and prior != candidate:
             raise QuickCandidateConflictV5()
         by_policy[identity] = candidate
+
+    if any(item.semantic_mode == "disabled_development" for item in by_policy.values()):
+        if any(item.semantic_mode != "disabled_development" for item in by_policy.values()):
+            raise QuickCandidateConflictV5()
+        return tuple(by_policy.values())
 
     # A suite-local behavior is screened only once. Prefer the declared default
     # within its behavior group, otherwise the canonical policy identity.
@@ -448,6 +459,11 @@ def parent_schedule_v5(
         )
         for entry in archive_order
     )
+    if any(
+        (parent.pit_data_scope, parent.semantic_mode) != (baseline.pit_data_scope, baseline.semantic_mode)
+        for parent in parents
+    ):
+        raise ParentSelectionFailureV5()
     offset = (state.next_round_index - 1) % len(parents)
     return parents[offset:] + parents[:offset]
 

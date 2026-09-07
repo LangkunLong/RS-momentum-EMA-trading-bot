@@ -356,9 +356,9 @@ def _require_explicit_pit_data_scope_v5(
     """Diagnose pre-scope authorities without rewriting authenticated bytes."""
 
     value = _authenticated_object_v5(artifact, label)
-    if "pit_data_scope" not in value:
+    if "pit_data_scope" not in value or "semantic_mode" not in value:
         raise ManifestAuthenticationFailureV5(
-            f"{label} predates explicit pit_data_scope; retain the old artifact and rebuild "
+            f"{label} predates explicit pit_data_scope/semantic_mode; retain the old artifact and rebuild "
             "the manifest graph with new content-addressed references before typed loading"
         )
 
@@ -598,6 +598,7 @@ def build_campaign_manifest_v5(
     provider: ProviderCapabilitiesV5 | None = None,
     resources: ResourceCapabilitiesV5 | None = None,
     pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
+    semantic_mode: Literal["required", "disabled_development"] = "required",
 ) -> AuthenticatedCampaignManifestV5:
     """Create and reauthenticate one discovery-only campaign manifest."""
 
@@ -626,8 +627,8 @@ def build_campaign_manifest_v5(
         panel_plan_ref=panel_plan_ref,
         sandbox_profile_ref=sandbox_profile_ref,
     )
-    if baseline.pit_data_scope != pit_data_scope:
-        raise ValueError("manifest PIT data scope differs from baseline authority")
+    if (baseline.pit_data_scope, baseline.semantic_mode) != (pit_data_scope, semantic_mode):
+        raise ValueError("manifest PIT data scope or semantic mode differs from baseline authority")
     _validate_precomposition_bindings_v5(
         target=target,
         source_snapshot=source_snapshot,
@@ -681,6 +682,7 @@ def build_campaign_manifest_v5(
         qualification_allowed=False,
         full_replay_allowed=False,
         pit_data_scope=pit_data_scope,
+        semantic_mode=semantic_mode,
     )
     manifest_ref = repository.create_typed_artifact(manifest_path, manifest)
     return authenticate_campaign_manifest_v5(repository=repository, manifest_ref=manifest_ref)
@@ -784,6 +786,7 @@ def authenticate_campaign_manifest_v5(
         or baseline_revision != baseline.policy_revision
         or source_bundle != baseline.source_bundle
         or manifest.pit_data_scope != baseline.pit_data_scope
+        or manifest.semantic_mode != baseline.semantic_mode
         or policy_scope.full_source_escape_allowed != manifest.search.allow_full_source_escape
         or manifest.apply is not False
         or manifest.qualification_allowed is not False
