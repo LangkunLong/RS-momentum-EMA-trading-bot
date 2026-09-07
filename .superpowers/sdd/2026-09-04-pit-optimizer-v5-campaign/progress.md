@@ -198,3 +198,63 @@
   The repair report/review and prerequisite audits remain in this plan's local workspace. Actual
   baseline capture and deterministic-repeat/runtime evidence remain blocked on the required local
   inputs and image; this source completion establishes no production run or return improvement.
+- Data/image continuation (2026-09-07): the user explicitly authorized obtaining the missing V5
+  inputs and evaluator image, superseding the earlier source-only acquisition boundary. The user
+  has Alpaca and FMP; FMP profile access succeeded but all four documented current/historical
+  constituent endpoints returned HTTP 402, with subscription/upgrade restriction confirmed.
+  Alpaca historical SIP access succeeded. Credentials stayed local and were not logged.
+- Evaluator image preparation complete: local Docker Desktop was started non-destructively and
+  the dedicated V5 recipe built from a verified exact 59-file context. Immutable local reference
+  `pit-optimizer-v5-evaluator@sha256:663f1749ba91df9e501e9de705cca83ff1c46305ca5a2ad589380fbe1d9893aa`
+  is a real RepoDigest. Runtime source identity is
+  `5989471897bee94e6886493f71b525c931388e029e6eeaa626abc3678c3e2fd7`. Restricted source/import smoke
+  passed with network disabled, read-only root, no host mounts, and UID/GID 65532. The authenticated
+  resource leaf binds the default 1 CPU/1024 MiB/32 PID/64 MiB-output sandbox profile. The expected
+  `evaluator/sandbox-profile.json` now exists with SHA-256
+  `7a9c1e73046f7a00abcb5fc029350ea7e42e5841b179074a5ef43a94f5613483`; the digest-named original and
+  image-preparation index preserve its source/resource/provenance chain. No evaluation occurred.
+  The first worktree-root build failed its source guard because ignore handling admitted extra
+  files; the accepted build used an independently verified exact context. Future root-context
+  builds need that issue resolved. Linux-only SecretStorage/jeepney versions are recorded in image
+  provenance; a Linux-complete dependency lock remains a reproducible-rebuild follow-up.
+- Data acquisition materially advanced: the S&P source pair now passes the actual V5 source
+  validators (711 events, 606 source tickers, 505 initial share-class members). Original immutable
+  HTML, reviewed map, names and spot-check hashes authenticate; original membership replayed byte
+  for byte, and the only adaptation is the seed date from 2021-01-01 to 2021-01-04. Both official
+  SEC bulk archives (2.97 GB) were copied into V5 raw acquisition storage and source/copy hashes
+  verified. Older S&P price/fundamental material (54 MB) was copied with original provenance and
+  remains explicitly partial, including legacy security-master exclusions.
+- With the user-supplied SEC contact, downloaded and hashed all 25 official financial-statement
+  archives from 2019 Q4 through 2025 Q4 (2.61 GB). Reverified all archive/SUB hashes and extracted
+  172,551 accession/CIK records across 10,567 CIKs into dated SIC evidence, retaining 1,951 unknown
+  SIC rows. Availability is the first supplied session strictly after SEC acceptance calendar
+  date. This is raw classification evidence, not final industry membership/ranks. The legacy S&P
+  seed-master subset covers 469 symbols; 464 have a preceding latest-filing SIC and five lack a
+  preceding filing under that old CIK mapping. Complete dated identities remain required.
+- Acquired all three non-tradable reference price series through the existing Alpaca SIP helpers:
+  1,508 sessions each for IWM/QQQ/SPY over 2020-01-02..2025-12-31, 4,524 rows per SPLIT and RAW
+  snapshot, with verified cutoff factors of 1.0 for all three. These remain authenticated reference
+  material pending the complete tradable lineage union and final price provenance composition.
+- Nasdaq public acquisition obtained 16 source documents, a contemporaneous 102-ticker anchor,
+  and four primary-source-supported corrections. The 91 corrected event claims reconcile to the
+  same 101-member year-end set as an independent endpoint backcast. The source pair was correctly
+  withheld: SOLS and omitted GRAIL transient inclusion/removal dates remain unresolved, and endpoint
+  agreement cannot establish complete transient coverage. Complete Russell 2000 daily membership
+  is still unestablished. Neither current ETF holdings nor reconstructed market-cap proxies were
+  substituted for index membership.
+- Current create-only preparation status is recorded at
+  `.artifacts/pit-optimizer-v5/data/acquisition/acquisition-status-20260907.json`, SHA-256
+  `d34e0ea7501bdb2e64e495d1b34d25ee8c1c81c818262b24a4c60f15071e4b7c`: 2 of 12 final input files
+  present, image ready, full bundle not ready. Exact raw acquisition receipts/provenance, helper
+  scripts, image and Nasdaq reports, and the independent data-source audit remain local. Initial
+  independent review approved S&P/image preparation without new Critical/Important findings. The
+  follow-up material review also found no new Critical/Important defect after checking all 172,551
+  SIC date gates, unknown/cutoff retention, reference bytes/source hashes, 11 cache files, 16 Nasdaq
+  receipts, and final status/input existence bindings. Findings remain in the same audit report.
+- Vendor coverage/quote inquiry drafts for LSEG and Nasdaq are prepared locally. On being asked
+  whether to send them, the user requested a recommendation. Recommended quotes only for missing
+  membership, retaining Alpaca/SEC sources, with coverage/retention/price review before purchase.
+  Explicit send approval has not been received; no inquiry, subscription, purchase, upload, push,
+  model-provider role call, test, market evaluation, baseline, held-out stage, or replay occurred.
+  Next dependency is complete membership/identities, then final price/fundamental/industry export,
+  V3 bundle verification and downstream baseline/campaign preparation under their existing gates.
