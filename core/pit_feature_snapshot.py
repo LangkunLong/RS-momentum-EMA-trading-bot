@@ -32,7 +32,7 @@ from core.canslim.l_leader_laggard import (
     finite_rs_snapshot,
 )
 from core.industry_group import load_pit_industry_assignments_as_of
-from core.pit_data import PITDataBundle
+from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
 from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
 from core.pit_universe_v3 import UNIVERSE_IDS
 
@@ -81,15 +81,18 @@ def build_entry_features_v3(
     session: date,
     price_history: pd.DataFrame,
     rs_snapshot: Mapping[str, float],
+    allow_schema_v2_development: bool = False,
 ) -> EntryFeaturesV3:
     """Build entry features from facts observable by ``session`` only."""
     symbol, active_symbols, validated_rs = _validated_context(
-        bundle, symbol, session, rs_snapshot, require_active=True
+        bundle, symbol, session, rs_snapshot, require_active=True,
+        allow_schema_v2_development=allow_schema_v2_development,
     )
     assignments = load_pit_industry_assignments_as_of(
         bundle,
         session=session,
         symbols=active_symbols,
+        allow_schema_v2_development=allow_schema_v2_development,
     )
     groups = {ticker: assignment.group_id for ticker, assignment in assignments.items()}
     target_group = groups.get(symbol)
@@ -140,16 +143,21 @@ def build_holding_features_v3(
     session: date,
     price_history: pd.DataFrame,
     rs_snapshot: Mapping[str, float],
+    allow_schema_v2_development: bool = False,
+    identity_transition_contract: PriceIdentityTransitionContract | None = None,
 ) -> HoldingFeaturesV3:
     """Build refreshed holding features from facts observable by ``session``."""
     symbol, active_symbols, validated_rs = _validated_context(
-        bundle, symbol, session, rs_snapshot, require_active=False
+        bundle, symbol, session, rs_snapshot, require_active=False,
+        allow_schema_v2_development=allow_schema_v2_development,
+        identity_transition_contract=identity_transition_contract,
     )
     assignment_symbols = active_symbols.union((symbol,))
     assignments = load_pit_industry_assignments_as_of(
         bundle,
         session=session,
         symbols=assignment_symbols,
+        allow_schema_v2_development=allow_schema_v2_development,
     )
     groups = {ticker: assignment.group_id for ticker, assignment in assignments.items()}
     target_group = groups.get(symbol)
@@ -179,10 +187,17 @@ def _validated_context(
     rs_snapshot: Mapping[str, float],
     *,
     require_active: bool,
+    allow_schema_v2_development: bool = False,
+    identity_transition_contract: PriceIdentityTransitionContract | None = None,
 ) -> tuple[str, frozenset[str], Mapping[str, float]]:
     if type(session) is not date:
         raise ValueError("feature session must be a date")
-    if bundle.metadata.get("schema_version") != "3":
+    if type(allow_schema_v2_development) is not bool:
+        raise ValueError("feature development flag must be a bool")
+    schema_version = bundle.metadata.get("schema_version")
+    if schema_version != "3" and not (
+        allow_schema_v2_development and schema_version == "2"
+    ):
         raise ValueError("V3 features require a schema-V3 PIT bundle")
     if session > bundle.data_cutoff.date():
         raise ValueError("feature session exceeds the authenticated bundle cutoff")
@@ -200,15 +215,31 @@ def _validated_context(
     if require_active and symbol not in active_symbols:
         raise ValueError("entry feature symbol is not active in the PIT union")
     if not require_active:
-        lineage_id = bundle.security_lineage_id(symbol)
-        resolved_symbol = bundle.membership_v3.ticker_for_lineage_at(
-            lineage_id, session
-        )
+        if schema_version == "2":
+            if (
+                type(identity_transition_contract) is not PriceIdentityTransitionContract
+                or identity_transition_contract.prices_provenance_sha256
+                != bundle.metadata["prices_provenance_sha256"]
+                or identity_transition_contract.request_contracts_sha256
+                != bundle.metadata["price_identity_request_contracts_sha256"]
+            ):
+                raise ValueError("development holding features require the authenticated identity transition contract")
+            resolved_symbol = identity_transition_contract.resolve_open_holding(symbol, session)
+        else:
+            lineage_id = bundle.security_lineage_id(symbol)
+            resolved_symbol = bundle.membership_v3.ticker_for_lineage_at(
+                lineage_id, session
+            )
         if resolved_symbol != symbol:
             raise ValueError(
                 "holding feature symbol is not the active authenticated price identity"
             )
-    validated_rs = finite_rs_snapshot(rs_snapshot, required_symbols=active_symbols)
+    # Legacy membership can include a ticker before its admitted price history
+    # is available (for example BBWI in early 2021). Preserve the causal engine's
+    # omissions; holding RS stays None and no industry mean is computed in V2.
+    validated_rs = finite_rs_snapshot(
+        rs_snapshot, required_symbols=() if schema_version == "2" else active_symbols
+    )
     return symbol, active_symbols, validated_rs
 
 

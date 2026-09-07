@@ -57,6 +57,7 @@ class PanelExecutionRequestV5:
     worker_startup_timeout_seconds: int
     output_limit_bytes: int
     baseline_capture_inputs_ref: ArtifactRefV5 | None = None
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
 
     def __post_init__(self) -> None:
         if (
@@ -71,6 +72,13 @@ class PanelExecutionRequestV5:
         ):
             raise ValueError("panel execution request schema is invalid")
         _digest(self.request_sha256, "panel request SHA-256")
+        if self.pit_data_scope not in {"production", "development_sp500_v2"}:
+            raise ValueError("panel execution PIT data scope is invalid")
+        if self.pit_data_scope == "development_sp500_v2" and (
+            self.baseline_capture_inputs_ref is not None
+            or self.panel.purpose not in {"quick", "discovery"}
+        ):
+            raise ValueError("development data cannot authorize baseline capture or held-out evaluation")
         validate_episode_plan_panel_v5(self.episode, self.panel)
         if self.episode.purpose != self.panel.purpose:
             raise ValueError("panel execution purpose differs from its authenticated panel")

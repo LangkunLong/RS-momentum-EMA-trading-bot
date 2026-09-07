@@ -57,6 +57,7 @@ class _SimulatorPolicy(Protocol):
     _strategy_was_injected: bool
     _owned_builtin_strategy: object
     pit_bundle: object
+    pit_data_scope: object
     strategy: object
 
 
@@ -189,9 +190,14 @@ def _owned_builtin_provider_mode(simulator: _SimulatorPolicy) -> str:
 def _causal_invariant_fields(
     simulator: _SimulatorPolicy,
 ) -> dict[str, dict[str, object]]:
-    del simulator
     invariant = PolicyClassification.CAUSAL_INVARIANT
     return {
+        "pit_data_scope": _field(
+            simulator.pit_data_scope,
+            invariant,
+            "core.backtest_engine.PortfolioSimulator.pit_data_scope",
+            optimizer_candidate=False,
+        ),
         "technical_fact_cutoff": _field(
             "completed_session_only",
             invariant,

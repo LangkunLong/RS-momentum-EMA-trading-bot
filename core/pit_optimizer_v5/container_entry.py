@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 from types import SimpleNamespace
@@ -202,6 +203,7 @@ def _validate_cli_authority(
 
 
 def main(argv: tuple[str, ...] | None = None) -> int:
+    stage = "request"
     try:
         arguments = _parser().parse_args(argv)
         raw_input = _read_input()
@@ -209,10 +211,12 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         _validate_cli_authority(arguments, raw_input=raw_input, request=request)
         from .image_manifest import verify_installed_evaluator_source_v5
 
+        stage = "image authentication"
         verify_installed_evaluator_source_v5(
             source_root=Path(__file__).resolve().parents[2],
             expected_sha256=request.sandbox_profile.runtime_source_sha256,
         )
+        stage = "policy authentication"
         source = read_policy_source_v5()
         policy_revision = derive_policy_revision_identity_v5(
             source_bundle=source,
@@ -225,6 +229,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         )
         if policy_revision != request.policy_revision:
             raise ValueError("panel policy source differs from request authority")
+        stage = "bundle authentication"
         with PITDataBundle(
             _BUNDLE_PATH,
             expected_sha256=request.evaluator_contract.pit_bundle_sha256,
@@ -232,6 +237,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         ) as bundle:
             if request.baseline_capture_inputs_ref is not None and bundle.metadata.get("schema_version") != "3":
                 raise ValueError("baseline requires a schema-V3 three-universe bundle")
+            stage = "evaluator authentication"
             evaluator = PitPanelEvaluatorV5(
                 contract=request.evaluator_contract,
                 sandbox_profile=request.sandbox_profile,
@@ -246,7 +252,9 @@ def main(argv: tuple[str, ...] | None = None) -> int:
                 prices_provenance=_PROVENANCE_PATH,
                 report_builder=summarize_panel_result,
                 candidate_policy_authority=policy_revision,
+                pit_data_scope=request.pit_data_scope,
             )
+            stage = "panel simulation"
             evaluation = evaluator.evaluate_candidate(
                 candidate_root=_POLICY_ROOT.resolve(strict=True),
                 panel=request.panel,
@@ -257,13 +265,33 @@ def main(argv: tuple[str, ...] | None = None) -> int:
                 ),
                 scenario_ids=request.scenario_ids,
             )
+        stage = "output authentication"
         output = panel_execution_output_bytes_v5(
             request=request,
             evaluation=evaluation,
         )
         _write_output(content=output, maximum_bytes=request.output_limit_bytes)
         return 0
-    except BaseException:
+    except BaseException as exc:
+        # Bound and sanitize the integration diagnostic; never print locals,
+        # environment variables, source lines, or a policy worker transcript.
+        message = " ".join(str(exc).split())[:2048]
+        message = re.sub(r"https?://\S+", "[redacted URL]", message)
+        message = re.sub(
+            r"(?i)\b(api[_-]?key|token|password|secret|authorization)\b"
+            r"\s*[=:]\s*\S+",
+            r"\1=[redacted]",
+            message,
+        )
+        location = ""
+        trace = exc.__traceback__
+        while trace is not None:
+            location = f"{Path(trace.tb_frame.f_code.co_filename).name}:{trace.tb_lineno}"
+            trace = trace.tb_next
+        print(
+            f"PIT panel failed at {stage} ({location}): {type(exc).__name__}: {message}",
+            file=sys.stderr,
+        )
         return 3
 
 

@@ -38,6 +38,7 @@ def load_pit_industry_assignments_as_of(
     *,
     session: date,
     symbols: Iterable[str],
+    allow_schema_v2_development: bool = False,
 ) -> Mapping[str, PITIndustryAssignment]:
     """Return each requested symbol's latest authenticated classification.
 
@@ -47,9 +48,11 @@ def load_pit_industry_assignments_as_of(
     never consults the current provider/cache used by :func:`load_industry_map`.
 
     Args:
-        bundle: Open, authenticated, query-only schema-V3 PIT bundle.
+        bundle: Open, authenticated, query-only PIT bundle.
         session: Completed session whose public information set is requested.
         symbols: Canonical active-union symbols (plus an optional held symbol).
+        allow_schema_v2_development: Explicitly permit schema-V2 development
+            data, which has no dated classifications and returns no assignments.
 
     Returns:
         Mapping from symbols with an available assignment to immutable records.
@@ -59,10 +62,21 @@ def load_pit_industry_assignments_as_of(
     """
     if type(session) is not date:
         raise ValueError("industry as-of session must be a date")
-    if bundle.metadata.get("schema_version") != "3":
+    if type(allow_schema_v2_development) is not bool:
+        raise ValueError("PIT industry development flag must be a bool")
+    schema_version = bundle.metadata.get("schema_version")
+    if schema_version != "3" and not (
+        allow_schema_v2_development and schema_version == "2"
+    ):
         raise ValueError("PIT industry assignments require a schema-V3 bundle")
 
     requested = frozenset(_pit_symbol(symbol) for symbol in symbols)
+    if schema_version == "2":
+        if session > date.fromisoformat(bundle.metadata["data_cutoff"]):
+            raise ValueError("industry session exceeds the authenticated bundle cutoff")
+        # Schema V2 has no authenticated dated classifications. Keep missing
+        # facts missing so portfolio exposure remains explicitly unclassified.
+        return MappingProxyType({})
     if not requested:
         return MappingProxyType({})
 

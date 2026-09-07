@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from core.backtest_engine import PortfolioSimulator, SimulationResultV5
 from core.backtest_fills import ExecutionProfileV5, FrictionScenario
@@ -321,7 +321,12 @@ class PitPanelEvaluatorV5:
         candidate_policy_authority: PolicyRevisionIdentityV5 | None = None,
         baseline_worker_factory: BaselineWorkerFactoryV5 | None = None,
         simulator_factory: SimulatorFactoryV5 = PortfolioSimulator,
+        pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
     ) -> None:
+        if pit_data_scope not in {"production", "development_sp500_v2"}:
+            raise ValueError("evaluator PIT data scope is invalid")
+        if pit_data_scope == "development_sp500_v2" and baseline_policy_revision is not None:
+            raise ValueError("development data cannot authorize baseline evaluation")
         if type(contract) is not EvaluatorContractV5:
             raise ValueError("evaluator contract must use schema V5")
         if type(sandbox_profile) is not SandboxProfileV5:
@@ -384,6 +389,11 @@ class PitPanelEvaluatorV5:
         metadata = getattr(pit_bundle, "metadata", None)
         if not isinstance(metadata, Mapping):
             raise ValueError("PIT bundle metadata is unavailable")
+        expected_schema = "2" if pit_data_scope == "development_sp500_v2" else "3"
+        if metadata.get("schema_version") != expected_schema:
+            raise ValueError(
+                f"{pit_data_scope} evaluation requires a schema-V{expected_schema} PIT bundle"
+            )
         warmup_start = metadata.get("warmup_start")
         if type(warmup_start) is not str:
             raise ValueError("PIT bundle warmup start is unavailable")
@@ -393,6 +403,7 @@ class PitPanelEvaluatorV5:
             raise ValueError("PIT bundle warmup start is invalid") from exc
 
         self._contract = contract
+        self._pit_data_scope = pit_data_scope
         self._sandbox_profile = sandbox_profile
         self._execution_profile = execution_profile
         self._pit_bundle = pit_bundle
@@ -473,6 +484,8 @@ class PitPanelEvaluatorV5:
     ) -> PanelEvaluationV5:
         if type(panel) is not EvaluationPanelSpec:
             raise ValueError("evaluation panel must use the authenticated panel schema")
+        if self._pit_data_scope == "development_sp500_v2" and panel.purpose not in {"quick", "discovery"}:
+            raise ValueError("development data cannot authorize held-out evaluation")
         if type(policy_revision) is not PolicyRevisionIdentityV5:
             raise ValueError("evaluation policy revision must use the V5 identity schema")
         if (
@@ -532,6 +545,7 @@ class PitPanelEvaluatorV5:
                 policy_client_factory=single_worker,
                 execution_profile=self._execution_profile,
                 friction_scenario=scenario,
+                pit_data_scope=self._pit_data_scope,
             )
             if not callable(getattr(simulator, "run", None)):
                 raise TypeError("V5 simulator factory returned an invalid simulator")
@@ -611,6 +625,7 @@ class PitPanelEvaluatorV5:
         if not isinstance(config, Mapping):
             raise ValueError("V5 result configuration is absent")
         expected = {
+            "pit_data_scope": self._pit_data_scope,
             "pit_bundle_sha256": self._contract.pit_bundle_sha256,
             "execution_profile_sha256": self._contract.execution_profile_sha256,
             "friction_scenario": _scenario_primitive(scenario),

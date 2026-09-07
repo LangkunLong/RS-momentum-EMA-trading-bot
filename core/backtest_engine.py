@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -2161,7 +2161,17 @@ class PortfolioSimulator:
         policy_client_factory: StrategyPolicyClientFactory | None = None,
         execution_profile: ExecutionProfileV5 | None = None,
         friction_scenario: FrictionScenario | None = None,
+        pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
     ) -> None:
+        if pit_data_scope not in {"production", "development_sp500_v2"}:
+            raise ValueError("simulator PIT data scope is invalid")
+        if pit_data_scope == "development_sp500_v2" and (
+            execution_profile is None
+            or pit_bundle is None
+            or pit_bundle.metadata.get("schema_version") != "2"
+            or type(identity_transition_contract) is not PriceIdentityTransitionContract
+        ):
+            raise ValueError("development scope requires V5 execution and authenticated schema-V2 PIT data")
         if (execution_profile is None) != (friction_scenario is None):
             raise ValueError(
                 "execution_profile and friction_scenario must be supplied together"
@@ -2220,6 +2230,7 @@ class PortfolioSimulator:
         self.cash_deployment_threshold_pct = cash_deployment_threshold_pct
         self.technical_only = technical_only
         self.pit_bundle = pit_bundle
+        self.pit_data_scope = pit_data_scope
         self.execution_profile = execution_profile
         self.friction_scenario = friction_scenario
         self.execution_profile_sha256 = (
@@ -2449,10 +2460,12 @@ class PortfolioSimulator:
             if client.interface_version == POLICY_INTERFACE_VERSION_V3 and (
                 not self._v5_enabled
                 or self.pit_bundle is None
-                or self.pit_bundle.metadata.get("schema_version") != "3"
+                or self.pit_bundle.metadata.get("schema_version") != (
+                    "2" if self.pit_data_scope == "development_sp500_v2" else "3"
+                )
             ):
                 raise ValueError(
-                    "policy interface V3 requires V5 execution and a schema-V3 PIT bundle"
+                    "policy interface V3 requires V5 execution and a PIT bundle matching its explicit data scope"
                 )
             return self._run_with_policy_client_active(
                 tickers,
@@ -3572,6 +3585,7 @@ class PortfolioSimulator:
             "technical_only": self.technical_only,
             "data_mode": "point_in_time" if self.pit_bundle is not None else "provider_cache",
             "pit_bundle_sha256": self.pit_bundle.sha256 if self.pit_bundle is not None else None,
+            "pit_data_scope": self.pit_data_scope,
             "pit_data_cutoff": str(self.pit_bundle.data_cutoff.date()) if self.pit_bundle is not None else None,
             "pit_manifest": self.pit_bundle.manifest() if self.pit_bundle is not None else None,
             "take_profit_pct": self.take_profit_pct,
@@ -3841,6 +3855,7 @@ class PortfolioSimulator:
             raise ValueError("V3 entry features require a PIT bundle")
         return build_entry_features_v3(
             bundle=self.pit_bundle,
+            allow_schema_v2_development=self.pit_data_scope == "development_sp500_v2",
             symbol=symbol,
             session=session.date(),
             price_history=history.loc[:session],
@@ -3862,6 +3877,8 @@ class PortfolioSimulator:
             raise ValueError("V3 holding features require a PIT bundle")
         return build_holding_features_v3(
             bundle=self.pit_bundle,
+            allow_schema_v2_development=self.pit_data_scope == "development_sp500_v2",
+            identity_transition_contract=self.identity_transition_contract,
             symbol=symbol,
             session=session.date(),
             price_history=history.loc[:session],
@@ -3882,6 +3899,7 @@ class PortfolioSimulator:
             self.pit_bundle,
             session=session.date(),
             symbols=self._open_positions,
+            allow_schema_v2_development=self.pit_data_scope == "development_sp500_v2",
         )
         notionals: list[float] = []
         risks: list[float] = []
