@@ -61,6 +61,13 @@
   do not create a real readiness record, inspect qualification content, render a runnable replay
   command, start Docker, or request replay approval. Cost if wrong: source readiness may precede
   real-outcome compatibility, which must be reauthenticated before any later full-replay decision.
+- Ruling: source audit found the evaluator-truth plan's baseline-authority Task 6 was never landed,
+  despite campaign manifests requiring its downstream authority. Implement those source contracts and
+  strict CLI commands provider-free before restoring market artifacts; `capture-baseline` remains
+  unavailable for real use until the authenticated bundle/panel/profiles exist, while sandbox-profile
+  source composition must not build or inspect Docker in this source-first stage. Cost if wrong: the
+  campaign would reach an artifact bundle only to discover it cannot create the required baseline
+  authority, so real discovery must stay blocked until this gap is source-complete and reviewed.
 
 ## Pre-flight dependency and conflict scan
 
@@ -162,3 +169,32 @@
   executable and source TOCTOU, and output refusal. No tests, real artifacts, providers, Docker,
   market data, or replay ran. A real readiness record remains blocked on a valid retired
   qualification outcome, the V5 bundle, and the separately required replay decision.
+- Continuation prerequisite audit: all 48 non-test Python source deliverables named by the four V5
+  plans exist, and all 60 commit references in their ledgers are ancestors of the current branch.
+  Source stages previously recorded complete were not redispatched. Python 3.13 in-memory compilation
+  of those 48 modules and the focused source diff check passed after repair commit `5cb81b7`.
+- Runtime prerequisite status confirmed by the user and exact-path existence checks: all twelve
+  required V5 input files and the authenticated evaluator sandbox profile remain absent. The user
+  already inspected 34 checkout roots; older partial prices/fundamentals are not authenticated V5
+  inputs, and no matching three-universe membership/provenance or industry/provenance set was found.
+  Docker's engine is user-reported unreachable. No broad data search, content access, Docker
+  inspection, fetch, synthesis, or artifact restoration was performed during this source repair.
+  Runtime progress requires deliberate trusted-source acquisition/import or adaptation, provenance
+  sealing, bundle build/verification, and immutable evaluator image/profile preparation. Discovery
+  adapter composition and exact-manifest approval remain later Task 4 work.
+- Evaluator-truth Task 6: fix round 1/5 (2 addressed, 0 open; commits `3b5666e..5cb81b7`).
+  Independent reviewer approved spec compliance and task quality with no Critical, Important, or
+  Minor findings. The consequential Windows path/descriptor timestamp pin repair was reviewed in
+  the same diff; complete metadata checks and explicit device/inode binding remain enforced.
+- Evaluator-truth Task 6: source implementation complete (commits `5dc4784..5cb81b7`, review clean).
+  Baseline graph/profile/verification/panel paths now use exact no-relocation authentication. Each
+  sandbox invocation mounts owned canonical LF policy bytes under retained Windows pins and cleans
+  up truthfully across terminal failures. Direct synthetic checks covered missing JSON/raw-panel
+  edges with zero scans/unrelated reads, the real CRLF source guard, all four canonical mounted
+  files, actual write/delete denial, seven transport/cleanup cases, and metadata/content tampering.
+  Python 3.13 compile/import, targeted Ruff, CLI help, diff checks, and all applicable normal commit
+  hooks passed; no hook bypass was needed. Owned scratch is absent, and no tests, real artifacts,
+  providers, Docker, market-data evaluation, confirmation, qualification, or replay were used.
+  The repair report/review and prerequisite audits remain in this plan's local workspace. Actual
+  baseline capture and deterministic-repeat/runtime evidence remain blocked on the required local
+  inputs and image; this source completion establishes no production run or return improvement.
