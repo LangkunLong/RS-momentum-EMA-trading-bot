@@ -425,7 +425,9 @@ class PITDataBundle:
                     else self._price_symbols.union(self._tradable_symbols)
                 )
             self._validate_integrity()
-            self._fundamentals_provider_cache: dict[str, _FundamentalsProviderState] = {}
+            self._fundamentals_provider_cache: dict[
+                tuple[str, bool], _FundamentalsProviderState
+            ] = {}
         except Exception:
             self._connection.close()
             raise
@@ -1380,6 +1382,8 @@ class PITDataBundle:
         self,
         ticker: str,
         as_of: date,
+        *,
+        include_provenance: bool,
     ) -> _FundamentalsProviderState:
         """Load one ticker's immutable history for chronological provider use."""
 
@@ -1387,7 +1391,8 @@ class PITDataBundle:
         if cache is None:
             cache = {}
             self._fundamentals_provider_cache = cache
-        state = cache.get(ticker)
+        cache_key = (ticker, include_provenance)
+        state = cache.get(cache_key)
         if state is not None:
             return state
 
@@ -1413,13 +1418,39 @@ class PITDataBundle:
             boundaries=boundaries,
             next_boundary_index=0,
             visible_records=[],
-            snapshot=self._fundamental_snapshot([], include_provenance=False),
+            snapshot=self._fundamental_snapshot(
+                [], include_provenance=include_provenance
+            ),
             latest_as_of=as_of,
         )
-        cache[ticker] = state
+        cache[cache_key] = state
         return state
 
-    def fundamentals_provider(self, symbol: str, as_of_date: pd.Timestamp) -> dict[str, Any]:
+    @staticmethod
+    def _copy_fundamental_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Return an isolated view of a cached provenance-bearing snapshot."""
+
+        result: dict[str, Any] = {}
+        for key, value in snapshot.items():
+            if isinstance(value, pd.DataFrame):
+                frame = value.copy(deep=True)
+                public_dates = value.attrs.get(PIT_PUBLIC_DATES_ATTR)
+                if public_dates is not None:
+                    frame.attrs[PIT_PUBLIC_DATES_ATTR] = dict(public_dates)
+                result[key] = frame
+            elif isinstance(value, dict):
+                result[key] = dict(value)
+            else:
+                result[key] = value
+        return result
+
+    def fundamentals_provider(
+        self,
+        symbol: str,
+        as_of_date: pd.Timestamp,
+        *,
+        include_provenance: bool = False,
+    ) -> dict[str, Any]:
         """Return strict as-of facts while reusing forward-only ticker state.
 
         A portfolio evaluates a ticker in chronological order far more often than
@@ -1434,9 +1465,17 @@ class PITDataBundle:
         if timestamp > self.data_cutoff:
             raise ValueError("requested fundamental date exceeds point-in-time bundle cutoff")
         as_of = timestamp.date()
-        state = self._fundamentals_provider_state(ticker, as_of)
+        state = self._fundamentals_provider_state(
+            ticker,
+            as_of,
+            include_provenance=include_provenance,
+        )
         if as_of < state.latest_as_of:
-            return self.fundamentals_as_of(ticker, as_of_date)
+            return self.fundamentals_as_of(
+                ticker,
+                as_of_date,
+                include_provenance=include_provenance,
+            )
 
         cutoff = as_of.isoformat()
         candidate_records = list(state.visible_records)
@@ -1452,10 +1491,12 @@ class PITDataBundle:
             candidate_next_boundary_index += 1
         if candidate_next_boundary_index != state.next_boundary_index:
             candidate_snapshot = self._fundamental_snapshot(
-                candidate_records, include_provenance=False
+                candidate_records, include_provenance=include_provenance
             )
             state.visible_records = candidate_records
             state.next_boundary_index = candidate_next_boundary_index
             state.snapshot = candidate_snapshot
         state.latest_as_of = as_of
+        if include_provenance:
+            return self._copy_fundamental_snapshot(state.snapshot)
         return state.snapshot

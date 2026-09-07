@@ -108,7 +108,7 @@ def build_entry_features_v3(
     )
 
     history = _validated_price_history(price_history, session)
-    fundamentals = bundle.fundamentals_as_of(
+    fundamentals = bundle.fundamentals_provider(
         symbol,
         pd.Timestamp(session),
         include_provenance=True,
