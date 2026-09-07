@@ -1254,8 +1254,28 @@ def build_parser_v5() -> argparse.ArgumentParser:
                 "identity-transition",
                 "resources",
             ):
-                command.add_argument(f"--{prefix}-path", required=True)
-                command.add_argument(f"--{prefix}-sha256", required=True)
+                required = prefix not in {
+                    "evaluator-contract",
+                    "baseline-policy-revision",
+                    "source-bundle",
+                    "policy-scope",
+                }
+                command.add_argument(f"--{prefix}-path", required=required)
+                command.add_argument(f"--{prefix}-sha256", required=required)
+            command.add_argument("--compose-source", action="store_true")
+            command.add_argument("--source-commit")
+            command.add_argument("--immutable-constraints-path")
+            command.add_argument("--immutable-constraints-sha256")
+            command.add_argument("--source-bundle-output-path")
+            command.add_argument("--policy-revision-output-path")
+            command.add_argument("--policy-scope-output-path")
+            command.add_argument("--evaluator-contract-output-path")
+            command.add_argument("--source-root", required=True)
+            command.add_argument("--scratch-root", required=True)
+            command.add_argument("--git-executable", required=True)
+            command.add_argument("--git-sha256")
+            command.add_argument("--docker-executable", required=True)
+            command.add_argument("--docker-sha256")
         if name == "build-sandbox-profile":
             command.add_argument("--image-name", required=True)
             command.add_argument(
@@ -1774,31 +1794,94 @@ def dispatch_baseline_cli_v5(
                         worker_factory=selected_factory,
                     )
             elif args.command == "prepare-baseline-inputs":
-                from core.pit_optimizer_v5.baseline_preparation import prepare_baseline_inputs_v5
+                from core.pit_optimizer_v5.baseline_preparation import (
+                    prepare_baseline_inputs_v5,
+                    prepare_composed_baseline_inputs_v5,
+                )
 
-                prepared = prepare_baseline_inputs_v5(
-                    repository=repository,
-                    output_path=args.output_path,
-                    evaluator_contract_ref=ArtifactRefV5(args.evaluator_contract_path, args.evaluator_contract_sha256),
-                    execution_profile_ref=ArtifactRefV5(args.execution_profile_path, args.execution_profile_sha256),
-                    sandbox_profile_ref=ArtifactRefV5(args.sandbox_profile_path, args.sandbox_profile_sha256),
-                    panel_plan_ref=ArtifactRefV5(args.panel_plan_path, args.panel_plan_sha256),
-                    baseline_policy_revision_ref=ArtifactRefV5(
-                        args.baseline_policy_revision_path, args.baseline_policy_revision_sha256
-                    ),
-                    source_bundle_ref=ArtifactRefV5(args.source_bundle_path, args.source_bundle_sha256),
-                    policy_scope_ref=ArtifactRefV5(args.policy_scope_path, args.policy_scope_sha256),
-                    evaluator_source_ref=ArtifactRefV5(args.evaluator_source_path, args.evaluator_source_sha256),
-                    identity_transition_ref=ArtifactRefV5(
+                common = {
+                    "repository": repository,
+                    "output_path": args.output_path,
+                    "execution_profile_ref": ArtifactRefV5(args.execution_profile_path, args.execution_profile_sha256),
+                    "sandbox_profile_ref": ArtifactRefV5(args.sandbox_profile_path, args.sandbox_profile_sha256),
+                    "panel_plan_ref": ArtifactRefV5(args.panel_plan_path, args.panel_plan_sha256),
+                    "evaluator_source_ref": ArtifactRefV5(args.evaluator_source_path, args.evaluator_source_sha256),
+                    "identity_transition_ref": ArtifactRefV5(
                         args.identity_transition_path, args.identity_transition_sha256
                     ),
-                    resources_ref=ArtifactRefV5(args.resources_path, args.resources_sha256),
-                )
+                    "resources_ref": ArtifactRefV5(args.resources_path, args.resources_sha256),
+                    "source_root": args.source_root,
+                    "scratch_root": args.scratch_root,
+                    "git_executable": args.git_executable,
+                    "git_sha256": args.git_sha256,
+                    "docker_executable": args.docker_executable,
+                    "docker_sha256": args.docker_sha256,
+                }
+                if args.compose_source:
+                    required_values = (
+                        args.source_commit,
+                        args.immutable_constraints_path,
+                        args.immutable_constraints_sha256,
+                        args.source_bundle_output_path,
+                        args.policy_revision_output_path,
+                        args.policy_scope_output_path,
+                        args.evaluator_contract_output_path,
+                    )
+                    explicit_values = (
+                        args.evaluator_contract_path,
+                        args.evaluator_contract_sha256,
+                        args.baseline_policy_revision_path,
+                        args.baseline_policy_revision_sha256,
+                        args.source_bundle_path,
+                        args.source_bundle_sha256,
+                        args.policy_scope_path,
+                        args.policy_scope_sha256,
+                    )
+                    if any(value is None for value in required_values) or any(
+                        value is not None for value in explicit_values
+                    ):
+                        raise ValueError("composed baseline inputs are incomplete or mixed with explicit source refs")
+                    prepared = prepare_composed_baseline_inputs_v5(
+                        **common,
+                        source_commit=args.source_commit,
+                        immutable_constraints_ref=ArtifactRefV5(
+                            args.immutable_constraints_path, args.immutable_constraints_sha256
+                        ),
+                        source_bundle_output_path=args.source_bundle_output_path,
+                        policy_revision_output_path=args.policy_revision_output_path,
+                        policy_scope_output_path=args.policy_scope_output_path,
+                        evaluator_contract_output_path=args.evaluator_contract_output_path,
+                    )
+                else:
+                    values = (
+                        args.evaluator_contract_path,
+                        args.evaluator_contract_sha256,
+                        args.baseline_policy_revision_path,
+                        args.baseline_policy_revision_sha256,
+                        args.source_bundle_path,
+                        args.source_bundle_sha256,
+                        args.policy_scope_path,
+                        args.policy_scope_sha256,
+                    )
+                    if any(value is None for value in values):
+                        raise ValueError("explicit baseline inputs are incomplete")
+                    prepared = prepare_baseline_inputs_v5(
+                        **common,
+                        evaluator_contract_ref=ArtifactRefV5(
+                            args.evaluator_contract_path, args.evaluator_contract_sha256
+                        ),
+                        baseline_policy_revision_ref=ArtifactRefV5(
+                            args.baseline_policy_revision_path, args.baseline_policy_revision_sha256
+                        ),
+                        source_bundle_ref=ArtifactRefV5(args.source_bundle_path, args.source_bundle_sha256),
+                        policy_scope_ref=ArtifactRefV5(args.policy_scope_path, args.policy_scope_sha256),
+                    )
                 payload = {
                     "schema_version": 5,
                     "status": "created",
                     "artifact_ref": prepared.inputs_ref,
                     "capture_argv": prepared.capture_argv,
+                    "powershell_command": prepared.powershell_command,
                     "provider_calls": 0,
                     "evaluation_performed": False,
                 }
