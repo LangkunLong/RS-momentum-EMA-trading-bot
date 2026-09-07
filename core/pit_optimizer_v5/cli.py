@@ -107,6 +107,7 @@ _BASELINE_COMMANDS = frozenset(
     {
         "write-execution-profile",
         "build-sandbox-profile",
+        "prepare-baseline-inputs",
         "capture-baseline",
         "verify-baseline",
     }
@@ -1240,6 +1241,21 @@ def build_parser_v5() -> argparse.ArgumentParser:
                 "docker-sha256",
             ):
                 command.add_argument(f"--{option}", required=True)
+        if name == "prepare-baseline-inputs":
+            for prefix in (
+                "evaluator-contract",
+                "execution-profile",
+                "sandbox-profile",
+                "panel-plan",
+                "baseline-policy-revision",
+                "source-bundle",
+                "policy-scope",
+                "evaluator-source",
+                "identity-transition",
+                "resources",
+            ):
+                command.add_argument(f"--{prefix}-path", required=True)
+                command.add_argument(f"--{prefix}-sha256", required=True)
         if name == "build-sandbox-profile":
             command.add_argument("--image-name", required=True)
             command.add_argument(
@@ -1757,6 +1773,36 @@ def dispatch_baseline_cli_v5(
                         output_path=args.output_path,
                         worker_factory=selected_factory,
                     )
+            elif args.command == "prepare-baseline-inputs":
+                from core.pit_optimizer_v5.baseline_preparation import prepare_baseline_inputs_v5
+
+                prepared = prepare_baseline_inputs_v5(
+                    repository=repository,
+                    output_path=args.output_path,
+                    evaluator_contract_ref=ArtifactRefV5(args.evaluator_contract_path, args.evaluator_contract_sha256),
+                    execution_profile_ref=ArtifactRefV5(args.execution_profile_path, args.execution_profile_sha256),
+                    sandbox_profile_ref=ArtifactRefV5(args.sandbox_profile_path, args.sandbox_profile_sha256),
+                    panel_plan_ref=ArtifactRefV5(args.panel_plan_path, args.panel_plan_sha256),
+                    baseline_policy_revision_ref=ArtifactRefV5(
+                        args.baseline_policy_revision_path, args.baseline_policy_revision_sha256
+                    ),
+                    source_bundle_ref=ArtifactRefV5(args.source_bundle_path, args.source_bundle_sha256),
+                    policy_scope_ref=ArtifactRefV5(args.policy_scope_path, args.policy_scope_sha256),
+                    evaluator_source_ref=ArtifactRefV5(args.evaluator_source_path, args.evaluator_source_sha256),
+                    identity_transition_ref=ArtifactRefV5(
+                        args.identity_transition_path, args.identity_transition_sha256
+                    ),
+                    resources_ref=ArtifactRefV5(args.resources_path, args.resources_sha256),
+                )
+                payload = {
+                    "schema_version": 5,
+                    "status": "created",
+                    "artifact_ref": prepared.inputs_ref,
+                    "capture_argv": prepared.capture_argv,
+                    "provider_calls": 0,
+                    "evaluation_performed": False,
+                }
+                ref = None
             elif args.command == "write-execution-profile":
                 ref = write_execution_profile_v5(repository=repository, output_path=args.output_path)
             else:
@@ -1768,7 +1814,8 @@ def dispatch_baseline_cli_v5(
                     image_digest=args.image_digest,
                     output_path=args.output_path,
                 )
-            payload = {"schema_version": 5, "status": "created", "artifact_ref": ref}
+            if args.command != "prepare-baseline-inputs":
+                payload = {"schema_version": 5, "status": "created", "artifact_ref": ref}
         exit_code = 0
     except Exception:
         # Includes bounded process timeouts and malformed graph metadata; do

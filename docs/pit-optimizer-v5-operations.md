@@ -10,7 +10,50 @@ The source, workspace, data, output, and control directories must already exist 
 
 Preparation checks the clean source commit and policy bytes, hashes the two data files without querying market or held-out domains, and constructs the actual production adapters to capture their identities. It does not start Docker or check daemon/image readiness. Before execution, make the manifest-pinned image available locally and configure `OPENROUTER_API_KEY` in the launch environment. The runtime uses the pinned image with pulling disabled.
 
-If no real manifest exists yet, first complete the upstream data, panel, and baseline work. `capture-baseline` already accepts `--capture-inputs-path` and `--capture-inputs-sha256`, but there is currently no `prepare-baseline-inputs` CLI builder. Its existing `BaselineCaptureInputsV5` must reference the real evaluator contract, execution profile, sandbox profile, discovery panel plan, baseline policy revision, source bundle, policy scope, evaluator source, identity transitions, and resource capabilities. Persist and authenticate those inputs, run the existing baseline capture/verification, and then use `build-manifest`. A provisional single-panel evaluation does not establish the full baseline or discovery campaign authority.
+If no real manifest exists yet, first complete the upstream data and panel work. The baseline input descriptor must reference the real evaluator contract, execution profile, sandbox profile, discovery panel plan, baseline policy revision, source bundle, policy scope, evaluator source, identity transitions, and resource capabilities. `prepare-baseline-inputs` authenticates that complete exact-path graph before publishing the descriptor create-only. It performs no evaluation, Docker action, provider call, directory scan, or held-out panel read. A provisional single-panel evaluation does not establish the full baseline or discovery campaign authority.
+
+## Prepare and capture the baseline
+
+Supply each existing artifact as a path relative to the canonical artifact root plus its SHA-256 digest. The command does not accept unverified identity placeholders. The final V3 PIT bundle, prices provenance, and discovery panels must already be reachable from the supplied discovery panel plan. The source bundle, policy revision, policy scope, evaluator contract, evaluator source map, identity-transition contract, and resource authority also need to have been built and persisted upstream; no safe production builder currently derives those artifacts from the panel plan alone.
+
+```powershell
+Set-Location 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture'
+$python = (Get-Command python.exe).Source
+$artifactRoot = Read-Host 'Absolute artifact repository directory'
+$baselineArgs = @(
+    '--artifact-root', $artifactRoot,
+    '--output-path', 'evaluator/baseline-capture-inputs.json',
+    '--evaluator-contract-path', '<path>', '--evaluator-contract-sha256', '<sha256>',
+    '--execution-profile-path', '<path>', '--execution-profile-sha256', '<sha256>',
+    '--sandbox-profile-path', '<path>', '--sandbox-profile-sha256', '<sha256>',
+    '--panel-plan-path', '<path>', '--panel-plan-sha256', '<sha256>',
+    '--baseline-policy-revision-path', '<path>', '--baseline-policy-revision-sha256', '<sha256>',
+    '--source-bundle-path', '<path>', '--source-bundle-sha256', '<sha256>',
+    '--policy-scope-path', '<path>', '--policy-scope-sha256', '<sha256>',
+    '--evaluator-source-path', '<path>', '--evaluator-source-sha256', '<sha256>',
+    '--identity-transition-path', '<path>', '--identity-transition-sha256', '<sha256>',
+    '--resources-path', '<path>', '--resources-sha256', '<sha256>'
+)
+$preparedLine = & $python -B -m core.pit_optimizer_v5.cli prepare-baseline-inputs @baselineArgs
+if ($LASTEXITCODE -ne 0) { $preparedLine; throw 'Baseline input preparation failed' }
+$prepared = ($preparedLine -replace '^PIT_OPTIMIZER_V5_BASELINE=', '') | ConvertFrom-Json
+
+# Fill the explicit host paths and executable hashes shown as placeholders in
+# $prepared.capture_argv, then run that argv. Equivalently:
+& $python -B -m core.pit_optimizer_v5.cli capture-baseline `
+    --artifact-root $artifactRoot `
+    --capture-inputs-path $prepared.artifact_ref.relative_path `
+    --capture-inputs-sha256 $prepared.artifact_ref.sha256 `
+    --output-path 'evaluator/baseline-authority.json' `
+    --source-root '<absolute-clean-source-root>' `
+    --scratch-root '<absolute-disjoint-scratch-root>' `
+    --trusted-git-executable '<absolute-git-executable>' `
+    --trusted-git-sha256 '<git-sha256>' `
+    --docker-executable '<absolute-docker-executable>' `
+    --docker-sha256 '<docker-sha256>'
+```
+
+Baseline capture requires a clean checkout at the exact source commit named by the policy scope, a disjoint empty scratch root, the locally available digest-pinned evaluator image, and authenticated Git and Docker executable hashes. It runs two fresh network-disabled full-grid evaluations and publishes authority only after byte-identical results and cleanup. Verify the resulting reference with `verify-baseline`, then pass that authority to `build-manifest`.
 
 ## Prepare the local adapter configuration
 
