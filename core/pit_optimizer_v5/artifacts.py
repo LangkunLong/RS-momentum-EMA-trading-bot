@@ -1332,6 +1332,8 @@ class LocalArtifactRepositoryV5:
             manifest.target,
             tuple(sorted(source_authorities, key=lambda item: item.experiment_id)),
             manifest.search.archive_capacity,
+            pit_data_scope=manifest.pit_data_scope,
+            semantic_mode=manifest.semantic_mode,
         )
         state = reduce_experiment_journal_v5(tuple(item.record for item in records), reducer)
         expected_archive = ArchiveSnapshotV5(final_round, references, reducer.to_primitive(state))

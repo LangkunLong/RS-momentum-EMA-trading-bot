@@ -137,8 +137,8 @@ class QuickScreenCandidateV5:
         validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
         if (self.parent_semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
             raise ValueError("quick-screen parent fingerprint differs from semantic mode")
-        if self.semantic_mode == "disabled_development" and self.semantic_fingerprint is not None:
-            raise ValueError("disabled semantics cannot carry a fingerprint")
+        if (self.semantic_fingerprint is None) != (self.semantic_mode == "disabled_development"):
+            raise ValueError("quick-screen fingerprint differs from semantic mode")
         if self.parent_semantic_fingerprint_sha256 is not None:
             _digest(self.parent_semantic_fingerprint_sha256, "quick-screen parent fingerprint")
         if not _assignment_matches_template(self):

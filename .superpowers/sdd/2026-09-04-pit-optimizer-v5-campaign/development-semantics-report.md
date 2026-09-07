@@ -24,3 +24,11 @@ Base: `993f4a96c8b2f4c7d9a779ee711ed9d55d1bd385` (controller-role adapter). This
 ## Remaining dependencies
 
 Independent review and actual real-round verification remain controller-owned. Rebuild the exact evaluator image because `contracts.py` is image-covered, regenerate matching evaluator/sandbox/manifest identities, and obtain four authenticated real gross/base/stress parent windows. Build a fresh disabled development parent/manifest graph and compose the existing feedback runtime with provider-free controller responses, then verify real record/checkpoint/cleanup and next-round recovery. No development composition or evaluator implementation was added here. All apply/qualification/full-replay and paid-accounting constraints remain unchanged. Skipping semantics can repeat behaviorally equivalent real evaluations; it establishes no behavioral novelty.
+
+## Independent review fixes — round 1
+
+The independent review identified one omitted reducer construction and one missing required-mode quick-screen invariant. `LocalArtifactRepositoryV5.verify_finalized_campaign` now supplies the finalized manifest's `pit_data_scope` and `semantic_mode` to `CandidateArchiveReducerV5`, so canonical final archive reconstruction uses the same mode as its records. This corrects the earlier report's overbroad statement that all reducer construction paths were already mode-bound.
+
+`QuickScreenCandidateV5` now requires a candidate semantic fingerprint exactly when semantics are required, and requires None in disabled development. Missing required evidence raises a schema error at construction instead of silently becoming ineligible. Source inspection confirms the runtime constructs these wrappers only for `quick_ready` candidates; invalid and exact-duplicate outcomes do not enter this stricter boundary.
+
+Reviewed the two-file source diff. Scoped Ruff output: `All checks passed!`. In-memory compilation output: `In-memory compile: 2 changed modules passed; no application imports or execution.` Scoped `git diff --check` passed. No tests, probes, application imports, Docker, network/provider calls or agents were used. Controller progress remains excluded. Independent re-review and real integration remain outstanding.
