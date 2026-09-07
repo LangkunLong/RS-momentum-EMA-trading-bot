@@ -348,6 +348,21 @@ def _authenticated_object_v5(artifact: AuthenticatedArtifactV5, label: str) -> d
     return value
 
 
+def _require_explicit_pit_data_scope_v5(
+    artifact: AuthenticatedArtifactV5,
+    *,
+    label: str,
+) -> None:
+    """Diagnose pre-scope authorities without rewriting authenticated bytes."""
+
+    value = _authenticated_object_v5(artifact, label)
+    if "pit_data_scope" not in value:
+        raise ManifestAuthenticationFailureV5(
+            f"{label} predates explicit pit_data_scope; retain the old artifact and rebuild "
+            "the manifest graph with new content-addressed references before typed loading"
+        )
+
+
 def _primitive_artifact_ref_v5(value: object, label: str) -> ArtifactRefV5:
     if type(value) is not dict or set(value) != {"relative_path", "sha256"}:
         raise ValueError(f"{label} reference is invalid")
@@ -482,6 +497,12 @@ def _authenticate_build_dependencies_v5(
         panel_plan_ref=panel_plan_ref,
         sandbox_profile_ref=sandbox_profile_ref,
     )
+    baseline_item = next(
+        item for item in graph.authenticated if item.reference == baseline_authority_ref
+    )
+    if type(baseline_item) is not AuthenticatedArtifactV5:
+        raise ValueError("baseline authority is not authenticated canonical JSON")
+    _require_explicit_pit_data_scope_v5(baseline_item, label="baseline parent authority")
     # Every existing edge is authenticated before the first typed load.  The
     # exact baseline policy edge may be absent only because this command owns
     # its create-only descriptor write.
@@ -682,6 +703,13 @@ def authenticate_campaign_manifest_v5(
         raise ManifestAuthenticationFailureV5(f"campaign artifact graph is {reason}")
 
     # Typed construction is intentionally after complete graph authentication.
+    manifest_item = next(
+        (item for item in graph.authenticated if item.reference == manifest_ref),
+        None,
+    )
+    if type(manifest_item) is not AuthenticatedArtifactV5:
+        raise ManifestAuthenticationFailureV5("campaign manifest is not authenticated canonical JSON")
+    _require_explicit_pit_data_scope_v5(manifest_item, label="campaign manifest")
     manifest = repository.load_typed_artifact(manifest_ref, value_type=CampaignManifestV5)
     execution = repository.load_typed_artifact(
         manifest.execution_profile_ref,
@@ -691,6 +719,13 @@ def authenticate_campaign_manifest_v5(
         manifest.evaluator_contract_ref,
         value_type=EvaluatorContractV5,
     )
+    baseline_item = next(
+        (item for item in graph.authenticated if item.reference == manifest.baseline_authority_ref),
+        None,
+    )
+    if type(baseline_item) is not AuthenticatedArtifactV5:
+        raise ManifestAuthenticationFailureV5("baseline parent authority is not authenticated canonical JSON")
+    _require_explicit_pit_data_scope_v5(baseline_item, label="baseline parent authority")
     baseline = repository.load_typed_artifact(
         manifest.baseline_authority_ref,
         value_type=BaselineParentAuthorityV5,

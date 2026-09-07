@@ -38,7 +38,7 @@ The pre-existing controller-owned `progress.md` modification was not touched or 
 
 ## Identity migration
 
-`pit_data_scope` participates in canonical dataclass serialization, so newly decoded legacy manifests and baseline parents receive the production default but their newly computed canonical identities include that explicit field. Any pre-existing reference whose digest was computed before this field existed must retain its original bytes/reference rather than be silently re-emitted under the old digest. There is no prior real production campaign to migrate.
+`pit_data_scope` participates in canonical dataclass serialization. The dataclass constructor defaults preserve source-call compatibility only; they do not migrate persisted JSON because typed artifact decoding requires exact keys. Pre-scope manifest and parent bytes remain readable and content-authenticatable at their original references, while typed loading now gives an actionable diagnostic requiring an explicitly rebuilt graph with new content-addressed references. Old artifacts must be retained unchanged and must never be silently re-emitted or relabeled under their old digests. There is no prior real production campaign to migrate.
 
 ## Remaining work
 
