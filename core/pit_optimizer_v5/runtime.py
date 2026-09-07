@@ -865,13 +865,21 @@ class _Journal:
 
 
 class _Runtime:
-    def __init__(self, inputs: FeedbackRoundInputV5, dependencies: FeedbackRoundDependenciesV5) -> None:
+    def __init__(
+        self,
+        inputs: FeedbackRoundInputV5,
+        dependencies: FeedbackRoundDependenciesV5,
+        *,
+        campaign_deadline_monotonic: float | None = None,
+    ) -> None:
         self.inputs = inputs
         self.dependencies = dependencies
         started = dependencies.clock.monotonic()
         if type(started) is not float or not math.isfinite(started):
             raise ValueError("runtime clock returned a non-finite monotonic value")
         self.round_deadline = started + inputs.manifest.resources.round_wall_timeout_seconds
+        if campaign_deadline_monotonic is not None:
+            self.round_deadline = min(self.round_deadline, campaign_deadline_monotonic)
         self.journal = _Journal(inputs, dependencies.persistence)
         self.parent: ParentCandidateV5 | None = None
         self.projection: SearchProjectionV5 | None = None
@@ -1016,7 +1024,10 @@ class _Runtime:
             ):
                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
             self.projection = projection
-            self._deadline("recovery", self.inputs.manifest.resources.round_wall_timeout_seconds)
+            # Terminal recovery can only return its durable outcome and clean owned
+            # resources; expiration must not strand cleanup behind a new-work gate.
+            if self.journal.terminal_payload() is None:
+                self._deadline("recovery", self.inputs.manifest.resources.round_wall_timeout_seconds)
         return projection
 
     def _adopt_completed_projection(self, projection: SearchProjectionV5) -> bool:
@@ -2687,11 +2698,17 @@ class _Runtime:
 def run_feedback_round_v5(
     inputs: FeedbackRoundInputV5,
     dependencies: FeedbackRoundDependenciesV5,
+    *,
+    campaign_deadline_monotonic: float | None = None,
 ) -> FeedbackRoundResultV5:
-    """Execute or resume one feedback round without concrete external adapters."""
+    """Execute or resume a round, optionally shortening it to a campaign deadline."""
 
     if type(inputs) is not FeedbackRoundInputV5 or type(dependencies) is not FeedbackRoundDependenciesV5:
         raise ValueError("feedback-round entry requires exact V5 input and dependencies")
+    if campaign_deadline_monotonic is not None and (
+        type(campaign_deadline_monotonic) is not float or not math.isfinite(campaign_deadline_monotonic)
+    ):
+        raise ValueError("campaign deadline must be a finite monotonic value")
     runtime: _Runtime | None = None
 
     def bare_failure(failure: RuntimeFailureV5) -> FeedbackRoundResultV5:
@@ -2735,7 +2752,7 @@ def run_feedback_round_v5(
             )
 
     try:
-        runtime = _Runtime(inputs, dependencies)
+        runtime = _Runtime(inputs, dependencies, campaign_deadline_monotonic=campaign_deadline_monotonic)
         return runtime.run()
     except _RuntimeAbort as abort:
         if runtime is None:
