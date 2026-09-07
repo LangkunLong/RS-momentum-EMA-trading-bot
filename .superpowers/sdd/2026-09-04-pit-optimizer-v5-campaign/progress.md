@@ -258,3 +258,19 @@
   model-provider role call, test, market evaluation, baseline, held-out stage, or replay occurred.
   Next dependency is complete membership/identities, then final price/fundamental/industry export,
   V3 bundle verification and downstream baseline/campaign preparation under their existing gates.
+- Vendor inquiry continuation (2026-09-07): the user explicitly authorized proceeding with LSEG
+  and Nasdaq, supplied the required contact details, and confirmed their name. Submitted both
+  prepared coverage/quote inquiries through official public web forms. LSEG redirected to its
+  thank-you page stating it received the details; Nasdaq's GIDS form replaced the input form with
+  "Success" and "Thank You!". Both submissions are confirmed; no vendor reference number appeared.
+  Nasdaq's comments field required whitespace-only flattening within its 2,000-character limit.
+  Optional marketing opt-ins were left unchecked. No purchase, subscription or data-file upload
+  occurred. The inquiry content and observed confirmations are preserved privately in
+  `.artifacts/pit-optimizer-v5/data/acquisition/vendor-inquiry-submissions-20260907.json`, SHA-256
+  `087d00327a603fb24802b5b36503d8c3c4cf985e5b82318956434a88cad2f801`.
+- Automatic review rejected opening Gmail for lack of separate mailbox-access authorization and
+  rejected a redundant append to already populated LSEG contact fields. Both rejected actions
+  were avoided: screenshot verification confirmed the existing contact values, and both inquiries
+  completed via vendor forms. No mailbox was accessed and no review restriction was bypassed.
+  Await vendor coverage, sample, retention/licensing and price responses before any purchase.
+  Reply monitoring is not configured. The underlying data/image preparation state is unchanged.
