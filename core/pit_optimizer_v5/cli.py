@@ -297,6 +297,7 @@ class CampaignAuthoritiesV5:
         if (
             self.manifest.baseline_authority_ref.sha256 != canonical_sha256_v5(self.baseline)
             or self.manifest.sandbox_profile_ref.sha256 != self.sandbox_profile.sha256
+            or self.manifest.pit_data_scope != self.baseline.pit_data_scope
         ):
             raise ValueError("V5 campaign authority identity differs from the manifest")
 
@@ -387,6 +388,8 @@ class ProductionRoundCompositionV5:
         owner_token_sha256: str,
         adapter_config: ProductionAdapterConfigV5,
     ) -> None:
+        if authorities.manifest.pit_data_scope != "production" or authorities.baseline.pit_data_scope != "production":
+            raise V5CliFailure("production_authority_mismatch")
         if type(self.inputs) is not FeedbackRoundInputV5 or type(self.dependencies) is not FeedbackRoundDependenciesV5:
             raise V5CliFailure("production_dependency_invalid")
         if (
@@ -488,6 +491,8 @@ class ProductionRoundFactoryV5:
         owner_token_sha256: str,
         adapter_config: ProductionAdapterConfigV5,
     ) -> ProductionRoundCompositionV5:
+        if authorities.manifest.pit_data_scope != "production" or authorities.baseline.pit_data_scope != "production":
+            raise V5CliFailure("production_authority_mismatch")
         if (
             adapter_config != self.adapter_config
             or authorities.manifest.sha256 != self.adapter_config.campaign_manifest_sha256
@@ -536,7 +541,9 @@ def _compose_production_round_from_paths_v5(
     """Construct real local adapters without invoking a provider, Git, or Docker."""
     provider_capabilities = authorities.manifest.provider
     if (
-        provider_capabilities is None
+        authorities.manifest.pit_data_scope != "production"
+        or authorities.baseline.pit_data_scope != "production"
+        or provider_capabilities is None
         or provider_capabilities.automatic_retries != 0
         or provider_capabilities.schema_repair_calls != 0
     ):
@@ -695,6 +702,8 @@ class ProductionV5CommandServices:
                 manifest_ref,
                 value_type=CampaignManifestV5,
             )
+            if manifest.pit_data_scope != "production":
+                raise V5CliFailure("campaign_authority_invalid")
             return CampaignAuthoritiesV5(
                 manifest=manifest,
                 panel_plan=repository.load_typed_artifact(
@@ -1141,6 +1150,11 @@ def build_parser_v5() -> argparse.ArgumentParser:
     build_manifest.add_argument("--max-discovery-survivors-per-template", type=int, default=6)
     build_manifest.add_argument("--archive-capacity", type=int, default=8)
     build_manifest.add_argument("--max-feedback-rounds", type=int, default=10)
+    build_manifest.add_argument(
+        "--pit-data-scope",
+        choices=("production", "development_sp500_v2"),
+        default="production",
+    )
     build_manifest.add_argument("--deny-full-source-escape", action="store_true")
     build_manifest.add_argument("--investigator-memory-max-bytes", type=int, default=96 * 1024)
     build_manifest.add_argument("--max-parallel-evaluations", type=int, default=2)
@@ -1480,6 +1494,7 @@ def _manifest_projection_v5(
         "campaign_id": manifest.campaign_id,
         "target_pct": manifest.target.to_text(),
         "source_commit": manifest.source_commit,
+        "pit_data_scope": manifest.pit_data_scope,
         "provider": (
             None
             if provider is None
@@ -1535,6 +1550,7 @@ def dispatch_manifest_cli_v5(
                 search=_manifest_search_capabilities_v5(namespace),
                 provider=_manifest_provider_capabilities_v5(namespace),
                 resources=_manifest_resource_capabilities_v5(namespace),
+                pit_data_scope=namespace.pit_data_scope,
             )
             projection = _manifest_projection_v5(authenticated, status="created")
         else:

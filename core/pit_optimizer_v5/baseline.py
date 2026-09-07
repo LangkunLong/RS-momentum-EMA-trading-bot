@@ -357,7 +357,12 @@ def verify_baseline_v5(*, repository, authority_ref: ArtifactRefV5) -> dict[str,
     )
     if parent != expected:
         raise ValueError("baseline parent projection differs from full authority")
-    baseline_parent_candidate_v5(authority=parent, discovery_plan=inputs.plan, evaluator_contract=inputs.evaluator)
+    baseline_parent_candidate_v5(
+        authority=parent,
+        discovery_plan=inputs.plan,
+        evaluator_contract=inputs.evaluator,
+        pit_data_scope="production",
+    )
     return {
         "schema_version": 5,
         "status": "verified",

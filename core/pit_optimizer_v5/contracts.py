@@ -1058,6 +1058,7 @@ class CampaignManifestV5:
     apply: Literal[False]
     qualification_allowed: Literal[False]
     full_replay_allowed: Literal[False]
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
@@ -1069,6 +1070,10 @@ class CampaignManifestV5:
             raise ValueError("campaign search capabilities are invalid")
         if self.provider is not None and type(self.provider) is not ProviderCapabilitiesV5:
             raise ValueError("campaign provider capabilities are invalid")
+        if self.pit_data_scope not in {"production", "development_sp500_v2"}:
+            raise ValueError("campaign PIT data scope is invalid")
+        if self.pit_data_scope == "development_sp500_v2" and self.provider is not None:
+            raise ValueError("development campaign must be provider-free")
         if type(self.resources) is not ResourceCapabilitiesV5:
             raise ValueError("campaign resource capabilities are invalid")
         if type(self.artifact_root) is not str or self.artifact_root != ARTIFACT_ROOT_V5:

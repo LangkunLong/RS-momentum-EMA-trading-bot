@@ -389,6 +389,8 @@ class FeedbackRoundInputV5:
             panel_plan=self.panel_plan,
             evaluator_contract=self.evaluator_contract,
         )
+        if self.manifest.pit_data_scope != self.baseline.pit_data_scope:
+            raise ValueError("feedback-round PIT data scope differs from baseline authority")
 
     @property
     def campaign_id(self) -> str:

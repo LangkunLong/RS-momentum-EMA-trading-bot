@@ -527,6 +527,7 @@ def _validate_precomposition_bindings_v5(
     sandbox_profile_ref: ArtifactRefV5,
     sandbox_profile: SandboxProfileV5,
     resources: ResourceCapabilitiesV5,
+    pit_data_scope: Literal["production", "development_sp500_v2"],
 ) -> None:
     if type(target) is not AnnualizedReturnTargetV5 or type(source_snapshot) is not PolicySourceSnapshotV5:
         raise ValueError("manifest target or source snapshot is invalid")
@@ -550,6 +551,7 @@ def _validate_precomposition_bindings_v5(
         authority=baseline_authority,
         discovery_plan=panel_plan,
         evaluator_contract=evaluator_contract,
+        pit_data_scope=pit_data_scope,
     )
     expected_source = baseline_authority.policy_revision.editable_source_sha256
     bundle_source = tuple((item.path, item.sha256) for item in baseline_authority.source_bundle.files)
@@ -574,6 +576,7 @@ def build_campaign_manifest_v5(
     search: SearchCapabilitiesV5 | None = None,
     provider: ProviderCapabilitiesV5 | None = None,
     resources: ResourceCapabilitiesV5 | None = None,
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
 ) -> AuthenticatedCampaignManifestV5:
     """Create and reauthenticate one discovery-only campaign manifest."""
 
@@ -587,6 +590,10 @@ def build_campaign_manifest_v5(
         raise ValueError("manifest search capabilities are invalid")
     if provider is not None and type(provider) is not ProviderCapabilitiesV5:
         raise ValueError("manifest provider capabilities are invalid")
+    if pit_data_scope not in {"production", "development_sp500_v2"}:
+        raise ValueError("manifest PIT data scope is invalid")
+    if pit_data_scope == "development_sp500_v2" and provider is not None:
+        raise ValueError("development campaign must be provider-free")
     if type(resolved_resources) is not ResourceCapabilitiesV5:
         raise ValueError("manifest resource capabilities are invalid")
 
@@ -598,6 +605,8 @@ def build_campaign_manifest_v5(
         panel_plan_ref=panel_plan_ref,
         sandbox_profile_ref=sandbox_profile_ref,
     )
+    if baseline.pit_data_scope != pit_data_scope:
+        raise ValueError("manifest PIT data scope differs from baseline authority")
     _validate_precomposition_bindings_v5(
         target=target,
         source_snapshot=source_snapshot,
@@ -612,6 +621,7 @@ def build_campaign_manifest_v5(
         sandbox_profile_ref=sandbox_profile_ref,
         sandbox_profile=sandbox,
         resources=resolved_resources,
+        pit_data_scope=pit_data_scope,
     )
 
     # Preserve the accepted Task 1 identity: the baseline descriptor is the
@@ -649,6 +659,7 @@ def build_campaign_manifest_v5(
         apply=False,
         qualification_allowed=False,
         full_replay_allowed=False,
+        pit_data_scope=pit_data_scope,
     )
     manifest_ref = repository.create_typed_artifact(manifest_path, manifest)
     return authenticate_campaign_manifest_v5(repository=repository, manifest_ref=manifest_ref)
@@ -728,6 +739,7 @@ def authenticate_campaign_manifest_v5(
         sandbox_profile_ref=manifest.sandbox_profile_ref,
         sandbox_profile=sandbox,
         resources=manifest.resources,
+        pit_data_scope=manifest.pit_data_scope,
     )
     if (
         manifest_ref.sha256 != manifest.sha256
@@ -736,6 +748,7 @@ def authenticate_campaign_manifest_v5(
         or policy_scope.baseline_policy_revision_ref != baseline.policy_revision_ref
         or baseline_revision != baseline.policy_revision
         or source_bundle != baseline.source_bundle
+        or manifest.pit_data_scope != baseline.pit_data_scope
         or policy_scope.full_source_escape_allowed != manifest.search.allow_full_source_escape
         or manifest.apply is not False
         or manifest.qualification_allowed is not False

@@ -1160,6 +1160,7 @@ def _authenticate_confirmation_attempt_dependencies_v5(
         authority=baseline,
         discovery_plan=discovery_plan,
         evaluator_contract=evaluator,
+        pit_data_scope=manifest.pit_data_scope,
     )
     if experiment.campaign_evidence is not None and experiment.policy_revision is not None:
         verified_campaign_cagr_pct(

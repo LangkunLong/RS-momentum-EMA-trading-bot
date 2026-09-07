@@ -164,7 +164,11 @@ class FixtureRoleInvokerV5:
     """Adapt a deterministic RoleRunnerV5 to the persisted runtime role boundary."""
 
     def __init__(self, manifest):
-        if type(manifest) is not CampaignManifestV5 or manifest.provider is not None:
+        if (
+            type(manifest) is not CampaignManifestV5
+            or manifest.provider is not None
+            or manifest.pit_data_scope != "production"
+        ):
             raise ValueError("fixture roles require exact provider-free authority")
         self.runner: RoleRunnerV5 = FixtureRoleRunnerV5(responses={}, campaign_fixture=True)
         self._manifest = manifest
@@ -342,6 +346,7 @@ def compose_fixture_round_v5(*, repository, authorities, round_index):
     manifest = authorities.manifest
     if (
         manifest.provider is not None
+        or manifest.pit_data_scope != "production"
         or manifest.sha256 != authorities.manifest_ref.sha256
         or manifest.search.hypotheses_per_investigator != 3
         or manifest.search.max_variants_per_template < 3
@@ -392,7 +397,7 @@ def compose_fixture_round_v5(*, repository, authorities, round_index):
 
 def verify_fixture_run_v5(*, repository, manifest):
     """Authenticate synthetic role/lease history without production adapter configuration."""
-    if manifest.provider is not None:
+    if manifest.provider is not None or manifest.pit_data_scope != "production":
         raise ValueError("fixture history requires provider-free authority")
     for index in range(1, manifest.search.max_feedback_rounds + 1):
         events = repository.load_round_events(campaign_id=manifest.campaign_id, round_index=index)

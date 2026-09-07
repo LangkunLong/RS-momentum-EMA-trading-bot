@@ -814,6 +814,7 @@ class BaselineParentAuthorityV5:
     campaign: CampaignEvidenceV5
     source_bundle: SourceBundleV5
     source_bundle_ref: ArtifactRefV5
+    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
 
     def __post_init__(self) -> None:
         if (
@@ -825,6 +826,8 @@ class BaselineParentAuthorityV5:
             or type(self.source_bundle_ref) is not ArtifactRefV5
         ):
             raise ValueError("baseline parent authority is invalid")
+        if self.pit_data_scope not in {"production", "development_sp500_v2"}:
+            raise ValueError("baseline parent PIT data scope is invalid")
         if (
             self.policy_revision_ref.sha256 != self.policy_revision.sha256
             or self.source_bundle_ref.sha256 != self.source_bundle.sha256
@@ -913,9 +916,12 @@ def baseline_parent_candidate_v5(
     authority: BaselineParentAuthorityV5,
     discovery_plan: CampaignPanelPlanV5,
     evaluator_contract: EvaluatorContractV5,
+    pit_data_scope: Literal["production", "development_sp500_v2"],
 ) -> ParentCandidateV5:
     if type(authority) is not BaselineParentAuthorityV5:
         raise ValueError("baseline authority is invalid")
+    if authority.pit_data_scope != pit_data_scope:
+        raise CampaignAuthorityMismatch()
     if authority.source_bundle.sha256 != evaluator_contract.baseline_source_bundle_sha256:
         raise CampaignAuthorityMismatch()
     score = verified_campaign_cagr_pct(

@@ -425,6 +425,7 @@ def parent_schedule_v5(
         authority=baseline,
         discovery_plan=discovery_plan,
         evaluator_contract=evaluator_contract,
+        pit_data_scope=baseline.pit_data_scope,
     )
     if not state.archive.entries:
         return (baseline_parent,)

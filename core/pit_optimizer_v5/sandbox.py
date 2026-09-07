@@ -844,6 +844,7 @@ def panel_execution_request_for_v5(
             request.manifest.resources.worker_startup_timeout_seconds
         ),
         output_limit_bytes=request.manifest.resources.evaluation_output_limit_bytes,
+        pit_data_scope=request.manifest.pit_data_scope,
     )
 
 
