@@ -135,3 +135,39 @@ Completed rounds with complete cleanup are reused. `no_novel_hypothesis` advance
 Campaign and round start times persist in epoch milliseconds. Resume subtracts elapsed wall time, including downtime, and passes the smaller remaining allowance to the runtime's monotonic deadline. It never resets those allowances or requires a full round's time to remain. This assumes an accurate host wall clock; a clock before a saved start is rejected. Cleanup retains its separate manifest timeout and can finish after the work deadline. Runtime calls remain responsible for honoring their supplied stage deadlines; this is not an external process watchdog.
 
 Resume uses the original config and owner. A round with a saved start but no round journal is reported as uncertain and is not restarted automatically; inspect its paid-request/reservation state using the existing recovery boundary before taking further action. Existing journaled work uses the runtime's reconciliation path. Do not delete launch records or create a new campaign to evade unsettled work or reset budgets. Held-out confirmation, qualification, full replay, and live application remain separate explicit stages.
+
+### Controller-authored development role responses
+
+For a provider-free manifest with `pit_data_scope=development_sp500_v2`, construct
+`FileBackedControllerRoleInvokerV5` with an absolute response directory. For each
+durable role request, place one file named `<call-key-sha256>.json` in that
+directory. Its JSON object has exactly these fields:
+
+```json
+{
+  "schema_version": 5,
+  "artifact_type": "controller_role_response",
+  "call_key_sha256": "<exact call key from the pending result>",
+  "request_sha256": "<exact request digest from the pending result>",
+  "response": {"artifact": {}, "binding": {}}
+}
+```
+
+`response` is the existing investigator, author, or critic response envelope and
+must satisfy that request's schema and evidence binding. The placeholders above
+describe the contract; they are not execution identities or a valid role result.
+
+When the file is absent, `run_feedback_round_v5` returns
+`awaiting_controller_response` with the role, call key, request digest, and durable
+request reference. It writes no role completion, round outcome, experiment, or
+checkpoint. Resume with the same repository and inputs after writing the file.
+The first bytes found for that exact call are sealed create-only in the repository;
+all later recovery reads those sealed bytes. A malformed or mismatched submitted
+response therefore remains a truthful failed terminal attempt and cannot be
+silently replaced by editing the input file.
+
+This path records exact zero external-provider usage. It is controller-authored
+development input, distinct from deterministic synthetic fixtures, and it does
+not run an automatic external-model campaign. Production provider-free execution
+continues to require fixture authority, while paid production continues to require
+ledger authority.

@@ -2419,7 +2419,37 @@ class FixtureRoleTerminalAuthorityV5:
         return canonical_sha256_v5(self)
 
 
-RoleTerminalAuthorityV5 = LedgerRoleTerminalAuthorityV5 | FixtureRoleTerminalAuthorityV5
+@dataclass(frozen=True, slots=True)
+class ControllerRoleTerminalAuthorityV5:
+    """Provider-free authority for an immutable controller-authored response."""
+
+    call_key_sha256: str
+    request_sha256: str
+    attempt_facts_sha256: str
+    raw_response_ref: ArtifactRefV5
+    artifact_sha256: str | None
+
+    def __post_init__(self) -> None:
+        _digest(self.call_key_sha256, "controller role terminal call key")
+        _digest(self.request_sha256, "controller role terminal request")
+        _digest(self.attempt_facts_sha256, "controller role terminal facts")
+        if (
+            type(self.raw_response_ref) is not ArtifactRefV5
+            or self.raw_response_ref.relative_path
+            != f"adapter-blobs/controller-role-responses/{self.call_key_sha256}.bin"
+        ):
+            raise ValueError("controller role terminal raw response is invalid")
+        if self.artifact_sha256 is not None:
+            _digest(self.artifact_sha256, "controller role terminal artifact")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self)
+
+
+RoleTerminalAuthorityV5 = (
+    LedgerRoleTerminalAuthorityV5 | FixtureRoleTerminalAuthorityV5 | ControllerRoleTerminalAuthorityV5
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2490,6 +2520,16 @@ class RoleInvocationPackageV5:
                 or self.attempt.usage != _zero_usage_facts()
             ):
                 raise ValueError("fixture terminal authority differs from its invocation")
+        elif type(authority) is ControllerRoleTerminalAuthorityV5:
+            if (
+                authority.call_key_sha256 != self.call.sha256
+                or authority.request_sha256 != self.request.sha256
+                or authority.attempt_facts_sha256 != self.attempt.sha256
+                or authority.artifact_sha256 != artifact_sha256
+                or self.attempt.usage != _zero_usage_facts()
+                or authority.raw_response_ref.sha256 != self.attempt.response_sha256
+            ):
+                raise ValueError("controller terminal authority differs from its invocation")
         else:
             raise ValueError("role invocation terminal authority is invalid")
 
@@ -2546,6 +2586,16 @@ class RoleReconciliationFailureV5:
 
 
 RoleReconciliationResultV5 = RoleInvocationPackageV5 | RoleReconciliationFailureV5
+
+
+class ControllerRoleResponsePendingV5(Exception):
+    """The exact durable role request is waiting for local controller input."""
+
+    def __init__(self, call: RoleCallKeyV5) -> None:
+        if type(call) is not RoleCallKeyV5:
+            raise ValueError("pending controller response requires an exact call key")
+        self.call = call
+        super().__init__(f"controller response pending for {call.role}")
 
 
 @runtime_checkable
@@ -3600,6 +3650,8 @@ __all__ = [
     "ExperimentPredictionAggregateV5",
     "ExperimentSemanticDifferenceAggregateV5",
     "ExistingPersistedRoleRequestV5",
+    "ControllerRoleResponsePendingV5",
+    "ControllerRoleTerminalAuthorityV5",
     "FailureStageV5",
     "FixtureRoleTerminalAuthorityV5",
     "FixtureRoleRunnerV5",

@@ -91,6 +91,7 @@ from core.pit_optimizer_v5.probes import ProbeObservationV5, SemanticFingerprint
 from core.pit_optimizer_v5.search import ArchiveEntryV5, SearchStateV5
 from core.pit_optimizer_v5.provider import (
     AuthorizedRoleSlotV5,
+    ControllerRoleTerminalAuthorityV5,
     ExistingPersistedRoleRequestV5,
     FixtureRoleTerminalAuthorityV5,
     FreshPersistedRoleRequestV5,
@@ -2470,6 +2471,9 @@ class LocalArtifactRepositoryV5:
         elif type(authority) is FixtureRoleTerminalAuthorityV5:
             kind = "fixture_authority"
             identity = authority.sha256
+        elif type(authority) is ControllerRoleTerminalAuthorityV5:
+            kind = "controller_authority"
+            identity = authority.sha256
         else:
             raise ValueError("role terminal authority is outside the closed V5 union")
         primitive = {
@@ -2505,6 +2509,15 @@ class LocalArtifactRepositoryV5:
             elif kind == "fixture_authority":
                 authority = _decode_dataclass(FixtureRoleTerminalAuthorityV5, envelope["authority"])
                 identity = authority.sha256
+            elif kind == "controller_authority":
+                authority = _decode_dataclass(ControllerRoleTerminalAuthorityV5, envelope["authority"])
+                identity = authority.sha256
+                self.load_binary_state(
+                    namespace="controller-role-responses",
+                    key=authority.call_key_sha256,
+                    reference=authority.raw_response_ref,
+                    maximum_bytes=_MAX_ARTIFACT_BYTES,
+                )
             else:
                 raise ArtifactSchemaFailureV5(reference)
         except ArtifactRepositoryFailureV5:
@@ -2522,6 +2535,32 @@ class LocalArtifactRepositoryV5:
         if canonical_json_bytes_v5(expected) != authenticated.content:
             raise ArtifactNonCanonicalV5(reference)
         return authority
+
+    def append_controller_role_response(self, *, call: RoleCallKeyV5, content: bytes) -> ArtifactRefV5:
+        """Seal the first exact local response bytes for a call; identical retries authenticate."""
+
+        if type(call) is not RoleCallKeyV5 or type(content) is not bytes:
+            raise ValueError("controller role response requires an exact call and immutable bytes")
+        return self.append_binary_state(namespace="controller-role-responses", key=call.sha256, content=content)
+
+    def load_controller_role_response(self, *, call: RoleCallKeyV5) -> tuple[ArtifactRefV5, bytes] | None:
+        """Load only an already sealed response selected by its exact call identity."""
+
+        if type(call) is not RoleCallKeyV5:
+            raise ValueError("controller role response requires an exact call")
+        relative = f"adapter-blobs/controller-role-responses/{call.sha256}.bin"
+        try:
+            content = self._read_relative(relative)
+        except ArtifactMissingV5:
+            return None
+        reference = ArtifactRefV5(relative, hashlib.sha256(content).hexdigest())
+        authenticated = self.load_binary_state(
+            namespace="controller-role-responses",
+            key=call.sha256,
+            reference=reference,
+            maximum_bytes=_MAX_ARTIFACT_BYTES,
+        )
+        return reference, authenticated
 
     def append_role_artifact(
         self,

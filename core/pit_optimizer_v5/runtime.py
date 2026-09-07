@@ -71,9 +71,12 @@ from core.pit_optimizer_v5.probes import (
     classify_semantic_fingerprints_v5,
 )
 from core.pit_optimizer_v5.provider import (
+    ControllerRoleResponsePendingV5,
+    ControllerRoleTerminalAuthorityV5,
     ExistingPersistedRoleRequestV5,
     FreshPersistedRoleRequestV5,
     FixtureRoleTerminalAuthorityV5,
+    LedgerRoleTerminalAuthorityV5,
     LedgerBackedRoleInvokerV5,
     PersistedRoleRequestV5,
     RecoverableRoleInvokerV5,
@@ -143,6 +146,7 @@ RuntimeStatusV5 = Literal[
     "novelty_exhausted",
     "critic_unavailable",
     "failed",
+    "awaiting_controller_response",
 ]
 CandidateRuntimeStatusV5 = Literal[
     "invalid",
@@ -232,6 +236,28 @@ class RuntimeFailureV5:
             raise ValueError("runtime failure role is invalid")
         if self.experiment_id is not None:
             _digest(self.experiment_id, "runtime failure experiment")
+
+
+@dataclass(frozen=True, slots=True)
+class PendingControllerRoleV5:
+    role: RoleNameV5
+    call_key_sha256: str
+    request_sha256: str
+    request_ref: ArtifactRefV5
+
+    def __post_init__(self) -> None:
+        if self.role not in {"investigator", "author", "critic"}:
+            raise ValueError("pending controller role is invalid")
+        _digest(self.call_key_sha256, "pending controller call key")
+        _digest(self.request_sha256, "pending controller request")
+        if type(self.request_ref) is not ArtifactRefV5:
+            raise ValueError("pending controller request reference is invalid")
+
+
+class _RuntimePendingControllerResponse(Exception):
+    def __init__(self, pending: PendingControllerRoleV5) -> None:
+        self.pending = pending
+        super().__init__(pending.role)
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +435,7 @@ class FeedbackRoundResultV5:
     cleanup: CleanupResultPayloadV5 | None
     failure: RuntimeFailureV5 | None
     cleanup_failure: RuntimeFailureV5 | None = None
+    pending_controller_role: PendingControllerRoleV5 | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {
@@ -417,6 +444,7 @@ class FeedbackRoundResultV5:
             "novelty_exhausted",
             "critic_unavailable",
             "failed",
+            "awaiting_controller_response",
         }:
             raise ValueError("feedback-round result status is invalid")
         if type(self.campaign_id) is not str or not self.campaign_id:
@@ -440,6 +468,16 @@ class FeedbackRoundResultV5:
             or self.cleanup_failure.code not in {"cleanup_failed", "deadline_exceeded", "invalid_dependency_result"}
         ):
             raise ValueError("feedback-round cleanup failure is invalid")
+        if self.status == "awaiting_controller_response":
+            if (
+                type(self.pending_controller_role) is not PendingControllerRoleV5
+                or self.failure is not None
+                or self.terminal_outcome is not None
+                or self.checkpoint is not None
+            ):
+                raise ValueError("pending feedback round has invalid terminal state")
+        elif self.pending_controller_role is not None:
+            raise ValueError("non-pending feedback round cannot carry a pending controller role")
         if self.status == "failed":
             if self.failure is None:
                 raise ValueError("failed feedback round requires its typed primary failure")
@@ -1053,9 +1091,7 @@ class _Runtime:
             package = self.dependencies.persistence.load_role_invocation(completed)
             if package.call != call or package.request != request:
                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role=role))
-            if (type(package.terminal_authority) is FixtureRoleTerminalAuthorityV5) != (
-                self.inputs.manifest.provider is None
-            ):
+            if not self._valid_terminal_authority(package):
                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role=role))
             return package
 
@@ -1069,19 +1105,34 @@ class _Runtime:
             elif type(persisted) is ExistingPersistedRoleRequestV5:
                 reconciled = self.dependencies.invoker.reconcile_once(persisted)
                 if type(reconciled) is RoleReconciliationFailureV5:
+                    if (
+                        reconciled.failure_code == "pending"
+                        and self.inputs.manifest.pit_data_scope == "development_sp500_v2"
+                        and self.inputs.manifest.provider is None
+                    ):
+                        raise ControllerRoleResponsePendingV5(call)
                     raise _RuntimeAbort(RuntimeFailureV5(role, "role_unrecoverable", role=role))  # type: ignore[arg-type]
                 package = reconciled
             else:
                 raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
         except _RuntimeAbort:
             raise
+        except ControllerRoleResponsePendingV5 as pending:
+            if pending.call != call:
+                raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role)) from None  # type: ignore[arg-type]
+            raise _RuntimePendingControllerResponse(
+                PendingControllerRoleV5(
+                    role=role,
+                    call_key_sha256=call.sha256,
+                    request_sha256=request.sha256,
+                    request_ref=persisted.reference,
+                )
+            ) from None
         except BaseException:
             raise _RuntimeAbort(RuntimeFailureV5(role, "role_unrecoverable", role=role)) from None  # type: ignore[arg-type]
         if type(package) is not RoleInvocationPackageV5 or package.call != call or package.request != request:
             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
-        if (type(package.terminal_authority) is FixtureRoleTerminalAuthorityV5) != (
-            self.inputs.manifest.provider is None
-        ):
+        if not self._valid_terminal_authority(package):
             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
         persisted_invocation = self.dependencies.persistence.persist_role_invocation(
             call=call,
@@ -1091,6 +1142,14 @@ class _Runtime:
         self.journal.append(persisted_invocation.payload)
         self._check_finished(deadline)
         return package
+
+    def _valid_terminal_authority(self, package: RoleInvocationPackageV5) -> bool:
+        authority_type = type(package.terminal_authority)
+        if self.inputs.manifest.pit_data_scope == "development_sp500_v2":
+            return self.inputs.manifest.provider is None and authority_type is ControllerRoleTerminalAuthorityV5
+        if self.inputs.manifest.provider is None:
+            return authority_type is FixtureRoleTerminalAuthorityV5
+        return authority_type is LedgerRoleTerminalAuthorityV5
 
     def _recover_projection(self) -> SearchProjectionV5:
         reducer = self.dependencies.archive_reducers.recovery_reducer(self.inputs)
@@ -2849,6 +2908,19 @@ def run_feedback_round_v5(
     try:
         runtime = _Runtime(inputs, dependencies, campaign_deadline_monotonic=campaign_deadline_monotonic)
         return runtime.run()
+    except _RuntimePendingControllerResponse as pending:
+        return FeedbackRoundResultV5(
+            status="awaiting_controller_response",
+            campaign_id=inputs.campaign_id,
+            round_index=inputs.round_index,
+            parent=(None if runtime is None else runtime.parent),
+            terminal_outcome=None,
+            record_refs=(() if runtime is None else runtime.record_refs),
+            checkpoint=None,
+            cleanup=None,
+            failure=None,
+            pending_controller_role=pending.pending,
+        )
     except _RuntimeAbort as abort:
         if runtime is None:
             return bare_failure(abort.failure)
@@ -2890,6 +2962,7 @@ __all__ = [
     "OwnedCleanupV5",
     "OwnedLeaseV5",
     "PaidRoleRecoveryRequiredV5",
+    "PendingControllerRoleV5",
     "RoleRequestFactoryV5",
     "RoundPersistenceV5",
     "RuntimeCancellationV5",

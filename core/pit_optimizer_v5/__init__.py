@@ -69,6 +69,7 @@ from .evaluator import (
     SimulationRunnerV5,
     SimulatorFactoryV5,
 )
+from .controller_roles import FileBackedControllerRoleInvokerV5
 from .runtime import (
     CandidateExecutionAuthorityV5,
     CandidateExecutionKeyV5,
@@ -78,6 +79,7 @@ from .runtime import (
     FeedbackRoundInputV5,
     FeedbackRoundResultV5,
     LeaseAwareCandidateRuntimeV5,
+    PendingControllerRoleV5,
     RuntimeFailureV5,
     run_feedback_round_v5,
 )
@@ -237,6 +239,7 @@ __all__ = [
     "FeedbackRoundDependenciesV5",
     "FeedbackRoundInputV5",
     "FeedbackRoundResultV5",
+    "FileBackedControllerRoleInvokerV5",
     "GitCandidateMaterializerV5",
     "GitWorkspaceDriverV5",
     "HypothesisV5",
@@ -323,6 +326,7 @@ __all__ = [
     "summarize_repository_v5",
     "selected_scenario",
     "run_feedback_round_v5",
+    "PendingControllerRoleV5",
     "validate_campaign_evidence_v5",
     "validate_campaign_manifest_bindings_v5",
     "validate_owned_panel_plans_v5",
