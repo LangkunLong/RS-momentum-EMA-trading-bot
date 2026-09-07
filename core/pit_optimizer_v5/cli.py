@@ -55,6 +55,7 @@ from core.pit_optimizer_v5.runtime import (
     FeedbackRoundDependenciesV5,
     FeedbackRoundInputV5,
     FeedbackRoundResultV5,
+    PaidRoleRecoveryRequiredV5,
     run_feedback_round_v5,
 )
 from core.pit_optimizer_v5.memory import (
@@ -921,6 +922,8 @@ class ProductionV5CommandServices:
     def execute(self, request: V5CliRequest) -> OptimizerSummaryV5:
         try:
             return self._execute(request)
+        except PaidRoleRecoveryRequiredV5:
+            raise
         except V5CliFailure:
             raise
         except BaseException:
@@ -1813,6 +1816,22 @@ def dispatch_v5_cli(
         if type(summary) is not OptimizerSummaryV5:
             raise V5CliFailure("runtime_result_invalid")
         exit_code = 0
+    except PaidRoleRecoveryRequiredV5 as exc:
+        emit(
+            "PIT_OPTIMIZER_V5_RECOVERY="
+            + canonical_json_bytes_v5(
+                {
+                    "schema_version": 5,
+                    "status": "recovery_required",
+                    "round_index": exc.round_index,
+                    "role": exc.role,
+                    "reason": exc.reason,
+                    "diagnostic": str(exc),
+                }
+            ).decode("utf-8")
+        )
+        summary = unavailable_summary_v5(command, "runtime_failed")
+        exit_code = 2
     except V5CliFailure as exc:
         summary = exc.summary or unavailable_summary_v5(command, exc.reason)
         exit_code = exc.exit_code

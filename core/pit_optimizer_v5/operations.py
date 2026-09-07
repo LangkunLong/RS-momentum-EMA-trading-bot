@@ -28,7 +28,7 @@ from core.pit_optimizer_v5.manifest import (
     capture_clean_policy_snapshot_v5,
 )
 from core.pit_optimizer_v5.memory import CleanupResultPayloadV5, RoundOutcomePayloadV5
-from core.pit_optimizer_v5.runtime import run_feedback_round_v5
+from core.pit_optimizer_v5.runtime import reconcile_existing_paid_roles_v5, run_feedback_round_v5
 from core.pit_optimizer_v5.summary import summarize_repository_v5
 
 
@@ -375,6 +375,13 @@ def run_production_campaign_v5(
         rounds = []
         reason = "max_feedback_rounds"
         for round_index in range(1, manifest.search.max_feedback_rounds + 1):
+            # Also inspect already-terminal rounds before their reuse shortcut:
+            # old interrupted paid work must not disappear behind complete cleanup.
+            reconcile_existing_paid_roles_v5(
+                replace(first.inputs, round_index=round_index),
+                persistence=repository,
+                invoker=first.dependencies.invoker,
+            )
             events = repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index)
             payloads = tuple(
                 repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind) for item in events

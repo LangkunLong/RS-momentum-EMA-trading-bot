@@ -74,6 +74,7 @@ from core.pit_optimizer_v5.provider import (
     ExistingPersistedRoleRequestV5,
     FreshPersistedRoleRequestV5,
     FixtureRoleTerminalAuthorityV5,
+    LedgerBackedRoleInvokerV5,
     PersistedRoleRequestV5,
     RecoverableRoleInvokerV5,
     RoleCallKeyV5,
@@ -781,6 +782,42 @@ class _RuntimeAbort(RuntimeError):
         self.failure = failure
 
 
+class PaidRoleRecoveryRequiredV5(RuntimeError):
+    """Unresolved accounting must not be sealed behind a new terminal outcome."""
+
+    def __init__(self, *, round_index: int, role: RoleNameV5 | None, reason: str) -> None:
+        self.round_index = round_index
+        self.role = role
+        self.reason = reason
+        prefix = (
+            f"Paid request accounting in round {round_index}: "
+            if role is None
+            else f"Paid {role} request in round {round_index}: "
+        )
+        if reason == "pending":
+            diagnostic = (
+                "the existing invocation claim is still pending. Resume after its response is durable or its "
+                "lease expires; no fresh provider call or terminal round outcome was created by recovery"
+            )
+        elif reason == "journal_closed":
+            diagnostic = (
+                "the paid completion is durable, but an existing terminal/cleanup record prevents appending its "
+                "missing role completion. Preserve the request, ledger and journal for explicit journal repair "
+                "or migration; restarting the round cannot repair this immutable history"
+            )
+        else:
+            diagnostic = (
+                f"local reconciliation is {reason}. Preserve the saved request, provider response and ledger "
+                "for inspection, then resume; recovery did not restart the request or close the round"
+            )
+        super().__init__(prefix + diagnostic)
+
+
+@runtime_checkable
+class _PaidRoleRequestSourceV5(Protocol):
+    def existing_paid_role_requests(self, *, round_index: int) -> tuple[ExistingPersistedRoleRequestV5, ...]: ...
+
+
 class _Journal:
     def __init__(self, inputs: FeedbackRoundInputV5, persistence: RoundPersistenceV5) -> None:
         self._inputs = inputs
@@ -862,6 +899,59 @@ class _Journal:
         self.events.append(event)
         self.payloads.append(payload)
         return event
+
+
+def reconcile_existing_paid_roles_v5(
+    inputs: FeedbackRoundInputV5,
+    *,
+    persistence: RoundPersistenceV5,
+    invoker: RecoverableRoleInvokerV5,
+) -> None:
+    """Journal existing paid terminals before work deadlines, without invoking a provider."""
+    if inputs.manifest.provider is None or type(invoker) is not LedgerBackedRoleInvokerV5:
+        return
+    source = invoker.reconciler
+    if not isinstance(source, _PaidRoleRequestSourceV5):
+        return
+    try:
+        journal = _Journal(inputs, persistence)
+        requests = source.existing_paid_role_requests(round_index=inputs.round_index)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise PaidRoleRecoveryRequiredV5(
+            round_index=inputs.round_index, role=None, reason="authority_unavailable"
+        ) from exc
+    for persisted in requests:
+        if (
+            type(persisted) is not ExistingPersistedRoleRequestV5
+            or persisted.call.campaign_id != inputs.campaign_id
+            or persisted.call.round_index != inputs.round_index
+        ):
+            raise PaidRoleRecoveryRequiredV5(round_index=inputs.round_index, role=None, reason="authority_unavailable")
+        role = persisted.call.role
+        try:
+            completed = journal.role_completion(role)
+            if completed is not None:
+                package = persistence.load_role_invocation(completed)
+                if package.call != persisted.call or package.request != persisted.request:
+                    raise ValueError("journal completion differs from the paid request")
+                continue
+            package = invoker.reconcile_once(persisted)
+            if type(package) is RoleReconciliationFailureV5:
+                raise PaidRoleRecoveryRequiredV5(round_index=inputs.round_index, role=role, reason=package.failure_code)
+            if journal.terminal_payload() is not None or journal.cleanup_payload() is not None:
+                raise PaidRoleRecoveryRequiredV5(round_index=inputs.round_index, role=role, reason="journal_closed")
+            recovered = persistence.persist_role_invocation(
+                call=persisted.call,
+                request_ref=persisted.reference,
+                package=package,
+            )
+            journal.append(recovered.payload)
+        except PaidRoleRecoveryRequiredV5:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise PaidRoleRecoveryRequiredV5(
+                round_index=inputs.round_index, role=role, reason="authority_unavailable"
+            ) from exc
 
 
 class _Runtime:
@@ -2709,6 +2799,9 @@ def run_feedback_round_v5(
         type(campaign_deadline_monotonic) is not float or not math.isfinite(campaign_deadline_monotonic)
     ):
         raise ValueError("campaign deadline must be a finite monotonic value")
+    # Recovery is local accounting, not new optimization work. Keep it outside
+    # the abort-to-terminal handler: pending claims must remain resumable.
+    reconcile_existing_paid_roles_v5(inputs, persistence=dependencies.persistence, invoker=dependencies.invoker)
     runtime: _Runtime | None = None
 
     def bare_failure(failure: RuntimeFailureV5) -> FeedbackRoundResultV5:
@@ -2794,6 +2887,7 @@ __all__ = [
     "NoveltyResolverV5",
     "OwnedCleanupV5",
     "OwnedLeaseV5",
+    "PaidRoleRecoveryRequiredV5",
     "RoleRequestFactoryV5",
     "RoundPersistenceV5",
     "RuntimeCancellationV5",
@@ -2804,5 +2898,6 @@ __all__ = [
     "RuntimeStatusV5",
     "SearchProjectionV5",
     "StageDeadlineV5",
+    "reconcile_existing_paid_roles_v5",
     "run_feedback_round_v5",
 ]

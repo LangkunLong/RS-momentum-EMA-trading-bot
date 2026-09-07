@@ -11,7 +11,12 @@ import time
 from typing import Callable, Mapping
 
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5, RoleLedgerMigrationAuthorityV5
-from core.pit_optimizer_v5.contracts import CampaignManifestV5, canonical_json_bytes_v5, canonical_sha256_v5
+from core.pit_optimizer_v5.contracts import (
+    ArtifactRefV5,
+    CampaignManifestV5,
+    canonical_json_bytes_v5,
+    canonical_sha256_v5,
+)
 from core.pit_optimizer_v5.provider import (
     AuthorizedRoleSlotV5,
     CompletionResultV5,
@@ -38,6 +43,7 @@ from core.pit_optimizer_v5.provider import (
     parse_and_bind_role_artifact,
     parsed_role_artifact_primitive_v5,
     prospective_role_usage_v5,
+    role_request_artifact_primitive_v5,
     sum_cost_usd_v5,
 )
 
@@ -844,6 +850,30 @@ class LocalRoleAuthorizationLedgerV5:
         matches = tuple(item for item in terminals if item.receipt.slot_id == slot.slot_id)
         if len(matches) != 1 or matches[0].facts != facts or matches[0].receipt != receipt:
             raise ValueError("local V5 role-ledger receipt is absent or different")
+
+    def existing_paid_role_requests(self, *, round_index: int) -> tuple[ExistingPersistedRoleRequestV5, ...]:
+        """Read exact pre-existing requests selected by this campaign's paid ledger."""
+        if type(round_index) is not int or not 1 <= round_index <= self._manifest.search.max_feedback_rounds:
+            raise ValueError("paid-request recovery round is invalid")
+        reservations, _ = self._load_verified()
+        existing: list[ExistingPersistedRoleRequestV5] = []
+        for reservation in reservations:
+            call, request = self._repository.load_unique_role_request_entry_by_sha256(
+                reservation.slot.request.request_sha256
+            )
+            if (
+                call.campaign_id != self._manifest.campaign_id
+                or call.round_index > self._manifest.search.max_feedback_rounds
+            ):
+                raise ValueError("paid-request recovery call differs from its campaign")
+            if call.round_index != round_index:
+                continue
+            reference = ArtifactRefV5(
+                f"roles/requests/{call.sha256}.json",
+                canonical_sha256_v5(role_request_artifact_primitive_v5(call=call, request=request)),
+            )
+            existing.append(ExistingPersistedRoleRequestV5(reference, call, request))
+        return tuple(sorted(existing, key=lambda item: item.call.role_position))
 
     def reconcile_paid_role(
         self,
