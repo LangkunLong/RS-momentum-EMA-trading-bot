@@ -1,0 +1,42 @@
+# Approved C-c execution-context handoff implementation
+
+Status: **STATIC CAPTURE FIX COMPLETE; CORRECTED HELPER NOT EXECUTED.**
+
+The campaign-specific helper is `run-approved-context-handoff.py`, 22,347 bytes, SHA-256 `d0c53e05c4f9cabf636a0df634b34d42473c460dccd3dd478d6fa29c59634e7f`. Its two modes implement one real local handoff for the already approved, uninitialized and unspent campaign. Execution remains gated on an independent review that names and approves this exact helper hash.
+
+The first reviewed source-mode invocation exited before native composition completed or a pipe was created because the in-memory `io.StringIO` capture did not implement `sys.stdout.reconfigure`, which imported `backtest.py` calls at line 25. No descriptor, receiver claim, result, receiver, launch, paid role activity, or environment publication occurred. `actual-context-handoff-source-01-failed-before-pipe.json`, SHA-256 `98ab5328451cd6d838229b886721a19e7a82337b4507b5164cc2c90627adbaa6`, records the safe failure and absence observation. The correction replaces only those capture streams with real `io.TextIOWrapper` instances over in-memory `io.BytesIO` buffers, then flushes and decodes the captured diagnostic bytes. It supplies the real `reconfigure` behavior and does not add a no-op shim or publish captured content.
+
+## Exact authority
+
+Before either mode does its work, the helper requires Python `-B`, authenticates its explicitly supplied reviewed hash and the fixed `context-handoff-independent-review.md` hash, and requires that review to contain this helper hash and an approval verdict. It also authenticates these unchanged inputs:
+
+- execution-context reproduction design: `ebfcf2c4a59c439e16f7cfebaca330beeaf227e9da53a57c6a870119575f4fe7`
+- failed-launch stage review: `8dd4d849205a37ea90ca00ef834f3d791b9e7e01136e53f4b1fd8ee3dcd74288`
+- actual launch-context diagnosis: `b59c1ad1a0c95fbe4dcdacb81c1a1c20fcda4e1ff1badc29c36f554a7b70268c`
+- approved actual diagnostic: `218c8a53c6a1eb72aa461685e0d9c9dbf39c6b89fc3ee06aace863ae9323cc18`
+- launch envelope: `e3c6c06daf69111fc566605eb3e1b55547c0257bc81c71b6e9c6fa972c5b9237`
+- fresh user grant: `8ef007db9e1111833b57fee305b419b846b50b95e35a517c45b262b8464e591e`
+- 22-file source authority: `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09`
+
+The helper additionally binds the exact campaign ID, manifest `d6ecfcf650ba705015f11220a5152ff24bbec56faf33bab8399d4a5fad0ead72`, config `934b02388104c31e9d8b570e6319eb158bc401312a634fd63438d78559a389ea`, policy `8b40cb1992ec1e57d73b1951691bea3cee45ffc04f3db82d84e5ff38e6abdd7e`, owner `05b9b28975be1ae9c4a61431a9d1d287a29ec9abc4e39b552dc5188d87065e7e`, worktree, limits, launch-helper hash and canonical saved-argv hash `c1104cbe89d0ce3ab818fb5f3a959e26652bcbdb162ff21540f30e46fc077a54`.
+
+## One-use handoff
+
+Source mode first runs the exact pinned diagnostic with `runpy.run_path`, captures its safe JSON result in memory, and requires the exact four prepared component identities, the full native host graph, 32 unchanged artifact files, and zero provider/evaluator activity. Only then does it obtain `_base_environment` from that genuinely composed native executor. It accepts only unique, sorted string pairs named `PATH`, `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, or `SYSTEMDRIVE`; missing names remain absent.
+
+Source mode creates one random local named-pipe endpoint and writes it to a create-only descriptor containing only `pipe_endpoint`. The pipe permits one instance, rejects remote clients, and uses a single 60-second deadline for accept, claim, payload delivery and acknowledgement. The protocol uses canonical JSON bytes through `send_bytes` and bounded `recv_bytes(128 KiB)` only. It has no pickle/object send, evaluation, authentication secret, credential value, environment dump, or persisted environment payload.
+
+Receiver mode rejects a preexisting claim or result and writes one exclusive claim before connecting. It validates the bounded environment payload, copies its own environment, removes all six control names, and adds only the source entries to that child-only mapping. It never changes `os.environ`. It runs the same exact diagnostic once under that mapping and treats exit zero alone as insufficient: all four component triples, the complete native graph, exact manifest/config, unchanged 32-file snapshot, and no provider/evaluator activity must match.
+
+Only after that proof does receiver mode call `subprocess.Popen` once with the exact saved launch argv, exact worktree, and same child environment. It inherits stdout/stderr, waits for that one child, records only safe booleans/digests/exit status in a create-only result, and returns the child exit code. The permanent claim prevents retry after a handoff, diagnostic, process-start, observation, or campaign failure. No helper path changes campaign artifacts, source, policy, owner, budget, or native launch arguments.
+
+## Static verification
+
+- Scoped Ruff: PASS.
+- AST parse and in-memory compile: PASS.
+- Scoped capture inspection confirms two real `TextIOWrapper`/`BytesIO` pairs, no `StringIO`, and no fake `reconfigure` implementation.
+- AST policy inspection: no project imports in the helper; three `send_bytes`, one bounded `recv_bytes`, zero object `send`/`recv`, zero `eval`/`exec`, one diagnostic `subprocess.run`, and one actual-launch `subprocess.Popen` call.
+- Static ordering inspection: source diagnostic proof precedes pipe/descriptor creation; receiver exclusive claim precedes its connection; receiver diagnostic proof precedes the sole `Popen` call.
+- `git diff --check`: PASS.
+
+No corrected helper mode, project import, named-pipe operation, descriptor, claim, result, diagnostic, provider, evaluator, Docker, campaign, credential, `.env`, or test activity was run during this correction and its static verification.

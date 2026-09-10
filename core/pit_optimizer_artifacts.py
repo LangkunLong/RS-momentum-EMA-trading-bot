@@ -469,7 +469,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _is_link_or_reparse(path: Path) -> bool:
-    metadata = os.lstat(path)
+    metadata = os.lstat(_windows_extended_path(path) if os.name == "nt" else path)
     attributes = getattr(metadata, "st_file_attributes", 0)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
@@ -481,10 +481,10 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, int]:
 
 def _windows_extended_path(path: Path) -> str:
     value = str(path)
-    if value.startswith("\\\\"):
-        return "\\\\?\\UNC\\" + value[2:]
     if value.startswith("\\\\?\\"):
         return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
     return "\\\\?\\" + value
 
 
@@ -494,7 +494,7 @@ def _open_windows_directory_locked(path: Path) -> tuple[int, tuple[int, int]]:
     import ctypes
     from ctypes import wintypes
 
-    before = os.lstat(path)
+    before = os.lstat(_windows_extended_path(path))
     if _is_link_or_reparse(path) or not stat.S_ISDIR(before.st_mode):
         raise ValueError("optimizer artifact parent is a link or reparse point")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -522,7 +522,7 @@ def _open_windows_directory_locked(path: Path) -> tuple[int, tuple[int, int]]:
     if handle in {None, invalid}:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        after = os.lstat(path)
+        after = os.lstat(_windows_extended_path(path))
         if (
             _is_link_or_reparse(path)
             or not stat.S_ISDIR(after.st_mode)
@@ -600,7 +600,7 @@ class _DirectoryAccess:
     def entry_exists(self, name: str) -> bool:
         try:
             if os.name == "nt":
-                metadata = os.lstat(self.path / name)
+                metadata = os.lstat(_windows_extended_path(self.path / name))
             else:
                 metadata = os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
         except FileNotFoundError:
@@ -615,7 +615,10 @@ class _DirectoryAccess:
 
     def unlink(self, name: str) -> None:
         if os.name == "nt":
-            (self.path / name).unlink(missing_ok=True)
+            try:
+                os.unlink(_windows_extended_path(self.path / name))
+            except FileNotFoundError:
+                pass
             return
         try:
             os.unlink(name, dir_fd=self.descriptor)
@@ -624,7 +627,7 @@ class _DirectoryAccess:
 
     def replace(self, source: str, target: str) -> None:
         if os.name == "nt":
-            os.replace(self.path / source, self.path / target)
+            os.replace(_windows_extended_path(self.path / source), _windows_extended_path(self.path / target))
             return
         os.replace(
             source,
@@ -759,7 +762,7 @@ def _extend_directory(
             if not create:
                 raise ValueError("optimizer artifact parent is absent") from None
             try:
-                child.mkdir()
+                os.mkdir(_windows_extended_path(child))
             except FileExistsError:
                 pass
             handle, identity = _open_windows_directory_locked(child)
@@ -806,7 +809,7 @@ def _open_exclusive_file(directory: _DirectoryAccess, name: str) -> int:
     if os.name != "nt":
         flags |= getattr(os, "O_NOFOLLOW", 0)
         return os.open(name, flags, 0o600, dir_fd=directory.descriptor)
-    return os.open(directory.path / name, flags, 0o600)
+    return os.open(_windows_extended_path(directory.path / name), flags, 0o600)
 
 
 def _write_create_only_in_directory(
@@ -844,7 +847,7 @@ def _open_temporary_file(
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{target_name}.",
             suffix=".tmp",
-            dir=directory.path,
+            dir=_windows_extended_path(directory.path),
         )
         return descriptor, Path(temporary_name).name
     for _attempt in range(128):

@@ -1,0 +1,26 @@
+{
+  "artifact_or_source_bytes_rewritten": false,
+  "campaign_initialized": false,
+  "descriptor_created": false,
+  "environment_payload_created_or_published": false,
+  "exit_code": 1,
+  "failure": {
+    "exception_message": "'_io.StringIO' object has no attribute 'reconfigure'",
+    "exception_type": "AttributeError",
+    "terminal_traceback_operation": "backtest.py line 25: sys.stdout.reconfigure(line_buffering=True)"
+  },
+  "launch_attempted": false,
+  "named_pipe_created": false,
+  "paid_spend_or_role_activity": false,
+  "path_observation": {
+    "descriptor_exists": false,
+    "receiver_claim_exists": false,
+    "result_exists": false,
+    "tool_chunk_id": "f3c9e5"
+  },
+  "project_composition_completed": false,
+  "receiver_started": false,
+  "schema_version": 1,
+  "stage": "source_diagnostic_capture_before_pipe_creation",
+  "tool_chunk_id": "845500"
+}

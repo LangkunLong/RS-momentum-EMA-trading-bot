@@ -133,7 +133,7 @@ def _open_regular_descriptor(
     before: os.stat_result | None = None
     if not create_new:
         before = (
-            os.lstat(directory.path / child)
+            os.lstat(_windows_extended_path(directory.path / child))
             if os.name == "nt"
             else os.stat(child, dir_fd=directory.descriptor, follow_symlinks=False)
         )
@@ -154,7 +154,7 @@ def _open_regular_descriptor(
     try:
         opened = os.fstat(descriptor)
         after = (
-            os.lstat(directory.path / child)
+            os.lstat(_windows_extended_path(directory.path / child))
             if os.name == "nt"
             else os.stat(child, dir_fd=directory.descriptor, follow_symlinks=False)
         )

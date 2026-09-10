@@ -363,6 +363,7 @@ def _exact_production_host_adapter_graph_v5(
         and executor.repository is repository
         and _windows_paths_equal_v5(executor.docker_executable, adapter_config.docker_executable)
         and _windows_paths_equal_v5(executor.control_root, adapter_config.control_root)
+        and driver.export_mode == getattr(adapter_config, "export_mode", "full")
         and driver.repository is repository
         and driver.owner is candidate.owner
         and driver.source_commit == authorities.manifest.source_commit
@@ -373,6 +374,36 @@ def _exact_production_host_adapter_graph_v5(
         and mount_factory.mount_identity_sha256 == adapter_config.mount_factory_identity_sha256
         and executor.executor_identity_sha256 == adapter_config.container_executor_identity_sha256
     )
+
+
+def _require_paid_adapter_graph_v5(invoker, *, repository, authorities, adapter_config):
+    if type(invoker) is not LedgerBackedRoleInvokerV5:
+        raise V5CliFailure("production_provider_invalid")
+    runner = invoker.runner
+    if type(runner) is not AuthorizedRoleRunnerV5:
+        raise V5CliFailure("production_provider_invalid")
+    lifecycle = runner.authorization_lifecycle
+    provider = runner.completion_provider
+    if type(provider) is not GatewayCompletionProviderV5:
+        raise V5CliFailure("production_dependency_invalid")
+    gateway = provider.gateway
+    if (
+        type(gateway) is not OpenRouterOneShotJsonCompletionV5
+        or type(lifecycle) is not LocalRoleAuthorizationLedgerV5
+        or invoker.reconciler is not lifecycle
+        or lifecycle.repository is not repository
+        or lifecycle.manifest is not authorities.manifest
+        or gateway.ledger is not lifecycle
+        or gateway.api_key_environment_variable != adapter_config.api_key_environment_variable
+        or runner.capabilities is not authorities.manifest.provider
+        or lifecycle.campaign_manifest_sha256 != authorities.manifest.sha256
+        or lifecycle.ledger_identity_sha256 != adapter_config.ledger_identity_sha256
+        or lifecycle.audit_store_identity_sha256 != adapter_config.audit_store_identity_sha256
+        or gateway.gateway_identity_sha256 != adapter_config.gateway_identity_sha256
+        or gateway.ledger_identity_sha256 != lifecycle.ledger_identity_sha256
+        or gateway.audit_store_identity_sha256 != lifecycle.audit_store_identity_sha256
+    ):
+        raise V5CliFailure("production_dependency_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,35 +434,15 @@ class ProductionRoundCompositionV5:
             or self.dependencies.persistence is not repository
         ):
             raise V5CliFailure("production_authority_mismatch")
-        if type(self.dependencies.invoker) is not LedgerBackedRoleInvokerV5:
-            raise V5CliFailure("production_provider_invalid")
-        runner = self.dependencies.invoker.runner
-        lifecycle = runner.authorization_lifecycle
-        provider = runner.completion_provider
+        _require_paid_adapter_graph_v5(
+            self.dependencies.invoker, repository=repository, authorities=authorities, adapter_config=adapter_config
+        )
         candidate = self.dependencies.candidates
-        if type(provider) is not GatewayCompletionProviderV5:
-            raise V5CliFailure("production_dependency_invalid")
-        gateway = provider.gateway
         base = candidate.base_operations if type(candidate) is DockerCandidateRuntimeV5 else None
         clock = self.dependencies.clock
         cleanup = self.dependencies.cleanup
         if (
-            type(runner) is not AuthorizedRoleRunnerV5
-            or type(gateway) is not OpenRouterOneShotJsonCompletionV5
-            or type(lifecycle) is not LocalRoleAuthorizationLedgerV5
-            or self.dependencies.invoker.reconciler is not lifecycle
-            or lifecycle.repository is not repository
-            or lifecycle.manifest is not authorities.manifest
-            or gateway.ledger is not lifecycle
-            or gateway.api_key_environment_variable != adapter_config.api_key_environment_variable
-            or runner.capabilities is not authorities.manifest.provider
-            or lifecycle.campaign_manifest_sha256 != authorities.manifest.sha256
-            or lifecycle.ledger_identity_sha256 != adapter_config.ledger_identity_sha256
-            or lifecycle.audit_store_identity_sha256 != adapter_config.audit_store_identity_sha256
-            or gateway.gateway_identity_sha256 != adapter_config.gateway_identity_sha256
-            or gateway.ledger_identity_sha256 != lifecycle.ledger_identity_sha256
-            or gateway.audit_store_identity_sha256 != lifecycle.audit_store_identity_sha256
-            or type(candidate) is not DockerCandidateRuntimeV5
+            type(candidate) is not DockerCandidateRuntimeV5
             or candidate.manifest != authorities.manifest
             or candidate.panel_plan != authorities.panel_plan
             or candidate.evaluator_contract != authorities.evaluator_contract
@@ -524,6 +535,37 @@ class ProductionRoundFactoryV5:
         return composition
 
 
+def _compose_paid_invoker_v5(*, repository, manifest, api_key_environment_variable="OPENROUTER_API_KEY"):
+    provider_capabilities = manifest.provider
+    if (
+        provider_capabilities is None
+        or provider_capabilities.automatic_retries != 0
+        or provider_capabilities.schema_repair_calls != 0
+    ):
+        raise V5CliFailure("production_provider_invalid")
+    try:
+        ledger = LocalRoleAuthorizationLedgerV5(
+            repository=repository,
+            manifest=manifest,
+        )
+        gateway = OpenRouterOneShotJsonCompletionV5(
+            ledger=ledger,
+            api_key_environment_variable=api_key_environment_variable,
+        )
+        role_runner = AuthorizedRoleRunnerV5(
+            capabilities=provider_capabilities,
+            provider=GatewayCompletionProviderV5(gateway),
+            lifecycle=ledger,
+        )
+        invoker = LedgerBackedRoleInvokerV5(
+            runner=role_runner,
+            reconciler=ledger,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise V5CliFailure("production_provider_invalid") from exc
+    return invoker
+
+
 def _compose_production_round_from_paths_v5(
     *,
     repository: LocalArtifactRepositoryV5,
@@ -549,6 +591,43 @@ def _compose_production_round_from_paths_v5(
         or provider_capabilities.schema_repair_calls != 0
     ):
         raise V5CliFailure("production_provider_invalid")
+    invoker = _compose_paid_invoker_v5(
+        repository=repository, manifest=authorities.manifest,
+        api_key_environment_variable=api_key_environment_variable,
+    )
+    return _compose_round_from_paths_v5(
+        repository=repository,
+        authorities=authorities,
+        round_index=round_index,
+        owner_token_sha256=owner_token_sha256,
+        source_root=source_root,
+        workspace_root=workspace_root,
+        data_root=data_root,
+        output_root=output_root,
+        control_root=control_root,
+        git_executable=git_executable,
+        docker_executable=docker_executable,
+        invoker=invoker,
+        export_mode="full",
+    )
+
+
+def _compose_round_from_paths_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    authorities: CampaignAuthoritiesV5,
+    round_index: int,
+    owner_token_sha256: str,
+    source_root: str,
+    workspace_root: str,
+    data_root: str,
+    output_root: str,
+    control_root: str,
+    git_executable: str,
+    docker_executable: str,
+    invoker: object,
+    export_mode: str,
+) -> ProductionRoundCompositionV5:
     try:
         owner = WorkspaceOwnerV5(
             authorities.manifest.campaign_id,
@@ -560,26 +639,6 @@ def _compose_production_round_from_paths_v5(
                 owner_token_sha256=owner_token_sha256,
             ),
         )
-        ledger = LocalRoleAuthorizationLedgerV5(
-            repository=repository,
-            manifest=authorities.manifest,
-        )
-        gateway = OpenRouterOneShotJsonCompletionV5(
-            ledger=ledger,
-            api_key_environment_variable=api_key_environment_variable,
-        )
-        role_runner = AuthorizedRoleRunnerV5(
-            capabilities=provider_capabilities,
-            provider=GatewayCompletionProviderV5(gateway),
-            lifecycle=ledger,
-        )
-        invoker = LedgerBackedRoleInvokerV5(
-            runner=role_runner,
-            reconciler=ledger,
-        )
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        raise V5CliFailure("production_provider_invalid") from exc
-    try:
         clock = SystemMonotonicClockV5()
         roots = WorkspaceRootsV5(
             source_root,
@@ -591,6 +650,7 @@ def _compose_production_round_from_paths_v5(
             git_executable=Path(git_executable),
             repository=repository,
             owner=owner,
+            export_mode=export_mode,
         )
         materializer = GitCandidateMaterializerV5(
             roots=roots,
@@ -782,13 +842,23 @@ class ProductionV5CommandServices:
             )
             if cleanups:
                 last_cleanup = cleanups[-1]
-        if last_cleanup is not None and last_cleanup.cleanup_complete and not all(resource_cleanup_states):
+        # A prior development round's cleanup does not retire a pending later round.
+        if (
+            authorities.manifest.pit_data_scope != "development_sp500_v2"
+            and last_cleanup is not None
+            and last_cleanup.cleanup_complete
+            and not all(resource_cleanup_states)
+        ):
             raise V5CliFailure("artifact_graph_invalid")
         checkpoint = repository.load_checkpoint()
         if checkpoint is not None:
             tuple(repository.load_experiment(reference) for reference in checkpoint.record_refs)
         if authorities.manifest.provider is None:
-            if packages:
+            if authorities.manifest.pit_data_scope == "development_sp500_v2":
+                from core.pit_optimizer_v5.development_preparation import authenticate_controller_packages_v5
+
+                authenticate_controller_packages_v5(repository, authorities.manifest, tuple(packages))
+            elif packages:
                 raise V5CliFailure("production_provider_invalid")
         else:
             try:
@@ -870,6 +940,7 @@ class ProductionV5CommandServices:
                 git_executable=Path(config.git_executable),
                 repository=repository,
                 owner=owner,
+                export_mode=getattr(config, "export_mode", "full"),
             )
             workspace_states = tuple(driver.authenticate_lease_history(item) for item in leases)
             retired = tuple(state.lifecycle == "retired" for state in workspace_states)
@@ -980,8 +1051,41 @@ class ProductionV5CommandServices:
             if not completed:
                 raise V5CliFailure("runtime_failed", exit_code=1, summary=summary)
             return summary
-        authorities = self._authorities(repository, request.manifest_ref)
         if request.command in {"verify-run", "summarize"}:
+            authenticated = authenticate_campaign_manifest_v5(repository=repository, manifest_ref=request.manifest_ref)
+            if authenticated.manifest.pit_data_scope == "development_sp500_v2":
+                from core.pit_optimizer_v5.development_preparation import require_development_v5
+
+                require_development_v5(authenticated.manifest)
+                authorities = CampaignAuthoritiesV5(
+                    authenticated.manifest,
+                    authenticated.panel_plan,
+                    authenticated.evaluator_contract,
+                    authenticated.baseline_authority,
+                    authenticated.sandbox_profile,
+                )
+            else:
+                authorities = self._authorities(repository, request.manifest_ref)
+        else:
+            # Standalone run/resume retain the production-only authority boundary.
+            authorities = self._authorities(repository, request.manifest_ref)
+        if request.command in {"verify-run", "summarize"}:
+            if (
+                authorities.manifest.pit_data_scope == "development_sp500_v2"
+                and authorities.manifest.semantic_mode == "disabled_development"
+            ):
+                from core.pit_optimizer_v5.development_preparation import load_development_config_v5
+
+                if request.adapter_config_ref is None:
+                    raise V5CliFailure("production_config_missing")
+                config = load_development_config_v5(repository, authorities, request.adapter_config_ref)
+                self._verify_local_run(repository, authorities, config)
+                return summarize_repository_v5(
+                    repository=repository,
+                    manifest=authorities.manifest,
+                    command=request.command,
+                    readiness_code="verified" if request.command == "verify-run" else "ready",
+                )
             if authorities.manifest.provider is None:
                 from core.pit_optimizer_v5.fixture_runtime import verify_fixture_run_v5
 
@@ -1088,17 +1192,19 @@ def build_parser_v5() -> argparse.ArgumentParser:
         if name in {"run", "resume", "verify-run", "summarize"}:
             command.add_argument("--adapter-config-path")
             command.add_argument("--adapter-config-sha256")
-    for name in ("prepare-production", "run-campaign", "resume-campaign"):
+    for name in ("prepare-production", "prepare-development", "run-campaign", "resume-campaign"):
         command = commands.add_parser(name, allow_abbrev=False)
         command.add_argument("--artifact-root", required=True)
         command.add_argument("--manifest-path", required=True)
         command.add_argument("--manifest-sha256", required=True)
-        command.add_argument("--owner-token-sha256", required=name != "prepare-production")
-        if name == "prepare-production":
+        command.add_argument("--owner-token-sha256", required=not name.startswith("prepare-"))
+        if name.startswith("prepare-"):
             for root in ("source", "workspace", "data", "output", "control"):
                 command.add_argument(f"--{root}-root", required=True)
             command.add_argument("--git-executable", help="Git executable; defaults to discovery on PATH")
             command.add_argument("--docker-executable", help="Docker executable; defaults to discovery on PATH")
+            if name == "prepare-development":
+                command.add_argument("--response-directory")
             command.add_argument("--round-index", type=int, default=1)
             command.add_argument(
                 "--output-path", required=True, help="Adapter config path relative to the artifact root"
@@ -1106,6 +1212,19 @@ def build_parser_v5() -> argparse.ArgumentParser:
         else:
             command.add_argument("--adapter-config-path", required=True)
             command.add_argument("--adapter-config-sha256", required=True)
+            command.add_argument("--campaign-policy-path")
+            command.add_argument("--campaign-policy-sha256")
+    for name in ("import-development", "controller-request", "controller-response"):
+        command = commands.add_parser(name, allow_abbrev=False)
+        command.add_argument("--artifact-root", required=True)
+        if name == "import-development":
+            command.add_argument("--input-file", required=True)
+            command.add_argument("--validate-only", action="store_true")
+        else:
+            for option in ("manifest-path", "manifest-sha256", "request-path", "request-sha256"):
+                command.add_argument("--" + option, required=True)
+            if name == "controller-response":
+                command.add_argument("--response-file", required=True)
     initialize = commands.add_parser("init-stage-ledgers", allow_abbrev=False)
     _add_panel_data_arguments_v5(initialize)
     initialize.add_argument("--confirmation-ledger-path", required=True)
@@ -1939,10 +2058,14 @@ def dispatch_v5_cli(
     emit: Callable[[str], None] = print,
 ) -> int:
     """Parse and dispatch one command; dependency construction stays outside parsing."""
-    if argv and argv[0] in {"prepare-production", "run-campaign", "resume-campaign"}:
+    if argv and argv[0] in {"prepare-production", "prepare-development", "run-campaign", "resume-campaign"}:
         from core.pit_optimizer_v5.operations import dispatch_production_operations_cli_v5
 
         return dispatch_production_operations_cli_v5(argv, emit=emit)
+    if argv and argv[0] in {"import-development", "controller-request", "controller-response"}:
+        from core.pit_optimizer_v5.development_preparation import dispatch_development_cli_v5
+
+        return dispatch_development_cli_v5(argv, emit=emit)
     if argv and argv[0] in _BASELINE_COMMANDS:
         return dispatch_baseline_cli_v5(argv, emit=emit)
     if argv and argv[0] in _PANEL_COMMANDS:

@@ -1,0 +1,28 @@
+{
+  "review_sha256": "4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b",
+  "scope": "Final independently approved P1-P4 host source; actual immutable historical collector only, no campaign grant",
+  "source_sha256_by_path": {
+    "core/pit_optimizer_v5/artifacts.py": "2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2",
+    "core/pit_optimizer_v5/campaign_admission.py": "3ea07b2b6db87cec0d1347aebb8035960a24de3fd2c7b9ec69f63b3db5d75670",
+    "core/pit_optimizer_v5/candidate_ir.py": "a437d9536fb57d48c7e9c9c6fab2f8a29ac9bea0666be61caeb2baf583b13f1b",
+    "core/pit_optimizer_v5/cli.py": "cf127dba9914911e51b7c9a7bf907ed3208aaffa8fb81184e30b1a0e7debae74",
+    "core/pit_optimizer_v5/contracts.py": "5ec3278af501f4abf285716bbd4d211fe5cd34c873e1644b63e3d43daa3de398",
+    "core/pit_optimizer_v5/controller_roles.py": "62f7414dd31a7970d08bcbf7fcc7faaeb19e5ee806cba5363311aef338b15b1f",
+    "core/pit_optimizer_v5/development_preparation.py": "4c2336bd973f349cd5aa1d5b8b78353f80e458e22daa9349d85c67775c08521e",
+    "core/pit_optimizer_v5/historical_verification.py": "978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b",
+    "core/pit_optimizer_v5/manifest.py": "813970f8f9ea467c2af8e674c4f9d90b25d06796f798c02d8e9134ad32daeded",
+    "core/pit_optimizer_v5/memory.py": "37e3a04791d827edd0e5fe99e1d62cb9997163f66954f99727177248f8949d76",
+    "core/pit_optimizer_v5/operations.py": "02249f02dfad345ef3b6cca59a378f5bc0a211517427991f4c661158e9883942",
+    "core/pit_optimizer_v5/production_fs.py": "26e744b81bd9ab9b2b241980657ce924f13783aeb06372f4d4f1db447a02b06a",
+    "core/pit_optimizer_v5/production_provider.py": "e8aa63d92f48574bfb082f20a15f253f06c4e304d9afee95f0b02ed7954b80f4",
+    "core/pit_optimizer_v5/production_runtime.py": "9d1fad0710037a64b46d1745d107203d114483baac215563e49e1c28e8892f83",
+    "core/pit_optimizer_v5/production_sandbox.py": "8dd79cef1e524a87cc324745ac7ee49fbbe5e1a91f271ce0d641451dc99337d7",
+    "core/pit_optimizer_v5/production_workspace.py": "4e040d8edae52bab0635af6327601bf62e34011976182a213e925bfdb9f8b115",
+    "core/pit_optimizer_v5/provider.py": "d9b17d62a6c8b485ba6ae6abb22a9e87f9d908b3c96409ba6e21f86eb691e937",
+    "core/pit_optimizer_v5/rendering.py": "bd726b9a32ddaf675a9883aade2099747a8682ab6be5f36d465de77542e93464",
+    "core/pit_optimizer_v5/runtime.py": "d834eae8e3e120355b4479c77f87ebe46519a0b82a52cc072abe1dab60943aec",
+    "core/pit_optimizer_v5/search.py": "2f756453123ce834d03cf5fcd2eb57c82781fe228d77e7d4218b600c1b124e3c",
+    "core/pit_optimizer_v5/selection.py": "208bf033ffbb2222cf5df4d35741f4b562e0c359a9cb5504dce8e846205085d9",
+    "core/pit_optimizer_v5/summary.py": "bbf96eeece0e5c3aab963e975977f16f703ec5780802869c565558d9f9f588c5"
+  }
+}

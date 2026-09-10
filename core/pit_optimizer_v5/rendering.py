@@ -11,6 +11,7 @@ import io
 import math
 import token
 import tokenize
+from typing import Literal
 
 from core.pit_optimizer_v5.candidate_ir import (
     LiteralAxisV5,
@@ -33,10 +34,26 @@ from core.pit_optimizer_v5.policy_scope import (
 
 
 _AXIS_MARKER = "PIT_AXIS"
+_REJECTED_VARIANT_FAILURE_CODE_V5 = "policy_source_unbounded_or_stateful"
+_REJECTED_VARIANT_AST_ERROR_V5 = "V5 policy AST contains an unbounded or stateful construct"
 
 
 class VariantRenderingCollisionV5(ValueError):
     """Two distinct strict assignments rendered the same complete source bytes."""
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedVariantV5:
+    """A bounded assignment rejected before source materialization or identity derivation."""
+
+    assignment: VariantAssignmentV5
+    failure_code: Literal["policy_source_unbounded_or_stateful"]
+
+    def __post_init__(self) -> None:
+        if type(self.assignment) is not VariantAssignmentV5:
+            raise ValueError("rejected variant assignment is invalid")
+        if type(self.failure_code) is not str or self.failure_code != _REJECTED_VARIANT_FAILURE_CODE_V5:
+            raise ValueError("rejected variant failure code is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,6 +393,25 @@ def _ordered_assignments(
     )
 
 
+def bounded_variant_assignments_v5(
+    *,
+    template: StructuralTemplateV5,
+    maximum: int,
+) -> tuple[VariantAssignmentV5, ...]:
+    """Return the renderer's exact capped assignment order without source rendering."""
+
+    if type(template) is not StructuralTemplateV5:
+        raise ValueError("variant template must use the V5 structural schema")
+    if type(maximum) is not int or maximum <= 0:
+        raise ValueError("variant maximum must be a positive integer")
+    assignments: list[VariantAssignmentV5] = []
+    for assignment in _ordered_assignments(template.axes):
+        assignments.append(assignment)
+        if len(assignments) == maximum:
+            break
+    return tuple(assignments)
+
+
 def _source_map(bundle: SourceBundleV5) -> dict[str, str]:
     return {item.path: item.source for item in bundle.files}
 
@@ -579,14 +615,15 @@ def _validate_render_inputs(
         _assert_no_marker_token(path=item.path, source=item.source)
 
 
-def render_variants(
+def _render_variant_outcomes(
     *,
     parent: SourceBundleV5,
     parent_revision: PolicyRevisionIdentityV5,
     template: StructuralTemplateV5,
     maximum: int,
-) -> tuple[RenderedVariantV5, ...]:
-    """Render capped, assignment-distinct variants without rewriting unrelated bytes."""
+    capture_known_ast_rejection: bool,
+) -> tuple[RenderedVariantV5 | RejectedVariantV5, ...]:
+    """Render capped outcomes while preserving strict assignment and collision handling."""
 
     _validate_render_inputs(
         parent=parent,
@@ -604,12 +641,12 @@ def render_variants(
             template=template,
         )
 
-    rendered_variants: list[RenderedVariantV5] = []
+    outcomes: list[RenderedVariantV5 | RejectedVariantV5] = []
     seen_bundles: dict[
         tuple[tuple[str, str], ...],
         tuple[tuple[str, type[object], object], ...],
     ] = {}
-    for assignment in _ordered_assignments(template.axes):
+    for assignment in bounded_variant_assignments_v5(template=template, maximum=maximum):
         if template.source_operations:
             rendered_sources = _render_operation_sources(
                 parent_sources=parent_sources,
@@ -629,27 +666,86 @@ def render_variants(
             parent_sources=parent_sources,
             rendered_sources=rendered_sources,
         )
-        source_bundle = _bundle_from_sources(rendered_sources)
-        bundle_key = tuple((item.path, item.source) for item in source_bundle.files)
-        prior_assignment = seen_bundles.get(bundle_key)
-        if prior_assignment is not None:
-            raise VariantRenderingCollisionV5("distinct strict assignments rendered identical complete source bytes")
-        seen_bundles[bundle_key] = _assignment_key(assignment)
-        policy_revision = derive_policy_revision_identity_v5(
-            source_bundle=source_bundle,
-            trusted_policy_runtime_sha256=(parent_revision.trusted_policy_runtime_sha256),
-            immutable_constraints_sha256=(parent_revision.immutable_constraints_sha256),
-        )
-        rendered_variants.append(
-            RenderedVariantV5(
-                assignment=assignment,
-                source_bundle=source_bundle,
-                policy_revision=policy_revision,
+        try:
+            source_bundle = _bundle_from_sources(rendered_sources)
+        except ValueError as exc:
+            if not capture_known_ast_rejection or str(exc) != _REJECTED_VARIANT_AST_ERROR_V5:
+                raise
+            outcomes.append(
+                RejectedVariantV5(
+                    assignment=assignment,
+                    failure_code=_REJECTED_VARIANT_FAILURE_CODE_V5,
+                )
             )
-        )
-        if len(rendered_variants) == maximum:
+        else:
+            bundle_key = tuple((item.path, item.source) for item in source_bundle.files)
+            prior_assignment = seen_bundles.get(bundle_key)
+            if prior_assignment is not None:
+                raise VariantRenderingCollisionV5("distinct strict assignments rendered identical complete source bytes")
+            seen_bundles[bundle_key] = _assignment_key(assignment)
+            policy_revision = derive_policy_revision_identity_v5(
+                source_bundle=source_bundle,
+                trusted_policy_runtime_sha256=(parent_revision.trusted_policy_runtime_sha256),
+                immutable_constraints_sha256=(parent_revision.immutable_constraints_sha256),
+            )
+            outcomes.append(
+                RenderedVariantV5(
+                    assignment=assignment,
+                    source_bundle=source_bundle,
+                    policy_revision=policy_revision,
+                )
+            )
+        if len(outcomes) == maximum:
             break
-    return tuple(rendered_variants)
+    return tuple(outcomes)
 
 
-__all__ = ["VariantRenderingCollisionV5", "render_variants"]
+def render_variant_outcomes_v5(
+    *,
+    parent: SourceBundleV5,
+    parent_revision: PolicyRevisionIdentityV5,
+    template: StructuralTemplateV5,
+    maximum: int,
+) -> tuple[RenderedVariantV5 | RejectedVariantV5, ...]:
+    """Render capped variants or the one closed host-side source rejection outcome."""
+
+    return _render_variant_outcomes(
+        parent=parent,
+        parent_revision=parent_revision,
+        template=template,
+        maximum=maximum,
+        capture_known_ast_rejection=True,
+    )
+
+
+def render_variants(
+    *,
+    parent: SourceBundleV5,
+    parent_revision: PolicyRevisionIdentityV5,
+    template: StructuralTemplateV5,
+    maximum: int,
+) -> tuple[RenderedVariantV5, ...]:
+    """Render capped, assignment-distinct variants without rejection outcomes."""
+
+    outcomes = _render_variant_outcomes(
+        parent=parent,
+        parent_revision=parent_revision,
+        template=template,
+        maximum=maximum,
+        capture_known_ast_rejection=False,
+    )
+    rendered: list[RenderedVariantV5] = []
+    for outcome in outcomes:
+        if type(outcome) is not RenderedVariantV5:
+            raise RuntimeError("strict variant rendering returned a rejection outcome")
+        rendered.append(outcome)
+    return tuple(rendered)
+
+
+__all__ = [
+    "RejectedVariantV5",
+    "VariantRenderingCollisionV5",
+    "bounded_variant_assignments_v5",
+    "render_variant_outcomes_v5",
+    "render_variants",
+]

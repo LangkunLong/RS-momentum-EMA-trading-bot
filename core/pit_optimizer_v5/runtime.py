@@ -16,6 +16,7 @@ from core.pit_optimizer_v5.candidate_ir import (
     RenderedVariantV5,
     SourceBundleV5,
     StructuralTemplateV5,
+    VariantAssignmentV5,
     derive_experiment_identity_v5,
     derive_pre_validation_invalid_experiment_identity_v5,
 )
@@ -31,6 +32,7 @@ from core.pit_optimizer_v5.contracts import (
     InvestigatorArtifactV5,
     PanelEvaluationV5,
     ValidationResultV5,
+    canonical_json_bytes_v5,
     canonical_sha256_v5,
     selected_scenario,
     validate_campaign_evidence_v5,
@@ -53,6 +55,7 @@ from core.pit_optimizer_v5.memory import (
     NoveltyExhaustedAuthorityV5,
     PreCriticEvidenceIdentityV5,
     QuickEvidencePayloadV5,
+    RenderRejectionPayloadV5,
     RenderedVariantPayloadV5,
     ResourceLeasePayloadV5,
     RoleCompletionPayloadV5,
@@ -64,6 +67,7 @@ from core.pit_optimizer_v5.memory import (
     SchedulingCursorV5,
     StoredExperimentRecordV5,
     is_testable_experiment_status_v5,
+    round_event_payload_primitive_v5,
 )
 from core.pit_optimizer_v5.probes import (
     BEHAVIORAL_EQUIVALENT_ON_SUITE_V1,
@@ -71,6 +75,7 @@ from core.pit_optimizer_v5.probes import (
     classify_semantic_fingerprints_v5,
 )
 from core.pit_optimizer_v5.provider import (
+    AuthorRoleInputV5,
     ControllerRoleResponsePendingV5,
     ControllerRoleTerminalAuthorityV5,
     CriticRoleInputV5,
@@ -87,7 +92,7 @@ from core.pit_optimizer_v5.provider import (
     RoleReconciliationFailureV5,
     RoleRequestV5,
 )
-from core.pit_optimizer_v5.rendering import render_variants
+from core.pit_optimizer_v5.rendering import RejectedVariantV5, render_variant_outcomes_v5
 from core.pit_optimizer_v5.search import (
     ArchiveRecordAuthorityV5,
     BaselineParentAuthorityV5,
@@ -357,6 +362,67 @@ class CandidateEvidenceV5:
     @property
     def experiment_id(self) -> str:
         return self.experiment_identity.sha256
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedCandidateEvidenceV5:
+    """Closed pre-materialization rejection; event authentication is deferred to B3b."""
+
+    experiment_identity: PreValidationInvalidExperimentIdentityV5
+    template: StructuralTemplateV5
+    assignment: VariantAssignmentV5
+    validation: ValidationResultV5
+    rejection_event_ref: ArtifactRefV5
+
+    def __post_init__(self) -> None:
+        if type(self.experiment_identity) is not PreValidationInvalidExperimentIdentityV5:
+            raise ValueError("rejected candidate identity is invalid")
+        if type(self.template) is not StructuralTemplateV5:
+            raise ValueError("rejected candidate template is invalid")
+        if type(self.assignment) is not VariantAssignmentV5:
+            raise ValueError("rejected candidate assignment is invalid")
+        if type(self.validation) is not ValidationResultV5:
+            raise ValueError("rejected candidate validation is invalid")
+        if type(self.rejection_event_ref) is not ArtifactRefV5:
+            raise ValueError("rejected candidate event reference is invalid")
+        if self.experiment_identity.template_sha256 != self.template.sha256:
+            raise ValueError("rejected candidate template differs from its identity")
+        if self.experiment_identity.assignment_sha256 != self.assignment.sha256:
+            raise ValueError("rejected candidate assignment differs from its identity")
+        if self.experiment_identity.parent_revision_sha256 != self.template.parent_revision_sha256:
+            raise ValueError("rejected candidate parent differs from its template")
+        if (
+            self.validation.valid
+            or self.validation.failure_code != "policy_source_unbounded_or_stateful"
+            or self.validation.changed_symbols != ()
+        ):
+            raise ValueError("rejected candidate validation is not the closed render rejection")
+        event_path = self.rejection_event_ref.relative_path.split("/")
+        if (
+            len(event_path) != 4
+            or event_path[0] != "events"
+            or len(event_path[2]) < 4
+            or not event_path[2].isdigit()
+            or not event_path[3].endswith(".json")
+            or len(event_path[3][:-5]) < 6
+            or not event_path[3][:-5].isdigit()
+        ):
+            raise ValueError("rejected candidate event reference is not a round event path")
+
+    @property
+    def experiment_id(self) -> str:
+        return self.experiment_identity.sha256
+
+    @property
+    def status(self) -> Literal["invalid"]:
+        return "invalid"
+
+    @property
+    def artifact_refs(self) -> tuple[ArtifactRefV5, ...]:
+        return (self.rejection_event_ref,)
+
+
+CandidateRecordEvidenceV5 = CandidateEvidenceV5 | RejectedCandidateEvidenceV5
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,9 +815,9 @@ class ExperimentRecordFactoryV5(Protocol):
         parent: ParentCandidateV5,
         decision: ScheduledHypothesisV5,
         template: StructuralTemplateV5,
-        candidates: tuple[CandidateEvidenceV5, ...],
-        critic: CriticArtifactV5,
-        critic_ref: ArtifactRefV5,
+        candidates: tuple[CandidateRecordEvidenceV5, ...],
+        critic: CriticArtifactV5 | None,
+        critic_ref: ArtifactRefV5 | None,
     ) -> tuple[ExperimentRecordV5, ...]: ...
 
 
@@ -925,6 +991,24 @@ class _Journal:
             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
         return matches[0]
 
+    def event_reference(self, payload: RoundEventPayloadV5) -> ArtifactRefV5:
+        payload_bytes = canonical_json_bytes_v5(round_event_payload_primitive_v5(payload))
+        matches = tuple(
+            event
+            for event, item in zip(self.events, self.payloads, strict=True)
+            if type(item) is type(payload)
+            and canonical_json_bytes_v5(round_event_payload_primitive_v5(item)) == payload_bytes
+        )
+        if len(matches) != 1:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        event = matches[0]
+        if event.campaign_id != self._inputs.campaign_id or event.round_index != self._inputs.round_index:
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+        return ArtifactRefV5(
+            relative_path=f"events/{event.campaign_id}/{event.round_index:04d}/{event.sequence:06d}.json",
+            sha256=event.sha256,
+        )
+
     def lease_payloads(self) -> tuple[ResourceLeasePayloadV5, ...]:
         return tuple(payload for payload in self.payloads if isinstance(payload, ResourceLeasePayloadV5))
 
@@ -952,6 +1036,7 @@ class _Journal:
                 RoleCompletionPayloadV5: "role_completion",
                 RoundIntentPayloadV5: "round_intent",
                 RenderedVariantPayloadV5: "rendered_variant",
+                RenderRejectionPayloadV5: "render_rejected",
                 CandidateStageResultPayloadV5: "candidate_stage_result",
                 QuickEvidencePayloadV5: "quick_evidence",
                 EpisodeEvidencePayloadV5: "episode_evidence",
@@ -1178,8 +1263,11 @@ class _Runtime:
 
     def _valid_terminal_authority(self, package: RoleInvocationPackageV5) -> bool:
         authority_type = type(package.terminal_authority)
-        if self.inputs.manifest.pit_data_scope == "development_sp500_v2":
-            return self.inputs.manifest.provider is None and authority_type is ControllerRoleTerminalAuthorityV5
+        if (
+            self.inputs.manifest.pit_data_scope == "development_sp500_v2"
+            and self.inputs.manifest.provider is None
+        ):
+            return authority_type is ControllerRoleTerminalAuthorityV5
         if self.inputs.manifest.provider is None:
             return authority_type is FixtureRoleTerminalAuthorityV5
         return authority_type is LedgerRoleTerminalAuthorityV5
@@ -1719,6 +1807,7 @@ class _Runtime:
         experiment_id: str,
         payload_type: (
             type[RenderedVariantPayloadV5]
+            | type[RenderRejectionPayloadV5]
             | type[CandidateStageResultPayloadV5]
             | type[QuickEvidencePayloadV5]
             | type[EpisodeEvidencePayloadV5]
@@ -2285,19 +2374,102 @@ class _Runtime:
         del materialized, deadline
         return record.semantic_fingerprint
 
+    def _rejected_candidate(
+        self,
+        *,
+        template: StructuralTemplateV5,
+        parent: ParentCandidateV5,
+        decision: ScheduledHypothesisV5,
+        outcome: RejectedVariantV5,
+        deadline: StageDeadlineV5,
+    ) -> RejectedCandidateEvidenceV5:
+        if self.dependencies.cancellation.is_cancelled():
+            raise _RuntimeAbort(RuntimeFailureV5("rendering", "cancelled"))
+        self._check_finished(deadline)
+        author = self.journal.role_completion("author")
+        if (
+            author is None
+            or author.outcome != "accepted"
+            or author.campaign_id != self.inputs.campaign_id
+            or author.round_index != self.inputs.round_index
+            or author.artifact_sha256 != template.sha256
+            or type(author.artifact_ref) is not ArtifactRefV5
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role="author"))
+        package = self.dependencies.persistence.load_role_invocation(author)
+        if (
+            type(package) is not RoleInvocationPackageV5
+            or not package.accepted
+            or package.call.campaign_id != self.inputs.campaign_id
+            or package.call.round_index != self.inputs.round_index
+            or package.call.role != "author"
+            or type(package.artifact) is not StructuralTemplateV5
+            or canonical_json_bytes_v5(package.artifact.to_primitive()) != canonical_json_bytes_v5(template.to_primitive())
+            or type(package.request.role_input) is not AuthorRoleInputV5
+            or package.request.role_input.hypothesis.sha256 != decision.hypothesis.sha256
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role="author"))
+        identity = derive_pre_validation_invalid_experiment_identity_v5(
+            parent_revision_sha256=parent.policy_identity_sha256,
+            hypothesis=decision.hypothesis,
+            template=template,
+            assignment=outcome.assignment,
+            round_index=self.inputs.round_index,
+            discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
+        )
+        expected = RenderRejectionPayloadV5(
+            experiment_identity=identity,
+            assignment=outcome.assignment,
+            author_artifact_ref=author.artifact_ref,
+            failure_code=outcome.failure_code,
+        )
+        expected_bytes = canonical_json_bytes_v5(round_event_payload_primitive_v5(expected))
+        existing = self._existing_payload(identity.sha256, RenderRejectionPayloadV5)
+        related = tuple(
+            item
+            for item in self.journal.payloads
+            if type(item) is RenderRejectionPayloadV5
+            and (item.experiment_identity.sha256 == identity.sha256 or item.assignment.sha256 == outcome.assignment.sha256)
+        )
+        if (
+            len(related) > 1
+            or (related and existing is None)
+            or any(canonical_json_bytes_v5(round_event_payload_primitive_v5(item)) != expected_bytes for item in related)
+        ):
+            raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256))
+        if existing is not None:
+            if canonical_json_bytes_v5(round_event_payload_primitive_v5(existing)) != expected_bytes:
+                raise _RuntimeAbort(
+                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                )
+            payload = existing
+        else:
+            if self.dependencies.cancellation.is_cancelled():
+                raise _RuntimeAbort(RuntimeFailureV5("rendering", "cancelled", experiment_id=identity.sha256))
+            self._check_finished(deadline, experiment_id=identity.sha256)
+            self.journal.append(expected, experiment_id=identity.sha256)
+            payload = expected
+        return RejectedCandidateEvidenceV5(
+            experiment_identity=identity,
+            template=template,
+            assignment=outcome.assignment,
+            validation=ValidationResultV5(False, "policy_source_unbounded_or_stateful", ()),
+            rejection_event_ref=self.journal.event_reference(payload),
+        )
+
     def _render_and_quick_screen(
         self,
         *,
         parent: ParentCandidateV5,
         decision: ScheduledHypothesisV5,
         template: StructuralTemplateV5,
-    ) -> tuple[CandidateEvidenceV5, ...]:
+    ) -> tuple[CandidateRecordEvidenceV5, ...]:
         deadline = self._deadline("rendering", self.inputs.manifest.resources.round_wall_timeout_seconds)
         parent_source = self.dependencies.candidates.load_parent_source(parent)
         if type(parent_source) is not SourceBundleV5 or parent_source.sha256 != parent.source_bundle_ref.sha256:
             raise _RuntimeAbort(RuntimeFailureV5("rendering", "invalid_dependency_result"))
         try:
-            variants = render_variants(
+            variants = render_variant_outcomes_v5(
                 parent=parent_source,
                 parent_revision=parent.policy_revision,
                 template=template,
@@ -2308,15 +2480,25 @@ class _Runtime:
         if not variants or len(variants) > self.inputs.manifest.search.max_variants_per_template:
             raise _RuntimeAbort(RuntimeFailureV5("rendering", "invalid_dependency_result"))
         self._check_finished(deadline)
-        candidates = tuple(
-            self._initial_candidate(
-                template=template,
-                variant=variant,
-                parent=parent,
-                decision=decision,
-            )
-            for variant in variants
-        )
+        candidates: list[CandidateRecordEvidenceV5] = []
+        for variant in variants:
+            if type(variant) is RenderedVariantV5:
+                candidates.append(self._initial_candidate(
+                    template=template,
+                    variant=variant,
+                    parent=parent,
+                    decision=decision,
+                ))
+            elif type(variant) is RejectedVariantV5:
+                candidates.append(self._rejected_candidate(
+                    template=template,
+                    parent=parent,
+                    decision=decision,
+                    outcome=variant,
+                    deadline=deadline,
+                ))
+            else:
+                raise _RuntimeAbort(RuntimeFailureV5("rendering", "invalid_dependency_result"))
         quick_candidates = tuple(
             QuickScreenCandidateV5(
                 template=template,
@@ -2329,7 +2511,7 @@ class _Runtime:
                 quick_evidence=item.quick_evidence,
             )
             for item in candidates
-            if item.status == "quick_ready"
+            if type(item) is CandidateEvidenceV5 and item.status == "quick_ready"
         )
         deadline = self._deadline("survivor_selection", self.inputs.manifest.resources.round_wall_timeout_seconds)
         try:
@@ -2345,21 +2527,30 @@ class _Runtime:
         survivor_revisions = {item.policy_identity_sha256 for item in survivors}
         return tuple(
             item
-            if item.status != "quick_ready" or item.materialized.variant.policy_revision.sha256 in survivor_revisions
+            if (
+                type(item) is RejectedCandidateEvidenceV5
+                or item.status != "quick_ready"
+                or item.materialized.variant.policy_revision.sha256 in survivor_revisions
+            )
             else replace(item, status="quick_rejected")
             for item in candidates
         )
 
     def _evaluate_discovery(
         self,
-        candidates: tuple[CandidateEvidenceV5, ...],
-    ) -> tuple[CandidateEvidenceV5, ...]:
+        candidates: tuple[CandidateRecordEvidenceV5, ...],
+    ) -> tuple[CandidateRecordEvidenceV5, ...]:
         episode_order = discovery_episode_execution_order_v5(
             discovery_plan=self.inputs.panel_plan,
             round_index=self.inputs.round_index,
         )
-        result: list[CandidateEvidenceV5] = []
+        result: list[CandidateRecordEvidenceV5] = []
         for candidate in candidates:
+            if type(candidate) is RejectedCandidateEvidenceV5:
+                result.append(candidate)
+                continue
+            if type(candidate) is not CandidateEvidenceV5:
+                raise _RuntimeAbort(RuntimeFailureV5("discovery_evaluation", "invalid_dependency_result"))
             if candidate.status != "quick_ready":
                 result.append(candidate)
                 continue
@@ -2585,19 +2776,68 @@ class _Runtime:
         parent: ParentCandidateV5,
         decision: ScheduledHypothesisV5,
         template: StructuralTemplateV5,
-        candidates: tuple[CandidateEvidenceV5, ...],
-        critic: CriticArtifactV5,
-        critic_ref: ArtifactRefV5,
+        candidates: tuple[CandidateRecordEvidenceV5, ...],
+        critic: CriticArtifactV5 | None,
+        critic_ref: ArtifactRefV5 | None,
     ) -> tuple[ExperimentRecordV5, ...]:
-        reviews = {review.experiment_id: review for review in critic.reviews}
-        expected_review_ids = tuple(
-            candidate.experiment_id for candidate in candidates if is_testable_experiment_status_v5(candidate.status)
-        )
-        if tuple(reviews) != expected_review_ids:
+        if type(candidates) is not tuple or not candidates:
             raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+        expected_review_ids: list[str] = []
+        for candidate in candidates:
+            if type(candidate) is CandidateEvidenceV5:
+                if is_testable_experiment_status_v5(candidate.status):
+                    expected_review_ids.append(candidate.experiment_id)
+            elif type(candidate) is not RejectedCandidateEvidenceV5:
+                raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+        if (critic is None) != (critic_ref is None):
+            raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+        if critic is not None and (type(critic) is not CriticArtifactV5 or type(critic_ref) is not ArtifactRefV5):
+            raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+        if expected_review_ids:
+            if critic is None or critic_ref is None:
+                raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+            reviews = {review.experiment_id: review for review in critic.reviews}
+            if tuple(reviews) != tuple(expected_review_ids):
+                raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+        else:
+            if critic is not None or critic_ref is not None:
+                raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
+            reviews = {}
         records: list[ExperimentRecordV5] = []
         try:
             for candidate in candidates:
+                if type(candidate) is RejectedCandidateEvidenceV5:
+                    if candidate.template != template or candidate.template.sha256 != template.sha256:
+                        raise ValueError("rejected candidate template differs from record construction template")
+                    records.append(
+                        ExperimentRecordV5(
+                            experiment_id=candidate.experiment_id,
+                            experiment_identity=candidate.experiment_identity,
+                            round_index=self.inputs.round_index,
+                            parent_revision_sha256=parent.policy_identity_sha256,
+                            parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
+                            pit_data_scope=self.inputs.manifest.pit_data_scope,
+                            semantic_mode=self.inputs.manifest.semantic_mode,
+                            hypothesis=decision.hypothesis,
+                            template=template,
+                            template_sha256=template.sha256,
+                            variant_assignment=candidate.assignment,
+                            policy_revision=None,
+                            semantic_fingerprint=None,
+                            status="invalid",
+                            validation=candidate.validation,
+                            quick_evidence=None,
+                            discovery_episodes=(),
+                            campaign_evidence=None,
+                            target_gap_pct=None,
+                            critic_review=None,
+                            artifact_refs=candidate.artifact_refs,
+                            critic_artifact_ref=None,
+                        )
+                    )
+                    continue
+                if type(candidate) is not CandidateEvidenceV5:
+                    raise ValueError("record candidate carrier is invalid")
                 testable = is_testable_experiment_status_v5(candidate.status)
                 campaign = candidate.campaign_evidence
                 records.append(
@@ -2661,23 +2901,40 @@ class _Runtime:
         self,
         *,
         projection: SearchProjectionV5,
-        candidates: tuple[CandidateEvidenceV5, ...],
+        candidates: tuple[CandidateRecordEvidenceV5, ...],
         records: tuple[ExperimentRecordV5, ...],
     ) -> tuple[tuple[ArtifactRefV5, ...], RepositoryCheckpointV5]:
+        if any(type(item) not in {CandidateEvidenceV5, RejectedCandidateEvidenceV5} for item in candidates):
+            raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
+        candidates_by_id = {item.experiment_id: item for item in candidates}
+        source_candidates: dict[str, CandidateEvidenceV5] = {}
+        if len(candidates_by_id) != len(candidates):
+            raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
+        for record in records:
+            candidate = candidates_by_id.get(record.experiment_id)
+            if (
+                candidate is None
+                or candidate.experiment_identity != record.experiment_identity
+                or candidate.status != record.status
+            ):
+                raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
+            if record.status in {"evaluated", "zero_trade"}:
+                if type(candidate) is not CandidateEvidenceV5:
+                    raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
+                source_candidates[record.experiment_id] = candidate
         refs = tuple(self.dependencies.persistence.append_experiment(record) for record in records)
         stored = tuple(
             StoredExperimentRecordV5(reference=reference, record=record)
             for reference, record in zip(refs, records, strict=True)
         )
-        candidates_by_id = {item.experiment_id: item for item in candidates}
         authorities = tuple(
             sorted(
                 (
                     ArchiveRecordAuthorityV5(
                         experiment_id=item.record.experiment_id,
                         experiment_record_ref=item.reference,
-                        source_bundle=candidates_by_id[item.record.experiment_id].materialized.variant.source_bundle,
-                        source_bundle_ref=candidates_by_id[item.record.experiment_id].materialized.source_bundle_ref,
+                        source_bundle=source_candidates[item.record.experiment_id].materialized.variant.source_bundle,
+                        source_bundle_ref=source_candidates[item.record.experiment_id].materialized.source_bundle_ref,
                     )
                     for item in stored
                     if item.record.status in {"evaluated", "zero_trade"}
@@ -2838,50 +3095,59 @@ class _Runtime:
 
         candidates = self._render_and_quick_screen(parent=parent, decision=decision, template=template)
         candidates = self._evaluate_discovery(candidates)
-        if any(item.status == "quick_ready" for item in candidates):
+        if not candidates or any(item.status == "quick_ready" for item in candidates):
             raise _RuntimeAbort(RuntimeFailureV5("discovery_evaluation", "invalid_dependency_result"))
         critic_candidates = tuple(
             item
             for item in candidates
-            if item.status != "quick_ready" and is_testable_experiment_status_v5(item.status)
+            if type(item) is CandidateEvidenceV5
+            and item.status != "quick_ready"
+            and is_testable_experiment_status_v5(item.status)
         )
-        if not critic_candidates:
-            raise _RuntimeAbort(RuntimeFailureV5("critic", "no_testable_experiments", role="critic"))
-        experiment_ids = tuple(item.experiment_id for item in critic_candidates)
-        critic_request = self.dependencies.requests.critic_request(
-            self.inputs,
-            projection,
-            decision,
-            critic_candidates,
-        )
-        critic_package = self._complete_role(
-            request=critic_request,
-            role="critic",
-            parent=parent,
-            hypothesis_id=decision.hypothesis.hypothesis_id,
-            experiment_ids=experiment_ids,
-        )
-        if not critic_package.accepted:
-            authority = CriticUnavailableAuthorityV5(
-                outcome="critic_unavailable",
-                discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
-                search_state_before_sha256=canonical_sha256_v5(projection.state.to_primitive()),
-                search_state_after_sha256=canonical_sha256_v5(state_after_novelty.to_primitive()),
-                parent_revision_sha256=parent.policy_identity_sha256,
-                hypothesis_id=decision.hypothesis.hypothesis_id,
-                critic_request_sha256=critic_request.sha256,
-                critic_evidence_sha256=critic_request.role_evidence.sha256,
-                critic_attempt_sha256s=(critic_package.attempt.sha256,),
-                experiment_ids=experiment_ids,
-                precritic_evidence=self._precritic_evidence(critic_candidates),
+        critic: CriticArtifactV5 | None = None
+        critic_ref: ArtifactRefV5 | None = None
+        if critic_candidates:
+            experiment_ids = tuple(item.experiment_id for item in critic_candidates)
+            critic_request = self.dependencies.requests.critic_request(
+                self.inputs,
+                projection,
+                decision,
+                critic_candidates,
             )
-            return self._terminal_result(authority)
-        if type(critic_package.artifact) is not CriticArtifactV5:
+            critic_package = self._complete_role(
+                request=critic_request,
+                role="critic",
+                parent=parent,
+                hypothesis_id=decision.hypothesis.hypothesis_id,
+                experiment_ids=experiment_ids,
+            )
+            if not critic_package.accepted:
+                authority = CriticUnavailableAuthorityV5(
+                    outcome="critic_unavailable",
+                    discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
+                    search_state_before_sha256=canonical_sha256_v5(projection.state.to_primitive()),
+                    search_state_after_sha256=canonical_sha256_v5(state_after_novelty.to_primitive()),
+                    parent_revision_sha256=parent.policy_identity_sha256,
+                    hypothesis_id=decision.hypothesis.hypothesis_id,
+                    critic_request_sha256=critic_request.sha256,
+                    critic_evidence_sha256=critic_request.role_evidence.sha256,
+                    critic_attempt_sha256s=(critic_package.attempt.sha256,),
+                    experiment_ids=experiment_ids,
+                    precritic_evidence=self._precritic_evidence(critic_candidates),
+                )
+                return self._terminal_result(authority)
+            if type(critic_package.artifact) is not CriticArtifactV5:
+                raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
+            critic = critic_package.artifact
+            if tuple(item.experiment_id for item in critic.reviews) != experiment_ids:
+                raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
+            critic_ref = self.dependencies.persistence.append_critic(critic)
+        elif any(
+            type(item) not in {CandidateEvidenceV5, RejectedCandidateEvidenceV5}
+            or is_testable_experiment_status_v5(item.status)
+            for item in candidates
+        ) or self.journal.role_completion("critic") is not None:
             raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
-        critic = critic_package.artifact
-        if tuple(item.experiment_id for item in critic.reviews) != experiment_ids:
-            raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
-        critic_ref = self.dependencies.persistence.append_critic(critic)
 
         deadline = self._deadline("finalization", self.inputs.manifest.resources.round_wall_timeout_seconds)
         expected_records = self._expected_records(
@@ -3013,6 +3279,7 @@ def run_feedback_round_v5(
 __all__ = [
     "ArchiveReducerFactoryV5",
     "CandidateEvidenceV5",
+    "CandidateRecordEvidenceV5",
     "CandidateExecutionAuthorityV5",
     "CandidateExecutionKeyV5",
     "CandidateExecutionPersistenceV5",
@@ -3032,6 +3299,7 @@ __all__ = [
     "PaidRoleRecoveryRequiredV5",
     "PendingControllerRoleV5",
     "RoleRequestFactoryV5",
+    "RejectedCandidateEvidenceV5",
     "RoundPersistenceV5",
     "RuntimeCancellationV5",
     "RuntimeClockV5",

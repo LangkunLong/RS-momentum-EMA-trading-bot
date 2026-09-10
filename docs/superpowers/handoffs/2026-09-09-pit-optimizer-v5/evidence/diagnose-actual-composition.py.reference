@@ -1,0 +1,80 @@
+"""Read-only native composition diagnosis of the actual failed launch resources."""
+from pathlib import Path
+import hashlib
+import json
+import sys
+
+ROOT = Path(__file__).resolve().parents[5]
+PACKAGE = Path(__file__).resolve().parent
+
+
+def disk(path):
+    value = str(path)
+    return Path(value if value.startswith("\\\\?\\") else "\\\\?\\" + value)
+
+
+def read(path):
+    return disk(path).read_bytes()
+
+
+def snapshot(root):
+    base = disk(root)
+    return {p.relative_to(base).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in base.rglob("*") if p.is_file()}
+
+
+if not sys.dont_write_bytecode:
+    raise RuntimeError("Actual diagnosis requires -B")
+raw = read(PACKAGE / "launch-envelope.json")
+if hashlib.sha256(raw).hexdigest() != "e3c6c06daf69111fc566605eb3e1b55547c0257bc81c71b6e9c6fa972c5b9237":
+    raise RuntimeError("Reviewed actual launch envelope changed")
+envelope = json.loads(raw)
+authority = json.loads(read(PACKAGE.parent / "admission-p4/reviewed-source-authority.json"))
+for relative, expected in authority["source_sha256_by_path"].items():
+    if hashlib.sha256(read(ROOT / relative)).hexdigest() != expected:
+        raise RuntimeError("Approved source bytes changed")
+campaign = envelope["campaign"]
+artifact_root = Path(campaign["artifact_root"])
+before = snapshot(artifact_root)
+sys.path.insert(0, str(ROOT))
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5
+from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
+from core.pit_optimizer_v5.operations import _authorities
+from core.pit_optimizer_v5.development_preparation import (
+    compose_development_round_v5, development_config_paths_v5, load_development_config_v5,
+)
+from core.pit_optimizer_v5.cli import _exact_production_host_adapter_graph_v5
+
+repository = LocalArtifactRepositoryV5(artifact_root)
+manifest_ref = ArtifactRefV5(**campaign["manifest_ref"])
+config_ref = ArtifactRefV5(**campaign["adapter_config_ref"])
+authenticated = authenticate_campaign_manifest_v5(repository=repository, manifest_ref=manifest_ref)
+authorities = _authorities(authenticated)
+config = load_development_config_v5(repository, authorities, config_ref)
+composition = compose_development_round_v5(
+    repository=repository, authorities=authorities, round_index=1,
+    owner_token_sha256=campaign["owner_token_sha256"],
+    **{name: getattr(config, name) for name in development_config_paths_v5(config)},
+)
+candidate = composition.dependencies.candidates
+base = candidate.base_operations
+actual = {
+    "candidate_base_identity_sha256": base.base_identity_sha256,
+    "workspace_driver_identity_sha256": base.materializer.driver.driver_identity_sha256,
+    "mount_factory_identity_sha256": candidate.mount_factory.mount_identity_sha256,
+    "container_executor_identity_sha256": candidate.panel_evaluator.evaluator.executor.executor_identity_sha256,
+}
+comparison = {name: {"prepared": getattr(config, name), "actual": value,
+                     "matches": getattr(config, name) == value} for name, value in actual.items()}
+after = snapshot(artifact_root)
+print(json.dumps({
+    "campaign_id": campaign["campaign_id"], "manifest_sha256": manifest_ref.sha256,
+    "config_sha256": config_ref.sha256, "components": comparison,
+    "native_host_graph_matches": _exact_production_host_adapter_graph_v5(
+        candidate, config, repository=repository, authorities=authorities),
+    "artifact_file_count": len(after), "artifact_bytes_unchanged": before == after,
+    "operation": "actual_native_composition_only_no_run_or_validation_bypass",
+    "provider_or_evaluator_invoked": False, "environment_values_published": False,
+}, sort_keys=True))

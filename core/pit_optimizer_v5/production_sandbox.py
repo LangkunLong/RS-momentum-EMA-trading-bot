@@ -636,6 +636,199 @@ class ExecutionCleanupRecordV5:
             raise ValueError("container execution cleanup record is invalid")
 
 
+def _validate_history_reservation_v5(
+    reservation: ExecutionReservationRecordV5 | None,
+    authority: CandidateExecutionAuthorityV5,
+    owner: WorkspaceOwnerV5,
+    expected_container_name: str,
+) -> None:
+    command_sha256 = authority.command_sha256
+    expected_lease_ids = tuple(
+        derive_execution_lease_id_v5(command_sha256, role) for role in ("evaluator_process", "container")
+    )
+    if (
+        reservation is None
+        or reservation.owner != owner
+        or reservation.request_sha256 != authority.request_sha256
+        or reservation.command_sha256 != command_sha256
+        or canonical_sha256_v5(
+            {
+                "request_sha256": authority.request_sha256,
+                "argv": reservation.command_argv,
+            }
+        )
+        != command_sha256
+        or reservation.container_name != expected_container_name
+        or reservation.control_relative_path != f"execution-{command_sha256[:24]}"
+        or reservation.output_mount_authority_sha256 != authority.output_mount_authority_sha256
+        or reservation.lease_ids != expected_lease_ids
+        or tuple(item.lease_id for item in authority.lease_payloads) != expected_lease_ids
+    ):
+        raise ValueError("container reservation differs from journal authority")
+
+
+def _validate_history_panel_v5(
+    authority: CandidateExecutionAuthorityV5,
+    panel_input: PanelExecutionRequestV5 | None,
+    evaluator_contract: EvaluatorContractV5,
+    sandbox_profile: SandboxProfileV5,
+) -> None:
+    if authority.key.stage == "semantic_probe":
+        if panel_input is not None:
+            raise ValueError("semantic probe unexpectedly has PIT panel input")
+    elif (
+        panel_input is None
+        or panel_input.request_sha256 != authority.request_sha256
+        or panel_input.evaluator_contract != evaluator_contract
+        or panel_input.sandbox_profile != sandbox_profile
+        or (
+            authority.key.stage == "quick_evaluation"
+            and (panel_input.episode.episode_ordinal is not None or panel_input.panel.purpose != "quick")
+        )
+        or (
+            authority.key.stage == "discovery_evaluation"
+            and (
+                panel_input.episode.episode_ordinal != authority.key.episode_ordinal
+                or panel_input.panel.purpose != "discovery"
+            )
+        )
+    ):
+        raise ValueError("container panel input differs from journal authority")
+
+
+def _validate_history_phases_v5(
+    phases: tuple[
+        ExecutionPhaseRecordV5 | None,
+        ExecutionPhaseRecordV5 | None,
+        ExecutionPhaseRecordV5 | None,
+        ExecutionPhaseRecordV5 | None,
+        ExecutionPhaseRecordV5 | None,
+    ],
+    identity: ExecutionContainerIdentityRecordV5 | None,
+) -> None:
+    launch_claim, created, start_claim, started, collected = phases
+    if (
+        (created is not None and launch_claim is None)
+        or (start_claim is not None and created is None)
+        or (started is not None and start_claim is None)
+        or (collected is not None and started is None)
+        or (identity is not None and launch_claim is None)
+    ):
+        raise ValueError("container phase history is not a valid prefix")
+    observed_phases = tuple(record for record in (created, started, collected) if record is not None)
+    if (
+        observed_phases
+        and identity is None
+        or any(record.container_identity_sha256 != identity.sha256 for record in observed_phases)
+    ):
+        raise ValueError("container phase identity differs from durable identity")
+    if created is not None and (
+        created.lifecycle_status != "created" or created.network_namespace_status != "empty"
+    ):
+        raise ValueError("container creation phase is not closed")
+    if collected is not None and collected.lifecycle_status != "exited":
+        raise ValueError("container collection phase is not closed")
+    if started is not None and collected is not None:
+        same_exited_state = (
+            started.lifecycle_status == "exited"
+            and started.state_attestation_sha256 == collected.state_attestation_sha256
+        )
+        network_transition = started.network_attestation_sha256 == collected.network_attestation_sha256 or (
+            same_exited_state
+            and started.network_namespace_status == "private"
+            and collected.network_namespace_status == "empty"
+        )
+        if started.lifecycle_status == "exited" and (not same_exited_state or not network_transition):
+            raise ValueError("container exited namespace history changed")
+
+
+def _validate_history_terminal_v5(
+    terminal: ExecutionTerminalRecordV5 | None,
+    authority: CandidateExecutionAuthorityV5,
+    collected: ExecutionPhaseRecordV5 | None,
+    require_successful_output: bool,
+) -> None:
+    if require_successful_output and (
+        terminal is None or terminal.status != "succeeded" or terminal.output_ref is None
+    ):
+        raise ValueError("journal execution evidence lacks its durable successful output")
+    if terminal is not None and (
+        terminal.request_sha256 != authority.request_sha256
+        or terminal.output_mount_authority_sha256 != authority.output_mount_authority_sha256
+        or terminal.status in {"succeeded", "nonzero_exit"}
+        and collected is None
+        or terminal.status != "succeeded"
+        and terminal.output_ref is not None
+    ):
+        raise ValueError("container terminal differs from execution history")
+
+
+def _validate_history_output_length_v5(terminal: ExecutionTerminalRecordV5, content: bytes) -> None:
+    if terminal.observed_byte_count != len(content):
+        raise ValueError("container terminal output length is invalid")
+
+
+def _validate_history_cleanup_v5(
+    container_absent: ExecutionCleanupRecordV5 | None,
+    cleanup: ExecutionCleanupRecordV5 | None,
+    expected_cleanup: ExecutionCleanupRecordV5,
+) -> bool:
+    if (
+        container_absent is not None
+        and container_absent != expected_cleanup
+        or cleanup is not None
+        and (cleanup != expected_cleanup or container_absent != expected_cleanup)
+    ):
+        raise ValueError("container cleanup history is foreign")
+    return cleanup is not None
+
+
+def _require_history_control_ready_v5(
+    created: ExecutionControlCreatedRecordV5 | None,
+    ready: ExecutionControlRecordV5 | None,
+    require_ready: bool,
+) -> None:
+    if require_ready and (created is None or ready is None):
+        raise ValueError("container phases lack control readiness")
+
+
+def _validate_history_control_binding_v5(
+    reservation: ExecutionReservationRecordV5,
+    created: ExecutionControlCreatedRecordV5 | None,
+    ready: ExecutionControlRecordV5,
+    expected_executor_sha256: str,
+    control_root_sha256: str | None,
+    transaction_root_sha256: str | None,
+    docker_identity_sha256: str | None,
+) -> None:
+    if (
+        created is None
+        or ready.executor_identity_sha256 != expected_executor_sha256
+        or ready.command_sha256 != reservation.command_sha256
+        or ready.control_root_identity_sha256 != control_root_sha256
+        or ready.transaction_root_identity_sha256 != transaction_root_sha256
+        or ready.docker_executable_identity_sha256 != docker_identity_sha256
+    ):
+        raise ValueError("container control readiness identity is foreign")
+
+
+def _validate_history_control_completion_v5(
+    created: ExecutionControlCreatedRecordV5 | None,
+    ready: ExecutionControlRecordV5 | None,
+    cleanup_complete: bool,
+    container_absent: bool,
+    actual_absent: bool,
+    control_root_sha256: str,
+) -> bool:
+    if cleanup_complete or actual_absent and container_absent:
+        if created is None or ready is None or not actual_absent:
+            raise ValueError("container cleanup control history is incomplete")
+        if created.control_root_identity_sha256 != control_root_sha256:
+            raise ValueError("container cleanup control root is foreign")
+        return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class _ExecutionReservationCapabilityV5:
     executor_identity_sha256: str
@@ -2493,9 +2686,11 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "StopTimeout": 10,
             "Shell": None,
         }
-        if set(config) != set(expected):
+        # Docker 29 omits these disabled/default fields from inspect output.
+        omitted_defaults = {"ExposedPorts", "ArgsEscaped", "NetworkDisabled", "MacAddress", "OnBuild", "Shell"}
+        if set(config) - set(expected) or set(expected) - set(config) - omitted_defaults:
             raise ValueError("container config contains an open execution field")
-        normalized = {key: config[key] for key in expected}
+        normalized = {key: config.get(key, expected[key]) for key in expected}
         if normalized != expected:
             raise ValueError("container config differs from executor authority")
         return normalized
@@ -2552,7 +2747,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 or mount.get("Type") != "bind"
                 or type(mount.get("Source")) is not str
                 or type(mount.get("Target")) is not str
-                or type(mount.get("ReadOnly")) is not bool
+                or type(mount.get("ReadOnly", False)) is not bool
                 or mount.get("Consistency", "") not in {"", "default"}
                 or mount.get("VolumeOptions") is not None
                 or mount.get("TmpfsOptions") is not None
@@ -2563,7 +2758,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 (
                     _windows_key(mount["Source"]),
                     mount["Target"],
-                    not mount["ReadOnly"],
+                    not mount.get("ReadOnly", False),
                 )
             )
         if actual != set(expected_mounts) or len(actual) != len(expected_mounts):
@@ -2693,17 +2888,25 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "Ulimits",
         }
         nullable_maps = {"PortBindings", "Sysctls", "StorageOpt", "Annotations"}
-        if set(host) != set(expected):
+        omitted_defaults = {"Sysctls", "StorageOpt", "Annotations", "KernelMemory", "KernelMemoryTCP"}
+        if set(host) - set(expected) or set(expected) - set(host) - omitted_defaults:
             raise ValueError("container HostConfig contains an open execution field")
         normalized: dict[str, object] = {}
         for key, expected_value in expected.items():
             value = host.get(key, expected_value)
             if key == "Mounts":
                 value = mount_authority
+            if key == "MaskedPaths" and type(value) is list and all(type(path) is str for path in value):
+                # Docker 29 adds this protection and changes ordering; no existing mask may disappear.
+                if len(value) == len(set(value)) and set(value) in (set(masked_paths), {*masked_paths, "/proc/interrupts"}):
+                    value = masked_paths
             if key in nullable_lists and value is None:
                 value = []
             if key in nullable_maps and value is None:
                 value = {}
+            if key == "OomKillDisable" and value is None:
+                # Docker 29 reports the default-enabled OOM killer as null after start.
+                value = False
             if key == "SecurityOpt" and value == ["no-new-privileges"]:
                 value = ["no-new-privileges:true"]
             normalized[key] = value
@@ -2735,7 +2938,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "MacAddress",
             "Networks",
         }
-        if set(network) != allowed:
+        required = {"SandboxID", "SandboxKey", "Ports", "Networks"}
+        if set(network) - allowed or not required.issubset(network):
             raise ValueError("container NetworkSettings contains an open execution field")
         dynamic_id = network.get("SandboxID")
         sandbox_key = network.get("SandboxKey")
@@ -2772,7 +2976,9 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             value = none_network.get(key, "")
             if type(value) is not str or (value and re.fullmatch(r"[0-9a-f]{64}", value) is None):
                 raise ValueError("container none-network identity is malformed")
-        if bool(none_network["NetworkID"]) is not bool(none_network["EndpointID"]):
+        if bool(none_network["NetworkID"]) is not bool(none_network["EndpointID"]) and not (
+            none_network["NetworkID"] and not none_network["EndpointID"] and not dynamic_id and not sandbox_key
+        ):
             raise ValueError("container none-network identity is incomplete")
         empty_values = {
             "IPAMConfig": {},
@@ -2838,23 +3044,9 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "DNSNames": none_network["DNSNames"] or [],
         }
         return {
-            "Bridge": network["Bridge"],
+            **top_empty,
             "SandboxID": dynamic_id,
             "SandboxKey": sandbox_key,
-            "Ports": network["Ports"] or {},
-            "HairpinMode": network["HairpinMode"],
-            "LinkLocalIPv6Address": network["LinkLocalIPv6Address"],
-            "LinkLocalIPv6PrefixLen": network["LinkLocalIPv6PrefixLen"],
-            "SecondaryIPAddresses": network["SecondaryIPAddresses"] or [],
-            "SecondaryIPv6Addresses": network["SecondaryIPv6Addresses"] or [],
-            "EndpointID": network["EndpointID"],
-            "Gateway": network["Gateway"],
-            "GlobalIPv6Address": network["GlobalIPv6Address"],
-            "GlobalIPv6PrefixLen": network["GlobalIPv6PrefixLen"],
-            "IPAddress": network["IPAddress"],
-            "IPPrefixLen": network["IPPrefixLen"],
-            "IPv6Gateway": network["IPv6Gateway"],
-            "MacAddress": network["MacAddress"],
             "Networks": {"none": normalized_none},
         }
 
@@ -2873,7 +3065,15 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             none_authority["NetworkID"],
             none_authority["EndpointID"],
         )
-        empty = all(value == "" for value in values)
+        # Docker 29 retains the none-network ID after removing its endpoint and namespace.
+        # Only an exited container may have this fully detached representation.
+        detached = (
+            status == "exited"
+            and values[0] == values[1] == values[3] == ""
+            and type(values[2]) is str
+            and re.fullmatch(r"[0-9a-f]{64}", values[2]) is not None
+        )
+        empty = all(value == "" for value in values) or detached
         private = all(type(value) is str and value != "" for value in values)
         if status == "created" and not empty:
             raise ValueError("created container unexpectedly owns a network namespace")
@@ -2963,9 +3163,9 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 or mount.get("Name", "") != ""
                 or mount.get("Driver", "") != ""
                 or mount.get("Propagation") != "rprivate"
-                or mount.get("Mode") not in {"ro", "rw"}
+                or mount.get("Mode") not in {"", "ro", "rw"}
                 or type(mount.get("RW")) is not bool
-                or (mount.get("Mode") == "rw") is not mount.get("RW")
+                or mount.get("Mode") != "" and (mount.get("Mode") == "rw") is not mount.get("RW")
                 or type(mount.get("Source")) is not str
                 or type(mount.get("Destination")) is not str
             ):
@@ -3010,17 +3210,19 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "AppArmorProfile",
             "ExecIDs",
             "HostConfig",
-            "GraphDriver",
             "Mounts",
             "Config",
             "NetworkSettings",
         }
-        optional = {"SizeRw", "SizeRootFs", "ImageManifestDescriptor"}
+        optional = {"SizeRw", "SizeRootFs", "ImageManifestDescriptor", "GraphDriver", "Storage"}
         if not required.issubset(item) or set(item) - required - optional:
             raise ValueError("container inspection contains an open top-level field")
         created_at = item["Created"]
         driver = item["Driver"]
-        graph = item["GraphDriver"]
+        modern_storage = "Storage" in item
+        if ("GraphDriver" in item) == modern_storage:
+            raise ValueError("container requires exactly one closed storage authority")
+        graph = item.get("GraphDriver")
         if (
             item["Id"] != container_id
             or item["Name"] != f"/{container_name}"
@@ -3038,41 +3240,51 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or type(driver) is not str
             or not driver
             or len(driver) > 128
+            or type(item["State"]) is not dict
             or item["Platform"] != "linux"
             or item["LogPath"] != ""
             or item["ExecIDs"] is not None
             and item["ExecIDs"] != []
         ):
             raise ValueError("container top-level identity differs from executor authority")
-        if type(graph) is not dict or set(graph) != {"Data", "Name"}:
-            raise ValueError("container graph-driver authority is malformed")
-        graph_data = graph["Data"]
-        if (
-            graph["Name"] != driver
-            or type(graph_data) is not dict
-            or any(
-                type(key) is not str
-                or not key
-                or "\x00" in key
-                or type(value) is not str
-                or "\x00" in value
-                or len(value) > 4096
-                for key, value in graph_data.items()
-            )
-        ):
-            raise ValueError("container graph-driver authority differs")
+        if modern_storage:
+            storage = item["Storage"]
+            if storage != {"RootFS": {"Snapshot": {"Name": driver}}} or driver != "overlayfs":
+                raise ValueError("container snapshot storage authority differs")
+            storage_authority = {"Storage": storage}
+        else:
+            if type(graph) is not dict or set(graph) != {"Data", "Name"}:
+                raise ValueError("container graph-driver authority is malformed")
+            graph_data = graph["Data"]
+            if (
+                graph["Name"] != driver
+                or type(graph_data) is not dict
+                or any(
+                    type(key) is not str
+                    or not key
+                    or "\x00" in key
+                    or type(value) is not str
+                    or "\x00" in value
+                    or len(value) > 4096
+                    for key, value in graph_data.items()
+                )
+            ):
+                raise ValueError("container graph-driver authority differs")
+            storage_authority = {"GraphDriver": {"Name": driver, "Data": graph_data}}
         engine_paths = {}
         for key in ("ResolvConfPath", "HostnamePath", "HostsPath"):
             value = item[key]
             if (
                 type(value) is not str
-                or not value
                 or "\x00" in value
                 or len(value) > 4096
-                or container_id not in value.casefold()
+                or not (modern_storage and item["State"].get("Status") == "created" and value == "")
+                and (not value or container_id not in value.casefold())
             ):
                 raise ValueError("container engine path differs from exact identity")
-            engine_paths[key] = value
+            # Snapshotter paths are allocated at start; validate exact ownership above,
+            # but keep the created/running stable attestation bound to the same container.
+            engine_paths[key] = container_id if modern_storage else value
         security_labels = {}
         for key in ("MountLabel", "ProcessLabel", "AppArmorProfile"):
             value = item[key]
@@ -3105,7 +3317,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "EnginePaths": engine_paths,
             "SecurityLabels": security_labels,
             "ExecIDs": (),
-            "GraphDriver": {"Name": driver, "Data": graph_data},
+            **storage_authority,
             "Sizes": size_authority,
             "ImageManifestDescriptor": manifest_descriptor,
         }
@@ -3877,8 +4089,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             value_type=ExecutionControlRecordV5,
             repair=False,
         )
-        if require_ready and (created is None or ready is None):
-            raise ValueError("container phases lack control readiness")
+        _require_history_control_ready_v5(created, ready, require_ready)
         try:
             with ExitStack() as stack:
                 root = stack.enter_context(
@@ -3894,26 +4105,50 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     root,
                     reservation.control_relative_path,
                 )
-                if ready is not None and (
-                    created is None
-                    or ready.executor_identity_sha256 != self.executor_identity_sha256
-                    or ready.command_sha256 != reservation.command_sha256
-                    or ready.control_root_identity_sha256 != self._control_root_identity(root)
-                    or ready.transaction_root_identity_sha256
-                    != canonical_sha256_v5(
-                        {
-                            "path": _windows_key(str(root.path / reservation.control_relative_path)),
-                            "identity": (created.transaction_device, created.transaction_inode),
-                        }
+                if ready is not None:
+                    control_root_sha256 = None
+                    transaction_root_sha256 = None
+                    docker_identity_sha256 = None
+                    if (
+                        created is not None
+                        and ready.executor_identity_sha256 == self.executor_identity_sha256
+                        and ready.command_sha256 == reservation.command_sha256
+                    ):
+                        control_root_sha256 = self._control_root_identity(root)
+                        if ready.control_root_identity_sha256 == control_root_sha256:
+                            transaction_root_sha256 = canonical_sha256_v5(
+                                {
+                                    "path": _windows_key(str(root.path / reservation.control_relative_path)),
+                                    "identity": (created.transaction_device, created.transaction_inode),
+                                }
+                            )
+                            if ready.transaction_root_identity_sha256 == transaction_root_sha256:
+                                docker_identity_sha256 = canonical_sha256_v5(self._docker_identity)
+                    _validate_history_control_binding_v5(
+                        reservation,
+                        created,
+                        ready,
+                        self.executor_identity_sha256,
+                        control_root_sha256,
+                        transaction_root_sha256,
+                        docker_identity_sha256,
                     )
-                    or ready.docker_executable_identity_sha256 != canonical_sha256_v5(self._docker_identity)
+                completion_control_root_sha256 = (
+                    self._control_root_identity(root)
+                    if (cleanup_complete or absent and container_absent)
+                    and created is not None
+                    and ready is not None
+                    and absent
+                    else ""
+                )
+                if _validate_history_control_completion_v5(
+                    created,
+                    ready,
+                    cleanup_complete,
+                    container_absent,
+                    absent,
+                    completion_control_root_sha256,
                 ):
-                    raise ValueError("container control readiness identity is foreign")
-                if cleanup_complete or absent and container_absent:
-                    if created is None or ready is None or not absent:
-                        raise ValueError("container cleanup control history is incomplete")
-                    if created.control_root_identity_sha256 != self._control_root_identity(root):
-                        raise ValueError("container cleanup control root is foreign")
                     return
                 if created is None:
                     if ready is not None or not absent:
@@ -4000,28 +4235,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             raise ValueError("container execution history authority is invalid")
         command_sha256 = authority.command_sha256
         reservation = self._load_reservation(command_sha256, repair=False)
-        expected_lease_ids = tuple(
-            derive_execution_lease_id_v5(command_sha256, role) for role in ("evaluator_process", "container")
+        _validate_history_reservation_v5(
+            reservation,
+            authority,
+            self._owner,
+            self._container_name(command_sha256),
         )
-        if (
-            reservation is None
-            or reservation.owner != self._owner
-            or reservation.request_sha256 != authority.request_sha256
-            or reservation.command_sha256 != command_sha256
-            or canonical_sha256_v5(
-                {
-                    "request_sha256": authority.request_sha256,
-                    "argv": reservation.command_argv,
-                }
-            )
-            != command_sha256
-            or reservation.container_name != self._container_name(command_sha256)
-            or reservation.control_relative_path != f"execution-{command_sha256[:24]}"
-            or reservation.output_mount_authority_sha256 != authority.output_mount_authority_sha256
-            or reservation.lease_ids != expected_lease_ids
-            or tuple(item.lease_id for item in authority.lease_payloads) != expected_lease_ids
-        ):
-            raise ValueError("container reservation differs from journal authority")
         source_identity = self._mount_factory.authenticate_output_history(authority)
         if (
             type(workspace_source_identity_sha256s) is not tuple
@@ -4034,27 +4253,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             value_type=PanelExecutionRequestV5,
             repair=False,
         )
-        if authority.key.stage == "semantic_probe":
-            if panel_input is not None:
-                raise ValueError("semantic probe unexpectedly has PIT panel input")
-        elif (
-            panel_input is None
-            or panel_input.request_sha256 != authority.request_sha256
-            or panel_input.evaluator_contract != self._mount_factory.evaluator_contract
-            or panel_input.sandbox_profile != self._profile
-            or (
-                authority.key.stage == "quick_evaluation"
-                and (panel_input.episode.episode_ordinal is not None or panel_input.panel.purpose != "quick")
-            )
-            or (
-                authority.key.stage == "discovery_evaluation"
-                and (
-                    panel_input.episode.episode_ordinal != authority.key.episode_ordinal
-                    or panel_input.panel.purpose != "discovery"
-                )
-            )
-        ):
-            raise ValueError("container panel input differs from journal authority")
+        _validate_history_panel_v5(
+            authority,
+            panel_input,
+            self._mount_factory.evaluator_contract,
+            self._profile,
+        )
 
         phases = {
             phase: self._phase(command_sha256, phase, repair=False)
@@ -4067,59 +4271,27 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             )
         }
         identity = self._container_identity(command_sha256, repair=False)
-        if (
-            (phases["created"] is not None and phases["launch_claim"] is None)
-            or (phases["start_claim"] is not None and phases["created"] is None)
-            or (phases["started"] is not None and phases["start_claim"] is None)
-            or (phases["collected"] is not None and phases["started"] is None)
-            or (identity is not None and phases["launch_claim"] is None)
-        ):
-            raise ValueError("container phase history is not a valid prefix")
-        observed_phases = tuple(
-            record for phase in ("created", "started", "collected") if (record := phases[phase]) is not None
+        _validate_history_phases_v5(
+            tuple(
+                phases[phase]
+                for phase in (
+                    "launch_claim",
+                    "created",
+                    "start_claim",
+                    "started",
+                    "collected",
+                )
+            ),
+            identity,
         )
-        if (
-            observed_phases
-            and identity is None
-            or any(record.container_identity_sha256 != identity.sha256 for record in observed_phases)
-        ):
-            raise ValueError("container phase identity differs from durable identity")
-        created = phases["created"]
-        started = phases["started"]
-        collected = phases["collected"]
-        if created is not None and (
-            created.lifecycle_status != "created" or created.network_namespace_status != "empty"
-        ):
-            raise ValueError("container creation phase is not closed")
-        if collected is not None and collected.lifecycle_status != "exited":
-            raise ValueError("container collection phase is not closed")
-        if started is not None and collected is not None:
-            same_exited_state = (
-                started.lifecycle_status == "exited"
-                and started.state_attestation_sha256 == collected.state_attestation_sha256
-            )
-            network_transition = started.network_attestation_sha256 == collected.network_attestation_sha256 or (
-                same_exited_state
-                and started.network_namespace_status == "private"
-                and collected.network_namespace_status == "empty"
-            )
-            if started.lifecycle_status == "exited" and (not same_exited_state or not network_transition):
-                raise ValueError("container exited namespace history changed")
 
         terminal = self._terminal_record(command_sha256, repair=False)
-        if require_successful_output and (
-            terminal is None or terminal.status != "succeeded" or terminal.output_ref is None
-        ):
-            raise ValueError("journal execution evidence lacks its durable successful output")
-        if terminal is not None and (
-            terminal.request_sha256 != authority.request_sha256
-            or terminal.output_mount_authority_sha256 != authority.output_mount_authority_sha256
-            or terminal.status in {"succeeded", "nonzero_exit"}
-            and phases["collected"] is None
-            or terminal.status != "succeeded"
-            and terminal.output_ref is not None
-        ):
-            raise ValueError("container terminal differs from execution history")
+        _validate_history_terminal_v5(
+            terminal,
+            authority,
+            phases["collected"],
+            require_successful_output,
+        )
         if terminal is not None and terminal.output_ref is not None:
             content = self._repository.load_binary_state(
                 namespace="container-output",
@@ -4127,8 +4299,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 reference=terminal.output_ref,
                 maximum_bytes=self._manifest.resources.evaluation_output_limit_bytes + 1,
             )
-            if terminal.observed_byte_count != len(content):
-                raise ValueError("container terminal output length is invalid")
+            _validate_history_output_length_v5(terminal, content)
 
         expected_cleanup = ExecutionCleanupRecordV5(
             5,
@@ -4148,14 +4319,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             value_type=ExecutionCleanupRecordV5,
             repair=False,
         )
-        if (
-            container_absent is not None
-            and container_absent != expected_cleanup
-            or cleanup is not None
-            and (cleanup != expected_cleanup or container_absent != expected_cleanup)
-        ):
-            raise ValueError("container cleanup history is foreign")
-        cleanup_complete = cleanup is not None
+        cleanup_complete = _validate_history_cleanup_v5(container_absent, cleanup, expected_cleanup)
         self._authenticate_control_history_read_only(
             reservation,
             cleanup_complete=cleanup_complete,
@@ -4243,12 +4407,29 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                                 permit_running_to_exited=True,
                             )
                         elif created is not None:
-                            self._require_phase_transition(
-                                created,
-                                identity,
-                                inspection,
-                                permit_running_to_exited=False,
-                            )
+                            if inspection.state_authority["Status"] in {"running", "exited"}:
+                                if (
+                                    self._phase(command_sha256, "launch_claim") is None
+                                    or self._phase(command_sha256, "start_claim") is None
+                                    or created.lifecycle_status != "created"
+                                    or created.network_namespace_status != "empty"
+                                ):
+                                    raise ValueError("container cleanup lacks exact durable start authority")
+                                # Start may succeed before its inspection/phase write fails.
+                                # Record the authenticated observation without relaunching.
+                                self._append_observed_phase(
+                                    command_sha256=command_sha256,
+                                    phase="started",
+                                    identity=identity,
+                                    inspection=inspection,
+                                )
+                            else:
+                                self._require_phase_transition(
+                                    created,
+                                    identity,
+                                    inspection,
+                                    permit_running_to_exited=False,
+                                )
                         elif inspection.state_authority["Status"] == "created":
                             self._append_observed_phase(
                                 command_sha256=command_sha256,

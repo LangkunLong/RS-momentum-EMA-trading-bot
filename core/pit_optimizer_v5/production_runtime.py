@@ -13,6 +13,7 @@ import time
 from typing import Literal
 
 from core.pit_optimizer_v5.artifacts import ArchiveSnapshotV5, LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.campaign_admission import require_live_role_admission_v5
 from core.pit_optimizer_v5.candidate_ir import (
     ExperimentIdentityV5,
     PolicyRevisionIdentityV5,
@@ -88,9 +89,11 @@ from core.pit_optimizer_v5.provider import (
 )
 from core.pit_optimizer_v5.runtime import (
     CandidateEvidenceV5,
+    CandidateRecordEvidenceV5,
     FeedbackRoundInputV5,
     MaterializedVariantV5,
     OwnedLeaseV5,
+    RejectedCandidateEvidenceV5,
     SearchProjectionV5,
     StageDeadlineV5,
 )
@@ -117,6 +120,26 @@ from core.pit_optimizer_v5.workspace import (
     MaterializedWorkspaceV5,
     WorkspaceLeaseV5,
     WorkspaceOwnerV5,
+)
+
+
+_INVESTIGATOR_ENTRY_COUNTS_V5 = (
+    "stage.evaluated_rows",
+    "stage.buy_signal_count",
+    "stage.market_pass",
+    "stage.breakout_pass",
+    "stage.buy_zone_pass",
+    "stage.technical_score_pass",
+    "stage.rs_pass",
+    "stage.entry_block_current_growth_below_threshold",
+    "stage.entry_block_current_growth_unavailable",
+    "stage.entry_block_annual_growth_below_threshold",
+    "stage.entry_block_annual_growth_unavailable",
+    "stage.entry_block_rs_score_below_threshold",
+    "stage.entry_block_rs_score_unavailable",
+    "stage.entry_block_composite_score_below_threshold",
+    "stage.entry_block_composite_score_unavailable",
+    "episode.discovery.entries_executed",
 )
 
 
@@ -567,6 +590,44 @@ class LocalRoleRequestFactoryV5:
     def manifest(self) -> CampaignManifestV5:
         return self._manifest
 
+    def _guarded_request(
+        self,
+        inputs: FeedbackRoundInputV5,
+        request: RoleRequestV5,
+    ) -> RoleRequestV5:
+        require_live_role_admission_v5(
+            repository=self.repository,
+            manifest=self.manifest,
+            request=request,
+            round_index=inputs.round_index,
+            now_epoch_ms=time.time_ns() // 1_000_000,
+            owner_token_sha256=inputs.owner_token_sha256,
+        )
+        return request
+
+    def _render_rejection_count(self, inputs: FeedbackRoundInputV5, projection: SearchProjectionV5) -> int:
+        if self._repository.load_checkpoint() != projection.checkpoint:
+            raise ValueError("investigator rejection checkpoint differs")
+        count = 0
+        for stored in projection.stored_records:
+            record = self._repository.load_experiment(stored.reference)
+            if (
+                record != stored.record
+                or record.round_index >= inputs.round_index
+                or record.experiment_identity.discovery_plan_sha256
+                != inputs.panel_plan.discovery_plan_sha256
+                or (record.pit_data_scope, record.semantic_mode)
+                != (inputs.manifest.pit_data_scope, inputs.manifest.semantic_mode)
+            ):
+                raise ValueError("investigator rejection record authority differs")
+            if (
+                record.status == "invalid"
+                and record.validation.failure_code
+                == "policy_source_unbounded_or_stateful"
+            ):
+                count += 1
+        return count
+
     def _investigator_parts(
         self,
         inputs: FeedbackRoundInputV5,
@@ -590,6 +651,19 @@ class LocalRoleRequestFactoryV5:
                     evidence.add(f"{prefix}.max_drawdown_pct", report.max_drawdown_pct),
                     evidence.add(f"{prefix}.closed_trades", report.closed_trades),
                     evidence.add(f"{prefix}.average_exposure_pct", report.average_exposure_pct),
+                )
+            )
+            counts = {item.metric_id: item.count for item in report.entry_funnel}
+            for metric_id in _INVESTIGATOR_ENTRY_COUNTS_V5:
+                if metric_id in counts:
+                    evaluator_ids.append(evidence.add(f"{prefix}.entry.{metric_id}", counts[metric_id]))
+
+        rejection_count = self._render_rejection_count(inputs, projection)
+        if rejection_count:
+            evaluator_ids.append(
+                evidence.add(
+                    "failure.rendering.policy_source_unbounded_or_stateful_count",
+                    rejection_count,
                 )
             )
 
@@ -763,21 +837,24 @@ class LocalRoleRequestFactoryV5:
         parent: ParentCandidateV5,
     ) -> RoleRequestV5:
         role_input, evidence = self._investigator_parts(inputs, projection, parent)
-        return build_role_request_v5(
-            role="investigator",
-            role_input=role_input,
-            issued_evidence=evidence,
-            expected_binding=RoleBindingV5(
-                parent.policy_identity_sha256,
-                None,
-                (),
-                inputs.panel_plan.discovery_plan_sha256,
-            ),
-            schema_authority=role_schema_authority_from_manifest_v5(
+        return self._guarded_request(
+            inputs,
+            build_role_request_v5(
                 role="investigator",
-                manifest=inputs.manifest,
+                role_input=role_input,
+                issued_evidence=evidence,
+                expected_binding=RoleBindingV5(
+                    parent.policy_identity_sha256,
+                    None,
+                    (),
+                    inputs.panel_plan.discovery_plan_sha256,
+                ),
+                schema_authority=role_schema_authority_from_manifest_v5(
+                    role="investigator",
+                    manifest=inputs.manifest,
+                ),
+                max_output_tokens=self.maximum_output_tokens,
             ),
-            max_output_tokens=self.maximum_output_tokens,
         )
 
     def author_request(
@@ -821,31 +898,34 @@ class LocalRoleRequestFactoryV5:
             }
             paths = (path_by_mechanism[decision.hypothesis.primary_mechanism],)
         sources = tuple(item for item in source.files if item.path in paths)
-        return build_role_request_v5(
-            role="author",
-            role_input=AuthorRoleInputV5(
-                sources,
-                full_source_allowed,
-                decision.hypothesis,
-                AuthorPolicyContractsV5(
-                    decision.parent.policy_revision,
-                    inputs.manifest.policy_scope_ref.sha256,
-                ),
-            ),
-            issued_evidence=RoleEvidenceV5(5, cited),
-            expected_binding=RoleBindingV5(
-                decision.parent.policy_identity_sha256,
-                decision.hypothesis.hypothesis_id,
-                (),
-                inputs.panel_plan.discovery_plan_sha256,
-            ),
-            schema_authority=role_schema_authority_from_manifest_v5(
+        return self._guarded_request(
+            inputs,
+            build_role_request_v5(
                 role="author",
-                manifest=inputs.manifest,
-                author_policy_paths=paths,
-                full_source_escape=full_source_allowed,
+                role_input=AuthorRoleInputV5(
+                    sources,
+                    full_source_allowed,
+                    decision.hypothesis,
+                    AuthorPolicyContractsV5(
+                        decision.parent.policy_revision,
+                        inputs.manifest.policy_scope_ref.sha256,
+                    ),
+                ),
+                issued_evidence=RoleEvidenceV5(5, cited),
+                expected_binding=RoleBindingV5(
+                    decision.parent.policy_identity_sha256,
+                    decision.hypothesis.hypothesis_id,
+                    (),
+                    inputs.panel_plan.discovery_plan_sha256,
+                ),
+                schema_authority=role_schema_authority_from_manifest_v5(
+                    role="author",
+                    manifest=inputs.manifest,
+                    author_policy_paths=paths,
+                    full_source_escape=full_source_allowed,
+                ),
+                max_output_tokens=self.maximum_output_tokens,
             ),
-            max_output_tokens=self.maximum_output_tokens,
         )
 
     @staticmethod
@@ -1079,27 +1159,30 @@ class LocalRoleRequestFactoryV5:
             )
             for candidate in candidates
         )
-        return build_role_request_v5(
-            role="critic",
-            role_input=CriticRoleInputV5(
-                tuple(evaluations),
-                predictions,
-                tuple(semantic_rows),
-                tuple(failures),
-                semantic_evidence_unavailable=inputs.manifest.semantic_mode == "disabled_development",
-            ),
-            issued_evidence=evidence.build(),
-            expected_binding=RoleBindingV5(
-                decision.parent.policy_identity_sha256,
-                decision.hypothesis.hypothesis_id,
-                experiment_ids,
-                inputs.panel_plan.discovery_plan_sha256,
-            ),
-            schema_authority=role_schema_authority_from_manifest_v5(
+        return self._guarded_request(
+            inputs,
+            build_role_request_v5(
                 role="critic",
-                manifest=inputs.manifest,
+                role_input=CriticRoleInputV5(
+                    tuple(evaluations),
+                    predictions,
+                    tuple(semantic_rows),
+                    tuple(failures),
+                    semantic_evidence_unavailable=inputs.manifest.semantic_mode == "disabled_development",
+                ),
+                issued_evidence=evidence.build(),
+                expected_binding=RoleBindingV5(
+                    decision.parent.policy_identity_sha256,
+                    decision.hypothesis.hypothesis_id,
+                    experiment_ids,
+                    inputs.panel_plan.discovery_plan_sha256,
+                ),
+                schema_authority=role_schema_authority_from_manifest_v5(
+                    role="critic",
+                    manifest=inputs.manifest,
+                ),
+                max_output_tokens=self.maximum_output_tokens,
             ),
-            max_output_tokens=self.maximum_output_tokens,
         )
 
 
@@ -1179,16 +1262,67 @@ class CanonicalExperimentRecordFactoryV5:
         parent: ParentCandidateV5,
         decision: ScheduledHypothesisV5,
         template: StructuralTemplateV5,
-        candidates: tuple[CandidateEvidenceV5, ...],
-        critic: CriticArtifactV5,
-        critic_ref: ArtifactRefV5,
+        candidates: tuple[CandidateRecordEvidenceV5, ...],
+        critic: CriticArtifactV5 | None,
+        critic_ref: ArtifactRefV5 | None,
     ) -> tuple[ExperimentRecordV5, ...]:
-        reviews = {item.experiment_id: item for item in critic.reviews}
-        expected_ids = tuple(item.experiment_id for item in candidates if is_testable_experiment_status_v5(item.status))
-        if tuple(reviews) != expected_ids:
-            raise ValueError("critic reviews differ from finalized experiment order")
+        if type(candidates) is not tuple or not candidates:
+            raise ValueError("record construction requires a nonempty candidate batch")
+        expected_ids: list[str] = []
+        for candidate in candidates:
+            if type(candidate) is CandidateEvidenceV5:
+                if is_testable_experiment_status_v5(candidate.status):
+                    expected_ids.append(candidate.experiment_id)
+            elif type(candidate) is not RejectedCandidateEvidenceV5:
+                raise ValueError("record candidate carrier is invalid")
+        if (critic is None) != (critic_ref is None):
+            raise ValueError("critic artifact and reference must be present together")
+        if critic is not None and (type(critic) is not CriticArtifactV5 or type(critic_ref) is not ArtifactRefV5):
+            raise ValueError("critic artifact binding is invalid")
+        if expected_ids:
+            if critic is None or critic_ref is None:
+                raise ValueError("testable records require a complete critic binding")
+            reviews = {item.experiment_id: item for item in critic.reviews}
+            if tuple(reviews) != tuple(expected_ids):
+                raise ValueError("critic reviews differ from finalized experiment order")
+        else:
+            if critic is not None or critic_ref is not None:
+                raise ValueError("untestable records must not carry a critic binding")
+            reviews = {}
         records: list[ExperimentRecordV5] = []
         for candidate in candidates:
+            if type(candidate) is RejectedCandidateEvidenceV5:
+                if candidate.template != template or candidate.template.sha256 != template.sha256:
+                    raise ValueError("rejected candidate template differs from record construction template")
+                records.append(
+                    ExperimentRecordV5(
+                        candidate.experiment_id,
+                        candidate.experiment_identity,
+                        inputs.round_index,
+                        parent.policy_identity_sha256,
+                        parent.semantic_fingerprint_sha256,
+                        decision.hypothesis,
+                        template,
+                        template.sha256,
+                        candidate.assignment,
+                        None,
+                        None,
+                        "invalid",
+                        candidate.validation,
+                        None,
+                        (),
+                        None,
+                        None,
+                        None,
+                        candidate.artifact_refs,
+                        None,
+                        pit_data_scope=inputs.manifest.pit_data_scope,
+                        semantic_mode=inputs.manifest.semantic_mode,
+                    )
+                )
+                continue
+            if type(candidate) is not CandidateEvidenceV5:
+                raise ValueError("record candidate carrier is invalid")
             testable = is_testable_experiment_status_v5(candidate.status)
             campaign = candidate.campaign_evidence
             records.append(
@@ -1244,7 +1378,11 @@ class LocalArchiveReducerFactoryV5:
     def _authorities(
         self,
         records: tuple[StoredExperimentRecordV5, ...],
+        *,
+        repair: bool = True,
     ) -> tuple[ArchiveRecordAuthorityV5, ...]:
+        if type(repair) is not bool:
+            raise ValueError("archive authority repair mode is invalid")
         result: list[ArchiveRecordAuthorityV5] = []
         for stored in records:
             record = stored.record
@@ -1256,6 +1394,7 @@ class LocalArchiveReducerFactoryV5:
                 namespace="policy-source",
                 key=record.policy_revision.sha256,
                 value_type=SourceBundleV5,
+                repair=repair,
             )
             if source is None:
                 raise ValueError("archive-eligible source authority is unavailable")
@@ -1305,6 +1444,7 @@ class LocalArchiveReducerFactoryV5:
         manifest: CampaignManifestV5,
         panel_plan: CampaignPanelPlanV5,
         evaluator_contract: EvaluatorContractV5,
+        repair: bool = True,
     ) -> SearchStateV5:
         """Authenticate the committed checkpoint/archive without repairing either file."""
 
@@ -1332,7 +1472,7 @@ class LocalArchiveReducerFactoryV5:
             panel_plan,
             evaluator_contract,
             manifest.target,
-            self._authorities(records),
+            self._authorities(records, repair=repair),
             manifest.search.archive_capacity,
             pit_data_scope=manifest.pit_data_scope,
             semantic_mode=manifest.semantic_mode,

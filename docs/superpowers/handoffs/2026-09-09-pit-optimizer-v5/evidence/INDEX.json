@@ -1,0 +1,110 @@
+{
+  "purpose": "Exact-byte reference snapshots at user-requested pause; not a runnable campaign package",
+  "date": "2026-09-09",
+  "corrected_helper_independent_review": "pending",
+  "corrected_helper_executed": false,
+  "entries": [
+    {
+      "snapshot": "reviewed-source-authority.json",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/admission-p4/reviewed-source-authority.json",
+      "size_bytes": 2740,
+      "sha256": "d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09"
+    },
+    {
+      "snapshot": "admission-p4-independent-review.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/admission-p4/independent-review.md",
+      "size_bytes": 16378,
+      "sha256": "4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b"
+    },
+    {
+      "snapshot": "admission-readiness.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/admission-readiness.md",
+      "size_bytes": 6801,
+      "sha256": "14f385172f29dccf258d4be4802137724774e57b267ebbac4201a4945c01aed2"
+    },
+    {
+      "snapshot": "concrete-c-c-independent-review.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c-independent-review.md",
+      "size_bytes": 10364,
+      "sha256": "54fed780c6f54ff96f318f4c14d1a94aee0ca450c883a0c0eff6765f0f8a235b"
+    },
+    {
+      "snapshot": "RUN-PROPOSAL.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/RUN-PROPOSAL.md",
+      "size_bytes": 7062,
+      "sha256": "c22ef5f3a4aa51b7d93ba5b53accd480952b9bd6aec2fafd1ca669289bba0150"
+    },
+    {
+      "snapshot": "launch-envelope.json",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/launch-envelope.json",
+      "size_bytes": 10508,
+      "sha256": "e3c6c06daf69111fc566605eb3e1b55547c0257bc81c71b6e9c6fa972c5b9237"
+    },
+    {
+      "snapshot": "fresh-user-grant.json",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/fresh-user-grant.json",
+      "size_bytes": 2195,
+      "sha256": "8ef007db9e1111833b57fee305b419b846b50b95e35a517c45b262b8464e591e"
+    },
+    {
+      "snapshot": "launch-campaign.ps1.reference",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/launch-campaign.ps1",
+      "size_bytes": 2102,
+      "sha256": "ee264b388f38533d1ced77cdc5eedb2424846f17a126a6c3573fe29b8fc84842"
+    },
+    {
+      "snapshot": "actual-launch-01-stage-review.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/actual-launch-01-stage-review.md",
+      "size_bytes": 5709,
+      "sha256": "8dd4d849205a37ea90ca00ef834f3d791b9e7e01136e53f4b1fd8ee3dcd74288"
+    },
+    {
+      "snapshot": "actual-launch-context-diagnosis.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/actual-launch-context-diagnosis.md",
+      "size_bytes": 3624,
+      "sha256": "b59c1ad1a0c95fbe4dcdacb81c1a1c20fcda4e1ff1badc29c36f554a7b70268c"
+    },
+    {
+      "snapshot": "execution-context-reproduction.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/execution-context-reproduction.md",
+      "size_bytes": 4615,
+      "sha256": "ebfcf2c4a59c439e16f7cfebaca330beeaf227e9da53a57c6a870119575f4fe7"
+    },
+    {
+      "snapshot": "diagnose-actual-composition.py.reference",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/diagnose-actual-composition.py",
+      "size_bytes": 3726,
+      "sha256": "218c8a53c6a1eb72aa461685e0d9c9dbf39c6b89fc3ee06aace863ae9323cc18"
+    },
+    {
+      "snapshot": "old-context-handoff-independent-review.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/context-handoff-independent-review.md",
+      "size_bytes": 7842,
+      "sha256": "86364488012427bfb06a31e5479e35444015086844dea0600b85d8a755574172"
+    },
+    {
+      "snapshot": "old-run-approved-context-handoff.py.reference",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/context-handoff-review-freeze-01/run-approved-context-handoff.py",
+      "size_bytes": 22109,
+      "sha256": "4e801fc0cf381b520ef147b07aa9f91bbc6edec62c058c9a9d2e3d6acfeb80ff"
+    },
+    {
+      "snapshot": "corrected-run-approved-context-handoff.py.reference",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/run-approved-context-handoff.py",
+      "size_bytes": 22347,
+      "sha256": "d0c53e05c4f9cabf636a0df634b34d42473c460dccd3dd478d6fa29c59634e7f"
+    },
+    {
+      "snapshot": "context-handoff-implementation-report.md",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/context-handoff-implementation-report.md",
+      "size_bytes": 5855,
+      "sha256": "e0d727c6f8efb3e1a3341a8b128d825759c4d34b485866bebab8b3f8e76d5f76"
+    },
+    {
+      "snapshot": "actual-context-handoff-source-01-failed-before-pipe.json",
+      "original_worktree_relative_path": ".artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/concrete-c-c/actual-context-handoff-source-01-failed-before-pipe.json",
+      "size_bytes": 868,
+      "sha256": "98ab5328451cd6d838229b886721a19e7a82337b4507b5164cc2c90627adbaa6"
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 import math
 import os
@@ -11,6 +12,10 @@ import time
 from typing import Callable, Mapping
 
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5, RoleLedgerMigrationAuthorityV5
+from core.pit_optimizer_v5.campaign_admission import (
+    load_campaign_admission_v5,
+    require_live_role_admission_v5,
+)
 from core.pit_optimizer_v5.contracts import (
     ArtifactRefV5,
     CampaignManifestV5,
@@ -46,6 +51,492 @@ from core.pit_optimizer_v5.provider import (
     role_request_artifact_primitive_v5,
     sum_cost_usd_v5,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RoleLedgerReadIdentityV5:
+    campaign_manifest_sha256: str
+    audit_store_identity_sha256: str
+    ledger_identity_sha256: str
+    gateway_identity_sha256: str
+
+
+def _role_ledger_read_identity_v5(
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    *,
+    api_key_environment_variable: str = "OPENROUTER_API_KEY",
+) -> RoleLedgerReadIdentityV5:
+    if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
+        raise ValueError("local V5 role-ledger read authority is invalid")
+    if manifest.provider is None:
+        raise ValueError("local V5 role ledger requires provider capabilities")
+    if api_key_environment_variable != "OPENROUTER_API_KEY":
+        raise ValueError("OpenRouter V5 gateway requires the configured secret handle")
+    audit_store_identity_sha256 = canonical_sha256_v5(
+        {
+            "domain": "pit-optimizer-v5-role-audit-v1",
+            "repository_root_identity_sha256": repository.root_identity_sha256,
+            "campaign_id": manifest.campaign_id,
+        }
+    )
+    ledger_identity_sha256 = canonical_sha256_v5(
+        {
+            "domain": "pit-optimizer-v5-role-ledger-v1",
+            "campaign_manifest_sha256": manifest.sha256,
+            "audit_store_identity_sha256": audit_store_identity_sha256,
+            "provider_capabilities_sha256": canonical_sha256_v5(manifest.provider),
+        }
+    )
+    gateway_identity_sha256 = canonical_sha256_v5(
+        {
+            "domain": "pit-optimizer-v5-openrouter-one-shot-v1",
+            "transport": "agent_loop.OpenRouterGateway.request_pit_optimizer_v5_json_once",
+            "api_key_environment_variable": api_key_environment_variable,
+            "ledger_identity_sha256": ledger_identity_sha256,
+            "audit_store_identity_sha256": audit_store_identity_sha256,
+        }
+    )
+    return RoleLedgerReadIdentityV5(
+        manifest.sha256,
+        audit_store_identity_sha256,
+        ledger_identity_sha256,
+        gateway_identity_sha256,
+    )
+
+
+def _conservative_unreported_usage_v5(
+    manifest: CampaignManifestV5,
+    slot: AuthorizedRoleSlotV5,
+) -> RoleUsageFactsV5:
+    """Derive the deterministic charge for one possibly-launched request."""
+
+    provider = manifest.provider
+    assert provider is not None
+    reserved_tokens = slot.input_tokens_upper_bound + slot.request.max_output_tokens
+    reserved_cost = slot.cost_upper_bound_usd or Decimal("0")
+    return RoleUsageFactsV5(
+        1,
+        True,
+        False,
+        reserved_tokens,
+        0,
+        reserved_tokens,
+        reserved_cost,
+        provider.model,
+        "unreported",
+        None,
+    )
+
+
+def _completion_usage_v5(
+    manifest: CampaignManifestV5,
+    response: RoleProviderResponseV5,
+) -> RoleUsageFactsV5:
+    provider = manifest.provider
+    assert provider is not None
+    completion = response.completion
+    return RoleUsageFactsV5(
+        completion.external_attempt_count,
+        True,
+        completion.response_received,
+        completion.input_tokens,
+        completion.output_tokens,
+        completion.input_tokens + completion.output_tokens,
+        completion.cost_usd,
+        provider.model,
+        completion.returned_model,
+        completion.provider_request_id,
+    )
+
+
+def _derive_reported_terminal_v5(
+    *,
+    manifest: CampaignManifestV5,
+    identity: RoleLedgerReadIdentityV5,
+    slot: AuthorizedRoleSlotV5,
+    request: RoleRequestV5,
+    response: RoleProviderResponseV5,
+) -> tuple[RoleAttemptFactsV5, ParsedRoleArtifactV5 | None]:
+    """Re-run the live runner's exact reported-response classification."""
+
+    provider = manifest.provider
+    assert provider is not None
+    if (
+        type(request) is not RoleRequestV5
+        or response.campaign_id != manifest.campaign_id
+        or response.campaign_manifest_sha256 != identity.campaign_manifest_sha256
+        or response.ledger_identity_sha256 != identity.ledger_identity_sha256
+        or response.audit_store_identity_sha256 != identity.audit_store_identity_sha256
+        or response.request_sha256 != request.sha256
+        or slot.request.request_sha256 != request.sha256
+        or slot.request.role != request.role
+        or slot.request.max_output_tokens != request.max_output_tokens
+        or slot.request.response_schema_sha256 != request.response_schema_sha256
+    ):
+        raise ValueError("local V5 reported role response authority differs")
+    usage = _completion_usage_v5(manifest, response)
+    completion = response.completion
+    overage = (
+        completion.returned_model != slot.request.model
+        or completion.output_tokens > slot.request.max_output_tokens
+        or completion.input_tokens > slot.input_tokens_upper_bound
+        or (slot.cost_upper_bound_usd is not None and completion.cost_usd > slot.cost_upper_bound_usd)
+        or slot.prior_external_attempts + usage.external_attempt_count > provider.maximum_role_calls
+        or slot.prior_total_tokens + usage.total_tokens > provider.maximum_total_tokens
+        or (
+            provider.maximum_usd is not None
+            and sum_cost_usd_v5(slot.prior_cost_usd, usage.cost_usd) > provider.maximum_usd
+        )
+    )
+    artifact: ParsedRoleArtifactV5 | None = None
+    failure_code: RoleFailureCode | None
+    if overage:
+        failure_code = RoleFailureCode.ACCOUNTING
+    elif not completion.accepted:
+        failure_code = RoleFailureCode.TRANSPORT
+    else:
+        try:
+            artifact = parse_and_bind_role_artifact(
+                request=request,
+                response_text=completion.response_text,
+            )
+        except RoleFailureV5 as failure:
+            failure_code = failure.code
+        except BaseException:
+            failure_code = RoleFailureCode.RESPONSE_SCHEMA
+        else:
+            failure_code = None
+    outcome = {
+        None: "accepted",
+        RoleFailureCode.TRANSPORT: "transport_failure",
+        RoleFailureCode.RESPONSE_SCHEMA: "response_schema_failure",
+        RoleFailureCode.EVIDENCE_BINDING: "evidence_binding_failure",
+        RoleFailureCode.AUTHORIZATION: "authorization_failure",
+        RoleFailureCode.ACCOUNTING: "accounting_failure",
+    }[failure_code]
+    try:
+        response_sha256 = canonical_role_response_sha256_v5(completion.response_text)
+    except ValueError:
+        response_sha256 = None
+    facts = RoleAttemptFactsV5(
+        request.role,
+        slot.request.attempt_kind,
+        slot.request.attempt_index,
+        request.sha256,
+        slot.slot_id,
+        outcome,  # type: ignore[arg-type]
+        failure_code,
+        usage,
+        response_sha256,
+        None if artifact is None else canonical_sha256_v5(artifact),
+    )
+    return facts, artifact
+
+
+def _verify_terminal_facts_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    identity: RoleLedgerReadIdentityV5,
+    reservation: RoleLedgerReservationV5,
+    terminal: RoleLedgerTerminalV5,
+    request: RoleRequestV5,
+) -> None:
+    """Recompute all provider-derived facts and the exact parsed artifact."""
+
+    slot = reservation.slot
+    facts = terminal.facts
+    response = repository.load_role_provider_response(
+        campaign_id=manifest.campaign_id,
+        request_sha256=slot.request.request_sha256,
+    )
+    if response is None:
+        if facts.usage.external_attempt_count == 1:
+            if (
+                facts.usage != _conservative_unreported_usage_v5(manifest, slot)
+                or facts.outcome not in {"transport_failure", "accounting_failure"}
+                or facts.response_sha256 is not None
+                or terminal.artifact is not None
+            ):
+                raise ValueError("local V5 unreported role terminal facts differ")
+            return
+        if (
+            facts.usage.external_attempt_count != 0
+            or facts.outcome not in {"authorization_failure", "accounting_failure"}
+            or facts.response_sha256 is not None
+            or terminal.artifact is not None
+        ):
+            raise ValueError("local V5 provider-free role terminal facts differ")
+        return
+    expected_facts, expected_artifact = _derive_reported_terminal_v5(
+        manifest=manifest,
+        identity=identity,
+        slot=slot,
+        request=request,
+        response=response,
+    )
+    if terminal.facts != expected_facts or terminal.artifact != expected_artifact:
+        raise ValueError("local V5 reported role terminal classification differs")
+
+
+def _load_verified_role_ledger_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    identity: RoleLedgerReadIdentityV5,
+) -> tuple[
+    tuple[RoleLedgerReservationV5, ...],
+    tuple[RoleLedgerTerminalV5, ...],
+]:
+    provider = manifest.provider
+    assert provider is not None
+    reservations, terminals = repository.load_role_ledger_records(
+        campaign_id=manifest.campaign_id,
+        migration_authority=RoleLedgerMigrationAuthorityV5(
+            campaign_id=manifest.campaign_id,
+            campaign_manifest_sha256=identity.campaign_manifest_sha256,
+            ledger_identity_sha256=identity.ledger_identity_sha256,
+            audit_store_identity_sha256=identity.audit_store_identity_sha256,
+            model=provider.model,
+            maximum_output_tokens_per_role=provider.maximum_output_tokens_per_role,
+        ),
+    )
+    by_reservation = {item.sha256: item for item in reservations}
+    if len(by_reservation) != len(reservations):
+        raise ValueError("local V5 role ledger has duplicate reservations")
+    by_slot = {item.slot.slot_id: item for item in reservations}
+    if len(by_slot) != len(reservations):
+        raise ValueError("local V5 role ledger has duplicate slots")
+    requests_by_slot: dict[str, RoleRequestV5] = {}
+    terminal_slots: set[str] = set()
+    for reservation in reservations:
+        request = repository.load_unique_role_request_by_sha256(reservation.slot.request.request_sha256)
+        input_bound, cost_bound = prospective_role_usage_v5(request, provider)
+        if (
+            reservation.campaign_id != manifest.campaign_id
+            or reservation.campaign_manifest_sha256 != identity.campaign_manifest_sha256
+            or reservation.ledger_identity_sha256 != identity.ledger_identity_sha256
+            or reservation.audit_store_identity_sha256 != identity.audit_store_identity_sha256
+            or reservation.slot.request.model != provider.model
+            or reservation.slot.request.max_output_tokens != provider.maximum_output_tokens_per_role
+            or reservation.slot.request.role != request.role
+            or reservation.slot.request.max_output_tokens != request.max_output_tokens
+            or reservation.slot.request.response_schema_sha256 != request.response_schema_sha256
+            or reservation.slot.input_tokens_upper_bound != input_bound
+            or reservation.slot.cost_upper_bound_usd != cost_bound
+            or reservation.slot.prior_external_attempts + 1 > provider.maximum_role_calls
+            or reservation.slot.prior_total_tokens + input_bound + request.max_output_tokens
+            > provider.maximum_total_tokens
+            or (
+                provider.maximum_usd is not None
+                and (
+                    cost_bound is None
+                    or sum_cost_usd_v5(reservation.slot.prior_cost_usd, cost_bound) > provider.maximum_usd
+                )
+            )
+            or (
+                reservation.record_schema_revision == 3
+                and reservation.invocation_claim.lease_deadline_epoch_ms
+                - reservation.invocation_claim.lease_started_epoch_ms
+                != manifest.resources.role_call_timeout_seconds * 1000
+            )
+        ):
+            raise ValueError("local V5 role-ledger reservation authority differs")
+        requests_by_slot[reservation.slot.slot_id] = request
+        expected_slot_id = canonical_sha256_v5(
+            {
+                "domain": "pit-optimizer-v5-role-slot-id-v1",
+                "campaign_manifest_sha256": identity.campaign_manifest_sha256,
+                "request_sha256": reservation.slot.request.sha256,
+            }
+        )
+        expected_authorization = canonical_sha256_v5(
+            {
+                "domain": "pit-optimizer-v5-role-slot-v1",
+                "ledger_identity_sha256": identity.ledger_identity_sha256,
+                "request_sha256": reservation.slot.request.sha256,
+                "terminal_sequence": reservation.slot.prior_terminal_sequence + 1,
+            }
+        )
+        if (
+            reservation.slot.slot_id != expected_slot_id
+            or reservation.slot.authorization_sha256 != expected_authorization
+        ):
+            raise ValueError("local V5 role-ledger reservation binding differs")
+    for terminal in terminals:
+        reservation = by_reservation.get(terminal.reservation_sha256)
+        if reservation is None or terminal.receipt.slot_id != reservation.slot.slot_id:
+            raise ValueError("local V5 role-ledger terminal lacks its reservation")
+        if terminal.receipt.slot_id in terminal_slots:
+            raise ValueError("local V5 role ledger has duplicate terminals")
+        terminal_slots.add(terminal.receipt.slot_id)
+    ordered = tuple(sorted(terminals, key=lambda item: item.receipt.terminal_sequence))
+    if tuple(item.receipt.terminal_sequence for item in ordered) != tuple(range(1, len(ordered) + 1)):
+        raise ValueError("local V5 role-ledger terminal chain is discontinuous")
+    ordered_reservations = tuple(sorted(reservations, key=lambda item: item.ledger_ordinal))
+    if tuple(item.ledger_ordinal for item in ordered_reservations) != tuple(
+        range(1, len(ordered_reservations) + 1)
+    ):
+        raise ValueError("local V5 role-ledger reservation sequence is discontinuous")
+    for index, reservation in enumerate(ordered_reservations):
+        slot = reservation.slot
+        prior = ordered[index - 1].receipt if index else None
+        if (
+            slot.prior_external_attempts != (0 if prior is None else prior.cumulative_external_attempts)
+            or slot.prior_total_tokens != (0 if prior is None else prior.cumulative_total_tokens)
+            or slot.prior_cost_usd != (Decimal("0") if prior is None else prior.cumulative_cost_usd)
+            or slot.prior_terminal_sequence != index
+        ):
+            raise ValueError("local V5 role-ledger reservation prior totals differ")
+        if index < len(ordered):
+            terminal = ordered[index]
+            expected_receipt_payload = {
+                "slot_id": slot.slot_id,
+                "slot_request_sha256": slot.request.sha256,
+                "authorization_sha256": slot.authorization_sha256,
+                "attempt_facts_sha256": terminal.facts.sha256,
+                "cumulative_external_attempts": (
+                    slot.prior_external_attempts + terminal.facts.usage.external_attempt_count
+                ),
+                "cumulative_total_tokens": slot.prior_total_tokens + terminal.facts.usage.total_tokens,
+                "cumulative_cost_usd": sum_cost_usd_v5(slot.prior_cost_usd, terminal.facts.usage.cost_usd),
+                "terminal_sequence": slot.prior_terminal_sequence + 1,
+            }
+            expected_receipt = RoleTerminalReceiptV5(
+                **expected_receipt_payload,
+                receipt_sha256=canonical_sha256_v5(expected_receipt_payload),
+            )
+            if (
+                terminal.reservation_sha256 != reservation.sha256
+                or terminal.facts.role != slot.request.role
+                or terminal.facts.attempt_kind != slot.request.attempt_kind
+                or terminal.facts.attempt_index != slot.request.attempt_index
+                or terminal.facts.request_sha256 != slot.request.request_sha256
+                or terminal.facts.slot_id != slot.slot_id
+                or terminal.receipt != expected_receipt
+            ):
+                raise ValueError("local V5 role-ledger terminal differs from its slot")
+            _verify_terminal_facts_v5(
+                repository=repository,
+                manifest=manifest,
+                identity=identity,
+                reservation=reservation,
+                terminal=terminal,
+                request=requests_by_slot[slot.slot_id],
+            )
+    return ordered_reservations, ordered
+
+
+def _authenticate_role_invocations_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    identity: RoleLedgerReadIdentityV5,
+    packages: tuple[RoleInvocationPackageV5, ...],
+    reservations: tuple[RoleLedgerReservationV5, ...],
+    terminals: tuple[RoleLedgerTerminalV5, ...],
+) -> None:
+    """Bind every journal terminal to the exact production ledger record."""
+
+    if type(packages) is not tuple or any(type(package) is not RoleInvocationPackageV5 for package in packages):
+        raise ValueError("local V5 role invocation collection is invalid")
+    if len(reservations) != len(terminals) or len(terminals) != len(packages):
+        raise ValueError("local V5 role ledger differs from journal completion state")
+    by_slot = {record.slot.slot_id: record for record in reservations}
+    terminal_by_slot = {record.receipt.slot_id: record for record in terminals}
+    ordered_packages: list[tuple[int, RoleInvocationPackageV5]] = []
+    provider = manifest.provider
+    assert provider is not None
+    for package in packages:
+        authority = package.terminal_authority
+        if type(authority) is FixtureRoleTerminalAuthorityV5:
+            raise ValueError("fixture role terminal is not production authority")
+        if type(authority) is not LedgerRoleTerminalAuthorityV5:
+            raise ValueError("role terminal lacks production ledger authority")
+        call = package.call
+        request = package.request
+        attempt = package.attempt
+        receipt = authority.receipt
+        reservation = by_slot.get(receipt.slot_id)
+        terminal = terminal_by_slot.get(receipt.slot_id)
+        slot_request = RoleSlotRequestV5(
+            request_sha256=request.sha256,
+            role=call.role,
+            attempt_kind=call.attempt_kind,
+            attempt_index=call.attempt_index,
+            model=provider.model,
+            max_output_tokens=request.max_output_tokens,
+            response_schema_sha256=request.response_schema_sha256,
+        )
+        persisted_call, persisted_request = repository.load_unique_role_request_entry_by_sha256(
+            request.sha256,
+        )
+        if (
+            call.campaign_id != manifest.campaign_id
+            or call.round_index > manifest.search.max_feedback_rounds
+            or persisted_call != call
+            or persisted_request != request
+            or reservation is None
+            or terminal is None
+            or reservation.slot.request != slot_request
+            or reservation.slot.slot_id != attempt.slot_id
+            or reservation.sha256 != terminal.reservation_sha256
+            or terminal.facts != attempt
+            or terminal.receipt != receipt
+            or terminal.artifact != package.artifact
+            or authority.call_key_sha256 != call.sha256
+            or receipt.attempt_facts_sha256 != attempt.sha256
+        ):
+            raise ValueError("journal role completion differs from production ledger")
+        ordered_packages.append((receipt.terminal_sequence, package))
+    if tuple(item[0] for item in ordered_packages) != tuple(range(1, len(packages) + 1)):
+        raise ValueError("journal role completion order differs from production ledger")
+
+
+def authenticate_paid_role_history_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    adapter_config: object,
+    packages: tuple[RoleInvocationPackageV5, ...],
+) -> None:
+    from core.pit_optimizer_v5.development_preparation import ProviderDevelopmentAdapterConfigV5
+
+    if (
+        type(repository) is not LocalArtifactRepositoryV5
+        or type(manifest) is not CampaignManifestV5
+        or type(adapter_config) is not ProviderDevelopmentAdapterConfigV5
+        or type(packages) is not tuple
+        or any(type(package) is not RoleInvocationPackageV5 for package in packages)
+    ):
+        raise ValueError("local V5 paid role history authority is invalid")
+    identity = _role_ledger_read_identity_v5(
+        repository,
+        manifest,
+        api_key_environment_variable=adapter_config.api_key_environment_variable,
+    )
+    if (
+        adapter_config.campaign_manifest_sha256 != identity.campaign_manifest_sha256
+        or adapter_config.repository_root_identity_sha256 != repository.root_identity_sha256
+        or adapter_config.gateway_identity_sha256 != identity.gateway_identity_sha256
+        or adapter_config.ledger_identity_sha256 != identity.ledger_identity_sha256
+        or adapter_config.audit_store_identity_sha256 != identity.audit_store_identity_sha256
+    ):
+        raise ValueError("local V5 paid role history identity differs")
+    reservations, terminals = _load_verified_role_ledger_v5(
+        repository=repository,
+        manifest=manifest,
+        identity=identity,
+    )
+    _authenticate_role_invocations_v5(
+        repository=repository,
+        manifest=manifest,
+        identity=identity,
+        packages=packages,
+        reservations=reservations,
+        terminals=terminals,
+    )
 
 
 class OpenRouterOneShotJsonCompletionV5:
@@ -132,6 +623,7 @@ class OpenRouterOneShotJsonCompletionV5:
             response_schema_json=response_schema_json,
             max_output_tokens=max_output_tokens,
             wall_deadline=deadline_monotonic,
+            allow_full_source_escape=self._ledger.manifest.search.allow_full_source_escape,
         )
         if type(result) is not CompletionResultV5:
             raise ValueError("OpenRouter V5 gateway returned an invalid completion")
@@ -208,41 +700,10 @@ class LocalRoleAuthorizationLedgerV5:
         return value
 
     def _conservative_unreported_usage(self, slot: AuthorizedRoleSlotV5) -> RoleUsageFactsV5:
-        """Derive the deterministic charge for one possibly-launched request."""
-
-        provider = self._manifest.provider
-        assert provider is not None
-        reserved_tokens = slot.input_tokens_upper_bound + slot.request.max_output_tokens
-        reserved_cost = slot.cost_upper_bound_usd or Decimal("0")
-        return RoleUsageFactsV5(
-            1,
-            True,
-            False,
-            reserved_tokens,
-            0,
-            reserved_tokens,
-            reserved_cost,
-            provider.model,
-            "unreported",
-            None,
-        )
+        return _conservative_unreported_usage_v5(self._manifest, slot)
 
     def _completion_usage(self, response: RoleProviderResponseV5) -> RoleUsageFactsV5:
-        provider = self._manifest.provider
-        assert provider is not None
-        completion = response.completion
-        return RoleUsageFactsV5(
-            completion.external_attempt_count,
-            True,
-            completion.response_received,
-            completion.input_tokens,
-            completion.output_tokens,
-            completion.input_tokens + completion.output_tokens,
-            completion.cost_usd,
-            provider.model,
-            completion.returned_model,
-            completion.provider_request_id,
-        )
+        return _completion_usage_v5(self._manifest, response)
 
     def _derive_reported_terminal(
         self,
@@ -251,80 +712,20 @@ class LocalRoleAuthorizationLedgerV5:
         request: RoleRequestV5,
         response: RoleProviderResponseV5,
     ) -> tuple[RoleAttemptFactsV5, ParsedRoleArtifactV5 | None]:
-        """Re-run the live runner's exact reported-response classification."""
-
-        provider = self._manifest.provider
-        assert provider is not None
+        identity = _role_ledger_read_identity_v5(self._repository, self._manifest)
         if (
-            type(request) is not RoleRequestV5
-            or response.campaign_id != self._manifest.campaign_id
-            or response.campaign_manifest_sha256 != self.campaign_manifest_sha256
-            or response.ledger_identity_sha256 != self.ledger_identity_sha256
-            or response.audit_store_identity_sha256 != self.audit_store_identity_sha256
-            or response.request_sha256 != request.sha256
-            or slot.request.request_sha256 != request.sha256
-            or slot.request.role != request.role
-            or slot.request.max_output_tokens != request.max_output_tokens
-            or slot.request.response_schema_sha256 != request.response_schema_sha256
+            identity.campaign_manifest_sha256 != self.campaign_manifest_sha256
+            or identity.audit_store_identity_sha256 != self.audit_store_identity_sha256
+            or identity.ledger_identity_sha256 != self.ledger_identity_sha256
         ):
-            raise ValueError("local V5 reported role response authority differs")
-        usage = self._completion_usage(response)
-        completion = response.completion
-        overage = (
-            completion.returned_model != slot.request.model
-            or completion.output_tokens > slot.request.max_output_tokens
-            or completion.input_tokens > slot.input_tokens_upper_bound
-            or (slot.cost_upper_bound_usd is not None and completion.cost_usd > slot.cost_upper_bound_usd)
-            or slot.prior_external_attempts + usage.external_attempt_count > provider.maximum_role_calls
-            or slot.prior_total_tokens + usage.total_tokens > provider.maximum_total_tokens
-            or (
-                provider.maximum_usd is not None
-                and sum_cost_usd_v5(slot.prior_cost_usd, usage.cost_usd) > provider.maximum_usd
-            )
+            raise ValueError("local V5 role-ledger identity differs")
+        return _derive_reported_terminal_v5(
+            manifest=self._manifest,
+            identity=identity,
+            slot=slot,
+            request=request,
+            response=response,
         )
-        artifact: ParsedRoleArtifactV5 | None = None
-        failure_code: RoleFailureCode | None
-        if overage:
-            failure_code = RoleFailureCode.ACCOUNTING
-        elif not completion.accepted:
-            failure_code = RoleFailureCode.TRANSPORT
-        else:
-            try:
-                artifact = parse_and_bind_role_artifact(
-                    request=request,
-                    response_text=completion.response_text,
-                )
-            except RoleFailureV5 as failure:
-                failure_code = failure.code
-            except BaseException:
-                failure_code = RoleFailureCode.RESPONSE_SCHEMA
-            else:
-                failure_code = None
-        outcome = {
-            None: "accepted",
-            RoleFailureCode.TRANSPORT: "transport_failure",
-            RoleFailureCode.RESPONSE_SCHEMA: "response_schema_failure",
-            RoleFailureCode.EVIDENCE_BINDING: "evidence_binding_failure",
-            RoleFailureCode.AUTHORIZATION: "authorization_failure",
-            RoleFailureCode.ACCOUNTING: "accounting_failure",
-        }[failure_code]
-        try:
-            response_sha256 = canonical_role_response_sha256_v5(completion.response_text)
-        except ValueError:
-            response_sha256 = None
-        facts = RoleAttemptFactsV5(
-            request.role,
-            slot.request.attempt_kind,
-            slot.request.attempt_index,
-            request.sha256,
-            slot.slot_id,
-            outcome,  # type: ignore[arg-type]
-            failure_code,
-            usage,
-            response_sha256,
-            None if artifact is None else canonical_sha256_v5(artifact),
-        )
-        return facts, artifact
 
     def _verify_terminal_facts(
         self,
@@ -333,39 +734,21 @@ class LocalRoleAuthorizationLedgerV5:
         terminal: RoleLedgerTerminalV5,
         request: RoleRequestV5,
     ) -> None:
-        """Recompute all provider-derived facts and the exact parsed artifact."""
-
-        slot = reservation.slot
-        facts = terminal.facts
-        response = self._repository.load_role_provider_response(
-            campaign_id=self._manifest.campaign_id,
-            request_sha256=slot.request.request_sha256,
-        )
-        if response is None:
-            if facts.usage.external_attempt_count == 1:
-                if (
-                    facts.usage != self._conservative_unreported_usage(slot)
-                    or facts.outcome not in {"transport_failure", "accounting_failure"}
-                    or facts.response_sha256 is not None
-                    or terminal.artifact is not None
-                ):
-                    raise ValueError("local V5 unreported role terminal facts differ")
-                return
-            if (
-                facts.usage.external_attempt_count != 0
-                or facts.outcome not in {"authorization_failure", "accounting_failure"}
-                or facts.response_sha256 is not None
-                or terminal.artifact is not None
-            ):
-                raise ValueError("local V5 provider-free role terminal facts differ")
-            return
-        expected_facts, expected_artifact = self._derive_reported_terminal(
-            slot=slot,
+        identity = _role_ledger_read_identity_v5(self._repository, self._manifest)
+        if (
+            identity.campaign_manifest_sha256 != self.campaign_manifest_sha256
+            or identity.audit_store_identity_sha256 != self.audit_store_identity_sha256
+            or identity.ledger_identity_sha256 != self.ledger_identity_sha256
+        ):
+            raise ValueError("local V5 role-ledger identity differs")
+        _verify_terminal_facts_v5(
+            repository=self._repository,
+            manifest=self._manifest,
+            identity=identity,
+            reservation=reservation,
+            terminal=terminal,
             request=request,
-            response=response,
         )
-        if terminal.facts != expected_facts or terminal.artifact != expected_artifact:
-            raise ValueError("local V5 reported role terminal classification differs")
 
     def _load_verified(
         self,
@@ -373,201 +756,41 @@ class LocalRoleAuthorizationLedgerV5:
         tuple[RoleLedgerReservationV5, ...],
         tuple[RoleLedgerTerminalV5, ...],
     ]:
-        provider = self._manifest.provider
-        assert provider is not None
-        reservations, terminals = self._repository.load_role_ledger_records(
-            campaign_id=self._manifest.campaign_id,
-            migration_authority=RoleLedgerMigrationAuthorityV5(
-                campaign_id=self._manifest.campaign_id,
-                campaign_manifest_sha256=self.campaign_manifest_sha256,
-                ledger_identity_sha256=self.ledger_identity_sha256,
-                audit_store_identity_sha256=self.audit_store_identity_sha256,
-                model=provider.model,
-                maximum_output_tokens_per_role=provider.maximum_output_tokens_per_role,
-            ),
-        )
-        by_reservation = {item.sha256: item for item in reservations}
-        if len(by_reservation) != len(reservations):
-            raise ValueError("local V5 role ledger has duplicate reservations")
-        by_slot = {item.slot.slot_id: item for item in reservations}
-        if len(by_slot) != len(reservations):
-            raise ValueError("local V5 role ledger has duplicate slots")
-        requests_by_slot: dict[str, RoleRequestV5] = {}
-        terminal_slots: set[str] = set()
-        for reservation in reservations:
-            request = self._repository.load_unique_role_request_by_sha256(reservation.slot.request.request_sha256)
-            input_bound, cost_bound = prospective_role_usage_v5(request, provider)
-            if (
-                reservation.campaign_id != self._manifest.campaign_id
-                or reservation.campaign_manifest_sha256 != self.campaign_manifest_sha256
-                or reservation.ledger_identity_sha256 != self.ledger_identity_sha256
-                or reservation.audit_store_identity_sha256 != self.audit_store_identity_sha256
-                or reservation.slot.request.model != provider.model
-                or reservation.slot.request.max_output_tokens != provider.maximum_output_tokens_per_role
-                or reservation.slot.request.role != request.role
-                or reservation.slot.request.max_output_tokens != request.max_output_tokens
-                or reservation.slot.request.response_schema_sha256 != request.response_schema_sha256
-                or reservation.slot.input_tokens_upper_bound != input_bound
-                or reservation.slot.cost_upper_bound_usd != cost_bound
-                or reservation.slot.prior_external_attempts + 1 > provider.maximum_role_calls
-                or reservation.slot.prior_total_tokens + input_bound + request.max_output_tokens
-                > provider.maximum_total_tokens
-                or (
-                    provider.maximum_usd is not None
-                    and (
-                        cost_bound is None
-                        or sum_cost_usd_v5(reservation.slot.prior_cost_usd, cost_bound) > provider.maximum_usd
-                    )
-                )
-                or (
-                    reservation.record_schema_revision == 3
-                    and reservation.invocation_claim.lease_deadline_epoch_ms
-                    - reservation.invocation_claim.lease_started_epoch_ms
-                    != self._manifest.resources.role_call_timeout_seconds * 1000
-                )
-            ):
-                raise ValueError("local V5 role-ledger reservation authority differs")
-            requests_by_slot[reservation.slot.slot_id] = request
-            expected_slot_id = canonical_sha256_v5(
-                {
-                    "domain": "pit-optimizer-v5-role-slot-id-v1",
-                    "campaign_manifest_sha256": self.campaign_manifest_sha256,
-                    "request_sha256": reservation.slot.request.sha256,
-                }
-            )
-            expected_authorization = canonical_sha256_v5(
-                {
-                    "domain": "pit-optimizer-v5-role-slot-v1",
-                    "ledger_identity_sha256": self.ledger_identity_sha256,
-                    "request_sha256": reservation.slot.request.sha256,
-                    "terminal_sequence": reservation.slot.prior_terminal_sequence + 1,
-                }
-            )
-            if (
-                reservation.slot.slot_id != expected_slot_id
-                or reservation.slot.authorization_sha256 != expected_authorization
-            ):
-                raise ValueError("local V5 role-ledger reservation binding differs")
-        for terminal in terminals:
-            reservation = by_reservation.get(terminal.reservation_sha256)
-            if reservation is None or terminal.receipt.slot_id != reservation.slot.slot_id:
-                raise ValueError("local V5 role-ledger terminal lacks its reservation")
-            if terminal.receipt.slot_id in terminal_slots:
-                raise ValueError("local V5 role ledger has duplicate terminals")
-            terminal_slots.add(terminal.receipt.slot_id)
-        ordered = tuple(sorted(terminals, key=lambda item: item.receipt.terminal_sequence))
-        if tuple(item.receipt.terminal_sequence for item in ordered) != tuple(range(1, len(ordered) + 1)):
-            raise ValueError("local V5 role-ledger terminal chain is discontinuous")
-        ordered_reservations = tuple(sorted(reservations, key=lambda item: item.ledger_ordinal))
-        if tuple(item.ledger_ordinal for item in ordered_reservations) != tuple(
-            range(1, len(ordered_reservations) + 1)
+        identity = _role_ledger_read_identity_v5(self._repository, self._manifest)
+        if (
+            identity.campaign_manifest_sha256 != self.campaign_manifest_sha256
+            or identity.audit_store_identity_sha256 != self.audit_store_identity_sha256
+            or identity.ledger_identity_sha256 != self.ledger_identity_sha256
         ):
-            raise ValueError("local V5 role-ledger reservation sequence is discontinuous")
-        for index, reservation in enumerate(ordered_reservations):
-            slot = reservation.slot
-            prior = ordered[index - 1].receipt if index else None
-            if (
-                slot.prior_external_attempts != (0 if prior is None else prior.cumulative_external_attempts)
-                or slot.prior_total_tokens != (0 if prior is None else prior.cumulative_total_tokens)
-                or slot.prior_cost_usd != (Decimal("0") if prior is None else prior.cumulative_cost_usd)
-                or slot.prior_terminal_sequence != index
-            ):
-                raise ValueError("local V5 role-ledger reservation prior totals differ")
-            if index < len(ordered):
-                terminal = ordered[index]
-                expected_receipt_payload = {
-                    "slot_id": slot.slot_id,
-                    "slot_request_sha256": slot.request.sha256,
-                    "authorization_sha256": slot.authorization_sha256,
-                    "attempt_facts_sha256": terminal.facts.sha256,
-                    "cumulative_external_attempts": (
-                        slot.prior_external_attempts + terminal.facts.usage.external_attempt_count
-                    ),
-                    "cumulative_total_tokens": slot.prior_total_tokens + terminal.facts.usage.total_tokens,
-                    "cumulative_cost_usd": sum_cost_usd_v5(slot.prior_cost_usd, terminal.facts.usage.cost_usd),
-                    "terminal_sequence": slot.prior_terminal_sequence + 1,
-                }
-                expected_receipt = RoleTerminalReceiptV5(
-                    **expected_receipt_payload,
-                    receipt_sha256=canonical_sha256_v5(expected_receipt_payload),
-                )
-                if (
-                    terminal.reservation_sha256 != reservation.sha256
-                    or terminal.facts.role != slot.request.role
-                    or terminal.facts.attempt_kind != slot.request.attempt_kind
-                    or terminal.facts.attempt_index != slot.request.attempt_index
-                    or terminal.facts.request_sha256 != slot.request.request_sha256
-                    or terminal.facts.slot_id != slot.slot_id
-                    or terminal.receipt != expected_receipt
-                ):
-                    raise ValueError("local V5 role-ledger terminal differs from its slot")
-                self._verify_terminal_facts(
-                    reservation=reservation,
-                    terminal=terminal,
-                    request=requests_by_slot[slot.slot_id],
-                )
-        return ordered_reservations, ordered
+            raise ValueError("local V5 role-ledger identity differs")
+        return _load_verified_role_ledger_v5(
+            repository=self._repository,
+            manifest=self._manifest,
+            identity=identity,
+        )
 
     def authenticate_role_invocations(
         self,
         packages: tuple[RoleInvocationPackageV5, ...],
     ) -> None:
-        """Bind every journal terminal to the exact production ledger record."""
-
         if type(packages) is not tuple or any(type(package) is not RoleInvocationPackageV5 for package in packages):
             raise ValueError("local V5 role invocation collection is invalid")
+        identity = _role_ledger_read_identity_v5(self._repository, self._manifest)
+        if (
+            identity.campaign_manifest_sha256 != self.campaign_manifest_sha256
+            or identity.audit_store_identity_sha256 != self.audit_store_identity_sha256
+            or identity.ledger_identity_sha256 != self.ledger_identity_sha256
+        ):
+            raise ValueError("local V5 role-ledger identity differs")
         reservations, terminals = self._load_verified()
-        if len(reservations) != len(terminals) or len(terminals) != len(packages):
-            raise ValueError("local V5 role ledger differs from journal completion state")
-        by_slot = {record.slot.slot_id: record for record in reservations}
-        terminal_by_slot = {record.receipt.slot_id: record for record in terminals}
-        ordered_packages: list[tuple[int, RoleInvocationPackageV5]] = []
-        provider = self._manifest.provider
-        assert provider is not None
-        for package in packages:
-            authority = package.terminal_authority
-            if type(authority) is FixtureRoleTerminalAuthorityV5:
-                raise ValueError("fixture role terminal is not production authority")
-            if type(authority) is not LedgerRoleTerminalAuthorityV5:
-                raise ValueError("role terminal lacks production ledger authority")
-            call = package.call
-            request = package.request
-            attempt = package.attempt
-            receipt = authority.receipt
-            reservation = by_slot.get(receipt.slot_id)
-            terminal = terminal_by_slot.get(receipt.slot_id)
-            slot_request = RoleSlotRequestV5(
-                request_sha256=request.sha256,
-                role=call.role,
-                attempt_kind=call.attempt_kind,
-                attempt_index=call.attempt_index,
-                model=provider.model,
-                max_output_tokens=request.max_output_tokens,
-                response_schema_sha256=request.response_schema_sha256,
-            )
-            persisted_call, persisted_request = self._repository.load_unique_role_request_entry_by_sha256(
-                request.sha256,
-            )
-            if (
-                call.campaign_id != self._manifest.campaign_id
-                or call.round_index > self._manifest.search.max_feedback_rounds
-                or persisted_call != call
-                or persisted_request != request
-                or reservation is None
-                or terminal is None
-                or reservation.slot.request != slot_request
-                or reservation.slot.slot_id != attempt.slot_id
-                or reservation.sha256 != terminal.reservation_sha256
-                or terminal.facts != attempt
-                or terminal.receipt != receipt
-                or terminal.artifact != package.artifact
-                or authority.call_key_sha256 != call.sha256
-                or receipt.attempt_facts_sha256 != attempt.sha256
-            ):
-                raise ValueError("journal role completion differs from production ledger")
-            ordered_packages.append((receipt.terminal_sequence, package))
-        if tuple(item[0] for item in ordered_packages) != tuple(range(1, len(packages) + 1)):
-            raise ValueError("journal role completion order differs from production ledger")
+        _authenticate_role_invocations_v5(
+            repository=self._repository,
+            manifest=self._manifest,
+            identity=identity,
+            packages=packages,
+            reservations=reservations,
+            terminals=terminals,
+        )
 
     def reserve_role_slot(self, request: RoleSlotRequestV5) -> AuthorizedRoleSlotV5:
         if type(request) is not RoleSlotRequestV5:
@@ -626,6 +849,33 @@ class LocalRoleAuthorizationLedgerV5:
                 cost_upper_bound_usd=cost_bound,
             )
             lease_started = self._now_ms()
+            admission = load_campaign_admission_v5(
+                repository=self._repository,
+                manifest=self._manifest,
+            )
+            if admission is not None:
+                call, exact_request = self._repository.load_unique_role_request_entry_by_sha256(
+                    request.request_sha256
+                )
+                if (
+                    exact_request != role_request
+                    or call.campaign_id != self._manifest.campaign_id
+                    or call.role != request.role
+                    or call.attempt_kind != request.attempt_kind
+                    or call.attempt_index != request.attempt_index
+                    or call.role_position != {"investigator": 1, "author": 2, "critic": 3}[call.role]
+                    or call.attempt_kind != "primary"
+                    or call.attempt_index != 1
+                    or call.request_sha256 != request.request_sha256
+                ):
+                    raise ValueError("local V5 admitted role call differs from its persisted request")
+                require_live_role_admission_v5(
+                    repository=self._repository,
+                    manifest=self._manifest,
+                    request=exact_request,
+                    round_index=call.round_index,
+                    now_epoch_ms=lease_started,
+                )
             record = RoleLedgerReservationV5(
                 schema_version=5,
                 record_schema_revision=3,
@@ -986,4 +1236,8 @@ class LocalRoleAuthorizationLedgerV5:
         )
 
 
-__all__ = ["LocalRoleAuthorizationLedgerV5", "OpenRouterOneShotJsonCompletionV5"]
+__all__ = [
+    "LocalRoleAuthorizationLedgerV5",
+    "OpenRouterOneShotJsonCompletionV5",
+    "authenticate_paid_role_history_v5",
+]

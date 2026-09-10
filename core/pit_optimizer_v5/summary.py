@@ -77,7 +77,10 @@ class OptimizerSummaryV5:
     source_unchanged: bool | None = None
     qualification_started: bool = False
     replay_started: bool = False
-    evaluation_mode: Literal["synthetic_fixture", "production"] = "production"
+    evaluation_mode: Literal["synthetic_fixture", "production", "development_sp500_v2"] = "production"
+    completed_lifecycle_rounds: int = 0
+    evaluated_feedback_rounds: int = 0
+    render_rejected_experiments: int = 0
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 5:
@@ -98,9 +101,20 @@ class OptimizerSummaryV5:
             self.evaluated_experiments,
             self.behaviorally_distinct_variants,
             self.archive_families,
+            self.completed_lifecycle_rounds,
+            self.evaluated_feedback_rounds,
+            self.render_rejected_experiments,
         ):
             if type(value) is not int or value < 0:
                 raise ValueError("optimizer summary count is invalid")
+        if (
+            self.completed_lifecycle_rounds > self.rounds_seen
+            or self.completed_lifecycle_rounds > self.experiments
+            or self.evaluated_feedback_rounds > self.completed_lifecycle_rounds
+            or self.evaluated_feedback_rounds > self.evaluated_experiments
+            or self.render_rejected_experiments > self.experiments
+        ):
+            raise ValueError("optimizer summary progress counts are inconsistent")
         if type(self.cost_usd) is not Decimal or not self.cost_usd.is_finite() or self.cost_usd < 0:
             raise ValueError("optimizer summary cost is invalid")
         for value in (self.best_campaign_cagr_pct, self.target_gap_pct, self.target_pct):
@@ -112,7 +126,7 @@ class OptimizerSummaryV5:
             raise ValueError("optimizer summary source state is invalid")
         if type(self.qualification_started) is not bool or type(self.replay_started) is not bool:
             raise ValueError("optimizer summary stage state is invalid")
-        if self.evaluation_mode not in {"synthetic_fixture", "production"}:
+        if self.evaluation_mode not in {"synthetic_fixture", "production", "development_sp500_v2"}:
             raise ValueError("optimizer summary evaluation mode is invalid")
         if self.execution_profile_sha256 is not None and (
             type(self.execution_profile_sha256) is not str
@@ -161,11 +175,27 @@ def summarize_repository_v5(
     manifest: CampaignManifestV5,
     command: Literal["run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"],
     readiness_code: str = "ready",
+    verification_scope: Literal["current_runtime", "completed_history"] = "current_runtime",
 ) -> OptimizerSummaryV5:
     """Project only non-sensitive counts and aggregate performance metrics."""
 
     if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
         raise ValueError("optimizer summary authority is invalid")
+    if type(verification_scope) is not str or verification_scope not in {
+        "current_runtime",
+        "completed_history",
+    }:
+        raise ValueError("optimizer summary verification scope is invalid")
+    if verification_scope == "completed_history":
+        from core.pit_optimizer_v5.development_preparation import (
+            authenticate_completed_development_history_v5,
+            require_development_v5,
+        )
+
+        if command != "summarize":
+            raise ValueError("completed history requires the summarize command")
+        require_development_v5(manifest)
+        authenticate_completed_development_history_v5(repository, manifest)
     rounds_seen = 0
     terminal_rounds = 0
     role_calls = 0
@@ -203,6 +233,20 @@ def summarize_repository_v5(
         manifest=manifest,
         panel_plan=panel_plan,
         evaluator_contract=evaluator_contract,
+        repair=verification_scope == "current_runtime",
+    )
+    record_rounds = {record.round_index for record in records}
+    completed_record_rounds = {
+        round_index
+        for round_index in record_rounds
+        if round_index in cleanups and cleanups[round_index].cleanup_complete
+    }
+    evaluated_record_rounds = {record.round_index for record in evaluated}
+    render_rejected_experiments = sum(
+        1
+        for record in records
+        if record.status == "invalid"
+        and record.validation.failure_code == "policy_source_unbounded_or_stateful"
     )
     stored = (
         ()
@@ -225,7 +269,18 @@ def summarize_repository_v5(
         else len(cleanups) == rounds_seen and all(item.cleanup_complete for item in cleanups.values())
     )
     source_unchanged = None
-    if manifest.provider is None and rounds_seen:
+    if manifest.pit_data_scope == "development_sp500_v2":
+        from core.pit_optimizer_v5.development_preparation import (
+            authenticate_development_history_v5,
+            require_development_v5,
+        )
+
+        # Scope and provider provenance are independent: the original config selects
+        # controller-package or paid-ledger authentication inside the shared verifier.
+        require_development_v5(manifest)
+        if verification_scope == "current_runtime" and rounds_seen:
+            authenticate_development_history_v5(repository, manifest)
+    elif manifest.provider is None and rounds_seen:
         from core.pit_optimizer_v5.fixture_runtime import verify_fixture_run_v5
         from core.pit_optimizer_v5.candidate_ir import SourceBundleV5
 
@@ -276,7 +331,16 @@ def summarize_repository_v5(
         source_unchanged,
         False,
         False,
-        "synthetic_fixture" if manifest.provider is None else "production",
+        "development_sp500_v2"
+        if manifest.pit_data_scope == "development_sp500_v2"
+        else "synthetic_fixture"
+        if manifest.provider is None
+        else "production",
+        completed_lifecycle_rounds=len(completed_record_rounds),
+        evaluated_feedback_rounds=len(
+            completed_record_rounds & evaluated_record_rounds
+        ),
+        render_rejected_experiments=render_rejected_experiments,
     )
 
 

@@ -347,6 +347,7 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
         git_executable: Path,
         repository: LocalArtifactRepositoryV5,
         owner: WorkspaceOwnerV5,
+        export_mode: str = "full",
     ) -> None:
         if os.name != "nt":
             raise RuntimeError("the concrete V5 Git workspace adapter requires Windows handle authority")
@@ -359,6 +360,9 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             or not git_executable.is_absolute()
         ):
             raise ValueError("local Git workspace configuration is invalid")
+        if export_mode not in {"full", "policy_only"}:
+            raise ValueError("invalid workspace export mode")
+        self._export_mode = export_mode
         executable_identity = _hash_regular_file(git_executable)
         source_path, source_info = _canonical_link_free_directory(roots.source_root)
         workspace_path, workspace_info = _canonical_link_free_directory(roots.workspace_root)
@@ -386,8 +390,17 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
                 ),
                 "repository_root_identity_sha256": repository.root_identity_sha256,
                 "owner_sha256": owner.sha256,
+                **(
+                    {"export_mode": export_mode, "export_paths": EDITABLE_POLICY_PATHS_V5}
+                    if export_mode == "policy_only"
+                    else {}
+                ),
             }
         )
+
+    @property
+    def export_mode(self) -> str:
+        return self._export_mode
 
     @property
     def driver_identity_sha256(self) -> str:
@@ -550,6 +563,7 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             "-r",
             "--full-tree",
             self._source_commit,
+            *(("--", *EDITABLE_POLICY_PATHS_V5) if self.export_mode == "policy_only" else ()),
             output_limit=32 * 1024 * 1024,
         )
         entries: list[tuple[tuple[str, ...], str]] = []
@@ -567,6 +581,8 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
             entries.append((parts, mode))
         paths = tuple("/".join(parts) for parts, _mode in entries)
         if len(set(paths)) != len(paths):
+            raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+        if self.export_mode == "policy_only" and set(paths) != set(EDITABLE_POLICY_PATHS_V5):
             raise WorkspaceDriverBoundaryErrorV5("driver_failed")
         entries.sort(key=lambda item: "/".join(item[0]))
         owned_directories: dict[tuple[str, ...], tuple[int, int]] = {(): target_identity}

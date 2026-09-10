@@ -614,8 +614,16 @@ def build_campaign_manifest_v5(
         raise ValueError("manifest provider capabilities are invalid")
     if pit_data_scope not in {"production", "development_sp500_v2"}:
         raise ValueError("manifest PIT data scope is invalid")
-    if pit_data_scope == "development_sp500_v2" and provider is not None:
-        raise ValueError("development campaign must be provider-free")
+    if (
+        pit_data_scope == "development_sp500_v2"
+        and provider is not None
+        and (
+            semantic_mode != "disabled_development"
+            or provider.automatic_retries != 0
+            or provider.schema_repair_calls != 0
+        )
+    ):
+        raise ValueError("development provider requires disabled semantics and zero retries/repair")
     if type(resolved_resources) is not ResourceCapabilitiesV5:
         raise ValueError("manifest resource capabilities are invalid")
 

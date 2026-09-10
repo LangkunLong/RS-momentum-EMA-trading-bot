@@ -1084,8 +1084,16 @@ class CampaignManifestV5:
             raise ValueError("campaign provider capabilities are invalid")
         if self.pit_data_scope not in {"production", "development_sp500_v2"}:
             raise ValueError("campaign PIT data scope is invalid")
-        if self.pit_data_scope == "development_sp500_v2" and self.provider is not None:
-            raise ValueError("development campaign must be provider-free")
+        if (
+            self.pit_data_scope == "development_sp500_v2"
+            and self.provider is not None
+            and (
+                self.semantic_mode != "disabled_development"
+                or self.provider.automatic_retries != 0
+                or self.provider.schema_repair_calls != 0
+            )
+        ):
+            raise ValueError("development provider requires disabled semantics and zero retries/repair")
         if type(self.resources) is not ResourceCapabilitiesV5:
             raise ValueError("campaign resource capabilities are invalid")
         if type(self.artifact_root) is not str or self.artifact_root != ARTIFACT_ROOT_V5:

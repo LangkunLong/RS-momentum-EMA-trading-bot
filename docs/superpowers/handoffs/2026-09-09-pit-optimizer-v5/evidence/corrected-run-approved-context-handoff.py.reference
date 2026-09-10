@@ -1,0 +1,555 @@
+"""One-use native control-environment handoff for the approved C-c launch."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import redirect_stderr, redirect_stdout
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import secrets
+import stat
+import subprocess
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parents[5]
+PACKAGE = Path(__file__).resolve().parent
+HELPER = Path(__file__).resolve()
+REVIEW = PACKAGE / "context-handoff-independent-review.md"
+DESCRIPTOR = PACKAGE / "context-handoff-descriptor.json"
+CLAIM = PACKAGE / "context-handoff-receiver-claim.json"
+RESULT = PACKAGE / "actual-context-handoff-result.json"
+DIAGNOSTIC = PACKAGE / "diagnose-actual-composition.py"
+LAUNCH_ENVELOPE = PACKAGE / "launch-envelope.json"
+GRANT = PACKAGE / "fresh-user-grant.json"
+SOURCE_AUTHORITY = PACKAGE.parent / "admission-p4/reviewed-source-authority.json"
+
+EXPECTED_FILES = {
+    PACKAGE / "execution-context-reproduction.md": (
+        "ebfcf2c4a59c439e16f7cfebaca330beeaf227e9da53a57c6a870119575f4fe7"
+    ),
+    PACKAGE / "actual-launch-01-stage-review.md": (
+        "8dd4d849205a37ea90ca00ef834f3d791b9e7e01136e53f4b1fd8ee3dcd74288"
+    ),
+    PACKAGE / "actual-launch-context-diagnosis.md": (
+        "b59c1ad1a0c95fbe4dcdacb81c1a1c20fcda4e1ff1badc29c36f554a7b70268c"
+    ),
+    DIAGNOSTIC: "218c8a53c6a1eb72aa461685e0d9c9dbf39c6b89fc3ee06aace863ae9323cc18",
+    LAUNCH_ENVELOPE: "e3c6c06daf69111fc566605eb3e1b55547c0257bc81c71b6e9c6fa972c5b9237",
+    GRANT: "8ef007db9e1111833b57fee305b419b846b50b95e35a517c45b262b8464e591e",
+    SOURCE_AUTHORITY: "d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09",
+}
+EXPECTED_CAMPAIGN_ID = "development-provider-two-evaluated-admission-20260908-01"
+EXPECTED_MANIFEST_SHA256 = "d6ecfcf650ba705015f11220a5152ff24bbec56faf33bab8399d4a5fad0ead72"
+EXPECTED_CONFIG_SHA256 = "934b02388104c31e9d8b570e6319eb158bc401312a634fd63438d78559a389ea"
+EXPECTED_POLICY_SHA256 = "8b40cb1992ec1e57d73b1951691bea3cee45ffc04f3db82d84e5ff38e6abdd7e"
+EXPECTED_OWNER_SHA256 = "05b9b28975be1ae9c4a61431a9d1d287a29ec9abc4e39b552dc5188d87065e7e"
+EXPECTED_SAVED_ARGV_SHA256 = "c1104cbe89d0ce3ab818fb5f3a959e26652bcbdb162ff21540f30e46fc077a54"
+EXPECTED_COMPONENTS = {
+    "candidate_base_identity_sha256": (
+        "3be51041cc46fe95cb683de00cf922441f4d3b0d84b9d9f376d1c8537ccb0876"
+    ),
+    "container_executor_identity_sha256": (
+        "e18e076aebc4327a234d1e861d78c5578b6fd2187edfde3e6ff1f1396683f9f2"
+    ),
+    "mount_factory_identity_sha256": (
+        "54d71af50f01cbef3ea04ef7cbd789980e19307e9e51e46530a52e42815ce418"
+    ),
+    "workspace_driver_identity_sha256": (
+        "9266c245b6c7ed29c9b45de7b10f4fa5f1bd5e59800bf1f1057d38bdfe470d72"
+    ),
+}
+CONTROL_KEYS = frozenset({"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "SYSTEMDRIVE"})
+MAX_MESSAGE_BYTES = 128 * 1024
+HANDOFF_TIMEOUT_SECONDS = 60.0
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+_REPARSE_POINT = 0x400
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical_bytes(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def disk(path: Path) -> Path:
+    value = str(path)
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return path
+    if value.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + value[2:])
+    return Path("\\\\?\\" + value)
+
+
+def read_regular(path: Path, label: str) -> bytes:
+    target = disk(path)
+    metadata = target.lstat()
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or attributes & _REPARSE_POINT:
+        raise RuntimeError(f"{label} is not a regular link-free file")
+    return target.read_bytes()
+
+
+def read_exact(path: Path, expected: str, label: str) -> bytes:
+    raw = read_regular(path, label)
+    if digest(raw) != expected:
+        raise RuntimeError(f"{label} digest mismatch")
+    return raw
+
+
+def exists(path: Path) -> bool:
+    try:
+        disk(path).lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def write_exclusive(path: Path, raw: bytes) -> None:
+    descriptor = os.open(
+        disk(path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(raw):
+            count = os.write(descriptor, raw[written:])
+            if count <= 0:
+                raise RuntimeError("exclusive write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("source", "receiver"))
+    parser.add_argument("--approved-helper-sha256", required=True)
+    parser.add_argument("--approved-review-sha256", required=True)
+    return parser.parse_args()
+
+
+def authenticate_fixed_bytes(args: argparse.Namespace) -> tuple[dict[str, object], dict[str, object]]:
+    if os.name != "nt" or not sys.dont_write_bytecode:
+        raise RuntimeError("the reviewed helper requires Windows and Python -B")
+    if not _DIGEST.fullmatch(args.approved_helper_sha256):
+        raise RuntimeError("an exact independently reviewed helper SHA-256 is required")
+    read_exact(HELPER, args.approved_helper_sha256, "context-handoff helper")
+    if not _DIGEST.fullmatch(args.approved_review_sha256):
+        raise RuntimeError("an exact independent-review SHA-256 is required")
+    review_raw = read_exact(REVIEW, args.approved_review_sha256, "context-handoff independent review")
+    review_text = review_raw.decode("utf-8")
+    if args.approved_helper_sha256 not in review_text or not re.search(
+        r"\b(PASS|APPROVE|APPROVED)\b", review_text, re.IGNORECASE
+    ):
+        raise RuntimeError("independent review does not approve this exact helper")
+    authenticated = {str(path): digest(read_exact(path, expected, path.name)) for path, expected in EXPECTED_FILES.items()}
+    authority = json.loads(read_exact(SOURCE_AUTHORITY, EXPECTED_FILES[SOURCE_AUTHORITY], "source authority"))
+    if type(authority) is not dict or len(authority.get("source_sha256_by_path", {})) != 22:
+        raise RuntimeError("reviewed source authority is malformed")
+    envelope = json.loads(read_exact(LAUNCH_ENVELOPE, EXPECTED_FILES[LAUNCH_ENVELOPE], "launch envelope"))
+    grant = json.loads(read_exact(GRANT, EXPECTED_FILES[GRANT], "fresh user grant"))
+    validate_envelope_and_grant(envelope, grant)
+    return envelope, {
+        "approved_helper_sha256": args.approved_helper_sha256,
+        "approved_review_sha256": args.approved_review_sha256,
+        "authenticated_file_sha256": authenticated,
+    }
+
+
+def validate_envelope_and_grant(envelope: object, grant: object) -> None:
+    if type(envelope) is not dict or type(grant) is not dict:
+        raise RuntimeError("grant or launch envelope is malformed")
+    campaign = envelope.get("campaign")
+    argv = envelope.get("saved_launch_argv")
+    if (
+        type(campaign) is not dict
+        or campaign.get("campaign_id") != EXPECTED_CAMPAIGN_ID
+        or campaign.get("manifest_ref", {}).get("sha256") != EXPECTED_MANIFEST_SHA256
+        or campaign.get("adapter_config_ref", {}).get("sha256") != EXPECTED_CONFIG_SHA256
+        or campaign.get("campaign_policy_ref", {}).get("sha256") != EXPECTED_POLICY_SHA256
+        or campaign.get("owner_token_sha256") != EXPECTED_OWNER_SHA256
+        or type(argv) is not list
+        or not argv
+        or any(type(item) is not str or not item for item in argv)
+        or digest(canonical_bytes(argv)) != EXPECTED_SAVED_ARGV_SHA256
+        or envelope.get("working_directory") != str(ROOT)
+    ):
+        raise RuntimeError("launch envelope differs from the exact approved campaign and argv")
+    if (
+        grant.get("user_message") != "Approved"
+        or grant.get("scope") != "one exact reviewed campaign run"
+        or grant.get("campaign_id") != EXPECTED_CAMPAIGN_ID
+        or grant.get("runtime_not_started_at_grant_record") is not True
+        or grant.get("limits") != envelope.get("limits")
+        or grant.get("launch_script_sha256") != envelope.get("launch_script_sha256")
+    ):
+        raise RuntimeError("fresh user grant differs from the exact launch envelope")
+
+
+def validate_diagnostic(value: object) -> None:
+    if type(value) is not dict:
+        raise RuntimeError("actual composition diagnostic did not emit an object")
+    expected_keys = {
+        "artifact_bytes_unchanged",
+        "artifact_file_count",
+        "campaign_id",
+        "components",
+        "config_sha256",
+        "environment_values_published",
+        "manifest_sha256",
+        "native_host_graph_matches",
+        "operation",
+        "provider_or_evaluator_invoked",
+    }
+    if set(value) != expected_keys:
+        raise RuntimeError("actual composition diagnostic fields differ")
+    components = value.get("components")
+    if type(components) is not dict or set(components) != set(EXPECTED_COMPONENTS):
+        raise RuntimeError("actual composition component proof is incomplete")
+    for name, expected in EXPECTED_COMPONENTS.items():
+        comparison = components[name]
+        if type(comparison) is not dict or comparison != {
+            "actual": expected,
+            "matches": True,
+            "prepared": expected,
+        }:
+            raise RuntimeError(f"actual composition mismatch: {name}")
+    if (
+        value["campaign_id"] != EXPECTED_CAMPAIGN_ID
+        or value["manifest_sha256"] != EXPECTED_MANIFEST_SHA256
+        or value["config_sha256"] != EXPECTED_CONFIG_SHA256
+        or value["native_host_graph_matches"] is not True
+        or value["artifact_bytes_unchanged"] is not True
+        or value["artifact_file_count"] != 32
+        or value["provider_or_evaluator_invoked"] is not False
+        or value["environment_values_published"] is not False
+        or value["operation"] != "actual_native_composition_only_no_run_or_validation_bypass"
+    ):
+        raise RuntimeError("actual composition diagnostic did not prove the approved unchanged graph")
+
+
+def diagnostic_argv(envelope: dict[str, object]) -> list[str]:
+    saved = envelope["saved_launch_argv"]
+    assert type(saved) is list
+    return [*saved[:3], str(DIAGNOSTIC)]
+
+
+def run_source_diagnostic(envelope: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    stdout_bytes = io.BytesIO()
+    stderr_bytes = io.BytesIO()
+    stdout = io.TextIOWrapper(stdout_bytes, encoding="utf-8")
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="utf-8")
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            namespace = runpy.run_path(str(DIAGNOSTIC), run_name="__main__")
+    finally:
+        stdout.flush()
+        stderr.flush()
+    if stderr_bytes.getvalue():
+        raise RuntimeError("source composition diagnostic wrote unexpected stderr")
+    validate_diagnostic(json.loads(stdout_bytes.getvalue().decode("utf-8")))
+    executor = namespace["candidate"].panel_evaluator.evaluator.executor
+    if executor.executor_identity_sha256 != EXPECTED_COMPONENTS["container_executor_identity_sha256"]:
+        raise RuntimeError("source diagnostic executor differs from its approved identity")
+    environment = executor._base_environment
+    if type(environment) is not tuple:
+        raise RuntimeError("native executor control environment is malformed")
+    pairs = []
+    seen = set()
+    for item in environment:
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or type(item[1]) is not str
+            or item[0] not in CONTROL_KEYS
+            or item[0] in seen
+        ):
+            raise RuntimeError("native executor exposed an invalid control-environment entry")
+        seen.add(item[0])
+        pairs.append(item)
+    if tuple(sorted(pairs)) != environment:
+        raise RuntimeError("native executor control environment is not canonical")
+    return environment
+
+
+def run_receiver_diagnostic(envelope: dict[str, object], child_environment: dict[str, str]) -> dict[str, object]:
+    completed = subprocess.run(
+        diagnostic_argv(envelope),
+        cwd=envelope["working_directory"],
+        env=child_environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0 or completed.stderr:
+        raise RuntimeError("receiver composition diagnostic process failed")
+    value = json.loads(completed.stdout.decode("utf-8"))
+    validate_diagnostic(value)
+    return value
+
+
+def claim_document(args: argparse.Namespace, endpoint: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation": "claim_exact_approved_saved_launch_once",
+        "campaign_id": EXPECTED_CAMPAIGN_ID,
+        "manifest_sha256": EXPECTED_MANIFEST_SHA256,
+        "adapter_config_sha256": EXPECTED_CONFIG_SHA256,
+        "campaign_policy_sha256": EXPECTED_POLICY_SHA256,
+        "owner_token_sha256": EXPECTED_OWNER_SHA256,
+        "saved_launch_argv_sha256": EXPECTED_SAVED_ARGV_SHA256,
+        "helper_sha256": args.approved_helper_sha256,
+        "review_sha256": args.approved_review_sha256,
+        "pipe_endpoint_sha256": digest(endpoint.encode("utf-8")),
+    }
+
+
+def create_pipe(endpoint: str) -> int:
+    import _winapi
+
+    flags = _winapi.PIPE_ACCESS_DUPLEX | _winapi.FILE_FLAG_OVERLAPPED | _winapi.FILE_FLAG_FIRST_PIPE_INSTANCE
+    mode = _winapi.PIPE_TYPE_MESSAGE | _winapi.PIPE_READMODE_MESSAGE | _winapi.PIPE_WAIT | 0x8
+    return _winapi.CreateNamedPipe(
+        endpoint,
+        flags,
+        mode,
+        1,
+        MAX_MESSAGE_BYTES,
+        MAX_MESSAGE_BYTES,
+        0,
+        _winapi.NULL,
+    )
+
+
+def accept_pipe(handle: int, timeout_seconds: float):
+    import _winapi
+    from multiprocessing.connection import PipeConnection
+
+    try:
+        overlapped = _winapi.ConnectNamedPipe(handle, overlapped=True)
+    except OSError as exc:
+        if exc.winerror != _winapi.ERROR_NO_DATA:
+            raise
+    else:
+        result = _winapi.WaitForMultipleObjects([overlapped.event], False, int(timeout_seconds * 1000))
+        if result == _winapi.WAIT_TIMEOUT:
+            overlapped.cancel()
+            try:
+                overlapped.GetOverlappedResult(True)
+            except OSError:
+                pass
+            raise TimeoutError("source named-pipe accept timed out")
+        if result != _winapi.WAIT_OBJECT_0:
+            raise RuntimeError("source named-pipe accept returned an unexpected wait result")
+        _, error = overlapped.GetOverlappedResult(True)
+        if error:
+            raise OSError(error, "source named-pipe accept failed")
+    return PipeConnection(handle)
+
+
+def receive_bytes(connection, deadline: float) -> bytes:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not connection.poll(remaining):
+        raise TimeoutError("context handoff timed out")
+    return connection.recv_bytes(MAX_MESSAGE_BYTES)
+
+
+def source_mode(args: argparse.Namespace, envelope: dict[str, object]) -> int:
+    import _winapi
+
+    if any(exists(path) for path in (DESCRIPTOR, CLAIM, RESULT)):
+        raise RuntimeError("one-use context handoff path already exists")
+    environment = run_source_diagnostic(envelope)
+    endpoint = rf"\\.\pipe\pit-v5-c-c-{secrets.token_hex(24)}"
+    handle = create_pipe(endpoint)
+    connection = None
+    try:
+        write_exclusive(DESCRIPTOR, canonical_bytes({"pipe_endpoint": endpoint}))
+        deadline = time.monotonic() + HANDOFF_TIMEOUT_SECONDS
+        connection = accept_pipe(handle, max(0.0, deadline - time.monotonic()))
+        handle = None
+        expected_claim = canonical_bytes(claim_document(args, endpoint))
+        if receive_bytes(connection, deadline) != expected_claim:
+            raise RuntimeError("receiver claim differs from the exact approved launch")
+        payload = canonical_bytes(
+            {
+                "schema_version": 1,
+                "control_environment": [list(item) for item in environment],
+            }
+        )
+        if len(payload) > MAX_MESSAGE_BYTES:
+            raise RuntimeError("native control environment exceeds the handoff bound")
+        connection.send_bytes(payload)
+        expected_ack = canonical_bytes(
+            {"claim_sha256": digest(expected_claim), "environment_received": True}
+        )
+        if receive_bytes(connection, deadline) != expected_ack:
+            raise RuntimeError("receiver did not acknowledge the exact in-memory handoff")
+    finally:
+        if connection is not None:
+            connection.close()
+        elif handle is not None:
+            _winapi.CloseHandle(handle)
+    print(
+        json.dumps(
+            {
+                "status": "single_context_handoff_completed",
+                "campaign_id": EXPECTED_CAMPAIGN_ID,
+                "native_graph_matched": True,
+                "environment_values_published": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def decode_environment(raw: bytes) -> tuple[tuple[str, str], ...]:
+    value = json.loads(raw.decode("utf-8"))
+    if type(value) is not dict or set(value) != {"schema_version", "control_environment"}:
+        raise RuntimeError("context handoff payload is malformed")
+    if value["schema_version"] != 1 or type(value["control_environment"]) is not list:
+        raise RuntimeError("context handoff payload version or entries are invalid")
+    pairs = []
+    seen = set()
+    for item in value["control_environment"]:
+        if (
+            type(item) is not list
+            or len(item) != 2
+            or type(item[0]) is not str
+            or type(item[1]) is not str
+            or item[0] not in CONTROL_KEYS
+            or item[0] in seen
+        ):
+            raise RuntimeError("context handoff contains a disallowed environment entry")
+        seen.add(item[0])
+        pairs.append((item[0], item[1]))
+    if pairs != sorted(pairs):
+        raise RuntimeError("context handoff entries are not canonical")
+    return tuple(pairs)
+
+
+def write_result(**values: object) -> None:
+    document = {
+        "schema_version": 1,
+        "campaign_id": EXPECTED_CAMPAIGN_ID,
+        "environment_values_published": False,
+        **values,
+    }
+    write_exclusive(RESULT, canonical_bytes(document))
+
+
+def receiver_mode(args: argparse.Namespace, envelope: dict[str, object]) -> int:
+    from multiprocessing.connection import Client
+
+    if exists(CLAIM) or exists(RESULT):
+        raise RuntimeError("the one-use receiver claim or result already exists")
+    descriptor = json.loads(read_regular(DESCRIPTOR, "handoff descriptor"))
+    if type(descriptor) is not dict or set(descriptor) != {"pipe_endpoint"}:
+        raise RuntimeError("handoff descriptor must contain only the pipe endpoint")
+    endpoint = descriptor["pipe_endpoint"]
+    if type(endpoint) is not str or not endpoint.startswith(r"\\.\pipe\pit-v5-c-c-"):
+        raise RuntimeError("handoff descriptor contains an invalid local pipe endpoint")
+    claim_raw = canonical_bytes(claim_document(args, endpoint))
+    write_exclusive(CLAIM, claim_raw)
+    phase = "handoff"
+    launch_attempted = False
+    child_started = False
+    try:
+        deadline = time.monotonic() + HANDOFF_TIMEOUT_SECONDS
+        with Client(endpoint, family="AF_PIPE", authkey=None) as connection:
+            connection.send_bytes(claim_raw)
+            environment = decode_environment(receive_bytes(connection, deadline))
+            connection.send_bytes(
+                canonical_bytes(
+                    {"claim_sha256": digest(claim_raw), "environment_received": True}
+                )
+            )
+        child_environment = dict(os.environ)
+        for key in CONTROL_KEYS:
+            child_environment.pop(key, None)
+        child_environment.update(environment)
+        phase = "diagnostic"
+        proof = run_receiver_diagnostic(envelope, child_environment)
+        phase = "launch"
+        launch_attempted = True
+        child = subprocess.Popen(
+            envelope["saved_launch_argv"],
+            cwd=envelope["working_directory"],
+            env=child_environment,
+        )
+        child_started = True
+        return_code = child.wait()
+        write_result(
+            status="exact_saved_launch_completed",
+            receiver_claim_sha256=digest(claim_raw),
+            diagnostic_proof_sha256=digest(canonical_bytes(proof)),
+            all_four_components_match=True,
+            native_host_graph_matches=True,
+            artifact_file_count=32,
+            artifact_bytes_unchanged=True,
+            launch_attempted=True,
+            child_started=True,
+            child_exit_code=return_code,
+            retry_authorized=False,
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "exact_saved_launch_completed",
+                    "campaign_id": EXPECTED_CAMPAIGN_ID,
+                    "child_exit_code": return_code,
+                    "environment_values_published": False,
+                },
+                sort_keys=True,
+            )
+        )
+        return return_code
+    except Exception as exc:
+        write_result(
+            status="stopped_without_retry",
+            failed_phase=phase,
+            failure_type=type(exc).__name__,
+            receiver_claim_sha256=digest(claim_raw),
+            launch_attempted=launch_attempted,
+            child_started=child_started,
+            retry_authorized=False,
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "stopped_without_retry",
+                    "failed_phase": phase,
+                    "campaign_id": EXPECTED_CAMPAIGN_ID,
+                    "environment_values_published": False,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+
+def main() -> int:
+    args = parse_args()
+    envelope, _authenticated = authenticate_fixed_bytes(args)
+    if args.mode == "source":
+        return source_mode(args, envelope)
+    return receiver_mode(args, envelope)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

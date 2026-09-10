@@ -51,6 +51,7 @@ RoundEventKindV5 = Literal[
     "round_intent",
     "role_completion",
     "rendered_variant",
+    "render_rejected",
     "candidate_stage_result",
     "quick_evidence",
     "episode_evidence",
@@ -66,6 +67,7 @@ RoundOutcomeKindV5 = Literal[
     "runtime_failed",
 ]
 CandidateStageV5 = Literal["validation", "semantic_probe", "quick_evaluation", "discovery_evaluation"]
+RenderRejectionFailureCodeV5 = Literal["policy_source_unbounded_or_stateful"]
 CandidateStageOutcomeV5 = Literal[
     "validation_valid",
     "validation_invalid",
@@ -144,6 +146,7 @@ _EVENT_KINDS = frozenset(
         "round_intent",
         "role_completion",
         "rendered_variant",
+        "render_rejected",
         "candidate_stage_result",
         "quick_evidence",
         "episode_evidence",
@@ -463,8 +466,13 @@ class ExperimentRecordV5:
             raise ValueError("validated experiment requires the post-validation identity")
         if self.policy_revision is None or not self.validation.valid:
             raise ValueError("validated experiment requires a valid policy revision")
-        if self.validation.changed_symbols != self.template.changed_symbols:
-            raise ValueError("validation changed symbols differ from the template")
+        parent_identical_duplicate = (
+            self.status == "exact_duplicate"
+            and self.experiment_identity.policy_revision_sha256 == self.parent_revision_sha256
+        )
+        expected_changed_symbols = () if parent_identical_duplicate else self.template.changed_symbols
+        if self.validation.changed_symbols != expected_changed_symbols:
+            raise ValueError("validation changed symbols differ from the expected candidate change")
         validate_post_validation_experiment_identity_v5(
             self.experiment_identity,
             policy_revision=self.policy_revision,
@@ -713,6 +721,32 @@ class RenderedVariantPayloadV5:
     def __post_init__(self) -> None:
         if type(self.variant) is not RenderedVariantV5:
             raise ValueError("rendered-variant payload is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class RenderRejectionPayloadV5:
+    """One closed host-side source rejection before variant materialization."""
+
+    experiment_identity: PreValidationInvalidExperimentIdentityV5
+    assignment: VariantAssignmentV5
+    author_artifact_ref: ArtifactRefV5
+    failure_code: RenderRejectionFailureCodeV5
+
+    def __post_init__(self) -> None:
+        if type(self.experiment_identity) is not PreValidationInvalidExperimentIdentityV5:
+            raise ValueError("render rejection identity is invalid")
+        if type(self.assignment) is not VariantAssignmentV5:
+            raise ValueError("render rejection assignment is invalid")
+        if self.experiment_identity.assignment_sha256 != self.assignment.sha256:
+            raise ValueError("render rejection assignment differs from its identity")
+        if (
+            type(self.author_artifact_ref) is not ArtifactRefV5
+            or self.author_artifact_ref.relative_path
+            != f"roles/artifacts/author/{self.experiment_identity.template_sha256}.json"
+        ):
+            raise ValueError("render rejection author artifact reference is invalid")
+        if type(self.failure_code) is not str or self.failure_code != "policy_source_unbounded_or_stateful":
+            raise ValueError("render rejection failure code is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1203,6 +1237,7 @@ RoundEventPayloadV5 = (
     RoundIntentPayloadV5
     | RoleCompletionPayloadV5
     | RenderedVariantPayloadV5
+    | RenderRejectionPayloadV5
     | CandidateStageResultPayloadV5
     | QuickEvidencePayloadV5
     | EpisodeEvidencePayloadV5
@@ -1216,6 +1251,7 @@ _PAYLOAD_TYPES: dict[str, type[object]] = {
     "round_intent": RoundIntentPayloadV5,
     "role_completion": RoleCompletionPayloadV5,
     "rendered_variant": RenderedVariantPayloadV5,
+    "render_rejected": RenderRejectionPayloadV5,
     "candidate_stage_result": CandidateStageResultPayloadV5,
     "quick_evidence": QuickEvidencePayloadV5,
     "episode_evidence": EpisodeEvidencePayloadV5,
@@ -1248,6 +1284,13 @@ def round_event_payload_primitive_v5(
                 "source_bundle": payload.variant.source_bundle.to_primitive(),
                 "policy_revision": payload.variant.policy_revision.to_primitive(),
             }
+        }
+    elif isinstance(payload, RenderRejectionPayloadV5):
+        body = {
+            "experiment_identity": payload.experiment_identity.to_primitive(),
+            "assignment": _assignment_artifact_primitive(payload.assignment),
+            "author_artifact_ref": payload.author_artifact_ref.to_primitive(),
+            "failure_code": payload.failure_code,
         }
     elif isinstance(payload, CandidateStageResultPayloadV5):
         body = {
@@ -1314,6 +1357,7 @@ class RoundEventV5:
             _digest(self.experiment_id, "round-event experiment ID")
         if self.event_kind in {
             "rendered_variant",
+            "render_rejected",
             "candidate_stage_result",
             "quick_evidence",
             "episode_evidence",
@@ -1342,6 +1386,9 @@ class RoundEventV5:
         if isinstance(payload, (CandidateStageResultPayloadV5, QuickEvidencePayloadV5, EpisodeEvidencePayloadV5)):
             if payload.experiment_id != self.experiment_id:
                 raise ValueError("round-event experiment differs from its payload")
+        if isinstance(payload, RenderRejectionPayloadV5):
+            if payload.experiment_identity.sha256 != self.experiment_id:
+                raise ValueError("round-event experiment differs from its rejection identity")
         if isinstance(payload, CandidateExecutionAuthorityV5):
             if (
                 payload.campaign_id != self.campaign_id
@@ -1414,6 +1461,7 @@ class RecoveryStepV5:
             raise ValueError("only role recovery steps carry role bindings")
         if self.event_kind in {
             "rendered_variant",
+            "render_rejected",
             "candidate_stage_result",
             "quick_evidence",
             "episode_evidence",
@@ -1477,6 +1525,7 @@ def _validate_candidate_stage_chain_v5(
                 payload,
                 (
                     RenderedVariantPayloadV5,
+                    RenderRejectionPayloadV5,
                     CandidateStageResultPayloadV5,
                     QuickEvidencePayloadV5,
                     EpisodeEvidencePayloadV5,
@@ -1508,6 +1557,12 @@ def _validate_candidate_stage_chain_v5(
                 raise ValueError("rendered candidate is duplicated")
             states[experiment_id] = "rendered"
             episode_ordinals[experiment_id] = set()
+            continue
+        if isinstance(payload, RenderRejectionPayloadV5):
+            assert experiment_id is not None
+            if experiment_id in states:
+                raise ValueError("render rejection conflicts with an existing candidate")
+            states[experiment_id] = "terminal"
             continue
         if isinstance(payload, CandidateStageResultPayloadV5):
             assert experiment_id is not None
@@ -2065,6 +2120,8 @@ __all__ = [
     "ProjectionLineageAuthorityV5",
     "QuickEvidencePayloadV5",
     "RecoveryStepV5",
+    "RenderRejectionFailureCodeV5",
+    "RenderRejectionPayloadV5",
     "RenderedVariantPayloadV5",
     "ResourceLeasePayloadV5",
     "RoleCompletionPayloadV5",

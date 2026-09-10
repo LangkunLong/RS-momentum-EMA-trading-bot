@@ -61,6 +61,66 @@ def _decode_unique_json(raw: bytes) -> dict[str, object]:
     return decoded
 
 
+def _classify_controller_response_v5(
+    *,
+    persisted: PersistedRoleRequestV5,
+    reference: ArtifactRefV5,
+    raw: bytes,
+) -> RoleInvocationPackageV5:
+    response_sha256 = reference.sha256
+    artifact = None
+    outcome = "response_schema_failure"
+    failure_code = RoleFailureCode.RESPONSE_SCHEMA
+    try:
+        envelope = _decode_unique_json(raw)
+        if set(envelope) != {
+            "schema_version",
+            "artifact_type",
+            "call_key_sha256",
+            "request_sha256",
+            "response",
+        }:
+            raise ValueError("controller response envelope keys are invalid")
+        if envelope["schema_version"] != 5 or envelope["artifact_type"] != "controller_role_response":
+            raise ValueError("controller response envelope schema is invalid")
+        if (
+            envelope["call_key_sha256"] != persisted.call.sha256
+            or envelope["request_sha256"] != persisted.request.sha256
+        ):
+            raise RoleEvidenceBindingFailureV5(role=persisted.call.role)
+        if type(envelope["response"]) is not dict:
+            raise ValueError("controller response payload is invalid")
+        response_text = json.dumps(envelope["response"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        artifact = parse_and_bind_role_artifact(request=persisted.request, response_text=response_text)
+        outcome = "accepted"
+        failure_code = None
+    except RoleEvidenceBindingFailureV5:
+        outcome = "evidence_binding_failure"
+        failure_code = RoleFailureCode.EVIDENCE_BINDING
+    except (RoleResponseSchemaFailureV5, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        pass
+    attempt = RoleAttemptFactsV5(
+        role=persisted.call.role,
+        attempt_kind=persisted.call.attempt_kind,
+        attempt_index=persisted.call.attempt_index,
+        request_sha256=persisted.request.sha256,
+        slot_id=None,
+        outcome=outcome,
+        failure_code=failure_code,
+        usage=_zero_usage(),
+        response_sha256=response_sha256,
+        artifact_sha256=None if artifact is None else canonical_sha256_v5(artifact),
+    )
+    authority = ControllerRoleTerminalAuthorityV5(
+        call_key_sha256=persisted.call.sha256,
+        request_sha256=persisted.request.sha256,
+        attempt_facts_sha256=attempt.sha256,
+        raw_response_ref=reference,
+        artifact_sha256=None if artifact is None else canonical_sha256_v5(artifact),
+    )
+    return RoleInvocationPackageV5(persisted.call, persisted.request, attempt, authority, artifact)
+
+
 class FileBackedControllerRoleInvokerV5:
     """Consume exact local JSON envelopes without any external-provider activity.
 
@@ -109,58 +169,7 @@ class FileBackedControllerRoleInvokerV5:
 
     def _terminal(self, persisted: PersistedRoleRequestV5) -> RoleInvocationPackageV5:
         reference, raw = self._sealed(persisted)
-        response_sha256 = reference.sha256
-        artifact = None
-        outcome = "response_schema_failure"
-        failure_code = RoleFailureCode.RESPONSE_SCHEMA
-        try:
-            envelope = _decode_unique_json(raw)
-            if set(envelope) != {
-                "schema_version",
-                "artifact_type",
-                "call_key_sha256",
-                "request_sha256",
-                "response",
-            }:
-                raise ValueError("controller response envelope keys are invalid")
-            if envelope["schema_version"] != 5 or envelope["artifact_type"] != "controller_role_response":
-                raise ValueError("controller response envelope schema is invalid")
-            if (
-                envelope["call_key_sha256"] != persisted.call.sha256
-                or envelope["request_sha256"] != persisted.request.sha256
-            ):
-                raise RoleEvidenceBindingFailureV5(role=persisted.call.role)
-            if type(envelope["response"]) is not dict:
-                raise ValueError("controller response payload is invalid")
-            response_text = json.dumps(envelope["response"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            artifact = parse_and_bind_role_artifact(request=persisted.request, response_text=response_text)
-            outcome = "accepted"
-            failure_code = None
-        except RoleEvidenceBindingFailureV5:
-            outcome = "evidence_binding_failure"
-            failure_code = RoleFailureCode.EVIDENCE_BINDING
-        except (RoleResponseSchemaFailureV5, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
-            pass
-        attempt = RoleAttemptFactsV5(
-            role=persisted.call.role,
-            attempt_kind=persisted.call.attempt_kind,
-            attempt_index=persisted.call.attempt_index,
-            request_sha256=persisted.request.sha256,
-            slot_id=None,
-            outcome=outcome,
-            failure_code=failure_code,
-            usage=_zero_usage(),
-            response_sha256=response_sha256,
-            artifact_sha256=None if artifact is None else canonical_sha256_v5(artifact),
-        )
-        authority = ControllerRoleTerminalAuthorityV5(
-            call_key_sha256=persisted.call.sha256,
-            request_sha256=persisted.request.sha256,
-            attempt_facts_sha256=attempt.sha256,
-            raw_response_ref=reference,
-            artifact_sha256=None if artifact is None else canonical_sha256_v5(artifact),
-        )
-        return RoleInvocationPackageV5(persisted.call, persisted.request, attempt, authority, artifact)
+        return _classify_controller_response_v5(persisted=persisted, reference=reference, raw=raw)
 
     def invoke_once(
         self,

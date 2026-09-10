@@ -444,8 +444,41 @@ def _validate_episode_quantity_path(
             if expected_action == "add_on":
                 add_on_count += 1
         elif action == "SELL":
-            if index == 0 or quantity > cumulative_quantity:
-                raise ValueError("V5 episode sell exceeds its causal open quantity")
+            # The engine closes its binary-float remainder; decimal reconstruction
+            # can differ within that same float's rounding interval. Require both
+            # representations and the existing quantity precision to agree.
+            closing_float_roundoff = (
+                quantity > cumulative_quantity
+                and change.action == "exit"
+                and change.quantity_after == 0.0
+                and float(quantity) == float(cumulative_quantity)
+                and _q(quantity) == _q(cumulative_quantity)
+            )
+            if index == 0 or (quantity > cumulative_quantity and not closing_float_roundoff):
+                excess = quantity - cumulative_quantity
+                previous_quantity_after = path[index - 1].quantity_after if index else None
+                try:
+                    normalized = (_q(quantity), _q(cumulative_quantity), _q(excess))
+                except ArithmeticError:
+                    # Diagnostic formatting must not replace the causal rejection.
+                    normalized = (None, None, None)
+                details = {
+                    "fill_index": index,
+                    "sell_quantity": quantity,
+                    "open_quantity": cumulative_quantity,
+                    "excess": excess,
+                    "normalized_sell": normalized[0],
+                    "normalized_open": normalized[1],
+                    "normalized_excess": normalized[2],
+                    "quantity_after": change.quantity_after,
+                    "previous_quantity_after": previous_quantity_after,
+                }
+                numeric_evidence = ", ".join(
+                    f"{key}={str(value)[:96]}" for key, value in details.items()
+                )
+                raise ValueError(
+                    "V5 episode sell exceeds its causal open quantity: " + numeric_evidence
+                )
             cumulative_quantity -= quantity
             expected_action = "exit" if _q(cumulative_quantity) == 0 else "scale_out"
         else:

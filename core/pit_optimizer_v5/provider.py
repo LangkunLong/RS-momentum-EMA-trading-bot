@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import re
+import sys
 import time
 from types import MappingProxyType
 from typing import Literal, Protocol, get_args, get_type_hints, runtime_checkable
@@ -39,6 +40,69 @@ from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 
 
 RoleNameV5 = Literal["investigator", "author", "critic"]
+
+
+def _emit_completion_failure_diagnostic_v5(exc: BaseException, *, request_sha256: str) -> None:
+    """Emit bounded local diagnostics without exception text, bodies, or secrets.
+
+    This is observational only: the ledger remains the accounting authority and
+    the original exception still follows the existing terminal settlement path.
+    """
+    try:
+        allowed_classes = {
+            "APIConnectionError", "APITimeoutError", "APIStatusError", "BadRequestError",
+            "AuthenticationError", "PermissionDeniedError", "NotFoundError", "RateLimitError",
+            "InternalServerError", "UnprocessableEntityError", "TimeoutError", "ValueError",
+            "TypeError", "ImportError", "ModuleNotFoundError", "RuntimeError", "OSError",
+            "ConfigurationError", "AccountingValidationError", "CancelledError",
+        }
+        allowed_codes = {
+            "invalid_request", "invalid_request_error", "invalid_api_key", "insufficient_credits",
+            "rate_limit_exceeded", "context_length_exceeded", "model_not_found", "server",
+            "provider_unavailable", "invalid_json_schema", "unsupported_parameter",
+        }
+        status = getattr(exc, "status_code", None)
+        body = getattr(exc, "body", None)
+        error = body.get("error", body) if type(body) is dict else {}
+        error = error if type(error) is dict else {}
+        metadata = error.get("metadata", {})
+        metadata = metadata if type(metadata) is dict else {}
+        codes = [error.get("type"), error.get("code"), metadata.get("error_type")]
+        # Emit only fixed vocabulary, never arbitrary provider message/body text.
+        hint_text = " ".join(
+            value[:16384] for value in (error.get("message"), error.get("param"), metadata.get("raw"))
+            if type(value) is str
+        )
+        hint_keywords = ("uniqueItems", "oneOf", "anyOf", "const", "additionalProperties", "required", "response_format", "json_schema")
+        schema_hints = [keyword for keyword in hint_keywords if re.search(r"(?<![A-Za-z0-9_])" + keyword + r"(?![A-Za-z0-9_])", hint_text)]
+        positions = []
+        trace = exc.__traceback__
+        allowed_paths = (
+            "agent_loop.py", "core/pit_optimizer_v5/provider.py",
+            "core/pit_optimizer_v5/production_provider.py", "core/pit_optimizer_v5/artifacts.py",
+        )
+        while trace is not None:
+            filename = trace.tb_frame.f_code.co_filename.replace("\\", "/")
+            for path in allowed_paths:
+                if filename == path or filename.endswith("/" + path):
+                    positions.append({"path": path, "line": trace.tb_lineno})
+                    break
+            trace = trace.tb_next
+        diagnostic = {
+            "schema_version": 1,
+            "request_sha256": request_sha256,
+            "exception_class": type(exc).__name__ if type(exc).__name__ in allowed_classes else "unknown",
+            "http_status": status if type(status) is int and 100 <= status <= 599 else None,
+            "error_codes": sorted({code for code in codes if type(code) is str and code in allowed_codes}),
+            "positions": positions[-8:],
+            "schema_keyword_hints": schema_hints,
+            "accounting_authority": False,
+        }
+        print("PIT_OPTIMIZER_V5_PROVIDER_DIAGNOSTIC=" + json.dumps(diagnostic, separators=(",", ":")),
+              file=sys.stderr, flush=True)
+    except BaseException:
+        # Diagnostics must never replace or interrupt authoritative settlement.
+        pass
 
 
 def sum_cost_usd_v5(left: Decimal, right: Decimal) -> Decimal:
@@ -218,6 +282,8 @@ _TICKER_CONTEXT_RE = re.compile(
 )
 _SAFE_UPPERCASE_TEXT_TOKENS = frozenset(
     {
+        "A",
+        "I",
         "ATR",
         "CAGR",
         "EMA",
@@ -786,7 +852,10 @@ def _validate_safe_text(value: object, label: str) -> str:
         or _TICKER_CONTEXT_RE.search(text)
     ):
         raise ValueError(f"{label} contains path or credential material")
-    for match in _TICKER_VALUE_RE.finditer(text):
+    # Mask only the bounded technical token for the uppercase scan. All path,
+    # credential and explicit ticker-context checks above inspect the original text.
+    uppercase_scan = re.sub(r"(?<![A-Za-z0-9_$./])I/O(?![A-Za-z0-9_/]|\.[A-Za-z0-9_])", "   ", text)
+    for match in _TICKER_VALUE_RE.finditer(uppercase_scan):
         if (
             match.group("cash") is not None
             or match.group("suffix") is not None
@@ -1926,6 +1995,114 @@ def wire_role_messages_v5(messages: tuple[Mapping[str, object], ...]) -> list[di
     return result
 
 
+def wire_role_schema_v5(
+    schema: Mapping[str, object], *, allow_full_source_escape: bool | None = None
+) -> dict[str, object]:
+    """Project schema nodes for transport without changing local schema authority.
+
+    Uniqueness is still enforced by the canonical schema/parser. Current oneOf
+    branches are disjoint by literal kind or null/array, so anyOf is equivalent.
+    Property names and annotation/data values are not schema keywords to rewrite.
+    """
+    if not isinstance(schema, Mapping):
+        raise ValueError("role transport schema must be an object")
+    if allow_full_source_escape is not None and type(allow_full_source_escape) is not bool:
+        raise ValueError("role transport authoring permission must be boolean or absent")
+
+    def project(node, *, root=False):
+        if type(node) is bool:
+            return node
+        if not isinstance(node, Mapping):
+            raise ValueError("role transport schema node is invalid")
+        result = dict(node)
+        result.pop("uniqueItems", None)
+        if root:
+            result.pop("$schema", None)
+            result.pop("x-pit-optimizer-v5-authority", None)
+        if "const" in result:
+            literal = result.pop("const")
+            if type(literal) is not str or "enum" in result or result.get("type", "string") != "string":
+                raise ValueError("role transport literal schema is unsupported")
+            result.update(type="string", enum=[literal])
+        if "oneOf" in result:
+            if "anyOf" in result:
+                raise ValueError("role transport alternatives conflict")
+            result["anyOf"] = result.pop("oneOf")
+        for key in ("properties", "$defs", "definitions", "patternProperties", "dependentSchemas"):
+            if key in result:
+                result[key] = {name: project(child) for name, child in result[key].items()}
+        for key in ("items", "additionalProperties", "contains", "not", "if", "then", "else", "propertyNames"):
+            if key in result:
+                result[key] = project(result[key])
+        for key in ("anyOf", "allOf", "prefixItems"):
+            if key in result:
+                result[key] = [project(child) for child in result[key]]
+        return result
+
+    result = project(schema, root=True)
+    authority = schema.get("x-pit-optimizer-v5-authority")
+    if (
+        isinstance(authority, Mapping)
+        and authority.get("role") == "investigator"
+        and allow_full_source_escape is False
+    ):
+        # This permission comes from the authenticated manifest, not the author-only
+        # RoleSchemaAuthority flag. None preserves historical/superset projection.
+        mode = result["properties"]["artifact"]["properties"]["hypotheses"]["items"]["properties"]["authoring_mode"]
+        mode["enum"] = ["symbol_edits"]
+    if isinstance(authority, Mapping) and authority.get("role") == "author":
+        # Match the existing local qualified-symbol contract at generation time.
+        # Never normalize a received artifact or change its canonical authority.
+        artifact = result["properties"]["artifact"]["properties"]
+        names = artifact["changed_symbols"]["items"]
+        names["pattern"] = r"^core\.strategy_policy\.v3\.[a-z_]+\.[A-Za-z_]\w*$"
+        artifact["changed_symbols"]["description"] = "Sorted unique module.symbol names; match operations in symbol-edits mode."
+        names["description"] = "Path without .py, / replaced by ., then .symbol."
+        operations = artifact["source_operations"]
+        operations["description"] = "Unique edits ordered by path enum order, then symbol. One complete function/constant each."
+        source = operations["items"]["properties"]["replacement_source"]
+        source["pattern"] = r"^[^\r\u0000\ufeff][^\r\u0000]*\n$"
+        source["description"] = "Decoded Python source must end in LF; no CR, NUL or initial BOM."
+        axes = artifact["axes"]
+        axes["description"] = "Sort by unique public identifier name; unique typed values must include default."
+        # Share identical literal alternatives to keep added guidance within the
+        # canonical schema byte bound used by historical ledger reservations.
+        axis = axes["items"]["properties"]
+        literal = axis["default"]
+        if literal != axis["values"]["items"] or "$defs" in result:
+            raise ValueError("author transport literal schemas differ")
+        result["$defs"] = {"literal": literal}
+        axis["default"] = {"$ref": "#/$defs/literal"}
+        axis["values"]["items"] = {"$ref": "#/$defs/literal"}
+        full_source = artifact["full_source_escape"]
+        if "anyOf" not in full_source:
+            operations["minItems"] = 1
+        if "anyOf" in full_source:
+            full_source["description"] = "If non-null, include all paths in enum order and set source_operations to []."
+            for branch in full_source["anyOf"]:
+                if branch.get("type") == "array":
+                    branch["items"]["properties"]["source"].update(
+                        pattern=source["pattern"], description=source["description"]
+                    )
+        result["properties"]["artifact"]["description"] = (
+            "Preserve market gates and ranking unless explicitly targeted by the hypothesis."
+        )
+    if isinstance(authority, Mapping):
+        result["properties"]["binding"]["description"] = "Copy input binding exactly."
+        artifact = result["properties"]["artifact"]["properties"]
+        if authority.get("role") == "investigator":
+            artifact["hypotheses"]["description"] = (
+                "Consecutive ranks from 1; unique hypothesis and prediction metric IDs. "
+                "Cite only issued evidence IDs."
+            )
+        elif authority.get("role") == "critic":
+            artifact["reviews"]["description"] = (
+                "One review per input binding.experiment_ids entry, in that order. "
+                "All citations must use issued evidence IDs."
+            )
+    return result
+
+
 def prospective_role_usage_v5(
     request: RoleRequestV5, capabilities: ProviderCapabilitiesV5
 ) -> tuple[int, Decimal | None]:
@@ -1933,7 +2110,10 @@ def prospective_role_usage_v5(
 
     input_bound = (
         len(canonical_json_bytes_v5(wire_role_messages_v5(request.messages)))
-        + len(request.schema_authority.canonical_schema_json)
+        + max(
+            len(request.schema_authority.canonical_schema_json),
+            len(canonical_json_bytes_v5(wire_role_schema_v5(json.loads(request.schema_authority.canonical_schema_json)))),
+        )
         + capabilities.input_token_overhead_upper_bound
     )
     price = capabilities.price_upper_bound
@@ -3293,7 +3473,8 @@ class AuthorizedRoleRunnerV5:
         )
         try:
             result = self._provider.complete_once(completion_request)
-        except BaseException:
+        except BaseException as exc:
+            _emit_completion_failure_diagnostic_v5(exc, request_sha256=request.sha256)
             return self._raise_recovered_failure(
                 request=request,
                 attempt_kind=canonical_kind,
@@ -3721,5 +3902,6 @@ __all__ = [
     "role_request_artifact_primitive_v5",
     "validate_parsed_role_artifact_v5",
     "wire_role_messages_v5",
+    "wire_role_schema_v5",
     "sum_cost_usd_v5",
 ]

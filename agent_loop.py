@@ -3865,12 +3865,13 @@ class OpenRouterGateway:
         response_schema_json: bytes,
         max_output_tokens: int,
         wall_deadline: float,
+        allow_full_source_escape: bool | None = None,
     ) -> object:
         """Perform one retry-free V5 JSON-schema completion without owning its ledger."""
 
         import asyncio
 
-        from core.pit_optimizer_v5.provider import CompletionResultV5, wire_role_messages_v5
+        from core.pit_optimizer_v5.provider import CompletionResultV5, wire_role_messages_v5, wire_role_schema_v5
 
         if (
             type(request_sha256) is not str
@@ -3912,7 +3913,7 @@ class OpenRouterGateway:
                 "json_schema": {
                     "name": "pit_optimizer_v5_role",
                     "strict": True,
-                    "schema": dict(schema),
+                    "schema": wire_role_schema_v5(schema, allow_full_source_escape=allow_full_source_escape),
                 },
             },
             stream=False,
